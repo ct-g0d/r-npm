@@ -11,9 +11,11 @@ use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_fs::tarball::extract_tar_gz;
+use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
+use rnpm_shim::{create_shims, normalize_shebang};
 
 /// Options for running rnpm install.
 #[derive(Debug, Clone)]
@@ -22,6 +24,7 @@ pub struct InstallOptions {
     pub registry_url: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
+    pub ignore_scripts: bool,
 }
 
 impl Default for InstallOptions {
@@ -31,6 +34,7 @@ impl Default for InstallOptions {
             registry_url: None,
             cache_dir: None,
             offline: false,
+            ignore_scripts: false,
         }
     }
 }
@@ -64,8 +68,7 @@ pub struct Installer {
 impl Installer {
     pub fn new(options: InstallOptions) -> Result<Self> {
         let root_dir = &options.project_dir;
-        let config = Config::load(Some(root_dir))
-            .unwrap_or_default();
+        let config = Config::load(Some(root_dir)).unwrap_or_default();
 
         let registry_url = if let Some(ref reg_str) = options.registry_url {
             Url::parse(reg_str).context("Invalid registry URL")?
@@ -105,7 +108,7 @@ impl Installer {
         })
     }
 
-    /// Run full install workflow from project package.json.
+    /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
@@ -142,6 +145,7 @@ impl Installer {
 
         // 2. Reify: download or fetch from cache, verify integrity, extract to node_modules
         let node_modules_dir = self.options.project_dir.join("node_modules");
+        let bin_dir = node_modules_dir.join(".bin");
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
 
         let mut cache_hits = 0;
@@ -149,7 +153,6 @@ impl Installer {
         let mut packages_installed = 0;
 
         let mut lockfile = LockfileV3::new(project_name, project_version);
-        // Populate root package dependencies
         if let Some(root_pkg) = lockfile.root_package_mut() {
             if !manifest.dependencies.is_empty() {
                 root_pkg.dependencies = Some(manifest.dependencies.clone());
@@ -185,6 +188,40 @@ impl Installer {
 
             packages_installed += 1;
 
+            // Generate shims if package declares bin
+            let pkg_manifest_path = dest_dir.join("package.json");
+            let mut has_install_script = false;
+
+            if pkg_manifest_path.exists() {
+                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    // Create companion shims
+                    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                        let target_rel = format!("{pkg_name}/{script_rel}");
+                        let script_path = dest_dir.join(&script_rel);
+                        let _ = normalize_shebang(&script_path);
+                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                    }
+
+                    // Execute lifecycle scripts if present
+                    if !self.options.ignore_scripts {
+                        for event in &["preinstall", "install", "postinstall"] {
+                            if let Some(cmd) = pkg_manifest.scripts.get(*event) {
+                                has_install_script = true;
+                                let mut ctx = LifecycleContext::new(
+                                    &self.options.project_dir,
+                                    &dest_dir,
+                                    pkg_name,
+                                    *event,
+                                    cmd,
+                                );
+                                ctx.package_version = pkg_manifest.version.clone();
+                                let _ = execute_lifecycle_script(&ctx);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Add entry to lockfile v3
             let lockfile_key = format!("node_modules/{pkg_name}");
             let mut lock_entry = LockfilePackage {
@@ -193,6 +230,10 @@ impl Installer {
                 integrity: Some(node.integrity.clone()),
                 ..Default::default()
             };
+
+            if has_install_script {
+                lock_entry.has_install_script = Some(true);
+            }
 
             if !node.dependencies.is_empty() {
                 lock_entry.dependencies = Some(node.dependencies.clone());
@@ -205,6 +246,128 @@ impl Installer {
         let lockfile_path = self.options.project_dir.join("package-lock.json");
         lockfile.save_to_file(&lockfile_path)
             .context("Failed to save package-lock.json")?;
+
+        Ok(InstallSummary {
+            packages_installed,
+            cache_hits,
+            cache_misses,
+            lockfile_path,
+        })
+    }
+
+    /// Run strict CI installation from committed package-lock.json.
+    pub async fn run_ci(&mut self) -> Result<InstallSummary> {
+        let manifest_path = self.options.project_dir.join("package.json");
+        let lockfile_path = self.options.project_dir.join("package-lock.json");
+
+        if !manifest_path.exists() {
+            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+        }
+        if !lockfile_path.exists() {
+            return Err(anyhow!("package-lock.json not found: rnpm ci requires a committed lockfile"));
+        }
+
+        let manifest = Manifest::from_file(&manifest_path)?;
+        let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
+        let lockfile = LockfileV3::from_json_str(&lockfile_str)
+            .context("Failed to parse package-lock.json")?;
+
+        // Strict drift check between manifest and lockfile
+        if let Some(root_pkg) = lockfile.packages.get("") {
+            if let Some(lock_deps) = &root_pkg.dependencies {
+                for (dep_name, dep_spec) in &manifest.dependencies {
+                    if let Some(lock_spec) = lock_deps.get(dep_name) {
+                        if lock_spec != dep_spec {
+                            return Err(anyhow!(
+                                "rnpm ERR! code EUSAGE: package.json dependency {}@{} does not match lockfile spec {}",
+                                dep_name, dep_spec, lock_spec
+                            ));
+                        }
+                    } else {
+                        return Err(anyhow!(
+                            "rnpm ERR! code EUSAGE: package.json dependency {} missing from package-lock.json",
+                            dep_name
+                        ));
+                    }
+                }
+            } else if !manifest.dependencies.is_empty() {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: package.json defines dependencies but lockfile has none"
+                ));
+            }
+        }
+
+        // Clean-slate: remove node_modules completely
+        let node_modules_dir = self.options.project_dir.join("node_modules");
+        let bin_dir = node_modules_dir.join(".bin");
+        if node_modules_dir.exists() {
+            std::fs::remove_dir_all(&node_modules_dir)?;
+        }
+        std::fs::create_dir_all(&node_modules_dir)?;
+
+        let mut cache_hits = 0;
+        let mut cache_misses = 0;
+        let mut packages_installed = 0;
+
+        for (pkg_key, pkg_info) in &lockfile.packages {
+            if pkg_key.is_empty() {
+                continue;
+            }
+
+            let resolved_url = pkg_info.resolved.as_ref()
+                .ok_or_else(|| anyhow!("Package {} missing resolved URL in lockfile", pkg_key))?;
+            let integrity_str = pkg_info.integrity.as_ref()
+                .ok_or_else(|| anyhow!("Package {} missing integrity in lockfile", pkg_key))?;
+
+            let (bytes, was_hit) = self.fetch_tarball(resolved_url).await?;
+            if was_hit {
+                cache_hits += 1;
+            } else {
+                cache_misses += 1;
+            }
+
+            let expected_integrity: Integrity = integrity_str.parse()
+                .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+            expected_integrity.verify(&bytes)
+                .map_err(|e| anyhow!("Integrity verification failed for {pkg_key}: {e}"))?;
+
+            let target_path = self.options.project_dir.join(pkg_key);
+            std::fs::create_dir_all(&target_path)?;
+
+            extract_tar_gz(Cursor::new(&bytes), &target_path, None)
+                .map_err(|e| anyhow!("Failed to extract {pkg_key}: {e}"))?;
+
+            packages_installed += 1;
+
+            let pkg_manifest_path = target_path.join("package.json");
+            if pkg_manifest_path.exists() {
+                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                        let target_rel = format!("{clean_pkg_name}/{script_rel}");
+                        let script_path = target_path.join(&script_rel);
+                        let _ = normalize_shebang(&script_path);
+                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                    }
+
+                    if !self.options.ignore_scripts {
+                        for event in &["preinstall", "install", "postinstall"] {
+                            if let Some(cmd) = pkg_manifest.scripts.get(*event) {
+                                let mut ctx = LifecycleContext::new(
+                                    &self.options.project_dir,
+                                    &target_path,
+                                    pkg_key,
+                                    *event,
+                                    cmd,
+                                );
+                                ctx.package_version = pkg_manifest.version.clone();
+                                let _ = execute_lifecycle_script(&ctx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(InstallSummary {
             packages_installed,
@@ -227,7 +390,6 @@ impl Installer {
         let range = Range::parse(range_str)
             .map_err(|e| anyhow!("Failed to parse semver range '{range_str}' for {name}: {e}"))?;
 
-        // Find highest version matching range
         let mut matching_versions: Vec<(Version, String)> = Vec::new();
         for (ver_str, _ver_info) in &metadata.versions {
             if let Ok(ver) = ver_str.parse::<Version>() {
@@ -264,18 +426,15 @@ impl Installer {
     }
 
     async fn fetch_tarball(&self, tarball_url: &str) -> Result<(Vec<u8>, bool)> {
-        // Try cache lookup first
         if let Ok(Some((_entry, data))) = self.cache.get(tarball_url) {
             debug!("Cache hit for {}", tarball_url);
             return Ok((data, true));
         }
 
-        // Cache miss -> download
         info!("Downloading {}", tarball_url);
         let bytes = self.registry_client.download_tarball_bytes(tarball_url).await
             .map_err(|e| anyhow!("Failed to download tarball from {tarball_url}: {e}"))?;
 
-        // Put in cache
         let _ = self.cache.put(tarball_url, &bytes, None);
 
         Ok((bytes, false))

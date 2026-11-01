@@ -9,11 +9,14 @@ members = [
     "crates/rnpm-fs",
     "crates/rnpm-install",
     "crates/rnpm-cli",
+    "crates/rnpm-shim",
+    "crates/rnpm-lifecycle",
+    "crates/rnpm-solver",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 rust-version = "1.85"
 authors = ["npm-rust contributors"]
 license = "MIT OR Apache-2.0"
@@ -46,3 +49,6 @@ rnpm-cache = { path = "crates/rnpm-cache" }
 rnpm-lockfile = { path = "crates/rnpm-lockfile" }
 rnpm-fs = { path = "crates/rnpm-fs" }
 rnpm-install = { path = "crates/rnpm-install" }
+rnpm-shim = { path = "crates/rnpm-shim" }
+rnpm-lifecycle = { path = "crates/rnpm-lifecycle" }
+rnpm-solver = { path = "crates/rnpm-solver" }

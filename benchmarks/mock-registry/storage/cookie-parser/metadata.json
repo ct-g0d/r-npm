@@ -1,0 +1,25 @@
+{
+  "_id": "cookie-parser",
+  "name": "cookie-parser",
+  "dist-tags": {
+    "latest": "1.4.6"
+  },
+  "versions": {
+    "1.4.6": {
+      "name": "cookie-parser",
+      "version": "1.4.6",
+      "description": "Cookie parsing middleware mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "071d01fd66d9a2484ccc30882dafc1dc873c4f6a",
+        "integrity": "sha512-wJXvj/zk33T/v9Vq/d9dMc7o8HJryzuDyb/7XwXRu8hURgJ7E400EwqWQkA4H1yDXDcufAUOE3XSRGtLDkRIqg==",
+        "tarball": "http://127.0.0.1:4873/cookie-parser/-/cookie-parser-1.4.6.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

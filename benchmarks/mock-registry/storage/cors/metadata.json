@@ -1,0 +1,25 @@
+{
+  "_id": "cors",
+  "name": "cors",
+  "dist-tags": {
+    "latest": "2.8.5"
+  },
+  "versions": {
+    "2.8.5": {
+      "name": "cors",
+      "version": "2.8.5",
+      "description": "Node.js CORS middleware mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "bd2a036ad886937314f83ebe9f236addbbe5d941",
+        "integrity": "sha512-agP2D5hcv3xtVANtK7DSXBEKSGC8r+cNDglmTNLMl6Is9J9ZVDBvZegv17ZzCFPmLhk+kTfKdhzuWrkFJLIHfw==",
+        "tarball": "http://127.0.0.1:4873/cors/-/cors-2.8.5.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

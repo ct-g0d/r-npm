@@ -1,0 +1,25 @@
+{
+  "_id": "depd",
+  "name": "depd",
+  "dist-tags": {
+    "latest": "2.0.0"
+  },
+  "versions": {
+    "2.0.0": {
+      "name": "depd",
+      "version": "2.0.0",
+      "description": "Deprecate all them things mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "2ec4d71e5e9f7b4127c9f0be486968e191c70d18",
+        "integrity": "sha512-PGE8Ror0JjHssWMD7ql6V1ewyzrGSp2eBC7+rCmZfLJjnSkl/Smb/g13InyemPDAYF8gTtxUwNKEg/fozNtZPw==",
+        "tarball": "http://127.0.0.1:4873/depd/-/depd-2.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

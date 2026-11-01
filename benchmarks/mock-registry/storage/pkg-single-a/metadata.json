@@ -11,9 +11,12 @@
       "description": "Synthetic single dependency package for tier1 benchmarks",
       "main": "index.js",
       "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
       "dist": {
-        "shasum": "42045dd4e00c6a18f7bf97eda94054f728ec0cc2",
-        "integrity": "sha512-Ipd3vqcguOCxjbjOOrRNO4JYjti1vNdsGMF0PTUCFZRts+5HcfjKfSUwRFUYwkqH8k0rZTaWYe8CfzZ0aE3olw==",
+        "shasum": "11e4cc742e0aae2310b142cf88d9facddb501cc3",
+        "integrity": "sha512-oUs0bSHG5ebBBt4PmCKMQFYqVPLy5pAtRd7faQu9yW352v/baEjeO3oiaG6sc9o63PFMSo2ugxIkLrauLyQmtg==",
         "tarball": "http://127.0.0.1:4873/pkg-single-a/-/pkg-single-a-1.0.0.tgz"
       }
     }

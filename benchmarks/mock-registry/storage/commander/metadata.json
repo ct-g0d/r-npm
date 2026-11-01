@@ -1,0 +1,25 @@
+{
+  "_id": "commander",
+  "name": "commander",
+  "dist-tags": {
+    "latest": "11.1.0"
+  },
+  "versions": {
+    "11.1.0": {
+      "name": "commander",
+      "version": "11.1.0",
+      "description": "Command-line interface framework mock for tier 2 benchmarks",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "015e8069ec5daa189b7b4a5918bf0d1362b31649",
+        "integrity": "sha512-FskAjeGueESKZg/Uf/8OEAPk0ZOATWGzp71q7zAVek0XHE8ZvvJr00iYc6QikfH6z+8TzeGrLkkPIsLIJGtMQw==",
+        "tarball": "http://127.0.0.1:4873/commander/-/commander-11.1.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

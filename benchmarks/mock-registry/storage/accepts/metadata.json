@@ -1,0 +1,27 @@
+{
+  "_id": "accepts",
+  "name": "accepts",
+  "dist-tags": {
+    "latest": "1.3.8"
+  },
+  "versions": {
+    "1.3.8": {
+      "name": "accepts",
+      "version": "1.3.8",
+      "description": "Higher-level content negotiation mock",
+      "main": "index.js",
+      "dependencies": {
+        "mime-types": "^2.1.35"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "00d8bc8eebb42b9c9be3902b3648cc4e8e4b6fdf",
+        "integrity": "sha512-DfBz3S6bCsNFUefIqhYY4Z2e09UVzivhhPyXBZm4+a8KdeuCaRBgTLtZ7Xz1nXG3KyZsqF5gw6DwkaeluWO6lA==",
+        "tarball": "http://127.0.0.1:4873/accepts/-/accepts-1.3.8.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

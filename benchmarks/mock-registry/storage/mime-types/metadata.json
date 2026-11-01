@@ -1,0 +1,27 @@
+{
+  "_id": "mime-types",
+  "name": "mime-types",
+  "dist-tags": {
+    "latest": "2.1.35"
+  },
+  "versions": {
+    "2.1.35": {
+      "name": "mime-types",
+      "version": "2.1.35",
+      "description": "The ultimate javascript content-type utility mock",
+      "main": "index.js",
+      "dependencies": {
+        "mime-db": "^1.52.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "c584c1954c4bf91d6cf2455393b5a1102a5c8a99",
+        "integrity": "sha512-5hkDy8xv4VbQqhzh3VA4218fIseqymTDxDYyQglwiF4UiDJezV5BPo3DPyHtkmivXggqS5nqqOhe4LJrM/MJsQ==",
+        "tarball": "http://127.0.0.1:4873/mime-types/-/mime-types-2.1.35.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

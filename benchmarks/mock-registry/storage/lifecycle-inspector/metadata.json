@@ -1,0 +1,30 @@
+{
+  "_id": "lifecycle-inspector",
+  "name": "lifecycle-inspector",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "lifecycle-inspector",
+      "version": "1.0.0",
+      "description": "Lifecycle hook inspector for differential environment & credential testing",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "scripts": {
+        "preinstall": "node inspect.js preinstall",
+        "install": "node inspect.js install",
+        "postinstall": "node inspect.js postinstall"
+      },
+      "hasInstallScript": true,
+      "dist": {
+        "shasum": "03ec792c4983b7e1ce94639902d60a559d45b08f",
+        "integrity": "sha512-ZLEpFIqTzIIWdk0sF19b4CrmlB1BJqHhRhbusFdNvpG6b7b8w4HdGoQuMhWCW77OCOha/Ggt40OonoauZv7XTQ==",
+        "tarball": "http://127.0.0.1:4873/lifecycle-inspector/-/lifecycle-inspector-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

@@ -13,9 +13,12 @@
       "dependencies": {
         "pkg-diamond-bottom": "^1.0.0"
       },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
       "dist": {
-        "shasum": "178c19f18c833107ceb9a604089bd919e1c9b45e",
-        "integrity": "sha512-q48QYtkdf4tycQDxQYbZ9hROsKdc9zHx+Gjb0zo2lRv1qa0Rr0DZRSwqsu/ImTopSmLO9m4K4vVfKuvn4r0SZg==",
+        "shasum": "fa372475e4980ad415e9357a32c6192b0c4f4d9c",
+        "integrity": "sha512-R1tC/mxzFN4uvvdcDMVyB7pG0OXdci7MD9Q/gJjxeUDqxdLxtd3luc613N4QO98eWMmtx9nZf2fghHJ0UtbDRw==",
         "tarball": "http://127.0.0.1:4873/pkg-diamond-left/-/pkg-diamond-left-1.0.0.tgz"
       }
     }

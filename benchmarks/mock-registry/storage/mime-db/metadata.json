@@ -1,0 +1,25 @@
+{
+  "_id": "mime-db",
+  "name": "mime-db",
+  "dist-tags": {
+    "latest": "1.52.0"
+  },
+  "versions": {
+    "1.52.0": {
+      "name": "mime-db",
+      "version": "1.52.0",
+      "description": "Media Type Database mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "58fc1b6beb0463eb7743d66f54344d11c58754f2",
+        "integrity": "sha512-imjjbzaYt/RR7Y8AmSgWel6V+WAoSsgzyJXDPWx1AXP3hmb8fXtdlpM5wjFt+TT9cMqsj6FQya2KV2VSXV78zQ==",
+        "tarball": "http://127.0.0.1:4873/mime-db/-/mime-db-1.52.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

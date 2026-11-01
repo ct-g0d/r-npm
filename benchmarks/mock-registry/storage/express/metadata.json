@@ -1,0 +1,30 @@
+{
+  "_id": "express",
+  "name": "express",
+  "dist-tags": {
+    "latest": "4.18.2"
+  },
+  "versions": {
+    "4.18.2": {
+      "name": "express",
+      "version": "4.18.2",
+      "description": "Fast, unopinionated, minimalist web framework mock for tier 2 benchmarks",
+      "main": "index.js",
+      "dependencies": {
+        "accepts": "^1.3.8",
+        "mime-types": "^2.1.35",
+        "debug": "^4.3.4",
+        "depd": "^2.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "84855fe2de23bd1d7ce6a4655f99e93192dbb885",
+        "integrity": "sha512-sCKH/6v0zl8TrddUQqlt9HP83inUSmi/+AABQgK3Zb2g3Yt6Jx9mGEpQiStfEK8XOtV3Kg/Qw6axNyivRDnB/g==",
+        "tarball": "http://127.0.0.1:4873/express/-/express-4.18.2.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

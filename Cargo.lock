@@ -1028,6 +1028,7 @@ dependencies = [
  "clap",
  "rnpm-core",
  "rnpm-install",
+ "rnpm-lifecycle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1081,8 +1082,11 @@ dependencies = [
  "rnpm-config",
  "rnpm-core",
  "rnpm-fs",
+ "rnpm-lifecycle",
  "rnpm-lockfile",
  "rnpm-registry",
+ "rnpm-shim",
+ "rnpm-solver",
  "serde",
  "serde_json",
  "tempfile",
@@ -1090,6 +1094,18 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rnpm-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rnpm-core",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1114,6 +1130,27 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rnpm-shim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rnpm-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rnpm-solver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rnpm-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

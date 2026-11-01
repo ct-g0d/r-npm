@@ -1,0 +1,29 @@
+{
+  "_id": "typescript",
+  "name": "typescript",
+  "dist-tags": {
+    "latest": "5.3.3"
+  },
+  "versions": {
+    "5.3.3": {
+      "name": "typescript",
+      "version": "5.3.3",
+      "description": "TypeScript compiler mock for tier 2 CLI benchmarks",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "bin": {
+        "tsc": "bin/tsc.js",
+        "tsserver": "bin/tsserver.js"
+      },
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "7d7087ee7007dd685ab7d68bb280dd55719faec0",
+        "integrity": "sha512-zG5QugMgTBI7rR7FuO6G+Edx5rqUxTsWQwsPEDLmn/GPnSe8GjX4diAePfIZXr7EfFSXrPrjsR6d8/vzp4kqiQ==",
+        "tarball": "http://127.0.0.1:4873/typescript/-/typescript-5.3.3.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

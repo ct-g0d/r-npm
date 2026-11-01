@@ -1,0 +1,22 @@
+{
+  "name": "tier2-typescript-cli",
+  "version": "1.0.0",
+  "description": "Tier 2 TypeScript CLI fixture with bin and script definitions",
+  "private": true,
+  "bin": {
+    "ts-cli": "./bin/ts-cli.js"
+  },
+  "scripts": {
+    "preinstall": "node -e \"console.log('root preinstall: ' + (process.env.npm_lifecycle_event || 'none'))\"",
+    "postinstall": "node -e \"console.log('root postinstall: ' + (process.env.npm_package_name || 'none'))\"",
+    "build": "tsc --version",
+    "start": "node ./bin/ts-cli.js",
+    "cli": "ts-cli",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "commander": "^11.0.0",
+    "mock-cli-helper": "^1.0.0",
+    "typescript": "^5.0.0"
+  }
+}

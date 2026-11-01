@@ -13,6 +13,9 @@ rnpm-registry = { workspace = true }
 rnpm-cache = { workspace = true }
 rnpm-lockfile = { workspace = true }
 rnpm-fs = { workspace = true }
+rnpm-shim = { workspace = true }
+rnpm-lifecycle = { workspace = true }
+rnpm-solver = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

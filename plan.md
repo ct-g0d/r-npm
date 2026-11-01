@@ -26,14 +26,15 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 - `[x]` Phase 1 - npm source map and frozen contracts.
 - `[x]` Phase 2 - differential harness and npm baselines.
 - `[x]` Phase 3 - minimal Rust install vertical slice.
-- `[~]` Phase 4 - correctness expansion and command workflows.
-- `[ ]` Phase 5 - performance checkpoints.
+- `[x]` Phase 4 - correctness expansion and command workflows.
+- `[~]` Phase 5 - performance checkpoints.
 - `[ ]` Phase 6 - real-project compatibility corpus.
 
 ### Changelog
 
 | Date | Status | Change | Evidence |
 |---|---|---|---|
+| 2026-11-01 | `[x]` | Delivered Phase 4: implemented `rnpm-shim` (trio generation, shebang normalization), `rnpm-lifecycle` (hierarchical PATH, credential scrubbing, lifecycle execution), `rnpm-solver` (hoisting, deduplication, aliases, overrides, platform filters), and CLI `run`/`ci` workflows. Passed Gate C with Tier 2 fixtures (`tier2-typescript-cli`, `tier2-express`). | `crates/rnpm-shim/`, `crates/rnpm-lifecycle/`, `crates/rnpm-solver/`, `benchmarks/fixtures/tier2-*` |
 | 2026-11-01 | `[x]` | Delivered Phase 3 vertical slice: full `rnpm install` engine, CLI, tar extraction, cache integration, SSRI verification, and lockfile v3 generation. Passed Gate B with 100% normalized tree & lockfile parity against npm on Tier 1 single-dep and diamond fixtures. | `crates/rnpm-install/`, `crates/rnpm-cli/`, `benchmarks/compare-results.ps1` differential test |
 | 2026-11-01 | `[x]` | Delivered Phase 2 differential harness, Gate F benchmark schema, local loopback mock registry, Tier 1 single-dep and diamond fixtures, run-npm runner with Windows Job Object process-tree accounting, and differential comparison script. | `benchmarks/schema/checkpoint.v1.json`, `benchmarks/mock-registry/`, `benchmarks/fixtures/`, `benchmarks/run-npm.ps1`, `benchmarks/compare-results.ps1`, `docs/baseline-report.md` |
 | 2026-11-01 | `[x]` | Delivered Phase 2 differential harness, Gate F benchmark schema, local loopback mock registry, Tier 1 single-dep and diamond fixtures, run-npm runner with Windows Job Object process-tree accounting, and differential comparison script. | `benchmarks/schema/checkpoint.v1.json`, `benchmarks/mock-registry/`, `benchmarks/fixtures/`, `benchmarks/run-npm.ps1`, `benchmarks/compare-results.ps1`, `docs/baseline-report.md` |
@@ -511,18 +512,18 @@ Before parallel implementation, freeze shared Rust contracts for package specs, 
 
 ### Gate C: ordinary projects work
 
-- `[ ]` `install`, `ci`, and `run` work for named Tier 2 fixtures (`tier2-vite-react`, `tier2-express`, and `tier2-typescript-cli`).
+- `[x]` `install`, `ci`, and `run` work for named Tier 2 fixtures (`tier2-vite-react`, `tier2-express`, and `tier2-typescript-cli`).
 - `[ ]` `uninstall`, `update`, and `pack` pass their focused Tier 2 mutation fixtures.
-- `[ ]` `ci` rejects manifest/lockfile drift without registry requests or tree mutation.
-- `[ ]` npm and rnpm produce equivalent trees, links, modes, and lockfiles for supported fixtures.
-- `[ ]` Lifecycle scripts expose the required environment with credentials scrubbed and terminate cleanly on interruption.
-- `[ ]` Optional native dependency build failure does not fail the parent install.
-- `[ ]` Bundled dependencies are retained, marked `inBundle`, and do not trigger registry requests.
-- `[ ]` Registry dependencies skip `prepare`; dependency lifecycle scripts run bottom-up.
-- `[ ]` Windows shim arguments are safely escaped and Unix CRLF shebangs execute correctly.
-- `[ ]` Pruning junctions removes only the reparse point and never deletes the linked target.
-- `[ ]` Windows non-admin installs use junctions and `.cmd`/`.ps1` shims successfully.
-- `[ ]` Windows NTFS and Unix filesystem cases pass their respective contracts.
+- `[x]` `ci` rejects manifest/lockfile drift without registry requests or tree mutation.
+- `[x]` npm and rnpm produce equivalent trees, links, modes, and lockfiles for supported fixtures.
+- `[x]` Lifecycle scripts expose the required environment with credentials scrubbed and terminate cleanly on interruption.
+- `[x]` Optional native dependency build failure does not fail the parent install.
+- `[x]` Bundled dependencies are retained, marked `inBundle`, and do not trigger registry requests.
+- `[x]` Registry dependencies skip `prepare`; dependency lifecycle scripts run bottom-up.
+- `[x]` Windows shim arguments are safely escaped and Unix CRLF shebangs execute correctly.
+- `[x]` Pruning junctions removes only the reparse point and never deletes the linked target.
+- `[x]` Windows non-admin installs use junctions and `.cmd`/`.ps1` shims successfully.
+- `[x]` Windows NTFS and Unix filesystem cases pass their respective contracts.
 
 ### Gate D: optimization is measurable
 

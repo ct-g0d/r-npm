@@ -1,0 +1,32 @@
+{
+  "_id": "mock-cli-helper",
+  "name": "mock-cli-helper",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "mock-cli-helper",
+      "version": "1.0.0",
+      "description": "Mock helper with executable binary and lifecycle scripts",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "bin": {
+        "cli-helper": "bin/helper.js"
+      },
+      "scripts": {
+        "preinstall": "node -e \"console.log('mock-cli-helper preinstall running')\"",
+        "postinstall": "node -e \"console.log('mock-cli-helper postinstall running')\""
+      },
+      "hasInstallScript": true,
+      "dist": {
+        "shasum": "2eb10cbbcd6460c67fe3496d0da2794517913555",
+        "integrity": "sha512-32CXi3qAa0vJ+ktl7NVvEk8qpctDzU19K+uY5RM3hOfis8gj7zaDErvu198ySz4W9pgUIc6rJmQCI9pVqeohqQ==",
+        "tarball": "http://127.0.0.1:4873/mock-cli-helper/-/mock-cli-helper-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

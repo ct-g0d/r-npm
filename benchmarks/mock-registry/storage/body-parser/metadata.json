@@ -1,0 +1,28 @@
+{
+  "_id": "body-parser",
+  "name": "body-parser",
+  "dist-tags": {
+    "latest": "1.20.2"
+  },
+  "versions": {
+    "1.20.2": {
+      "name": "body-parser",
+      "version": "1.20.2",
+      "description": "Node.js body parsing middleware mock",
+      "main": "index.js",
+      "dependencies": {
+        "bytes": "^3.1.2",
+        "raw-body": "^2.5.2"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "0d2d3d16562ec513719151fc5ff9eea3fb935b77",
+        "integrity": "sha512-QRLT8I4CcfYjwMpuSL/kTh38o8D6SfYABsd922X32egL3ShLH2UTxiaDZbc98gGVENPsxhR5PSPsFM/PZo1+1g==",
+        "tarball": "http://127.0.0.1:4873/body-parser/-/body-parser-1.20.2.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

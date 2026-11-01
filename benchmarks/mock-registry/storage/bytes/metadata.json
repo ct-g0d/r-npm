@@ -1,0 +1,25 @@
+{
+  "_id": "bytes",
+  "name": "bytes",
+  "dist-tags": {
+    "latest": "3.1.2"
+  },
+  "versions": {
+    "3.1.2": {
+      "name": "bytes",
+      "version": "3.1.2",
+      "description": "Utility to parse a string bytes to bytes and vice-versa mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "964ff9b523efb81fa6de88c5ca1d94ef1e2d0dad",
+        "integrity": "sha512-AUTGPPcj0ER98LyuzTVpAH45Ee97+d1w+U4SWc9Nc/MxGmm/TgTj6EChWNVRNLo0RoAQi9LvWDvob1ICdXPKYQ==",
+        "tarball": "http://127.0.0.1:4873/bytes/-/bytes-3.1.2.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

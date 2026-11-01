@@ -1,0 +1,25 @@
+{
+  "_id": "debug",
+  "name": "debug",
+  "dist-tags": {
+    "latest": "4.3.4"
+  },
+  "versions": {
+    "4.3.4": {
+      "name": "debug",
+      "version": "4.3.4",
+      "description": "Small debugging utility mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "3a64682df9b03a77166ff0f47dbba3823ebf683d",
+        "integrity": "sha512-B6rzgwS/4v6eV7SqrW+XIqPLMQmHTfE6mfDtl5URTAseDnK99bh8CEmI5d1Mm3OOsdn/jqsoJMtr1gaDCgbcVA==",
+        "tarball": "http://127.0.0.1:4873/debug/-/debug-4.3.4.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

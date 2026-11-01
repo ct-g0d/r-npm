@@ -1,0 +1,27 @@
+{
+  "_id": "raw-body",
+  "name": "raw-body",
+  "dist-tags": {
+    "latest": "2.5.2"
+  },
+  "versions": {
+    "2.5.2": {
+      "name": "raw-body",
+      "version": "2.5.2",
+      "description": "Get and validate the raw body of a readable stream mock",
+      "main": "index.js",
+      "dependencies": {
+        "bytes": "^3.1.2"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "0b8ce4b78b8a11338f2aa9c6e6b807bf457ccc00",
+        "integrity": "sha512-jTJ3ILCpV6SRwPHUT1uRi1lYNO5vjhXuw3J6vhwncVwcJNBmuR7/V9z6kNvsBFYWzFJBzvDKCvfkLk/nDictrg==",
+        "tarball": "http://127.0.0.1:4873/raw-body/-/raw-body-2.5.2.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}
