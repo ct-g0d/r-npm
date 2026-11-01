@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "1.0.0",
+  "inventory_date": "2026-11-01T19:00:00Z",
+  "machine": {
+    "hostname": "BENCHMARK-WIN11",
+    "os": {
+      "family": "windows",
+      "caption": "Microsoft Windows 11 Pro",
+      "version": "10.0.26300",
+      "build": 26300,
+      "architecture": "x86_64",
+      "kernel": "Windows NT 10.0",
+      "code_page": "UTF-8 (65001)",
+      "developer_mode": false,
+      "admin_privileges": false
+    },
+    "cpu": {
+      "model": "Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz",
+      "architecture": "Coffee Lake",
+      "physical_cores": 6,
+      "logical_processors": 12,
+      "base_clock_mhz": 2200,
+      "max_turbo_mhz": 4100,
+      "l1_cache_kb": 384,
+      "l2_cache_kb": 1536,
+      "l3_cache_kb": 9216,
+      "features": ["mmx", "sse", "sse2", "sse3", "ssse3", "sse4_1", "sse4_2", "avx", "avx2", "fma", "aes"]
+    },
+    "memory": {
+      "total_bytes": 34359738368,
+      "total_gb": 32,
+      "available_bytes": 11811160064,
+      "available_gb": 11,
+      "type": "DDR4",
+      "speed_mhz": 2666,
+      "channels": 2
+    },
+    "storage": [
+      {
+        "drive": "D:",
+        "filesystem": "NTFS",
+        "total_bytes": 1000204886016,
+        "free_bytes": 691484098560,
+        "free_gb": 644,
+        "sector_size_bytes": 4096,
+        "features": {
+          "junctions": true,
+          "symlinks_unprivileged": false,
+          "case_sensitive": false,
+          "extended_paths": true,
+          "file_locking": "mandatory_and_opportunistic"
+        }
+      }
+    ]
+  },
+  "toolchains": {
+    "rust": {
+      "rustc": "1.99.1",
+      "cargo": "1.99.1",
+      "commit": "58cf8f9c3 2026-10-13",
+      "target_triple": "x86_64-pc-windows-msvc",
+      "edition": "2024",
+      "msvc_version": "14.40"
+    },
+    "node": {
+      "version": "v24.21.0",
+      "v8_version": "13.x",
+      "arch": "x64",
+      "platform": "win32"
+    },
+    "npm": {
+      "version": "11.19.0",
+      "lockfile_version": 3
+    }
+  },
+  "shells": {
+    "cmd": {
+      "path": "C:\\Windows\\System32\\cmd.exe",
+      "version": "10.0.26300"
+    },
+    "powershell": {
+      "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "version": "5.1.26300",
+      "execution_policy": "Restricted"
+    }
+  },
+  "network": {
+    "mock_registry_url": "http://127.0.0.1:4873",
+    "mock_registry_latency_ms": 0.2,
+    "public_registry_url": "https://registry.npmjs.org",
+    "dns_servers": ["127.0.0.1", "1.1.1.1"]
+  },
+  "antivirus": {
+    "provider": "Windows Defender",
+    "real_time_protection": true,
+    "monitored_impact": "Transient EBUSY/EPERM on file deletion/rename requiring retry with backoff"
+  },
+  "measurement_collector": {
+    "primary": "Windows Job Object",
+    "accounting_fields": [
+      "TotalUserTime",
+      "TotalKernelTime",
+      "PeakWorkingSetSize",
+      "PeakPagefileUsage",
+      "ReadOperationCount",
+      "WriteOperationCount",
+      "ReadTransferCount",
+      "WriteTransferCount"
+    ],
+    "high_resolution_clock": "QueryPerformanceCounter",
+    "os_cache_purged_default": false
+  }
+}

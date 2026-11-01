@@ -22,8 +22,8 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 ### Current status
 
 - `[x]` Planning and review passes 1-3 complete.
-- `[ ]` Phase 0 - environment inventory and workspace skeleton.
-- `[ ]` Phase 1 - npm source map and frozen contracts.
+- `[x]` Phase 0 - environment inventory and workspace skeleton.
+- `[~]` Phase 1 - npm source map and frozen contracts.
 - `[ ]` Phase 2 - differential harness and npm baselines.
 - `[ ]` Phase 3 - minimal Rust install vertical slice.
 - `[ ]` Phase 4 - correctness expansion and command workflows.
@@ -34,6 +34,7 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 
 | Date | Status | Change | Evidence |
 |---|---|---|---|
+| 2026-11-01 | `[x]` | Delivered Phase 0 and Phase 1 documentation and frozen specifications: environment inventory, baseline machine JSON, npm source map, compatibility contract, resolver contract, cache contract, lockfile contract, lifecycle contract, and platform filesystem contract. | `docs/` and `benchmarks/baseline-machine.json` |
 | 2026-10-31 | `[x]` | Initial roadmap created; review pass assigned to AGY 1, AGY 2, and AGY 3. | This file and delegated review threads |
 | 2026-10-31 | `[x]` | Added semver, aliases, overrides, lockfile migration, cache locking, tar safety, platform filesystem, process-tree metrics, fixture tiers, and quantitative gates from pass 1. | This file |
 | 2026-10-31 | `[x]` | Pass 2 added week-by-week milestones, exact cache states, statistical rules, security/auth edge cases, and tickable phase deliverables. | This file and AGY 1-3 review threads |
@@ -173,9 +174,9 @@ Record:
 
 Deliverables:
 
-- `[ ]` `docs/environment.md`
-- `[ ]` `benchmarks/baseline-machine.json`
-- `[ ]` a clean Cargo workspace skeleton
+- `[x]` `docs/environment.md`
+- `[x]` `benchmarks/baseline-machine.json`
+- `[x]` a clean Cargo workspace skeleton
 
 ## Phase 1: map npm before rewriting it
 
@@ -211,13 +212,13 @@ For each area, document:
 
 Deliverables:
 
-- `[ ]` `docs/npm-source-map.md`
-- `[ ]` `docs/compatibility-contract.md`
-- `[ ]` `docs/resolver-contract.md`
-- `[ ]` `docs/cache-contract.md`
-- `[ ]` `docs/lockfile-contract.md`
-- `[ ]` `docs/lifecycle-contract.md`
-- `[ ]` `docs/platform-fs-contract.md`
+- `[x]` `docs/npm-source-map.md`
+- `[x]` `docs/compatibility-contract.md`
+- `[x]` `docs/resolver-contract.md`
+- `[x]` `docs/cache-contract.md`
+- `[x]` `docs/lockfile-contract.md`
+- `[x]` `docs/lifecycle-contract.md`
+- `[x]` `docs/platform-fs-contract.md`
 - `[ ]` `tests/fixtures/source-map/`
 
 ### Architecture-blocking compatibility decisions
