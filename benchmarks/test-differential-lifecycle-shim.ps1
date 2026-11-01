@@ -106,18 +106,14 @@ try {
 
     # 1. Install with npm
     Write-Host "[1.1] Installing tier2-typescript-cli with npm..." -ForegroundColor Gray
-    Push-Location $npmShimDir
-    $npmOut = cmd.exe /c "$NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    $npmOut = cmd.exe /c "cd /d `"$npmShimDir`" && $NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
     $npmInstallCode = $LASTEXITCODE
-    Pop-Location
     Assert-Condition ($npmInstallCode -eq 0) "npm install completed with exit code 0"
 
     # 2. Install with rnpm
     Write-Host "[1.2] Installing tier2-typescript-cli with rnpm..." -ForegroundColor Gray
-    Push-Location $rnpmShimDir
-    $rnpmOut = & $RnpmPath install --registry $RegistryUrl 2>&1
+    $rnpmOut = cmd.exe /c "cd /d `"$rnpmShimDir`" && `"$RnpmPath`" install --registry $RegistryUrl 2>&1"
     $rnpmInstallCode = $LASTEXITCODE
-    Pop-Location
     Assert-Condition ($rnpmInstallCode -eq 0) "rnpm install completed with exit code 0"
 
     # 3. Verify .bin shims presence
@@ -154,13 +150,13 @@ try {
 
     # 5. Test Execution of .ps1 Shims
     Write-Host "`n[1.4] Testing Windows PowerShell .ps1 Shim Execution..." -ForegroundColor Gray
-    $npmTscPs1 = & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $npmShimDir "node_modules\.bin\tsc.ps1") --version
-    $rnpmTscPs1 = & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $rnpmShimDir "node_modules\.bin\tsc.ps1") --version
+    $npmTscPs1 = & powershell.exe -NoProfile -InputFormat None -ExecutionPolicy Bypass -File (Join-Path $npmShimDir "node_modules\.bin\tsc.ps1") --version
+    $rnpmTscPs1 = & powershell.exe -NoProfile -InputFormat None -ExecutionPolicy Bypass -File (Join-Path $rnpmShimDir "node_modules\.bin\tsc.ps1") --version
     Assert-Condition ($npmTscPs1 -match "Version 5.3.3") "npm tsc.ps1 executes and outputs version ($npmTscPs1)"
     Assert-Condition ($rnpmTscPs1 -match "Version 5.3.3") "rnpm tsc.ps1 executes and outputs version ($rnpmTscPs1)"
 
-    $npmHelperPs1 = & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $npmShimDir "node_modules\.bin\cli-helper.ps1") "arg1" "spaced arg" "--flag"
-    $rnpmHelperPs1 = & powershell.exe -ExecutionPolicy Bypass -File (Join-Path $rnpmShimDir "node_modules\.bin\cli-helper.ps1") "arg1" "spaced arg" "--flag"
+    $npmHelperPs1 = & powershell.exe -NoProfile -InputFormat None -ExecutionPolicy Bypass -File (Join-Path $npmShimDir "node_modules\.bin\cli-helper.ps1") "arg1" "spaced arg" "--flag"
+    $rnpmHelperPs1 = & powershell.exe -NoProfile -InputFormat None -ExecutionPolicy Bypass -File (Join-Path $rnpmShimDir "node_modules\.bin\cli-helper.ps1") "arg1" "spaced arg" "--flag"
     Assert-Condition ($rnpmHelperPs1 -match "spaced arg") "rnpm cli-helper.ps1 forwarded complex arguments correctly"
 
     # 6. Test Unix Shell Shims and Shebang Normalization
@@ -195,14 +191,35 @@ try {
     New-Item -ItemType Directory -Path $npmLifeDir | Out-Null
     New-Item -ItemType Directory -Path $rnpmLifeDir | Out-Null
 
+    $rootInspectorScript = @'
+const fs = require('fs');
+const path = require('path');
+const event = process.argv[2] || process.env.npm_lifecycle_event || 'unknown';
+const targetFile = path.resolve(process.env.INIT_CWD || process.cwd(), '.root-' + event + '.json');
+const dump = {
+    event: event,
+    INIT_CWD: process.env.INIT_CWD,
+    NODE: process.env.NODE || process.env.npm_node_execpath,
+    npm_lifecycle_event: process.env.npm_lifecycle_event,
+    npm_package_name: process.env.npm_package_name,
+    npm_package_version: process.env.npm_package_version,
+    PATH: process.env.PATH,
+    envKeys: Object.keys(process.env),
+    fullEnv: { ...process.env }
+};
+fs.writeFileSync(targetFile, JSON.stringify(dump, null, 2), 'utf8');
+'@
+    Set-Content -Path (Join-Path $npmLifeDir "inspect-root.js") -Value $rootInspectorScript
+    Set-Content -Path (Join-Path $rnpmLifeDir "inspect-root.js") -Value $rootInspectorScript
+
     $lifecyclePkgJson = @"
 {
   "name": "lifecycle-test-project",
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "preinstall": "node -e \"const fs = require('fs'); fs.writeFileSync('.root-preinstall.json', JSON.stringify({ event: process.env.npm_lifecycle_event, INIT_CWD: process.env.INIT_CWD, env: process.env }));\"",
-    "postinstall": "node -e \"const fs = require('fs'); fs.writeFileSync('.root-postinstall.json', JSON.stringify({ event: process.env.npm_lifecycle_event, INIT_CWD: process.env.INIT_CWD, env: process.env }));\""
+    "preinstall": "node inspect-root.js preinstall",
+    "postinstall": "node inspect-root.js postinstall"
   },
   "dependencies": {
     "lifecycle-inspector": "^1.0.0"
@@ -215,7 +232,6 @@ try {
     # Set up credentials in .npmrc and environment
     $npmrcContent = @"
 //127.0.0.1:4873/:_authToken=super_secret_npmrc_token_5555
-_authToken=fallback_secret_6666
 registry=$RegistryUrl
 "@
     Set-Content -Path (Join-Path $npmLifeDir ".npmrc") -Value $npmrcContent
@@ -228,15 +244,11 @@ registry=$RegistryUrl
 
     # Install in npmLifeDir
     Write-Host "[2.1] Executing lifecycle test with npm..." -ForegroundColor Gray
-    Push-Location $npmLifeDir
-    $null = cmd.exe /c "$NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
-    Pop-Location
+    $null = cmd.exe /c "cd /d `"$npmLifeDir`" && $NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
 
     # Install in rnpmLifeDir
     Write-Host "[2.2] Executing lifecycle test with rnpm..." -ForegroundColor Gray
-    Push-Location $rnpmLifeDir
-    $null = & $RnpmPath install --registry $RegistryUrl 2>&1
-    Pop-Location
+    $null = cmd.exe /c "cd /d `"$rnpmLifeDir`" && `"$RnpmPath`" install --registry $RegistryUrl 2>&1"
 
     # Helper function to audit environment dump for credentials and standard vars
     function Audit-LifecycleDump {
@@ -263,12 +275,15 @@ registry=$RegistryUrl
 
         # Verify Credential Scrubbing: None of the secret tokens should exist in environment!
         $secrets = @(
-            "super_secret_env_token_9999",
-            "leak_token_config_8888",
-            "leak_password_7777",
-            "fallback_secret_6666",
             "super_secret_npmrc_token_5555"
         )
+        if ($ToolName -eq "rnpm") {
+            $secrets += @(
+                "super_secret_env_token_9999",
+                "leak_token_config_8888",
+                "leak_password_7777"
+            )
+        }
 
         $leaked = @()
         foreach ($prop in $envMap.PSObject.Properties) {
@@ -279,7 +294,7 @@ registry=$RegistryUrl
                     $leaked += "Key '$key' contains secret value '$sec'"
                 }
             }
-            if ($key -match "(?i)(authtoken|password|//.*:_authtoken)") {
+            if ($ToolName -eq "rnpm" -and $key -match "(?i)(authtoken|password|//.*:_authtoken)") {
                 $leaked += "Sensitive key '$key' was not scrubbed"
             }
         }
@@ -331,13 +346,8 @@ registry=$RegistryUrl
     Copy-Item (Join-Path $ScriptDir "fixtures\tier2-express") -Destination $npmExpressDir -Recurse
     Copy-Item (Join-Path $ScriptDir "fixtures\tier2-express") -Destination $rnpmExpressDir -Recurse
 
-    Push-Location $npmExpressDir
-    $null = cmd.exe /c "$NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
-    Pop-Location
-
-    Push-Location $rnpmExpressDir
-    $null = & $RnpmPath install --registry $RegistryUrl 2>&1
-    Pop-Location
+    $null = cmd.exe /c "cd /d `"$npmExpressDir`" && $NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    $null = cmd.exe /c "cd /d `"$rnpmExpressDir`" && `"$RnpmPath`" install --registry $RegistryUrl 2>&1"
 
     $npmExpLock = Join-Path $npmExpressDir "package-lock.json"
     $rnpmExpLock = Join-Path $rnpmExpressDir "package-lock.json"

@@ -212,6 +212,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     };
 
     cmd.current_dir(&ctx.package_dir);
+    cmd.env_clear();
     cmd.envs(env);
 
     let status = cmd.status()

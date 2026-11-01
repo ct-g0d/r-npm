@@ -11,7 +11,10 @@ use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_fs::tarball::extract_tar_gz;
-use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
+use rnpm_lifecycle::{
+    execute_lifecycle_script, execute_topological, LifecycleContext, LifecycleOptions,
+    LifecyclePackageNode, PackageSource,
+};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
@@ -162,6 +165,8 @@ impl Installer {
             }
         }
 
+        let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
+
         for (pkg_name, node) in &resolved_tree {
             let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
             if was_hit {
@@ -188,7 +193,7 @@ impl Installer {
 
             packages_installed += 1;
 
-            // Generate shims if package declares bin
+            // Generate shims if package declares bin and collect lifecycle node
             let pkg_manifest_path = dest_dir.join("package.json");
             let mut has_install_script = false;
 
@@ -202,23 +207,18 @@ impl Installer {
                         let _ = create_shims(&bin_dir, &bin_name, &target_rel);
                     }
 
-                    // Execute lifecycle scripts if present
-                    if !self.options.ignore_scripts {
-                        for event in &["preinstall", "install", "postinstall"] {
-                            if let Some(cmd) = pkg_manifest.scripts.get(*event) {
-                                has_install_script = true;
-                                let mut ctx = LifecycleContext::new(
-                                    &self.options.project_dir,
-                                    &dest_dir,
-                                    pkg_name,
-                                    *event,
-                                    cmd,
-                                );
-                                ctx.package_version = pkg_manifest.version.clone();
-                                let _ = execute_lifecycle_script(&ctx);
-                            }
-                        }
-                    }
+                    has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                        || pkg_manifest.scripts.contains_key("install")
+                        || pkg_manifest.scripts.contains_key("postinstall");
+
+                    lifecycle_nodes.push(LifecyclePackageNode {
+                        package_path: format!("node_modules/{pkg_name}"),
+                        disk_path: dest_dir.clone(),
+                        manifest: pkg_manifest,
+                        source: PackageSource::Registry,
+                        dependencies: node.dependencies.keys().cloned().collect(),
+                        optional: false,
+                    });
                 }
             }
 
@@ -242,7 +242,18 @@ impl Installer {
             lockfile.insert_package(&lockfile_key, lock_entry);
         }
 
-        // 3. Write deterministic package-lock.json
+        // 3. Execute lifecycle scripts bottom-up followed by root hooks
+        if !self.options.ignore_scripts {
+            let lifecycle_opts = LifecycleOptions {
+                root_dir: self.options.project_dir.clone(),
+                init_cwd: self.options.project_dir.clone(),
+                ignore_scripts: false,
+                capture_output: false,
+            };
+            let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
+        }
+
+        // 4. Write deterministic package-lock.json
         let lockfile_path = self.options.project_dir.join("package-lock.json");
         lockfile.save_to_file(&lockfile_path)
             .context("Failed to save package-lock.json")?;
