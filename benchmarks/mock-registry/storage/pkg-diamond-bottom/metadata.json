@@ -1,0 +1,22 @@
+{
+  "_id": "pkg-diamond-bottom",
+  "name": "pkg-diamond-bottom",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-diamond-bottom",
+      "version": "1.0.0",
+      "description": "Synthetic diamond bottom dependency package",
+      "main": "index.js",
+      "dependencies": {},
+      "dist": {
+        "shasum": "e7bdf8d94fcd67cdb638aebfd24bf1526e36d636",
+        "integrity": "sha512-2q+or9zKxypjeA6UFzXh43/H0FihhqrCj3jiM1uwlYs08jwSO+5WVtkuWB2md3oTGJ0461Vyh0WfDP8Ky+IILg==",
+        "tarball": "http://127.0.0.1:4873/pkg-diamond-bottom/-/pkg-diamond-bottom-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

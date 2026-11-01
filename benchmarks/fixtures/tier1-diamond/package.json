@@ -1,0 +1,10 @@
+{
+  "name": "tier1-diamond",
+  "version": "1.0.0",
+  "description": "Synthetic diamond dependency fixture",
+  "private": true,
+  "dependencies": {
+    "pkg-diamond-left": "^1.0.0",
+    "pkg-diamond-right": "^1.0.0"
+  }
+}

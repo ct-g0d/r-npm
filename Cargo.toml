@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rnpm-core",
+    "crates/rnpm-config",
+    "crates/rnpm-registry",
+    "crates/rnpm-cache",
+    "crates/rnpm-lockfile",
+    "crates/rnpm-fs",
+    "crates/rnpm-install",
+    "crates/rnpm-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["npm-rust contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sha2 = "0.10"
+sha1 = "0.10"
+data-encoding = "2.6"
+flate2 = "1.0"
+tar = "0.4"
+tempfile = "3.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+url = "2.5"
+path-clean = "1.0"
+fs4 = { version = "0.12", features = ["tokio"] }
+
+# Internal workspace crates
+rnpm-core = { path = "crates/rnpm-core" }
+rnpm-config = { path = "crates/rnpm-config" }
+rnpm-registry = { path = "crates/rnpm-registry" }
+rnpm-cache = { path = "crates/rnpm-cache" }
+rnpm-lockfile = { path = "crates/rnpm-lockfile" }
+rnpm-fs = { path = "crates/rnpm-fs" }
+rnpm-install = { path = "crates/rnpm-install" }

@@ -1,0 +1,22 @@
+{
+  "_id": "pkg-single-a",
+  "name": "pkg-single-a",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-single-a",
+      "version": "1.0.0",
+      "description": "Synthetic single dependency package for tier1 benchmarks",
+      "main": "index.js",
+      "dependencies": {},
+      "dist": {
+        "shasum": "42045dd4e00c6a18f7bf97eda94054f728ec0cc2",
+        "integrity": "sha512-Ipd3vqcguOCxjbjOOrRNO4JYjti1vNdsGMF0PTUCFZRts+5HcfjKfSUwRFUYwkqH8k0rZTaWYe8CfzZ0aE3olw==",
+        "tarball": "http://127.0.0.1:4873/pkg-single-a/-/pkg-single-a-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

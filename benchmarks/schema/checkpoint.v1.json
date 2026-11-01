@@ -1,0 +1,333 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/npm-rust/npm-rust/main/benchmarks/schema/checkpoint.v1.json",
+  "title": "Gate F Benchmark Checkpoint Artifact",
+  "description": "Standardized machine-readable benchmark checkpoint schema for npm and rnpm comparative performance and correctness evaluations.",
+  "type": "object",
+  "required": [
+    "version",
+    "metadata",
+    "scenario",
+    "correctness",
+    "metrics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "checkpoint.v1"
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "timestamp",
+        "git",
+        "tool",
+        "node_version",
+        "os",
+        "cpu",
+        "ram_bytes",
+        "antivirus_state",
+        "os_cache_purged"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp of when the benchmark was executed."
+        },
+        "git": {
+          "type": "object",
+          "required": ["revision", "dirty"],
+          "additionalProperties": false,
+          "properties": {
+            "revision": { "type": "string" },
+            "dirty": { "type": "boolean" }
+          }
+        },
+        "tool": {
+          "type": "object",
+          "required": ["name", "version"],
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string", "enum": ["npm", "rnpm"] },
+            "version": { "type": "string" },
+            "commit": { "type": ["string", "null"] }
+          }
+        },
+        "node_version": {
+          "type": "string",
+          "description": "Node.js runtime version, e.g. v24.21.0"
+        },
+        "rust_version": {
+          "type": ["string", "null"],
+          "description": "Rust compiler version if applicable"
+        },
+        "cargo_profile": {
+          "type": ["string", "null"],
+          "enum": ["dev", "release", null]
+        },
+        "target_triple": {
+          "type": ["string", "null"]
+        },
+        "os": {
+          "type": "string",
+          "description": "Operating system and kernel/build version"
+        },
+        "cpu": {
+          "type": "string",
+          "description": "CPU model name and core counts"
+        },
+        "ram_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total physical memory in bytes"
+        },
+        "antivirus_state": {
+          "type": "string",
+          "description": "Active antivirus or Windows Defender real-time scanning status"
+        },
+        "os_cache_purged": {
+          "type": "boolean",
+          "description": "Whether the OS file system standby cache was purged before testing"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "required": [
+        "fixture",
+        "tier",
+        "cache_state",
+        "command",
+        "registry_kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fixture": {
+          "type": "string",
+          "description": "Fixture name, e.g., tier1-single-dep, tier1-diamond"
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["tier1", "tier2", "tier3"]
+        },
+        "cache_state": {
+          "type": "string",
+          "enum": [
+            "pristine-cold",
+            "cold-ci",
+            "lockfile-only-ci",
+            "warm-install",
+            "hot-noop"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "enum": ["install", "ci"]
+        },
+        "registry_kind": {
+          "type": "string",
+          "enum": ["mock-loopback", "public"]
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "required": [
+        "exit_code",
+        "normalized_tree_match",
+        "lockfile_match",
+        "digest_mismatches",
+        "installed_package_tree_digest",
+        "lockfile_digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "exit_code": {
+          "type": "integer"
+        },
+        "normalized_tree_match": {
+          "type": "boolean"
+        },
+        "lockfile_match": {
+          "type": "boolean"
+        },
+        "digest_mismatches": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "installed_package_tree_digest": {
+          "type": ["string", "null"]
+        },
+        "lockfile_digest": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "trials_raw",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "trials_raw": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "trial_index",
+              "wall_time_ms",
+              "user_cpu_ms",
+              "system_cpu_ms",
+              "peak_working_set_bytes",
+              "peak_commit_charge_bytes",
+              "disk_read_bytes",
+              "disk_write_bytes",
+              "disk_read_ops",
+              "disk_write_ops",
+              "network_bytes_read",
+              "network_bytes_written",
+              "network_requests",
+              "exit_code"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "trial_index": { "type": "integer", "minimum": 0 },
+              "wall_time_ms": { "type": "number", "minimum": 0 },
+              "user_cpu_ms": { "type": "number", "minimum": 0 },
+              "system_cpu_ms": { "type": "number", "minimum": 0 },
+              "peak_working_set_bytes": { "type": "integer", "minimum": 0 },
+              "peak_commit_charge_bytes": { "type": "integer", "minimum": 0 },
+              "disk_read_bytes": { "type": "integer", "minimum": 0 },
+              "disk_write_bytes": { "type": "integer", "minimum": 0 },
+              "disk_read_ops": { "type": "integer", "minimum": 0 },
+              "disk_write_ops": { "type": "integer", "minimum": 0 },
+              "network_bytes_read": { "type": "integer", "minimum": 0 },
+              "network_bytes_written": { "type": "integer", "minimum": 0 },
+              "network_requests": { "type": "integer", "minimum": 0 },
+              "exit_code": { "type": "integer" }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "required": [
+            "wall_time",
+            "user_cpu",
+            "system_cpu",
+            "peak_working_set",
+            "peak_commit_charge",
+            "disk_write_bytes",
+            "disk_read_bytes",
+            "write_amplification",
+            "uncompressed_package_bytes",
+            "outliers_replaced"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "wall_time": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr", "mean", "rsd_pct"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 },
+                "mean": { "type": "number", "minimum": 0 },
+                "rsd_pct": { "type": "number", "minimum": 0 }
+              }
+            },
+            "user_cpu": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "system_cpu": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "peak_working_set": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "peak_commit_charge": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "disk_write_bytes": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "disk_read_bytes": {
+              "type": "object",
+              "required": ["median", "min", "max", "iqr"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "min": { "type": "number", "minimum": 0 },
+                "max": { "type": "number", "minimum": 0 },
+                "iqr": { "type": "number", "minimum": 0 }
+              }
+            },
+            "write_amplification": {
+              "type": "object",
+              "required": ["median", "ratio"],
+              "additionalProperties": false,
+              "properties": {
+                "median": { "type": "number", "minimum": 0 },
+                "ratio": { "type": "number", "minimum": 0 }
+              }
+            },
+            "uncompressed_package_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outliers_replaced": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

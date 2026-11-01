@@ -1,0 +1,166 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use serde::{Deserialize, Serialize};
+use crate::error::ManifestError;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PackageBin {
+    Single(String),
+    Map(BTreeMap<String, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BundledDependencies {
+    Boolean(bool),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PackageWorkspaces {
+    List(Vec<String>),
+    Config { packages: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PeerDependencyMeta {
+    #[serde(default)]
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub main: Option<String>,
+
+    #[serde(default)]
+    pub bin: Option<PackageBin>,
+
+    #[serde(default)]
+    pub scripts: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub dev_dependencies: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub peer_dependencies: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
+
+    #[serde(default)]
+    pub optional_dependencies: BTreeMap<String, String>,
+
+    #[serde(default, alias = "bundleDependencies")]
+    pub bundled_dependencies: Option<BundledDependencies>,
+
+    #[serde(default)]
+    pub workspaces: Option<PackageWorkspaces>,
+
+    #[serde(default)]
+    pub os: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub cpu: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub engines: BTreeMap<String, String>,
+
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Manifest {
+    /// Parse manifest from raw bytes, with tolerance for UTF-8 BOM.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, ManifestError> {
+        // Strip UTF-8 BOM if present (0xEF, 0xBB, 0xBF)
+        let clean_bytes = if bytes.starts_with(b"\xEF\xBB\xBF") {
+            &bytes[3..]
+        } else {
+            bytes
+        };
+
+        serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
+            message: err.to_string(),
+            line: err.line(),
+            column: err.column(),
+        })
+    }
+
+    /// Parse manifest from string, with tolerance for UTF-8 BOM.
+    pub fn from_str(s: &str) -> Result<Self, ManifestError> {
+        let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
+        serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+            message: err.to_string(),
+            line: err.line(),
+            column: err.column(),
+        })
+    }
+
+    /// Read and parse a package.json file from disk.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|err| ManifestError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        Self::from_slice(&bytes)
+    }
+
+    /// Returns list of (binary_name, script_path) defined in manifest.
+    pub fn bin_entries(&self) -> Vec<(String, String)> {
+        match &self.bin {
+            None => Vec::new(),
+            Some(PackageBin::Single(script_path)) => {
+                // If package name is "@scope/foo", binary name is "foo"
+                let bin_name = self
+                    .name
+                    .as_deref()
+                    .map(|n| {
+                        if let Some(slash_idx) = n.find('/') {
+                            &n[slash_idx + 1..]
+                        } else {
+                            n
+                        }
+                    })
+                    .unwrap_or("app")
+                    .to_string();
+                vec![(bin_name, script_path.clone())]
+            }
+            Some(PackageBin::Map(map)) => {
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+        }
+    }
+
+    /// Returns a list of package names that are marked as bundled.
+    pub fn bundled_package_names(&self) -> Vec<String> {
+        match &self.bundled_dependencies {
+            None => Vec::new(),
+            Some(BundledDependencies::Boolean(true)) => {
+                // If true, all regular dependencies are bundled
+                self.dependencies.keys().cloned().collect()
+            }
+            Some(BundledDependencies::Boolean(false)) => Vec::new(),
+            Some(BundledDependencies::List(list)) => list.clone(),
+        }
+    }
+
+    /// Returns workspace patterns if configured.
+    pub fn workspace_patterns(&self) -> Vec<String> {
+        match &self.workspaces {
+            None => Vec::new(),
+            Some(PackageWorkspaces::List(patterns)) => patterns.clone(),
+            Some(PackageWorkspaces::Config { packages }) => packages.clone(),
+        }
+    }
+}

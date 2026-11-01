@@ -1,0 +1,24 @@
+{
+  "_id": "pkg-diamond-left",
+  "name": "pkg-diamond-left",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-diamond-left",
+      "version": "1.0.0",
+      "description": "Synthetic diamond left dependency package",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-diamond-bottom": "^1.0.0"
+      },
+      "dist": {
+        "shasum": "178c19f18c833107ceb9a604089bd919e1c9b45e",
+        "integrity": "sha512-q48QYtkdf4tycQDxQYbZ9hROsKdc9zHx+Gjb0zo2lRv1qa0Rr0DZRSwqsu/ImTopSmLO9m4K4vVfKuvn4r0SZg==",
+        "tarball": "http://127.0.0.1:4873/pkg-diamond-left/-/pkg-diamond-left-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

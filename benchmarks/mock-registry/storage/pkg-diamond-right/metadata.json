@@ -1,0 +1,24 @@
+{
+  "_id": "pkg-diamond-right",
+  "name": "pkg-diamond-right",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-diamond-right",
+      "version": "1.0.0",
+      "description": "Synthetic diamond right dependency package",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-diamond-bottom": "^1.0.0"
+      },
+      "dist": {
+        "shasum": "aeff6410ed2b860c7f942830aeb04abc089f5171",
+        "integrity": "sha512-Z2k20MTTMpG2EEE3GDx8SnsZkpjzMPyC5tDBjIAqG7oOhMYGNzpGwJeQfGTn3zgEVuYPRfjuIuimAY+vP+guSw==",
+        "tarball": "http://127.0.0.1:4873/pkg-diamond-right/-/pkg-diamond-right-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

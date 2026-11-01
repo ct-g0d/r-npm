@@ -1,0 +1,9 @@
+{
+  "name": "tier1-single-dep",
+  "version": "1.0.0",
+  "description": "Synthetic benchmark fixture with a single direct dependency",
+  "private": true,
+  "dependencies": {
+    "pkg-single-a": "^1.0.0"
+  }
+}

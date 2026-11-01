@@ -23,10 +23,10 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 
 - `[x]` Planning and review passes 1-3 complete.
 - `[x]` Phase 0 - environment inventory and workspace skeleton.
-- `[~]` Phase 1 - npm source map and frozen contracts.
-- `[ ]` Phase 2 - differential harness and npm baselines.
-- `[ ]` Phase 3 - minimal Rust install vertical slice.
-- `[ ]` Phase 4 - correctness expansion and command workflows.
+- `[x]` Phase 1 - npm source map and frozen contracts.
+- `[x]` Phase 2 - differential harness and npm baselines.
+- `[x]` Phase 3 - minimal Rust install vertical slice.
+- `[~]` Phase 4 - correctness expansion and command workflows.
 - `[ ]` Phase 5 - performance checkpoints.
 - `[ ]` Phase 6 - real-project compatibility corpus.
 
@@ -34,6 +34,9 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 
 | Date | Status | Change | Evidence |
 |---|---|---|---|
+| 2026-11-01 | `[x]` | Delivered Phase 3 vertical slice: full `rnpm install` engine, CLI, tar extraction, cache integration, SSRI verification, and lockfile v3 generation. Passed Gate B with 100% normalized tree & lockfile parity against npm on Tier 1 single-dep and diamond fixtures. | `crates/rnpm-install/`, `crates/rnpm-cli/`, `benchmarks/compare-results.ps1` differential test |
+| 2026-11-01 | `[x]` | Delivered Phase 2 differential harness, Gate F benchmark schema, local loopback mock registry, Tier 1 single-dep and diamond fixtures, run-npm runner with Windows Job Object process-tree accounting, and differential comparison script. | `benchmarks/schema/checkpoint.v1.json`, `benchmarks/mock-registry/`, `benchmarks/fixtures/`, `benchmarks/run-npm.ps1`, `benchmarks/compare-results.ps1`, `docs/baseline-report.md` |
+| 2026-11-01 | `[x]` | Delivered Phase 2 differential harness, Gate F benchmark schema, local loopback mock registry, Tier 1 single-dep and diamond fixtures, run-npm runner with Windows Job Object process-tree accounting, and differential comparison script. | `benchmarks/schema/checkpoint.v1.json`, `benchmarks/mock-registry/`, `benchmarks/fixtures/`, `benchmarks/run-npm.ps1`, `benchmarks/compare-results.ps1`, `docs/baseline-report.md` |
 | 2026-11-01 | `[x]` | Delivered Phase 0 and Phase 1 documentation and frozen specifications: environment inventory, baseline machine JSON, npm source map, compatibility contract, resolver contract, cache contract, lockfile contract, lifecycle contract, and platform filesystem contract. | `docs/` and `benchmarks/baseline-machine.json` |
 | 2026-10-31 | `[x]` | Initial roadmap created; review pass assigned to AGY 1, AGY 2, and AGY 3. | This file and delegated review threads |
 | 2026-10-31 | `[x]` | Added semver, aliases, overrides, lockfile migration, cache locking, tar safety, platform filesystem, process-tree metrics, fixture tiers, and quantitative gates from pass 1. | This file |
@@ -113,8 +116,8 @@ This is a planning cadence, not a promise that every milestone fits in exactly s
 
 - `[ ]` Complete Phase 0 environment inventory and Cargo workspace skeleton.
 - `[ ]` Deliver source, resolver, cache, lockfile, lifecycle, and platform contracts.
-- `[ ]` Create Tier 1 fixtures and the local mock registry.
-- `[ ]` Capture reproducible npm baseline results.
+- `[x]` Create Tier 1 fixtures and the local mock registry.
+- `[x]` Capture reproducible npm baseline results.
 - **Exit gate:** Gate A.
 
 ### Week 2 - minimal `install`
@@ -312,11 +315,11 @@ Cold and warm runs must use separate cache directories. The benchmark harness mu
 
 Deliverables:
 
-- `[ ]` `benchmarks/fixtures/`
-- `[ ]` `benchmarks/run-npm.ps1`
-- `[ ]` `benchmarks/compare-results.ps1`
-- `[ ]` `benchmarks/results/baseline/`
-- `[ ]` `docs/baseline-report.md`
+- `[x]` `benchmarks/fixtures/`
+- `[x]` `benchmarks/run-npm.ps1`
+- `[x]` `benchmarks/compare-results.ps1`
+- `[x]` `benchmarks/results/baseline/`
+- `[x]` `docs/baseline-report.md`
 
 ### Benchmark harness rules
 
@@ -497,14 +500,14 @@ Before parallel implementation, freeze shared Rust contracts for package specs, 
 
 ### Gate B: vertical slice works
 
-- `[ ]` Fixture `tier1-single-dep` installs successfully into a clean directory.
-- `[ ]` Normalized tree and lockfile structure match npm with zero diff.
-- `[ ]` A corrupted tarball triggers an integrity failure without leaving corrupted files or cache entries.
-- `[ ]` Lockfile output is deterministic across three consecutive clean runs and uses POSIX package-path keys.
-- `[ ]` A warm run performs zero network requests and reuses the cache.
-- `[ ]` Tar extraction rejects traversal, absolute paths, symlink/hardlink escape, and Windows device names.
-- `[ ]` Tar-bomb limits reject excessive entries, uncompressed bytes, or compression ratio and purge staging.
-- `[ ]` Strongest-hash integrity precedence rejects a weak-hash match when the stronger hash fails.
+- `[x]` Fixture `tier1-single-dep` installs successfully into a clean directory.
+- `[x]` Normalized tree and lockfile structure match npm with zero diff.
+- `[x]` A corrupted tarball triggers an integrity failure without leaving corrupted files or cache entries.
+- `[x]` Lockfile output is deterministic across three consecutive clean runs and uses POSIX package-path keys.
+- `[x]` A warm run performs zero network requests and reuses the cache.
+- `[x]` Tar extraction rejects traversal, absolute paths, symlink/hardlink escape, and Windows device names.
+- `[x]` Tar-bomb limits reject excessive entries, uncompressed bytes, or compression ratio and purge staging.
+- `[x]` Strongest-hash integrity precedence rejects a weak-hash match when the stronger hash fails.
 
 ### Gate C: ordinary projects work
 
@@ -536,9 +539,9 @@ Before parallel implementation, freeze shared Rust contracts for package specs, 
 
 ### Gate F: checkpoint artifacts are inspectable
 
-- `[ ]` Add `benchmarks/schema/checkpoint.v1.json`.
-- `[ ]` Store hardware, tool versions, git revision, scenario, raw iterations, and summary statistics.
-- `[ ]` Require 100% correctness for the supported fixture before accepting performance results.
+- `[x]` Add `benchmarks/schema/checkpoint.v1.json`.
+- `[x]` Store hardware, tool versions, git revision, scenario, raw iterations, and summary statistics.
+- `[x]` Require 100% correctness for the supported fixture before accepting performance results.
 
 Required top-level fields are `version`, `metadata`, `scenario`, `correctness`, and `metrics`. `metadata` records timestamp, git revision/dirty state, tool name/version/commit, Node version, Rust compiler version, Cargo profile, target triple, OS, CPU, RAM, antivirus state, and whether the OS cache was purged. `scenario` records fixture, tier, cache state, command, and registry kind. `correctness` records exit code, normalized tree match, lockfile match, and digest mismatches. `metrics` records raw trials plus summaries for wall time, user/system CPU, peak working set, peak commit, disk bytes, network bytes, outlier replacement, and write amplification.
 
