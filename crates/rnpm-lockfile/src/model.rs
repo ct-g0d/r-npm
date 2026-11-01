@@ -139,6 +139,12 @@ impl LockfileV3 {
         self.packages.get(&posix_key)
     }
 
+    /// Remove a package by path, normalizing the lookup key to POSIX forward slashes.
+    pub fn remove_package(&mut self, path: &str) -> Option<LockfilePackage> {
+        let posix_key = to_posix_path(path);
+        self.packages.remove(&posix_key)
+    }
+
     /// Access the root package `""`.
     pub fn root_package(&self) -> Option<&LockfilePackage> {
         self.packages.get("")

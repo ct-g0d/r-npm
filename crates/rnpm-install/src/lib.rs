@@ -51,6 +51,18 @@ pub struct InstallSummary {
     pub lockfile_path: PathBuf,
 }
 
+/// Result of an update run.
+#[derive(Debug, Clone)]
+pub struct UpdateSummary {
+    pub packages_updated: usize,
+    pub updated_packages: Vec<String>,
+    pub old_versions: HashMap<String, String>,
+    pub new_versions: HashMap<String, String>,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub lockfile_path: PathBuf,
+}
+
 /// Resolved node in dependency graph.
 #[derive(Debug, Clone)]
 pub struct ResolvedNode {
@@ -450,4 +462,287 @@ impl Installer {
 
         Ok((bytes, false))
     }
+
+    /// Helper to reify a single package node into node_modules and return lifecycle node and lockfile package.
+    async fn reify_package(
+        &self,
+        node: &ResolvedNode,
+        node_modules_dir: &std::path::Path,
+        bin_dir: &std::path::Path,
+    ) -> Result<(usize, usize, LockfilePackage, Option<LifecyclePackageNode>)> {
+        let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
+        let cache_hits = if was_hit { 1 } else { 0 };
+        let cache_misses = if was_hit { 0 } else { 1 };
+
+        let expected_integrity: Integrity = node.integrity.parse()
+            .map_err(|e| anyhow!("Invalid integrity string: {e}"))?;
+        expected_integrity.verify(&bytes)
+            .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
+
+        let dest_dir = node_modules_dir.join(&node.name);
+        if dest_dir.exists() {
+            let _ = std::fs::remove_dir_all(&dest_dir);
+        }
+        std::fs::create_dir_all(&dest_dir)?;
+
+        extract_tar_gz(Cursor::new(&bytes), &dest_dir, None)
+            .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
+
+        let pkg_manifest_path = dest_dir.join("package.json");
+        let mut has_install_script = false;
+        let mut lifecycle_node = None;
+
+        if pkg_manifest_path.exists() {
+            if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                    let target_rel = format!("{}/{script_rel}", node.name);
+                    let script_path = dest_dir.join(&script_rel);
+                    let _ = normalize_shebang(&script_path);
+                    let _ = create_shims(bin_dir, &bin_name, &target_rel);
+                }
+
+                has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                    || pkg_manifest.scripts.contains_key("install")
+                    || pkg_manifest.scripts.contains_key("postinstall");
+
+                lifecycle_node = Some(LifecyclePackageNode {
+                    package_path: format!("node_modules/{}", node.name),
+                    disk_path: dest_dir.clone(),
+                    manifest: pkg_manifest,
+                    source: PackageSource::Registry,
+                    dependencies: node.dependencies.keys().cloned().collect(),
+                    optional: false,
+                });
+            }
+        }
+
+        let mut lock_entry = LockfilePackage {
+            version: Some(node.version.clone()),
+            resolved: Some(node.resolved_url.clone()),
+            integrity: Some(node.integrity.clone()),
+            ..Default::default()
+        };
+
+        if has_install_script {
+            lock_entry.has_install_script = Some(true);
+        }
+
+        if !node.dependencies.is_empty() {
+            lock_entry.dependencies = Some(node.dependencies.clone());
+        }
+
+        Ok((cache_hits, cache_misses, lock_entry, lifecycle_node))
+    }
+
+    /// Run package update workflow.
+    /// If `targets` is non-empty, only update those specified packages.
+    /// Otherwise, update all top-level dependencies declared in `package.json`.
+    pub async fn update(&mut self, targets: &[String]) -> Result<UpdateSummary> {
+        let manifest_path = self.options.project_dir.join("package.json");
+        if !manifest_path.exists() {
+            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+        }
+
+        let manifest = Manifest::from_file(&manifest_path)
+            .context("Failed to parse project package.json")?;
+
+        let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
+        let project_version = manifest.version.clone();
+
+        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let mut lockfile = if lockfile_path.exists() {
+            LockfileV3::load_from_file(&lockfile_path)?
+        } else {
+            LockfileV3::new(project_name.clone(), project_version.clone())
+        };
+
+        // Ensure root package matches current manifest dependencies
+        if let Some(root_pkg) = lockfile.root_package_mut() {
+            root_pkg.name = Some(project_name.clone());
+            root_pkg.version = project_version.clone();
+            if !manifest.dependencies.is_empty() {
+                root_pkg.dependencies = Some(manifest.dependencies.clone());
+            }
+            if !manifest.dev_dependencies.is_empty() {
+                root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+            }
+        }
+
+        // Determine which packages to update
+        let mut deps_to_update: BTreeMap<String, String> = BTreeMap::new();
+        if targets.is_empty() {
+            // Update all top-level dependencies
+            for (k, v) in &manifest.dependencies {
+                deps_to_update.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &manifest.dev_dependencies {
+                deps_to_update.insert(k.clone(), v.clone());
+            }
+        } else {
+            for target in targets {
+                if let Some(range) = manifest.dependencies.get(target) {
+                    deps_to_update.insert(target.clone(), range.clone());
+                } else if let Some(range) = manifest.dev_dependencies.get(target) {
+                    deps_to_update.insert(target.clone(), range.clone());
+                } else {
+                    return Err(anyhow!("Package '{}' is not a dependency in package.json", target));
+                }
+            }
+        }
+
+        let mut updated_packages: Vec<String> = Vec::new();
+        let mut old_versions: HashMap<String, String> = HashMap::new();
+        let mut new_versions: HashMap<String, String> = HashMap::new();
+
+        // 1. Check for newer versions satisfying ranges
+        let mut newly_resolved_roots: BTreeMap<String, ResolvedNode> = BTreeMap::new();
+        for (pkg_name, range_str) in &deps_to_update {
+            let lock_key = format!("node_modules/{pkg_name}");
+            let current_locked_ver = lockfile.get_package(&lock_key)
+                .and_then(|p| p.version.clone());
+
+            let resolved = self.resolve_package(pkg_name, range_str).await?;
+
+            if let Some(ref cur_ver) = current_locked_ver {
+                if cur_ver != &resolved.version {
+                    updated_packages.push(pkg_name.clone());
+                    old_versions.insert(pkg_name.clone(), cur_ver.clone());
+                    new_versions.insert(pkg_name.clone(), resolved.version.clone());
+                    newly_resolved_roots.insert(pkg_name.clone(), resolved);
+                }
+            } else {
+                // Not in lockfile yet
+                updated_packages.push(pkg_name.clone());
+                new_versions.insert(pkg_name.clone(), resolved.version.clone());
+                newly_resolved_roots.insert(pkg_name.clone(), resolved);
+            }
+        }
+
+        let node_modules_dir = self.options.project_dir.join("node_modules");
+        let bin_dir = node_modules_dir.join(".bin");
+        std::fs::create_dir_all(&node_modules_dir)?;
+
+        let mut cache_hits = 0;
+        let mut cache_misses = 0;
+        let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
+
+        if !updated_packages.is_empty() {
+            // 2. Resolve transitive dependencies for newly updated packages
+            let mut full_subgraph: BTreeMap<String, ResolvedNode> = BTreeMap::new();
+            let mut queue: VecDeque<(String, String)> = VecDeque::new();
+
+            for (name, node) in newly_resolved_roots {
+                for (sub_name, sub_range) in &node.dependencies {
+                    queue.push_back((sub_name.clone(), sub_range.clone()));
+                }
+                full_subgraph.insert(name, node);
+            }
+
+            while let Some((dep_name, dep_range)) = queue.pop_front() {
+                if full_subgraph.contains_key(&dep_name) {
+                    continue;
+                }
+                let node = self.resolve_package(&dep_name, &dep_range).await?;
+                for (sub_name, sub_range) in &node.dependencies {
+                    if !full_subgraph.contains_key(sub_name) {
+                        queue.push_back((sub_name.clone(), sub_range.clone()));
+                    }
+                }
+                full_subgraph.insert(dep_name, node);
+            }
+
+            // 3. Reify newly resolved packages into node_modules and update lockfile
+            for (pkg_name, node) in &full_subgraph {
+                let (hits, misses, lock_entry, l_node) = self
+                    .reify_package(node, &node_modules_dir, &bin_dir)
+                    .await?;
+                cache_hits += hits;
+                cache_misses += misses;
+                if let Some(ln) = l_node {
+                    lifecycle_nodes.push(ln);
+                }
+
+                let lockfile_key = format!("node_modules/{pkg_name}");
+                lockfile.insert_package(&lockfile_key, lock_entry);
+            }
+
+            // 4. Garbage collection / cleanup of superseded orphaned transitive dependencies
+            let mut reachable: HashSet<String> = HashSet::new();
+            let mut to_visit: VecDeque<String> = VecDeque::new();
+
+            if let Some(root_pkg) = lockfile.root_package() {
+                if let Some(deps) = &root_pkg.dependencies {
+                    for dep in deps.keys() {
+                        to_visit.push_back(dep.clone());
+                    }
+                }
+                if let Some(dev_deps) = &root_pkg.dev_dependencies {
+                    for dep in dev_deps.keys() {
+                        to_visit.push_back(dep.clone());
+                    }
+                }
+            }
+
+            while let Some(pkg_name) = to_visit.pop_front() {
+                if !reachable.insert(pkg_name.clone()) {
+                    continue;
+                }
+                let key = format!("node_modules/{pkg_name}");
+                if let Some(pkg_entry) = lockfile.get_package(&key) {
+                    if let Some(deps) = &pkg_entry.dependencies {
+                        for sub_dep in deps.keys() {
+                            if !reachable.contains(sub_dep) {
+                                to_visit.push_back(sub_dep.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let all_keys: Vec<String> = lockfile.packages.keys().cloned().collect();
+            for key in all_keys {
+                if key.is_empty() {
+                    continue;
+                }
+                let pkg_name = key.strip_prefix("node_modules/").unwrap_or(&key);
+                if !pkg_name.contains('/') || (pkg_name.starts_with('@') && pkg_name.matches('/').count() == 1) {
+                    if !reachable.contains(pkg_name) {
+                        lockfile.remove_package(&key);
+                        let path_to_remove = self.options.project_dir.join(&key);
+                        if path_to_remove.exists() {
+                            let _ = std::fs::remove_dir_all(&path_to_remove);
+                        }
+                    }
+                }
+            }
+
+            // 5. Run lifecycle scripts if needed
+            if !self.options.ignore_scripts && !lifecycle_nodes.is_empty() {
+                let lifecycle_opts = LifecycleOptions {
+                    root_dir: self.options.project_dir.clone(),
+                    init_cwd: self.options.project_dir.clone(),
+                    ignore_scripts: false,
+                    capture_output: false,
+                };
+                let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
+            }
+        }
+
+        // 6. Rewrite package-lock.json deterministically
+        lockfile.save_to_file(&lockfile_path)
+            .context("Failed to save package-lock.json")?;
+
+        Ok(UpdateSummary {
+            packages_updated: updated_packages.len(),
+            updated_packages,
+            old_versions,
+            new_versions,
+            cache_hits,
+            cache_misses,
+            lockfile_path,
+        })
+    }
 }
+
+#[cfg(test)]
+mod tests;

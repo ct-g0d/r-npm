@@ -52,3 +52,9 @@ rnpm-install = { path = "crates/rnpm-install" }
 rnpm-shim = { path = "crates/rnpm-shim" }
 rnpm-lifecycle = { path = "crates/rnpm-lifecycle" }
 rnpm-solver = { path = "crates/rnpm-solver" }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

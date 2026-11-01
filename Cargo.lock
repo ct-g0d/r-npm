@@ -1026,9 +1026,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "rnpm-core",
  "rnpm-install",
  "rnpm-lifecycle",
+ "rnpm-lockfile",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1078,6 +1084,7 @@ name = "rnpm-install"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "rnpm-cache",
  "rnpm-config",
  "rnpm-core",
@@ -1089,6 +1096,7 @@ dependencies = [
  "rnpm-solver",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
