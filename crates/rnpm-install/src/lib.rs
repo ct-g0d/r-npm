@@ -34,7 +34,7 @@ pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) 
 
     if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
         let _ = rnpm_fs::remove_junction(&link_path);
-        if link_path.exists() {
+        if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
             let _ = std::fs::remove_dir_all(&link_path);
         }
     }
@@ -729,7 +729,7 @@ impl Installer {
                 }
                 if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&link_path);
-                    if link_path.exists() {
+                    if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
                         let _ = std::fs::remove_dir_all(&link_path);
                     }
                 }
