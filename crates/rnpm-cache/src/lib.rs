@@ -19,6 +19,7 @@ pub use storage::{Cache, VerifyReport};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::collect_files_recursive;
     use rnpm_core::{Algorithm, Integrity};
     use tempfile::tempdir;
 
@@ -893,4 +894,72 @@ mod tests {
         let (_, final_data) = cache.get("final-key").unwrap().expect("Must retrieve final entry");
         assert_eq!(final_data, b"final data");
     }
+
+    #[test]
+    fn test_put_with_integrity_multi_hash_prioritizes_sha512_and_rejects_mismatch() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let data = b"multi-hash test payload content";
+        let key = "https://registry.npmjs.org/multi-hash/-/multi-hash-1.0.0.tgz";
+
+        // sha1 matches data, but sha512 is mismatched / tampered
+        let matching_sha1 = Integrity::from_bytes(data, Algorithm::Sha1);
+        let wrong_sha512 = Integrity::from_bytes(b"corrupted or tampered content", Algorithm::Sha512);
+
+        let multi_integrity = Integrity::parse(&format!("{matching_sha1} {wrong_sha512}")).unwrap();
+
+        // Calling put_with_integrity must prioritize sha512 over sha1 and reject with IntegrityMismatch
+        let res = cache.put_with_integrity(key, data, Some(&multi_integrity), None);
+        assert!(
+            matches!(res, Err(CacheError::IntegrityMismatch { .. })),
+            "Must reject when strongest hash (sha512) mismatches, even if sha1 matches: {:?}",
+            res
+        );
+
+        // Verify cache remains completely clean (no index entry, no blob written)
+        assert!(cache.get(key).unwrap().is_none(), "Cache must have no entry for key");
+
+        // Verify content-v2 directory has no blobs
+        let content_dir = cache.root().join("content-v2").join("sha512");
+        let mut blobs = Vec::new();
+        collect_files_recursive(&content_dir, &mut blobs);
+        assert_eq!(blobs.len(), 0, "No content-addressable blobs should be created on integrity mismatch");
+
+        // Now test matching multi-hash: both sha1 and sha512 match data
+        let matching_sha512 = Integrity::from_bytes(data, Algorithm::Sha512);
+        let valid_multi = Integrity::parse(&format!("{matching_sha1} {matching_sha512}")).unwrap();
+
+        let entry = cache.put_with_integrity(key, data, Some(&valid_multi), None).unwrap();
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.size, data.len() as u64);
+
+        let (retrieved_entry, retrieved_data) = cache.get(key).unwrap().expect("Cache hit expected");
+        assert_eq!(retrieved_data, data);
+        assert!(retrieved_entry.integrity.contains("sha512-"));
+    }
+
+    #[test]
+    fn test_put_with_integrity_untouched_cache_files_on_failure() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let data = b"payload to be rejected";
+        let key = "https://registry.npmjs.org/reject-test/-/reject-1.0.0.tgz";
+        let wrong_integrity = Integrity::from_bytes(b"completely different", Algorithm::Sha512);
+
+        let err = cache.put_with_integrity(key, data, Some(&wrong_integrity), None).unwrap_err();
+        assert!(matches!(err, CacheError::IntegrityMismatch { .. }));
+
+        // Check index directory is empty
+        let index_dir = cache.root().join("index-v5");
+        let mut indices = Vec::new();
+        collect_files_recursive(&index_dir, &mut indices);
+        assert_eq!(indices.len(), 0, "No index entries must be created on rejection");
+
+        // Check tmp directory is empty
+        let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir()).unwrap().collect();
+        assert_eq!(tmp_entries.len(), 0, "No temp files must remain in tmp directory");
+    }
 }
+

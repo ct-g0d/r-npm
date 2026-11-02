@@ -102,6 +102,7 @@ pub fn extract_tar_gz<R: Read>(
     let mut entry_count = 0;
     let mut symlink_count = 0;
     let mut total_uncompressed = 0u64;
+    let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -149,8 +150,15 @@ pub fn extract_tar_gz<R: Read>(
         // Ensure no ancestor directory between destination and target_path is a symlink or junction
         ensure_no_symlink_ancestors(&target_path, destination)?;
 
-        // Security check: escaping symlinks/hardlinks
+        // Check special entry types: FIFOs, block/character devices
         let entry_type = entry.header().entry_type();
+        if entry_type.is_block_special() || entry_type.is_character_special() || entry_type.is_fifo() {
+            return Err(FsError::ForbiddenSpecialEntry {
+                path: raw_path,
+            });
+        }
+
+        // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             symlink_count += 1;
             if symlink_count > limits.max_symlinks {
@@ -173,12 +181,11 @@ pub fn extract_tar_gz<R: Read>(
                     fs::create_dir_all(parent)?;
                 }
 
-                // If target_path exists, remove it before creating link
-                if target_path.is_symlink() || target_path.exists() {
-                    let _ = fs::remove_file(&target_path);
-                }
+                // If target_path exists, safely unlink it (handling Windows junctions) before creating link
+                unlink_target_path(&target_path);
 
                 if entry_type.is_symlink() {
+                    symlink_paths.insert(relative_path.clone());
                     #[cfg(unix)]
                     {
                         let _ = std::os::unix::fs::symlink(&link_target, &target_path);
@@ -194,7 +201,20 @@ pub fn extract_tar_gz<R: Read>(
                     }
                 } else if entry_type.is_hard_link() {
                     let source_full = destination.join(&cleaned_rel);
-                    if source_full.exists() && !source_full.is_symlink() {
+                    #[cfg(windows)]
+                    let is_symlink_or_junction = source_full.is_symlink()
+                        || crate::junction::is_junction(&source_full).unwrap_or(false);
+                    #[cfg(not(windows))]
+                    let is_symlink_or_junction = source_full.is_symlink();
+
+                    if symlink_paths.contains(&cleaned_rel) || is_symlink_or_junction {
+                        return Err(FsError::EscapingSymlink {
+                            link: relative_path.clone(),
+                            target: normalized_target,
+                        });
+                    }
+
+                    if source_full.exists() {
                         if fs::hard_link(&source_full, &target_path).is_err() {
                             if source_full.is_file() {
                                 let _ = fs::copy(&source_full, &target_path);
@@ -208,9 +228,7 @@ pub fn extract_tar_gz<R: Read>(
 
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
-            if target_path.is_symlink() {
-                let _ = fs::remove_file(&target_path);
-            }
+            unlink_target_path(&target_path);
             fs::create_dir_all(&target_path)?;
         } else if entry_type.is_file() {
             // Check single entry size limit from header if available
@@ -259,10 +277,8 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
 
-            // If target_path is already a symlink, remove it to prevent writing through symlink
-            if target_path.is_symlink() {
-                let _ = fs::remove_file(&target_path);
-            }
+            // If target_path is already a symlink or junction, safely unlink it to prevent writing through symlink
+            unlink_target_path(&target_path);
 
             // Clear read-only permissions on existing target file if present
             if target_path.exists() {
@@ -374,6 +390,20 @@ pub fn extract_tar_gz<R: Read>(
     })
 }
 
+/// Safely unlinks a pre-existing target path before creating a new entry.
+/// On Windows, directory junctions are safely unlinked using `remove_junction` or `fs::remove_dir`
+/// to prevent `fs::remove_file` failures and avoid deleting target contents.
+fn unlink_target_path(path: &Path) {
+    #[cfg(windows)]
+    if crate::junction::is_junction(path).unwrap_or(false) {
+        let _ = crate::junction::remove_junction(path);
+        return;
+    }
+    if path.is_symlink() || path.is_file() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Security helper ensuring no ancestor between destination and target is a symlink or junction.
 fn ensure_no_symlink_ancestors(target: &Path, destination: &Path) -> Result<(), FsError> {
     let mut current = target.parent();
@@ -417,7 +447,7 @@ pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
 
     let first = components.next()?;
     if let Component::Normal(os_str) = first {
-        if os_str == "package" {
+        if os_str.to_string_lossy().eq_ignore_ascii_case("package") {
             let remainder: PathBuf = components.collect();
             if remainder.as_os_str().is_empty() {
                 return None;
@@ -463,6 +493,13 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
 
                 // Reject ASCII control characters (0x00 to 0x1F)
                 if name.chars().any(|c| (c as u32) < 0x20) {
+                    return Err(FsError::PathTraversal {
+                        path: path.to_path_buf(),
+                    });
+                }
+
+                // Reject Windows invalid characters: *, ?, ", <, >, |
+                if name.chars().any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|')) {
                     return Err(FsError::PathTraversal {
                         path: path.to_path_buf(),
                     });

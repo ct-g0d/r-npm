@@ -21,6 +21,9 @@ pub enum FsError {
     #[error("SUID/SGID mode bits (0o{mode:o}) forbidden in path '{path}'")]
     ForbiddenModeBits { mode: u32, path: PathBuf },
 
+    #[error("Forbidden special entry (block, character, or fifo) in path '{path}'")]
+    ForbiddenSpecialEntry { path: PathBuf },
+
     #[error("Tar bomb resource limit exceeded ({limit_type}): {detail}")]
     TarBombLimitExceeded {
         limit_type: String,

@@ -1580,3 +1580,318 @@ async fn test_file_archive_dependency_installation_and_ci() {
     assert!(pkg_dir.join("package.json").exists());
 }
 
+#[tokio::test]
+async fn test_cache_poisoning_defense_on_corrupted_tarball_download() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let good_tar = make_tarball("poison-test", "1.0.0", &[]);
+    let good_integrity = Integrity::from_bytes(&good_tar, Algorithm::Sha512).to_string();
+    let corrupted_tar = b"attacker corrupted tarball payload content";
+
+    let corrupted_tar_c = corrupted_tar.to_vec();
+    let good_integrity_c = good_integrity.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let su = su.clone();
+                        let good_integrity_c = good_integrity_c.clone();
+                        let corrupted_tar_c = corrupted_tar_c.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, content_type, body) = if req_str.contains("GET /poison-test") {
+                                    let json = serde_json::json!({
+                                        "name": "poison-test",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "poison-test",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su}tarballs/poison-test-1.0.0.tgz"),
+                                                    "integrity": good_integrity_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, "application/json", serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/poison-test-1.0.0.tgz") {
+                                    (200, "application/octet-stream", corrupted_tar_c)
+                                } else {
+                                    (404, "text/plain", b"Not Found".to_vec())
+                                };
+
+                                let resp_header = format!(
+                                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp_header.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("test-cache-defense".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("poison-test".to_string(), "^1.0.0".to_string());
+    manifest.save_to_file(project_dir.path().join("package.json")).unwrap();
+
+    let tarball_url = format!("{server_url}tarballs/poison-test-1.0.0.tgz");
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let install_res = installer.run().await;
+    assert!(
+        install_res.is_err(),
+        "Installation MUST fail when downloaded tarball hash mismatches integrity: {:?}",
+        install_res
+    );
+
+    // Verify local cache remains completely clean/unpolluted
+    let cache = rnpm_cache::Cache::new(cache_dir.path()).unwrap();
+    let cached_entry = cache.get(&tarball_url).unwrap();
+    assert!(
+        cached_entry.is_none(),
+        "Local cache MUST NOT be poisoned with corrupted tarball bytes! Cache get must return None"
+    );
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_cache_poisoning_defense_on_ci_run() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let good_tar = make_tarball("ci-poison-test", "1.0.0", &[]);
+    let good_integrity = Integrity::from_bytes(&good_tar, Algorithm::Sha512).to_string();
+    let corrupted_tar = b"attacker corrupted bytes in ci pipeline";
+
+    let corrupted_tar_c = corrupted_tar.to_vec();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let corrupted_tar_c = corrupted_tar_c.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, content_type, body) = if req_str.contains("GET /tarballs/ci-poison-test-1.0.0.tgz") {
+                                    (200, "application/octet-stream", corrupted_tar_c)
+                                } else {
+                                    (404, "text/plain", b"Not Found".to_vec())
+                                };
+
+                                let resp_header = format!(
+                                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp_header.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let tarball_url = format!("{su}tarballs/ci-poison-test-1.0.0.tgz");
+
+    // package.json
+    let mut manifest = Manifest::default();
+    manifest.name = Some("ci-defense-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("ci-poison-test".to_string(), "^1.0.0".to_string());
+    manifest.save_to_file(project_dir.path().join("package.json")).unwrap();
+
+    // package-lock.json
+    let mut lockfile = LockfileV3::new("ci-defense-app", Some("1.0.0".to_string()));
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(manifest.dependencies.clone());
+    }
+    let pkg_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(tarball_url.clone()),
+        integrity: Some(good_integrity.clone()),
+        ..Default::default()
+    };
+    lockfile.insert_package("node_modules/ci-poison-test", pkg_entry);
+    lockfile.save_to_file(&project_dir.path().join("package-lock.json")).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let ci_res = installer.run_ci().await;
+    assert!(
+        ci_res.is_err(),
+        "run_ci MUST fail when downloaded tarball hash mismatches integrity: {:?}",
+        ci_res
+    );
+
+    // Verify local cache remains clean
+    let cache = rnpm_cache::Cache::new(cache_dir.path()).unwrap();
+    let cached_entry = cache.get(&tarball_url).unwrap();
+    assert!(
+        cached_entry.is_none(),
+        "run_ci MUST NOT poison local cache with corrupted tarball bytes! Cache get must return None"
+    );
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_multi_hash_integrity_sha512_prioritized_over_sha1() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let good_tar = make_tarball("multi-pkg", "1.0.0", &[]);
+    let matching_sha1 = Integrity::from_bytes(&good_tar, Algorithm::Sha1);
+    let wrong_sha512 = Integrity::from_bytes(b"tampered sha512 content", Algorithm::Sha512);
+
+    // Multi-hash integrity: sha1 matches the bytes, but sha512 mismatches!
+    let multi_integrity = format!("{matching_sha1} {wrong_sha512}");
+
+    let good_tar_c = good_tar.clone();
+    let multi_integrity_c = multi_integrity.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let su = su.clone();
+                        let multi_integrity_c = multi_integrity_c.clone();
+                        let good_tar_c = good_tar_c.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, content_type, body) = if req_str.contains("GET /multi-pkg") {
+                                    let json = serde_json::json!({
+                                        "name": "multi-pkg",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "multi-pkg",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su}tarballs/multi-pkg-1.0.0.tgz"),
+                                                    "integrity": multi_integrity_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, "application/json", serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/multi-pkg-1.0.0.tgz") {
+                                    (200, "application/octet-stream", good_tar_c)
+                                } else {
+                                    (404, "text/plain", b"Not Found".to_vec())
+                                };
+
+                                let resp_header = format!(
+                                    "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp_header.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("test-multi-hash-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("multi-pkg".to_string(), "^1.0.0".to_string());
+    manifest.save_to_file(project_dir.path().join("package.json")).unwrap();
+
+    let tarball_url = format!("{server_url}tarballs/multi-pkg-1.0.0.tgz");
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run().await;
+    assert!(
+        res.is_err(),
+        "Must immediately reject when sha512 mismatches, despite matching sha1: {:?}",
+        res
+    );
+
+    // Verify cache remains unpolluted
+    let cache = rnpm_cache::Cache::new(cache_dir.path()).unwrap();
+    let cached = cache.get(&tarball_url).unwrap();
+    assert!(
+        cached.is_none(),
+        "Cache must remain clean on multi-hash sha512 mismatch"
+    );
+
+    let _ = tx.send(());
+}
+
+

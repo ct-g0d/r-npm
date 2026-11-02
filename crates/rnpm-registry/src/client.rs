@@ -249,6 +249,212 @@ impl Default for RegistryClientConfig {
     }
 }
 
+/// Helper to convert year, month (1..=12), day (1..=31) to days since Unix epoch (1970-01-01).
+pub fn days_from_civil(mut y: i64, m: u64, d: u64) -> i64 {
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Helper to convert days since Unix epoch to civil date (year, month, day).
+pub fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
+fn parse_month_name(token: &str) -> Option<u64> {
+    match token.to_ascii_lowercase().as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
+}
+
+/// Formats a `SystemTime` as an HTTP-date string (IMF-fixdate format, e.g. "Sun, 06 Nov 1994 08:49:37 GMT").
+pub fn format_http_date(st: std::time::SystemTime) -> String {
+    let unix_secs = st
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = unix_secs.div_euclid(86400);
+    let rem_secs = unix_secs.rem_euclid(86400);
+    let hour = rem_secs / 3600;
+    let min = (rem_secs % 3600) / 60;
+    let sec = rem_secs % 60;
+
+    let (y, m, d) = civil_from_days(days);
+    let day_of_week = ((days + 4).rem_euclid(7)) as usize;
+    let weekdays = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let wk = weekdays[day_of_week];
+    let mon = months[(m.saturating_sub(1) as usize).min(11)];
+    format!("{wk}, {:02} {mon} {y} {:02}:{:02}:{:02} GMT", d, hour, min, sec)
+}
+
+/// Parses an HTTP-date string (IMF-fixdate, RFC 850, or ANSI C asctime, and RFC 2822)
+/// into a Unix timestamp (seconds since Unix epoch 1970-01-01 00:00:00 UTC).
+pub fn parse_http_date_to_unix_timestamp(s: &str) -> Option<i64> {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == ',' || c == '-' { ' ' } else { c })
+        .collect();
+    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut month = None;
+    let mut month_idx = None;
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(m) = parse_month_name(tok) {
+            month = Some(m);
+            month_idx = Some(i);
+            break;
+        }
+    }
+    let month = month?;
+    let month_idx = month_idx?;
+
+    let mut time = None;
+    let mut time_idx = None;
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok.contains(':') && !tok.starts_with('+') && !tok.starts_with('-') {
+            let parts: Vec<&str> = tok.split(':').collect();
+            if parts.len() == 2 || parts.len() == 3 {
+                if let (Ok(h), Ok(m)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    let s = if parts.len() == 3 {
+                        parts[2].parse::<u64>().ok()?
+                    } else {
+                        0
+                    };
+                    if h < 24 && m < 60 && s <= 60 {
+                        time = Some((h, m, s));
+                        time_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let (hour, min, sec) = time?;
+    let time_idx = time_idx?;
+
+    let mut day: Option<u64> = None;
+    let mut year: Option<i64> = None;
+
+    if month_idx > 0 && tokens[month_idx - 1].chars().all(|c| c.is_ascii_digit()) {
+        day = tokens[month_idx - 1].parse::<u64>().ok();
+        for (i, tok) in tokens.iter().enumerate().skip(month_idx + 1) {
+            if i != time_idx && tok.chars().all(|c| c.is_ascii_digit()) {
+                year = tok.parse::<i64>().ok();
+                break;
+            }
+        }
+    } else {
+        if month_idx + 1 < tokens.len() && tokens[month_idx + 1].chars().all(|c| c.is_ascii_digit()) {
+            day = tokens[month_idx + 1].parse::<u64>().ok();
+        }
+        for tok in tokens.iter().skip(time_idx + 1) {
+            if tok.chars().all(|c| c.is_ascii_digit()) {
+                year = tok.parse::<i64>().ok();
+                break;
+            }
+        }
+    }
+
+    let day = day?;
+    let mut year = year?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    if year < 70 {
+        year += 2000;
+    } else if year < 100 {
+        year += 1900;
+    }
+
+    let mut tz_offset_secs: i64 = 0;
+    for tok in tokens.iter().skip(time_idx + 1) {
+        let t = tok.trim();
+        if t.eq_ignore_ascii_case("gmt") || t.eq_ignore_ascii_case("utc") || t == "Z" {
+            tz_offset_secs = 0;
+            break;
+        }
+        if t.starts_with('+') || t.starts_with('-') {
+            let sign = if t.starts_with('-') { -1 } else { 1 };
+            let num_str = &t[1..];
+            let offset_parts: Vec<&str> = num_str.split(':').collect();
+            if offset_parts.len() == 2 {
+                if let (Ok(h), Ok(m)) = (offset_parts[0].parse::<i64>(), offset_parts[1].parse::<i64>()) {
+                    tz_offset_secs = sign * (h * 3600 + m * 60);
+                    break;
+                }
+            } else if num_str.len() == 4 {
+                if let (Ok(h), Ok(m)) = (num_str[0..2].parse::<i64>(), num_str[2..4].parse::<i64>()) {
+                    tz_offset_secs = sign * (h * 3600 + m * 60);
+                    break;
+                }
+            }
+        }
+    }
+
+    let days = days_from_civil(year, month, day);
+    let total_secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64) - tz_offset_secs;
+    Some(total_secs)
+}
+
+/// Parses an HTTP-date string into duration in seconds relative to current time.
+pub fn parse_http_date_to_seconds_from_now(s: &str) -> Option<u64> {
+    let unix_secs = parse_http_date_to_unix_timestamp(s)?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let diff = unix_secs - now_secs;
+    Some(if diff > 0 { diff as u64 } else { 0 })
+}
+
+/// Parses a `Retry-After` header value which may be either integer seconds (e.g. `120`)
+/// or an HTTP-date string (e.g. `Wed, 21 Oct 2025 07:28:00 GMT`).
+pub fn parse_retry_after(header: Option<&HeaderValue>) -> Option<u64> {
+    let s = header?.to_str().ok()?.trim();
+    parse_retry_after_str(s)
+}
+
+/// Parses a `Retry-After` string which may be either integer seconds or an HTTP-date.
+pub fn parse_retry_after_str(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    parse_http_date_to_seconds_from_now(s)
+}
+
 /// Client for interacting with npm package registries.
 #[derive(Clone)]
 pub struct RegistryClient {
@@ -579,16 +785,10 @@ impl RegistryClient {
                     // Check for retryable HTTP status codes (429, 502, 503, 504)
                     let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
                     let is_retryable_server_error = self.config.retry_on_status.contains(&status.as_u16())
-                        || status == StatusCode::SERVICE_UNAVAILABLE
-                        || status == StatusCode::BAD_GATEWAY
-                        || status == StatusCode::GATEWAY_TIMEOUT;
+                        || status.is_server_error();
 
                     if is_rate_limited {
-                        let retry_after_secs = resp
-                            .headers()
-                            .get(RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
+                        let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
 
                         let within_backoff_budget = if let Some(secs) = retry_after_secs {
                             Duration::from_secs(secs) <= self.config.max_retry_backoff
@@ -617,11 +817,7 @@ impl RegistryClient {
                             return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
                         }
                     } else if is_retryable_server_error {
-                        let retry_after_secs = resp
-                            .headers()
-                            .get(RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
+                        let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
 
                         let within_backoff_budget = if let Some(secs) = retry_after_secs {
                             Duration::from_secs(secs) <= self.config.max_retry_backoff
@@ -797,11 +993,7 @@ impl RegistryClient {
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+            let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
             return Err(RegistryError::RateLimited { retry_after });
         }
 
@@ -896,11 +1088,7 @@ impl RegistryClient {
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+            let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
             return Err(RegistryError::RateLimited { retry_after });
         }
 
@@ -963,11 +1151,7 @@ impl RegistryClient {
         }
 
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+            let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
             return Err(RegistryError::RateLimited { retry_after });
         }
 
@@ -1011,74 +1195,100 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<BytesFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let (resp, _permit) = self
-            .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
-            .await?;
+        let host_key = if let Some(port) = url.port() {
+            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        } else {
+            url.host_str().unwrap_or_default().to_ascii_lowercase()
+        };
 
-        let status = resp.status();
-        if status == StatusCode::NOT_MODIFIED {
+        let mut stream_attempt = 0;
+        loop {
+            let (resp, _permit) = self
+                .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
+                .await?;
+
+            let status = resp.status();
+            if status == StatusCode::NOT_MODIFIED {
+                let etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| if_none_match.map(|s| s.to_string()));
+                return Ok(BytesFetchResult::NotModified { etag });
+            }
+
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: tarball_url.to_string(),
+                    status: 404,
+                });
+            }
+
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
+                return Err(RegistryError::RateLimited { retry_after });
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
             let etag = resp
                 .headers()
                 .get(ETAG)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| if_none_match.map(|s| s.to_string()));
-            return Ok(BytesFetchResult::NotModified { etag });
+                .map(|s| s.to_string());
+
+            match resp.bytes().await {
+                Ok(bytes) => {
+                    return Ok(BytesFetchResult::Fresh {
+                        bytes: bytes.to_vec(),
+                        etag,
+                    });
+                }
+                Err(err) => {
+                    if stream_attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                            .min(self.config.max_retry_backoff);
+                        debug!(
+                            "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                            err, url, delay, stream_attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        stream_attempt += 1;
+                        continue;
+                    } else {
+                        if self.config.circuit_breaker_enabled {
+                            self.circuit_breaker.record_failure(&host_key).await;
+                        }
+                        return Err(RegistryError::Http(err));
+                    }
+                }
+            }
         }
-
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: tarball_url.to_string(),
-                status: 404,
-            });
-        }
-
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            return Err(RegistryError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        let etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        let bytes = resp.bytes().await?;
-        Ok(BytesFetchResult::Fresh {
-            bytes: bytes.to_vec(),
-            etag,
-        })
     }
 
     /// Download multiple tarballs concurrently with bounded concurrency.
@@ -1118,52 +1328,11 @@ impl RegistryClient {
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let (mut resp, _permit) = self
-            .execute_with_permit(Method::GET, url.clone(), None, None)
-            .await?;
-
-        let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: tarball_url.to_string(),
-                status: 404,
-            });
-        }
-
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            return Err(RegistryError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        let host_key = if let Some(port) = url.port() {
+            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        } else {
+            url.host_str().unwrap_or_default().to_ascii_lowercase()
+        };
 
         if let Some(parent) = dest_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -1171,23 +1340,105 @@ impl RegistryClient {
             })?;
         }
 
-        let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
-            RegistryError::Other(format!("Failed to create {}: {e}", dest_path.display()))
-        })?;
+        let mut stream_attempt = 0;
+        loop {
+            let (mut resp, _permit) = self
+                .execute_with_permit(Method::GET, url.clone(), None, None)
+                .await?;
 
-        let mut written: u64 = 0;
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to write chunk to {}: {e}", dest_path.display()))
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: tarball_url.to_string(),
+                    status: 404,
+                });
+            }
+
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
+                return Err(RegistryError::RateLimited { retry_after });
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
+            let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
+                RegistryError::Other(format!("Failed to create {}: {e}", dest_path.display()))
             })?;
-            written += chunk.len() as u64;
+
+            let mut written: u64 = 0;
+            let mut stream_err = None;
+
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            return Err(RegistryError::Other(format!(
+                                "Failed to write chunk to {}: {e}",
+                                dest_path.display()
+                            )));
+                        }
+                        written += chunk.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        stream_err = Some(err);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = stream_err {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+
+                if stream_attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                    debug!(
+                        "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                        err, url, delay, stream_attempt + 1, self.config.max_retries
+                    );
+                    tokio::time::sleep(delay).await;
+                    stream_attempt += 1;
+                    continue;
+                } else {
+                    if self.config.circuit_breaker_enabled {
+                        self.circuit_breaker.record_failure(&host_key).await;
+                    }
+                    return Err(RegistryError::Http(err));
+                }
+            }
+
+            file.flush().await.map_err(|e| {
+                RegistryError::Other(format!("Failed to flush {}: {e}", dest_path.display()))
+            })?;
+
+            return Ok(written);
         }
-
-        file.flush().await.map_err(|e| {
-            RegistryError::Other(format!("Failed to flush {}: {e}", dest_path.display()))
-        })?;
-
-        Ok(written)
     }
 
     /// Download multiple tarballs directly to disk destinations concurrently with bounded concurrency.
@@ -1258,5 +1509,46 @@ mod tests {
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert!(config.retry_on_status.contains(&429));
         assert!(config.retry_on_status.contains(&503));
+    }
+
+    #[test]
+    fn test_parse_retry_after_integer_seconds() {
+        assert_eq!(parse_retry_after_str("120"), Some(120));
+        assert_eq!(parse_retry_after_str("0"), Some(0));
+        assert_eq!(parse_retry_after_str("  45  "), Some(45));
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date_formats() {
+        // Known historical timestamp: Sun, 06 Nov 1994 08:49:37 GMT -> 784111777
+        assert_eq!(
+            parse_http_date_to_unix_timestamp("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784111777)
+        );
+        // RFC 850 format
+        assert_eq!(
+            parse_http_date_to_unix_timestamp("Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some(784111777)
+        );
+        // ANSI C asctime format
+        assert_eq!(
+            parse_http_date_to_unix_timestamp("Sun Nov  6 08:49:37 1994"),
+            Some(784111777)
+        );
+
+        // Historical dates in the past resolve to 0 seconds from now
+        assert_eq!(
+            parse_retry_after_str("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(0)
+        );
+
+        // Date in future relative to now
+        let future_time = std::time::SystemTime::now() + Duration::from_secs(30);
+        let http_date = format_http_date(future_time);
+        let parsed_secs = parse_retry_after_str(&http_date).expect("should parse future HTTP-date");
+        assert!(
+            parsed_secs >= 28 && parsed_secs <= 31,
+            "Expected ~30s, got {parsed_secs}"
+        );
     }
 }

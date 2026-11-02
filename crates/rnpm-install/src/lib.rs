@@ -656,9 +656,28 @@ impl Installer {
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
+                let expected_integrity: Option<Integrity> = if !node.integrity.is_empty() {
+                    match node.integrity.parse::<Integrity>() {
+                        Ok(i) => Some(i),
+                        Err(e) => {
+                            if node.optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                    pkg_name, e
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!("Invalid integrity string for {pkg_name}: {e}"));
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&node.resolved_url) {
-                    let is_valid = if let Ok(expected) = node.integrity.parse::<Integrity>() {
-                        expected.verify(&data).is_ok()
+                    let is_valid = if let Some(ref exp) = expected_integrity {
+                        exp.verify(&data).is_ok()
                     } else {
                         true
                     };
@@ -671,7 +690,20 @@ impl Installer {
                         let _ = cache.purge_key(&node.resolved_url);
                         match registry_client.download_tarball_bytes(&node.resolved_url).await {
                             Ok(bytes) => {
-                                let _ = cache.put(&node.resolved_url, &bytes, None);
+                                if let Some(ref exp) = expected_integrity {
+                                    if let Err(e) = exp.verify(&bytes) {
+                                        if node.optional {
+                                            warn!(
+                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                                pkg_name, e
+                                            );
+                                            return Ok(None);
+                                        } else {
+                                            return Err(anyhow!("Integrity verification failed for {pkg_name}: {e}"));
+                                        }
+                                    }
+                                }
+                                let _ = cache.put_with_integrity(&node.resolved_url, &bytes, expected_integrity.as_ref(), None);
                                 Ok((bytes, false))
                             }
                             Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
@@ -681,7 +713,20 @@ impl Installer {
                     info!("Downloading {}", node.resolved_url);
                     match registry_client.download_tarball_bytes(&node.resolved_url).await {
                         Ok(bytes) => {
-                            let _ = cache.put(&node.resolved_url, &bytes, None);
+                            if let Some(ref exp) = expected_integrity {
+                                if let Err(e) = exp.verify(&bytes) {
+                                    if node.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                            pkg_name, e
+                                        );
+                                        return Ok(None);
+                                    } else {
+                                        return Err(anyhow!("Integrity verification failed for {pkg_name}: {e}"));
+                                    }
+                                }
+                            }
+                            let _ = cache.put_with_integrity(&node.resolved_url, &bytes, expected_integrity.as_ref(), None);
                             Ok((bytes, false))
                         }
                         Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
@@ -693,7 +738,7 @@ impl Installer {
                     Err(err) => {
                         if node.optional {
                             warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
                                 pkg_name, err
                             );
                             return Ok(None);
@@ -703,33 +748,18 @@ impl Installer {
                     }
                 };
 
-                // Verify integrity in memory
-                let expected_integrity: Result<Integrity, _> = node.integrity.parse()
-                    .map_err(|e| anyhow!("Invalid integrity string: {e}"));
-                let expected_integrity = match expected_integrity {
-                    Ok(i) => i,
-                    Err(e) => {
+                // Verify integrity in memory (defense in depth)
+                if let Some(ref exp) = expected_integrity {
+                    if let Err(e) = exp.verify(&bytes) {
                         if node.optional {
                             warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
                                 pkg_name, e
                             );
                             return Ok(None);
                         } else {
-                            return Err(e);
+                            return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
                         }
-                    }
-                };
-
-                if let Err(e) = expected_integrity.verify(&bytes) {
-                    if node.optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                            pkg_name, e
-                        );
-                        return Ok(None);
-                    } else {
-                        return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
                     }
                 }
 
@@ -937,6 +967,22 @@ impl Installer {
 
             // Handle workspace links
             if pkg_info.link == Some(true) {
+                // Path containment defense: ensure pkg_key has no traversal, device names, or escapes
+                if pkg_key.contains("..") || pkg_key.contains(':') || pkg_key.contains('\\') || pkg_key.contains('\0') {
+                    return Err(anyhow!("Package lock entry '{pkg_key}' contains illegal path characters"));
+                }
+                rnpm_fs::validate_entry_path(Path::new(pkg_key))
+                    .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
+
+                let full_target = self.options.project_dir.join(pkg_key);
+                let cleaned = path_clean::clean(&full_target);
+                if !cleaned.starts_with(&self.options.project_dir) {
+                    return Err(anyhow!("Package path '{cleaned:?}' escapes project boundary"));
+                }
+                if pkg_key.starts_with("node_modules/") && !cleaned.starts_with(&node_modules_dir) {
+                    return Err(anyhow!("Package path '{cleaned:?}' escapes node_modules boundary"));
+                }
+
                 let target_rel = pkg_info.resolved.as_ref().ok_or_else(|| {
                     anyhow!("Workspace link {pkg_key} missing resolved target in lockfile")
                 })?;
@@ -974,6 +1020,22 @@ impl Installer {
             // Skip workspace member physical directories
             if !pkg_key.starts_with("node_modules/") {
                 continue;
+            }
+
+            // Path containment defense: ensure pkg_key has no traversal, device names, or escapes
+            if pkg_key.contains("..") || pkg_key.contains(':') || pkg_key.contains('\\') || pkg_key.contains('\0') {
+                return Err(anyhow!("Package lock entry '{pkg_key}' contains illegal path characters"));
+            }
+            rnpm_fs::validate_entry_path(Path::new(pkg_key))
+                .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
+
+            let full_target = self.options.project_dir.join(pkg_key);
+            let cleaned = path_clean::clean(&full_target);
+            if !cleaned.starts_with(&self.options.project_dir) {
+                return Err(anyhow!("Package path '{cleaned:?}' escapes project boundary"));
+            }
+            if !cleaned.starts_with(&node_modules_dir) {
+                return Err(anyhow!("Package path '{cleaned:?}' escapes node_modules boundary"));
             }
 
             let is_optional = pkg_info.optional.unwrap_or(false);
@@ -1125,7 +1187,7 @@ impl Installer {
                                     return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
                                 }
                             }
-                            let _ = self.cache.put(_resolved_url, &fresh_bytes, None);
+                            let _ = self.cache.put_with_integrity(_resolved_url, &fresh_bytes, Some(&expected_integrity), None);
                             fresh_bytes
                         }
                         Err(fetch_err) => {
@@ -1151,6 +1213,9 @@ impl Installer {
                     }
                 }
             } else {
+                if !was_hit {
+                    let _ = self.cache.put_with_integrity(_resolved_url, &bytes, Some(&expected_integrity), None);
+                }
                 bytes
             };
 
@@ -1439,6 +1504,8 @@ impl Installer {
     }
 
     /// Fetch multiple tarballs concurrently with bounded semaphore limits and local disk cache.
+    /// Does NOT write unverified tarballs into the cache. Cache writing must be performed
+    /// by callers only after SSRI integrity verification.
     pub async fn fetch_tarballs_concurrent(
         &self,
         urls: &[&str],
@@ -1459,7 +1526,8 @@ impl Installer {
                 info!("Downloading {}", url_str);
                 match registry_client.download_tarball_bytes(&url_str).await {
                     Ok(bytes) => {
-                        let _ = cache.put(&url_str, &bytes, None);
+                        // Do not pollute cache with unverified bytes!
+                        // Caching must be performed after integrity verification by the caller.
                         (idx, Ok((bytes, false)))
                     }
                     Err(e) => (idx, Err(anyhow!("Failed to download tarball from {url_str}: {e}"))),
@@ -1491,7 +1559,7 @@ impl Installer {
         let bytes = self.registry_client.download_tarball_bytes(tarball_url).await
             .map_err(|e| anyhow!("Failed to download tarball from {tarball_url}: {e}"))?;
 
-        let _ = self.cache.put(tarball_url, &bytes, None);
+        // Do not pollute the cache with unverified bytes!
 
         Ok((bytes, false))
     }
@@ -1513,7 +1581,22 @@ impl Installer {
         expected_integrity.verify(bytes)
             .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
 
+        if !was_hit {
+            let _ = self.cache.put_with_integrity(&node.resolved_url, bytes, Some(&expected_integrity), None);
+        }
+
+        // Path containment defense: ensure node.name has no traversal, device names, or escapes
+        if node.name.contains("..") || node.name.contains(':') || node.name.contains('\\') || node.name.contains('\0') {
+            return Err(anyhow!("Package name '{}' contains illegal path characters", node.name));
+        }
+        rnpm_fs::validate_entry_path(Path::new(&node.name))
+            .map_err(|e| anyhow!("Invalid package name '{}': {e}", node.name))?;
+
         let dest_dir = node_modules_dir.join(&node.name);
+        let cleaned_dest = path_clean::clean(&dest_dir);
+        if !cleaned_dest.starts_with(node_modules_dir) {
+            return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes node_modules"));
+        }
         extract_and_replace(Cursor::new(bytes), &dest_dir, None)
             .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
 
