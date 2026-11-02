@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+﻿use std::collections::BTreeMap;
 use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use crate::platform::Platform;
 use crate::solver::{resolve_dependency_graph, ResolverOptions};
@@ -469,3 +469,49 @@ fn test_empty_manifest_resolution() {
     assert_eq!(graph.nodes.len(), 1);
 }
 
+#[test]
+fn test_dependency_graph_prune_unreferenced() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Package A requires B
+    provider.add_version("pkg-a", "1.0.0", |v| {
+        v.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    });
+    // Package B requires C
+    provider.add_version("pkg-b", "1.0.0", |v| {
+        v.dependencies.insert("pkg-c".to_string(), "^1.0.0".to_string());
+    });
+    // Package C
+    provider.add_version("pkg-c", "1.0.0", |_| {});
+
+    // Package D (independent)
+    provider.add_version("pkg-d", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("prune-test".to_string());
+    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("pkg-d".to_string(), "^1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let mut graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    assert!(graph.nodes.contains_key("node_modules/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-b"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-c"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-d"));
+
+    // Remove pkg-a
+    assert!(graph.remove_root_dependency("pkg-a"));
+    let pruned = graph.prune_unreferenced();
+
+    // pkg-a, pkg-b, pkg-c should all be pruned
+    assert!(pruned.contains("node_modules/pkg-a"));
+    assert!(pruned.contains("node_modules/pkg-b"));
+    assert!(pruned.contains("node_modules/pkg-c"));
+    assert!(!pruned.contains("node_modules/pkg-d"));
+
+    assert!(!graph.nodes.contains_key("node_modules/pkg-a"));
+    assert!(!graph.nodes.contains_key("node_modules/pkg-b"));
+    assert!(!graph.nodes.contains_key("node_modules/pkg-c"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-d"));
+}

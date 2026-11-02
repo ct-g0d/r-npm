@@ -10,6 +10,7 @@ use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
+use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::tarball::extract_tar_gz;
 use rnpm_lifecycle::{
     execute_lifecycle_script, execute_topological, LifecycleContext, LifecycleOptions,
@@ -20,6 +21,7 @@ use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::Platform;
+use rnpm_solver::graph::DependencyGraph;
 
 /// Options for running rnpm install.
 #[derive(Debug, Clone)]
@@ -736,4 +738,297 @@ impl Installer {
 
         Ok((bytes, false))
     }
+
+    /// Uninstall packages from project:
+    /// 1. Removes specified package names from package.json (`dependencies`, `devDependencies`, `optionalDependencies`).
+    /// 2. Prunes unreferenced dependencies from the in-memory dependency graph and lockfile.
+    /// 3. Deletes the corresponding package directories from `node_modules` (including nested packages that are no longer referenced).
+    /// 4. Writes updated deterministic `package.json` and `package-lock.json`.
+    pub fn uninstall(&self, options: &UninstallOptions) -> Result<UninstallSummary> {
+        let manifest_path = self.options.project_dir.join("package.json");
+        if !manifest_path.exists() {
+            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+        }
+
+        let mut manifest = Manifest::from_file(&manifest_path)
+            .context("Failed to parse project package.json")?;
+
+        // Validate package names against malformed inputs or path traversal attacks
+        for pkg in &options.packages {
+            let trimmed = pkg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.contains("..") || trimmed.contains('\\') || trimmed.starts_with('/') {
+                return Err(anyhow!("Invalid package name '{trimmed}': path traversal not permitted"));
+            }
+        }
+
+        let mut removed_packages = Vec::new();
+
+        // Determine which sections to target
+        let target_all = !options.save_dev && !options.save_optional && !options.save_prod;
+
+        for raw_pkg in &options.packages {
+            let pkg = raw_pkg.trim();
+            if pkg.is_empty() {
+                continue;
+            }
+
+            let mut removed = false;
+
+            if options.save_dev || target_all {
+                if manifest.dev_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+            }
+
+            if options.save_optional || target_all {
+                if manifest.optional_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+            }
+
+            if options.save_prod || target_all {
+                if manifest.dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+            }
+
+            if removed {
+                removed_packages.push(pkg.to_string());
+            }
+        }
+
+        // Save updated package.json deterministically
+        manifest.save_to_file(&manifest_path)
+            .context("Failed to save updated package.json")?;
+
+        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let mut pruned_nodes: HashSet<String> = HashSet::new();
+
+        if lockfile_path.exists() {
+            let lockfile_str = std::fs::read_to_string(&lockfile_path)
+                .context("Failed to read package-lock.json")?;
+            let mut lockfile = LockfileV3::from_json_str(&lockfile_str)
+                .context("Failed to parse package-lock.json")?;
+
+            // Build and prune in-memory dependency graph
+            let mut in_memory_graph = DependencyGraph::from_lockfile_v3(&lockfile);
+            for pkg in &removed_packages {
+                in_memory_graph.remove_root_dependency(pkg);
+            }
+            let graph_pruned = in_memory_graph.prune_unreferenced();
+
+            // Sync root package metadata with updated manifest
+            if let Some(root_pkg) = lockfile.root_package_mut() {
+                if manifest.dependencies.is_empty() {
+                    root_pkg.dependencies = None;
+                } else {
+                    root_pkg.dependencies = Some(manifest.dependencies.clone());
+                }
+
+                if manifest.dev_dependencies.is_empty() {
+                    root_pkg.dev_dependencies = None;
+                } else {
+                    root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+                }
+
+                if manifest.optional_dependencies.is_empty() {
+                    root_pkg.optional_dependencies = None;
+                } else {
+                    root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+                }
+            }
+
+            // Prune unreferenced dependencies using reachability graph
+            pruned_nodes = prune_lockfile(&mut lockfile, &manifest);
+            pruned_nodes.extend(graph_pruned);
+
+            // Write updated deterministic package-lock.json
+            lockfile.save_to_file(&lockfile_path)
+                .context("Failed to save updated package-lock.json")?;
+        }
+
+        // Remove deleted package directories from node_modules
+        let node_modules_dir = self.options.project_dir.join("node_modules");
+        let bin_dir = node_modules_dir.join(".bin");
+
+        // Clean direct removed packages and all pruned lockfile nodes
+        let mut dirs_to_remove = HashSet::new();
+        for pkg in &removed_packages {
+            dirs_to_remove.insert(format!("node_modules/{pkg}"));
+        }
+        for pruned in &pruned_nodes {
+            dirs_to_remove.insert(pruned.clone());
+        }
+
+        // Sort descending by length so nested subdirectories are deleted before parent directories
+        let mut sorted_dirs: Vec<String> = dirs_to_remove.into_iter().collect();
+        sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+        for rel_dir in sorted_dirs {
+            let target_path = self.options.project_dir.join(&rel_dir);
+            let is_junc = is_junction(&target_path).unwrap_or(false);
+            if target_path.exists() || is_junc {
+                // Remove shims from .bin if package had bin entries
+                let pkg_manifest_path = target_path.join("package.json");
+                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    for (bin_name, _) in pkg_manifest.bin_entries() {
+                        let shim_path = bin_dir.join(&bin_name);
+                        let _ = std::fs::remove_file(&shim_path);
+                        #[cfg(windows)]
+                        {
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
+                        }
+                    }
+                }
+
+                if is_junc {
+                    let _ = remove_junction(&target_path);
+                } else if target_path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&target_path);
+                } else {
+                    let _ = std::fs::remove_file(&target_path);
+                }
+
+                // If parent is a scoped directory (e.g. @scope) and empty, remove it
+                if let Some(parent) = target_path.parent() {
+                    if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                        if parent_name.starts_with('@') && parent.is_dir() {
+                            if let Ok(mut entries) = std::fs::read_dir(parent) {
+                                if entries.next().is_none() {
+                                    let _ = std::fs::remove_dir(parent);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up .bin if empty
+        if bin_dir.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(&bin_dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(&bin_dir);
+                }
+            }
+        }
+
+        Ok(UninstallSummary {
+            removed_packages,
+            pruned_dependencies: pruned_nodes.into_iter().collect(),
+            lockfile_path,
+        })
+    }
 }
+
+/// Options for running rnpm uninstall.
+#[derive(Debug, Clone, Default)]
+pub struct UninstallOptions {
+    pub packages: Vec<String>,
+    pub save_dev: bool,
+    pub save_optional: bool,
+    pub save_prod: bool,
+}
+
+/// Result of an uninstall run.
+#[derive(Debug, Clone)]
+pub struct UninstallSummary {
+    pub removed_packages: Vec<String>,
+    pub pruned_dependencies: Vec<String>,
+    pub lockfile_path: PathBuf,
+}
+
+/// Prunes unreferenced packages from lockfile based on reachability from manifest direct dependencies.
+/// Returns the set of lockfile package paths (e.g. "node_modules/foo") that were pruned.
+pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet<String> {
+    // 1. Collect all root direct dependency names
+    let mut root_dep_names = HashSet::new();
+    for name in manifest.dependencies.keys() {
+        root_dep_names.insert(name.clone());
+    }
+    for name in manifest.dev_dependencies.keys() {
+        root_dep_names.insert(name.clone());
+    }
+    for name in manifest.optional_dependencies.keys() {
+        root_dep_names.insert(name.clone());
+    }
+
+    // 2. Breadth-First-Search from root to mark reachable lockfile keys
+    let mut reachable_keys = HashSet::new();
+    reachable_keys.insert(String::new()); // Root package "" is always reachable
+
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    // Direct root dependencies point to "node_modules/<name>"
+    for dep_name in &root_dep_names {
+        let key = format!("node_modules/{dep_name}");
+        if lockfile.packages.contains_key(&key) {
+            reachable_keys.insert(key.clone());
+            queue.push_back(key);
+        }
+    }
+
+    while let Some(current_key) = queue.pop_front() {
+        if let Some(pkg) = lockfile.packages.get(&current_key) {
+            let mut all_deps = Vec::new();
+            if let Some(deps) = &pkg.dependencies {
+                all_deps.extend(deps.keys().cloned());
+            }
+            if let Some(opt_deps) = &pkg.optional_dependencies {
+                all_deps.extend(opt_deps.keys().cloned());
+            }
+
+            for dep_name in all_deps {
+                // Resolution in node_modules tree: check nested then parent scopes
+                let nested_key = format!("{current_key}/node_modules/{dep_name}");
+                let hoisted_key = format!("node_modules/{dep_name}");
+
+                let target_key = if lockfile.packages.contains_key(&nested_key) {
+                    Some(nested_key)
+                } else if lockfile.packages.contains_key(&hoisted_key) {
+                    Some(hoisted_key)
+                } else {
+                    // Search ancestors
+                    let mut found = None;
+                    let parts: Vec<&str> = current_key.split("/node_modules/").collect();
+                    for i in (1..parts.len()).rev() {
+                        let ancestor = parts[..i].join("/node_modules/");
+                        let candidate = format!("{ancestor}/node_modules/{dep_name}");
+                        if lockfile.packages.contains_key(&candidate) {
+                            found = Some(candidate);
+                            break;
+                        }
+                    }
+                    found
+                };
+
+                if let Some(k) = target_key {
+                    if !reachable_keys.contains(&k) {
+                        reachable_keys.insert(k.clone());
+                        queue.push_back(k);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Remove all unreachable keys (excluding "")
+    let mut pruned = HashSet::new();
+    let all_keys: Vec<String> = lockfile.packages.keys().cloned().collect();
+
+    for key in all_keys {
+        if !key.is_empty() && !reachable_keys.contains(&key) {
+            lockfile.packages.remove(&key);
+            pruned.insert(key);
+        }
+    }
+
+    pruned
+}
+
+#[cfg(test)]
+mod tests;
