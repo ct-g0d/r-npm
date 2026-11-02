@@ -1,11 +1,15 @@
 use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, ETAG, IF_NONE_MATCH, LOCATION,
+    RETRY_AFTER, USER_AGENT,
+};
 use reqwest::{Client, Method, Response, StatusCode};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 use url::Url;
 
@@ -25,18 +29,6 @@ pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 /// Maximum number of HTTP redirects to follow before failing.
 pub const MAX_REDIRECTS: usize = 10;
 
-/// Encodes a package name according to npm registry rules:
-/// Scoped packages `@scope/pkg` are encoded as `@scope%2fpkg`.
-/// Unscoped packages `pkg` remain unchanged.
-pub fn encode_package_name(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix('@') {
-        if let Some((scope, pkg)) = rest.split_once('/') {
-            return format!("@{scope}%2f{pkg}");
-        }
-    }
-    name.to_string()
-}
-
 /// Default maximum concurrent requests allowed across the client.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
 
@@ -49,6 +41,151 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 /// Default pool idle connection timeout.
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 
+/// Default connect timeout.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Default maximum retry attempts for retryable errors (429, 503, transient errors).
+pub const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Default initial retry backoff duration in milliseconds.
+pub const DEFAULT_INITIAL_RETRY_BACKOFF_MS: u64 = 100;
+
+/// Default maximum retry backoff duration in seconds.
+pub const DEFAULT_MAX_RETRY_BACKOFF_SECS: u64 = 5;
+
+/// Encodes a package name according to npm registry rules:
+/// Scoped packages `@scope/pkg` are encoded as `@scope%2fpkg`.
+/// Unscoped packages `pkg` remain unchanged.
+pub fn encode_package_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@') {
+        if let Some((scope, pkg)) = rest.split_once('/') {
+            return format!("@{scope}%2f{pkg}");
+        }
+    }
+    name.to_string()
+}
+
+/// Result of a conditional metadata fetch (ETag / 304 Not Modified).
+#[derive(Debug, Clone)]
+pub enum MetadataFetchResult {
+    /// Server returned fresh metadata (HTTP 200 OK) with optional ETag.
+    Fresh {
+        metadata: AbbreviatedPackageMetadata,
+        etag: Option<String>,
+    },
+    /// Server returned HTTP 304 Not Modified; cached data is still valid.
+    NotModified {
+        etag: Option<String>,
+    },
+}
+
+impl MetadataFetchResult {
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    pub fn is_not_modified(&self) -> bool {
+        matches!(self, Self::NotModified { .. })
+    }
+
+    pub fn metadata(&self) -> Option<&AbbreviatedPackageMetadata> {
+        match self {
+            Self::Fresh { metadata, .. } => Some(metadata),
+            Self::NotModified { .. } => None,
+        }
+    }
+
+    pub fn into_metadata(self) -> Option<AbbreviatedPackageMetadata> {
+        match self {
+            Self::Fresh { metadata, .. } => Some(metadata),
+            Self::NotModified { .. } => None,
+        }
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            Self::Fresh { etag, .. } => etag.as_deref(),
+            Self::NotModified { etag, .. } => etag.as_deref(),
+        }
+    }
+}
+
+/// Result of a conditional bytes fetch (ETag / 304 Not Modified).
+#[derive(Debug, Clone)]
+pub enum BytesFetchResult {
+    /// Server returned fresh bytes (HTTP 200 OK) with optional ETag.
+    Fresh {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
+    /// Server returned HTTP 304 Not Modified.
+    NotModified {
+        etag: Option<String>,
+    },
+}
+
+impl BytesFetchResult {
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    pub fn is_not_modified(&self) -> bool {
+        matches!(self, Self::NotModified { .. })
+    }
+
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Fresh { bytes, .. } => Some(bytes),
+            Self::NotModified { .. } => None,
+        }
+    }
+
+    pub fn into_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Fresh { bytes, .. } => Some(bytes),
+            Self::NotModified { .. } => None,
+        }
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            Self::Fresh { etag, .. } => etag.as_deref(),
+            Self::NotModified { etag, .. } => etag.as_deref(),
+        }
+    }
+}
+
+/// Result of a conditional tarball response fetch.
+#[derive(Debug)]
+pub enum TarballFetchResult {
+    /// Server returned fresh tarball response (HTTP 200 OK) with optional ETag.
+    Modified {
+        response: Response,
+        etag: Option<String>,
+    },
+    /// Server returned HTTP 304 Not Modified.
+    NotModified {
+        etag: Option<String>,
+    },
+}
+
+impl TarballFetchResult {
+    pub fn is_modified(&self) -> bool {
+        matches!(self, Self::Modified { .. })
+    }
+
+    pub fn is_not_modified(&self) -> bool {
+        matches!(self, Self::NotModified { .. })
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            Self::Modified { etag, .. } => etag.as_deref(),
+            Self::NotModified { etag, .. } => etag.as_deref(),
+        }
+    }
+}
+
 /// Registry client configuration.
 #[derive(Debug, Clone)]
 pub struct RegistryClientConfig {
@@ -57,10 +194,15 @@ pub struct RegistryClientConfig {
     pub auth_token: Option<String>,
     pub trusted_hosts: HashSet<String>,
     pub timeout: Duration,
+    pub connect_timeout: Duration,
     pub max_concurrent_requests: usize,
     pub pool_max_idle_per_host: usize,
     pub tcp_keepalive: Duration,
     pub pool_idle_timeout: Duration,
+    pub max_retries: usize,
+    pub initial_retry_backoff: Duration,
+    pub max_retry_backoff: Duration,
+    pub retry_on_status: HashSet<u16>,
 }
 
 impl Default for RegistryClientConfig {
@@ -71,16 +213,27 @@ impl Default for RegistryClientConfig {
             trusted_hosts.insert(h.to_ascii_lowercase());
         }
 
+        let mut retry_on_status = HashSet::new();
+        retry_on_status.insert(429);
+        retry_on_status.insert(502);
+        retry_on_status.insert(503);
+        retry_on_status.insert(504);
+
         Self {
             default_registry: registry_url,
             user_agent: default_user_agent(),
             auth_token: None,
             trusted_hosts,
             timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
             pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
             tcp_keepalive: Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS),
             pool_idle_timeout: Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_retry_backoff: Duration::from_millis(DEFAULT_INITIAL_RETRY_BACKOFF_MS),
+            max_retry_backoff: Duration::from_secs(DEFAULT_MAX_RETRY_BACKOFF_SECS),
+            retry_on_status,
         }
     }
 }
@@ -107,6 +260,10 @@ impl RegistryClient {
             HeaderValue::from_str(&config.user_agent)
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
+        headers.insert(
+            CONNECTION,
+            HeaderValue::from_static("keep-alive"),
+        );
 
         let max_idle = if config.pool_max_idle_per_host == 0 {
             DEFAULT_POOL_MAX_IDLE_PER_HOST
@@ -120,6 +277,7 @@ impl RegistryClient {
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(config.timeout)
+            .connect_timeout(config.connect_timeout)
             .tcp_nodelay(true)
             .tcp_keepalive(Some(config.tcp_keepalive))
             .pool_idle_timeout(Some(config.pool_idle_timeout))
@@ -148,6 +306,17 @@ impl RegistryClient {
     /// Access the bounded concurrency semaphore.
     pub fn semaphore(&self) -> &std::sync::Arc<tokio::sync::Semaphore> {
         &self.semaphore
+    }
+
+    /// Acquire an owned permit from the bounded concurrency semaphore.
+    /// Holding this permit ensures that total concurrent in-flight network requests
+    /// and active socket streams remain strictly bounded by `max_concurrent_requests`.
+    pub async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, RegistryError> {
+        self.semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| RegistryError::Other(e.to_string()))
     }
 
     /// Format the metadata URL for a package name.
@@ -193,6 +362,185 @@ impl RegistryClient {
         false
     }
 
+    /// Execute a request under semaphore permit with redirect security and retry backoff.
+    pub async fn execute_with_permit(
+        &self,
+        method: Method,
+        initial_url: Url,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
+        let permit = self.acquire_permit().await?;
+        let resp = self
+            .execute_request_loop(method, initial_url, accept_header, if_none_match)
+            .await?;
+        Ok((resp, permit))
+    }
+
+    /// Internal request dispatch loop with redirect security policy and retry backoff on 429/503.
+    async fn execute_request_loop(
+        &self,
+        method: Method,
+        initial_url: Url,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<Response, RegistryError> {
+        let mut attempt = 0;
+
+        loop {
+            let mut current_url = initial_url.clone();
+            let mut redirect_count = 0;
+
+            let response_result: Result<Response, RegistryError> = loop {
+                let mut req = self.client.request(method.clone(), current_url.clone());
+
+                if let Some(accept) = accept_header {
+                    req = req.header(ACCEPT, accept);
+                }
+
+                if let Some(etag) = if_none_match {
+                    req = req.header(IF_NONE_MATCH, etag);
+                }
+
+                // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts)
+                let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
+
+                if should_send_auth {
+                    if let Some(token) = &self.config.auth_token {
+                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    }
+                } else {
+                    debug!(
+                        "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
+                        initial_url, current_url
+                    );
+                }
+
+                let resp = match req.send().await {
+                    Ok(r) => r,
+                    Err(e) => break Err(RegistryError::Http(e)),
+                };
+
+                let status = resp.status();
+
+                if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
+                    redirect_count += 1;
+                    if redirect_count > MAX_REDIRECTS {
+                        break Err(RegistryError::TooManyRedirects(MAX_REDIRECTS));
+                    }
+
+                    if let Some(location) = resp.headers().get(LOCATION) {
+                        let loc_str = match location.to_str() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                break Err(RegistryError::SecurityViolation(
+                                    "Invalid characters in redirect Location header".into(),
+                                ))
+                            }
+                        };
+                        let next_url = match current_url.join(loc_str) {
+                            Ok(u) => u,
+                            Err(e) => break Err(RegistryError::UrlParse(e)),
+                        };
+                        debug!("Following redirect {} -> {}", current_url, next_url);
+                        current_url = next_url;
+                        continue;
+                    } else {
+                        break Err(RegistryError::ServerError {
+                            status: status.as_u16(),
+                            body: "Redirect response missing Location header".into(),
+                        });
+                    }
+                }
+
+                break Ok(resp);
+            };
+
+            match response_result {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    // Check for retryable HTTP status codes (429, 502, 503, 504)
+                    let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
+                    let is_retryable_server_error = self.config.retry_on_status.contains(&status.as_u16())
+                        || status == StatusCode::SERVICE_UNAVAILABLE
+                        || status == StatusCode::BAD_GATEWAY
+                        || status == StatusCode::GATEWAY_TIMEOUT;
+
+                    if is_rate_limited {
+                        let retry_after_secs = resp
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        let within_backoff_budget = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs) <= self.config.max_retry_backoff
+                        } else {
+                            true
+                        };
+
+                        if within_backoff_budget && attempt < self.config.max_retries {
+                            let delay = if let Some(secs) = retry_after_secs {
+                                Duration::from_secs(secs)
+                            } else {
+                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                                    .min(self.config.max_retry_backoff)
+                            };
+                            debug!(
+                                "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
+                                initial_url, delay, attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
+                        }
+                    } else if is_retryable_server_error && attempt < self.config.max_retries {
+                        let retry_after_secs = resp
+                            .headers()
+                            .get(RETRY_AFTER)
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+
+                        let delay = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs).min(self.config.max_retry_backoff)
+                        } else {
+                            (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                                .min(self.config.max_retry_backoff)
+                        };
+                        debug!(
+                            "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
+                            status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Ok(resp);
+                }
+                Err(err) => {
+                    // Check if network error is transient and retryable
+                    if attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                            .min(self.config.max_retry_backoff);
+                        debug!(
+                            "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
+                            err, initial_url, delay, attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute a request following redirects manually and enforcing the security rule:
     /// Never forward auth headers across redirects to untrusted hostnames.
     pub async fn execute_with_security_policy(
@@ -201,61 +549,24 @@ impl RegistryClient {
         initial_url: Url,
         accept_header: Option<&str>,
     ) -> Result<Response, RegistryError> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| RegistryError::Other(e.to_string()))?;
+        let (resp, _permit) = self
+            .execute_with_permit(method, initial_url, accept_header, None)
+            .await?;
+        Ok(resp)
+    }
 
-        let mut current_url = initial_url.clone();
-
-        for _redirect_count in 0..MAX_REDIRECTS {
-            let mut req = self.client.request(method.clone(), current_url.clone());
-
-            if let Some(accept) = accept_header {
-                req = req.header(ACCEPT, accept);
-            }
-
-            // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts)
-            let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
-
-            if should_send_auth {
-                if let Some(token) = &self.config.auth_token {
-                    req = req.header(AUTHORIZATION, format!("Bearer {token}"));
-                }
-            } else {
-                debug!(
-                    "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
-                    initial_url, current_url
-                );
-            }
-
-            let resp = req.send().await?;
-            let status = resp.status();
-
-            if status.is_redirection() {
-                if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
-                    let loc_str = location.to_str().map_err(|_| {
-                        RegistryError::SecurityViolation(
-                            "Invalid characters in redirect Location header".into(),
-                        )
-                    })?;
-                    let next_url = current_url.join(loc_str)?;
-                    debug!("Following redirect {} -> {}", current_url, next_url);
-                    current_url = next_url;
-                    continue;
-                } else {
-                    return Err(RegistryError::ServerError {
-                        status: status.as_u16(),
-                        body: "Redirect response missing Location header".into(),
-                    });
-                }
-            }
-
-            return Ok(resp);
-        }
-
-        Err(RegistryError::TooManyRedirects(MAX_REDIRECTS))
+    /// Execute a request with optional ETag conditional header (`If-None-Match`).
+    pub async fn execute_with_security_policy_conditional(
+        &self,
+        method: Method,
+        initial_url: Url,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<Response, RegistryError> {
+        let (resp, _permit) = self
+            .execute_with_permit(method, initial_url, accept_header, if_none_match)
+            .await?;
+        Ok(resp)
     }
 
     /// Fetch abbreviated install metadata for a package from the default registry.
@@ -267,17 +578,61 @@ impl RegistryClient {
         self.get_package_metadata_from_url(package_name, url).await
     }
 
+    /// Fetch abbreviated install metadata conditionally using ETag (`If-None-Match`).
+    pub async fn get_package_metadata_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_from_url_conditional(package_name, url, if_none_match)
+            .await
+    }
+
     /// Fetch abbreviated install metadata from an explicit URL.
     pub async fn get_package_metadata_from_url(
         &self,
         package_name: &str,
         url: Url,
     ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-        let resp = self
-            .execute_with_security_policy(Method::GET, url.clone(), Some(NPM_INSTALL_V1_JSON))
+        match self
+            .get_package_metadata_from_url_conditional(package_name, url, None)
+            .await?
+        {
+            MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
+            MetadataFetchResult::NotModified { .. } => Err(RegistryError::Other(
+                "Unexpected 304 Not Modified response for unconditional request".into(),
+            )),
+        }
+    }
+
+    /// Fetch abbreviated install metadata from an explicit URL with ETag conditional validation.
+    pub async fn get_package_metadata_from_url_conditional(
+        &self,
+        package_name: &str,
+        url: Url,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let (resp, _permit) = self
+            .execute_with_permit(
+                Method::GET,
+                url.clone(),
+                Some(NPM_INSTALL_V1_JSON),
+                if_none_match,
+            )
             .await?;
 
         let status = resp.status();
+        if status == StatusCode::NOT_MODIFIED {
+            let etag = resp
+                .headers()
+                .get(ETAG)
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| if_none_match.map(|s| s.to_string()));
+            return Ok(MetadataFetchResult::NotModified { etag });
+        }
+
         if status == StatusCode::NOT_FOUND {
             return Err(RegistryError::PackageNotFound {
                 package: package_name.to_string(),
@@ -306,7 +661,7 @@ impl RegistryClient {
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = resp
                 .headers()
-                .get(reqwest::header::RETRY_AFTER)
+                .get(RETRY_AFTER)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
             return Err(RegistryError::RateLimited { retry_after });
@@ -320,8 +675,14 @@ impl RegistryClient {
             });
         }
 
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
         let metadata: AbbreviatedPackageMetadata = resp.json().await?;
-        Ok(metadata)
+        Ok(MetadataFetchResult::Fresh { metadata, etag })
     }
 
     /// Fetch abbreviated install metadata for multiple packages concurrently with bounded concurrency.
@@ -356,9 +717,18 @@ impl RegistryClient {
 
     /// Download a tarball stream from URL, safely following redirects.
     pub async fn download_tarball(&self, tarball_url: &str) -> Result<Response, RegistryError> {
+        let (resp, _permit) = self.download_tarball_stream(tarball_url).await?;
+        Ok(resp)
+    }
+
+    /// Download a tarball stream while maintaining an owned concurrency permit.
+    pub async fn download_tarball_stream(
+        &self,
+        tarball_url: &str,
+    ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let resp = self
-            .execute_with_security_policy(Method::GET, url.clone(), None)
+        let (resp, permit) = self
+            .execute_with_permit(Method::GET, url.clone(), None, None)
             .await?;
 
         let status = resp.status();
@@ -390,7 +760,7 @@ impl RegistryClient {
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = resp
                 .headers()
-                .get(reqwest::header::RETRY_AFTER)
+                .get(RETRY_AFTER)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
             return Err(RegistryError::RateLimited { retry_after });
@@ -404,14 +774,173 @@ impl RegistryClient {
             });
         }
 
-        Ok(resp)
+        Ok((resp, permit))
+    }
+
+    /// Download a tarball response conditionally using ETag (`If-None-Match`).
+    pub async fn download_tarball_conditional(
+        &self,
+        tarball_url: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<TarballFetchResult, RegistryError> {
+        let url = Url::parse(tarball_url)?;
+        let (resp, _permit) = self
+            .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
+            .await?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_MODIFIED {
+            let etag = resp
+                .headers()
+                .get(ETAG)
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| if_none_match.map(|s| s.to_string()));
+            return Ok(TarballFetchResult::NotModified { etag });
+        }
+
+        if status == StatusCode::NOT_FOUND {
+            return Err(RegistryError::PackageNotFound {
+                package: tarball_url.to_string(),
+                status: 404,
+            });
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Unauthorized {
+                url: url.to_string(),
+                status: 401,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: url.to_string(),
+                status: 403,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(RegistryError::RateLimited { retry_after });
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        Ok(TarballFetchResult::Modified {
+            response: resp,
+            etag,
+        })
     }
 
     /// Download tarball directly to memory bytes.
     pub async fn download_tarball_bytes(&self, tarball_url: &str) -> Result<Vec<u8>, RegistryError> {
-        let resp = self.download_tarball(tarball_url).await?;
+        match self
+            .download_tarball_bytes_conditional(tarball_url, None)
+            .await?
+        {
+            BytesFetchResult::Fresh { bytes, .. } => Ok(bytes),
+            BytesFetchResult::NotModified { .. } => Err(RegistryError::Other(
+                "Unexpected 304 Not Modified response for unconditional tarball request".into(),
+            )),
+        }
+    }
+
+    /// Download tarball directly to memory bytes with ETag conditional validation.
+    pub async fn download_tarball_bytes_conditional(
+        &self,
+        tarball_url: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<BytesFetchResult, RegistryError> {
+        let url = Url::parse(tarball_url)?;
+        let (resp, _permit) = self
+            .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
+            .await?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_MODIFIED {
+            let etag = resp
+                .headers()
+                .get(ETAG)
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| if_none_match.map(|s| s.to_string()));
+            return Ok(BytesFetchResult::NotModified { etag });
+        }
+
+        if status == StatusCode::NOT_FOUND {
+            return Err(RegistryError::PackageNotFound {
+                package: tarball_url.to_string(),
+                status: 404,
+            });
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Unauthorized {
+                url: url.to_string(),
+                status: 401,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: url.to_string(),
+                status: 403,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(RegistryError::RateLimited { retry_after });
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
         let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(BytesFetchResult::Fresh {
+            bytes: bytes.to_vec(),
+            etag,
+        })
     }
 
     /// Download multiple tarballs concurrently with bounded concurrency.
@@ -450,7 +979,54 @@ impl RegistryClient {
         tarball_url: &str,
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
-        let mut resp = self.download_tarball(tarball_url).await?;
+        let url = Url::parse(tarball_url)?;
+        let (mut resp, _permit) = self
+            .execute_with_permit(Method::GET, url.clone(), None, None)
+            .await?;
+
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(RegistryError::PackageNotFound {
+                package: tarball_url.to_string(),
+                status: 404,
+            });
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Unauthorized {
+                url: url.to_string(),
+                status: 401,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: url.to_string(),
+                status: 403,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(RegistryError::RateLimited { retry_after });
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
         if let Some(parent) = dest_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
@@ -531,5 +1107,18 @@ mod tests {
             scoped_url.as_str(),
             "https://registry.npmjs.org/@scope%2fpkg"
         );
+    }
+
+    #[test]
+    fn test_client_config_defaults_and_keepalive() {
+        let config = RegistryClientConfig::default();
+        assert_eq!(config.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
+        assert_eq!(config.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
+        assert_eq!(config.tcp_keepalive, Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS));
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS));
+        assert_eq!(config.connect_timeout, Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS));
+        assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert!(config.retry_on_status.contains(&429));
+        assert!(config.retry_on_status.contains(&503));
     }
 }

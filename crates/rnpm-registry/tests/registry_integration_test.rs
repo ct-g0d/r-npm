@@ -1,8 +1,10 @@
 use rnpm_registry::{
-    AbbreviatedPackageMetadata, RegistryClient, RegistryClientConfig, NPM_INSTALL_V1_JSON,
+    AbbreviatedPackageMetadata, BytesFetchResult, MetadataFetchResult, RegistryClient,
+    RegistryClientConfig, TarballFetchResult, NPM_INSTALL_V1_JSON,
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -480,6 +482,308 @@ async fn test_concurrent_metadata_and_tarball_fetching() {
     assert_eq!(tarballs.len(), 2);
     assert_eq!(tarballs[0].as_ref().unwrap(), b"bytes-a");
     assert_eq!(tarballs[1].as_ref().unwrap(), b"bytes-b");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_retry_backoff_on_503_recovers() {
+    let mock_json = r#"{
+        "name": "flakey-503-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "flakey-503-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "pkg.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /flakey-503-pkg") {
+            let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                // First attempt: 503 Service Unavailable
+                (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+            } else {
+                // Second attempt: succeeds with 200 OK
+                (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+            }
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-retry-503".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 2,
+        initial_retry_backoff: Duration::from_millis(10),
+        max_retry_backoff: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata("flakey-503-pkg").await.unwrap();
+    assert_eq!(meta.name, "flakey-503-pkg");
+    assert_eq!(attempt_counter.load(Ordering::SeqCst), 2, "Must have retried and succeeded on attempt 2");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_retry_backoff_on_429_recovers() {
+    let mock_json = r#"{
+        "name": "flakey-429-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "flakey-429-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "pkg.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /flakey-429-pkg") {
+            let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                // First attempt: 429 Too Many Requests with 0-second Retry-After
+                (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec())
+            } else {
+                // Second attempt: succeeds
+                (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+            }
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-retry-429".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 2,
+        initial_retry_backoff: Duration::from_millis(10),
+        max_retry_backoff: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata("flakey-429-pkg").await.unwrap();
+    assert_eq!(meta.name, "flakey-429-pkg");
+    assert_eq!(attempt_counter.load(Ordering::SeqCst), 2, "Must have retried on 429 and succeeded on attempt 2");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_retry_backoff_exceeds_max_retries_fails() {
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /persistently-503-pkg") {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-retry-exhaust".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 2,
+        initial_retry_backoff: Duration::from_millis(5),
+        max_retry_backoff: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.get_package_metadata("persistently-503-pkg").await.unwrap_err();
+    assert_eq!(err.status_code(), Some(503));
+    // Attempt 0 + 2 retries = 3 total requests
+    assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_etag_304_conditional_metadata_and_tarball() {
+    let mock_json = r#"{
+        "name": "cached-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "cached-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "cached-pkg.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+    let tarball_data = b"cached-tarball-binary-payload-999";
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /cached-pkg") {
+            if req.to_lowercase().contains("if-none-match: \"pkg-etag-v1\"") {
+                // 304 Not Modified
+                (304, vec![("ETag", "\"pkg-etag-v1\"".into())], vec![])
+            } else {
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "application/json".into()),
+                        ("ETag", "\"pkg-etag-v1\"".into()),
+                    ],
+                    mock_json.as_bytes().to_vec(),
+                )
+            }
+        } else if req.contains("GET /tarballs/cached-pkg.tgz") {
+            if req.to_lowercase().contains("if-none-match: \"tarball-etag-v1\"") {
+                // 304 Not Modified
+                (304, vec![("ETag", "\"tarball-etag-v1\"".into())], vec![])
+            } else {
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "application/octet-stream".into()),
+                        ("ETag", "\"tarball-etag-v1\"".into()),
+                    ],
+                    tarball_data.to_vec(),
+                )
+            }
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-etag".into(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // 1. Initial metadata fetch (unconditional)
+    let meta_res1 = client.get_package_metadata_conditional("cached-pkg", None).await.unwrap();
+    assert!(meta_res1.is_fresh());
+    assert!(matches!(meta_res1, MetadataFetchResult::Fresh { .. }));
+    assert_eq!(meta_res1.etag(), Some("\"pkg-etag-v1\""));
+    assert_eq!(meta_res1.metadata().unwrap().name, "cached-pkg");
+
+    // 2. Conditional metadata fetch with matching ETag (HTTP 304 Not Modified)
+    let meta_res2 = client
+        .get_package_metadata_conditional("cached-pkg", Some("\"pkg-etag-v1\""))
+        .await
+        .unwrap();
+    assert!(meta_res2.is_not_modified());
+    assert!(matches!(meta_res2, MetadataFetchResult::NotModified { .. }));
+    assert_eq!(meta_res2.etag(), Some("\"pkg-etag-v1\""));
+    assert!(meta_res2.metadata().is_none());
+
+    // 3. Conditional metadata fetch with stale ETag (HTTP 200 Fresh)
+    let meta_res3 = client
+        .get_package_metadata_conditional("cached-pkg", Some("\"stale-etag-v0\""))
+        .await
+        .unwrap();
+    assert!(meta_res3.is_fresh());
+    assert_eq!(meta_res3.etag(), Some("\"pkg-etag-v1\""));
+
+    // 4. Tarball conditional fetch (unconditional -> 200 Fresh)
+    let tar_url = format!("{}tarballs/cached-pkg.tgz", server.url());
+    let tar_res1 = client.download_tarball_bytes_conditional(&tar_url, None).await.unwrap();
+    assert!(tar_res1.is_fresh());
+    assert_eq!(tar_res1.bytes(), Some(tarball_data.as_slice()));
+    assert_eq!(tar_res1.etag(), Some("\"tarball-etag-v1\""));
+
+    // 5. Tarball conditional fetch with matching ETag (HTTP 304 Not Modified)
+    let tar_res2 = client
+        .download_tarball_bytes_conditional(&tar_url, Some("\"tarball-etag-v1\""))
+        .await
+        .unwrap();
+    assert!(tar_res2.is_not_modified());
+    assert!(matches!(tar_res2, BytesFetchResult::NotModified { .. }));
+    assert_eq!(tar_res2.etag(), Some("\"tarball-etag-v1\""));
+    assert!(tar_res2.bytes().is_none());
+
+    // 6. Tarball response conditional fetch
+    let stream_res1 = client.download_tarball_conditional(&tar_url, None).await.unwrap();
+    assert!(stream_res1.is_modified());
+    assert!(matches!(stream_res1, TarballFetchResult::Modified { .. }));
+    assert_eq!(stream_res1.etag(), Some("\"tarball-etag-v1\""));
+
+    let stream_res2 = client.download_tarball_conditional(&tar_url, Some("\"tarball-etag-v1\"")).await.unwrap();
+    assert!(stream_res2.is_not_modified());
+    assert!(matches!(stream_res2, TarballFetchResult::NotModified { .. }));
+    assert_eq!(stream_res2.etag(), Some("\"tarball-etag-v1\""));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_semaphore_bounded_worker_pool_socket_exhaustion_prevention() {
+    let current_concurrency = Arc::new(AtomicUsize::new(0));
+    let peak_concurrency = Arc::new(AtomicUsize::new(0));
+
+    let cur = current_concurrency.clone();
+    let peak = peak_concurrency.clone();
+
+    let server = MockHttpServer::start(move |_req| {
+        let active = cur.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(active, Ordering::SeqCst);
+        // Small delay to simulate network latency and test concurrency ceiling
+        std::thread::sleep(Duration::from_millis(25));
+        cur.fetch_sub(1, Ordering::SeqCst);
+
+        (
+            200,
+            vec![("Content-Type", "application/octet-stream".into())],
+            b"tarball payload bytes".to_vec(),
+        )
+    })
+    .await;
+
+    // Strict semaphore limit of 3 concurrent requests
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-semaphore-concurrency".into(),
+        timeout: Duration::from_secs(10),
+        max_concurrent_requests: 3,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let test_url = format!("{}tarball.tgz", server.url());
+    let urls: Vec<String> = (0..12).map(|_| test_url.clone()).collect();
+
+    // Trigger 12 downloads concurrently
+    let results = client.download_tarballs_concurrent(&urls).await;
+    assert_eq!(results.len(), 12);
+    for res in results {
+        assert_eq!(res.unwrap(), b"tarball payload bytes");
+    }
+
+    let observed_peak = peak_concurrency.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= 3,
+        "Peak concurrency {observed_peak} exceeded semaphore limit of 3! Socket pool violated bounding!"
+    );
 
     server.stop();
 }

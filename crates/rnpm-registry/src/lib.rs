@@ -10,8 +10,8 @@ pub mod error;
 pub mod metadata;
 
 pub use client::{
-    default_user_agent, encode_package_name, RegistryClient, RegistryClientConfig,
-    NPM_INSTALL_V1_JSON,
+    default_user_agent, encode_package_name, BytesFetchResult, MetadataFetchResult,
+    RegistryClient, RegistryClientConfig, TarballFetchResult, NPM_INSTALL_V1_JSON,
 };
 pub use error::RegistryError;
 pub use metadata::{
