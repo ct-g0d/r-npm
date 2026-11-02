@@ -501,8 +501,27 @@ impl Installer {
                     }
                 }
 
-                // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
+                // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
+                const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
+                if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
+                    return Err(anyhow!(
+                        "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
+                        pkg_name, MAX_COMPRESSED_TARBALL_BYTES
+                    ));
+                }
+
+                // Path containment defense: ensure pkg_name has no traversal or device escaping
+                if pkg_name.contains("..") || pkg_name.contains(':') || pkg_name.contains('\\') || pkg_name.contains('\0') {
+                    return Err(anyhow!("Package name '{pkg_name}' contains illegal path characters"));
+                }
+
                 let dest_dir = node_modules_dir.join(&pkg_name);
+                let cleaned_dest = path_clean::clean(&dest_dir);
+                if !cleaned_dest.starts_with(&node_modules_dir) {
+                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes node_modules"));
+                }
+
+                // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
                 let dest_dir_clone = dest_dir.clone();
                 let extract_res = tokio::task::spawn_blocking(move || {
                     extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)

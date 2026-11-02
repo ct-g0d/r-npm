@@ -1090,6 +1090,7 @@ dependencies = [
  "anyhow",
  "data-encoding",
  "flate2",
+ "path-clean",
  "rnpm-cache",
  "rnpm-config",
  "rnpm-core",

@@ -1392,3 +1392,36 @@ async fn test_targeted_update_preserves_satisfying_and_unrelated_dependencies() 
 
     let _ = tx.send(());
 }
+
+#[tokio::test]
+async fn test_install_reification_path_containment_and_illegal_package_names() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let illegal_names = [
+        "../escaped-pkg",
+        "../../root-escape",
+        "foo/../../bar",
+        "win\\slash\\escape",
+        "ads:stream",
+        "null\0byte",
+    ];
+
+    for bad_name in illegal_names {
+        let pkg_json = project_dir.path().join("package.json");
+        std::fs::write(&pkg_json, format!(r#"{{"name": "test-sec", "dependencies": {{"{bad_name}": "1.0.0"}}}}"#)).unwrap();
+
+        let options = InstallOptions {
+            project_dir: project_dir.path().to_path_buf(),
+            registry_url: Some("https://registry.npmjs.org/".to_string()),
+            cache_dir: Some(cache_dir.path().to_path_buf()),
+            offline: true,
+            ignore_scripts: true,
+        };
+
+        let mut installer = Installer::new(options).unwrap();
+        let res = installer.run().await;
+        assert!(res.is_err(), "Expected error for illegal package name '{bad_name}', but succeeded");
+    }
+}
+
