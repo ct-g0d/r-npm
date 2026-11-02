@@ -1032,6 +1032,7 @@ dependencies = [
  "rnpm-install",
  "rnpm-lifecycle",
  "rnpm-lockfile",
+ "rnpm-shim",
  "rnpm-solver",
  "serde",
  "serde_json",

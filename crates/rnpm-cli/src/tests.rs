@@ -145,7 +145,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_commands_gate_e_diagnostics() {
-        let commands = ["publish", "login", "audit", "token", "exec"];
+        let commands = ["publish", "login", "audit", "token", "deprecate"];
         for cmd in commands {
             let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
             assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
@@ -155,6 +155,10 @@ use tokio::net::TcpListener;
             assert!(msg.contains(&format!("The command '{cmd}' is not currently implemented in rnpm.")));
             assert!(msg.contains("docs/compatibility-contract.md"));
         }
+
+        // Verify exec and npx are recognized and not blocked as unsupported commands
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "exec"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "npx"]).is_none());
     }
 
     #[test]
@@ -258,6 +262,8 @@ use tokio::net::TcpListener;
                 args: vec![],
                 workspaces: true,
                 workspace: vec![],
+                filter: vec![],
+                scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
             },
@@ -380,6 +386,8 @@ use tokio::net::TcpListener;
                 args: vec![],
                 workspaces: true,
                 workspace: vec![],
+                filter: vec![],
+                scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
             },
@@ -414,3 +422,282 @@ use tokio::net::TcpListener;
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_cli_exec_local_binary_success() {
+        let temp = tempdir().unwrap();
+        let project_dir = temp.path();
+
+        let marker_file = project_dir.join("exec_local_marker.txt");
+        let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+        // Set up package.json
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name": "test-project", "version": "1.0.0"}"#,
+        ).unwrap();
+
+        // Set up node_modules/echo-tool/index.js
+        let tool_dir = project_dir.join("node_modules").join("echo-tool");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        std::fs::write(
+            tool_dir.join("index.js"),
+            format!("require('fs').writeFileSync('{escaped_marker}', 'local-exec-ok');\n"),
+        ).unwrap();
+
+        // Create shims in node_modules/.bin
+        let bin_dir = project_dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        rnpm_shim::create_shims(&bin_dir, "echo-tool", "echo-tool/index.js").unwrap();
+
+        let cli = Cli {
+            command: Commands::Exec {
+                package: "echo-tool".to_string(),
+                args: vec![],
+                registry: None,
+                cache: None,
+                offline: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(project_dir.to_path_buf())).await;
+        assert!(res.is_ok(), "Local exec should succeed: {:?}", res.err());
+
+        let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+        assert_eq!(marker_content.trim(), "local-exec-ok");
+    }
+
+    #[tokio::test]
+    async fn test_cli_exec_exit_code_fidelity() {
+        let temp = tempdir().unwrap();
+        let project_dir = temp.path();
+
+        std::fs::write(
+            project_dir.join("package.json"),
+            r#"{"name": "test-project", "version": "1.0.0"}"#,
+        ).unwrap();
+
+        let tool_dir = project_dir.join("node_modules").join("fail-tool");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        std::fs::write(
+            tool_dir.join("index.js"),
+            "process.exit(53);\n",
+        ).unwrap();
+
+        let bin_dir = project_dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        rnpm_shim::create_shims(&bin_dir, "fail-tool", "fail-tool/index.js").unwrap();
+
+        let cli = Cli {
+            command: Commands::Exec {
+                package: "fail-tool".to_string(),
+                args: vec![],
+                registry: None,
+                cache: None,
+                offline: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(project_dir.to_path_buf())).await;
+        assert!(res.is_err(), "Exec with non-zero exit code must return an error");
+
+        let err = res.unwrap_err();
+        let script_err = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>()
+            .expect("Error must downcast to ScriptExitError to preserve exit code");
+        assert_eq!(script_err.exit_code, 53, "Exit code must faithfully be 53");
+    }
+
+    fn make_tarball_with_bin(pkg_name: &str, version: &str, bin_name: &str, script_content: &str) -> Vec<u8> {
+        let manifest_json = serde_json::json!({
+            "name": pkg_name,
+            "version": version,
+            "bin": {
+                bin_name: format!("bin/{bin_name}.js")
+            }
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+        let script_bytes = script_content.as_bytes();
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut gz);
+            let mut header = Header::new_gnu();
+            header.set_size(manifest_bytes.len() as u64);
+            header.set_mode(0o644);
+            let path = "package/package.json";
+            header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, Cursor::new(manifest_bytes)).unwrap();
+
+            let mut bin_header = Header::new_gnu();
+            bin_header.set_size(script_bytes.len() as u64);
+            bin_header.set_mode(0o755);
+            let bin_path = format!("package/bin/{bin_name}.js");
+            bin_header.as_mut_bytes()[..bin_path.len()].copy_from_slice(bin_path.as_bytes());
+            bin_header.set_cksum();
+            builder.append(&bin_header, Cursor::new(script_bytes)).unwrap();
+
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
+        let project_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+
+        let marker_file = project_dir.path().join("dynamic_exec_marker.txt");
+        let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+        let script = format!("require('fs').writeFileSync('{escaped_marker}', 'dynamic-exec-ok');\n");
+
+        let pkg_tar = make_tarball_with_bin("mock-cli-tool", "1.0.0", "mock-cli-tool", &script);
+        let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{local_addr}/");
+        let su = server_url.clone();
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    accept_res = listener.accept() => {
+                        if let Ok((mut stream, _)) = accept_res {
+                            let pkg_int_c = pkg_int.clone();
+                            let pkg_tar_c = pkg_tar.clone();
+                            let su_c = su.clone();
+
+                            tokio::spawn(async move {
+                                let mut buf = vec![0u8; 4096];
+                                let n = stream.read(&mut buf).await.unwrap_or(0);
+                                if n > 0 {
+                                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                    let (status, headers, body) = if req_str.contains("GET /mock-cli-tool") {
+                                        let json = serde_json::json!({
+                                            "name": "mock-cli-tool",
+                                            "dist-tags": { "latest": "1.0.0" },
+                                            "versions": {
+                                                "1.0.0": {
+                                                    "name": "mock-cli-tool",
+                                                    "version": "1.0.0",
+                                                    "bin": { "mock-cli-tool": "bin/mock-cli-tool.js" },
+                                                    "dist": {
+                                                        "tarball": format!("{su_c}tarballs/mock-cli-tool.tgz"),
+                                                        "integrity": pkg_int_c
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                    } else if req_str.contains("GET /tarballs/mock-cli-tool.tgz") {
+                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], pkg_tar_c)
+                                    } else {
+                                        (404, vec![], b"Not Found".to_vec())
+                                    };
+
+                                    let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                    let mut response = format!(
+                                        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                        body.len()
+                                    );
+                                    for (k, v) in headers {
+                                        response.push_str(&format!("{k}: {v}\r\n"));
+                                    }
+                                    response.push_str("\r\n");
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    let _ = stream.write_all(&body).await;
+                                    let _ = stream.flush().await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        let cli = Cli {
+            command: Commands::Exec {
+                package: "mock-cli-tool".to_string(),
+                args: vec![],
+                registry: Some(server_url),
+                cache: Some(cache_dir.path().to_path_buf()),
+                offline: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(project_dir.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Dynamic exec should succeed: {:?}", res.err());
+
+        let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+        assert_eq!(marker_content.trim(), "dynamic-exec-ok");
+
+        // Verify that the ephemeral cache directory was populated
+        let npx_dir = cache_dir.path().join("_npx").join("mock-cli-tool");
+        assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
+        assert!(npx_dir.join("package.json").exists(), "Ephemeral package.json must exist");
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_cli_run_workspaces_with_filter_and_scope() {
+        let root_dir = tempdir().unwrap();
+        let marker_file = root_dir.path().join("cli_filter_marker.txt");
+        let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+        // Root package.json with workspaces
+        std::fs::write(
+            root_dir.path().join("package.json"),
+            r#"{"name": "monorepo-root", "workspaces": ["packages/*"]}"#,
+        ).unwrap();
+
+        // Package @scope/core
+        let core_dir = root_dir.path().join("packages").join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(
+            core_dir.join("package.json"),
+            format!(r#"{{"name": "@scope/core", "version": "1.0.0", "scripts": {{"test-filter": "node -e \"require('fs').appendFileSync('{escaped_marker}', '@scope/core\\n')\""}}}}"#),
+        ).unwrap();
+
+        // Package @scope/ui
+        let ui_dir = root_dir.path().join("packages").join("ui");
+        std::fs::create_dir_all(&ui_dir).unwrap();
+        std::fs::write(
+            ui_dir.join("package.json"),
+            format!(r#"{{"name": "@scope/ui", "version": "1.0.0", "dependencies": {{"@scope/core": "1.0.0"}}, "scripts": {{"test-filter": "node -e \"require('fs').appendFileSync('{escaped_marker}', '@scope/ui\\n')\""}}}}"#),
+        ).unwrap();
+
+        // Package app-web (outside @scope)
+        let app_dir = root_dir.path().join("packages").join("app-web");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("package.json"),
+            format!(r#"{{"name": "app-web", "version": "1.0.0", "scripts": {{"test-filter": "node -e \"require('fs').appendFileSync('{escaped_marker}', 'app-web\\n')\""}}}}"#),
+        ).unwrap();
+
+        // Run `rnpm run test-filter --filter @scope/*`
+        let cli = Cli {
+            command: Commands::Run {
+                script: "test-filter".to_string(),
+                args: vec![],
+                workspaces: true,
+                workspace: vec![],
+                filter: vec!["@scope/*".to_string()],
+                scope: vec![],
+                if_present: false,
+                ignore_scripts: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(root_dir.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Filtered workspace run should succeed: {:?}", res.err());
+
+        let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+        let lines: Vec<&str> = marker_content.lines().collect();
+        assert_eq!(lines, vec!["@scope/core", "@scope/ui"]);
+    }
+

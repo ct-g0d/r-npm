@@ -26,6 +26,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rnpm-lockfile = { workspace = true }
+rnpm-shim = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 serde = { workspace = true }

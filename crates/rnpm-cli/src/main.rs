@@ -53,6 +53,7 @@ pub(crate) enum Commands {
     },
 
     /// Run arbitrary package scripts
+    #[command(alias = "run-script")]
     Run {
         /// Script name declared in package.json
         script: String,
@@ -69,6 +70,14 @@ pub(crate) enum Commands {
         #[arg(long = "workspace")]
         workspace: Vec<String>,
 
+        /// Filter workspace packages by name, scope (@scope, @scope/*), glob (ui-*), or path
+        #[arg(long = "filter")]
+        filter: Vec<String>,
+
+        /// Filter workspace packages by scope or name (alias of filter)
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+
         /// If true, do not fail if a package does not declare the script
         #[arg(long)]
         if_present: bool,
@@ -76,6 +85,29 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+    },
+
+    /// Run arbitrary package binaries dynamically (npx equivalent)
+    #[command(alias = "npx", alias = "x")]
+    Exec {
+        /// Package name or binary to execute
+        package: String,
+
+        /// Additional arguments passed to the binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Offline mode (only use cache)
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Pack project into a tarball archive
@@ -159,7 +191,7 @@ where
 
     let unsupported_commands = [
         "publish", "login", "adduser", "logout", "token", "team",
-        "audit", "fix", "exec", "npx", "outdated", "deprecate",
+        "audit", "fix", "outdated", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
         "view", "info", "search", "stars", "star", "unstar",
         "ping", "whoami", "version", "init", "create",
@@ -256,23 +288,30 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 summary.packages_installed
             );
         }
-        Commands::Run { script, args, workspaces, workspace, if_present, ignore_scripts } => {
+        Commands::Run {
+            script,
+            args,
+            workspaces,
+            workspace,
+            filter,
+            scope,
+            if_present,
+            ignore_scripts,
+        } => {
             let manifest_path = current_dir.join("package.json");
             if !manifest_path.exists() {
-                eprintln!("rnpm ERR! code ENOENT: package.json not found in {}", current_dir.display());
-                std::process::exit(1);
+                return Err(anyhow::anyhow!("code ENOENT: package.json not found in {}", current_dir.display()));
             }
 
             let manifest = Manifest::from_file(&manifest_path)?;
 
-            if workspaces || !workspace.is_empty() {
+            let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
+            if workspaces || has_filter {
                 let discovered = rnpm_core::workspace::discover_workspaces_from_manifest(&current_dir, &manifest)
                     .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
 
                 if discovered.is_empty() {
-                    eprintln!("npm error code ENOWORKSPACES");
-                    eprintln!("npm error No workspaces found in {}", current_dir.display());
-                    std::process::exit(1);
+                    return Err(anyhow::anyhow!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", current_dir.display()));
                 }
 
                 let graph = rnpm_solver::WorkspaceDependencyGraph::construct(&discovered)
@@ -287,10 +326,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     })
                     .collect();
 
-                let filter = if workspace.is_empty() {
+                let mut combined_filters = Vec::new();
+                combined_filters.extend(workspace);
+                combined_filters.extend(filter);
+                combined_filters.extend(scope);
+
+                let filter_opt = if combined_filters.is_empty() {
                     None
                 } else {
-                    Some(workspace)
+                    Some(combined_filters)
                 };
 
                 let ws_opts = rnpm_lifecycle::WorkspaceRunOptions {
@@ -298,7 +342,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     args,
                     ignore_scripts,
                     if_present,
-                    filter_members: filter,
+                    filter_members: filter_opt,
                 };
 
                 let summary = rnpm_lifecycle::execute_workspace_scripts_topological(
@@ -317,8 +361,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 let script_cmd = match manifest.scripts.get(&script) {
                     Some(cmd) => cmd,
                     None => {
-                        eprintln!("rnpm ERR! missing script: {script}");
-                        std::process::exit(1);
+                        return Err(anyhow::anyhow!("missing script: {script}"));
                     }
                 };
 
@@ -333,20 +376,145 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ctx.package_version = manifest.version.clone();
 
                 if !ignore_scripts {
-                    match execute_lifecycle_script(&ctx) {
-                        Ok(status) => {
-                            if let Some(code) = status.code() {
-                                if code != 0 {
-                                    std::process::exit(code);
+                    let status = execute_lifecycle_script(&ctx)?;
+                    if !status.success() {
+                        let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                            exit_code: code,
+                            message: format!("Lifecycle script '{}' failed with exit code: {}", script, code),
+                        }));
+                    }
+                }
+            }
+        }
+        Commands::Exec {
+            package,
+            args,
+            registry,
+            cache,
+            offline,
+        } => {
+            // 1. Check local node_modules/.bin first
+            let local_bin = rnpm_lifecycle::find_local_binary(&current_dir, &package);
+            let binary_to_run = if let Some(bin_path) = local_bin {
+                bin_path
+            } else {
+                // Not found locally: resolve and install into ephemeral _npx cache
+                let cache_path = cache.clone().unwrap_or_else(|| {
+                    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                        PathBuf::from(appdata).join("rnpm").join("cache")
+                    } else {
+                        std::env::temp_dir().join(".rnpm-cache")
+                    }
+                });
+
+                let safe_spec: String = package
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+                    .collect();
+
+                let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+                let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &package);
+
+                if let Some(target) = bin_target {
+                    target
+                } else {
+                    if offline {
+                        return Err(anyhow::anyhow!(
+                            "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
+                            package
+                        ));
+                    }
+
+                    std::fs::create_dir_all(&npx_env_dir)?;
+
+                    // Parse package and version/range
+                    let (pkg_name, version_req) = if let Some(stripped) = package.strip_prefix('@') {
+                        if let Some(idx) = stripped.find('@') {
+                            (format!("@{}", &stripped[..idx]), stripped[idx + 1..].to_string())
+                        } else {
+                            (package.clone(), "*".to_string())
+                        }
+                    } else if let Some(idx) = package.find('@') {
+                        (package[..idx].to_string(), package[idx + 1..].to_string())
+                    } else {
+                        (package.clone(), "*".to_string())
+                    };
+
+                    let minimal_manifest = serde_json::json!({
+                        "name": "rnpm-exec-env",
+                        "version": "1.0.0",
+                        "dependencies": {
+                            pkg_name.clone(): version_req
+                        }
+                    });
+
+                    std::fs::write(
+                        npx_env_dir.join("package.json"),
+                        serde_json::to_string_pretty(&minimal_manifest)?,
+                    )?;
+
+                    let install_options = InstallOptions {
+                        project_dir: npx_env_dir.clone(),
+                        registry_url: registry,
+                        cache_dir: Some(cache_path.clone()),
+                        offline: false,
+                        ignore_scripts: false,
+                    };
+
+                    let mut installer = Installer::new(install_options)?;
+                    installer.run().await?;
+
+                    // Now locate binary in npx_env_dir
+                    if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &package) {
+                        target
+                    } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name) {
+                        target
+                    } else {
+                        // Scan .bin folder in npx_env_dir for any executable
+                        let bin_dir = npx_env_dir.join("node_modules").join(".bin");
+                        let mut found = None;
+                        if bin_dir.is_dir() {
+                            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.is_file() {
+                                        found = Some(p);
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("rnpm ERR! lifecycle script failed: {e}");
-                            std::process::exit(1);
-                        }
+                        found.ok_or_else(|| anyhow::anyhow!(
+                            "Could not determine binary to run for package '{}'",
+                            package
+                        ))?
                     }
                 }
+            };
+
+            // Execute the resolved binary with ancestor bin directories prepended to PATH
+            let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(&current_dir);
+            if let Some(parent_bin) = binary_to_run.parent() {
+                if !path_entries.contains(&parent_bin.to_path_buf()) {
+                    path_entries.insert(0, parent_bin.to_path_buf());
+                }
+            }
+
+            let status = rnpm_lifecycle::execute_binary_async(
+                &binary_to_run,
+                &args,
+                &current_dir,
+                &path_entries,
+                &std::collections::HashMap::new(),
+            ).await?;
+
+            if !status.success() {
+                let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: format!("Process exited with status code: {}", code),
+                }));
             }
         }
         Commands::Pack {
@@ -557,6 +725,9 @@ async fn main() {
     };
 
     if let Err(err) = run_cli(cli, None).await {
+        if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+            std::process::exit(exit_err.exit_code);
+        }
         print_structured_error(&err);
         std::process::exit(1);
     }

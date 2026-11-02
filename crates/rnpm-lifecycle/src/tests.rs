@@ -793,3 +793,161 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
     assert!(res.is_ok(), "Large 60-package topological lifecycle execution should succeed");
 }
+
+#[test]
+fn test_glob_match_and_matches_filter() {
+    let root = PathBuf::from("/workspace/monorepo");
+    let member_path = root.join("packages").join("ui-button");
+
+    // Exact matches
+    assert!(matches_filter("ui-button", "ui-button", &member_path, &root));
+    assert!(!matches_filter("ui-card", "ui-button", &member_path, &root));
+
+    // Scoped matches
+    let scoped_path = root.join("packages").join("core");
+    assert!(matches_filter("@scope/core", "@scope/core", &scoped_path, &root));
+    assert!(matches_filter("@scope", "@scope/core", &scoped_path, &root));
+    assert!(matches_filter("@scope/*", "@scope/core", &scoped_path, &root));
+    assert!(matches_filter("@scope/c*", "@scope/core", &scoped_path, &root));
+    assert!(!matches_filter("@other", "@scope/core", &scoped_path, &root));
+
+    // Glob matches
+    assert!(matches_filter("ui-*", "ui-button", &member_path, &root));
+    assert!(matches_filter("*-button", "ui-button", &member_path, &root));
+    assert!(matches_filter("ui-b?tt?n", "ui-button", &member_path, &root));
+    assert!(!matches_filter("api-*", "ui-button", &member_path, &root));
+
+    // Path matches
+    assert!(matches_filter("packages/ui-button", "ui-button", &member_path, &root));
+    assert!(matches_filter("./packages/ui-button", "ui-button", &member_path, &root));
+    assert!(matches_filter("packages/*", "ui-button", &member_path, &root));
+    assert!(!matches_filter("apps/*", "ui-button", &member_path, &root));
+}
+
+#[test]
+fn test_find_local_binary_and_ancestor_collection() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // Create root node_modules/.bin
+    let bin_dir = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+
+    let bin_name = if cfg!(windows) { "my-tool.cmd" } else { "my-tool" };
+    let bin_file = bin_dir.join(bin_name);
+    std::fs::write(&bin_file, "dummy content").unwrap();
+
+    // Create deep child directory
+    let child_dir = root.join("packages").join("nested").join("deep");
+    std::fs::create_dir_all(&child_dir).unwrap();
+
+    // find_local_binary traversing up from child_dir must find my-tool
+    let found = find_local_binary(&child_dir, "my-tool");
+    assert!(found.is_some(), "Should find my-tool in ancestor node_modules/.bin");
+    let found_path = found.unwrap();
+    assert_eq!(found_path.file_name().unwrap(), std::ffi::OsStr::new(bin_name));
+
+    // collect_ancestor_bin_dirs should include the ancestor bin dir
+    let ancestor_bins = collect_ancestor_bin_dirs(&child_dir);
+    assert!(ancestor_bins.contains(&bin_dir));
+}
+
+#[tokio::test]
+async fn test_execute_binary_exit_code_fidelity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // Write a node script that exits with custom non-zero code 42
+    let script = root.join("exit_with_code.js");
+    std::fs::write(&script, "process.exit(42);").unwrap();
+
+    let status = execute_binary_async(
+        &script,
+        &[],
+        root,
+        &[],
+        &HashMap::new(),
+    ).await.expect("Binary spawn should execute");
+
+    assert!(!status.success());
+    let code = extract_exit_status_code(&status);
+    assert_eq!(code, 42, "Exit status code must be preserved faithfully as 42");
+}
+
+#[tokio::test]
+async fn test_execute_workspace_scripts_with_filter_and_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("filter_exec_order.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let mut members = Vec::new();
+    let packages = [
+        ("@scope/core", "packages/core"),
+        ("@scope/ui", "packages/ui"),
+        ("app-web", "apps/web"),
+        ("app-docs", "apps/docs"),
+    ];
+
+    for (name, rel_path) in &packages {
+        let pkg_dir = root.join(rel_path);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.to_string());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.scripts.insert(
+            "build".to_string(),
+            format!("node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}\\n')\""),
+        );
+
+        members.push(WorkspaceScriptMember {
+            name: name.to_string(),
+            path: pkg_dir,
+            manifest,
+        });
+    }
+
+    // Topological order: @scope/core -> @scope/ui -> app-web -> app-docs
+    let topo_order = vec![
+        "@scope/core".to_string(),
+        "@scope/ui".to_string(),
+        "app-web".to_string(),
+        "app-docs".to_string(),
+    ];
+
+    // 1. Run with filter = Some(vec!["@scope/*"])
+    let opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: Some(vec!["@scope/*".to_string()]),
+    };
+
+    let summary = execute_workspace_scripts_topological(root, &members, &topo_order, &opts)
+        .await
+        .expect("Filtered execution should succeed");
+
+    assert_eq!(summary.executed_packages, vec!["@scope/core", "@scope/ui"]);
+
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["@scope/core", "@scope/ui"]);
+
+    // 2. Run with unmatched filter should return error
+    let bad_opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: Some(vec!["nonexistent-*".to_string()]),
+    };
+
+    let err_res = execute_workspace_scripts_topological(root, &members, &topo_order, &bad_opts).await;
+    assert!(err_res.is_err());
+    let err_msg = err_res.unwrap_err().to_string();
+    assert!(err_msg.contains("No workspace packages matched the filter/scope criteria"));
+}
+
