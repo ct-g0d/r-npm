@@ -61,6 +61,18 @@ pub(crate) enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
@@ -129,6 +141,80 @@ pub(crate) enum Commands {
     },
 }
 
+pub(crate) fn check_unsupported_cli_invocation<I, T>(raw_args: I) -> Option<(String, String)>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .map(|a| a.into().to_string_lossy().to_string())
+        .collect();
+
+    if args.len() < 2 {
+        return None;
+    }
+
+    let first = &args[1];
+
+    let unsupported_commands = [
+        "publish", "login", "adduser", "logout", "token", "team",
+        "audit", "fix", "exec", "npx", "outdated", "deprecate",
+        "access", "profile", "org", "doctor", "fund", "explain",
+        "view", "info", "search", "stars", "star", "unstar",
+        "ping", "whoami", "version", "init", "create",
+    ];
+
+    if unsupported_commands.contains(&first.as_str()) {
+        return Some((
+            "ERR_UNSUPPORTED_COMMAND".to_string(),
+            format!(
+                "npm error code ERR_UNSUPPORTED_COMMAND\n\
+                 npm error The command '{}' is not currently implemented in rnpm.\n\
+                 npm error See docs/compatibility-contract.md for the active compatibility surface.",
+                first
+            ),
+        ));
+    }
+
+    let unsupported_flags = [
+        "--legacy-peer-deps",
+        "--global",
+        "-g",
+    ];
+
+    for arg in &args[1..] {
+        if unsupported_flags.contains(&arg.as_str()) {
+            return Some((
+                "ERR_UNSUPPORTED_FLAG".to_string(),
+                format!(
+                    "npm error code ERR_UNSUPPORTED_FLAG\n\
+                     npm error The flag '{}' is not supported by rnpm.\n\
+                     npm error See docs/compatibility-contract.md for supported options.",
+                    arg
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+pub(crate) fn print_structured_error(err: &anyhow::Error) {
+    let err_str = format!("{:#}", err);
+    if err_str.contains("Unsupported protocol") {
+        eprintln!("npm error code ERR_UNSUPPORTED_PROTOCOL");
+        eprintln!("npm error {err_str}");
+        eprintln!("npm error Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
+    } else if err_str.contains("ERR_UNSUPPORTED_COMMAND") {
+        eprintln!("{err_str}");
+    } else if err_str.contains("ERR_UNSUPPORTED_FLAG") {
+        eprintln!("{err_str}");
+    } else {
+        eprintln!("rnpm ERR! {err_str}");
+    }
+}
+
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let current_dir = match dir {
         Some(d) => d,
@@ -170,7 +256,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 summary.packages_installed
             );
         }
-        Commands::Run { script, args, ignore_scripts } => {
+        Commands::Run { script, args, workspaces, workspace, if_present, ignore_scripts } => {
             let manifest_path = current_dir.join("package.json");
             if !manifest_path.exists() {
                 eprintln!("rnpm ERR! code ENOENT: package.json not found in {}", current_dir.display());
@@ -178,36 +264,87 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
 
             let manifest = Manifest::from_file(&manifest_path)?;
-            let script_cmd = match manifest.scripts.get(&script) {
-                Some(cmd) => cmd,
-                None => {
-                    eprintln!("rnpm ERR! missing script: {script}");
+
+            if workspaces || !workspace.is_empty() {
+                let discovered = rnpm_core::workspace::discover_workspaces_from_manifest(&current_dir, &manifest)
+                    .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
+
+                if discovered.is_empty() {
+                    eprintln!("npm error code ENOWORKSPACES");
+                    eprintln!("npm error No workspaces found in {}", current_dir.display());
                     std::process::exit(1);
                 }
-            };
 
-            let full_cmd = if args.is_empty() {
-                script_cmd.clone()
+                let graph = rnpm_solver::WorkspaceDependencyGraph::construct(&discovered)
+                    .map_err(|e| anyhow::anyhow!("Workspace dependency graph error: {e}"))?;
+
+                let members: Vec<rnpm_lifecycle::WorkspaceScriptMember> = discovered
+                    .into_iter()
+                    .map(|m| rnpm_lifecycle::WorkspaceScriptMember {
+                        name: m.name,
+                        path: m.path,
+                        manifest: m.manifest,
+                    })
+                    .collect();
+
+                let filter = if workspace.is_empty() {
+                    None
+                } else {
+                    Some(workspace)
+                };
+
+                let ws_opts = rnpm_lifecycle::WorkspaceRunOptions {
+                    script,
+                    args,
+                    ignore_scripts,
+                    if_present,
+                    filter_members: filter,
+                };
+
+                let summary = rnpm_lifecycle::execute_workspace_scripts_topological(
+                    &current_dir,
+                    &members,
+                    &graph.topological_order,
+                    &ws_opts,
+                ).await?;
+
+                println!(
+                    "rnpm: executed script in {} workspace package(s) ({} skipped)",
+                    summary.executed_packages.len(),
+                    summary.skipped_packages.len()
+                );
             } else {
-                format!("{script_cmd} {}", args.join(" "))
-            };
+                let script_cmd = match manifest.scripts.get(&script) {
+                    Some(cmd) => cmd,
+                    None => {
+                        eprintln!("rnpm ERR! missing script: {script}");
+                        std::process::exit(1);
+                    }
+                };
 
-            let pkg_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
-            let mut ctx = LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
-            ctx.package_version = manifest.version.clone();
+                let full_cmd = if args.is_empty() {
+                    script_cmd.clone()
+                } else {
+                    format!("{script_cmd} {}", args.join(" "))
+                };
 
-            if !ignore_scripts {
-                match execute_lifecycle_script(&ctx) {
-                    Ok(status) => {
-                        if let Some(code) = status.code() {
-                            if code != 0 {
-                                std::process::exit(code);
+                let pkg_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
+                let mut ctx = LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
+                ctx.package_version = manifest.version.clone();
+
+                if !ignore_scripts {
+                    match execute_lifecycle_script(&ctx) {
+                        Ok(status) => {
+                            if let Some(code) = status.code() {
+                                if code != 0 {
+                                    std::process::exit(code);
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("rnpm ERR! lifecycle script failed: {e}");
-                        std::process::exit(1);
+                        Err(e) => {
+                            eprintln!("rnpm ERR! lifecycle script failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -393,13 +530,36 @@ fn format_bytes(bytes: u64, space: bool) -> String {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
-    run_cli(cli, None).await
+    if let Some((_, msg)) = check_unsupported_cli_invocation(std::env::args_os()) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let rendered = e.render().to_string();
+            if rendered.contains("unrecognized subcommand") {
+                let first_arg = std::env::args().nth(1).unwrap_or_default();
+                eprintln!("npm error code ERR_UNSUPPORTED_COMMAND");
+                eprintln!("npm error The command '{first_arg}' is not currently implemented in rnpm.");
+                eprintln!("npm error See docs/compatibility-contract.md for the active compatibility surface.");
+            } else {
+                eprintln!("{rendered}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(err) = run_cli(cli, None).await {
+        print_structured_error(&err);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
