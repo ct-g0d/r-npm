@@ -1,0 +1,11 @@
+{
+  "name": "pkg-45",
+  "version": "1.0.0",
+  "description": "pkg-45 (Tier 3) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-15": "workspace:*",
+    "pkg-30": "workspace:^"
+  },
+  "scripts": {}
+}

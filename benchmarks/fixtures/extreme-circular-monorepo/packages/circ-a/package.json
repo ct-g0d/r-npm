@@ -1,0 +1,9 @@
+{
+  "name": "circ-a",
+  "version": "1.0.0",
+  "description": "Circular workspace dependency participant A",
+  "main": "index.js",
+  "dependencies": {
+    "circ-b": "workspace:*"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "pkg-51",
+  "version": "1.0.0",
+  "description": "pkg-51 (Tier 4) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-44": "workspace:~",
+    "pkg-45": "workspace:*",
+    "pkg-30": "workspace:^",
+    "commander": "11.0.0"
+  },
+  "scripts": {
+    "preinstall": "node -e \"console.log('pkg-51 preinstall');\"",
+    "postinstall": "node -e \"console.log('pkg-51 postinstall');\""
+  },
+  "bin": {
+    "pkg-51-cli": "./bin/cli.js"
+  }
+}

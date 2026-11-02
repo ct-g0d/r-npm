@@ -1,0 +1,18 @@
+{
+  "name": "pkg-52",
+  "version": "1.0.0",
+  "description": "pkg-52 (Tier 5) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-01": "workspace:*",
+    "pkg-15": "workspace:*",
+    "pkg-26": "workspace:*",
+    "pkg-41": "workspace:*",
+    "pkg-49": "workspace:*",
+    "pkg-50": "workspace:*",
+    "pkg-51": "workspace:*"
+  },
+  "scripts": {
+    "test": "node -e \"console.log('pkg-52 integration test suite running');\""
+  }
+}

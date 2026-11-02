@@ -1,0 +1,12 @@
+{
+  "name": "pkg-32",
+  "version": "1.0.0",
+  "description": "pkg-32 (Tier 2) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-17": "workspace:~",
+    "pkg-18": "workspace:*",
+    "pkg-07": "workspace:^"
+  },
+  "scripts": {}
+}

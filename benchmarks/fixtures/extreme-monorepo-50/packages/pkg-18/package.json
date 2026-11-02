@@ -1,0 +1,11 @@
+{
+  "name": "pkg-18",
+  "version": "1.0.0",
+  "description": "pkg-18 (Tier 1) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-08": "workspace:*",
+    "pkg-09": "workspace:^"
+  },
+  "scripts": {}
+}

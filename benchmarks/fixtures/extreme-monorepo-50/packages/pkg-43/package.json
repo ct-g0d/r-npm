@@ -1,0 +1,11 @@
+{
+  "name": "pkg-43",
+  "version": "1.0.0",
+  "description": "pkg-43 (Tier 3) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-13": "workspace:^",
+    "pkg-28": "workspace:~"
+  },
+  "scripts": {}
+}

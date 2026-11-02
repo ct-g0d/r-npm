@@ -1,0 +1,18 @@
+{
+  "name": "pkg-26",
+  "version": "1.0.0",
+  "description": "pkg-26 (Tier 2) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-11": "workspace:~",
+    "pkg-12": "workspace:*",
+    "pkg-01": "workspace:^",
+    "lodash": "4.17.20"
+  },
+  "scripts": {
+    "preinstall": "node -e \"console.log('pkg-26 preinstall');\"",
+    "install": "node -e \"console.log('pkg-26 install');\"",
+    "postinstall": "node -e \"console.log('pkg-26 postinstall');\"",
+    "prepare": "node -e \"console.log('pkg-26 prepare');\""
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "pkg-40",
+  "version": "1.0.0",
+  "description": "pkg-40 (Tier 2) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-25": "workspace:^",
+    "pkg-11": "workspace:~",
+    "pkg-05": "workspace:*"
+  },
+  "scripts": {}
+}

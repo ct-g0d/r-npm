@@ -1350,6 +1350,83 @@ fn test_optional_peer_absent_not_auto_downloaded() {
 }
 
 #[test]
+fn test_extreme_monorepo_50_fixture() {
+    use rnpm_core::workspace::discover_workspaces;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use std::path::PathBuf;
+
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/fixtures/extreme-monorepo-50");
+    if !fixture_dir.exists() {
+        return;
+    }
+
+    let members = discover_workspaces(&fixture_dir)
+        .expect("Must discover all workspace members in extreme-monorepo-50");
+    assert_eq!(members.len(), 52, "Must discover exactly 52 workspace packages");
+
+    // Construct DAG and compute topological order
+    let graph = WorkspaceDependencyGraph::construct(&members)
+        .expect("WorkspaceDependencyGraph must construct without errors for extreme-monorepo-50");
+
+    assert_eq!(graph.topological_order.len(), 52);
+
+    let pos = |name: &str| {
+        graph
+            .topological_order
+            .iter()
+            .position(|p| p == name)
+            .unwrap_or_else(|| panic!("Package {} missing in topological order", name))
+    };
+
+    // Verify critical lifecycle ordering
+    assert!(pos("pkg-01") < pos("pkg-15"), "pkg-01 must precede pkg-15");
+    assert!(pos("pkg-15") < pos("pkg-49"), "pkg-15 must precede pkg-49");
+    assert!(pos("pkg-49") < pos("pkg-52"), "pkg-49 must precede pkg-52");
+    assert!(pos("pkg-50") < pos("pkg-52"), "pkg-50 must precede pkg-52");
+    assert!(pos("pkg-51") < pos("pkg-52"), "pkg-51 must precede pkg-52");
+
+    // Tier 0 packages must precede Tier 1
+    assert!(pos("pkg-01") < pos("pkg-11"));
+    assert!(pos("pkg-02") < pos("pkg-12"));
+    assert!(pos("pkg-05") < pos("pkg-15"));
+
+    // Tier 1 packages must precede Tier 2 diamonds
+    assert!(pos("pkg-11") < pos("pkg-26"));
+    assert!(pos("pkg-12") < pos("pkg-26"));
+}
+
+#[test]
+fn test_extreme_circular_monorepo_fixture() {
+    use rnpm_core::workspace::discover_workspaces;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use crate::error::SolverError;
+    use std::path::PathBuf;
+
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/fixtures/extreme-circular-monorepo");
+    if !fixture_dir.exists() {
+        return;
+    }
+
+    let members = discover_workspaces(&fixture_dir)
+        .expect("Must discover workspace members in extreme-circular-monorepo");
+    assert_eq!(members.len(), 2, "Must discover exactly 2 workspace packages");
+
+    let result = WorkspaceDependencyGraph::construct(&members);
+    assert!(result.is_err(), "Must detect circular dependency");
+    match result.unwrap_err() {
+        SolverError::CycleDetected(msg) => {
+            assert!(msg.contains("Circular workspace dependency detected"));
+            assert!(msg.contains("circ-a"));
+            assert!(msg.contains("circ-b"));
+        }
+        other => panic!("Expected CycleDetected error, got: {:?}", other),
+    }
+}
+
+
+#[test]
 fn test_peer_conflict_rich_diagnostics() {
     let mut provider = InMemoryPackageProvider::new();
 

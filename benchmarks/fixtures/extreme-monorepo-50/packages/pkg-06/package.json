@@ -1,0 +1,8 @@
+{
+  "name": "pkg-06",
+  "version": "1.0.0",
+  "description": "pkg-06 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {},
+  "scripts": {}
+}

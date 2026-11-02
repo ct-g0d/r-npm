@@ -1,0 +1,15 @@
+{
+  "name": "pkg-01",
+  "version": "1.0.0",
+  "description": "pkg-01 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "bytes": "^3.1.2"
+  },
+  "scripts": {
+    "preinstall": "node -e \"console.log('pkg-01 preinstall');\"",
+    "install": "node -e \"console.log('pkg-01 install');\"",
+    "postinstall": "node -e \"console.log('pkg-01 postinstall');\"",
+    "prepare": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', { recursive: true }); fs.writeFileSync('dist/pkg-01-artifact.json', JSON.stringify({ name: 'pkg-01', timestamp: Date.now() })); console.log('pkg-01 prepare created dist/pkg-01-artifact.json');\""
+  }
+}
