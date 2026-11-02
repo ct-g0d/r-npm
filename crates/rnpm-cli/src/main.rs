@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use rnpm_core::manifest::Manifest;
-use rnpm_install::{InstallOptions, Installer};
+use rnpm_install::{InstallOptions, Installer, UninstallOptions};
 use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
 
 #[derive(Parser, Debug)]
@@ -70,8 +70,23 @@ enum Commands {
     Pack,
 
     /// Remove a package from project dependencies
+    #[command(alias = "remove", alias = "rm", alias = "r", alias = "un")]
     Uninstall {
-        package: String,
+        /// Package names to uninstall
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Remove only from devDependencies
+        #[arg(short = 'D', long = "save-dev")]
+        save_dev: bool,
+
+        /// Remove only from optionalDependencies
+        #[arg(short = 'O', long = "save-optional")]
+        save_optional: bool,
+
+        /// Remove only from regular dependencies
+        #[arg(short = 'P', long = "save-prod", alias = "save")]
+        save_prod: bool,
     },
 
     /// Update packages
@@ -170,8 +185,32 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: 'pack' command workflow is scheduled for Phase 5.");
             std::process::exit(1);
         }
-        Commands::Uninstall { .. } | Commands::Update { .. } => {
-            eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: mutation workflow is scheduled for Phase 5.");
+        Commands::Uninstall {
+            packages,
+            save_dev,
+            save_optional,
+            save_prod,
+        } => {
+            let options = InstallOptions {
+                project_dir: current_dir,
+                ..Default::default()
+            };
+            let installer = Installer::new(options)?;
+            let uninstall_options = UninstallOptions {
+                packages,
+                save_dev,
+                save_optional,
+                save_prod,
+            };
+            let summary = installer.uninstall(&uninstall_options)?;
+            println!(
+                "rnpm: removed {} package(s), pruned {} unreferenced dependencies",
+                summary.removed_packages.len(),
+                summary.pruned_dependencies.len()
+            );
+        }
+        Commands::Update { .. } => {
+            eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: update workflow is scheduled for Phase 5.");
             std::process::exit(1);
         }
     }

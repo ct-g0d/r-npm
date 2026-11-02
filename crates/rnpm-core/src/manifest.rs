@@ -163,4 +163,32 @@ impl Manifest {
             Some(PackageWorkspaces::Config { packages }) => packages.clone(),
         }
     }
+
+    /// Serialize manifest to a deterministic formatted JSON string with a trailing newline.
+    pub fn to_json_string(&self) -> Result<String, ManifestError> {
+        let mut json = serde_json::to_string_pretty(self).map_err(|err| ManifestError::MalformedJson {
+            message: err.to_string(),
+            line: err.line(),
+            column: err.column(),
+        })?;
+        json.push('\n');
+        Ok(json)
+    }
+
+    /// Save the manifest deterministically to disk.
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), ManifestError> {
+        let path = path.as_ref();
+        let content = self.to_json_string()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ManifestError::Io {
+                path: parent.to_path_buf(),
+                source: err,
+            })?;
+        }
+        fs::write(path, content).map_err(|err| ManifestError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        Ok(())
+    }
 }

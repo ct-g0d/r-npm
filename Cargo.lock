@@ -1029,6 +1029,8 @@ dependencies = [
  "rnpm-core",
  "rnpm-install",
  "rnpm-lifecycle",
+ "rnpm-lockfile",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1148,9 +1150,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rnpm-core",
+ "rnpm-lockfile",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
