@@ -849,3 +849,92 @@ async fn test_tarball_stream_concurrency_permit_retention() {
     // Permit is now released back to semaphore!
     assert_eq!(client.semaphore().available_permits(), 1, "Permit must be released when TarballStream is dropped");
 }
+
+#[tokio::test]
+async fn test_security_redirect_loop_detected() {
+    let server = TestHttpServer::start(|mut stream, _, _| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+
+        // Redirect back to /loop
+        let resp = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.download_tarball_bytes(&format!("{}loop", server.url())).await.unwrap_err();
+    match err {
+        RegistryError::SecurityViolation(msg) => {
+            assert!(msg.contains("Redirect loop detected"), "Expected 'Redirect loop detected', got: {msg}");
+        }
+        other => panic!("Expected RegistryError::SecurityViolation, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_security_redirect_to_unsupported_scheme() {
+    let server = TestHttpServer::start(|mut stream, _, _| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+
+        let resp = "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.download_tarball_bytes(&format!("{}leak", server.url())).await.unwrap_err();
+    match err {
+        RegistryError::SecurityViolation(msg) => {
+            assert!(msg.contains("Redirect to unsupported scheme"), "Expected 'Redirect to unsupported scheme', got: {msg}");
+        }
+        other => panic!("Expected RegistryError::SecurityViolation, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_security_redirect_crlf_injection() {
+    let server = TestHttpServer::start(|mut stream, _, _| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+
+        // Raw bytes with CRLF in Location header value (if sent as bytes)
+        let resp = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/evil\r\nX-Injected: true\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.download_tarball_bytes(&format!("{}crlf", server.url())).await.unwrap_err();
+    match err {
+        RegistryError::SecurityViolation(_) | RegistryError::Http(_) => {
+            // Expected either security violation or reqwest parser rejection of invalid header
+        }
+        other => panic!("Expected SecurityViolation or Http error on CRLF in Location, got: {other:?}"),
+    }
+}

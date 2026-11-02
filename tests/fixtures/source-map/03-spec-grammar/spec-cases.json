@@ -1,0 +1,58 @@
+{
+  "subsystem": "npm-package-arg",
+  "cases": [
+    {
+      "input": "lodash@^4.17.21",
+      "expected_type": "range",
+      "name": "lodash",
+      "spec": "^4.17.21"
+    },
+    {
+      "input": "chalk@latest",
+      "expected_type": "tag",
+      "name": "chalk",
+      "spec": "latest"
+    },
+    {
+      "input": "@scope/foo@1.0.0",
+      "expected_type": "version",
+      "name": "@scope/foo",
+      "spec": "1.0.0"
+    },
+    {
+      "input": "my-react@npm:react@^18.2.0",
+      "expected_type": "alias",
+      "name": "my-react",
+      "alias_target": "react",
+      "spec": "^18.2.0"
+    },
+    {
+      "input": "local-dep@file:../local-dir",
+      "expected_type": "directory",
+      "name": "local-dep",
+      "path": "../local-dir"
+    },
+    {
+      "input": "tar-dep@file:./pkg.tgz",
+      "expected_type": "file",
+      "name": "tar-dep",
+      "path": "./pkg.tgz"
+    },
+    {
+      "input": "git-dep@github:npm/cli#v10.0.0",
+      "expected_type": "git",
+      "name": "git-dep",
+      "git_host": "github"
+    },
+    {
+      "input": "remote-tar@https://example.com/pkg-1.0.0.tgz",
+      "expected_type": "remote",
+      "name": "remote-tar"
+    },
+    {
+      "input": "bad-dep@ftp://example.com/pkg.tgz",
+      "expected_error": "EUNSUPPORTEDPROTOCOL",
+      "name": "bad-dep"
+    }
+  ]
+}

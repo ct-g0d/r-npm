@@ -1,0 +1,9 @@
+{
+  "name": "fixture-fs-extraction",
+  "version": "1.0.0",
+  "description": "Source map fixture verifying archive prefix stripping and extraction limits",
+  "files": [
+    "index.js",
+    "lib/"
+  ]
+}

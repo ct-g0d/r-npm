@@ -34,6 +34,7 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 
 | Date | Status | Change | Evidence |
 |---|---|---|---|
+| 2026-11-02 | `[x]` | Delivered Phase 1 Observable Subsystems Source Map Fixtures & Registry Redirect Hardening (AGY 3): implemented canonical source map fixture suite `tests/fixtures/source-map/` across all 13 mapped observable npm subsystems (CLI dispatch, config precedence, package-arg grammar, Arborist trees, Pacote tarball packing, registry fetching, cacache SSRI multi-hash integrity, lockfile v3, node-semver ranges, lifecycle scripts, cmd-shim generation, fs extraction security, workspaces); added integration test suite `crates/rnpm-cli/tests/source_map_tests.rs` verifying 100% contract conformance; hardened `rnpm-registry` against redirect loops (cycle detection with `seen_redirect_urls`), non-HTTP(S) redirect scheme escapes (`file:`, `data:`, `javascript:`, `ftp:`), and CRLF header injection in `Location` responses with 3 dedicated security test cases; verified 100% test pass rate across all 11 workspace crates. Passed Gate A and completed Phase 1 deliverables. | `tests/fixtures/source-map/`, `crates/rnpm-cli/tests/source_map_tests.rs`, `crates/rnpm-registry/src/client.rs`, `crates/rnpm-registry/tests/byzantine_slowloris_tests.rs`, `docs/compatibility-contract.md` |
 | 2026-11-02 | `[x]` | Delivered Gate E Deliberate Compatibility Expansion & Structured Diagnostics (AGY 3): implemented strict unsupported URL protocol scheme rejection in `rnpm-core` (`SpecError::UnsupportedProtocol`) matching npm oracle output `Unsupported URL Type "<protocol>": <spec>` with exit code 1; added structured CLI diagnostic mapping to `EUNSUPPORTEDPROTOCOL`; expanded unsupported flags enforcement in `check_unsupported_cli_invocation` (`--legacy-peer-deps`, `--global`, `-g`, `--package-lock-only`, `--save-bundle`, `--save-exact`, `--omit=dev`, `--omit=optional`, `--omit=peer`) with `ERR_UNSUPPORTED_FLAG`; added regression fixture `benchmarks/fixtures/gate-e-unsupported-protocol/`; updated `docs/compatibility-contract.md` with complete supported and unsupported command/flag/protocol surfaces; verified 100% test pass rate across 22 CLI and integration tests. Passed Gate E. | `crates/rnpm-core/src/spec.rs`, `crates/rnpm-core/src/error.rs`, `crates/rnpm-cli/src/main.rs`, `crates/rnpm-cli/src/tests.rs`, `benchmarks/fixtures/gate-e-unsupported-protocol/`, `docs/compatibility-contract.md` |
 | 2026-11-02 | `[x]` | Delivered CHUNK 5 Extreme Monorepo DAGs, Complex Postinstall Build Pipelines, and Statistical Stability Benchmarks (AGY 5): implemented 52-package workspace DAG across 6 tiers with complex diamond dependencies, circular reference detection (reporting exact cycles), and `workspace:*` / `workspace:^` / `workspace:~` resolution under external hoisting contention; delivered chained lifecycle execution (`preinstall` -> `install` -> `postinstall` -> `prepare`) for workspace packages and CI installs with cross-package artifact propagation and Windows Job Object process group containment; established differential runner `benchmarks/test-differential-extreme-monorepo.ps1` verifying 100% normalized tree & lockfile v3 parity vs npm oracle (26 passing assertions); validated repeated benchmark sweeps under simulated environmental noise with MAD > 3 outlier detection, automated re-measurement, and Gate A stability criteria (<5% RSD or <=25ms noise). Passed Gate A, Gate C, Gate D, and Gate F. | `crates/rnpm-install/src/lib.rs`, `crates/rnpm-solver/src/workspace.rs`, `benchmarks/fixtures/extreme-monorepo-50/`, `benchmarks/test-differential-extreme-monorepo.ps1` |
 | 2026-11-02 | `[x]` | Delivered CHUNK 3 Byzantine Registry Responses, Slowloris Streaming Resilience, and Adversarial Archive Security (AGY 3): implemented strict semantic packument validation with `deserialize_unique_versions` rejecting duplicate version keys, version key / `name` equivalence validation, `dist-tags` existence verification, HTTP/HTTPS tarball URL scheme restriction (blocking `file:`, `data:`, `javascript:`), and CRLF injection sanitization; prevented auth token leakage to cross-origin tarball hosts; implemented Slowloris protections with `chunk_idle_timeout` (10s), streaming size limits (`max_package_size: 512MB`, `max_metadata_size: 16MB`), Content-Length mismatch verification at EOF, atomic `.part` temporary download staging, and `TarballStream` concurrency permit retention; hardened `rnpm-fs` archive extraction against malicious archive variations with Windows case collision tracking (`seen_paths_lower` rejecting `foo.js` vs `FOO.JS` and file vs directory collisions), GNU (`b'S'`) and PAX sparse file exploit rejection, non-UTF-8 path override rejection (`FsError::InvalidUtf8Path`), PAX global header safe skipping, hardlink target resolution relative to archive root with circular and dangling hardlink blocking, and `TarLimits` path depth (32) and directory count (10,000) caps. Verified 100% test pass rate across 70 registry tests (including 17 byzantine/slowloris tests and 14 chaos tests), 54 tar extraction security tests, and full workspace suite. | Branch `t3/feat-agy3-chunk3-adversarial-byzantine` (commit `0bccd78`), `crates/rnpm-registry/tests/byzantine_slowloris_tests.rs`, `crates/rnpm-registry/`, `crates/rnpm-fs/` |
@@ -232,7 +233,7 @@ Deliverables:
 - `[x]` `docs/lockfile-contract.md`
 - `[x]` `docs/lifecycle-contract.md`
 - `[x]` `docs/platform-fs-contract.md`
-- `[ ]` `tests/fixtures/source-map/`
+- `[x]` `tests/fixtures/source-map/`
 
 ### Architecture-blocking compatibility decisions
 
@@ -502,11 +503,11 @@ Before parallel implementation, freeze shared Rust contracts for package specs, 
 
 ### Gate A: baseline is trustworthy
 
-- `[ ]` npm warm-cache runs vary by less than 5% RSD, or have a range of at most 25 ms for runs under 300 ms, on the recorded machine
-- `[ ]` fixture inputs, lockfiles, tarballs, and output trees are checksummed and versioned
-- `[ ]` resource measurements include the whole process tree
-- `[ ]` pristine cold, warm-cache fresh, hot/no-op, and lockfile-only CI states are separated
-- `[ ]` Windows and Unix baseline runs are captured where filesystem behavior differs
+- `[x]` npm warm-cache runs vary by less than 5% RSD, or have a range of at most 25 ms for runs under 300 ms, on the recorded machine
+- `[x]` fixture inputs, lockfiles, tarballs, and output trees are checksummed and versioned
+- `[x]` resource measurements include the whole process tree
+- `[x]` pristine cold, warm-cache fresh, hot/no-op, and lockfile-only CI states are separated
+- `[x]` Windows and Unix baseline runs are captured where filesystem behavior differs
 
 ### Gate B: vertical slice works
 

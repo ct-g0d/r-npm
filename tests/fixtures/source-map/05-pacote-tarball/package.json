@@ -1,0 +1,13 @@
+{
+  "name": "fixture-pacote-tarball",
+  "version": "1.0.0",
+  "description": "Source map fixture verifying Pacote packing/unpacking and SSRI integrity",
+  "main": "index.js",
+  "bin": {
+    "pacote-tool": "./bin/tool.js"
+  },
+  "files": [
+    "index.js",
+    "bin/"
+  ]
+}

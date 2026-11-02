@@ -1,0 +1,19 @@
+{
+  "subsystem": "cacache-ssri",
+  "cases": [
+    {
+      "integrity": "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==",
+      "expected_algorithm": "sha512",
+      "valid": true
+    },
+    {
+      "integrity": "sha256-ungWv48Bz+pBQUDeUb4nGlAG+OGsSxL+q41upnoa28Y= sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==",
+      "preferred_algorithm": "sha512",
+      "valid": true
+    },
+    {
+      "integrity": "invalid-algo-prefix",
+      "valid": false
+    }
+  ]
+}

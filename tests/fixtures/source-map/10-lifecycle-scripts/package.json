@@ -1,0 +1,10 @@
+{
+  "name": "fixture-lifecycle-scripts",
+  "version": "1.0.0",
+  "scripts": {
+    "preinstall": "node -e \"console.log('preinstall:' + process.env.npm_lifecycle_event)\"",
+    "install": "node -e \"console.log('install:' + process.env.npm_lifecycle_event)\"",
+    "postinstall": "node -e \"console.log('postinstall:' + process.env.npm_lifecycle_event)\"",
+    "test-env": "node -e \"console.log('cwd:' + process.env.INIT_CWD)\""
+  }
+}

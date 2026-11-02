@@ -846,6 +846,8 @@ impl RegistryClient {
         loop {
             let mut current_url = initial_url.clone();
             let mut redirect_count = 0;
+            let mut seen_redirect_urls: HashSet<Url> = HashSet::new();
+            seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
                 let mut req = self.client.request(method.clone(), current_url.clone());
@@ -894,10 +896,26 @@ impl RegistryClient {
                                 ))
                             }
                         };
+                        if loc_str.contains('\r') || loc_str.contains('\n') {
+                            break Err(RegistryError::SecurityViolation(
+                                "Location header contains forbidden CR/LF characters".into(),
+                            ));
+                        }
                         let next_url = match current_url.join(loc_str) {
                             Ok(u) => u,
                             Err(e) => break Err(RegistryError::UrlParse(e)),
                         };
+                        let next_scheme = next_url.scheme().to_ascii_lowercase();
+                        if next_scheme != "http" && next_scheme != "https" {
+                            break Err(RegistryError::SecurityViolation(format!(
+                                "Redirect to unsupported scheme '{next_scheme}': only http and https are allowed"
+                            )));
+                        }
+                        if !seen_redirect_urls.insert(next_url.clone()) {
+                            break Err(RegistryError::SecurityViolation(format!(
+                                "Redirect loop detected: '{next_url}' was visited more than once"
+                            )));
+                        }
                         debug!("Following redirect {} -> {}", current_url, next_url);
                         current_url = next_url;
                         continue;

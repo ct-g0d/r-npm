@@ -105,8 +105,11 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
   - `403 Forbidden` -> `E403`
   - `404 Not Found` -> `E404`
   - `429 Too Many Requests` -> `E429`
-- **Credential Containment (Security Boundary):**
-  - **Redirects:** If an HTTP redirect points to a different host (e.g. CDN storage bucket on S3/Cloudflare), `Authorization` headers must be stripped immediately.
+- **Credential Containment & Redirect Security (Security Boundary):**
+  - **Redirect Auth Stripping:** If an HTTP redirect points to a different host (e.g. CDN storage bucket on S3/Cloudflare), `Authorization` headers must be stripped immediately.
+  - **Redirect Cycle Detection:** Maintain a set of visited URLs (`seen_redirect_urls`); abort immediately with `RegistryError::SecurityViolation` upon detecting a redirect loop.
+  - **Redirect Scheme Restriction:** Strictly reject redirects to non-HTTP(S) schemes (e.g. `file:`, `data:`, `javascript:`, `ftp:`) with `RegistryError::SecurityViolation`.
+  - **CRLF Header Defense:** Validate `Location` header against CR/LF characters (`\r`, `\n`) to prevent HTTP response splitting.
   - **Process Environment:** Auth tokens (`_authToken`) and passwords must NEVER be passed into environment variables (`process.env`) of child lifecycle scripts.
 
 ### 4.5. Lockfile v3 Serialization & Migration
