@@ -1,0 +1,25 @@
+{
+  "_id": "pkg-deep-shared",
+  "name": "pkg-deep-shared",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-shared",
+      "version": "1.0.0",
+      "description": "Deep chain shared dependency node",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "b32440f72e845d53b7675c5d39c0059ebd270736",
+        "integrity": "sha512-4wqtauWnW//P53cGtwRMTG44pzHoUFTxMRe8UFSyS2crKyx9mMmnF1ng1lpDwNX2YIymq+oARF3hWSV52yUbcQ==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-shared/-/pkg-deep-shared-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

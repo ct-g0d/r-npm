@@ -191,6 +191,137 @@ try {
     $treeCmp3 = (node $StatsUtil compare-trees "$npmUnDir\node_modules" "$rnpmUnDir\node_modules") | ConvertFrom-Json
     Assert-Condition ($treeCmp3.match -eq $true) "Tree parity after express uninstall & transitive pruning" ($treeCmp3.mismatches -join "; ")
 
+    # Mutation 4: Scoped Package Uninstall Edge Cases (@scope/pkg-alpha, @scope/pkg-beta)
+    Write-Host "`n[1.5] Testing Scoped Packages Uninstall Edge Cases..." -ForegroundColor Gray
+    $npmScopedDir = Join-Path $TempBase "npm-scoped"
+    $rnpmScopedDir = Join-Path $TempBase "rnpm-scoped"
+
+    New-Item -ItemType Directory -Path $npmScopedDir | Out-Null
+    New-Item -ItemType Directory -Path $rnpmScopedDir | Out-Null
+
+    $scopedPkgJson = @'
+{
+  "name": "tier2-scoped-uninstall",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@scope/pkg-alpha": "^1.0.0",
+    "@scope/pkg-beta": "^1.0.0"
+  }
+}
+'@
+    Set-Content -Path (Join-Path $npmScopedDir "package.json") -Value $scopedPkgJson
+    Set-Content -Path (Join-Path $rnpmScopedDir "package.json") -Value $scopedPkgJson
+
+    $null = cmd.exe /c "cd /d `"$npmScopedDir`" && $NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm install scoped packages setup succeeded"
+
+    $null = cmd.exe /c "cd /d `"$rnpmScopedDir`" && `"$RnpmPath`" install --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm install scoped packages setup succeeded"
+
+    $treeCmpScopedInit = (node $StatsUtil compare-trees "$npmScopedDir\node_modules" "$rnpmScopedDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpScopedInit.match -eq $true) "Initial scoped packages tree parity" ($treeCmpScopedInit.mismatches -join "; ")
+
+    $lockCmpScopedInit = (node $StatsUtil compare-lockfiles "$npmScopedDir\package-lock.json" "$rnpmScopedDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpScopedInit.match -eq $true) "Initial scoped packages lockfile parity" ($lockCmpScopedInit.mismatches -join "; ")
+
+    # Sub-test 1.5.1: Uninstall @scope/pkg-alpha (parent @scope dir MUST remain because @scope/pkg-beta exists)
+    $null = cmd.exe /c "cd /d `"$npmScopedDir`" && $NpmPath uninstall @scope/pkg-alpha --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm uninstall @scope/pkg-alpha exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmScopedDir`" && `"$RnpmPath`" uninstall @scope/pkg-alpha 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm uninstall @scope/pkg-alpha exited with 0"
+
+    Assert-Condition (-not (Test-Path "$rnpmScopedDir\node_modules\@scope\pkg-alpha")) "rnpm removed node_modules/@scope/pkg-alpha"
+    Assert-Condition (Test-Path "$rnpmScopedDir\node_modules\@scope\pkg-beta") "rnpm preserved sibling node_modules/@scope/pkg-beta"
+    Assert-Condition (Test-Path "$rnpmScopedDir\node_modules\@scope") "rnpm retained non-empty parent node_modules/@scope directory"
+
+    $treeCmpScoped1 = (node $StatsUtil compare-trees "$npmScopedDir\node_modules" "$rnpmScopedDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpScoped1.match -eq $true) "Tree parity after partial scoped uninstall" ($treeCmpScoped1.mismatches -join "; ")
+
+    $lockCmpScoped1 = (node $StatsUtil compare-lockfiles "$npmScopedDir\package-lock.json" "$rnpmScopedDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpScoped1.match -eq $true) "Lockfile parity after partial scoped uninstall" ($lockCmpScoped1.mismatches -join "; ")
+
+    # Sub-test 1.5.2: Uninstall remaining @scope/pkg-beta (parent @scope dir MUST now be pruned)
+    $null = cmd.exe /c "cd /d `"$npmScopedDir`" && $NpmPath uninstall @scope/pkg-beta --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm uninstall @scope/pkg-beta exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmScopedDir`" && `"$RnpmPath`" uninstall @scope/pkg-beta 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm uninstall @scope/pkg-beta exited with 0"
+
+    Assert-Condition (-not (Test-Path "$rnpmScopedDir\node_modules\@scope\pkg-beta")) "rnpm removed node_modules/@scope/pkg-beta"
+    Assert-Condition (-not (Test-Path "$rnpmScopedDir\node_modules\@scope")) "rnpm pruned now-empty parent node_modules/@scope directory"
+
+    $treeCmpScoped2 = (node $StatsUtil compare-trees "$npmScopedDir\node_modules" "$rnpmScopedDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpScoped2.match -eq $true) "Tree parity after full scoped uninstall" ($treeCmpScoped2.mismatches -join "; ")
+
+    $lockCmpScoped2 = (node $StatsUtil compare-lockfiles "$npmScopedDir\package-lock.json" "$rnpmScopedDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpScoped2.match -eq $true) "Lockfile parity after full scoped uninstall" ($lockCmpScoped2.mismatches -join "; ")
+
+    # Mutation 5: Deep Dependency Tree & Transitive Pruning Edge Cases
+    Write-Host "`n[1.6] Testing Deep Dependency Tree & Transitive Pruning Edge Cases..." -ForegroundColor Gray
+    $npmDeepDir = Join-Path $TempBase "npm-deep"
+    $rnpmDeepDir = Join-Path $TempBase "rnpm-deep"
+
+    New-Item -ItemType Directory -Path $npmDeepDir | Out-Null
+    New-Item -ItemType Directory -Path $rnpmDeepDir | Out-Null
+
+    $deepPkgJson = @'
+{
+  "name": "tier2-deep-uninstall",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pkg-deep-a": "^1.0.0",
+    "pkg-deep-shared": "^1.0.0"
+  }
+}
+'@
+    Set-Content -Path (Join-Path $npmDeepDir "package.json") -Value $deepPkgJson
+    Set-Content -Path (Join-Path $rnpmDeepDir "package.json") -Value $deepPkgJson
+
+    $null = cmd.exe /c "cd /d `"$npmDeepDir`" && $NpmPath install --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm install deep tree setup succeeded"
+
+    $null = cmd.exe /c "cd /d `"$rnpmDeepDir`" && `"$RnpmPath`" install --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm install deep tree setup succeeded"
+
+    $treeCmpDeepInit = (node $StatsUtil compare-trees "$npmDeepDir\node_modules" "$rnpmDeepDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpDeepInit.match -eq $true) "Initial deep tree parity" ($treeCmpDeepInit.mismatches -join "; ")
+
+    # Verify all chain members exist initially: a -> b -> c -> d -> (e, shared)
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-a") "pkg-deep-a installed"
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-b") "pkg-deep-b installed"
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-c") "pkg-deep-c installed"
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-d") "pkg-deep-d installed"
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-e") "pkg-deep-e installed"
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-shared") "pkg-deep-shared installed"
+
+    # Uninstall root of deep chain 'pkg-deep-a'
+    $null = cmd.exe /c "cd /d `"$npmDeepDir`" && $NpmPath uninstall pkg-deep-a --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm uninstall pkg-deep-a exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmDeepDir`" && `"$RnpmPath`" uninstall pkg-deep-a 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm uninstall pkg-deep-a exited with 0"
+
+    # Direct package removed
+    Assert-Condition (-not (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-a")) "rnpm removed direct dependency pkg-deep-a"
+
+    # Entire unreferenced deep chain b->c->d->e must be pruned
+    Assert-Condition (-not (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-b")) "rnpm pruned deep transitive pkg-deep-b"
+    Assert-Condition (-not (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-c")) "rnpm pruned deep transitive pkg-deep-c"
+    Assert-Condition (-not (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-d")) "rnpm pruned deep transitive pkg-deep-d"
+    Assert-Condition (-not (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-e")) "rnpm pruned deep transitive pkg-deep-e"
+
+    # Shared dependency must be retained because root package.json explicitly depends on it
+    Assert-Condition (Test-Path "$rnpmDeepDir\node_modules\pkg-deep-shared") "rnpm preserved shared dependency pkg-deep-shared"
+
+    $treeCmpDeep = (node $StatsUtil compare-trees "$npmDeepDir\node_modules" "$rnpmDeepDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpDeep.match -eq $true) "Tree parity after deep uninstall and transitive pruning" ($treeCmpDeep.mismatches -join "; ")
+
+    $lockCmpDeep = (node $StatsUtil compare-lockfiles "$npmDeepDir\package-lock.json" "$rnpmDeepDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpDeep.match -eq $true) "Lockfile parity after deep uninstall and transitive pruning" ($lockCmpDeep.mismatches -join "; ")
+
     # =========================================================================
     # PART 2: Tier 2 Update Mutation Differential Tests
     # =========================================================================
@@ -260,6 +391,175 @@ try {
 
     $lockCmpUp = (node $StatsUtil compare-lockfiles "$npmUpDir\package-lock.json" "$rnpmUpDir\package-lock.json") | ConvertFrom-Json
     Assert-Condition ($lockCmpUp.match -eq $true) "Lockfile parity after full update (npm vs rnpm)" ($lockCmpUp.mismatches -join "; ")
+
+    # Mutation 4: Update with Pre-Release Ranges (pkg-prerelease 1.1.0-alpha.1 -> 1.1.0-alpha.2)
+    Write-Host "`n[2.4] Testing Update with Pre-Release Ranges..." -ForegroundColor Gray
+    $npmPreDir = Join-Path $TempBase "npm-prerelease"
+    $rnpmPreDir = Join-Path $TempBase "rnpm-prerelease"
+
+    New-Item -ItemType Directory -Path $npmPreDir | Out-Null
+    New-Item -ItemType Directory -Path $rnpmPreDir | Out-Null
+
+    $prePkgJson = @'
+{
+  "name": "tier2-prerelease-update",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pkg-prerelease": "^1.1.0-alpha.1"
+  }
+}
+'@
+    $preLockJson = @'
+{
+  "name": "tier2-prerelease-update",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "tier2-prerelease-update",
+      "version": "1.0.0",
+      "dependencies": {
+        "pkg-prerelease": "^1.1.0-alpha.1"
+      }
+    },
+    "node_modules/pkg-prerelease": {
+      "version": "1.1.0-alpha.1",
+      "resolved": "http://127.0.0.1:4873/pkg-prerelease/-/pkg-prerelease-1.1.0-alpha.1.tgz",
+      "integrity": "sha512-2WSJOwkiT9RlVWn0iqYrdoJQw61FsTH7CJuuC/isADI5Pa/NQTv3OSoodOmqqB7TIk45Fqmq1DzU1S34k+OFkw=="
+    }
+  }
+}
+'@
+    Set-Content -Path (Join-Path $npmPreDir "package.json") -Value $prePkgJson
+    Set-Content -Path (Join-Path $rnpmPreDir "package.json") -Value $prePkgJson
+    Set-Content -Path (Join-Path $npmPreDir "package-lock.json") -Value $preLockJson
+    Set-Content -Path (Join-Path $rnpmPreDir "package-lock.json") -Value $preLockJson
+
+    $null = cmd.exe /c "cd /d `"$npmPreDir`" && $NpmPath ci --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm ci prerelease setup succeeded"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPreDir`" && `"$RnpmPath`" ci --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm ci prerelease setup succeeded"
+
+    $npmPreInit = (Get-Content "$npmPreDir\node_modules\pkg-prerelease\package.json" -Raw | ConvertFrom-Json).version
+    $rnpmPreInit = (Get-Content "$rnpmPreDir\node_modules\pkg-prerelease\package.json" -Raw | ConvertFrom-Json).version
+    Assert-Condition ($npmPreInit -eq "1.1.0-alpha.1" -and $rnpmPreInit -eq "1.1.0-alpha.1") "Initial prerelease version is 1.1.0-alpha.1 in both trees"
+
+    # Targeted update of pkg-prerelease within prerelease range ^1.1.0-alpha.1
+    $null = cmd.exe /c "cd /d `"$npmPreDir`" && $NpmPath update pkg-prerelease --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm update pkg-prerelease exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPreDir`" && `"$RnpmPath`" update pkg-prerelease --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm update pkg-prerelease exited with 0"
+
+    $npmPreUpdated = (Get-Content "$npmPreDir\node_modules\pkg-prerelease\package.json" -Raw | ConvertFrom-Json).version
+    $rnpmPreUpdated = (Get-Content "$rnpmPreDir\node_modules\pkg-prerelease\package.json" -Raw | ConvertFrom-Json).version
+    Assert-Condition ($npmPreUpdated -eq "1.1.0-alpha.2") "npm updated pkg-prerelease to 1.1.0-alpha.2"
+    Assert-Condition ($rnpmPreUpdated -eq "1.1.0-alpha.2") "rnpm updated pkg-prerelease to 1.1.0-alpha.2"
+
+    $treeCmpPre = (node $StatsUtil compare-trees "$npmPreDir\node_modules" "$rnpmPreDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpPre.match -eq $true) "Tree parity after prerelease range update" ($treeCmpPre.mismatches -join "; ")
+
+    $lockCmpPre = (node $StatsUtil compare-lockfiles "$npmPreDir\package-lock.json" "$rnpmPreDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpPre.match -eq $true) "Lockfile parity after prerelease range update" ($lockCmpPre.mismatches -join "; ")
+
+    # Mutation 5: Update with Peer Dependencies
+    Write-Host "`n[2.5] Testing Update with Peer Dependencies..." -ForegroundColor Gray
+    $npmPeerDir = Join-Path $TempBase "npm-peer"
+    $rnpmPeerDir = Join-Path $TempBase "rnpm-peer"
+
+    New-Item -ItemType Directory -Path $npmPeerDir | Out-Null
+    New-Item -ItemType Directory -Path $rnpmPeerDir | Out-Null
+
+    $peerPkgJson = @'
+{
+  "name": "tier2-peer-update",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "pkg-peer-host": "^1.0.0",
+    "pkg-peer-plugin": "^1.0.0"
+  }
+}
+'@
+    $peerLockJson = @'
+{
+  "name": "tier2-peer-update",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "tier2-peer-update",
+      "version": "1.0.0",
+      "dependencies": {
+        "pkg-peer-host": "^1.0.0",
+        "pkg-peer-plugin": "^1.0.0"
+      }
+    },
+    "node_modules/pkg-peer-host": {
+      "version": "1.0.0",
+      "resolved": "http://127.0.0.1:4873/pkg-peer-host/-/pkg-peer-host-1.0.0.tgz",
+      "integrity": "sha512-WWtw8dsy9VcvGVukGtnYZMSISWkcS3RD/kcGTKCa/tZK0dvVS919C+oTVoRozOsVTtc+pk4moMNbxqHOBPyj1g=="
+    },
+    "node_modules/pkg-peer-plugin": {
+      "version": "1.0.0",
+      "resolved": "http://127.0.0.1:4873/pkg-peer-plugin/-/pkg-peer-plugin-1.0.0.tgz",
+      "integrity": "sha512-7rufNnoWV6Asw0G+QwW8b9AnI6PJyClU0a7T9Kta87VOWlHcUYvDInlNa3H1iPUlx6O/j/KhEGbNanYN4kdBww==",
+      "peerDependencies": {
+        "pkg-peer-host": ">=1.0.0"
+      }
+    }
+  }
+}
+'@
+    Set-Content -Path (Join-Path $npmPeerDir "package.json") -Value $peerPkgJson
+    Set-Content -Path (Join-Path $rnpmPeerDir "package.json") -Value $peerPkgJson
+    Set-Content -Path (Join-Path $npmPeerDir "package-lock.json") -Value $peerLockJson
+    Set-Content -Path (Join-Path $rnpmPeerDir "package-lock.json") -Value $peerLockJson
+
+    $null = cmd.exe /c "cd /d `"$npmPeerDir`" && $NpmPath ci --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm ci peer dependencies setup succeeded"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPeerDir`" && `"$RnpmPath`" ci --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm ci peer dependencies setup succeeded"
+
+    # Targeted update of peer host only
+    $null = cmd.exe /c "cd /d `"$npmPeerDir`" && $NpmPath update pkg-peer-host --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm update pkg-peer-host exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPeerDir`" && `"$RnpmPath`" update pkg-peer-host --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm update pkg-peer-host exited with 0"
+
+    $npmHostUp = (Get-Content "$npmPeerDir\node_modules\pkg-peer-host\package.json" -Raw | ConvertFrom-Json).version
+    $rnpmHostUp = (Get-Content "$rnpmPeerDir\node_modules\pkg-peer-host\package.json" -Raw | ConvertFrom-Json).version
+    Assert-Condition ($npmHostUp -eq "1.1.0" -and $rnpmHostUp -eq "1.1.0") "Targeted update updated pkg-peer-host to 1.1.0 in both"
+
+    $npmPlugPreserved = (Get-Content "$npmPeerDir\node_modules\pkg-peer-plugin\package.json" -Raw | ConvertFrom-Json).version
+    $rnpmPlugPreserved = (Get-Content "$rnpmPeerDir\node_modules\pkg-peer-plugin\package.json" -Raw | ConvertFrom-Json).version
+    Assert-Condition ($npmPlugPreserved -eq "1.0.0" -and $rnpmPlugPreserved -eq "1.0.0") "Targeted update preserved pkg-peer-plugin at 1.0.0 in both"
+
+    $treeCmpPeerTarget = (node $StatsUtil compare-trees "$npmPeerDir\node_modules" "$rnpmPeerDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpPeerTarget.match -eq $true) "Tree parity after targeted peer host update" ($treeCmpPeerTarget.mismatches -join "; ")
+
+    # Full update of peer project
+    $null = cmd.exe /c "cd /d `"$npmPeerDir`" && $NpmPath update --registry $RegistryUrl --no-audit --no-fund 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "npm update (all) for peer project exited with 0"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPeerDir`" && `"$RnpmPath`" update --registry $RegistryUrl 2>&1"
+    Assert-Condition ($LASTEXITCODE -eq 0) "rnpm update (all) for peer project exited with 0"
+
+    $npmPlugUp = (Get-Content "$npmPeerDir\node_modules\pkg-peer-plugin\package.json" -Raw | ConvertFrom-Json).version
+    $rnpmPlugUp = (Get-Content "$rnpmPeerDir\node_modules\pkg-peer-plugin\package.json" -Raw | ConvertFrom-Json).version
+    Assert-Condition ($npmPlugUp -eq "1.1.0" -and $rnpmPlugUp -eq "1.1.0") "Full update updated pkg-peer-plugin to 1.1.0 in both"
+
+    $treeCmpPeerFull = (node $StatsUtil compare-trees "$npmPeerDir\node_modules" "$rnpmPeerDir\node_modules") | ConvertFrom-Json
+    Assert-Condition ($treeCmpPeerFull.match -eq $true) "Tree parity after full peer update" ($treeCmpPeerFull.mismatches -join "; ")
+
+    $lockCmpPeerFull = (node $StatsUtil compare-lockfiles "$npmPeerDir\package-lock.json" "$rnpmPeerDir\package-lock.json") | ConvertFrom-Json
+    Assert-Condition ($lockCmpPeerFull.match -eq $true) "Lockfile parity after full peer update" ($lockCmpPeerFull.mismatches -join "; ")
 
     # =========================================================================
     # PART 3: Tier 2 Pack Mutation Differential Tests
@@ -399,6 +699,113 @@ console.log(JSON.stringify(entries));
     Assert-Condition ($hasLib) "Tarball contains package/lib/index.js"
     Assert-Condition ($hasBin) "Tarball contains package/bin/tool.js"
     Assert-Condition (-not $hasTempLog) "Tarball excludes unlisted temp.log"
+
+    # Test 3.4: Pack with Complex .npmignore Rules
+    Write-Host "`n[3.4] Testing Pack with Complex .npmignore Rules..." -ForegroundColor Gray
+    $npmPackComplexDir = Join-Path $TempBase "npm-pack-complex"
+    $rnpmPackComplexDir = Join-Path $TempBase "rnpm-pack-complex"
+
+    New-Item -ItemType Directory -Path $npmPackComplexDir | Out-Null
+    New-Item -ItemType Directory -Path $rnpmPackComplexDir | Out-Null
+
+    function Setup-ComplexPackFixture {
+        param([string]$targetDir)
+
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "lib") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "src") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "docs") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "logs") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "temp") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $targetDir "nested\sub") -Force | Out-Null
+
+        Set-Content -Path (Join-Path $targetDir "package.json") -Value @'
+{
+  "name": "tier2-complex-pack",
+  "version": "1.2.0",
+  "description": "Package testing complex npmignore rules and exclusions",
+  "main": "lib/index.js"
+}
+'@
+        Set-Content -Path (Join-Path $targetDir "README.md") -Value "# Tier 2 Complex Pack`nDocumentation and overview."
+        Set-Content -Path (Join-Path $targetDir "LICENSE") -Value "MIT License`nCopyright (c) 2026"
+        Set-Content -Path (Join-Path $targetDir "lib\index.js") -Value "module.exports = { name: 'complex-pack' };"
+        Set-Content -Path (Join-Path $targetDir "lib\util.js") -Value "module.exports = { util: true };"
+        Set-Content -Path (Join-Path $targetDir "lib\util.spec.js") -Value "// spec file that should be ignored"
+        Set-Content -Path (Join-Path $targetDir "src\main.ts") -Value "export const main = 1;"
+        Set-Content -Path (Join-Path $targetDir "docs\guide.md") -Value "# Guide docs"
+        Set-Content -Path (Join-Path $targetDir "docs\api.md") -Value "# API docs"
+        Set-Content -Path (Join-Path $targetDir "logs\app.log") -Value "App log to ignore"
+        Set-Content -Path (Join-Path $targetDir "logs\audit.log") -Value "Audit log to ignore"
+        Set-Content -Path (Join-Path $targetDir "logs\keep-me.log") -Value "Special log to keep via negation rule"
+        Set-Content -Path (Join-Path $targetDir "temp\cache.tmp") -Value "Temp cache to ignore"
+        Set-Content -Path (Join-Path $targetDir "nested\sub\data.txt") -Value "Nested data to keep"
+        Set-Content -Path (Join-Path $targetDir "nested\sub\extra.skip") -Value "Nested skip file to ignore"
+
+        Set-Content -Path (Join-Path $targetDir ".npmignore") -Value @'
+# Ignore log files
+*.log
+# Negation rule to un-ignore specific log
+!keep-me.log
+
+# Ignore test spec files
+*.spec.js
+
+# Directory ignore rules
+docs/
+temp/
+
+# Ignore custom skip extension
+*.skip
+
+# Deliberate attempts to ignore strictly required files (must still be included by npm rules)
+package.json
+README.md
+LICENSE
+'@
+    }
+
+    Setup-ComplexPackFixture -targetDir $npmPackComplexDir
+    Setup-ComplexPackFixture -targetDir $rnpmPackComplexDir
+
+    # Compare Dry-Run JSON output on complex ignore fixture
+    $npmComplexJsonRaw = cmd.exe /c "cd /d `"$npmPackComplexDir`" && $NpmPath pack --dry-run --json 2>&1"
+    $npmComplexJson = $npmComplexJsonRaw | ConvertFrom-Json
+
+    $rnpmComplexJsonRaw = cmd.exe /c "cd /d `"$rnpmPackComplexDir`" && `"$RnpmPath`" pack --dry-run --json 2>&1"
+    $rnpmComplexJson = $rnpmComplexJsonRaw | ConvertFrom-Json
+
+    Assert-Condition ($npmComplexJson[0].name -eq "tier2-complex-pack" -and $rnpmComplexJson[0].name -eq "tier2-complex-pack") "Complex pack name matches in JSON output"
+    Assert-Condition ($npmComplexJson[0].version -eq "1.2.0" -and $rnpmComplexJson[0].version -eq "1.2.0") "Complex pack version matches in JSON output"
+    Assert-Condition ($npmComplexJson[0].filename -eq "tier2-complex-pack-1.2.0.tgz" -and $rnpmComplexJson[0].filename -eq "tier2-complex-pack-1.2.0.tgz") "Complex pack tarball filename matches in JSON output"
+    Assert-Condition ($npmComplexJson[0].entryCount -eq $rnpmComplexJson[0].entryCount) "Complex pack entryCount parity ($($npmComplexJson[0].entryCount))"
+
+    # Actual pack creation on complex ignore fixture
+    $null = cmd.exe /c "cd /d `"$npmPackComplexDir`" && $NpmPath pack 2>&1"
+    Assert-Condition (Test-Path "$npmPackComplexDir\tier2-complex-pack-1.2.0.tgz") "npm created tier2-complex-pack-1.2.0.tgz"
+
+    $null = cmd.exe /c "cd /d `"$rnpmPackComplexDir`" && `"$RnpmPath`" pack 2>&1"
+    Assert-Condition (Test-Path "$rnpmPackComplexDir\tier2-complex-pack-1.2.0.tgz") "rnpm created tier2-complex-pack-1.2.0.tgz"
+
+    # Inspect rnpm generated tarball entries against complex ignore expectations
+    $rnpmComplexEntriesRaw = node $inspectJs "$rnpmPackComplexDir\tier2-complex-pack-1.2.0.tgz"
+    $rnpmComplexEntries = $rnpmComplexEntriesRaw | ConvertFrom-Json
+    $entryNames = $rnpmComplexEntries | ForEach-Object { $_.name }
+
+    Assert-Condition ($entryNames -contains "package/package.json") "Complex pack includes required package/package.json"
+    Assert-Condition ($entryNames -contains "package/README.md") "Complex pack includes required package/README.md"
+    Assert-Condition ($entryNames -contains "package/LICENSE") "Complex pack includes required package/LICENSE"
+    Assert-Condition ($entryNames -contains "package/lib/index.js") "Complex pack includes package/lib/index.js"
+    Assert-Condition ($entryNames -contains "package/lib/util.js") "Complex pack includes package/lib/util.js"
+    Assert-Condition ($entryNames -contains "package/src/main.ts") "Complex pack includes package/src/main.ts"
+    Assert-Condition ($entryNames -contains "package/logs/keep-me.log") "Complex pack includes negated rule package/logs/keep-me.log"
+    Assert-Condition ($entryNames -contains "package/nested/sub/data.txt") "Complex pack includes nested package/nested/sub/data.txt"
+
+    Assert-Condition (-not ($entryNames -contains "package/lib/util.spec.js")) "Complex pack excludes ignored *.spec.js"
+    Assert-Condition (-not ($entryNames -like "*package/docs/*")) "Complex pack excludes ignored docs/ directory"
+    Assert-Condition (-not ($entryNames -like "*package/temp/*")) "Complex pack excludes ignored temp/ directory"
+    Assert-Condition (-not ($entryNames -contains "package/logs/app.log")) "Complex pack excludes ignored logs/app.log"
+    Assert-Condition (-not ($entryNames -contains "package/logs/audit.log")) "Complex pack excludes ignored logs/audit.log"
+    Assert-Condition (-not ($entryNames -contains "package/nested/sub/extra.skip")) "Complex pack excludes ignored *.skip file"
 
 } finally {
     if (-not $KeepTemp -and (Test-Path $TempBase)) {

@@ -1,0 +1,25 @@
+{
+  "_id": "pkg-deep-e",
+  "name": "pkg-deep-e",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-e",
+      "version": "1.0.0",
+      "description": "Deep chain leaf node",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "9a0e9f147c90470ccbea66b2f04127f6ed6cf7f2",
+        "integrity": "sha512-eXxewt1BUPznhv2y7V4eVRifMQhqj62UBdar00N70s0rRqeKRYSPqmv0g5d2PsO1irUNRjJMziZR6axtzUS20g==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-e/-/pkg-deep-e-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

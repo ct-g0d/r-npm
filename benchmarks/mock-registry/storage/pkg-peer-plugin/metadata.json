@@ -1,0 +1,44 @@
+{
+  "_id": "pkg-peer-plugin",
+  "name": "pkg-peer-plugin",
+  "dist-tags": {
+    "latest": "1.1.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-peer-plugin",
+      "version": "1.0.0",
+      "description": "Plugin requiring peer host >=1.0.0",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {
+        "pkg-peer-host": ">=1.0.0"
+      },
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "d183edf65ddf28e9556387c37e93e71f26fbeca5",
+        "integrity": "sha512-7rufNnoWV6Asw0G+QwW8b9AnI6PJyClU0a7T9Kta87VOWlHcUYvDInlNa3H1iPUlx6O/j/KhEGbNanYN4kdBww==",
+        "tarball": "http://127.0.0.1:4873/pkg-peer-plugin/-/pkg-peer-plugin-1.0.0.tgz"
+      }
+    },
+    "1.1.0": {
+      "name": "pkg-peer-plugin",
+      "version": "1.1.0",
+      "description": "Plugin updated to v1.1.0 requiring peer host >=1.0.0",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {
+        "pkg-peer-host": ">=1.0.0"
+      },
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "49c8a702ce8af55be22c209a6b84b681a0408560",
+        "integrity": "sha512-ojZcC8RqjqP69hyLrPe0QhEYEeO76uRRj4RtKCwVX81MEmWCyDRkCr8o7VuSylEQUG+cLzzmmX5SUo+sQG2/Eg==",
+        "tarball": "http://127.0.0.1:4873/pkg-peer-plugin/-/pkg-peer-plugin-1.1.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

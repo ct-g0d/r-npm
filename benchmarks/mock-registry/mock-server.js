@@ -138,7 +138,7 @@ const server = http.createServer((req, res) => {
         const scope = tarballMatch[1];
         const rawName = tarballMatch[2];
         const filename = tarballMatch[3];
-        const pkgName = scope ? `${scope}/${rawName}` : rawName;
+        const pkgName = normalizePkgName(scope ? `${scope}/${rawName}` : rawName);
 
         const candidatePath = path.join(storageDir, pkgName, filename);
         if (fs.existsSync(candidatePath)) {

@@ -453,6 +453,187 @@ const PACKAGES = [
             ].join('\n')
         },
         dependencies: {}
+    },
+
+    // ==========================================
+    // Tier 2: Scoped Packages for Uninstall Parity
+    // ==========================================
+    {
+        name: '@scope/pkg-alpha',
+        version: '1.0.0',
+        description: 'Scoped package alpha for differential mutation testing',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "@scope/pkg-alpha", version: "1.0.0" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: '@scope/pkg-beta',
+        version: '1.0.0',
+        description: 'Scoped package beta for differential mutation testing',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "@scope/pkg-beta", version: "1.0.0" };\n'
+        },
+        dependencies: {}
+    },
+
+    // ==========================================
+    // Tier 2: Deep Dependency Trees for Transitive Pruning Parity
+    // ==========================================
+    {
+        name: 'pkg-deep-a',
+        version: '1.0.0',
+        description: 'Root of deep chain for differential uninstall testing',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'const b = require("pkg-deep-b"); module.exports = { name: "pkg-deep-a", b };\n'
+        },
+        dependencies: {
+            'pkg-deep-b': '^1.0.0'
+        }
+    },
+    {
+        name: 'pkg-deep-b',
+        version: '1.0.0',
+        description: 'Deep chain intermediate level 1',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'const c = require("pkg-deep-c"); module.exports = { name: "pkg-deep-b", c };\n'
+        },
+        dependencies: {
+            'pkg-deep-c': '^1.0.0'
+        }
+    },
+    {
+        name: 'pkg-deep-c',
+        version: '1.0.0',
+        description: 'Deep chain intermediate level 2',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'const d = require("pkg-deep-d"); module.exports = { name: "pkg-deep-c", d };\n'
+        },
+        dependencies: {
+            'pkg-deep-d': '^1.0.0'
+        }
+    },
+    {
+        name: 'pkg-deep-d',
+        version: '1.0.0',
+        description: 'Deep chain intermediate level 3',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'const e = require("pkg-deep-e"); const shared = require("pkg-deep-shared"); module.exports = { name: "pkg-deep-d", e, shared };\n'
+        },
+        dependencies: {
+            'pkg-deep-e': '^1.0.0',
+            'pkg-deep-shared': '^1.0.0'
+        }
+    },
+    {
+        name: 'pkg-deep-e',
+        version: '1.0.0',
+        description: 'Deep chain leaf node',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-deep-e", leaf: true };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-deep-shared',
+        version: '1.0.0',
+        description: 'Deep chain shared dependency node',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-deep-shared", shared: true };\n'
+        },
+        dependencies: {}
+    },
+
+    // ==========================================
+    // Tier 2: Pre-Release Ranges for Update Parity
+    // ==========================================
+    {
+        name: 'pkg-prerelease',
+        version: '1.0.0',
+        description: 'Stable release baseline',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-prerelease", version: "1.0.0" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-prerelease',
+        version: '1.1.0-alpha.1',
+        description: 'Prerelease alpha.1',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-prerelease", version: "1.1.0-alpha.1" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-prerelease',
+        version: '1.1.0-alpha.2',
+        description: 'Prerelease alpha.2',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-prerelease", version: "1.1.0-alpha.2" };\n'
+        },
+        dependencies: {}
+    },
+
+    // ==========================================
+    // Tier 2: Peer Dependencies for Update Parity
+    // ==========================================
+    {
+        name: 'pkg-peer-host',
+        version: '1.0.0',
+        description: 'Peer host package v1.0.0',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-peer-host", version: "1.0.0" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-peer-host',
+        version: '1.1.0',
+        description: 'Peer host package updated v1.1.0',
+        main: 'index.js',
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-peer-host", version: "1.1.0" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-peer-plugin',
+        version: '1.0.0',
+        description: 'Plugin requiring peer host >=1.0.0',
+        main: 'index.js',
+        peerDependencies: {
+            'pkg-peer-host': '>=1.0.0'
+        },
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-peer-plugin", version: "1.0.0" };\n'
+        },
+        dependencies: {}
+    },
+    {
+        name: 'pkg-peer-plugin',
+        version: '1.1.0',
+        description: 'Plugin updated to v1.1.0 requiring peer host >=1.0.0',
+        main: 'index.js',
+        peerDependencies: {
+            'pkg-peer-host': '>=1.0.0'
+        },
+        files: {
+            'package/index.js': 'module.exports = { name: "pkg-peer-plugin", version: "1.1.0" };\n'
+        },
+        dependencies: {}
     }
 ];
 
@@ -474,11 +655,16 @@ function build() {
         const pkgDir = path.join(STORAGE_DIR, pkgName);
         if (!fs.existsSync(pkgDir)) fs.mkdirSync(pkgDir, { recursive: true });
 
+        const nonPrerelease = versions.filter(v => !v.version.includes('-'));
+        const latestVer = nonPrerelease.length > 0
+            ? nonPrerelease[nonPrerelease.length - 1].version
+            : versions[versions.length - 1].version;
+
         const packument = {
             _id: pkgName,
             name: pkgName,
             'dist-tags': {
-                latest: versions[versions.length - 1].version
+                latest: latestVer
             },
             versions: {},
             modified: '2026-11-01T00:00:00.000Z'
@@ -519,7 +705,7 @@ function build() {
             }
 
             const tarGz = makeTarGz(entries);
-            const tarballFileName = `${v.name}-${v.version}.tgz`;
+            const tarballFileName = `${v.name.replace(/^@[^/]+\//, '')}-${v.version}.tgz`;
             const tarballFilePath = path.join(pkgDir, tarballFileName);
             fs.writeFileSync(tarballFilePath, tarGz);
 

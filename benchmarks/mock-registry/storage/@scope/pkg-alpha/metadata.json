@@ -1,0 +1,25 @@
+{
+  "_id": "@scope/pkg-alpha",
+  "name": "@scope/pkg-alpha",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "@scope/pkg-alpha",
+      "version": "1.0.0",
+      "description": "Scoped package alpha for differential mutation testing",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "47340baea9fa0dab909e6b52ba9c0b56d8406f75",
+        "integrity": "sha512-U706h0Rd5vbTKA6o/aw0nNwoAQzQjz2z5VIl7CZT8JvqsQtrydoS3cTVD/DEfV/z7TnNkrUFCdZlzfRULLjThw==",
+        "tarball": "http://127.0.0.1:4873/@scope/pkg-alpha/-/pkg-alpha-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

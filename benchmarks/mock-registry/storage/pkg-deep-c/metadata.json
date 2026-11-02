@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-deep-c",
+  "name": "pkg-deep-c",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-c",
+      "version": "1.0.0",
+      "description": "Deep chain intermediate level 2",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-deep-d": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "9385ff93c4e4ba6b5f6f8c5e6b33650b8c5e40b9",
+        "integrity": "sha512-9dk+kYH4FXWcNYdn9hZoNRkuzfI5h8AEo1/4l1ZZn5jLGJCu4I5zzwXtuK/Feu6/mr2fI1e8I5VMn12xKZt0TA==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-c/-/pkg-deep-c-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

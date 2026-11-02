@@ -1,0 +1,28 @@
+{
+  "_id": "pkg-deep-d",
+  "name": "pkg-deep-d",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-d",
+      "version": "1.0.0",
+      "description": "Deep chain intermediate level 3",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-deep-e": "^1.0.0",
+        "pkg-deep-shared": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "6e859c95fe1a01474afc0c8a73116cd79fafe18a",
+        "integrity": "sha512-P22BdiBhcxIN8j96ro6ucFExlrW7w+NRb4fEiizaGEBwf32RNFsGN+wbrO9oE8OqqYZZ7JK97FrUeOZYD/zjWQ==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-d/-/pkg-deep-d-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}
