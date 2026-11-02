@@ -14,3 +14,4 @@ anyhow = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rnpm-fs = { workspace = true }
+serde_json = { workspace = true }

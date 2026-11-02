@@ -170,3 +170,193 @@ fn test_workspace_directory_junction_linking_unprivileged() {
     assert!(member_dir.exists(), "Target workspace package must remain intact");
     assert!(member_dir.join("index.js").exists(), "Target files must remain intact");
 }
+
+#[test]
+fn test_extreme_shim_argument_escaping_nested_quotes_and_backticks() {
+    // 1. Deeply nested quotes across multiple levels
+    let deep_nested = r#""level1 \"level2 \\\"level3\\\" level2\" level1""#;
+    let escaped_cmd = escape_cmd_arg(deep_nested);
+    assert!(escaped_cmd.starts_with('"') && escaped_cmd.ends_with('"'));
+    assert!(escaped_cmd.contains("level1"));
+    assert!(escaped_cmd.contains("level2"));
+    assert!(escaped_cmd.contains("level3"));
+    assert!(escaped_cmd.contains(r#"\""#));
+
+    // 2. Mixed single and double quotes
+    let mixed = r#"He said, "It's dangerous to go alone; take 'this' & that!""#;
+    let escaped_posix = escape_posix_arg(mixed);
+    assert_eq!(escaped_posix, r#"'He said, "It'\''s dangerous to go alone; take '\''this'\'' & that!"'"#);
+
+    let escaped_ps1 = escape_ps1_arg(mixed);
+    assert_eq!(escaped_ps1, r#"'He said, "It''s dangerous to go alone; take ''this'' & that!"'"#);
+
+    let escaped_cmd_mixed = escape_cmd_arg(mixed);
+    assert!(escaped_cmd_mixed.contains(r#"\"It's dangerous"#));
+
+    // 3. Backticks combined with shell command expansions
+    let backtick_injection = r#"`echo "evil"` && $(whoami) || `rm -rf /`"#;
+    let posix_bt = escape_posix_arg(backtick_injection);
+    // In POSIX single quotes, backticks and $() are 100% literal and safe
+    assert!(posix_bt.starts_with('\'') && posix_bt.ends_with('\''));
+    assert!(posix_bt.contains(r#"`echo "evil"`"#));
+
+    let ps1_bt = escape_ps1_arg(backtick_injection);
+    // In PowerShell single quotes, backticks are 100% literal and safe
+    assert!(ps1_bt.starts_with('\'') && ps1_bt.ends_with('\''));
+    assert!(ps1_bt.contains(r#"`echo "evil"`"#));
+
+    let cmd_bt = escape_cmd_arg(backtick_injection);
+    assert!(cmd_bt.starts_with('"') && cmd_bt.ends_with('"'));
+    assert!(cmd_bt.contains(r#"\"evil\""#));
+
+    // 4. Multi-line arguments with \n and \r\n
+    let multiline_unix = "SELECT * FROM users\nWHERE active = 1\nORDER BY id DESC;";
+    assert_eq!(escape_posix_arg(multiline_unix), format!("'{multiline_unix}'"));
+    assert_eq!(escape_ps1_arg(multiline_unix), format!("'{multiline_unix}'"));
+    let cmd_multi = escape_cmd_arg(multiline_unix);
+    assert!(cmd_multi.starts_with('"') && cmd_multi.ends_with('"'));
+    assert!(cmd_multi.contains("SELECT * FROM users\nWHERE active = 1"));
+
+    let multiline_crlf = "header line\r\n\"nested middle\"\r\nfooter line";
+    let ps1_crlf = escape_ps1_arg(multiline_crlf);
+    assert_eq!(ps1_crlf, format!("'{multiline_crlf}'"));
+    let posix_crlf = escape_posix_arg(multiline_crlf);
+    assert_eq!(posix_crlf, format!("'{multiline_crlf}'"));
+    let cmd_crlf = escape_cmd_arg(multiline_crlf);
+    assert!(cmd_crlf.contains(r#"\"nested middle\""#));
+
+    // 5. Windows path arguments with spaces and trailing backslashes before closing quote
+    let win_path_arg = r#"C:\Program Files\NodeJS\x86\"#;
+    let escaped_win_path = escape_cmd_arg(win_path_arg);
+    // Must end with \\" so the trailing backslash doesn't escape the closing quote
+    assert!(escaped_win_path.ends_with(r#"\\""#));
+    assert_eq!(escaped_win_path, r#""C:\Program Files\NodeJS\x86\\""#);
+}
+
+#[test]
+fn test_extreme_shim_path_spaces_and_special_characters() {
+    // 1. Target path with multiple spaces, parentheses, ampersands, plus signs
+    let complex_path = "nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js";
+
+    let posix = generate_posix_shim(complex_path);
+    assert!(posix.contains(r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#));
+
+    let cmd = generate_cmd_shim(complex_path);
+    assert!(cmd.contains(r#""%dp0%\..\nested dir\Program Files (x86)\Acme & Sons\C++ Tools\bin\my tool.js""#));
+
+    let ps1 = generate_ps1_shim(complex_path);
+    assert!(ps1.contains(r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#));
+
+    // 2. Target path with backticks and PowerShell subexpressions
+    let bt_path = "packages/my`tool`/lib/$(subexpr)/index.js";
+    let ps1_bt = generate_ps1_shim(bt_path);
+    assert!(ps1_bt.contains("my``tool``"));
+    assert!(ps1_bt.contains("`$(subexpr)"));
+
+    let posix_bt = generate_posix_shim(bt_path);
+    assert!(posix_bt.contains(r#"my\`tool\`"#));
+    assert!(posix_bt.contains(r#"\$(subexpr)"#));
+
+    // 3. Target path with % variables in Windows cmd
+    let pct_path = "libs/%USERPROFILE%/bin/cli.js";
+    let cmd_pct = generate_cmd_shim(pct_path);
+    assert!(cmd_pct.contains(r#"%dp0%\..\libs\%%USERPROFILE%%\bin\cli.js"#));
+}
+
+#[test]
+fn test_extreme_shim_live_invocation_on_disk() {
+    let dir = tempdir().unwrap();
+    // Path containing spaces and parentheses mirroring realistic Windows directories
+    let project_root = dir.path().join("My Projects (x86)").join("Test Suite");
+    let bin_dir = project_root.join("node_modules").join(".bin");
+    let tool_dir = project_root.join("node_modules").join("spaced tool").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&tool_dir).unwrap();
+
+    let output_file = project_root.join("args_output.json");
+    let escaped_out = output_file.to_string_lossy().replace('\\', "/");
+
+    let script_file = tool_dir.join("cli.js");
+    let script_code = format!(
+        "const fs = require('fs');\n\
+        const args = process.argv.slice(2);\n\
+        fs.writeFileSync('{escaped_out}', JSON.stringify(args));\n"
+    );
+    fs::write(&script_file, script_code).unwrap();
+
+    // Create shims pointing to the tool across relative directories with spaces
+    create_shims(
+        &bin_dir,
+        "spaced-tool",
+        "spaced tool/bin/cli.js",
+    ).unwrap();
+
+    let cmd_shim = bin_dir.join("spaced-tool.cmd");
+    let ps1_shim = bin_dir.join("spaced-tool.ps1");
+    let sh_shim = bin_dir.join("spaced-tool");
+
+    assert!(cmd_shim.exists());
+    assert!(ps1_shim.exists());
+    assert!(sh_shim.exists());
+
+    // Test live invocation via CMD wrapper on Windows
+    #[cfg(windows)]
+    {
+        // 1. Invoke .cmd shim with various extreme arguments
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.current_dir(&bin_dir);
+        let status = cmd
+            .arg("/c")
+            .arg(".\\spaced-tool.cmd")
+            .arg("plain_arg")
+            .arg("arg with spaces")
+            .arg(r#"arg with "nested quotes""#)
+            .arg("`backtick_arg`")
+            .arg("multi-word arg")
+            .status()
+            .expect("Failed to execute cmd shim");
+
+        assert!(status.success(), "CMD shim execution must succeed");
+        assert!(output_file.exists(), "CMD shim must have executed target node script");
+
+        let content = fs::read_to_string(&output_file).unwrap();
+        let parsed_args: Vec<String> = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(parsed_args.len(), 5);
+        assert_eq!(parsed_args[0], "plain_arg");
+        assert_eq!(parsed_args[1], "arg with spaces");
+        assert!(parsed_args[2].contains("nested quotes"));
+        assert_eq!(parsed_args[3], "`backtick_arg`");
+        assert_eq!(parsed_args[4], "multi-word arg");
+
+        fs::remove_file(&output_file).unwrap();
+
+        // 2. Invoke .ps1 wrapper with PowerShell including multi-line argument
+        let ps_status = std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&ps1_shim)
+            .arg("ps1_arg")
+            .arg("ps1 with spaces")
+            .arg(r#"nested "quotes" in ps1"#)
+            .arg("`ps1_backtick`")
+            .arg("multi\nline\narg")
+            .stdin(std::process::Stdio::null())
+            .status();
+
+        if let Ok(st) = ps_status {
+            if st.success() && output_file.exists() {
+                let ps_content = fs::read_to_string(&output_file).unwrap();
+                let ps_args: Vec<String> = serde_json::from_str(&ps_content).unwrap();
+                assert_eq!(ps_args[0], "ps1_arg");
+                assert_eq!(ps_args[1], "ps1 with spaces");
+                assert!(ps_args[2].contains("quotes"));
+                assert!(ps_args[3].contains("ps1_backtick"));
+                assert!(ps_args[4].contains("multi\nline"));
+            }
+        }
+    }
+}
