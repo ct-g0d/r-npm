@@ -3313,3 +3313,467 @@ fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
     let target_b = graph.nodes.get(&edge_b.to_location).unwrap();
     assert_eq!(target_b.version, "2.1.0");
 }
+
+#[test]
+fn test_adversarial_bipartite_peer_mesh_with_optional_and_strict() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 4 Core Engines
+    provider.add_version("core-engine", "2.0.0", |_| {});
+    provider.add_version("core-renderer", "3.5.0", |_| {});
+    provider.add_version("core-database", "1.8.0", |_| {});
+    provider.add_version("core-telemetry", "5.1.0", |_| {});
+
+    // 4 Plugins forming a bipartite peer web with mixed required and optional peers
+    // 1. plugin-ui: strict peer core-engine (^2.0.0), strict peer core-renderer (^3.0.0), optional peer core-telemetry (^5.0.0)
+    provider.add_version("plugin-ui", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies.insert("core-telemetry".to_string(), "^5.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("core-telemetry".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    // 2. plugin-store: strict peer core-engine (^2.0.0), strict peer core-database (^1.0.0), optional peer core-renderer (^3.0.0)
+    provider.add_version("plugin-store", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("core-renderer".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    // 3. plugin-analytics: strict peer core-telemetry (^5.0.0), optional peer core-database (^1.0.0), optional peer core-engine (^2.0.0)
+    provider.add_version("plugin-analytics", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-telemetry".to_string(), "^5.0.0".to_string());
+        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("core-database".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert("core-engine".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    // 4. plugin-export: strict peer core-renderer (^3.0.0), strict peer core-database (^1.0.0), optional absent peer core-opt-missing (^1.0.0)
+    provider.add_version("plugin-export", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("core-opt-missing".to_string(), "^1.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("core-opt-missing".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("bipartite-peer-app".to_string());
+    manifest.dependencies.insert("core-engine".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("core-renderer".to_string(), "3.5.0".to_string());
+    manifest.dependencies.insert("core-database".to_string(), "1.8.0".to_string());
+    manifest.dependencies.insert("core-telemetry".to_string(), "5.1.0".to_string());
+    manifest.dependencies.insert("plugin-ui".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("plugin-store".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("plugin-analytics".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("plugin-export".to_string(), "1.0.0".to_string());
+
+    // Phase 1: Successful resolution under strict_peers: true
+    let strict_opts = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &strict_opts)
+        .expect("Bipartite peer mesh with mixed optional and strict peers must resolve cleanly under strict_peers");
+
+    for name in &[
+        "core-engine",
+        "core-renderer",
+        "core-database",
+        "core-telemetry",
+        "plugin-ui",
+        "plugin-store",
+        "plugin-analytics",
+        "plugin-export",
+    ] {
+        let loc = format!("node_modules/{name}");
+        assert!(graph.nodes.contains_key(&loc), "Expected node at {loc}");
+    }
+    assert!(!graph.nodes.contains_key("node_modules/core-opt-missing"));
+
+    // Verify plugin-ui edges
+    let ui_edges = graph.get_outgoing_edges("node_modules/plugin-ui");
+    let ui_engine = ui_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    assert_eq!(ui_engine.dep_type, DependencyType::Peer);
+    let ui_renderer = ui_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    assert_eq!(ui_renderer.dep_type, DependencyType::Peer);
+    let ui_telemetry = ui_edges.iter().find(|e| e.package_name == "core-telemetry").unwrap();
+    assert_eq!(ui_telemetry.dep_type, DependencyType::PeerOptional);
+
+    // Verify plugin-store edges
+    let store_edges = graph.get_outgoing_edges("node_modules/plugin-store");
+    let store_engine = store_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    assert_eq!(store_engine.dep_type, DependencyType::Peer);
+    let store_db = store_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    assert_eq!(store_db.dep_type, DependencyType::Peer);
+    let store_renderer = store_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    assert_eq!(store_renderer.dep_type, DependencyType::PeerOptional);
+
+    // Verify plugin-analytics edges
+    let analytics_edges = graph.get_outgoing_edges("node_modules/plugin-analytics");
+    let an_telemetry = analytics_edges.iter().find(|e| e.package_name == "core-telemetry").unwrap();
+    assert_eq!(an_telemetry.dep_type, DependencyType::Peer);
+    let an_db = analytics_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    assert_eq!(an_db.dep_type, DependencyType::PeerOptional);
+    let an_engine = analytics_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    assert_eq!(an_engine.dep_type, DependencyType::PeerOptional);
+
+    // Verify plugin-export edges
+    let export_edges = graph.get_outgoing_edges("node_modules/plugin-export");
+    let exp_renderer = export_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    assert_eq!(exp_renderer.dep_type, DependencyType::Peer);
+    let exp_db = export_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    assert_eq!(exp_db.dep_type, DependencyType::Peer);
+    assert!(!export_edges.iter().any(|e| e.package_name == "core-opt-missing"));
+
+    // Phase 2: Adversarial strict peer conflict in the bipartite mesh
+    provider.add_version("plugin-strict-conflict", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-engine".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+    });
+    let mut conflict_manifest = manifest.clone();
+    conflict_manifest.dependencies.insert("plugin-strict-conflict".to_string(), "1.0.0".to_string());
+
+    let err = resolve_dependency_graph(&conflict_manifest, &provider, &strict_opts).unwrap_err();
+    assert!(err.is_peer_conflict());
+    assert!(err.to_string().contains("Conflicting peer dependency 'core-engine'"));
+
+    // Phase 3: Adversarial optional peer conflict in the bipartite mesh
+    provider.add_version("plugin-optional-conflict", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies.insert("core-engine".to_string(), "^3.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("core-engine".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+    let mut opt_conflict_manifest = manifest.clone();
+    opt_conflict_manifest.dependencies.insert("plugin-optional-conflict".to_string(), "1.0.0".to_string());
+
+    let opt_graph = resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts)
+        .expect("Incompatible optional peer must be omitted and not fail strict resolution");
+    let opt_edges = opt_graph.get_outgoing_edges("node_modules/plugin-optional-conflict");
+    assert!(opt_edges.iter().any(|e| e.package_name == "core-renderer" && e.dep_type == DependencyType::Peer));
+    assert!(!opt_edges.iter().any(|e| e.package_name == "core-engine"), "Incompatible optional peer must be omitted");
+}
+
+#[test]
+fn test_adversarial_deep_transitive_nested_overrides() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Branch Alpha: 5-level deep chain: root -> alpha-1 -> alpha-2 -> alpha-3 -> alpha-4 -> alpha-5
+    provider.add_version("alpha-1", "1.0.0", |v| {
+        v.dependencies.insert("alpha-2".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("alpha-2", "1.0.0", |v| {
+        v.dependencies.insert("alpha-3".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("alpha-3", "1.0.0", |v| {
+        v.dependencies.insert("alpha-4".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("alpha-4", "1.0.0", |v| {
+        v.dependencies.insert("alpha-5".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("alpha-5", "1.0.0", |v| {
+        v.dependencies.insert("shared-lib".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("metric-tracker".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("logger".to_string(), "^1.0.0".to_string());
+    });
+
+    // Branch Beta: 5-level deep chain: root -> beta-1 -> beta-2 -> beta-3 -> beta-4 -> beta-5
+    provider.add_version("beta-1", "1.0.0", |v| {
+        v.dependencies.insert("beta-2".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("beta-2", "1.0.0", |v| {
+        v.dependencies.insert("beta-3".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("beta-3", "1.0.0", |v| {
+        v.dependencies.insert("beta-4".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("beta-4", "1.0.0", |v| {
+        v.dependencies.insert("beta-5".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("beta-5", "1.0.0", |v| {
+        v.dependencies.insert("shared-lib".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("metric-tracker".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("logger".to_string(), "^1.0.0".to_string());
+    });
+
+    // Shared packages available in provider
+    provider.add_version("shared-lib", "1.0.0", |_| {});
+    provider.add_version("shared-lib", "2.0.0", |_| {});
+    provider.add_version("shared-lib", "3.0.0", |_| {});
+
+    provider.add_version("metric-tracker", "1.0.0", |_| {});
+    provider.add_version("metric-tracker", "2.5.0", |_| {});
+    provider.add_version("metric-tracker", "4.0.0", |_| {});
+
+    provider.add_version("logger", "1.0.0", |_| {});
+    provider.add_version("logger", "2.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("deep-transitive-overrides-app".to_string());
+    manifest.dependencies.insert("alpha-1".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("beta-1".to_string(), "1.0.0".to_string());
+
+    // Configure 5-level deep nested and spec-targeted overrides:
+    // - Branch Alpha: nested object syntax overrides shared-lib@^1.0.0 to 2.0.0;
+    //                 arrow syntax overrides metric-tracker@^1.0.0 to 4.0.0
+    // - Branch Beta:  nested object syntax overrides shared-lib@^1.0.0 to 3.0.0;
+    //                 arrow syntax overrides metric-tracker@^1.0.0 to 2.5.0
+    // - logger is un-overridden on both branches and should cleanly resolve to 1.0.0
+    let overrides_json = serde_json::json!({
+        "alpha-1": {
+            "alpha-2": {
+                "alpha-3": {
+                    "alpha-4": {
+                        "alpha-5": {
+                            "shared-lib@^1.0.0": "2.0.0"
+                        }
+                    }
+                }
+            }
+        },
+        "alpha-1 > alpha-2 > alpha-3 > alpha-4 > alpha-5 > metric-tracker@^1.0.0": "4.0.0",
+        "beta-1": {
+            "beta-2": {
+                "beta-3": {
+                    "beta-4": {
+                        "beta-5": {
+                            "shared-lib@^1.0.0": "3.0.0"
+                        }
+                    }
+                }
+            }
+        },
+        "beta-1 > beta-2 > beta-3 > beta-4 > beta-5 > metric-tracker@^1.0.0": "2.5.0"
+    });
+    manifest.extra.insert("overrides".to_string(), overrides_json);
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Deep transitive nested overrides resolution must succeed");
+
+    // Both 2.0.0 and 3.0.0 of shared-lib must exist in the resolved graph
+    let shared_nodes: Vec<_> = graph.nodes.values().filter(|n| n.name == "shared-lib").collect();
+    assert_eq!(shared_nodes.len(), 2, "Both overridden versions of shared-lib must exist");
+    assert!(shared_nodes.iter().any(|n| n.version == "2.0.0"));
+    assert!(shared_nodes.iter().any(|n| n.version == "3.0.0"));
+
+    // Both 4.0.0 and 2.5.0 of metric-tracker must exist in the resolved graph
+    let metric_nodes: Vec<_> = graph.nodes.values().filter(|n| n.name == "metric-tracker").collect();
+    assert_eq!(metric_nodes.len(), 2, "Both overridden versions of metric-tracker must exist");
+    assert!(metric_nodes.iter().any(|n| n.version == "4.0.0"));
+    assert!(metric_nodes.iter().any(|n| n.version == "2.5.0"));
+
+    // Verify Branch Alpha: outgoing edges from alpha-5 must resolve to 2.0.0 and 4.0.0 without leaking Beta's overrides
+    let alpha_5_node = graph.nodes.values().find(|n| n.name == "alpha-5").unwrap();
+    let alpha_5_edges = graph.get_outgoing_edges(&alpha_5_node.location);
+
+    let alpha_shared_edge = alpha_5_edges.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let alpha_shared_target = graph.nodes.get(&alpha_shared_edge.to_location).unwrap();
+    assert_eq!(
+        alpha_shared_target.version, "2.0.0",
+        "Alpha branch must resolve shared-lib to overridden 2.0.0"
+    );
+
+    let alpha_metric_edge = alpha_5_edges.iter().find(|e| e.package_name == "metric-tracker").unwrap();
+    let alpha_metric_target = graph.nodes.get(&alpha_metric_edge.to_location).unwrap();
+    assert_eq!(
+        alpha_metric_target.version, "4.0.0",
+        "Alpha branch must resolve metric-tracker to overridden 4.0.0"
+    );
+
+    let alpha_logger_edge = alpha_5_edges.iter().find(|e| e.package_name == "logger").unwrap();
+    let alpha_logger_target = graph.nodes.get(&alpha_logger_edge.to_location).unwrap();
+    assert_eq!(
+        alpha_logger_target.version, "1.0.0",
+        "Alpha branch must resolve logger to un-overridden 1.0.0"
+    );
+
+    // Verify Branch Beta: outgoing edges from beta-5 must resolve to 3.0.0 and 2.5.0 without leaking Alpha's overrides
+    let beta_5_node = graph.nodes.values().find(|n| n.name == "beta-5").unwrap();
+    let beta_5_edges = graph.get_outgoing_edges(&beta_5_node.location);
+
+    let beta_shared_edge = beta_5_edges.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let beta_shared_target = graph.nodes.get(&beta_shared_edge.to_location).unwrap();
+    assert_eq!(
+        beta_shared_target.version, "3.0.0",
+        "Beta branch must resolve shared-lib to overridden 3.0.0"
+    );
+
+    let beta_metric_edge = beta_5_edges.iter().find(|e| e.package_name == "metric-tracker").unwrap();
+    let beta_metric_target = graph.nodes.get(&beta_metric_edge.to_location).unwrap();
+    assert_eq!(
+        beta_metric_target.version, "2.5.0",
+        "Beta branch must resolve metric-tracker to overridden 2.5.0"
+    );
+
+    let beta_logger_edge = beta_5_edges.iter().find(|e| e.package_name == "logger").unwrap();
+    let beta_logger_target = graph.nodes.get(&beta_logger_edge.to_location).unwrap();
+    assert_eq!(
+        beta_logger_target.version, "1.0.0",
+        "Beta branch must resolve logger to un-overridden 1.0.0"
+    );
+
+    // Un-overridden logger is hoisted and shared at root node_modules/logger
+    assert_eq!(
+        alpha_logger_edge.to_location, beta_logger_edge.to_location,
+        "Un-overridden logger must be deduplicated across branches"
+    );
+    assert_eq!(alpha_logger_edge.to_location, "node_modules/logger");
+}
+
+#[test]
+fn test_adversarial_workspace_circular_dev_with_peer_chains() {
+    use rnpm_core::workspace::WorkspaceMember;
+    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
+    use crate::error::SolverError;
+    use std::path::PathBuf;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("shared-logger", "2.0.0", |_| {});
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("ws-peer-cycle-root".to_string());
+    root_manifest.dependencies.insert("shared-logger".to_string(), "^2.0.0".to_string());
+
+    // Package A (core engine) depends on Package B in production
+    let mut manifest_a = Manifest::default();
+    manifest_a.name = Some("pkg-a".to_string());
+    manifest_a.version = Some("1.0.0".to_string());
+    manifest_a.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    let member_a = WorkspaceMember {
+        name: "pkg-a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-a"),
+        relative_path: "packages/pkg-a".to_string(),
+        manifest: manifest_a,
+    };
+
+    // Package B (plugin runner) has devDependency on Package C AND Package A (dev cycle: A -> B -> A)
+    let mut manifest_b = Manifest::default();
+    manifest_b.name = Some("pkg-b".to_string());
+    manifest_b.version = Some("1.0.0".to_string());
+    manifest_b.dev_dependencies.insert("pkg-c".to_string(), "workspace:*".to_string());
+    manifest_b.dev_dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    let member_b = WorkspaceMember {
+        name: "pkg-b".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-b"),
+        relative_path: "packages/pkg-b".to_string(),
+        manifest: manifest_b,
+    };
+
+    // Package C (plugin) has peerDependency on Package A (^1.0.0) and peerDependency on external shared-logger (^2.0.0)
+    let mut manifest_c = Manifest::default();
+    manifest_c.name = Some("pkg-c".to_string());
+    manifest_c.version = Some("1.0.0".to_string());
+    manifest_c.peer_dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest_c.peer_dependencies.insert("shared-logger".to_string(), "^2.0.0".to_string());
+    let member_c = WorkspaceMember {
+        name: "pkg-c".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-c"),
+        relative_path: "packages/pkg-c".to_string(),
+        manifest: manifest_c.clone(),
+    };
+
+    // 1. Verify that WorkspaceDependencyGraph::construct gracefully breaks the circular devDependency back-edge (pkg-b -> pkg-a)
+    let ws_graph = WorkspaceDependencyGraph::construct(&[member_a.clone(), member_b.clone(), member_c.clone()])
+        .expect("Circular devDependencies in workspace must construct and topo sort successfully");
+
+    // Sibling dependencies separation
+    assert!(ws_graph.dependencies["pkg-a"].contains_key("pkg-b"));
+    assert!(ws_graph.dev_dependencies["pkg-b"].contains_key("pkg-a"));
+    assert!(ws_graph.dev_dependencies["pkg-b"].contains_key("pkg-c"));
+
+    // In topological order, leaf pkg-b must precede dependent pkg-a
+    let pos_a = ws_graph.topological_order.iter().position(|x| x == "pkg-a").unwrap();
+    let pos_b = ws_graph.topological_order.iter().position(|x| x == "pkg-b").unwrap();
+    assert!(pos_b < pos_a, "Leaf dependency pkg-b must precede dependent pkg-a");
+
+    // 2. Full workspace graph resolution with peer satisfaction
+    let options = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let graph = resolve_workspace_graph(
+        &root_manifest,
+        &[member_a.clone(), member_b.clone(), member_c.clone()],
+        &provider,
+        &options,
+    ).expect("Workspace resolution must preserve peer satisfaction despite dev cycle breaking");
+
+    // All workspace links and locations exist
+    assert!(graph.nodes.contains_key("node_modules/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-b"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-c"));
+    assert!(graph.nodes.contains_key("packages/pkg-a"));
+    assert!(graph.nodes.contains_key("packages/pkg-b"));
+    assert!(graph.nodes.contains_key("packages/pkg-c"));
+
+    // External dependency shared-logger hoisted to root node_modules
+    assert!(graph.nodes.contains_key("node_modules/shared-logger"));
+
+    // Verify edges from pkg-a: prod edge to pkg-b
+    let edges_a = graph.get_outgoing_edges("packages/pkg-a");
+    let edge_a_to_b = edges_a.iter().find(|e| e.package_name == "pkg-b").unwrap();
+    assert_eq!(edge_a_to_b.dep_type, DependencyType::Prod);
+    assert_eq!(edge_a_to_b.to_location, "node_modules/pkg-b");
+
+    // Verify edges from pkg-b: dev edges to pkg-c and pkg-a
+    let edges_b = graph.get_outgoing_edges("packages/pkg-b");
+    let edge_b_to_c = edges_b.iter().find(|e| e.package_name == "pkg-c").unwrap();
+    assert_eq!(edge_b_to_c.dep_type, DependencyType::Dev);
+    assert_eq!(edge_b_to_c.to_location, "node_modules/pkg-c");
+
+    let edge_b_to_a = edges_b.iter().find(|e| e.package_name == "pkg-a").unwrap();
+    assert_eq!(edge_b_to_a.dep_type, DependencyType::Dev);
+    assert_eq!(edge_b_to_a.to_location, "node_modules/pkg-a");
+
+    // Verify edges from pkg-c: peer satisfaction to pkg-a AND external shared-logger
+    let edges_c = graph.get_outgoing_edges("packages/pkg-c");
+    let peer_edge_a = edges_c.iter().find(|e| e.package_name == "pkg-a")
+        .expect("pkg-c must have resolved peer dependency edge to pkg-a");
+    assert_eq!(peer_edge_a.dep_type, DependencyType::Peer);
+    assert_eq!(peer_edge_a.to_location, "node_modules/pkg-a");
+
+    let peer_edge_logger = edges_c.iter().find(|e| e.package_name == "shared-logger")
+        .expect("pkg-c must have resolved peer dependency edge to shared-logger");
+    assert_eq!(peer_edge_logger.dep_type, DependencyType::Peer);
+    assert_eq!(peer_edge_logger.to_location, "node_modules/shared-logger");
+
+    // 3. Strict peer conflict verification: if pkg-c requires incompatible pkg-a (^2.0.0)
+    let mut manifest_c_bad = manifest_c.clone();
+    manifest_c_bad.peer_dependencies.insert("pkg-a".to_string(), "^2.0.0".to_string());
+    let member_c_bad = WorkspaceMember {
+        name: "pkg-c".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-c"),
+        relative_path: "packages/pkg-c".to_string(),
+        manifest: manifest_c_bad,
+    };
+
+    let strict_err = resolve_workspace_graph(
+        &root_manifest,
+        &[member_a, member_b, member_c_bad],
+        &provider,
+        &options,
+    ).unwrap_err();
+    assert!(strict_err.is_peer_conflict());
+    match strict_err {
+        SolverError::PeerConflict { peer, .. } => {
+            assert_eq!(peer, "pkg-a");
+        }
+        other => panic!("Expected PeerConflict, got {other:?}"),
+    }
+}

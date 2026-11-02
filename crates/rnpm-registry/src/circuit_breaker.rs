@@ -60,11 +60,11 @@ impl CircuitBreaker {
         let mut hosts = self.hosts.write().await;
         let entry = hosts.entry(host.to_string()).or_default();
 
-        if entry.state == CircuitBreakerState::Open {
-            if entry.last_state_change.elapsed() >= self.reset_timeout {
-                entry.state = CircuitBreakerState::HalfOpen;
-                entry.last_state_change = Instant::now();
-            }
+        if entry.state == CircuitBreakerState::Open
+            && entry.last_state_change.elapsed() >= self.reset_timeout
+        {
+            entry.state = CircuitBreakerState::HalfOpen;
+            entry.last_state_change = Instant::now();
         }
 
         entry.state

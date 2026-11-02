@@ -281,6 +281,24 @@ impl LifecycleOptions {
     }
 }
 
+/// Captured output of a script execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ScriptOutput {
+    pub fn success() -> Self {
+        Self {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
 /// Context for running a lifecycle script per docs/lifecycle-contract.md.
 #[derive(Debug, Clone)]
 pub struct LifecycleContext {
@@ -294,6 +312,8 @@ pub struct LifecycleContext {
     pub npm_execpath: Option<PathBuf>,
     pub extra_env: HashMap<String, String>,
     pub timeout: Option<std::time::Duration>,
+    pub capture_output: bool,
+    pub captured_output: std::sync::Arc<std::sync::Mutex<Option<ScriptOutput>>>,
 }
 
 impl LifecycleContext {
@@ -315,12 +335,23 @@ impl LifecycleContext {
             npm_execpath: None,
             extra_env: HashMap::new(),
             timeout: None,
+            capture_output: false,
+            captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
         self
+    }
+
+    pub fn with_capture_output(mut self, capture: bool) -> Self {
+        self.capture_output = capture;
+        self
+    }
+
+    pub fn get_captured_output(&self) -> Option<ScriptOutput> {
+        self.captured_output.lock().unwrap().clone()
     }
 }
 
@@ -532,6 +563,55 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
     out
 }
 
+/// Concurrently drains a readable stream in chunks, applying credential scrubbing
+/// on streaming chunks to ensure child processes cannot stall from filled pipe buffers.
+pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
+    let mut out = String::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut carry = String::new();
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                if !carry.is_empty() {
+                    let scrubbed = scrub_text(&carry);
+                    out.push_str(&scrubbed);
+                }
+                break;
+            }
+            Ok(n) => {
+                let chunk_str = String::from_utf8_lossy(&buf[..n]);
+                let combined = format!("{carry}{chunk_str}");
+
+                if combined.len() > 512 {
+                    let split_candidate = combined.len() - 256;
+                    let split_pos = match combined[..split_candidate].rfind(|c: char| c == '\n' || c == '\r' || c == ' ' || c == ';') {
+                        Some(pos) => pos + 1,
+                        None => split_candidate,
+                    };
+
+                    let to_process = &combined[..split_pos];
+                    let scrubbed = scrub_text(to_process);
+                    out.push_str(&scrubbed);
+                    carry = combined[split_pos..].to_string();
+                } else {
+                    carry = combined;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                if !carry.is_empty() {
+                    let scrubbed = scrub_text(&carry);
+                    out.push_str(&scrubbed);
+                }
+                break;
+            }
+        }
+    }
+
+    out
+}
+
 /// Builds the scrubbed and populated environment map for the lifecycle script.
 pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
@@ -691,8 +771,14 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     cmd.env_clear();
     cmd.envs(env);
     cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
+
+    if ctx.capture_output {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
 
     let guard = process_guard::ProcessTreeGuard::new();
 
@@ -710,6 +796,22 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     if let Some(ref g) = guard {
         g.assign_process(child.id());
     }
+
+    // Drain piped stdout and stderr concurrently using dedicated worker threads
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let stdout_handle = if let Some(mut r) = child_stdout {
+        Some(std::thread::spawn(move || drain_and_scrub_reader(&mut r)))
+    } else {
+        None
+    };
+
+    let stderr_handle = if let Some(mut r) = child_stderr {
+        Some(std::thread::spawn(move || drain_and_scrub_reader(&mut r)))
+    } else {
+        None
+    };
 
     let status = if let Some(timeout) = ctx.timeout {
         let start = std::time::Instant::now();
@@ -745,6 +847,17 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         child.wait()
             .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?
     };
+
+    let stdout_str = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_str = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    if ctx.capture_output {
+        *ctx.captured_output.lock().unwrap() = Some(ScriptOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: stdout_str,
+            stderr: stderr_str,
+        });
+    }
 
     if !status.success() {
         warn!(
@@ -801,8 +914,14 @@ where
     cmd.env_clear();
     cmd.envs(env);
     cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
+
+    if ctx.capture_output {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
 
     let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new());
 
@@ -820,6 +939,26 @@ where
     if let Some(ref g) = *guard {
         g.assign_process(child.id());
     }
+
+    // Drain piped stdout and stderr concurrently using tokio worker tasks
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let stdout_task = tokio::task::spawn_blocking(move || {
+        if let Some(mut r) = child_stdout {
+            drain_and_scrub_reader(&mut r)
+        } else {
+            String::new()
+        }
+    });
+
+    let stderr_task = tokio::task::spawn_blocking(move || {
+        if let Some(mut r) = child_stderr {
+            drain_and_scrub_reader(&mut r)
+        } else {
+            String::new()
+        }
+    });
 
     let pkg_name = ctx.package_name.clone();
     let guard_clone = guard.clone();
@@ -935,6 +1074,17 @@ where
     let status = status_res
         .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?;
 
+    let stdout_str = stdout_task.await.unwrap_or_default();
+    let stderr_str = stderr_task.await.unwrap_or_default();
+
+    if ctx.capture_output {
+        *ctx.captured_output.lock().unwrap() = Some(ScriptOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: stdout_str,
+            stderr: stderr_str,
+        });
+    }
+
     if !status.success() {
         warn!(
             "Lifecycle script '{}' failed for {} with exit code: {:?}",
@@ -949,6 +1099,51 @@ where
 /// If cancelled or aborted by SIGINT/SIGTERM, runaway child processes are cleanly terminated immediately.
 pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<ExitStatus> {
     execute_lifecycle_script_with_abort(ctx, std::future::pending()).await
+}
+
+/// Spawns and executes a lifecycle script synchronously, capturing stdout and stderr cleanly.
+pub fn execute_lifecycle_script_captured(ctx: &LifecycleContext) -> Result<ScriptOutput> {
+    let mut ctx_clone = ctx.clone();
+    ctx_clone.capture_output = true;
+    let status = execute_lifecycle_script(&ctx_clone)?;
+    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
+        exit_code: status.code().unwrap_or(-1),
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    Ok(out)
+}
+
+/// Spawns and executes a lifecycle script asynchronously, capturing stdout and stderr cleanly.
+pub async fn execute_lifecycle_script_async_captured(ctx: &LifecycleContext) -> Result<ScriptOutput> {
+    let mut ctx_clone = ctx.clone();
+    ctx_clone.capture_output = true;
+    let status = execute_lifecycle_script_async(&ctx_clone).await?;
+    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
+        exit_code: status.code().unwrap_or(-1),
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    Ok(out)
+}
+
+/// Spawns and executes a lifecycle script asynchronously with abort, capturing stdout and stderr cleanly.
+pub async fn execute_lifecycle_script_with_abort_captured<F>(
+    ctx: &LifecycleContext,
+    abort_fut: F,
+) -> Result<ScriptOutput>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut ctx_clone = ctx.clone();
+    ctx_clone.capture_output = true;
+    let status = execute_lifecycle_script_with_abort(&ctx_clone, abort_fut).await?;
+    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
+        exit_code: status.code().unwrap_or(-1),
+        stdout: String::new(),
+        stderr: String::new(),
+    });
+    Ok(out)
 }
 
 /// Detailed error holding the exact non-zero exit code of a process or script execution.

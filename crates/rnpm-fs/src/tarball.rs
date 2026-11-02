@@ -92,7 +92,8 @@ pub fn extract_tar_gz<R: Read>(
     limits: Option<TarLimits>,
 ) -> Result<ExtractionSummary, FsError> {
     let limits = limits.unwrap_or_default();
-    fs::create_dir_all(destination)?;
+    let verbatim_dest = crate::path::to_verbatim_path(destination);
+    fs::create_dir_all(&verbatim_dest)?;
 
     let compressed_counter = Arc::new(AtomicU64::new(0));
     let counting_reader = CountingReader::with_counter(reader, Arc::clone(&compressed_counter));
@@ -143,11 +144,11 @@ pub fn extract_tar_gz<R: Read>(
         // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
         validate_entry_path(&relative_path)?;
 
-        let target_path = destination.join(&relative_path);
+        let target_path = verbatim_dest.join(&relative_path);
 
         // Security check against Symlink Slip:
         // Ensure no ancestor directory between destination and target_path is a symlink or junction
-        ensure_no_symlink_ancestors(&target_path, destination)?;
+        ensure_no_symlink_ancestors(&target_path, &verbatim_dest)?;
 
         // Security check: escaping symlinks/hardlinks
         let entry_type = entry.header().entry_type();
@@ -185,7 +186,7 @@ pub fn extract_tar_gz<R: Read>(
                     }
                     #[cfg(windows)]
                     {
-                        let target_full = destination.join(&cleaned_rel);
+                        let target_full = verbatim_dest.join(&cleaned_rel);
                         if target_full.is_dir() {
                             let _ = crate::junction::create_junction(&target_path, &target_full);
                         } else if target_full.is_file() {
@@ -193,7 +194,7 @@ pub fn extract_tar_gz<R: Read>(
                         }
                     }
                 } else if entry_type.is_hard_link() {
-                    let source_full = destination.join(&cleaned_rel);
+                    let source_full = verbatim_dest.join(&cleaned_rel);
                     if source_full.exists() && !source_full.is_symlink() {
                         if fs::hard_link(&source_full, &target_path).is_err() {
                             if source_full.is_file() {

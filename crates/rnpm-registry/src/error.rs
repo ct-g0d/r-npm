@@ -125,4 +125,137 @@ impl RegistryError {
             _ => false,
         }
     }
+
+    /// Returns true if this error is transient and retryable (timeouts, connect errors, truncated body stream decode errors, 429/502/503/504).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(e) => {
+                if e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body() {
+                    return true;
+                }
+                if let Some(status) = e.status() {
+                    let code = status.as_u16();
+                    if code == 429 || code == 502 || code == 503 || code == 504 {
+                        return true;
+                    }
+                }
+                let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+                while let Some(err) = source {
+                    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                        match io_err.kind() {
+                            std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::UnexpectedEof => return true,
+                            _ => {}
+                        }
+                    }
+                    source = err.source();
+                }
+                false
+            }
+            Self::RateLimited { .. } => true,
+            Self::ServerError { status, .. } => {
+                *status == 429 || *status == 502 || *status == 503 || *status == 504
+            }
+            _ => false,
+        }
+    }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_transient_rate_limited() {
+        let err = RegistryError::RateLimited {
+            retry_after: Some(5),
+        };
+        assert!(err.is_transient());
+        assert!(err.is_rate_limited());
+        assert_eq!(err.retry_after(), Some(5));
+        assert_eq!(err.status_code(), Some(429));
+    }
+
+    #[test]
+    fn test_is_transient_server_error_codes() {
+        for transient_code in [429, 502, 503, 504] {
+            let err = RegistryError::ServerError {
+                status: transient_code,
+                body: "Transient failure".into(),
+            };
+            assert!(
+                err.is_transient(),
+                "Status {transient_code} should be considered transient"
+            );
+            assert_eq!(err.status_code(), Some(transient_code));
+        }
+
+        for non_transient_code in [400, 401, 403, 404, 405, 500] {
+            let err = RegistryError::ServerError {
+                status: non_transient_code,
+                body: "Permanent failure".into(),
+            };
+            assert!(
+                !err.is_transient(),
+                "Status {non_transient_code} should not be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_transient_non_retryable_variants() {
+        let not_found = RegistryError::PackageNotFound {
+            package: "foo".into(),
+            status: 404,
+        };
+        assert!(!not_found.is_transient());
+        assert!(not_found.is_not_found());
+        assert_eq!(not_found.status_code(), Some(404));
+
+        let unauth = RegistryError::Unauthorized {
+            url: "https://registry.npmjs.org/pkg".into(),
+            status: 401,
+            message: "Unauthorized".into(),
+        };
+        assert!(!unauth.is_transient());
+        assert!(unauth.is_unauthorized());
+        assert!(unauth.is_auth_error());
+        assert_eq!(unauth.status_code(), Some(401));
+
+        let forbidden = RegistryError::Forbidden {
+            url: "https://registry.npmjs.org/pkg".into(),
+            status: 403,
+            message: "Forbidden".into(),
+        };
+        assert!(!forbidden.is_transient());
+        assert!(forbidden.is_forbidden());
+        assert!(forbidden.is_auth_error());
+        assert_eq!(forbidden.status_code(), Some(403));
+
+        let redirects = RegistryError::TooManyRedirects(10);
+        assert!(!redirects.is_transient());
+
+        let sec_violation = RegistryError::SecurityViolation("evil redirect".into());
+        assert!(!sec_violation.is_transient());
+
+        let version_not_found = RegistryError::VersionNotFound {
+            package: "foo".into(),
+            version: "1.0.0".into(),
+        };
+        assert!(!version_not_found.is_transient());
+
+        let cb_open = RegistryError::CircuitBreakerOpen {
+            host: "registry.npmjs.org".into(),
+        };
+        assert!(!cb_open.is_transient());
+        assert!(cb_open.is_circuit_breaker_open());
+
+        let other = RegistryError::Other("custom error".into());
+        assert!(!other.is_transient());
+    }
+}
+

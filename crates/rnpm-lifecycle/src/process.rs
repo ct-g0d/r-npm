@@ -187,20 +187,105 @@ pub async fn execute_shell_command(
     }
 
     if capture_output {
-        let output = child.wait_with_output().await.map_err(|err| LifecycleError::Io {
+        use tokio::io::AsyncReadExt;
+
+        let mut child_stdout = child.stdout.take();
+        let mut child_stderr = child.stderr.take();
+
+        let stdout_task = tokio::spawn(async move {
+            if let Some(mut r) = child_stdout {
+                let mut out = String::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut carry = String::new();
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) => {
+                            if !carry.is_empty() {
+                                out.push_str(&scrub_text(&carry));
+                            }
+                            break;
+                        }
+                        Ok(n) => {
+                            let chunk_str = String::from_utf8_lossy(&buf[..n]);
+                            let combined = format!("{carry}{chunk_str}");
+                            if combined.len() > 512 {
+                                let split_candidate = combined.len() - 256;
+                                let split_pos = match combined[..split_candidate].rfind(|c: char| c == '\n' || c == '\r' || c == ' ' || c == ';') {
+                                    Some(pos) => pos + 1,
+                                    None => split_candidate,
+                                };
+                                out.push_str(&scrub_text(&combined[..split_pos]));
+                                carry = combined[split_pos..].to_string();
+                            } else {
+                                carry = combined;
+                            }
+                        }
+                        Err(_) => {
+                            if !carry.is_empty() {
+                                out.push_str(&scrub_text(&carry));
+                            }
+                            break;
+                        }
+                    }
+                }
+                out
+            } else {
+                String::new()
+            }
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            if let Some(mut r) = child_stderr {
+                let mut out = String::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut carry = String::new();
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) => {
+                            if !carry.is_empty() {
+                                out.push_str(&scrub_text(&carry));
+                            }
+                            break;
+                        }
+                        Ok(n) => {
+                            let chunk_str = String::from_utf8_lossy(&buf[..n]);
+                            let combined = format!("{carry}{chunk_str}");
+                            if combined.len() > 512 {
+                                let split_candidate = combined.len() - 256;
+                                let split_pos = match combined[..split_candidate].rfind(|c: char| c == '\n' || c == '\r' || c == ' ' || c == ';') {
+                                    Some(pos) => pos + 1,
+                                    None => split_candidate,
+                                };
+                                out.push_str(&scrub_text(&combined[..split_pos]));
+                                carry = combined[split_pos..].to_string();
+                            } else {
+                                carry = combined;
+                            }
+                        }
+                        Err(_) => {
+                            if !carry.is_empty() {
+                                out.push_str(&scrub_text(&carry));
+                            }
+                            break;
+                        }
+                    }
+                }
+                out
+            } else {
+                String::new()
+            }
+        });
+
+        let status = child.wait().await.map_err(|err| LifecycleError::Io {
             path: package_dir.to_path_buf(),
             source: err,
         })?;
 
-        let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+        let exit_code = status.code().unwrap_or(-1);
 
-        // Filter credentials from logs / output
-        let stdout = scrub_text(&raw_stdout);
-        let stderr = scrub_text(&raw_stderr);
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        if output.status.success() {
+        if status.success() {
             Ok(ScriptOutput {
                 exit_code,
                 stdout,

@@ -1317,3 +1317,120 @@ async fn test_sigint_and_sigterm_exit_code_fidelity() {
     }
 }
 
+#[test]
+fn test_massive_output_pipe_drain_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let script_file = root.join("emit_sync.js");
+    std::fs::write(&script_file, r#"
+const chunk = Buffer.alloc(64 * 1024, 'X');
+for (let i = 0; i < 165; i++) {
+    process.stdout.write(chunk);
+}
+process.stdout.write('\nghp_1234567890abcdef1234567890abcdef\n');
+process.stdout.write('AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n');
+
+const errChunk = Buffer.alloc(64 * 1024, 'Y');
+for (let j = 0; j < 35; j++) {
+    process.stderr.write(errChunk);
+}
+process.stderr.write('\n//registry.npmjs.org/:_authToken=secret_auth_token_9999\n');
+process.stderr.write('password=super_secret_pass_123\n');
+process.exitCode = 0;
+"#).unwrap();
+
+    let escaped = script_file.to_string_lossy().replace('\\', "/");
+    let script = format!("node \"{escaped}\"");
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "massive-output-sync-pkg",
+        "install",
+        &script,
+    ).with_capture_output(true);
+
+    let start = std::time::Instant::now();
+    let status = execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
+    assert!(status.success(), "Process must exit cleanly with code 0");
+    assert!(start.elapsed() < std::time::Duration::from_secs(15), "Must complete without pipe buffer deadlock");
+
+    let out = ctx.get_captured_output().expect("Captured output must be present");
+    assert_eq!(out.exit_code, 0);
+
+    // Verify massive output was drained: stdout > 10MB (165 * 64KB ~ 10.8MB)
+    assert!(out.stdout.len() >= 10 * 1024 * 1024, "Stdout must be > 10 MB, was {}", out.stdout.len());
+    assert!(out.stderr.len() >= 2 * 1024 * 1024, "Stderr must be > 2 MB, was {}", out.stderr.len());
+
+    // Verify credential scrubbing on streaming output chunks
+    assert!(!out.stdout.contains("1234567890abcdef1234567890abcdef"));
+    assert!(!out.stdout.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(out.stdout.contains("ghp_[REDACTED]"));
+    assert!(out.stdout.contains("AWS_ACCESS_KEY_ID=[REDACTED]") || out.stdout.contains("aws_access_key_id=[REDACTED]"));
+
+    assert!(!out.stderr.contains("secret_auth_token_9999"));
+    assert!(!out.stderr.contains("super_secret_pass_123"));
+    assert!(out.stderr.contains("_authToken=[REDACTED]") || out.stderr.contains("_authtoken=[REDACTED]"));
+    assert!(out.stderr.contains("password=[REDACTED]"));
+}
+
+#[tokio::test]
+async fn test_massive_output_pipe_drain_async() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let script_file = root.join("emit_async.js");
+    std::fs::write(&script_file, r#"
+const chunk = Buffer.alloc(64 * 1024, 'A');
+for (let i = 0; i < 170; i++) {
+    process.stdout.write(chunk);
+}
+process.stdout.write('\ngithub_pat_11AAAAAAA_BBBBBBBB2222222\n');
+process.stdout.write('JWT=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy\n');
+
+const errChunk = Buffer.alloc(64 * 1024, 'B');
+for (let j = 0; j < 35; j++) {
+    process.stderr.write(errChunk);
+}
+process.stderr.write('\nssh_auth_sock=/tmp/ssh-agent.sock\n');
+process.stderr.write('_authToken=super_secret_auth_token_chunk6\n');
+process.exitCode = 0;
+"#).unwrap();
+
+    let escaped = script_file.to_string_lossy().replace('\\', "/");
+    let script = format!("node \"{escaped}\"");
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "massive-output-async-pkg",
+        "postinstall",
+        &script,
+    ).with_capture_output(true);
+
+    let start = std::time::Instant::now();
+    let status = execute_lifecycle_script_async(&ctx).await.expect("Async massive output execution must succeed");
+    assert!(status.success(), "Process must exit cleanly with code 0");
+    assert!(start.elapsed() < std::time::Duration::from_secs(15), "Must complete without pipe buffer deadlock");
+
+    let out = ctx.get_captured_output().expect("Captured output must be present");
+    assert_eq!(out.exit_code, 0);
+
+    // Verify massive output was drained: stdout > 10MB
+    assert!(out.stdout.len() >= 10 * 1024 * 1024, "Stdout must be > 10 MB, was {}", out.stdout.len());
+    assert!(out.stderr.len() >= 2 * 1024 * 1024, "Stderr must be > 2 MB, was {}", out.stderr.len());
+
+    // Verify credential scrubbing on streaming output chunks
+    assert!(!out.stdout.contains("github_pat_11AAAAAAA_BBBBBBBB2222222"));
+    assert!(!out.stdout.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy"));
+    assert!(out.stdout.contains("github_pat_[REDACTED]"));
+    assert!(out.stdout.contains("JWT=[REDACTED]") || out.stdout.contains("jwt=[REDACTED]"));
+
+    assert!(!out.stderr.contains("/tmp/ssh-agent.sock"));
+    assert!(!out.stderr.contains("super_secret_auth_token_chunk6"));
+    assert!(out.stderr.contains("ssh_auth_sock=[REDACTED]") || out.stderr.contains("SSH_AUTH_SOCK=[REDACTED]"));
+    assert!(out.stderr.contains("_authToken=[REDACTED]") || out.stderr.contains("_authtoken=[REDACTED]"));
+}
+
+

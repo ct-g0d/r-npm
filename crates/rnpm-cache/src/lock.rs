@@ -46,6 +46,19 @@ impl CacheLock {
             match Self::try_acquire_exclusive(path)? {
                 Some(lock) => return Ok(lock),
                 None => {
+                    // Check if current lock owner process has died; if so, break and reclaim stale lock immediately
+                    if let Some(pid) = Self::read_lock_pid(path) {
+                        if !is_process_alive(pid) {
+                            warn!(
+                                "Lock owner process PID {pid} for {} no longer exists. Breaking and reclaiming stale lock.",
+                                path.display()
+                            );
+                            if let Ok(Some(recovered)) = Self::force_recover_stale_lock(path) {
+                                return Ok(recovered);
+                            }
+                        }
+                    }
+
                     let elapsed = start.elapsed();
                     if elapsed >= timeout {
                         // Check if lock file can be recovered (e.g. stale lock recovery)
@@ -139,8 +152,26 @@ impl CacheLock {
         }
     }
 
-    /// Check whether a lock file exists and is older than the stale threshold.
+    /// Parse owner PID from the lock file if present (e.g. `pid=1234 time=...`).
+    pub fn read_lock_pid(path: &Path) -> Option<u32> {
+        let content = std::fs::read_to_string(path).ok()?;
+        for token in content.split_whitespace() {
+            if let Some(pid_str) = token.strip_prefix("pid=") {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether a lock file exists and is older than the stale threshold or belongs to a dead process.
     pub fn is_lock_stale(path: &Path, threshold: Duration) -> bool {
+        if let Some(pid) = Self::read_lock_pid(path) {
+            if !is_process_alive(pid) {
+                return true;
+            }
+        }
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(mtime) = meta.modified() {
                 if let Ok(age) = SystemTime::now().duration_since(mtime) {
@@ -231,6 +262,69 @@ impl Drop for CacheLock {
         if let Some(file) = self.file.take() {
             debug!("Releasing lock on {}", self.path.display());
             let _ = file.unlock();
+        }
+    }
+}
+
+/// Inspects whether a process with the given PID is alive.
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    type HANDLE = *mut std::ffi::c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    const STILL_ACTIVE: DWORD = 259;
+    const ERROR_ACCESS_DENIED: DWORD = 5;
+
+    extern "system" {
+        fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) -> HANDLE;
+        fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn GetLastError() -> DWORD;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            let err = GetLastError();
+            // Access denied implies process exists under another security context
+            return err == ERROR_ACCESS_DENIED;
+        }
+
+        let mut exit_code: DWORD = 0;
+        let success = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+
+        if success != 0 {
+            exit_code == STILL_ACTIVE
+        } else {
+            true
+        }
+    }
+}
+
+/// Inspects whether a process with the given PID is alive on Unix using kill(pid, 0).
+#[cfg(not(windows))]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe {
+        let res = kill(pid as i32, 0);
+        if res == 0 {
+            true
+        } else {
+            let err = std::io::Error::last_os_error();
+            // EPERM (code 1) means process exists but owned by someone else
+            err.raw_os_error() == Some(1)
         }
     }
 }

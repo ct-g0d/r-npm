@@ -82,7 +82,7 @@ impl PackageBin {
             PackageBin::Single(path) => {
                 let bin_name = package_name
                     .split('/')
-                    .last()
+                    .next_back()
                     .unwrap_or(package_name)
                     .trim_start_matches('@');
                 let mut map = BTreeMap::new();

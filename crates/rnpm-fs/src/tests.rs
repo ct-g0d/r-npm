@@ -1322,4 +1322,100 @@ fn test_broken_junction_safe_removal() {
     assert!(!link.exists());
 }
 
+#[test]
+fn test_verbatim_path_normalization_and_strip() {
+    use std::path::Path;
+    use crate::path::{strip_verbatim_prefix, to_verbatim_path};
+
+    #[cfg(windows)]
+    {
+        // 1. Forward slash conversion and redundant components
+        let p1 = Path::new("C:/foo/bar/./baz/../qux/file.txt");
+        let v1 = to_verbatim_path(p1);
+        assert_eq!(v1.to_string_lossy(), r"\\?\C:\foo\bar\qux\file.txt");
+
+        // 2. Stripping verbatim prefix
+        let s1 = strip_verbatim_prefix(&v1);
+        assert_eq!(s1.to_string_lossy(), r"C:\foo\bar\qux\file.txt");
+
+        // 3. UNC path handling
+        let p_unc = Path::new(r"\\server\share\a\.\b\..\c");
+        let v_unc = to_verbatim_path(p_unc);
+        assert_eq!(v_unc.to_string_lossy(), r"\\?\UNC\server\share\a\c");
+
+        let s_unc = strip_verbatim_prefix(&v_unc);
+        assert_eq!(s_unc.to_string_lossy(), r"\\server\share\a\c");
+
+        // 4. Already verbatim path
+        let p_already = Path::new(r"\\?\C:\existing\path");
+        let v_already = to_verbatim_path(p_already);
+        assert_eq!(v_already.to_string_lossy(), r"\\?\C:\existing\path");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let p = Path::new("/foo/bar/./baz/../qux/file.txt");
+        let v = to_verbatim_path(p);
+        assert_eq!(v.to_string_lossy(), "/foo/bar/qux/file.txt");
+        let s = strip_verbatim_prefix(&v);
+        assert_eq!(s.to_string_lossy(), "/foo/bar/qux/file.txt");
+    }
+}
+
+#[test]
+fn test_verbatim_path_extraction_and_junction_exceeding_max_path() {
+    use crate::tarball::extract_tar_gz;
+
+    let dir = tempdir().unwrap();
+    // Build a deeply nested destination path where full path > 280 chars
+    let mut deep_dest = dir.path().to_path_buf();
+    for i in 0..10 {
+        deep_dest = deep_dest.join(format!("long_prefix_subfolder_{i}"));
+    }
+    fs::create_dir_all(&deep_dest).unwrap();
+
+    let mut deep_rel = String::from("package");
+    for i in 0..8 {
+        deep_rel.push_str(&format!("/deep_level_{i}_nested_path_component"));
+    }
+    deep_rel.push_str("/deep_file.txt");
+
+    let payload = b"verbatim path extraction payload for > 260 character Windows paths";
+    let tar_bytes = create_test_tarball(&[
+        ("package/package.json", br#"{"name":"long-path-pkg","version":"1.0.0"}"#, 0o644),
+        (&deep_rel, payload, 0o644),
+    ]);
+
+    // Extract using extract_tar_gz directly
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &deep_dest, None).expect("Extraction must succeed");
+    assert_eq!(summary.entries_extracted, 2);
+
+    let sub_path = deep_rel.strip_prefix("package/").unwrap();
+    let file_path = deep_dest.join(sub_path);
+    let full_len = file_path.to_string_lossy().len();
+    assert!(full_len > 260, "Target file path length must exceed MAX_PATH (260), was {full_len}");
+
+    let read_back = fs::read(&file_path).expect("Must read file with verbatim long path");
+    assert_eq!(read_back, payload);
+
+    // Create a junction to this deep destination
+    let junction_link = dir.path().join("link_to_deep_dest");
+    create_junction(&junction_link, &deep_dest).expect("Junction creation must succeed for deep path");
+    assert!(is_junction(&junction_link).unwrap());
+
+    // Read through the junction
+    let read_through_junction = fs::read(junction_link.join(sub_path)).expect("Must read through junction");
+    assert_eq!(read_through_junction, payload);
+
+    // Remove junction safely
+    remove_junction(&junction_link).expect("Must safely remove junction");
+    assert!(!junction_link.exists());
+    assert!(file_path.exists(), "Target file must still exist after junction removal");
+
+    // Remove entire deep directory with remove_dir_all_safe
+    crate::junction::remove_dir_all_safe(&deep_dest).expect("remove_dir_all_safe must handle long paths");
+    assert!(!deep_dest.exists());
+}
+
+
 

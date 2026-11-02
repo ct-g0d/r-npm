@@ -434,6 +434,99 @@ mod tests {
     }
 
     #[test]
+    fn test_dead_pid_stale_lock_breaking_immediate() {
+        use std::time::Duration;
+        use crate::lock::is_process_alive;
+
+        let dead_pid = 9999999u32;
+        assert!(!is_process_alive(dead_pid), "PID {dead_pid} must be confirmed dead");
+
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap()
+            .with_lock_timeout(Duration::from_millis(500))
+            .with_stale_threshold(Duration::from_secs(3600)); // Very large stale threshold
+
+        let lock_path = cache.lock_path("idx_dead_pid_lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        // Write lock file with dead PID
+        std::fs::write(&lock_path, format!("pid={dead_pid} time=999999\n")).unwrap();
+        assert!(lock_path.exists());
+
+        // Attempting to acquire lock should immediately detect dead PID and reclaim without waiting 3600s
+        let start = std::time::Instant::now();
+        let lock_res = CacheLock::acquire_exclusive_with_options(
+            &lock_path,
+            Duration::from_millis(500),
+            Duration::from_secs(3600),
+        );
+
+        assert!(lock_res.is_ok(), "Must break and reclaim lock held by dead PID: {:?}", lock_res.err());
+        assert!(start.elapsed() < Duration::from_millis(250), "Reclamation must be immediate");
+
+        let lock = lock_res.unwrap();
+        drop(lock);
+
+        let content = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(content.contains(&format!("pid={}", std::process::id())));
+    }
+
+    #[test]
+    fn test_self_healing_corrupted_blob_and_unparseable_index() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key = "self-healing-pkg@1.0.0";
+        let original_data = b"production-ready-cached-tarball-data-bytes";
+
+        // 1. Put valid item
+        let entry = cache.put(key, original_data, None).expect("put must succeed");
+        assert_eq!(entry.key, key);
+
+        // Verify clean get
+        let retrieved = cache.get(key).expect("get must succeed");
+        assert!(retrieved.is_some());
+        let (read_entry, read_bytes) = retrieved.unwrap();
+        assert_eq!(read_bytes, original_data);
+        assert_eq!(read_entry.sha512_hex, entry.sha512_hex);
+
+        // 2. Corrupt the blob on disk
+        let blob_path = cache.blob_path(&entry.sha512_hex);
+        assert!(blob_path.exists());
+        std::fs::write(&blob_path, b"completely corrupted garbage bytes").unwrap();
+
+        // 3. get(key) should detect SSRI / SHA-512 mismatch, auto-purge corrupt blob & index, and return None
+        let miss_res = cache.get(key).expect("get on corrupted blob must not error");
+        assert!(miss_res.is_none(), "Must treat corrupted blob as cache miss");
+        assert!(!blob_path.exists(), "Corrupt blob must be auto-purged from disk");
+
+        let index_path = IndexEntry::path_for_key(cache.root(), key);
+        assert!(!index_path.exists(), "Index referencing corrupt blob must be auto-purged");
+
+        // 4. Caller re-fetches cleanly and stores again
+        let entry2 = cache.put(key, original_data, None).expect("re-fetch put must succeed");
+        assert_eq!(entry2.sha512_hex, entry.sha512_hex);
+        assert!(blob_path.exists());
+
+        // 5. Corrupt index entry with unparseable JSON
+        std::fs::write(&index_path, b"{ this is definitely not valid json syntax }}}").unwrap();
+        let index_miss = cache.get(key).expect("get on invalid JSON index must not error");
+        assert!(index_miss.is_none(), "Must treat invalid JSON index as cache miss");
+        assert!(!index_path.exists(), "Corrupted index file must be auto-purged");
+
+        // 6. Test corrupt index entry with invalid SSRI integrity string
+        let mut malformed_entry = entry.clone();
+        malformed_entry.integrity = "invalid_not_ssri_format".to_string();
+        std::fs::write(&index_path, serde_json::to_string(&malformed_entry).unwrap()).unwrap();
+
+        let unparseable_miss = cache.get(key).expect("get on unparseable integrity must not error");
+        assert!(unparseable_miss.is_none(), "Must treat unparseable integrity as cache miss");
+        assert!(!index_path.exists(), "Index with unparseable integrity must be auto-purged");
+    }
+
+    #[test]
     fn test_rapid_lock_timeouts_and_contention() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;

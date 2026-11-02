@@ -196,6 +196,33 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Helper to reliably read a file with retries on Windows transient file sharing locks.
+fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut attempts = 0;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        attempts += 1;
+        match fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => {
+                if attempts >= 10 {
+                    return Err(e);
+                }
+                let jitter = (attempts as u64 * 3) % 7;
+                sleep(delay + Duration::from_millis(jitter));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(150));
+            }
+        }
+    }
+}
+
+/// Helper to reliably read a UTF-8 file with retries on Windows transient file sharing locks.
+fn read_to_string_with_retries(path: &Path) -> std::io::Result<String> {
+    let bytes = read_file_with_retries(path)?;
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Content-addressable cache manager.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -418,7 +445,7 @@ impl Cache {
             return Ok(None);
         }
 
-        let bytes = match fs::read(&blob_path) {
+        let bytes = match read_file_with_retries(&blob_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -461,7 +488,7 @@ impl Cache {
             return Ok(None);
         }
 
-        let content = match fs::read_to_string(&index_path) {
+        let content = match read_to_string_with_retries(&index_path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -483,6 +510,15 @@ impl Cache {
                         index_path.display(),
                         key,
                         entry.key
+                    );
+                    let _ = remove_file_with_retries(&index_path);
+                    return Ok(None);
+                }
+                if let Err(err) = Integrity::parse(&entry.integrity) {
+                    warn!(
+                        "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
+                        index_path.display(),
+                        entry.integrity
                     );
                     let _ = remove_file_with_retries(&index_path);
                     return Ok(None);
@@ -539,9 +575,6 @@ impl Cache {
         }
 
         let _key_lock = self.lock_key(key)?;
-        if index_path.exists() {
-            let _ = remove_file_with_retries(&index_path);
-        }
         if let Err(err) = rename_with_retries(&temp_path, &index_path) {
             let _ = remove_file_with_retries(&temp_path);
             return Err(CacheError::Io(err));
@@ -563,10 +596,11 @@ impl Cache {
         match self.get_by_sha512(&entry.sha512_hex)? {
             Some(bytes) => {
                 // Verify against entry integrity as well
-                if let Ok(expected_integrity) = Integrity::parse(&entry.integrity) {
-                    if let Err(err) = expected_integrity.verify(&bytes) {
+                let expected_integrity = match Integrity::parse(&entry.integrity) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
                         warn!(
-                            "Integrity mismatch for key '{key}': {err}. Purging corrupt entry."
+                            "Unparseable SSRI integrity in index for key '{key}': {err}. Auto-purging corrupt entry."
                         );
                         let index_path = IndexEntry::path_for_key(&self.root, key);
                         let _ = remove_file_with_retries(&index_path);
@@ -574,6 +608,17 @@ impl Cache {
                         let _ = remove_file_with_retries(&blob_path);
                         return Ok(None);
                     }
+                };
+
+                if let Err(err) = expected_integrity.verify(&bytes) {
+                    warn!(
+                        "SSRI SHA-512 integrity mismatch for key '{key}': {err}. Auto-purging corrupt entry and treating as cache miss."
+                    );
+                    let index_path = IndexEntry::path_for_key(&self.root, key);
+                    let _ = remove_file_with_retries(&index_path);
+                    let blob_path = self.blob_path(&entry.sha512_hex);
+                    let _ = remove_file_with_retries(&blob_path);
+                    return Ok(None);
                 }
                 Ok(Some((entry, bytes)))
             }
@@ -586,6 +631,30 @@ impl Cache {
                 );
                 Ok(None)
             }
+        }
+    }
+
+    /// Retrieve a blob by its SSRI Integrity descriptor.
+    /// If corrupted, auto-purges the corrupt blob, logs a diagnostic, and returns `Ok(None)` for clean re-fetching.
+    pub fn get_by_integrity(&self, integrity: &Integrity) -> Result<Option<Vec<u8>>, CacheError> {
+        let sha512_entry = integrity.entries.iter().find(|e| e.algorithm == Algorithm::Sha512);
+        if let Some(entry) = sha512_entry {
+            let hex = HEXLOWER.encode(&entry.digest);
+            match self.get_by_sha512(&hex)? {
+                Some(bytes) => {
+                    if let Err(err) = integrity.verify(&bytes) {
+                        warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
+                        let blob_path = self.blob_path(&hex);
+                        let _ = remove_file_with_retries(&blob_path);
+                        Ok(None)
+                    } else {
+                        Ok(Some(bytes))
+                    }
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
         }
     }
 
@@ -709,7 +778,7 @@ impl Cache {
                     continue;
                 }
 
-                match fs::read(&path) {
+                match read_file_with_retries(&path) {
                     Ok(bytes) => {
                         let mut hasher = Sha512::new();
                         hasher.update(&bytes);
@@ -729,6 +798,10 @@ impl Cache {
                             report.corrupted_blobs += 1;
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Concurrent rename or cleanup; safely skip
+                        continue;
+                    }
                     Err(e) => {
                         warn!("Unreadable blob at {} ({}). Purging.", path.display(), e);
                         let _ = remove_file_with_retries(&path);
@@ -745,8 +818,12 @@ impl Cache {
             collect_files_recursive(&index_dir, &mut index_paths);
 
             for path in index_paths {
-                let content = match fs::read_to_string(&path) {
+                let content = match read_to_string_with_retries(&path) {
                     Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Concurrent rename or cleanup; safely skip
+                        continue;
+                    }
                     Err(e) => {
                         warn!("Unreadable index file at {} ({}). Purging.", path.display(), e);
                         let _ = remove_file_with_retries(&path);

@@ -4,14 +4,17 @@ use crate::error::FsError;
 
 /// Create a non-admin directory junction on Windows, or a symlink on Unix.
 pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
+    let link_v = crate::path::to_verbatim_path(link);
+    let target_v = crate::path::to_verbatim_path(target);
+
     #[cfg(windows)]
     {
-        create_windows_junction(link, target)
+        create_windows_junction(&link_v, &target_v)
     }
 
     #[cfg(not(windows))]
     {
-        std::os::unix::fs::symlink(target, link).map_err(FsError::Io)
+        std::os::unix::fs::symlink(&target_v, &link_v).map_err(FsError::Io)
     }
 }
 
@@ -19,11 +22,12 @@ pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
 /// Ensures deleting the junction removes ONLY the reparse point, never target contents!
 /// Returns an error if the path exists but is not a junction or symlink.
 pub fn remove_junction(path: &Path) -> Result<(), FsError> {
-    if !path.exists() && !is_reparse_point_or_symlink(path)? {
+    let path_v = crate::path::to_verbatim_path(path);
+    if !path_v.exists() && !is_reparse_point_or_symlink(&path_v)? {
         return Ok(());
     }
 
-    if !is_reparse_point_or_symlink(path)? {
+    if !is_reparse_point_or_symlink(&path_v)? {
         return Err(FsError::JunctionError {
             path: path.to_path_buf(),
             detail: "Refusing to remove path: target exists but is not a junction or symlink".to_string(),
@@ -35,11 +39,11 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
         // On Windows, remove_dir calls RemoveDirectoryW, which removes the reparse point
         // and does NOT touch any contents inside the target directory.
         // Clear readonly attribute if set before attempting removal
-        if let Ok(meta) = fs::symlink_metadata(path) {
+        if let Ok(meta) = fs::symlink_metadata(&path_v) {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
             }
         }
 
@@ -47,7 +51,7 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
         let mut delay = std::time::Duration::from_millis(5);
         loop {
             attempts += 1;
-            match fs::remove_dir(path) {
+            match fs::remove_dir(&path_v) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
@@ -76,17 +80,18 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
 /// are NEVER recursively traversed (only their reparse points are unlinked).
 /// Also handles Windows read-only attributes and transient file locks with backoff retries.
 pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
-    if !path.exists() && !is_reparse_point_or_symlink(path)? {
+    let path_v = crate::path::to_verbatim_path(path);
+    if !path_v.exists() && !is_reparse_point_or_symlink(&path_v)? {
         return Ok(());
     }
 
     // 1. If it's a junction or symlink, remove ONLY the reparse point/link, never target contents!
-    if is_reparse_point_or_symlink(path)? {
-        return remove_junction(path);
+    if is_reparse_point_or_symlink(&path_v)? {
+        return remove_junction(&path_v);
     }
 
     // 2. Query metadata to determine file vs directory
-    let meta = match fs::symlink_metadata(path) {
+    let meta = match fs::symlink_metadata(&path_v) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(FsError::Io(e)),
@@ -99,7 +104,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
             }
         }
         #[cfg(unix)]
@@ -113,7 +118,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         }
 
         // Read directory entries
-        match fs::read_dir(path) {
+        match fs::read_dir(&path_v) {
             Ok(entries) => {
                 for entry_res in entries {
                     let entry = match entry_res {
@@ -134,7 +139,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
             }
         }
 
@@ -142,7 +147,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         let mut delay = std::time::Duration::from_millis(5);
         loop {
             attempts += 1;
-            match fs::remove_dir(path) {
+            match fs::remove_dir(&path_v) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
@@ -162,7 +167,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
             }
         }
         #[cfg(unix)]
@@ -171,7 +176,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let mut perms = meta.permissions();
             if perms.mode() & 0o200 == 0 {
                 perms.set_mode(perms.mode() | 0o600);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
             }
         }
 
@@ -179,7 +184,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         let mut delay = std::time::Duration::from_millis(5);
         loop {
             attempts += 1;
-            match fs::remove_file(path) {
+            match fs::remove_file(&path_v) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
@@ -197,7 +202,8 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
 
 /// Check if a path is a junction or symlink.
 pub fn is_junction(path: &Path) -> Result<bool, FsError> {
-    is_reparse_point_or_symlink(path)
+    let path_v = crate::path::to_verbatim_path(path);
+    is_reparse_point_or_symlink(&path_v)
 }
 
 fn is_reparse_point_or_symlink(path: &Path) -> Result<bool, FsError> {
@@ -226,30 +232,20 @@ fn is_reparse_point_or_symlink(path: &Path) -> Result<bool, FsError> {
 fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     use std::process::Command;
 
+    let link_v = crate::path::to_verbatim_path(link);
+    let target_v = crate::path::to_verbatim_path(target);
+
     // Ensure parent directory of link exists
-    if let Some(parent) = link.parent() {
+    if let Some(parent) = link_v.parent() {
         fs::create_dir_all(parent)?;
     }
 
     // Target must exist for a junction
-    let target_canonical = target.canonicalize().map_err(FsError::Io)?;
-    let target_str = target_canonical.to_string_lossy().replace('/', "\\");
-    let clean_target = if let Some(stripped) = target_str.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", stripped)
-    } else if let Some(stripped) = target_str.strip_prefix(r"\\?\") {
-        stripped.to_string()
-    } else {
-        target_str.to_string()
-    };
+    let target_canonical = target_v.canonicalize().map_err(FsError::Io)?;
+    let target_canon_v = crate::path::to_verbatim_path(&target_canonical);
 
-    let link_str = link.to_string_lossy().replace('/', "\\");
-    let clean_link = if let Some(stripped) = link_str.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", stripped)
-    } else if let Some(stripped) = link_str.strip_prefix(r"\\?\") {
-        stripped.to_string()
-    } else {
-        link_str.to_string()
-    };
+    let link_str = link_v.to_string_lossy().to_string();
+    let target_str = target_canon_v.to_string_lossy().to_string();
 
     // cmd.exe /C mklink /J "<link>" "<target>"
     // mklink /J creates directory junctions without administrator privileges.
@@ -258,8 +254,8 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
             "/C",
             "mklink",
             "/J",
-            &clean_link,
-            &clean_target,
+            &link_str,
+            &target_str,
         ])
         .output()
         .map_err(|err| FsError::JunctionError {
@@ -268,6 +264,26 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
         })?;
 
     if !output.status.success() {
+        // Fallback for short paths if cmd.exe didn't accept \\?\ prefix
+        let clean_link = crate::path::strip_verbatim_prefix(&link_v).to_string_lossy().to_string();
+        let clean_target = crate::path::strip_verbatim_prefix(&target_canon_v).to_string_lossy().to_string();
+
+        let retry_output = Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &clean_link,
+                &clean_target,
+            ])
+            .output();
+
+        if let Ok(retry) = retry_output {
+            if retry.status.success() {
+                return Ok(());
+            }
+        }
+
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(FsError::JunctionError {

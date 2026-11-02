@@ -658,7 +658,7 @@ impl RegistryClient {
                 }
                 Err(err) => {
                     // Check if network error is transient and retryable
-                    if attempt < self.config.max_retries {
+                    if err.is_transient() && attempt < self.config.max_retries {
                         let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
                             .min(self.config.max_retry_backoff);
                         debug!(
@@ -751,76 +751,99 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
-        let (resp, _permit) = self
-            .execute_with_permit(
-                Method::GET,
-                url.clone(),
-                Some(NPM_INSTALL_V1_JSON),
-                if_none_match,
-            )
-            .await?;
+        let mut attempt = 0;
+        loop {
+            let (resp, _permit) = self
+                .execute_with_permit(
+                    Method::GET,
+                    url.clone(),
+                    Some(NPM_INSTALL_V1_JSON),
+                    if_none_match,
+                )
+                .await?;
 
-        let status = resp.status();
-        if status == StatusCode::NOT_MODIFIED {
+            let status = resp.status();
+            if status == StatusCode::NOT_MODIFIED {
+                let etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| if_none_match.map(|s| s.to_string()));
+                return Ok(MetadataFetchResult::NotModified { etag });
+            }
+
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: package_name.to_string(),
+                    status: 404,
+                });
+            }
+
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                return Err(RegistryError::RateLimited { retry_after });
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
             let etag = resp
                 .headers()
                 .get(ETAG)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| if_none_match.map(|s| s.to_string()));
-            return Ok(MetadataFetchResult::NotModified { etag });
+                .map(|s| s.to_string());
+
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let reg_err = RegistryError::Http(e);
+                    if reg_err.is_transient() && attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                            .min(self.config.max_retry_backoff);
+                        debug!(
+                            "Metadata body truncated for {}, retrying in {:?} (attempt {}/{})",
+                            url, delay, attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(reg_err);
+                }
+            };
+
+            let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)
+                .map_err(RegistryError::Json)?;
+            return Ok(MetadataFetchResult::Fresh { metadata, etag });
         }
-
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: package_name.to_string(),
-                status: 404,
-            });
-        }
-
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            return Err(RegistryError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        let etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        let metadata: AbbreviatedPackageMetadata = resp.json().await?;
-        Ok(MetadataFetchResult::Fresh { metadata, etag })
     }
 
     /// Fetch abbreviated install metadata for multiple packages concurrently with bounded concurrency.
@@ -1011,74 +1034,95 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<BytesFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let (resp, _permit) = self
-            .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
-            .await?;
+        let mut attempt = 0;
+        loop {
+            let (resp, _permit) = self
+                .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
+                .await?;
 
-        let status = resp.status();
-        if status == StatusCode::NOT_MODIFIED {
+            let status = resp.status();
+            if status == StatusCode::NOT_MODIFIED {
+                let etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| if_none_match.map(|s| s.to_string()));
+                return Ok(BytesFetchResult::NotModified { etag });
+            }
+
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: tarball_url.to_string(),
+                    status: 404,
+                });
+            }
+
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                return Err(RegistryError::RateLimited { retry_after });
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
             let etag = resp
                 .headers()
                 .get(ETAG)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| if_none_match.map(|s| s.to_string()));
-            return Ok(BytesFetchResult::NotModified { etag });
-        }
+                .map(|s| s.to_string());
 
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: tarball_url.to_string(),
-                status: 404,
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let reg_err = RegistryError::Http(e);
+                    if reg_err.is_transient() && attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                            .min(self.config.max_retry_backoff);
+                        debug!(
+                            "Tarball body truncated for {}, retrying in {:?} (attempt {}/{})",
+                            tarball_url, delay, attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(reg_err);
+                }
+            };
+
+            return Ok(BytesFetchResult::Fresh {
+                bytes: bytes.to_vec(),
+                etag,
             });
         }
-
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            return Err(RegistryError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        let etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        let bytes = resp.bytes().await?;
-        Ok(BytesFetchResult::Fresh {
-            bytes: bytes.to_vec(),
-            etag,
-        })
     }
 
     /// Download multiple tarballs concurrently with bounded concurrency.
@@ -1118,76 +1162,104 @@ impl RegistryClient {
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let (mut resp, _permit) = self
-            .execute_with_permit(Method::GET, url.clone(), None, None)
-            .await?;
+        let mut attempt = 0;
+        loop {
+            let (mut resp, _permit) = self
+                .execute_with_permit(Method::GET, url.clone(), None, None)
+                .await?;
 
-        let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: tarball_url.to_string(),
-                status: 404,
-            });
-        }
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: tarball_url.to_string(),
+                    status: 404,
+                });
+            }
 
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
 
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
 
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            return Err(RegistryError::RateLimited { retry_after });
-        }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                return Err(RegistryError::RateLimited { retry_after });
+            }
 
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
 
-        if let Some(parent) = dest_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
+            if let Some(parent) = dest_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
+                })?;
+            }
+
+            let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
+                RegistryError::Other(format!("Failed to create {}: {e}", dest_path.display()))
             })?;
-        }
 
-        let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
-            RegistryError::Other(format!("Failed to create {}: {e}", dest_path.display()))
-        })?;
+            let mut written: u64 = 0;
+            let mut stream_err = None;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            return Err(RegistryError::Other(format!("Failed to write chunk to {}: {e}", dest_path.display())));
+                        }
+                        written += chunk.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        stream_err = Some(RegistryError::Http(e));
+                        break;
+                    }
+                }
+            }
 
-        let mut written: u64 = 0;
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to write chunk to {}: {e}", dest_path.display()))
+            if let Some(err) = stream_err {
+                if err.is_transient() && attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                    debug!(
+                        "Tarball stream dropped mid-download for {}, retrying in {:?} (attempt {}/{})",
+                        tarball_url, delay, attempt + 1, self.config.max_retries
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err);
+            }
+
+            file.flush().await.map_err(|e| {
+                RegistryError::Other(format!("Failed to flush {}: {e}", dest_path.display()))
             })?;
-            written += chunk.len() as u64;
+
+            return Ok(written);
         }
-
-        file.flush().await.map_err(|e| {
-            RegistryError::Other(format!("Failed to flush {}: {e}", dest_path.display()))
-        })?;
-
-        Ok(written)
     }
 
     /// Download multiple tarballs directly to disk destinations concurrently with bounded concurrency.
@@ -1258,5 +1330,141 @@ mod tests {
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert!(config.retry_on_status.contains(&429));
         assert!(config.retry_on_status.contains(&503));
+    }
+
+    #[tokio::test]
+    async fn test_client_retry_transient_503_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else {
+                    let body = r#"{"name":"pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let config = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            user_agent: "test-client".into(),
+            max_retries: 2,
+            initial_retry_backoff: Duration::from_millis(5),
+            max_retry_backoff: Duration::from_millis(20),
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(config).unwrap();
+        let meta = client.get_package_metadata("pkg").await.unwrap();
+        assert_eq!(meta.name, "pkg");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_client_no_retry_on_404_not_found() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                attempts_clone.fetch_add(1, Ordering::SeqCst);
+                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let config = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            user_agent: "test-client".into(),
+            max_retries: 3,
+            initial_retry_backoff: Duration::from_millis(5),
+            max_retry_backoff: Duration::from_millis(20),
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(config).unwrap();
+        let res = client.get_package_metadata("nonexistent-pkg").await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.is_not_found());
+        assert!(!err.is_transient());
+        // 404 should never be retried, exactly 1 attempt
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_client_retry_body_stream_drop_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    // Send header with Content-Length 100, but only 10 bytes then close connection
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 100\r\n\r\n0123456789";
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                } else {
+                    let payload = b"complete-tarball-stream-payload";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(payload).await;
+                }
+            }
+        });
+
+        let config = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            user_agent: "test-client".into(),
+            max_retries: 2,
+            initial_retry_backoff: Duration::from_millis(5),
+            max_retry_backoff: Duration::from_millis(20),
+            timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(config).unwrap();
+        let tarball_url = format!("http://{addr}/tarball.tgz");
+        let bytes = client.download_tarball_bytes(&tarball_url).await.unwrap();
+        assert_eq!(bytes, b"complete-tarball-stream-payload");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

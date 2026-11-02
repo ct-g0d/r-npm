@@ -27,7 +27,8 @@ pub fn extract_and_replace<R: Read>(
     destination: &Path,
     limits: Option<TarLimits>,
 ) -> Result<ExtractionSummary, FsError> {
-    let parent = destination
+    let dest_v = crate::path::to_verbatim_path(destination);
+    let parent = dest_v
         .parent()
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -48,7 +49,7 @@ pub fn extract_and_replace<R: Read>(
     })?;
 
     // Staging succeeded: replace destination with staging directory
-    replace_dir_with_retries(staging_path, destination, 30)?;
+    replace_dir_with_retries(staging_path, &dest_v, 30)?;
 
     // Extraction and atomic rename succeeded; disable tempdir auto-deletion
     std::mem::forget(staging_temp);
@@ -63,7 +64,9 @@ pub fn replace_dir_with_retries(
     destination: &Path,
     max_retries: usize,
 ) -> Result<(), FsError> {
-    let parent = destination
+    let staging_v = crate::path::to_verbatim_path(staging);
+    let destination_v = crate::path::to_verbatim_path(destination);
+    let parent = destination_v
         .parent()
         .unwrap_or_else(|| Path::new("."));
 
@@ -74,7 +77,7 @@ pub fn replace_dir_with_retries(
     loop {
         attempt += 1;
 
-        let result = try_replace_dir(staging, destination, parent);
+        let result = try_replace_dir(&staging_v, &destination_v, parent);
         match result {
             Ok(()) => return Ok(()),
             Err(err) => {

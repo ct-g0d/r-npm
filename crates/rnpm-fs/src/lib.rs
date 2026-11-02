@@ -2,12 +2,14 @@ pub mod atomic;
 pub mod error;
 pub mod junction;
 pub mod parallel;
+pub mod path;
 pub mod tarball;
 
 pub use atomic::{extract_and_replace, recover_atomic_writes, replace_dir_with_retries};
 pub use error::FsError;
 pub use junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
 pub use parallel::{extract_batch_parallel, BatchExtractionItem};
+pub use path::{strip_verbatim_prefix, to_verbatim_path};
 pub use tarball::{
     collect_pack_files, compute_tarball_filename, extract_tar_gz, pack_directory,
     strip_package_prefix, validate_entry_path, ExtractionSummary, PackSummary, PackedFileEntry,

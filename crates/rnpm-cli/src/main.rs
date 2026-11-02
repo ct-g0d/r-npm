@@ -290,9 +290,7 @@ pub(crate) fn print_structured_error(err: &anyhow::Error) {
         eprintln!("npm error code ERR_UNSUPPORTED_PROTOCOL");
         eprintln!("npm error {err_str}");
         eprintln!("npm error Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
-    } else if err_str.contains("ERR_UNSUPPORTED_COMMAND") {
-        eprintln!("{err_str}");
-    } else if err_str.contains("ERR_UNSUPPORTED_FLAG") {
+    } else if err_str.contains("ERR_UNSUPPORTED_COMMAND") || err_str.contains("ERR_UNSUPPORTED_FLAG") {
         eprintln!("{err_str}");
     } else {
         eprintln!("rnpm ERR! {err_str}");
