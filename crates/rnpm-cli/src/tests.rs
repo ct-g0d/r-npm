@@ -2,6 +2,7 @@ use super::*;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rnpm_core::integrity::{Algorithm, Integrity};
+use rnpm_core::spec::PackageTarget;
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -190,8 +191,8 @@ use tokio::net::TcpListener;
             let err = res.unwrap_err();
             let err_str = err.to_string();
             assert!(
-                err_str.contains("Unsupported protocol"),
-                "Expected UnsupportedProtocol error, got: {err_str}"
+                err_str.contains("Unsupported URL Type") || err_str.contains("Unsupported protocol"),
+                "Expected Unsupported URL Type error, got: {err_str}"
             );
         }
 
@@ -737,7 +738,109 @@ use tokio::net::TcpListener;
         // Commands still deferred should still trigger ERR_UNSUPPORTED_COMMAND
         let check_fix = check_unsupported_cli_invocation(vec!["rnpm", "fix"]);
         assert!(check_fix.is_some());
-        let (code, _) = check_fix.unwrap();
+        let (code, msg) = check_fix.unwrap();
         assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
+        assert!(msg.contains("ERR_UNSUPPORTED_COMMAND"));
+        assert!(msg.contains("fix"));
+    }
+
+    #[tokio::test]
+    async fn test_cli_unsupported_flags_filtering() {
+        let test_flags = [
+            "--legacy-peer-deps",
+            "--global",
+            "-g",
+            "--package-lock-only",
+            "--save-bundle",
+            "--save-exact",
+            "--omit=dev",
+            "--omit=optional",
+            "--omit=peer",
+        ];
+
+        for flag in test_flags {
+            let check = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+            assert!(
+                check.is_some(),
+                "Expected unsupported flag check to trigger for '{flag}'"
+            );
+            let (code, msg) = check.unwrap();
+            assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
+            assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
+            assert!(msg.contains(flag));
+            assert!(msg.contains("docs/compatibility-contract.md"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_unsupported_protocol_diagnostics() {
+        let bad_protocols = [
+            ("ftp://example.com/pkg.tgz", "ftp:"),
+            ("svn://repo.example.com/trunk", "svn:"),
+            ("sftp://files.example.com/pkg.tgz", "sftp:"),
+            ("hg+https://hg.example.com/repo", "hg+https:"),
+            ("cvs://anonymous@cvs.example.com/root", "cvs:"),
+            ("telnet://bbs.example.com", "telnet:"),
+        ];
+
+        for (spec, expected_proto) in bad_protocols {
+            let res = PackageTarget::parse(spec);
+            assert!(
+                res.is_err(),
+                "Expected PackageTarget::parse to fail for unsupported protocol: {spec}"
+            );
+            let err = res.unwrap_err();
+            let err_str = err.to_string();
+            assert!(
+                err_str.contains("Unsupported URL Type"),
+                "Expected 'Unsupported URL Type' in '{err_str}' for spec '{spec}'"
+            );
+            assert!(
+                err_str.contains(expected_proto),
+                "Expected protocol '{expected_proto}' in '{err_str}'"
+            );
+
+            // Also verify that structured error printing formats EUNSUPPORTEDPROTOCOL
+            let anyhow_err = anyhow::Error::from(err);
+            let formatted = format!("{:#}", anyhow_err);
+            assert!(formatted.contains("Unsupported URL Type"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()
+            .parent().unwrap()
+            .join("benchmarks")
+            .join("fixtures")
+            .join("gate-e-unsupported-protocol");
+
+        assert!(
+            fixture_dir.join("package.json").exists(),
+            "gate-e-unsupported-protocol fixture must exist at {}",
+            fixture_dir.display()
+        );
+
+        let cli = Cli {
+            command: Commands::Install {
+                packages: vec![],
+                registry: None,
+                cache: None,
+                offline: true,
+                ignore_scripts: true,
+            },
+        };
+
+        let res = run_cli(cli, Some(fixture_dir)).await;
+        assert!(
+            res.is_err(),
+            "Install must fail when project contains unsupported protocol dependency"
+        );
+        let err_str = format!("{:#}", res.unwrap_err());
+        assert!(
+            err_str.contains("Unsupported URL Type \"ftp:\""),
+            "Error message must specify Unsupported URL Type 'ftp:', got: {err_str}"
+        );
     }
 

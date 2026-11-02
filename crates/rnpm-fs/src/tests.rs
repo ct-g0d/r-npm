@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::io::Cursor;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -1359,6 +1359,39 @@ fn test_verbatim_path_normalization_and_strip() {
         assert_eq!(v.to_string_lossy(), "/foo/bar/qux/file.txt");
         let s = strip_verbatim_prefix(&v);
         assert_eq!(s.to_string_lossy(), "/foo/bar/qux/file.txt");
+fn test_security_rejection_special_device_entries() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // Test FIFO, Block special, and Character special
+    let special_types = [
+        (tar::EntryType::Fifo, "package/my_fifo"),
+        (tar::EntryType::Block, "package/my_block"),
+        (tar::EntryType::Char, "package/my_char"),
+    ];
+
+    for (entry_type, path) in special_types {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut gz);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, Cursor::new(&[])).unwrap();
+            builder.finish().unwrap();
+        }
+        let tar_bytes = gz.finish().unwrap();
+
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::ForbiddenSpecialEntry { .. })),
+            "Expected ForbiddenSpecialEntry for {:?} ({}), got: {:?}",
+            entry_type,
+            path,
+            res
+        );
     }
 }
 
@@ -1417,5 +1450,552 @@ fn test_verbatim_path_extraction_and_junction_exceeding_max_path() {
     assert!(!deep_dest.exists());
 }
 
+fn test_security_rejection_windows_illegal_characters() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let illegal_names = [
+        "package/star*name.js",
+        "package/question?mark.js",
+        "package/quote\"test.js",
+        "package/left<angle.js",
+        "package/right>angle.js",
+        "package/pipe|test.js",
+    ];
+
+    for bad in illegal_names {
+        let tar_bytes = create_test_tarball(&[(bad, b"dummy content", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::PathTraversal { .. })),
+            "Expected PathTraversal for {}, got: {:?}",
+            bad,
+            res
+        );
+    }
+}
+
+#[test]
+fn test_security_hardlink_attacks_rejection() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. Hardlink pointing outside extraction directory
+    let mut gz1 = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz1);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_link(&mut header, "package/evil_hardlink.js", "package/../../etc/passwd").unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_outside = gz1.finish().unwrap();
+    let res_outside = extract_tar_gz(Cursor::new(&tar_outside), &dest, None);
+    assert!(
+        matches!(res_outside, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink for hardlink escaping destination, got: {:?}",
+        res_outside
+    );
+
+    // 2. Hardlink pointing to a symlink
+    let mut gz2 = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz2);
+
+        // First append regular file
+        let mut h_file = Header::new_gnu();
+        h_file.set_size(12);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/target.txt", Cursor::new(b"hello target")).unwrap();
+
+        // Second append symlink pointing to regular file
+        let mut h_sym = Header::new_gnu();
+        h_sym.set_entry_type(tar::EntryType::Symlink);
+        h_sym.set_size(0);
+        h_sym.set_mode(0o777);
+        h_sym.set_cksum();
+        builder.append_link(&mut h_sym, "package/sub/symlink.js", "../target.txt").unwrap();
+
+        // Third append hardlink pointing to the symlink
+        let mut h_hard = Header::new_gnu();
+        h_hard.set_entry_type(tar::EntryType::Link);
+        h_hard.set_size(0);
+        h_hard.set_mode(0o644);
+        h_hard.set_cksum();
+        builder.append_link(&mut h_hard, "package/hardlink_to_sym.js", "package/sub/symlink.js").unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar_sym = gz2.finish().unwrap();
+    let res_sym = extract_tar_gz(Cursor::new(&tar_sym), &dest, None);
+    assert!(
+        matches!(res_sym, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink for hardlink pointing to a symlink, got: {:?}",
+        res_sym
+    );
+}
+
+#[test]
+fn test_case_insensitive_package_prefix_extraction() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let tar_bytes = create_test_tarball(&[
+        ("PACKAGE/upper.txt", b"uppercase prefix", 0o644),
+        ("Package/mixed.txt", b"mixed case prefix", 0o644),
+        ("pAcKaGe/sub/strange.txt", b"strange case prefix", 0o644),
+    ]);
+
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 3);
+
+    assert!(dest.join("upper.txt").exists());
+    assert!(dest.join("mixed.txt").exists());
+    assert!(dest.join("sub/strange.txt").exists());
+    assert_eq!(fs::read_to_string(dest.join("upper.txt")).unwrap(), "uppercase prefix");
+}
+
+#[test]
+fn test_windows_junction_cleanup_before_unpacking() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    let external_target = dir.path().join("external_target");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&external_target).unwrap();
+    fs::write(external_target.join("important.txt"), b"do not delete me!").unwrap();
+
+    // Create a junction inside dest at dest/my_file
+    let junction_path = dest.join("my_file");
+    create_junction(&junction_path, &external_target).unwrap();
+    assert!(is_junction(&junction_path).unwrap());
+
+    // Extract a tarball where "package/my_file" is a file replacing the pre-existing directory junction.
+    // On Windows, fs::remove_file fails on directory junctions, but unlink_target_path uses remove_junction.
+    let tar_bytes = create_test_tarball(&[
+        ("package/my_file", b"new file content", 0o644),
+    ]);
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 1);
+
+    // Verify extracted file exists and replaced the junction
+    assert!(dest.join("my_file").is_file());
+    assert_eq!(
+        fs::read_to_string(dest.join("my_file")).unwrap(),
+        "new file content"
+    );
+
+    // Verify external target was NOT destroyed or overwritten
+    assert!(external_target.join("important.txt").exists());
+    assert_eq!(
+        fs::read_to_string(external_target.join("important.txt")).unwrap(),
+        "do not delete me!"
+    );
+}
+
+#[test]
+fn test_zip_slip_escapes_comprehensive() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // Absolute Unix path
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_size(10);
+        header.set_mode(0o644);
+        let path_bytes = b"/etc/passwd";
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(b"evil data!")).unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_abs = gz.finish().unwrap();
+    let res_abs = extract_tar_gz(Cursor::new(&tar_abs), &dest, None);
+    assert!(
+        matches!(res_abs, Err(FsError::AbsolutePath { .. })),
+        "Expected AbsolutePath for /etc/passwd, got: {:?}",
+        res_abs
+    );
+
+    // Drive colon path (e.g. C:/evil.js)
+    let tar_drive = create_test_tarball(&[("C:/evil.js", b"evil", 0o644)]);
+    let res_drive = extract_tar_gz(Cursor::new(&tar_drive), &dest, None);
+    assert!(
+        matches!(res_drive, Err(FsError::PathTraversal { .. }) | Err(FsError::AbsolutePath { .. })),
+        "Expected PathTraversal/AbsolutePath for drive colon, got: {:?}",
+        res_drive
+    );
+
+    // Prefix traversal (package/../secret.js)
+    let tar_prefix = create_test_tarball(&[("package/../secret.js", b"evil", 0o644)]);
+    let res_prefix = extract_tar_gz(Cursor::new(&tar_prefix), &dest, None);
+    assert!(
+        matches!(res_prefix, Err(FsError::PathTraversal { .. })),
+        "Expected PathTraversal for prefix traversal, got: {:?}",
+        res_prefix
+    );
+}
+
+#[test]
+fn test_windows_reserved_names_and_dot_space_comprehensive() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let reserved = [
+        "package/aux.js",
+        "package/COM鹿",
+        "package/com1.json",
+        "package/LPT9.dat",
+        "package/PRN",
+        "package/CLOCK$",
+    ];
+    for name in reserved {
+        let tar_bytes = create_test_tarball(&[(name, b"dummy", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::WindowsReservedDeviceName { .. })),
+            "Expected WindowsReservedDeviceName for {name}, got: {:?}",
+            res
+        );
+    }
+
+    let dot_space = [
+        "package/foo.",
+        "package/bar ",
+    ];
+    for name in dot_space {
+        let tar_bytes = create_test_tarball(&[(name, b"dummy", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::TrailingDotOrSpace { .. })),
+            "Expected TrailingDotOrSpace for {name}, got: {:?}",
+            res
+        );
+    }
+}
+
+#[test]
+fn test_windows_case_collision_detection() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. Exact case collision between two files: foo.js and FOO.JS
+    let tar_files = create_test_tarball(&[
+        ("package/foo.js", b"console.log('lower');", 0o644),
+        ("package/FOO.JS", b"console.log('upper');", 0o644),
+    ]);
+    let res_files = extract_tar_gz(Cursor::new(&tar_files), &dest, None);
+    assert!(
+        matches!(res_files, Err(FsError::CaseCollision { .. })),
+        "Expected CaseCollision for foo.js and FOO.JS, got: {res_files:?}"
+    );
+
+    // 2. Directory vs file collision: package/my_dir/file.txt and package/MY_DIR
+    let tar_dir_file = create_test_tarball(&[
+        ("package/my_dir/file.txt", b"child content", 0o644),
+        ("package/MY_DIR", b"file content", 0o644),
+    ]);
+    let dest2 = dir.path().join("dest2");
+    let res_dir_file = extract_tar_gz(Cursor::new(&tar_dir_file), &dest2, None);
+    assert!(
+        matches!(res_dir_file, Err(FsError::CaseCollision { .. })),
+        "Expected CaseCollision for dir my_dir vs file MY_DIR, got: {res_dir_file:?}"
+    );
+
+    // 3. File first, then directory collision: package/item and package/ITEM/child.txt
+    let tar_file_dir = create_test_tarball(&[
+        ("package/item", b"file content", 0o644),
+        ("package/ITEM/child.txt", b"child content", 0o644),
+    ]);
+    let dest3 = dir.path().join("dest3");
+    let res_file_dir = extract_tar_gz(Cursor::new(&tar_file_dir), &dest3, None);
+    assert!(
+        matches!(res_file_dir, Err(FsError::CaseCollision { .. })),
+        "Expected CaseCollision for file item vs dir ITEM, got: {res_file_dir:?}"
+    );
+}
+
+#[test]
+fn test_security_rejection_sparse_files() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. GNU sparse file entry (type 'S')
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.as_gnu_mut().unwrap().set_real_size(0);
+        let path_bytes = b"package/sparse.bin";
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(&[])).unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::ForbiddenSparseFile { .. })),
+        "Expected ForbiddenSparseFile for entry_type b'S', got: {res:?}"
+    );
+
+    // 2. PAX sparse attributes (GNU.sparse.*)
+    let mut gz_pax = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz_pax);
+        builder.append_pax_extensions([("GNU.sparse.size", b"1024".as_slice())]).unwrap();
+
+        let mut header = Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        let path_bytes = b"package/pax_sparse.bin";
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(b"data")).unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_pax = gz_pax.finish().unwrap();
+    let dest_pax = dir.path().join("dest_pax");
+    let res_pax = extract_tar_gz(Cursor::new(&tar_pax), &dest_pax, None);
+    assert!(
+        matches!(res_pax, Err(FsError::ForbiddenSparseFile { .. })),
+        "Expected ForbiddenSparseFile for PAX sparse attributes, got: {res_pax:?}"
+    );
+}
+
+#[test]
+fn test_tar_bomb_path_depth_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. Path exceeding default limit (> 32 components): 33 components
+    let mut deep_path = String::from("package");
+    for i in 1..=33 {
+        deep_path.push_str(&format!("/d{i}"));
+    }
+    deep_path.push_str("/file.txt");
+
+    let tar_bytes = create_test_tarball(&[
+        (&deep_path, b"content", 0o644),
+    ]);
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "path depth"),
+        "Expected TarBombLimitExceeded with limit_type 'path depth', got: {res:?}"
+    );
+
+    // 2. Custom small limit: max_path_depth = 4
+    let limits = TarLimits {
+        max_path_depth: 4,
+        ..Default::default()
+    };
+    let tar_shallow = create_test_tarball(&[
+        ("package/1/2/3/4/5/file.txt", b"shallow", 0o644),
+    ]);
+    let dest2 = dir.path().join("dest2");
+    let res2 = extract_tar_gz(Cursor::new(&tar_shallow), &dest2, Some(limits));
+    assert!(
+        matches!(res2, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "path depth"),
+        "Expected TarBombLimitExceeded for custom path depth limit, got: {res2:?}"
+    );
+}
+
+#[test]
+fn test_tar_bomb_directory_count_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        // Create 4 directory entries
+        for i in 1..=4 {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            let dir_path = format!("package/dir_{i}/");
+            header.as_mut_bytes()[..dir_path.len()].copy_from_slice(dir_path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, Cursor::new(&[])).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let limits = TarLimits {
+        max_directories: 3,
+        ..Default::default()
+    };
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "directory count"),
+        "Expected TarBombLimitExceeded with limit_type 'directory count', got: {res:?}"
+    );
+}
+
+#[test]
+fn test_security_rejection_dangling_and_circular_hardlinks() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. Dangling hardlink pointing to non-existent target
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_link(&mut header, "package/dangling_link.js", "package/ghost.js").unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_dangling = gz.finish().unwrap();
+    let res_dangling = extract_tar_gz(Cursor::new(&tar_dangling), &dest, None);
+    assert!(
+        matches!(res_dangling, Err(FsError::DanglingHardlink { .. })),
+        "Expected DanglingHardlink error, got: {res_dangling:?}"
+    );
+
+    // 2. Circular hardlink pointing to itself
+    let mut gz_circ = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz_circ);
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_link(&mut header, "package/self_loop.js", "package/self_loop.js").unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_circ = gz_circ.finish().unwrap();
+    let dest_circ = dir.path().join("dest_circ");
+    let res_circ = extract_tar_gz(Cursor::new(&tar_circ), &dest_circ, None);
+    assert!(
+        matches!(res_circ, Err(FsError::CircularHardlink { .. })),
+        "Expected CircularHardlink error, got: {res_circ:?}"
+    );
+}
+
+#[test]
+fn test_hardlink_target_resolution_from_archive_root() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // Hardlink inside package/bin/sub/tool.js pointing to package/lib/source.js.
+    // In tar archives, hardlink targets are relative to archive root, NOT relative to link parent dir.
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        // 1. Regular file at lib/source.js
+        let mut h_file = Header::new_gnu();
+        let content = b"console.log('root hardlink success');";
+        h_file.set_size(content.len() as u64);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/lib/source.js", Cursor::new(content)).unwrap();
+
+        // 2. Hardlink at bin/sub/tool.js pointing to lib/source.js (or package/lib/source.js)
+        let mut h_link = Header::new_gnu();
+        h_link.set_entry_type(tar::EntryType::Link);
+        h_link.set_size(0);
+        h_link.set_mode(0o644);
+        h_link.set_cksum();
+        builder.append_link(&mut h_link, "package/bin/sub/tool.js", "package/lib/source.js").unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 2);
+
+    let src_path = dest.join("lib/source.js");
+    let link_path = dest.join("bin/sub/tool.js");
+
+    assert!(src_path.exists(), "Source file must exist");
+    assert!(link_path.exists(), "Hardlink target must exist at resolved path");
+
+    let link_content = fs::read(&link_path).unwrap();
+    assert_eq!(link_content, b"console.log('root hardlink success');");
+}
+
+#[test]
+fn test_security_rejection_non_utf8_path() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        // Raw bytes with invalid UTF-8 sequence 0xFF 0xFE
+        let path_bytes = b"package/bad_\xff\xfe_file.txt";
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(b"data")).unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::InvalidUtf8Path { .. })),
+        "Expected InvalidUtf8Path error, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_skip_xglobal_header_without_validation_failure() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        // 1. XGlobalHeader entry (type 'g')
+        let mut h_global = Header::new_gnu();
+        h_global.set_entry_type(tar::EntryType::XGlobalHeader);
+        let global_data = b"comment=rnpm global pax header\n";
+        h_global.set_size(global_data.len() as u64);
+        h_global.set_mode(0o644);
+        let path_bytes = b"pax_global_header";
+        h_global.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        h_global.set_cksum();
+        builder.append(&h_global, Cursor::new(global_data)).unwrap();
+
+        // 2. Regular entry
+        let mut h_file = Header::new_gnu();
+        let content = b"console.log('xglobal skipped successfully');";
+        h_file.set_size(content.len() as u64);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/index.js", Cursor::new(content)).unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 1);
+    assert!(dest.join("index.js").exists());
+}
 
 

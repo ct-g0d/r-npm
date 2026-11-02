@@ -49,19 +49,6 @@ impl PackageTarget {
             return Self::parse_alias(alias_str);
         }
 
-        // Unsupported protocols (e.g. svn://, ftp://, hg+https://, cvs://)
-        let unsupported_protocols = [
-            "svn://", "ftp://", "hg+https://", "hg+ssh://", "cvs://",
-        ];
-        for proto in unsupported_protocols {
-            if s.starts_with(proto) {
-                return Err(SpecError::UnsupportedProtocol {
-                    protocol: proto.trim_end_matches('/').to_string(),
-                    spec: s.to_string(),
-                });
-            }
-        }
-
         // Git dependency specifications:
         // "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0",
         // "git+ssh://git@github.com/org/repo.git", "git://github.com/org/repo.git",
@@ -92,6 +79,22 @@ impl PackageTarget {
             let parsed_url = Url::parse(s)
                 .map_err(|e| SpecError::InvalidFormat(format!("Invalid URL '{s}': {e}")))?;
             return Ok(PackageTarget::Url(parsed_url));
+        }
+
+        // Unsupported protocols (e.g. svn://, ftp://, sftp://, hg+https://, cvs://, etc.)
+        if let Some((scheme, _)) = s.split_once("://") {
+            return Err(SpecError::UnsupportedProtocol {
+                protocol: format!("{scheme}:"),
+                spec: s.to_string(),
+            });
+        }
+        for proto in &["cvs:", "svn:", "ftp:", "hg:"] {
+            if s.starts_with(proto) {
+                return Err(SpecError::UnsupportedProtocol {
+                    protocol: proto.to_string(),
+                    spec: s.to_string(),
+                });
+            }
         }
 
         // Try exact version

@@ -1,0 +1,25 @@
+{
+  "subsystem": "cli-dispatch",
+  "observable_behaviors": [
+    {
+      "command": "rnpm --version",
+      "expected_exit_code": 0,
+      "stdout_match": "rnpm \\d+\\.\\d+\\.\\d+"
+    },
+    {
+      "command": "rnpm help",
+      "expected_exit_code": 0,
+      "stdout_contains": "High performance Rust implementation of npm workflows"
+    },
+    {
+      "command": "rnpm publish",
+      "expected_exit_code": 1,
+      "stderr_contains": "npm error code ERR_UNSUPPORTED_COMMAND"
+    },
+    {
+      "command": "rnpm install --legacy-peer-deps",
+      "expected_exit_code": 1,
+      "stderr_contains": "npm error code ERR_UNSUPPORTED_FLAG"
+    }
+  ]
+}

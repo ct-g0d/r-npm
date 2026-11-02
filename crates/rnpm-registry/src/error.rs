@@ -46,6 +46,25 @@ pub enum RegistryError {
     #[error("Circuit breaker is OPEN for host '{host}'; registry is temporarily failing fast")]
     CircuitBreakerOpen { host: String },
 
+    #[error("Malformed package metadata: {0}")]
+    MalformedMetadata(String),
+
+    #[error("Size limit exceeded: {message} (limit: {limit} bytes, actual: {actual} bytes)")]
+    SizeLimitExceeded {
+        limit: u64,
+        actual: u64,
+        message: String,
+    },
+
+    #[error("Slowloris chunk idle timeout exceeded ({0:?})")]
+    SlowlorisTimeout(std::time::Duration),
+
+    #[error("Content-Length mismatch: expected {expected} bytes, got {actual} bytes")]
+    ContentLengthMismatch {
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("Unexpected error: {0}")]
     Other(String),
 }
@@ -105,9 +124,30 @@ impl RegistryError {
     /// Returns true if this error was caused by a connection or request timeout.
     pub fn is_timeout(&self) -> bool {
         match self {
+            Self::SlowlorisTimeout(_) => true,
             Self::Http(e) => e.is_timeout(),
             _ => false,
         }
+    }
+
+    /// Returns true if this error was caused by a slowloris chunk idle timeout.
+    pub fn is_slowloris_timeout(&self) -> bool {
+        matches!(self, Self::SlowlorisTimeout(_))
+    }
+
+    /// Returns true if this error was caused by malformed packument metadata.
+    pub fn is_malformed_metadata(&self) -> bool {
+        matches!(self, Self::MalformedMetadata(_))
+    }
+
+    /// Returns true if this error was caused by exceeding a payload or package size limit.
+    pub fn is_size_limit_exceeded(&self) -> bool {
+        matches!(self, Self::SizeLimitExceeded { .. })
+    }
+
+    /// Returns true if this error was caused by a Content-Length mismatch.
+    pub fn is_content_length_mismatch(&self) -> bool {
+        matches!(self, Self::ContentLengthMismatch { .. })
     }
 
     /// Returns true if this error was caused by a connection or DNS resolution failure.

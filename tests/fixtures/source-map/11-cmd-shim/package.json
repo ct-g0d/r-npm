@@ -1,0 +1,8 @@
+{
+  "name": "fixture-cmd-shim",
+  "version": "1.0.0",
+  "bin": {
+    "my-cli": "./bin/my-cli.js",
+    "second-tool": "./bin/second-tool.js"
+  }
+}

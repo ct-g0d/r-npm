@@ -154,16 +154,22 @@ fn cleanup_stale_trash(parent: &Path) {
                 let _ = crate::junction::remove_dir_all_safe(&entry.path());
             } else if name_str.starts_with(".rnpm-staging-") {
                 // Only clean staging dirs older than 30 seconds to avoid deleting in-flight extractions
-                if let Ok(meta) = entry.metadata() {
+                let should_clean = if let Ok(meta) = entry.metadata() {
                     if let Ok(mtime) = meta.modified() {
                         if let Ok(age) = now.duration_since(mtime) {
-                            if age < Duration::from_secs(30) {
-                                continue;
-                            }
+                            age >= Duration::from_secs(30)
+                        } else {
+                            false
                         }
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                if should_clean {
+                    let _ = crate::junction::remove_dir_all_safe(&entry.path());
                 }
-                let _ = crate::junction::remove_dir_all_safe(&entry.path());
             }
         }
     }

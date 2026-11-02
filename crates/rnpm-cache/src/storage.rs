@@ -98,7 +98,7 @@ fn remove_dir_all_with_retries(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Recursively collect all files under a directory.
-fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -534,6 +534,89 @@ impl Cache {
                 Ok(None)
             }
         }
+    }
+
+    /// Store an entry into the cache with key mapping and strict integrity verification.
+    ///
+    /// If `expected_integrity` is provided, verifies it BEFORE writing blob or index entry;
+    /// if mismatch, returns `CacheError::IntegrityMismatch` immediately without touching cache files!
+    pub fn put_with_integrity(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected_integrity: Option<&Integrity>,
+        metadata: Option<&[u8]>,
+    ) -> Result<IndexEntry, CacheError> {
+        // If expected_integrity is provided, verify it BEFORE writing blob or index entry
+        if let Some(expected) = expected_integrity {
+            expected.verify(data).map_err(|e| match e {
+                IntegrityError::Mismatch {
+                    expected,
+                    actual,
+                    ..
+                } => CacheError::IntegrityMismatch {
+                    key: key.to_string(),
+                    expected,
+                    actual,
+                },
+                other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
+            })?;
+        }
+
+        // Put blob in content-addressable storage
+        let sha512_hex = self.put_blob(data, None)?;
+        let integrity = if let Some(expected) = expected_integrity {
+            expected.to_string()
+        } else {
+            Integrity::from_bytes(data, Algorithm::Sha512).to_string()
+        };
+
+        let metadata_val = match metadata {
+            Some(m) => match serde_json::from_slice::<serde_json::Value>(m) {
+                Ok(val) => Some(val),
+                Err(_) => match std::str::from_utf8(m) {
+                    Ok(s) => Some(serde_json::Value::String(s.to_string())),
+                    Err(_) => Some(serde_json::Value::String(HEXLOWER.encode(m))),
+                },
+            },
+            None => None,
+        };
+
+        let entry = IndexEntry::new(
+            key.to_string(),
+            integrity,
+            sha512_hex,
+            data.len() as u64,
+            metadata_val,
+        );
+
+        // Put index entry with atomic write and cross-process lock
+        let index_path = IndexEntry::path_for_key(&self.root, key);
+        if let Some(parent) = index_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = self.create_temp_path("index");
+        {
+            let json_bytes = serde_json::to_vec_pretty(&entry)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&json_bytes)?;
+            file.flush()?;
+        }
+
+        let _key_lock = self.lock_key(key)?;
+        if index_path.exists() {
+            let _ = remove_file_with_retries(&index_path);
+        }
+        if let Err(err) = rename_with_retries(&temp_path, &index_path) {
+            let _ = remove_file_with_retries(&temp_path);
+            return Err(CacheError::Io(err));
+        }
+
+        Ok(entry)
     }
 
     /// Store an entry into the cache with key mapping.

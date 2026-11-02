@@ -265,6 +265,12 @@ where
         "--legacy-peer-deps",
         "--global",
         "-g",
+        "--package-lock-only",
+        "--save-bundle",
+        "--save-exact",
+        "--omit=dev",
+        "--omit=optional",
+        "--omit=peer",
     ];
 
     for arg in &args[1..] {
@@ -286,8 +292,8 @@ where
 
 pub(crate) fn print_structured_error(err: &anyhow::Error) {
     let err_str = format!("{:#}", err);
-    if err_str.contains("Unsupported protocol") {
-        eprintln!("npm error code ERR_UNSUPPORTED_PROTOCOL");
+    if err_str.contains("Unsupported URL Type") || err_str.contains("Unsupported protocol") {
+        eprintln!("npm error code EUNSUPPORTEDPROTOCOL");
         eprintln!("npm error {err_str}");
         eprintln!("npm error Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
     } else if err_str.contains("ERR_UNSUPPORTED_COMMAND") || err_str.contains("ERR_UNSUPPORTED_FLAG") {

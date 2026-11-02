@@ -47,7 +47,7 @@ pub enum SpecError {
     #[error("Invalid specifier format: '{0}'")]
     InvalidFormat(String),
 
-    #[error("Unsupported protocol '{protocol}' in specifier '{spec}'")]
+    #[error("Unsupported URL Type \"{protocol}\": {spec}")]
     UnsupportedProtocol {
         protocol: String,
         spec: String,
