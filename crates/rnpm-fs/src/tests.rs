@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::Cursor;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -373,6 +373,152 @@ fn test_pack_directory_tarball_generation_and_integrity() {
 
     assert_eq!(extraction.entries_extracted, summary.entry_count);
 }
+
+#[test]
+fn test_tar_bomb_ratio_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // Create a 200KB repeating payload which compresses down to under 500 bytes (>400:1 ratio)
+    let bomb_data = vec![b'0'; 200_000];
+    let entries = [
+        ("package/bomb.txt", bomb_data.as_slice(), 0o644),
+    ];
+    let tar_bytes = create_test_tarball(&entries);
+
+    // Limit to max 20.0 compression ratio
+    let limits = TarLimits {
+        max_entries: 10_000,
+        max_uncompressed_size: 10_000_000,
+        max_compression_ratio: 20.0,
+    };
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "compression ratio"),
+        "Expected TarBombLimitExceeded for compression ratio, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_security_rejection_backslash_path_traversal() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let tar_bytes = create_test_tarball(&[
+        (r"package\..\evil.js", b"malicious", 0o644),
+    ]);
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(matches!(res, Err(FsError::PathTraversal { .. })));
+}
+
+#[test]
+fn test_parallel_batch_extraction() {
+    use crate::parallel::{extract_batch_parallel, BatchExtractionItem};
+
+    let dir = tempdir().unwrap();
+
+    let mut items = Vec::new();
+    for i in 1..=6 {
+        let pkg_content = format!("package-{i}-content");
+        let tar_bytes = create_test_tarball(&[
+            ("package/index.js", pkg_content.as_bytes(), 0o644),
+            ("package/package.json", format!("{{\"name\": \"pkg-{i}\"}}").as_bytes(), 0o644),
+        ]);
+        let dest = dir.path().join(format!("pkg-{i}"));
+        items.push(BatchExtractionItem::new(
+            Cursor::new(tar_bytes),
+            dest,
+            None,
+        ));
+    }
+
+    let summaries = extract_batch_parallel(items, 3);
+    assert_eq!(summaries.len(), 6);
+    for (i, summary_res) in summaries.into_iter().enumerate() {
+        let idx = i + 1;
+        let summary = summary_res.unwrap();
+        assert_eq!(summary.entries_extracted, 2);
+
+        let pkg_dir = dir.path().join(format!("pkg-{idx}"));
+        assert!(pkg_dir.join("index.js").exists());
+        assert!(pkg_dir.join("package.json").exists());
+        let read_content = fs::read_to_string(pkg_dir.join("index.js")).unwrap();
+        assert_eq!(read_content, format!("package-{idx}-content"));
+    }
+}
+
+#[test]
+fn test_extraction_throughput_benchmark() {
+    use crate::parallel::{extract_batch_parallel, BatchExtractionItem};
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let num_packages = 40;
+    let mut tarballs = Vec::new();
+
+    for i in 0..num_packages {
+        let content_1 = vec![b'x'; 20_000];
+        let content_2 = vec![b'y'; 40_000];
+        let content_3 = vec![b'z'; 10_000];
+        let tb = create_test_tarball(&[
+            ("package/index.js", &content_1, 0o644),
+            ("package/lib/large.js", &content_2, 0o644),
+            ("package/lib/util.js", &content_3, 0o644),
+            ("package/package.json", format!("{{\"name\":\"bench-pkg-{i}\",\"version\":\"1.0.0\"}}").as_bytes(), 0o644),
+        ]);
+        tarballs.push(tb);
+    }
+
+    // 1. Sequential extraction (concurrency = 1)
+    let seq_dir = dir.path().join("sequential");
+    fs::create_dir_all(&seq_dir).unwrap();
+    let seq_items: Vec<_> = tarballs
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            BatchExtractionItem::new(
+                Cursor::new(bytes.clone()),
+                seq_dir.join(format!("pkg-{i}")),
+                None,
+            )
+        })
+        .collect();
+
+    let t0 = Instant::now();
+    let seq_res = extract_batch_parallel(seq_items, 1);
+    let seq_time = t0.elapsed();
+    assert_eq!(seq_res.len(), num_packages);
+
+    // 2. Parallel extraction (bounded concurrency = 8)
+    let par_dir = dir.path().join("parallel");
+    fs::create_dir_all(&par_dir).unwrap();
+    let par_items: Vec<_> = tarballs
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            BatchExtractionItem::new(
+                Cursor::new(bytes.clone()),
+                par_dir.join(format!("pkg-{i}")),
+                None,
+            )
+        })
+        .collect();
+
+    let t1 = Instant::now();
+    let par_res = extract_batch_parallel(par_items, 8);
+    let par_time = t1.elapsed();
+    assert_eq!(par_res.len(), num_packages);
+
+    println!(
+        "\n[EXTRACTION BENCHMARK] 40 packages (70KB uncompressed each, 2.8MB total):\n  Sequential (concurrency=1): {:?}\n  Parallel (concurrency=8): {:?}\n  Speedup: {:.2}x\n",
+        seq_time,
+        par_time,
+        seq_time.as_secs_f64() / par_time.as_secs_f64()
+    );
+}
+
 
 #[test]
 fn test_pack_files_array_and_ignore_rules() {
