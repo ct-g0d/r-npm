@@ -361,7 +361,7 @@ pub fn encode_package_name(name: &str) -> String {
 }
 
 /// Validates a package name against malicious patterns such as path traversal (`..`),
-/// backslashes, empty names, and control characters.
+/// backslashes, empty names, Unicode spoofing, and control characters.
 pub fn validate_package_name(name: &str) -> Result<(), ConfigError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -372,16 +372,65 @@ pub fn validate_package_name(name: &str) -> Result<(), ConfigError> {
         || trimmed.contains('\\')
         || trimmed.contains('\r')
         || trimmed.contains('\n')
+        || trimmed.chars().any(|c| c.is_control())
     {
         return Err(ConfigError::InvalidLine(format!(
             "Package name contains illegal control or escape characters: '{trimmed}'"
         )));
     }
 
+    // Reject non-ASCII characters (e.g. Cyrillic homoglyphs, zero-width spaces, fullwidth characters, RTL overrides)
+    if trimmed.chars().any(|c| !c.is_ascii()) {
+        return Err(ConfigError::InvalidLine(format!(
+            "Package name contains forbidden non-ASCII or spoofed characters: '{trimmed}'"
+        )));
+    }
+
+    // Check for encoded path traversal sequences (%2e, %2f, %5c)
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("%2e%2e")
+        || lower.contains("..%2f")
+        || lower.contains("%2f..")
+        || lower.contains("%5c")
+    {
+        return Err(ConfigError::InvalidLine(format!(
+            "Package name contains forbidden path traversal component: '{name}'"
+        )));
+    }
+
     let unverified = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    for segment in unverified.split('/') {
+    let segments: Vec<&str> = unverified.split('/').collect();
+
+    // Check for empty segments (e.g. leading slash, trailing slash, double slash, empty scope)
+    if trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || unverified.starts_with('/')
+        || unverified.ends_with('/')
+        || segments.iter().any(|s| s.is_empty())
+    {
+        return Err(ConfigError::InvalidLine(format!(
+            "Package name contains invalid slash formatting: '{name}'"
+        )));
+    }
+
+    // A scoped package must have exactly one slash (@scope/pkg); unscoped package must have 0 slashes
+    if trimmed.starts_with('@') {
+        if segments.len() != 2 {
+            return Err(ConfigError::InvalidLine(format!(
+                "Scoped package must contain exactly one slash: '{name}'"
+            )));
+        }
+    } else if segments.len() != 1 {
+        return Err(ConfigError::InvalidLine(format!(
+            "Unscoped package cannot contain slashes: '{name}'"
+        )));
+    }
+
+    for segment in segments {
         if segment == "."
             || segment == ".."
+            || segment.starts_with("..")
+            || segment.ends_with("..")
             || segment.eq_ignore_ascii_case("%2e")
             || segment.eq_ignore_ascii_case("%2e%2e")
         {

@@ -1,6 +1,6 @@
 use rnpm_registry::{
-    AbbreviatedPackageMetadata, BytesFetchResult, MetadataFetchResult, RegistryClient,
-    RegistryClientConfig, TarballFetchResult, NPM_INSTALL_V1_JSON,
+    AbbreviatedPackageMetadata, BytesFetchResult, CircuitBreakerState, MetadataFetchResult,
+    RegistryClient, RegistryClientConfig, RegistryError, TarballFetchResult, NPM_INSTALL_V1_JSON,
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -786,4 +786,646 @@ async fn test_semaphore_bounded_worker_pool_socket_exhaustion_prevention() {
     );
 
     server.stop();
+}
+
+/// Helper raw TCP server for injecting low-level socket and stream faults.
+struct FaultInjectionTcpServer {
+    addr: SocketAddr,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl FaultInjectionTcpServer {
+    async fn start<F, Fut>(action: F) -> Self
+    where
+        F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let action = Arc::new(action);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    res = listener.accept() => {
+                        if let Ok((stream, _)) = res {
+                            let act = action.clone();
+                            tokio::spawn(async move {
+                                act(stream).await;
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            addr,
+            shutdown: tx,
+        }
+    }
+
+    fn url(&self) -> Url {
+        Url::parse(&format!("http://{}/", self.addr)).unwrap()
+    }
+
+    fn stop(self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+// =========================================================================
+// Network Fault Injection Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_network_fault_dropped_socket_mid_download_bytes() {
+    // Server starts sending 200 OK with Content-Length: 50000, writes 64 bytes, then drops socket
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 50000\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(b"initial 64 bytes of chunked payload before socket drop...12345678").await;
+        let _ = stream.flush().await;
+        // Abruptly drop the stream (TCP FIN/RST without completing body)
+        drop(stream);
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-drop".into(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let tarball_url = format!("{}faulty.tgz", server.url());
+    let res = client.download_tarball_bytes(&tarball_url).await;
+    assert!(res.is_err(), "Expected download to fail when socket drops prematurely");
+    let err = res.unwrap_err();
+    assert!(
+        err.is_decode() || matches!(err, RegistryError::Http(_)),
+        "Expected HTTP/decode error on dropped socket, got: {err:?}"
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_dropped_socket_mid_download_to_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest_file = temp_dir.path().join("partial_download.tgz");
+
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 30000\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(b"some partial bytes written to disk").await;
+        let _ = stream.flush().await;
+        drop(stream);
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-drop-file".into(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let tarball_url = format!("{}faulty-file.tgz", server.url());
+    let res = client.download_tarball_to_file(&tarball_url, &dest_file).await;
+    assert!(res.is_err(), "Expected file download to fail when socket is severed mid-stream");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_corrupted_chunked_stream_invalid_hex() {
+    // Server replies with Transfer-Encoding: chunked, but sends invalid hex size
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\nZZZZ_INVALID_HEX\r\nPayload\r\n0\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-chunk-hex".into(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let tarball_url = format!("{}corrupted-chunk.tgz", server.url());
+    let res = client.download_tarball_bytes(&tarball_url).await;
+    assert!(res.is_err(), "Expected error on invalid chunk hex length");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_corrupted_chunked_stream_premature_truncation() {
+    // Server announces 100 bytes (hex 64), sends only 10 bytes, then severs connection
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n64\r\n1234567890";
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        drop(stream);
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-chunk-trunc".into(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let tarball_url = format!("{}truncated-chunk.tgz", server.url());
+    let res = client.download_tarball_bytes(&tarball_url).await;
+    assert!(res.is_err(), "Expected decode error on truncated chunk body");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_corrupted_chunked_stream_malformed_terminator() {
+    // Server sends valid chunk but corrupts chunk CRLF terminator
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n5\r\nhelloCORRUPTED_NO_CRLF";
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        drop(stream);
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-chunk-term".into(),
+        timeout: Duration::from_secs(3),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let tarball_url = format!("{}bad-term.tgz", server.url());
+    let res = client.download_tarball_bytes(&tarball_url).await;
+    assert!(res.is_err(), "Expected error on malformed chunk terminator");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_request_timeout() {
+    // Server accepts connection but hangs without writing response headers
+    let server = FaultInjectionTcpServer::start(|mut stream| async move {
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        // Sleep longer than client timeout
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-fault-timeout".into(),
+        timeout: Duration::from_millis(80),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let res = client.get_package_metadata("timeout-pkg").await;
+    assert!(res.is_err(), "Expected request to timeout");
+    let err = res.unwrap_err();
+    assert!(err.is_timeout(), "Expected error.is_timeout() to be true, got: {err:?}");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_network_fault_connect_timeout() {
+    // TEST-NET-1 (192.0.2.1:81) is guaranteed non-routable, causing connect attempt to timeout
+    let non_routable_url = Url::parse("http://192.0.2.1:81/").unwrap();
+    let config = RegistryClientConfig {
+        default_registry: non_routable_url,
+        user_agent: "test-fault-connect-timeout".into(),
+        connect_timeout: Duration::from_millis(60),
+        timeout: Duration::from_millis(150),
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let res = client.get_package_metadata("connect-timeout-pkg").await;
+    assert!(res.is_err(), "Expected connect timeout error");
+    let err = res.unwrap_err();
+    assert!(
+        err.is_timeout() || err.is_connect(),
+        "Expected timeout or connect error, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_network_fault_dns_resolution_failure() {
+    // RFC 2606 / 6761 reserved .invalid domain is guaranteed to fail DNS resolution
+    let unresolvable_url = Url::parse("http://nonexistent-rnpm-dns-fault-test.invalid/").unwrap();
+    let config = RegistryClientConfig {
+        default_registry: unresolvable_url,
+        user_agent: "test-dns-failure".into(),
+        timeout: Duration::from_secs(2),
+        max_retries: 1,
+        initial_retry_backoff: Duration::from_millis(5),
+        max_retry_backoff: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let res = client.get_package_metadata("dns-failure-pkg").await;
+    assert!(res.is_err(), "Expected DNS resolution to fail");
+    let err = res.unwrap_err();
+    assert!(
+        err.is_connect() || matches!(err, RegistryError::Http(_)),
+        "Expected connection error on DNS failure, got: {err:?}"
+    );
+}
+
+// =========================================================================
+// Circuit Breaker & Chaotic Retry Resiliency Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_chaotic_retry_oscillating_429_503_recovers() {
+    let mock_json = r#"{
+        "name": "chaotic-recovering-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "chaotic-recovering-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "pkg.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    // Oscillates: attempt 0 -> 429, attempt 1 -> 503, attempt 2 -> 200 OK
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /chaotic-recovering-pkg") {
+            let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+            match attempt {
+                0 => (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec()),
+                1 => (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec()),
+                _ => (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec()),
+            }
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-chaotic-recovering".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 3,
+        initial_retry_backoff: Duration::from_millis(5),
+        max_retry_backoff: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata("chaotic-recovering-pkg").await.unwrap();
+    assert_eq!(meta.name, "chaotic-recovering-pkg");
+    assert_eq!(
+        attempt_counter.load(Ordering::SeqCst),
+        3,
+        "Must have navigated chaotic 429 -> 503 oscillation and succeeded on attempt 3"
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_chaotic_retry_oscillating_exceeds_max_retries_fails() {
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    // Oscillates indefinitely between 429 and 503
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /chaotic-exhaust-pkg") {
+            let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if attempt % 2 == 0 {
+                (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec())
+            } else {
+                (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+            }
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-chaotic-exhaust".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 3,
+        initial_retry_backoff: Duration::from_millis(5),
+        max_retry_backoff: Duration::from_millis(30),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.get_package_metadata("chaotic-exhaust-pkg").await.unwrap_err();
+    assert!(
+        err.is_rate_limited() || err.status_code() == Some(503),
+        "Expected rate limit or 503 status code when chaotic retries are exhausted"
+    );
+    // 1 initial + 3 retries = 4 attempts total
+    assert_eq!(attempt_counter.load(Ordering::SeqCst), 4);
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_trips_under_consecutive_failures() {
+    let request_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = request_counter.clone();
+
+    let server = MockHttpServer::start(move |_req| {
+        counter_clone.fetch_add(1, Ordering::SeqCst);
+        (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+    })
+    .await;
+
+    let host_str = server.addr.to_string();
+
+    // Circuit breaker configured: threshold 2 consecutive failures, 100ms reset timeout
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-circuit-breaker".into(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        circuit_breaker_enabled: true,
+        circuit_breaker_failure_threshold: 2,
+        circuit_breaker_reset_timeout: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // Request 1: fails with 503 (consecutive failures = 1)
+    let res1 = client.get_package_metadata("pkg1").await;
+    assert!(res1.is_err());
+    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Closed);
+
+    // Request 2: fails with 503 (consecutive failures = 2 -> trips circuit to OPEN)
+    let res2 = client.get_package_metadata("pkg2").await;
+    assert!(res2.is_err());
+    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Open);
+
+    let requests_before_fast_fail = request_counter.load(Ordering::SeqCst);
+    assert_eq!(requests_before_fast_fail, 2);
+
+    // Request 3: Circuit is OPEN -> fails fast with ZERO network requests!
+    let res3 = client.get_package_metadata("pkg3").await;
+    assert!(res3.is_err());
+    let err3 = res3.unwrap_err();
+    assert!(
+        err3.is_circuit_breaker_open(),
+        "Expected CircuitBreakerOpen error on fast-fail, got: {err3:?}"
+    );
+
+    // Assert that the server received NO new request for Request 3
+    assert_eq!(
+        request_counter.load(Ordering::SeqCst),
+        requests_before_fast_fail,
+        "Circuit breaker must prevent requests from hitting the network while OPEN"
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_probe_and_recovery() {
+    let mock_json = r#"{
+        "name": "healthy-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "healthy-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "pkg.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let should_succeed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let succ_clone = should_succeed.clone();
+
+    let server = MockHttpServer::start(move |_req| {
+        if succ_clone.load(Ordering::SeqCst) {
+            (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+        } else {
+            (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+        }
+    })
+    .await;
+
+    let host_str = server.addr.to_string();
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-circuit-recovery".into(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        circuit_breaker_enabled: true,
+        circuit_breaker_failure_threshold: 1,
+        circuit_breaker_reset_timeout: Duration::from_millis(60),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // 1. Initial request fails and immediately trips circuit
+    let _ = client.get_package_metadata("unhealthy").await;
+    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Open);
+
+    // 2. Wait for reset timeout to elapse
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Verify circuit transitioned to HalfOpen
+    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::HalfOpen);
+
+    // 3. Remote server is now healthy
+    should_succeed.store(true, Ordering::SeqCst);
+
+    // 4. Probe request in HalfOpen state succeeds and resets circuit to Closed
+    let meta = client.get_package_metadata("healthy-pkg").await.unwrap();
+    assert_eq!(meta.name, "healthy-pkg");
+    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Closed);
+
+    // 5. Subsequent request succeeds normally
+    let meta2 = client.get_package_metadata("healthy-pkg").await.unwrap();
+    assert_eq!(meta2.name, "healthy-pkg");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_retry_after_budget_breaker() {
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = attempt_counter.clone();
+
+    // Server returns 429 with 1 hour Retry-After
+    let server = MockHttpServer::start(move |_req| {
+        counter_clone.fetch_add(1, Ordering::SeqCst);
+        (429, vec![("Retry-After", "3600".into())], b"Rate limit exceeded".to_vec())
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-budget-breaker".into(),
+        timeout: Duration::from_secs(2),
+        max_retries: 3,
+        max_retry_backoff: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client.get_package_metadata("budget-breaker-pkg").await.unwrap_err();
+    assert!(err.is_rate_limited());
+    assert_eq!(err.retry_after(), Some(3600));
+
+    // Must break immediately on attempt 0 without retrying because 3600s > max_retry_backoff (2s)
+    assert_eq!(
+        attempt_counter.load(Ordering::SeqCst),
+        1,
+        "Client must break immediately when Retry-After exceeds backoff budget"
+    );
+
+    server.stop();
+}
+
+// =========================================================================
+// Scoped Registry Routing & Security Edge Case Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_scoped_registry_routing_mixed_case_and_unicode_spoofing() {
+    let mock_json_corp = r#"{
+        "name": "@corp/widget",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "@corp/widget",
+                "version": "1.0.0",
+                "dist": { "tarball": "corp.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let mock_json_public = r#"{
+        "name": "public-pkg",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "2.0.0": {
+                "name": "public-pkg",
+                "version": "2.0.0",
+                "dist": { "tarball": "pub.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    // Server 1: Default public registry
+    let public_server = MockHttpServer::start(move |req| {
+        if req.contains("GET /public-pkg") {
+            (200, vec![("Content-Type", "application/json".into())], mock_json_public.as_bytes().to_vec())
+        } else {
+            (404, vec![], b"Not Found in Public".to_vec())
+        }
+    })
+    .await;
+
+    // Server 2: Private @corp registry
+    let corp_server = MockHttpServer::start(move |req| {
+        if req.contains("GET /@corp%2fwidget") {
+            (200, vec![("Content-Type", "application/json".into())], mock_json_corp.as_bytes().to_vec())
+        } else {
+            (404, vec![], b"Not Found in Corp".to_vec())
+        }
+    })
+    .await;
+
+    let mut scoped_registries = std::collections::BTreeMap::new();
+    scoped_registries.insert("@corp".to_string(), corp_server.url());
+
+    let mut trusted_hosts = HashSet::new();
+    trusted_hosts.insert(public_server.addr.to_string());
+    trusted_hosts.insert(corp_server.addr.to_string());
+
+    let config = RegistryClientConfig {
+        default_registry: public_server.url(),
+        user_agent: "test-scoped-routing".into(),
+        timeout: Duration::from_secs(5),
+        scoped_registries,
+        trusted_hosts,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // 1. Scoped package resolves to private corp server
+    let corp_meta = client.get_package_metadata("@corp/widget").await.unwrap();
+    assert_eq!(corp_meta.name, "@corp/widget");
+
+    // 2. Mixed-case scope correctly routes to @corp server
+    assert_eq!(
+        client.registry_for_package("@CORP/widget"),
+        &corp_server.url()
+    );
+    assert_eq!(
+        client.registry_for_package("@Corp/Widget"),
+        &corp_server.url()
+    );
+    assert_eq!(
+        client.registry_for_package("@cOrP%2fwidget"),
+        &corp_server.url()
+    );
+
+    // 3. Unscoped package routes to default public server
+    let pub_meta = client.get_package_metadata("public-pkg").await.unwrap();
+    assert_eq!(pub_meta.name, "public-pkg");
+
+    // 4. Unicode Cyrillic homoglyph spoofing: '@соrр/widget' (Cyrillic 'о', 'р')
+    // Must NOT match '@corp' and must route to default public server (where it returns 404)
+    let cyrillic_spoof = "@\u{0441}\u{043E}r\u{0440}/widget";
+    assert_eq!(
+        client.registry_for_package(cyrillic_spoof),
+        &public_server.url(),
+        "Spoofed Unicode scope must never route to private registry!"
+    );
+
+    public_server.stop();
+    corp_server.stop();
 }
