@@ -185,23 +185,87 @@ fn is_shadowed_by_incompatible_between(
     false
 }
 
-/// Finds the closest visible node for `install_name` starting from `from_location`
-/// and walking up the `node_modules` hierarchy to root.
-pub fn find_visible_node<'a>(
+/// Helper check if a node matches either `install_name` or physical `name`.
+#[inline]
+pub fn node_matches_peer_name(node: &crate::graph::Node, install_name: &str, package_name: &str) -> bool {
+    node.name == package_name
+        || node.install_name == install_name
+        || node.name == install_name
+        || node.install_name == package_name
+}
+
+/// Finds all immediate children in `scope`'s node_modules directory that match peer name.
+fn find_matching_node_in_scope<'a>(
+    graph: &'a DependencyGraph,
+    scope: &str,
+    install_name: &str,
+    package_name: &str,
+) -> Option<&'a crate::graph::Node> {
+    let prefix = if scope.is_empty() {
+        "node_modules/".to_string()
+    } else {
+        format!("{scope}/node_modules/")
+    };
+
+    for (loc, node) in graph.nodes.range(prefix.clone()..) {
+        if !loc.starts_with(&prefix) {
+            break;
+        }
+        let rest = &loc[prefix.len()..];
+        // Ensure this node is directly in `scope`, not inside a nested sub-node_modules
+        if rest.contains("/node_modules/") {
+            continue;
+        }
+        if node_matches_peer_name(node, install_name, package_name) {
+            return Some(node);
+        }
+    }
+
+    None
+}
+
+/// Finds the closest visible node for a peer requirement matching either its `install_name`
+/// OR its physical `package_name` (e.g. for aliased packages `install_name != package_name`).
+pub fn find_visible_peer_node<'a>(
     graph: &'a DependencyGraph,
     from_location: &str,
     install_name: &str,
+    package_name: &str,
 ) -> Option<&'a crate::graph::Node> {
     let mut current = from_location;
-    let mut candidate_buf = String::with_capacity(from_location.len() + 14 + install_name.len());
+    let max_len = install_name.len().max(package_name.len());
+    let mut candidate_buf = String::with_capacity(from_location.len() + 14 + max_len);
+
     while !current.is_empty() {
+        // 1. Direct check: <current>/node_modules/<install_name>
         candidate_buf.clear();
         candidate_buf.push_str(current);
         candidate_buf.push_str("/node_modules/");
         candidate_buf.push_str(install_name);
         if let Some(node) = graph.nodes.get(&candidate_buf) {
+            if node_matches_peer_name(node, install_name, package_name) {
+                return Some(node);
+            }
+        }
+
+        // 2. Direct check: <current>/node_modules/<package_name>
+        if package_name != install_name {
+            candidate_buf.clear();
+            candidate_buf.push_str(current);
+            candidate_buf.push_str("/node_modules/");
+            candidate_buf.push_str(package_name);
+            if let Some(node) = graph.nodes.get(&candidate_buf) {
+                if node_matches_peer_name(node, install_name, package_name) {
+                    return Some(node);
+                }
+            }
+        }
+
+        // 3. Aliased packages search in scope: e.g. <current>/node_modules/<alias> where node.name == package_name
+        if let Some(node) = find_matching_node_in_scope(graph, current, install_name, package_name) {
             return Some(node);
         }
+
         // Ascend one directory level in node_modules hierarchy
         if let Some(idx) = current.rfind("/node_modules/") {
             current = &current[..idx];
@@ -213,9 +277,37 @@ pub fn find_visible_node<'a>(
         }
     }
 
-    // Finally, check root `node_modules/<install_name>`
-    let root_target = format!("node_modules/{install_name}");
-    graph.nodes.get(&root_target)
+    // Finally, check root scope ("")
+    // 1. Direct check by install_name
+    let root_install = format!("node_modules/{install_name}");
+    if let Some(node) = graph.nodes.get(&root_install) {
+        if node_matches_peer_name(node, install_name, package_name) {
+            return Some(node);
+        }
+    }
+
+    // 2. Direct check by package_name
+    if package_name != install_name {
+        let root_pkg = format!("node_modules/{package_name}");
+        if let Some(node) = graph.nodes.get(&root_pkg) {
+            if node_matches_peer_name(node, install_name, package_name) {
+                return Some(node);
+            }
+        }
+    }
+
+    // 3. Root scope scan for aliased packages
+    find_matching_node_in_scope(graph, "", install_name, package_name)
+}
+
+/// Finds the closest visible node for `install_name` starting from `from_location`
+/// and walking up the `node_modules` hierarchy to root.
+pub fn find_visible_node<'a>(
+    graph: &'a DependencyGraph,
+    from_location: &str,
+    install_name: &str,
+) -> Option<&'a crate::graph::Node> {
+    find_visible_peer_node(graph, from_location, install_name, install_name)
 }
 
 #[cfg(test)]
@@ -298,5 +390,31 @@ mod tests {
         // From root: CANNOT see nested-lib's local-dep
         let vis4 = find_visible_node(&graph, "", "local-dep");
         assert!(vis4.is_none());
+    }
+
+    #[test]
+    fn test_find_visible_peer_node_aliased() {
+        let mut graph = DependencyGraph::new();
+        // Package installed with alias: install_name="my-react", name="react"
+        let mut aliased_node = make_test_node("node_modules/my-react", "react", "18.2.0");
+        aliased_node.install_name = "my-react".to_string();
+        graph.nodes.insert("node_modules/my-react".to_string(), aliased_node);
+
+        // Nested consumer: node_modules/react-redux
+        graph.nodes.insert(
+            "node_modules/react-redux".to_string(),
+            make_test_node("node_modules/react-redux", "react-redux", "8.0.0"),
+        );
+
+        // 1. Peer requirement asking for physical name "react"
+        let found_by_pkg_name = find_visible_peer_node(&graph, "node_modules/react-redux", "react", "react");
+        assert!(found_by_pkg_name.is_some());
+        assert_eq!(found_by_pkg_name.unwrap().location, "node_modules/my-react");
+        assert_eq!(found_by_pkg_name.unwrap().name, "react");
+
+        // 2. Peer requirement asking for alias name "my-react"
+        let found_by_alias = find_visible_peer_node(&graph, "node_modules/react-redux", "my-react", "my-react");
+        assert!(found_by_alias.is_some());
+        assert_eq!(found_by_alias.unwrap().location, "node_modules/my-react");
     }
 }

@@ -101,7 +101,8 @@ fn is_wildcard(s: &str) -> bool {
 }
 
 fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
-    let s = input.trim().trim_start_matches(|c| c == 'v' || c == '=' || c == ' ');
+    let s = input.trim().trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+    let s = s.trim();
     if s.is_empty() || is_wildcard(s) {
         return Ok(PartialVersion {
             major: None,
@@ -123,7 +124,11 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
         let p_str = &s[idx + 1..];
         let mut pres = Vec::new();
         for part in p_str.split('.') {
-            if part.chars().all(|c| c.is_ascii_digit()) && !part.is_empty() {
+            let part = part.trim();
+            if part.chars().all(|c| c.is_ascii_digit())
+                && !part.is_empty()
+                && (part.len() == 1 || !part.starts_with('0'))
+            {
                 if let Ok(n) = part.parse::<u64>() {
                     pres.push(PrereleaseId::Numeric(n));
                     continue;
@@ -137,22 +142,22 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
     };
 
     let parts: Vec<&str> = ver_part.split('.').collect();
-    let major = if parts.is_empty() || is_wildcard(parts[0]) {
+    let major = if parts.is_empty() || is_wildcard(parts[0].trim()) {
         None
     } else {
-        Some(parts[0].parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
+        Some(parts[0].trim().parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
     };
 
-    let minor = if parts.len() < 2 || is_wildcard(parts[1]) {
+    let minor = if parts.len() < 2 || is_wildcard(parts[1].trim()) {
         None
     } else {
-        Some(parts[1].parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
+        Some(parts[1].trim().parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
     };
 
-    let patch = if parts.len() < 3 || is_wildcard(parts[2]) {
+    let patch = if parts.len() < 3 || is_wildcard(parts[2].trim()) {
         None
     } else {
-        Some(parts[2].parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
+        Some(parts[2].trim().parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
     };
 
     Ok(PartialVersion {
@@ -245,12 +250,56 @@ fn parse_comparator_set(input: &str) -> Result<Vec<Comparator>, SemverError> {
 }
 
 fn tokenize_set(input: &str) -> Vec<String> {
-    // Split on whitespace, but preserve hyphen ranges if " - "
-    let mut result = Vec::new();
-    for part in input.split_whitespace() {
-        result.push(part.to_string());
+    let raw_parts: Vec<&str> = input.split_whitespace().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < raw_parts.len() {
+        let part = raw_parts[i];
+
+        // Check if part is a prefix operator or combination
+        let mut op = String::new();
+        let mut consumed = 0;
+
+        if (part == ">" || part == "<") && i + 1 < raw_parts.len() && raw_parts[i + 1] == "=" {
+            op = format!("{}=", part);
+            consumed = 2;
+        } else if part == "~" && i + 1 < raw_parts.len() && raw_parts[i + 1] == ">" {
+            op = "~>".to_string();
+            consumed = 2;
+        } else if part == ">="
+            || part == "<="
+            || part == ">"
+            || part == "<"
+            || part == "="
+            || part == "~"
+            || part == "^"
+            || part == "~>"
+            || part == "v"
+            || part == "V"
+        {
+            op = part.to_string();
+            consumed = 1;
+        }
+
+        if !op.is_empty() {
+            // Check if there is a next part that is NOT a hyphen range separator
+            if i + consumed < raw_parts.len() && raw_parts[i + consumed] != "-" {
+                let next_part = raw_parts[i + consumed];
+                tokens.push(format!("{}{}", op, next_part));
+                i += consumed + 1;
+                continue;
+            } else {
+                tokens.push(op);
+                i += consumed;
+                continue;
+            }
+        }
+
+        // Not a prefix operator, push as-is
+        tokens.push(part.to_string());
+        i += 1;
     }
-    result
+    tokens
 }
 
 fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
@@ -295,8 +344,13 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
         ]);
     }
 
-    // Tilde ranges: ~1.2.3
-    if let Some(rest) = t.strip_prefix('~') {
+    // Tilde ranges: ~1.2.3, ~>1.2.3
+    let t_stripped = if let Some(r) = t.strip_prefix("~>") {
+        Some(r)
+    } else {
+        t.strip_prefix('~')
+    };
+    if let Some(rest) = t_stripped {
         let p = parse_partial_version(rest)?;
         let major = p.major.unwrap_or(0);
         let minor = p.minor.unwrap_or(0);

@@ -247,13 +247,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let is_peer = task.dep_type == DependencyType::Peer
             || task.dep_type == DependencyType::PeerOptional;
         if is_peer {
+            let dep_alias = if task.install_name != dep_spec.package_name {
+                Some(task.install_name.as_str())
+            } else {
+                None
+            };
             if self
                 .peer_ctx
-                .is_cycle(&task.parent_package_name, &dep_spec.package_name)
+                .is_cycle_with_alias(&task.parent_package_name, None, &dep_spec.package_name, dep_alias)
             {
                 let cycle_path_str = self
                     .peer_ctx
-                    .find_cycle_path(&task.parent_package_name, &dep_spec.package_name)
+                    .find_cycle_path_with_alias(&task.parent_package_name, None, &dep_spec.package_name, dep_alias)
                     .map(|p| p.join(" -> "))
                     .unwrap_or_else(|| {
                         format!("{} -> {}", task.parent_package_name, dep_spec.package_name)
@@ -262,16 +267,22 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     "Peer cycle detected: {}, resolving to active instance",
                     cycle_path_str
                 );
-                // Look for existing node with package_name visible in ancestor scope or anywhere in graph
-                if let Some(existing) = crate::hoisting::find_visible_node(
+                // Look for existing node with package_name or install_name visible in ancestor scope or anywhere in graph
+                if let Some(existing) = crate::hoisting::find_visible_peer_node(
                     &self.graph,
                     &task.parent_location,
-                    &dep_spec.install_name,
+                    &task.install_name,
+                    &dep_spec.package_name,
                 ).or_else(|| {
                     self.graph
                         .nodes
                         .iter()
-                        .find(|(_, n)| n.name == dep_spec.package_name)
+                        .find(|(_, n)| {
+                            n.name == dep_spec.package_name
+                                || n.install_name == task.install_name
+                                || n.name == task.install_name
+                                || n.install_name == dep_spec.package_name
+                        })
                         .map(|(_, n)| n)
                 }) {
                     self.graph.edges.push(DependencyEdge {
@@ -287,12 +298,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
 
             // Check if peer is already satisfied in ancestor/root scope
-            if let Some(existing) = crate::hoisting::find_visible_node(
+            if let Some(existing) = crate::hoisting::find_visible_peer_node(
                 &self.graph,
                 &task.parent_location,
-                &dep_spec.install_name,
+                &task.install_name,
+                &dep_spec.package_name,
             ) {
-                if existing.name == dep_spec.package_name {
+                if crate::hoisting::node_matches_peer_name(existing, &task.install_name, &dep_spec.package_name) {
                     if crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         debug!(
                             "Peer dependency '{}@{}' satisfied by existing node at '{}'",
@@ -318,13 +330,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 (*task.ancestors).clone(),
                                 format!(
                                     "Installed {}@{} at '{}' does not satisfy peer constraint '{}'",
-                                    dep_spec.package_name, existing.version, existing.location, effective_spec
+                                    existing.name, existing.version, existing.location, effective_spec
                                 ),
                             ));
                         } else {
                             warn!(
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
-                                task.parent_package_name, dep_spec.package_name, effective_spec, dep_spec.package_name, existing.version
+                                task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
                             );
                         }
                     } else if task.dep_type == DependencyType::PeerOptional {
@@ -548,6 +560,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         };
                         child_deps.insert(k.clone(), (v.clone(), p_type));
                         self.peer_ctx.enter(&dep_spec.package_name, k);
+                        if task.install_name != dep_spec.package_name {
+                            self.peer_ctx.enter(&task.install_name, k);
+                        }
                     }
                 }
 

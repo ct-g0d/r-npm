@@ -30,16 +30,20 @@ impl Overrides {
     }
 
     /// Parse overrides from package.json `overrides` field.
+    ///
+    /// Supports npm RFC 36 arrow syntax (`>`) such as:
+    /// - `"foo > bar": "2.0.0"`
+    /// - `"foo@1.0.0 > bar": "2.0.0"`
+    /// - `"@scope/a > @scope/b": "1.0.0"`
+    /// - `"a > b > c": "1.0.0"`
     pub fn from_json_value(
         value: Option<&serde_json::Value>,
         root_dependencies: BTreeMap<String, String>,
     ) -> Self {
-        let rules = if let Some(val) = value {
-            serde_json::from_value::<BTreeMap<String, OverrideValue>>(val.clone())
-                .unwrap_or_default()
-        } else {
-            BTreeMap::new()
-        };
+        let mut rules = BTreeMap::new();
+        if let Some(val) = value {
+            parse_overrides_into_map(val, &mut rules);
+        }
         Self::new(rules, root_dependencies)
     }
 
@@ -151,12 +155,18 @@ impl Overrides {
             return self.find_direct(rules, dep_name, requested_spec);
         }
 
-        let parent = ancestors[0].as_ref();
+        let parent_str = ancestors[0].as_ref();
+        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
+
         for (k, v) in rules {
-            let matches_parent = if let Some((k_name, _)) = parse_key_and_spec(k) {
-                k_name == parent
+            let (k_name, k_spec) = parse_key_and_spec(k).unwrap_or((k.as_str(), ""));
+
+            let matches_parent = if k_name != parent_name {
+                false
+            } else if !k_spec.is_empty() && !parent_ver.is_empty() {
+                spec_matches(k_spec, parent_ver)
             } else {
-                k == parent
+                true
             };
 
             if matches_parent {
@@ -179,6 +189,138 @@ impl Overrides {
         }
 
         None
+    }
+}
+
+fn parse_override_val(val: &serde_json::Value) -> Option<OverrideValue> {
+    match val {
+        serde_json::Value::String(s) => Some(OverrideValue::Exact(s.clone())),
+        serde_json::Value::Number(n) => Some(OverrideValue::Exact(n.to_string())),
+        serde_json::Value::Object(_) => {
+            let mut sub_map = BTreeMap::new();
+            parse_overrides_into_map(val, &mut sub_map);
+            Some(OverrideValue::Nested(sub_map))
+        }
+        _ => None,
+    }
+}
+
+fn parse_overrides_into_map(val: &serde_json::Value, rules: &mut BTreeMap<String, OverrideValue>) {
+    let serde_json::Value::Object(map) = val else {
+        return;
+    };
+
+    for (k, v) in map {
+        let Some(parsed_val) = parse_override_val(v) else {
+            continue;
+        };
+
+        let parts = split_arrow_key(k);
+        insert_override_rule(rules, &parts, parsed_val);
+    }
+}
+
+/// Splits an override key on arrow `>` separators, preserving `@` scopes and `>=` comparators.
+fn split_arrow_key(key: &str) -> Vec<String> {
+    if !key.contains('>') {
+        return vec![key.trim().to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let chars: Vec<char> = key.chars().collect();
+    let mut last_idx = 0;
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Check if this '>' is a comparator rather than an arrow separator:
+            // 1. Followed by '=' (e.g. '>=')
+            // 2. Preceded by '@' (e.g. '@>')
+            let is_comparator = (i + 1 < chars.len() && chars[i + 1] == '=')
+                || (i > 0 && chars[i - 1] == '@');
+            if !is_comparator {
+                let part: String = chars[last_idx..i].iter().collect();
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+                last_idx = i + 1;
+            }
+        }
+        i += 1;
+    }
+
+    let last_part: String = chars[last_idx..].iter().collect();
+    let trimmed = last_part.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+
+    if parts.is_empty() {
+        vec![key.trim().to_string()]
+    } else {
+        parts
+    }
+}
+
+/// Inserts a multi-hop override path into a nested `BTreeMap<String, OverrideValue>`.
+fn insert_override_rule(
+    map: &mut BTreeMap<String, OverrideValue>,
+    parts: &[String],
+    value: OverrideValue,
+) {
+    if parts.is_empty() {
+        return;
+    }
+
+    if parts.len() == 1 {
+        let target = &parts[0];
+        match map.get_mut(target) {
+            None => {
+                map.insert(target.clone(), value);
+            }
+            Some(existing) => match (&mut *existing, value) {
+                (OverrideValue::Exact(ref mut curr), OverrideValue::Exact(new_val)) => {
+                    *curr = new_val;
+                }
+                (OverrideValue::Nested(existing_map), OverrideValue::Exact(new_val)) => {
+                    existing_map.insert(".".to_string(), OverrideValue::Exact(new_val));
+                }
+                (OverrideValue::Exact(curr), OverrideValue::Nested(mut incoming_map)) => {
+                    let old_val = std::mem::take(curr);
+                    incoming_map.insert(".".to_string(), OverrideValue::Exact(old_val));
+                    *existing = OverrideValue::Nested(incoming_map);
+                }
+                (OverrideValue::Nested(existing_map), OverrideValue::Nested(incoming_map)) => {
+                    for (k, v) in incoming_map {
+                        insert_override_rule(existing_map, &[k], v);
+                    }
+                }
+            },
+        }
+    } else {
+        let first = &parts[0];
+        let sub_map = match map.get_mut(first) {
+            Some(OverrideValue::Nested(sub)) => sub,
+            Some(OverrideValue::Exact(curr)) => {
+                let old_val = std::mem::take(curr);
+                let mut new_map = BTreeMap::new();
+                new_map.insert(".".to_string(), OverrideValue::Exact(old_val));
+                *map.get_mut(first).unwrap() = OverrideValue::Nested(new_map);
+                match map.get_mut(first).unwrap() {
+                    OverrideValue::Nested(sub) => sub,
+                    _ => unreachable!(),
+                }
+            }
+            None => {
+                map.insert(first.clone(), OverrideValue::Nested(BTreeMap::new()));
+                match map.get_mut(first).unwrap() {
+                    OverrideValue::Nested(sub) => sub,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        insert_override_rule(sub_map, &parts[1..], value);
     }
 }
 
@@ -287,5 +429,37 @@ mod tests {
 
         let res = overrides.resolve_override("foo", "^2.0.0", &["parent"]);
         assert_eq!(res, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_arrow_syntax_overrides() {
+        let json = serde_json::json!({
+            "foo > bar": "2.0.0",
+            "foo@1.0.0 > baz": "3.0.0",
+            "@scope/a > @scope/b": "1.0.0",
+            "a > b > c": "4.0.0",
+            "nested": {
+                "x > y": "5.0.0"
+            }
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // Under foo: bar is 2.0.0
+        assert_eq!(overrides.resolve_override("bar", "^1.0.0", &["foo"]), Some("2.0.0".to_string()));
+
+        // Under foo: baz is 3.0.0
+        assert_eq!(overrides.resolve_override("baz", "^1.0.0", &["foo"]), Some("3.0.0".to_string()));
+
+        // Under @scope/a: @scope/b is 1.0.0
+        assert_eq!(overrides.resolve_override("@scope/b", "*", &["@scope/a"]), Some("1.0.0".to_string()));
+
+        // Under a > b: c is 4.0.0
+        assert_eq!(overrides.resolve_override("c", "^1.0.0", &["a", "b"]), Some("4.0.0".to_string()));
+
+        // Under nested > x: y is 5.0.0
+        assert_eq!(overrides.resolve_override("y", "^1.0.0", &["nested", "x"]), Some("5.0.0".to_string()));
+
+        // Top level lookup for bar should be None
+        assert_eq!(overrides.resolve_override("bar", "^1.0.0", &[]), None);
     }
 }
