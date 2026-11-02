@@ -47,6 +47,14 @@ impl Overrides {
         Self::new(rules, root_dependencies)
     }
 
+    /// Construct overrides from a manifest.
+    pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Result<Self, crate::error::SolverError> {
+        Ok(Self::from_json_value(
+            manifest.extra.get("overrides"),
+            manifest.dependencies.clone(),
+        ))
+    }
+
     /// Check if a dependency should be overridden.
     ///
     /// - `dep_name`: the real or alias name being requested

@@ -79,6 +79,48 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self
     }
 
+    /// Attaches an existing base graph to the solver (e.g. pre-populated workspace graph).
+    pub fn with_graph(mut self, graph: DependencyGraph) -> Self {
+        self.graph = graph;
+        self
+    }
+
+    /// Enqueue an external dependency resolution task.
+    pub fn enqueue_task(
+        &mut self,
+        parent_location: String,
+        parent_package_name: String,
+        install_name: String,
+        raw_spec: String,
+        dep_type: DependencyType,
+        ancestors: std::sync::Arc<Vec<String>>,
+    ) {
+        if dep_type == DependencyType::Peer || dep_type == DependencyType::PeerOptional {
+            self.peer_ctx.enter(&parent_package_name, &install_name);
+        }
+        self.queue.push_back(ResolveTask {
+            parent_location,
+            parent_package_name,
+            install_name,
+            raw_spec,
+            dep_type,
+            ancestors,
+        });
+    }
+
+    /// Processes all queued dependency resolution tasks until completion.
+    pub fn resolve_tasks(&mut self) -> Result<(), SolverError> {
+        while let Some(task) = self.queue.pop_front() {
+            self.process_task(task)?;
+        }
+        Ok(())
+    }
+
+    /// Extracts the resolved dependency graph.
+    pub fn into_graph(self) -> DependencyGraph {
+        self.graph
+    }
+
     /// Resolves the dependency graph starting from a root manifest.
     pub fn resolve(mut self, root_manifest: &Manifest) -> Result<DependencyGraph, SolverError> {
         // Fast-path: if lockfile v3 matches root_manifest specs, bypass expensive traversal
@@ -163,7 +205,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 root_deps
                     .entry(k.clone())
                     .or_insert_with(|| (v.clone(), p_type));
-                self.peer_ctx.enter(&root_name, k);
             }
         }
 
@@ -254,11 +295,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             };
             if self
                 .peer_ctx
-                .is_cycle_with_alias(&task.parent_package_name, None, &dep_spec.package_name, dep_alias)
+                .is_cycle_on_path_with_alias(&task.ancestors, &dep_spec.package_name, dep_alias)
             {
                 let cycle_path_str = self
                     .peer_ctx
-                    .find_cycle_path_with_alias(&task.parent_package_name, None, &dep_spec.package_name, dep_alias)
+                    .find_cycle_path_on_path(&task.ancestors, &dep_spec.package_name, dep_alias)
                     .map(|p| p.join(" -> "))
                     .unwrap_or_else(|| {
                         format!("{} -> {}", task.parent_package_name, dep_spec.package_name)
@@ -267,24 +308,43 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     "Peer cycle detected: {}, resolving to active instance",
                     cycle_path_str
                 );
-                // Look for existing node with package_name or install_name visible in ancestor scope or anywhere in graph
+                // Look for existing node with package_name or install_name visible in ancestor scope
                 if let Some(existing) = crate::hoisting::find_visible_peer_node(
                     &self.graph,
                     &task.parent_location,
                     &task.install_name,
                     &dep_spec.package_name,
-                ).or_else(|| {
-                    self.graph
-                        .nodes
-                        .iter()
-                        .find(|(_, n)| {
-                            n.name == dep_spec.package_name
-                                || n.install_name == task.install_name
-                                || n.name == task.install_name
-                                || n.install_name == dep_spec.package_name
-                        })
-                        .map(|(_, n)| n)
-                }) {
+                ) {
+                    if !crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
+                        if task.dep_type == DependencyType::Peer {
+                            if self.options.strict_peers {
+                                return Err(SolverError::peer_conflict(
+                                    &task.parent_package_name,
+                                    &dep_spec.package_name,
+                                    &effective_spec,
+                                    Some(existing.version.clone()),
+                                    Some(existing.location.clone()),
+                                    (*task.ancestors).clone(),
+                                    format!(
+                                        "Installed {}@{} at '{}' does not satisfy peer constraint '{}'",
+                                        existing.name, existing.version, existing.location, effective_spec
+                                    ),
+                                ));
+                            } else {
+                                warn!(
+                                    "Peer dependency conflict in cycle: {} requires {}@{}, but found {}@{} (non-strict mode)",
+                                    task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
+                                );
+                            }
+                        } else if task.dep_type == DependencyType::PeerOptional {
+                            debug!(
+                                "Optional peer dependency '{}' for '{}' in cycle conflicts with installed {}@{} at '{}'; omitting optional peer",
+                                dep_spec.package_name, task.parent_package_name, existing.name, existing.version, existing.location
+                            );
+                            return Ok(());
+                        }
+                    }
+
                     self.graph.edges.push(DependencyEdge {
                         from_location: task.parent_location,
                         to_location: existing.location.clone(),
@@ -548,6 +608,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // Peer dependencies
                 if !self.options.legacy_peer_deps {
                     for (k, v) in &chosen_version.peer_dependencies {
+                        if let Some((_, DependencyType::Prod)) = child_deps.get(k) {
+                            // Direct production dependency already present; do not overwrite with Peer or PeerOptional
+                            continue;
+                        }
                         let is_opt_peer = chosen_version
                             .peer_dependencies_meta
                             .get(k)
@@ -559,10 +623,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             DependencyType::Peer
                         };
                         child_deps.insert(k.clone(), (v.clone(), p_type));
-                        self.peer_ctx.enter(&dep_spec.package_name, k);
-                        if task.install_name != dep_spec.package_name {
-                            self.peer_ctx.enter(&task.install_name, k);
-                        }
                     }
                 }
 
@@ -630,12 +690,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
             PackageTarget::Alias { target, .. } => self.select_version(meta, target),
             PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
-                meta.versions.values().last()
+                select_max_semver_version(meta)
             }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
-                    meta.versions.values().last()
+                    select_max_semver_version(meta)
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                     for (ver_str, v_meta) in &meta.versions {
@@ -656,11 +716,34 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                     best.map(|(v_meta, _)| v_meta)
                 } else {
-                    meta.versions.values().last()
+                    select_max_semver_version(meta)
                 }
             }
         }
     }
+}
+
+/// Returns the highest version in `meta.versions` by SemVer comparison,
+/// falling back to the last entry if no versions parse as valid SemVer.
+fn select_max_semver_version<'b>(
+    meta: &'b PackageMetadata,
+) -> Option<&'b PackageVersionMetadata> {
+    let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
+    for (ver_str, v_meta) in &meta.versions {
+        if let Ok(parsed) = Version::parse(ver_str) {
+            match &best {
+                Some((_, best_v)) => {
+                    if &parsed > best_v {
+                        best = Some((v_meta, parsed));
+                    }
+                }
+                None => {
+                    best = Some((v_meta, parsed));
+                }
+            }
+        }
+    }
+    best.map(|(v_meta, _)| v_meta).or_else(|| meta.versions.values().last())
 }
 
 /// Attempts fast-path dependency graph construction from a lockfile v3 without tree traversal.

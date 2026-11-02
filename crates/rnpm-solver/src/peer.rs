@@ -142,6 +142,39 @@ impl PeerContext {
         Some(full_cycle)
     }
 
+    /// Checks if adding a peer dependency creates a cycle along the active resolution path.
+    pub fn is_cycle_on_path(&self, path: &[String], peer: &str) -> bool {
+        self.is_cycle_on_path_with_alias(path, peer, None)
+    }
+
+    /// Checks if adding a peer dependency creates a cycle along the active resolution path,
+    /// considering optional peer alias.
+    pub fn is_cycle_on_path_with_alias(
+        &self,
+        path: &[String],
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) -> bool {
+        path.iter().any(|ancestor| {
+            ancestor == peer || peer_alias.map_or(false, |pa| ancestor == pa)
+        })
+    }
+
+    /// Finds the cycle path from the matching ancestor along `path` to `peer`.
+    pub fn find_cycle_path_on_path(
+        &self,
+        path: &[String],
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let idx = path.iter().position(|ancestor| {
+            ancestor == peer || peer_alias.map_or(false, |pa| ancestor == pa)
+        })?;
+        let mut cycle = path[idx..].to_vec();
+        cycle.push(peer.to_string());
+        Some(cycle)
+    }
+
     /// Mark a peer edge as actively being resolved.
     pub fn enter(&mut self, dependent: &str, peer: &str) {
         self.active_graph
@@ -221,5 +254,29 @@ mod tests {
             .find_cycle_path_with_alias("react", Some("my-react"), "react-dom", None)
             .unwrap();
         assert_eq!(path, vec!["react", "react-dom", "my-react"]);
+    }
+
+    #[test]
+    fn test_peer_cycle_detection_on_path() {
+        let ctx = PeerContext::new();
+        let path = vec!["root".to_string(), "a".to_string(), "b".to_string()];
+
+        assert!(ctx.is_cycle_on_path(&path, "a"));
+        assert!(ctx.is_cycle_on_path(&path, "b"));
+        assert!(!ctx.is_cycle_on_path(&path, "c"));
+
+        assert_eq!(
+            ctx.find_cycle_path_on_path(&path, "a", None),
+            Some(vec!["a".to_string(), "b".to_string(), "a".to_string()])
+        );
+
+        // Disjoint path does not detect false cycle
+        let disjoint_path = vec!["root".to_string(), "c".to_string(), "d".to_string()];
+        assert!(!ctx.is_cycle_on_path(&disjoint_path, "a"));
+        assert!(!ctx.is_cycle_on_path(&disjoint_path, "b"));
+
+        // With alias
+        assert!(ctx.is_cycle_on_path_with_alias(&path, "real-a", Some("a")));
+        assert!(!ctx.is_cycle_on_path_with_alias(&disjoint_path, "real-a", Some("a-other")));
     }
 }

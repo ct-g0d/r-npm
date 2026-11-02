@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use crate::error::IntegrityError;
+use crate::error::{IntegrityError, SemverError};
 use crate::integrity::{Algorithm, Integrity};
 use crate::manifest::Manifest;
 use crate::semver::{Comparator, Op, PrereleaseId, Range, Version};
@@ -1010,3 +1010,188 @@ fn test_semver_node_semver_official_fixtures() {
     assert!(!r_star.satisfies(&Version::parse("1.0.0-alpha").unwrap()));
     assert!(r_star.satisfies(&Version::parse("1.0.0").unwrap()));
 }
+
+#[test]
+fn test_semver_integer_overflow_prevention() {
+    let overflow_ranges = [
+        format!("^{}.0.0", u64::MAX),
+        format!("^0.{}.0", u64::MAX),
+        format!("^0.0.{}", u64::MAX),
+        format!("~{}", u64::MAX),
+        format!("~{}.x", u64::MAX),
+        format!("~1.{}.0", u64::MAX),
+        format!("~{}.{}.0", u64::MAX, u64::MAX),
+        format!("{}.x", u64::MAX),
+        format!("1.{}.x", u64::MAX),
+        format!("={}.x", u64::MAX),
+        format!("=1.{}.x", u64::MAX),
+        format!(">{}.x", u64::MAX),
+        format!(">1.{}.x", u64::MAX),
+        format!("<={}.x", u64::MAX),
+        format!("<=1.{}.x", u64::MAX),
+        format!("1.0.0 - {}", u64::MAX),
+        format!("1.0.0 - 1.{}", u64::MAX),
+    ];
+
+    for r_str in &overflow_ranges {
+        let res = Range::parse(r_str);
+        assert!(
+            res.is_err(),
+            "Expected overflow error for range '{r_str}', but got: {res:?}"
+        );
+        match res.unwrap_err() {
+            SemverError::InvalidRange(msg) => {
+                assert!(
+                    msg.contains("Version number overflow:"),
+                    "Expected message to contain 'Version number overflow:', got: '{msg}'"
+                );
+            }
+            other => panic!("Expected SemverError::InvalidRange, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_semver_wildcard_operators_and_hyphen() {
+    let wildcards = ["*", "x", "X", "=*", "= *", "=x", "=X", "<= *", "<=* ", "<=x", "<=X"];
+    let test_versions = ["0.0.0", "1.0.0", "1.2.3", "99.99.99"];
+
+    for w in &wildcards {
+        let r = Range::parse(w).unwrap_or_else(|e| panic!("Failed to parse wildcard '{w}': {e}"));
+        for v_str in &test_versions {
+            let v = Version::parse(v_str).unwrap();
+            assert!(
+                r.satisfies(&v),
+                "Wildcard range '{w}' should satisfy '{v_str}'"
+            );
+        }
+    }
+
+    // Hyphen range with wildcards: * - 2.0.0
+    let r_star_hyphen = Range::parse("* - 2.0.0").unwrap();
+    assert!(r_star_hyphen.satisfies(&Version::parse("0.0.0").unwrap()));
+    assert!(r_star_hyphen.satisfies(&Version::parse("1.5.0").unwrap()));
+    assert!(r_star_hyphen.satisfies(&Version::parse("2.0.0").unwrap()));
+    assert!(!r_star_hyphen.satisfies(&Version::parse("2.0.1").unwrap()));
+    assert!(!r_star_hyphen.satisfies(&Version::parse("3.0.0").unwrap()));
+
+    // Hyphen range: * - *
+    let r_star_star = Range::parse("* - *").unwrap();
+    assert!(r_star_star.satisfies(&Version::parse("0.0.0").unwrap()));
+    assert!(r_star_star.satisfies(&Version::parse("5.0.0").unwrap()));
+
+    // Hyphen range: 1.0.0 - *
+    let r_star_upper = Range::parse("1.0.0 - *").unwrap();
+    assert!(!r_star_upper.satisfies(&Version::parse("0.9.9").unwrap()));
+    assert!(r_star_upper.satisfies(&Version::parse("1.0.0").unwrap()));
+    assert!(r_star_upper.satisfies(&Version::parse("5.0.0").unwrap()));
+}
+
+#[test]
+fn test_semver_reject_bare_operators() {
+    let bare_ops = [
+        ">", "<", "=", ">=", "<=", "~", "^", "~>", "> =", "< =", "> || <", "1.0.0 >", "1.0.0 <",
+        "1.0.0 =",
+    ];
+
+    for op in &bare_ops {
+        let res = Range::parse(op);
+        assert!(
+            res.is_err(),
+            "Expected bare operator '{op}' to be rejected, but got: {res:?}"
+        );
+        match res.unwrap_err() {
+            SemverError::InvalidRange(_) => {}
+            other => panic!("Expected SemverError::InvalidRange for '{op}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_semver_reject_trailing_empty_prerelease_and_segments() {
+    let invalid_pre = [
+        "1.0.0-",
+        "1.0.0-.",
+        "^1.0.0-",
+        "~1.0.0-",
+        ">=1.0.0-",
+        "1.0.0-alpha.",
+        "1.0.0-..1",
+    ];
+
+    for r_str in &invalid_pre {
+        let res = Range::parse(r_str);
+        assert!(
+            res.is_err(),
+            "Expected invalid prerelease '{r_str}' to be rejected, got: {res:?}"
+        );
+    }
+    assert!(Version::parse("1.0.0-").is_err());
+    assert!(Version::parse_loose("1.0.0-").is_err());
+
+    let invalid_segments = [
+        "1.2.3.4",
+        "^1.2.3.4",
+        "~1.2.3.4",
+        ">=1.2.3.4",
+        "1.2.3.4.5",
+        "1.0.0 - 1.2.3.4",
+    ];
+
+    for r_str in &invalid_segments {
+        let res = Range::parse(r_str);
+        assert!(
+            res.is_err(),
+            "Expected 4+ segments '{r_str}' to be rejected, got: {res:?}"
+        );
+    }
+    assert!(Version::parse("1.2.3.4").is_err());
+    assert!(Version::parse_loose("1.2.3.4").is_err());
+}
+
+#[test]
+fn test_semver_pathological_fragmented_range_unions() {
+    let range_str = ">1.0.0 <=1.2.0 || >1.3.0 <=1.4.0 || >=2.0.0-0 <3.0.0-0";
+    let r = Range::parse(range_str).unwrap();
+
+    // Check boundary matches
+    assert!(!r.satisfies(&Version::parse("1.0.0").unwrap()));
+    assert!(r.satisfies(&Version::parse("1.1.0").unwrap()));
+    assert!(r.satisfies(&Version::parse("1.2.0").unwrap()));
+    assert!(!r.satisfies(&Version::parse("1.2.1").unwrap()));
+    assert!(!r.satisfies(&Version::parse("1.3.0").unwrap()));
+    assert!(r.satisfies(&Version::parse("1.3.5").unwrap()));
+    assert!(r.satisfies(&Version::parse("1.4.0").unwrap()));
+    assert!(!r.satisfies(&Version::parse("1.5.0").unwrap()));
+    assert!(r.satisfies(&Version::parse("2.0.0-0").unwrap()));
+    assert!(r.satisfies(&Version::parse("2.0.0-alpha.1").unwrap()));
+    assert!(r.satisfies(&Version::parse("2.0.0").unwrap()));
+    assert!(r.satisfies(&Version::parse("2.9.9").unwrap()));
+    assert!(!r.satisfies(&Version::parse("3.0.0-0").unwrap()));
+    assert!(!r.satisfies(&Version::parse("3.0.0").unwrap()));
+}
+
+#[test]
+fn test_semver_zero_version_cascades() {
+    // ^0.0.1 := >=0.0.1 <0.0.2-0
+    let r1 = Range::parse("^0.0.1").unwrap();
+    assert!(r1.satisfies(&Version::parse("0.0.1").unwrap()));
+    assert!(!r1.satisfies(&Version::parse("0.0.2").unwrap()));
+    assert!(!r1.satisfies(&Version::parse("0.0.0").unwrap()));
+    assert!(!r1.satisfies(&Version::parse("0.1.0").unwrap()));
+
+    // ^0.1.0 := >=0.1.0 <0.2.0-0
+    let r2 = Range::parse("^0.1.0").unwrap();
+    assert!(r2.satisfies(&Version::parse("0.1.0").unwrap()));
+    assert!(r2.satisfies(&Version::parse("0.1.5").unwrap()));
+    assert!(!r2.satisfies(&Version::parse("0.2.0").unwrap()));
+    assert!(!r2.satisfies(&Version::parse("0.0.9").unwrap()));
+
+    // ~0.0.4 := >=0.0.4 <0.1.0-0
+    let r3 = Range::parse("~0.0.4").unwrap();
+    assert!(r3.satisfies(&Version::parse("0.0.4").unwrap()));
+    assert!(r3.satisfies(&Version::parse("0.0.9").unwrap()));
+    assert!(!r3.satisfies(&Version::parse("0.1.0").unwrap()));
+    assert!(!r3.satisfies(&Version::parse("0.0.3").unwrap()));
+}
+

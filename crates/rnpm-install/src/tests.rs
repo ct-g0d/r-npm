@@ -1580,3 +1580,269 @@ async fn test_file_archive_dependency_installation_and_ci() {
     assert!(pkg_dir.join("package.json").exists());
 }
 
+#[tokio::test]
+async fn test_ci_drift_detection_dev_dependencies_mutated() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Initial package.json with devDependencies
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dev_dependencies.insert("dev-tool".to_string(), "^1.0.0".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    // 2. Matching lockfile
+    let mut lockfile = LockfileV3::new("dev-drift-app", Some("1.0.0".to_string()));
+    let mut dev_deps = BTreeMap::new();
+    dev_deps.insert("dev-tool".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps);
+    lockfile.insert_package("node_modules/dev-tool", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("https://registry.npmjs.org/dev-tool/-/dev-tool-1.0.0.tgz".to_string()),
+        integrity: Some("sha512-validhash".to_string()),
+        dev: Some(true),
+        ..Default::default()
+    });
+    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+
+    // 3. Mutate devDependencies in package.json to ^2.0.0
+    manifest.dev_dependencies.insert("dev-tool".to_string(), "^2.0.0".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_err(), "run_ci must fail when devDependencies mutated in package.json");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
+    assert!(err_msg.contains("dev-tool"), "Error must mention drifted package: {err_msg}");
+}
+
+#[tokio::test]
+async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Lockfile has two dependencies: "dep-a" and "dep-b"
+    let mut lockfile = LockfileV3::new("dep-drift-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert("dep-a".to_string(), "^1.0.0".to_string());
+    deps.insert("dep-b".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps);
+    lockfile.insert_package("node_modules/dep-a", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("https://registry.npmjs.org/dep-a/-/dep-a-1.0.0.tgz".to_string()),
+        integrity: Some("sha512-hasha".to_string()),
+        ..Default::default()
+    });
+    lockfile.insert_package("node_modules/dep-b", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("https://registry.npmjs.org/dep-b/-/dep-b-1.0.0.tgz".to_string()),
+        integrity: Some("sha512-hashb".to_string()),
+        ..Default::default()
+    });
+    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+
+    // 2. package.json has "dep-b" deleted, only contains "dep-a"
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dep-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("dep-a".to_string(), "^1.0.0".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_err(), "run_ci must fail when dependency deleted from package.json but present in lockfile");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
+    assert!(err_msg.contains("dep-b"), "Error must mention removed dependency: {err_msg}");
+}
+
+#[tokio::test]
+async fn test_ci_security_adversarial_file_path_traversal_rejected() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("sec-traversal-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("malicious-pkg".to_string(), "file:../../secret.tgz".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    let valid_hash = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
+    let traversal_paths = vec![
+        "file:../../secret.tgz",
+        "file:./pkgs/../../secret.tgz",
+        "file:/etc/shadow",
+        "file:C:\\secret\\evil.tgz",
+        "file:pkgs/evil\0byte.tgz",
+    ];
+
+    for bad_resolved in traversal_paths {
+        let mut lockfile = LockfileV3::new("sec-traversal-app", Some("1.0.0".to_string()));
+        let mut deps = BTreeMap::new();
+        deps.insert("malicious-pkg".to_string(), bad_resolved.to_string());
+        lockfile.root_package_mut().unwrap().dependencies = Some(deps);
+        lockfile.insert_package("node_modules/malicious-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some(bad_resolved.to_string()),
+            integrity: Some(valid_hash.to_string()),
+            ..Default::default()
+        });
+        lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+
+        let mut installer = Installer::new(InstallOptions {
+            project_dir: project_dir.to_path_buf(),
+            offline: true,
+            ..Default::default()
+        }).unwrap();
+
+        let res = installer.run_ci().await;
+        assert!(res.is_err(), "run_ci must reject adversarial file: traversal path '{bad_resolved}'");
+    }
+}
+
+#[tokio::test]
+async fn test_ci_transitive_package_integrity_verification() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // Create a valid tarball for child-pkg
+    let child_tar = make_tarball("child-pkg", "1.0.0", &[]);
+    let child_valid_integrity = Integrity::from_bytes(&child_tar, Algorithm::Sha512).to_string();
+
+    let pkgs_dir = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    let child_tar_path = pkgs_dir.join("child-pkg-1.0.0.tgz");
+    fs::write(&child_tar_path, &child_tar).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("integrity-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    // 1. Missing or empty integrity on transitive dependency in lockfile
+    let mut lock_missing_integrity = LockfileV3::new("integrity-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
+    lock_missing_integrity.root_package_mut().unwrap().dependencies = Some(deps);
+    lock_missing_integrity.insert_package("node_modules/parent-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+        integrity: Some(child_valid_integrity.clone()),
+        ..Default::default()
+    });
+    // Transitive package has empty integrity!
+    lock_missing_integrity.insert_package("node_modules/child-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+        integrity: Some("   ".to_string()),
+        ..Default::default()
+    });
+    lock_missing_integrity.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_err(), "run_ci must fail when transitive package has empty integrity");
+
+    // 2. Mismatched integrity on transitive dependency
+    let mut lock_tampered = LockfileV3::new("integrity-app", Some("1.0.0".to_string()));
+    let mut deps2 = BTreeMap::new();
+    deps2.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
+    lock_tampered.root_package_mut().unwrap().dependencies = Some(deps2);
+    lock_tampered.insert_package("node_modules/parent-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+        integrity: Some(child_valid_integrity.clone()),
+        ..Default::default()
+    });
+    // Tampered integrity!
+    let tampered_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    lock_tampered.insert_package("node_modules/child-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+        integrity: Some(tampered_integrity.to_string()),
+        ..Default::default()
+    });
+    lock_tampered.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+
+    let mut installer2 = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    let res2 = installer2.run_ci().await;
+    assert!(res2.is_err(), "run_ci must fail when transitive package integrity verification fails");
+    let err_str = res2.unwrap_err().to_string();
+    assert!(err_str.to_lowercase().contains("integrity"), "Error must mention integrity: {err_str}");
+}
+
+#[tokio::test]
+async fn test_ci_and_install_persists_hidden_lockfile() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let tar_bytes = make_tarball("local-dep", "1.0.0", &[]);
+
+    let pkgs = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs).unwrap();
+    fs::write(pkgs.join("local-dep-1.0.0.tgz"), &tar_bytes).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("hidden-lock-test".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert("local-dep".to_string(), "file:./pkgs/local-dep-1.0.0.tgz".to_string());
+    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    };
+
+    // 1. Run install
+    let mut installer = Installer::new(options.clone()).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    // Verify hidden lockfile was created in node_modules/.package-lock.json
+    let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+    assert!(hidden_path.exists(), "node_modules/.package-lock.json must exist after install");
+
+    let loaded_hidden = LockfileV3::load_hidden(project_dir).unwrap();
+    assert_eq!(loaded_hidden.name, "hidden-lock-test");
+    assert!(loaded_hidden.packages.contains_key("node_modules/local-dep"));
+
+    // 2. Remove node_modules and run CI
+    fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+    assert!(!hidden_path.exists());
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(ci_summary.packages_installed, 1);
+
+    // Verify hidden lockfile was created after run_ci
+    assert!(hidden_path.exists(), "node_modules/.package-lock.json must exist after run_ci");
+    let loaded_ci_hidden = LockfileV3::load_hidden(project_dir).unwrap();
+    assert_eq!(loaded_ci_hidden.name, "hidden-lock-test");
+    assert!(loaded_ci_hidden.packages.contains_key("node_modules/local-dep"));
+}
+
