@@ -1,0 +1,25 @@
+{
+  "_id": "has-flag",
+  "name": "has-flag",
+  "dist-tags": {
+    "latest": "4.0.0"
+  },
+  "versions": {
+    "4.0.0": {
+      "name": "has-flag",
+      "version": "4.0.0",
+      "description": "Check if argv has a specific flag mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "814d9244ea26af5272b3fccb069888520bc3348b",
+        "integrity": "sha512-6UEm1uaM0NOIyL+HVo1t3lGgN4bjMCRwshUvAg8d29deKAvt3/MpCIskaAh76KBlBKk8oJb14SpPsbPU/7HgaA==",
+        "tarball": "http://127.0.0.1:4873/has-flag/-/has-flag-4.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

@@ -19,11 +19,12 @@
 - `uninstall`: Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile.
 - `update`: Fetch latest versions matching declared semver ranges for registry dependencies.
 - `pack`: Package project files into a canonical npm-compatible `.tgz` archive.
+- `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints, generating structured JSON / human-readable reports, and enforcing `--audit-level` exit thresholds.
 
 ### Unsupported & Deferred Commands
 - `publish`, `adduser`, `login`, `token`, `team`: Account and package publishing.
 - `exec`, `npx`: Dynamic ephemeral package downloads and execution.
-- `audit`, `fix`: Vulnerability scanning.
+- `fix`: Vulnerability automated remediation.
 - Git / Hosted Tarball protocols (`git+ssh://`, `github:user/repo`).
 - Writing legacy lockfile formats (v1 or v2).
 

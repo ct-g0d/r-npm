@@ -1,0 +1,28 @@
+{
+  "_id": "prettier",
+  "name": "prettier",
+  "dist-tags": {
+    "latest": "3.2.5"
+  },
+  "versions": {
+    "3.2.5": {
+      "name": "prettier",
+      "version": "3.2.5",
+      "description": "Prettier code formatter mock with CLI bin",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "bin": {
+        "prettier": "bin/prettier.cjs"
+      },
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "521aefa81fe2381631c85ad316c038eea4f249ba",
+        "integrity": "sha512-IYcMJc9PMyw24rHeEwZZE5Hfwk7HXhz9Lp/Fn8xmZ/alaYEEI3r1aM9aV6AJMaTRqw6d/BeNF2XhsMTTQbk6Bw==",
+        "tarball": "http://127.0.0.1:4873/prettier/-/prettier-3.2.5.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

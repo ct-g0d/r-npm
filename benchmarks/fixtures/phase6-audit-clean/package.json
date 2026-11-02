@@ -1,0 +1,9 @@
+{
+  "name": "phase6-audit-clean",
+  "version": "1.0.0",
+  "description": "Phase 6 fixture with clean dependencies for zero-vulnerability audit verification",
+  "private": true,
+  "dependencies": {
+    "lodash": "4.17.21"
+  }
+}

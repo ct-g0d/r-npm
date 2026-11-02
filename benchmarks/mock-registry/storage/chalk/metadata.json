@@ -1,0 +1,28 @@
+{
+  "_id": "chalk",
+  "name": "chalk",
+  "dist-tags": {
+    "latest": "4.1.2"
+  },
+  "versions": {
+    "4.1.2": {
+      "name": "chalk",
+      "version": "4.1.2",
+      "description": "Terminal string styling done right mock",
+      "main": "index.js",
+      "dependencies": {
+        "ansi-styles": "^4.1.0",
+        "supports-color": "^7.1.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "81a62bede80c7edb780e67fb73defaaed97d6ed5",
+        "integrity": "sha512-8m8jSMvae4Y+q3Qta6vjudTarc0Mp7eCe7cSm/dFhBmJjFPH5x1epo7HdTVvmcZ0BW9kbk81C2khxLqLMFp5Og==",
+        "tarball": "http://127.0.0.1:4873/chalk/-/chalk-4.1.2.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

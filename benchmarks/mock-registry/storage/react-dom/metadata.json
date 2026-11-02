@@ -1,0 +1,29 @@
+{
+  "_id": "react-dom",
+  "name": "react-dom",
+  "dist-tags": {
+    "latest": "18.2.0"
+  },
+  "versions": {
+    "18.2.0": {
+      "name": "react-dom",
+      "version": "18.2.0",
+      "description": "React package for working with the DOM mock",
+      "main": "index.js",
+      "dependencies": {
+        "loose-envify": "^1.1.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {
+        "react": "^18.2.0"
+      },
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "454b703d2009c72ad36eb90b2c084d4ad7cec2c7",
+        "integrity": "sha512-y6n8xRanY83+srbaVVj0nirwsQT2+ZCI5qzqx2IFdN9fejnDs/pY2DBBgxduUw69FYSpZzHvcpx0WDdOpfRXDg==",
+        "tarball": "http://127.0.0.1:4873/react-dom/-/react-dom-18.2.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

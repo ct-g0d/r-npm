@@ -1,0 +1,9 @@
+{
+  "name": "phase6-audit-moderate",
+  "version": "1.0.0",
+  "description": "Phase 6 fixture with moderate severity vulnerability for audit-level threshold verification",
+  "private": true,
+  "dependencies": {
+    "marked": "4.0.0"
+  }
+}

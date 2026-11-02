@@ -1,3 +1,5 @@
+mod audit;
+
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -171,6 +173,25 @@ pub(crate) enum Commands {
         #[arg(long)]
         ignore_scripts: bool,
     },
+
+    /// Perform a security audit of dependency vulnerabilities
+    Audit {
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Output audit results as structured JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Minimum vulnerability level to exit with an error (info, low, moderate, high, critical)
+        #[arg(long = "audit-level", default_value = "low")]
+        audit_level: String,
+
+        /// Dry-run mode
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub(crate) fn check_unsupported_cli_invocation<I, T>(raw_args: I) -> Option<(String, String)>
@@ -191,7 +212,7 @@ where
 
     let unsupported_commands = [
         "publish", "login", "adduser", "logout", "token", "team",
-        "audit", "fix", "outdated", "deprecate",
+        "fix", "outdated", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
         "view", "info", "search", "stars", "star", "unstar",
         "ping", "whoami", "version", "init", "create",
@@ -644,6 +665,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 );
             }
         }
+        Commands::Audit {
+            registry,
+            json,
+            audit_level,
+            ..
+        } => {
+            audit::run_audit(&current_dir, registry, json, &audit_level).await?;
+        }
     }
 
     Ok(())
@@ -711,6 +740,10 @@ async fn main() {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
+            if !e.use_stderr() {
+                print!("{e}");
+                std::process::exit(0);
+            }
             let rendered = e.render().to_string();
             if rendered.contains("unrecognized subcommand") {
                 let first_arg = std::env::args().nth(1).unwrap_or_default();

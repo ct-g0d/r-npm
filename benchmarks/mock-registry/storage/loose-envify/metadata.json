@@ -1,0 +1,27 @@
+{
+  "_id": "loose-envify",
+  "name": "loose-envify",
+  "dist-tags": {
+    "latest": "1.4.0"
+  },
+  "versions": {
+    "1.4.0": {
+      "name": "loose-envify",
+      "version": "1.4.0",
+      "description": "Fast replacement of process.env.NODE_ENV mock",
+      "main": "index.js",
+      "dependencies": {
+        "js-tokens": "^4.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "cfa36a7e2c85b80101856c4fb51a546c96907df0",
+        "integrity": "sha512-pbSG+YCjeTGqbryWM2jF8pAKln68ZQD0bG39u4fyWtNMxt1m0n2bgSmSzobfo7eL5WC1D6GacycHKfXjU478fA==",
+        "tarball": "http://127.0.0.1:4873/loose-envify/-/loose-envify-1.4.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

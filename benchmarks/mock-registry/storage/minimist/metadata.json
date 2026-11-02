@@ -1,0 +1,40 @@
+{
+  "_id": "minimist",
+  "name": "minimist",
+  "dist-tags": {
+    "latest": "1.2.8"
+  },
+  "versions": {
+    "1.2.5": {
+      "name": "minimist",
+      "version": "1.2.5",
+      "description": "parse argument options mock (vulnerable)",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "fcf366553e394ff6087b4865dea1c6aae403718f",
+        "integrity": "sha512-bPReV297UGZqcFQ4h8Hp93rLuUsbBQsT3IthXKSWDblztxNeot0OnKrFSNpL8oNzgYN5aOSa0iT/UvDJapLj2Q==",
+        "tarball": "http://127.0.0.1:4873/minimist/-/minimist-1.2.5.tgz"
+      }
+    },
+    "1.2.8": {
+      "name": "minimist",
+      "version": "1.2.8",
+      "description": "parse argument options mock (patched)",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "134e31fff3cbe4912d80bb9f1fccf510add9a643",
+        "integrity": "sha512-C+qD90NdjsKGb+pfI8sqA8iqDCjY2r7zcTT0VZTrj4WZlhTEkXtV7nu12aWz/bg3/R9THFhLruRMpI9UpM6q/g==",
+        "tarball": "http://127.0.0.1:4873/minimist/-/minimist-1.2.8.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

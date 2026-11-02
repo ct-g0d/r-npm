@@ -1,0 +1,27 @@
+{
+  "_id": "supports-color",
+  "name": "supports-color",
+  "dist-tags": {
+    "latest": "7.2.0"
+  },
+  "versions": {
+    "7.2.0": {
+      "name": "supports-color",
+      "version": "7.2.0",
+      "description": "Detect whether a terminal supports color mock",
+      "main": "index.js",
+      "dependencies": {
+        "has-flag": "^4.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "974b1c2fcf68aff15f7ce836f0c3d4ed287b5f6f",
+        "integrity": "sha512-iPJLxOUYRDuMpr5y6HbZy3k9qhfJymWLFJ/lIHvubp2q5VFA2fVE2h7bDocBSe+oJ+oIMXPRiKsP4ttHGRIMKw==",
+        "tarball": "http://127.0.0.1:4873/supports-color/-/supports-color-7.2.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

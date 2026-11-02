@@ -48,7 +48,7 @@ pub fn extract_and_replace<R: Read>(
     })?;
 
     // Staging succeeded: replace destination with staging directory
-    replace_dir_with_retries(staging_path, destination, 15)?;
+    replace_dir_with_retries(staging_path, destination, 30)?;
 
     // Extraction and atomic rename succeeded; disable tempdir auto-deletion
     std::mem::forget(staging_temp);

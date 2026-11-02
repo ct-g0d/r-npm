@@ -1,0 +1,25 @@
+{
+  "_id": "color-name",
+  "name": "color-name",
+  "dist-tags": {
+    "latest": "1.1.4"
+  },
+  "versions": {
+    "1.1.4": {
+      "name": "color-name",
+      "version": "1.1.4",
+      "description": "A list of color names and their values mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "ff89db9a87402560619c713b1f075f7bd6db40f0",
+        "integrity": "sha512-Io/YO0ZEOwoOn5I+6JADExYDAnAdAlGBJU9Mpxj7Nf2P9kcZbzLdBK96L8xXgJI8m5LVorTNkFG2yLKgryRCbg==",
+        "tarball": "http://127.0.0.1:4873/color-name/-/color-name-1.1.4.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}
