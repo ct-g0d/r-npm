@@ -1222,3 +1222,173 @@ async fn test_workspace_junction_security_content_preserved() {
     assert!(secret_file.exists(), "Target file must NEVER be deleted when removing junction!");
     assert_eq!(fs::read_to_string(&secret_file).unwrap(), "precious content");
 }
+
+#[tokio::test]
+async fn test_targeted_update_preserves_satisfying_and_unrelated_dependencies() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let pkg_a_110_tar = make_tarball("pkg-a", "1.1.0", &[("dep-shared", "^1.0.0")]);
+    let a_110_int = Integrity::from_bytes(&pkg_a_110_tar, Algorithm::Sha512).to_string();
+    let a_110_tar_c = pkg_a_110_tar.clone();
+    let a_110_int_c = a_110_int.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let a_110_int_c = a_110_int_c.clone();
+                        let a_110_tar_c = a_110_tar_c.clone();
+                        let su = su.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /pkg-a") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-a",
+                                        "dist-tags": { "latest": "1.1.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "pkg-a",
+                                                "version": "1.0.0",
+                                                "dist": { "tarball": format!("{su}tarballs/pkg-a-1.0.0.tgz"), "integrity": "sha512-old" },
+                                                "dependencies": { "dep-shared": "^1.0.0" }
+                                            },
+                                            "1.1.0": {
+                                                "name": "pkg-a",
+                                                "version": "1.1.0",
+                                                "dist": { "tarball": format!("{su}tarballs/pkg-a-1.1.0.tgz"), "integrity": a_110_int_c },
+                                                "dependencies": { "dep-shared": "^1.0.0" }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/pkg-a-1.1.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], a_110_tar_c)
+                                } else if req_str.contains("GET /dep-shared") {
+                                    // Should NOT be called because dep-shared 1.0.0 is already locked and satisfies ^1.0.0!
+                                    let json = serde_json::json!({
+                                        "name": "dep-shared",
+                                        "dist-tags": { "latest": "1.9.9" },
+                                        "versions": {
+                                            "1.9.9": {
+                                                "name": "dep-shared",
+                                                "version": "1.9.9",
+                                                "dist": { "tarball": format!("{su}tarballs/dep-shared-1.9.9.tgz"), "integrity": "sha512-new" }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
+
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let pkg_json = project_dir.path().join("package.json");
+    std::fs::write(&pkg_json, r#"{
+        "name": "targeted-test",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-a": "^1.0.0",
+            "pkg-b": "^1.0.0"
+        }
+    }"#).unwrap();
+
+    let mut lock = LockfileV3::new("targeted-test", Some("1.0.0".to_string()));
+    let mut d = BTreeMap::new();
+    d.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    d.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(d);
+
+    let mut a_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{server_url}tarballs/pkg-a-1.0.0.tgz")),
+        integrity: Some("sha512-old".to_string()),
+        ..Default::default()
+    };
+    let mut a_deps = BTreeMap::new();
+    a_deps.insert("dep-shared".to_string(), "^1.0.0".to_string());
+    a_entry.dependencies = Some(a_deps);
+    lock.insert_package("node_modules/pkg-a", a_entry);
+
+    let b_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{server_url}tarballs/pkg-b-1.0.0.tgz")),
+        integrity: Some("sha512-pkg-b".to_string()),
+        ..Default::default()
+    };
+    lock.insert_package("node_modules/pkg-b", b_entry);
+
+    let shared_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{server_url}tarballs/dep-shared-1.0.0.tgz")),
+        integrity: Some("sha512-shared".to_string()),
+        ..Default::default()
+    };
+    lock.insert_package("node_modules/dep-shared", shared_entry);
+
+    let lock_path = project_dir.path().join("package-lock.json");
+    lock.save_to_file(&lock_path).unwrap();
+
+    let nm = project_dir.path().join("node_modules");
+    fs::create_dir_all(nm.join("pkg-b")).unwrap();
+    fs::write(nm.join("pkg-b/package.json"), "{}").unwrap();
+    fs::create_dir_all(nm.join("dep-shared")).unwrap();
+    fs::write(nm.join("dep-shared/package.json"), "{}").unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: true,
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    // Targeted update for ONLY pkg-a
+    let summary = installer.update(&["pkg-a".to_string()]).await.unwrap();
+
+    assert_eq!(summary.packages_updated, 1);
+    assert_eq!(summary.updated_packages, vec!["pkg-a"]);
+
+    let updated_lock = LockfileV3::load_from_file(&lock_path).unwrap();
+    // pkg-a updated to 1.1.0
+    assert_eq!(updated_lock.get_package("node_modules/pkg-a").unwrap().version, Some("1.1.0".to_string()));
+    // pkg-b is completely UNTOUCHED at 1.0.0
+    assert_eq!(updated_lock.get_package("node_modules/pkg-b").unwrap().version, Some("1.0.0".to_string()));
+    // dep-shared satisfies ^1.0.0 so it is RETAINED at 1.0.0 without modification
+    assert_eq!(updated_lock.get_package("node_modules/dep-shared").unwrap().version, Some("1.0.0".to_string()));
+
+    let _ = tx.send(());
+}

@@ -142,6 +142,24 @@ impl Installer {
         client_config.default_registry = registry_url;
         client_config.trusted_hosts = trusted_hosts;
 
+        let concurrency = config
+            .npmrc
+            .settings
+            .get("maxsockets")
+            .or_else(|| config.npmrc.settings.get("concurrency"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .or_else(|| {
+                std::env::var("RNPM_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+            });
+
+        if let Some(c) = concurrency {
+            if c > 0 {
+                client_config.max_concurrent_requests = c;
+            }
+        }
+
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;
 
@@ -151,6 +169,20 @@ impl Installer {
             registry_client,
             metadata_cache: HashMap::new(),
         })
+    }
+
+    /// Reconfigure maximum network worker concurrency (bounded semaphore).
+    pub fn with_concurrency(mut self, concurrency: usize) -> Result<Self> {
+        let mut cfg = self.registry_client.config().clone();
+        cfg.max_concurrent_requests = concurrency;
+        self.registry_client = RegistryClient::with_config(cfg)
+            .context("Failed to reconfigure registry client with concurrency")?;
+        Ok(self)
+    }
+
+    /// Access the underlying registry client.
+    pub fn registry_client(&self) -> &RegistryClient {
+        &self.registry_client
     }
 
     /// Run standard install workflow from project package.json.
@@ -235,6 +267,9 @@ impl Installer {
                 queue.push_back((opt_name.clone(), opt_range.clone(), true));
             }
         }
+
+        let initial_names: Vec<&str> = queue.iter().map(|(n, _, _)| n.as_str()).collect();
+        let _ = self.prefetch_metadata(&initial_names).await;
 
         while let Some((dep_name, dep_range, is_optional)) = queue.pop_front() {
             if let Some(existing) = resolved_tree.get_mut(&dep_name) {
@@ -367,6 +402,7 @@ impl Installer {
         }
 
         // Reify external packages
+        let mut packages_to_download: Vec<(&String, &ResolvedNode)> = Vec::new();
         for (pkg_name, node) in &resolved_tree {
             if node.skipped {
                 // NEVER download or extract skipped packages!
@@ -383,10 +419,18 @@ impl Installer {
                 if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
                 if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
                 lockfile.insert_package(&lockfile_key, lock_entry);
-                continue;
+            } else {
+                packages_to_download.push((pkg_name, node));
             }
+        }
 
-            let fetch_res = self.fetch_tarball(&node.resolved_url).await;
+        let download_urls: Vec<&str> = packages_to_download
+            .iter()
+            .map(|(_, node)| node.resolved_url.as_str())
+            .collect();
+        let download_results = self.fetch_tarballs_concurrent(&download_urls).await;
+
+        for ((pkg_name, node), fetch_res) in packages_to_download.into_iter().zip(download_results) {
             let (bytes, was_hit) = match fetch_res {
                 Ok(res) => res,
                 Err(err) => {
@@ -603,6 +647,8 @@ impl Installer {
         let mut cache_misses = 0;
         let mut packages_installed = 0;
 
+        let mut packages_to_download: Vec<(&String, &String, &String, bool)> = Vec::new();
+
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
                 continue;
@@ -695,7 +741,16 @@ impl Installer {
                 }
             };
 
-            let fetch_res = self.fetch_tarball(resolved_url).await;
+            packages_to_download.push((pkg_key, resolved_url, integrity_str, is_optional));
+        }
+
+        let ci_urls: Vec<&str> = packages_to_download
+            .iter()
+            .map(|(_, url, _, _)| url.as_str())
+            .collect();
+        let ci_download_results = self.fetch_tarballs_concurrent(&ci_urls).await;
+
+        for ((pkg_key, _resolved_url, integrity_str, is_optional), fetch_res) in packages_to_download.into_iter().zip(ci_download_results) {
             let (bytes, was_hit) = match fetch_res {
                 Ok(res) => res,
                 Err(err) => {
@@ -913,6 +968,75 @@ impl Installer {
         })
     }
 
+    /// Prefetch package metadata concurrently for a set of package names.
+    pub async fn prefetch_metadata(&mut self, names: &[&str]) -> Result<()> {
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|n| !self.metadata_cache.contains_key(**n))
+            .map(|n| n.to_string())
+            .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let results = self
+            .registry_client
+            .get_package_metadata_concurrent(&missing)
+            .await;
+
+        for (name, res) in missing.into_iter().zip(results) {
+            if let Ok(meta) = res {
+                self.metadata_cache.insert(name, meta);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch multiple tarballs concurrently with bounded semaphore limits and local disk cache.
+    pub async fn fetch_tarballs_concurrent(
+        &self,
+        urls: &[&str],
+    ) -> Vec<Result<(Vec<u8>, bool)>> {
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (idx, url) in urls.iter().enumerate() {
+            let cache = self.cache.clone();
+            let registry_client = self.registry_client.clone();
+            let url_str = url.to_string();
+
+            join_set.spawn(async move {
+                if let Ok(Some((_entry, data))) = cache.get(&url_str) {
+                    debug!("Cache hit for {}", url_str);
+                    return (idx, Ok((data, true)));
+                }
+
+                info!("Downloading {}", url_str);
+                match registry_client.download_tarball_bytes(&url_str).await {
+                    Ok(bytes) => {
+                        let _ = cache.put(&url_str, &bytes, None);
+                        (idx, Ok((bytes, false)))
+                    }
+                    Err(e) => (idx, Err(anyhow!("Failed to download tarball from {url_str}: {e}"))),
+                }
+            });
+        }
+
+        let mut results: Vec<Option<Result<(Vec<u8>, bool)>>> = (0..urls.len()).map(|_| None).collect();
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(anyhow!("Download task cancelled"))))
+            .collect()
+    }
+
+    #[allow(dead_code)]
     async fn fetch_tarball(&self, tarball_url: &str) -> Result<(Vec<u8>, bool)> {
         if let Ok(Some((_entry, data))) = self.cache.get(tarball_url) {
             debug!("Cache hit for {}", tarball_url);
@@ -928,20 +1052,21 @@ impl Installer {
         Ok((bytes, false))
     }
 
-    /// Helper to reify a single package node into node_modules and return lifecycle node and lockfile package.
-    async fn reify_package(
+    /// Helper to reify a package with pre-downloaded or cached bytes.
+    fn reify_package_with_bytes(
         &self,
         node: &ResolvedNode,
+        bytes: &[u8],
+        was_hit: bool,
         node_modules_dir: &std::path::Path,
         bin_dir: &std::path::Path,
     ) -> Result<(usize, usize, LockfilePackage, Option<LifecyclePackageNode>)> {
-        let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
         let cache_hits = if was_hit { 1 } else { 0 };
         let cache_misses = if was_hit { 0 } else { 1 };
 
         let expected_integrity: Integrity = node.integrity.parse()
             .map_err(|e| anyhow!("Invalid integrity string: {e}"))?;
-        expected_integrity.verify(&bytes)
+        expected_integrity.verify(bytes)
             .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
 
         let dest_dir = node_modules_dir.join(&node.name);
@@ -950,7 +1075,7 @@ impl Installer {
         }
         std::fs::create_dir_all(&dest_dir)?;
 
-        extract_tar_gz(Cursor::new(&bytes), &dest_dir, None)
+        extract_tar_gz(Cursor::new(bytes), &dest_dir, None)
             .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
 
         let pkg_manifest_path = dest_dir.join("package.json");
@@ -997,6 +1122,18 @@ impl Installer {
         }
 
         Ok((cache_hits, cache_misses, lock_entry, lifecycle_node))
+    }
+
+    /// Helper to reify a single package node into node_modules and return lifecycle node and lockfile package.
+    #[allow(dead_code)]
+    async fn reify_package(
+        &self,
+        node: &ResolvedNode,
+        node_modules_dir: &std::path::Path,
+        bin_dir: &std::path::Path,
+    ) -> Result<(usize, usize, LockfilePackage, Option<LifecyclePackageNode>)> {
+        let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
+        self.reify_package_with_bytes(node, &bytes, was_hit, node_modules_dir, bin_dir)
     }
 
     /// Run package update workflow.
@@ -1055,11 +1192,15 @@ impl Installer {
             }
         }
 
+        let is_targeted = !targets.is_empty();
         let mut updated_packages: Vec<String> = Vec::new();
         let mut old_versions: HashMap<String, String> = HashMap::new();
         let mut new_versions: HashMap<String, String> = HashMap::new();
 
-        // 1. Check for newer versions satisfying ranges
+        // 1. Check for newer versions satisfying ranges (prefetch metadata first)
+        let target_names: Vec<&str> = deps_to_update.keys().map(|s| s.as_str()).collect();
+        let _ = self.prefetch_metadata(&target_names).await;
+
         let mut newly_resolved_roots: BTreeMap<String, ResolvedNode> = BTreeMap::new();
         for (pkg_name, range_str) in &deps_to_update {
             let lock_key = format!("node_modules/{pkg_name}");
@@ -1092,13 +1233,36 @@ impl Installer {
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
 
         if !updated_packages.is_empty() {
-            // 2. Resolve transitive dependencies for newly updated packages
+            // 2. Resolve transitive dependencies for newly updated packages.
+            // When targeted, do not modify unrelated dependencies or dependencies
+            // whose existing locked version already satisfies the required range.
             let mut full_subgraph: BTreeMap<String, ResolvedNode> = BTreeMap::new();
             let mut queue: VecDeque<(String, String)> = VecDeque::new();
 
             for (name, node) in newly_resolved_roots {
                 for (sub_name, sub_range) in &node.dependencies {
-                    queue.push_back((sub_name.clone(), sub_range.clone()));
+                    let should_enqueue = if is_targeted {
+                        let lock_key = format!("node_modules/{sub_name}");
+                        if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
+                            if let Some(ref ver_str) = existing_pkg.version {
+                                if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range)) {
+                                    !range.satisfies(&ver)
+                                } else {
+                                    true
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+
+                    if should_enqueue {
+                        queue.push_back((sub_name.clone(), sub_range.clone()));
+                    }
                 }
                 full_subgraph.insert(name, node);
             }
@@ -1110,17 +1274,51 @@ impl Installer {
                 let node = self.resolve_package(&dep_name, &dep_range, false).await?;
                 for (sub_name, sub_range) in &node.dependencies {
                     if !full_subgraph.contains_key(sub_name) {
-                        queue.push_back((sub_name.clone(), sub_range.clone()));
+                        let should_enqueue = if is_targeted {
+                            let lock_key = format!("node_modules/{sub_name}");
+                            if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
+                                if let Some(ref ver_str) = existing_pkg.version {
+                                    if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range)) {
+                                        !range.satisfies(&ver)
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    true
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+
+                        if should_enqueue {
+                            queue.push_back((sub_name.clone(), sub_range.clone()));
+                        }
                     }
                 }
                 full_subgraph.insert(dep_name, node);
             }
 
-            // 3. Reify newly resolved packages into node_modules and update lockfile
+            // 3. Reify newly resolved packages into node_modules and update lockfile concurrently
+            let mut packages_to_download: Vec<(&String, &ResolvedNode)> = Vec::new();
             for (pkg_name, node) in &full_subgraph {
+                if !node.skipped {
+                    packages_to_download.push((pkg_name, node));
+                }
+            }
+
+            let download_urls: Vec<&str> = packages_to_download
+                .iter()
+                .map(|(_, n)| n.resolved_url.as_str())
+                .collect();
+            let download_results = self.fetch_tarballs_concurrent(&download_urls).await;
+
+            for ((pkg_name, node), fetch_res) in packages_to_download.into_iter().zip(download_results) {
+                let (bytes, was_hit) = fetch_res?;
                 let (hits, misses, lock_entry, l_node) = self
-                    .reify_package(node, &node_modules_dir, &bin_dir)
-                    .await?;
+                    .reify_package_with_bytes(node, &bytes, was_hit, &node_modules_dir, &bin_dir)?;
                 cache_hits += hits;
                 cache_misses += misses;
                 if let Some(ln) = l_node {
@@ -1146,6 +1344,37 @@ impl Installer {
                         to_visit.push_back(dep.clone());
                     }
                 }
+                if let Some(opt_deps) = &root_pkg.optional_dependencies {
+                    for dep in opt_deps.keys() {
+                        to_visit.push_back(dep.clone());
+                    }
+                }
+            }
+
+            for dep in manifest.dependencies.keys() {
+                to_visit.push_back(dep.clone());
+            }
+            for dep in manifest.dev_dependencies.keys() {
+                to_visit.push_back(dep.clone());
+            }
+            for dep in manifest.optional_dependencies.keys() {
+                to_visit.push_back(dep.clone());
+            }
+
+            // Also check workspace packages in lockfile
+            for (pkg_key, pkg_entry) in &lockfile.packages {
+                if !pkg_key.starts_with("node_modules/") && !pkg_key.is_empty() {
+                    if let Some(deps) = &pkg_entry.dependencies {
+                        for dep in deps.keys() {
+                            to_visit.push_back(dep.clone());
+                        }
+                    }
+                    if let Some(dev_deps) = &pkg_entry.dev_dependencies {
+                        for dep in dev_deps.keys() {
+                            to_visit.push_back(dep.clone());
+                        }
+                    }
+                }
             }
 
             while let Some(pkg_name) = to_visit.pop_front() {
@@ -1156,6 +1385,13 @@ impl Installer {
                 if let Some(pkg_entry) = lockfile.get_package(&key) {
                     if let Some(deps) = &pkg_entry.dependencies {
                         for sub_dep in deps.keys() {
+                            if !reachable.contains(sub_dep) {
+                                to_visit.push_back(sub_dep.clone());
+                            }
+                        }
+                    }
+                    if let Some(opt_deps) = &pkg_entry.optional_dependencies {
+                        for sub_dep in opt_deps.keys() {
                             if !reachable.contains(sub_dep) {
                                 to_visit.push_back(sub_dep.clone());
                             }

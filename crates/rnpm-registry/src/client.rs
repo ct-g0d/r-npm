@@ -37,6 +37,18 @@ pub fn encode_package_name(name: &str) -> String {
     name.to_string()
 }
 
+/// Default maximum concurrent requests allowed across the client.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
+
+/// Default maximum idle connections per host in the connection pool.
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+
+/// Default TCP keep-alive interval.
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// Default pool idle connection timeout.
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+
 /// Registry client configuration.
 #[derive(Debug, Clone)]
 pub struct RegistryClientConfig {
@@ -45,6 +57,10 @@ pub struct RegistryClientConfig {
     pub auth_token: Option<String>,
     pub trusted_hosts: HashSet<String>,
     pub timeout: Duration,
+    pub max_concurrent_requests: usize,
+    pub pool_max_idle_per_host: usize,
+    pub tcp_keepalive: Duration,
+    pub pool_idle_timeout: Duration,
 }
 
 impl Default for RegistryClientConfig {
@@ -61,6 +77,10 @@ impl Default for RegistryClientConfig {
             auth_token: None,
             trusted_hosts,
             timeout: Duration::from_secs(30),
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            pool_max_idle_per_host: DEFAULT_POOL_MAX_IDLE_PER_HOST,
+            tcp_keepalive: Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS),
+            pool_idle_timeout: Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
         }
     }
 }
@@ -70,6 +90,7 @@ impl Default for RegistryClientConfig {
 pub struct RegistryClient {
     client: Client,
     config: RegistryClientConfig,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl RegistryClient {
@@ -87,22 +108,46 @@ impl RegistryClient {
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
 
+        let max_idle = if config.pool_max_idle_per_host == 0 {
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        } else {
+            config.pool_max_idle_per_host
+        };
+
         // We disable reqwest's automatic redirect following so that we can enforce
         // the strict security rule: NEVER forward auth headers across redirects to untrusted hostnames.
         let client = Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(config.timeout)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(config.tcp_keepalive))
+            .pool_idle_timeout(Some(config.pool_idle_timeout))
+            .pool_max_idle_per_host(max_idle)
             .build()?;
 
-        Ok(Self { client, config })
+        let max_concurrency = if config.max_concurrent_requests == 0 {
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        } else {
+            config.max_concurrent_requests
+        };
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+
+        Ok(Self {
+            client,
+            config,
+            semaphore,
+        })
     }
 
     /// Access the client configuration.
     pub fn config(&self) -> &RegistryClientConfig {
         &self.config
+    }
+
+    /// Access the bounded concurrency semaphore.
+    pub fn semaphore(&self) -> &std::sync::Arc<tokio::sync::Semaphore> {
+        &self.semaphore
     }
 
     /// Format the metadata URL for a package name.
@@ -138,7 +183,7 @@ impl RegistryClient {
             if self.config.trusted_hosts.contains(&host_lower) {
                 return true;
             }
-            if let Some(port) = current_url.port() {
+            if let Some(port) = current_url.port_or_known_default() {
                 if self.config.trusted_hosts.contains(&format!("{host_lower}:{port}")) {
                     return true;
                 }
@@ -156,6 +201,12 @@ impl RegistryClient {
         initial_url: Url,
         accept_header: Option<&str>,
     ) -> Result<Response, RegistryError> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| RegistryError::Other(e.to_string()))?;
+
         let mut current_url = initial_url.clone();
 
         for _redirect_count in 0..MAX_REDIRECTS {
@@ -234,11 +285,20 @@ impl RegistryClient {
             });
         }
 
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        if status == StatusCode::UNAUTHORIZED {
             let msg = resp.text().await.unwrap_or_default();
             return Err(RegistryError::Unauthorized {
                 url: url.to_string(),
-                status: status.as_u16(),
+                status: 401,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: url.to_string(),
+                status: 403,
                 message: msg,
             });
         }
@@ -264,6 +324,36 @@ impl RegistryClient {
         Ok(metadata)
     }
 
+    /// Fetch abbreviated install metadata for multiple packages concurrently with bounded concurrency.
+    pub async fn get_package_metadata_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[S],
+    ) -> Vec<Result<AbbreviatedPackageMetadata, RegistryError>> {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, pkg) in packages.iter().enumerate() {
+            let client = self.clone();
+            let name = pkg.as_ref().to_string();
+            join_set.spawn(async move {
+                let res = client.get_package_metadata(&name).await;
+                (idx, res)
+            });
+        }
+
+        let mut results: Vec<Option<Result<AbbreviatedPackageMetadata, RegistryError>>> =
+            (0..packages.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
+    }
+
     /// Download a tarball stream from URL, safely following redirects.
     pub async fn download_tarball(&self, tarball_url: &str) -> Result<Response, RegistryError> {
         let url = Url::parse(tarball_url)?;
@@ -272,6 +362,40 @@ impl RegistryClient {
             .await?;
 
         let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(RegistryError::PackageNotFound {
+                package: tarball_url.to_string(),
+                status: 404,
+            });
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Unauthorized {
+                url: url.to_string(),
+                status: 401,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: url.to_string(),
+                status: 403,
+                message: msg,
+            });
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(RegistryError::RateLimited { retry_after });
+        }
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(RegistryError::ServerError {
@@ -288,6 +412,36 @@ impl RegistryClient {
         let resp = self.download_tarball(tarball_url).await?;
         let bytes = resp.bytes().await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Download multiple tarballs concurrently with bounded concurrency.
+    pub async fn download_tarballs_concurrent<S: AsRef<str>>(
+        &self,
+        tarball_urls: &[S],
+    ) -> Vec<Result<Vec<u8>, RegistryError>> {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, url) in tarball_urls.iter().enumerate() {
+            let client = self.clone();
+            let url_str = url.as_ref().to_string();
+            join_set.spawn(async move {
+                let res = client.download_tarball_bytes(&url_str).await;
+                (idx, res)
+            });
+        }
+
+        let mut results: Vec<Option<Result<Vec<u8>, RegistryError>>> =
+            (0..tarball_urls.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
     }
 
     /// Download tarball stream directly to a destination file on disk.
@@ -320,6 +474,37 @@ impl RegistryClient {
         })?;
 
         Ok(written)
+    }
+
+    /// Download multiple tarballs directly to disk destinations concurrently with bounded concurrency.
+    pub async fn download_tarballs_to_files_concurrent(
+        &self,
+        downloads: &[(&str, &Path)],
+    ) -> Vec<Result<u64, RegistryError>> {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, (url, dest)) in downloads.iter().enumerate() {
+            let client = self.clone();
+            let url_str = url.to_string();
+            let dest_buf = dest.to_path_buf();
+            join_set.spawn(async move {
+                let res = client.download_tarball_to_file(&url_str, &dest_buf).await;
+                (idx, res)
+            });
+        }
+
+        let mut results: Vec<Option<Result<u64, RegistryError>>> =
+            (0..downloads.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
     }
 }
 
