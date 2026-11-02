@@ -18,9 +18,14 @@ fn create_test_tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
             header.set_size(data.len() as u64);
             header.set_mode(mode);
             let path_bytes = path.as_bytes();
-            header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
-            header.set_cksum();
-            builder.append(&header, Cursor::new(data)).unwrap();
+            if path_bytes.len() <= 100 {
+                header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+                header.set_cksum();
+                builder.append(&header, Cursor::new(data)).unwrap();
+            } else {
+                header.set_cksum();
+                builder.append_data(&mut header, path, Cursor::new(data)).unwrap();
+            }
         }
         builder.finish().unwrap();
     }
@@ -820,6 +825,403 @@ fn test_replace_dir_with_retries_replaces_junction() {
     // Verify external target was NOT destroyed during atomic replacement!
     assert!(external_target.exists());
     assert!(external_target.join("ext.txt").exists());
+}
+
+#[test]
+fn test_extreme_archive_zero_byte_tarball() {
+    let dir = tempdir().unwrap();
+    let dest_extract = dir.path().join("dest_extract");
+    let dest_replace = dir.path().join("dest_replace");
+
+    // 1. Raw 0-byte buffer: extract_tar_gz must return error (unexpected EOF on gzip header)
+    let res_empty = extract_tar_gz(Cursor::new(&[]), &dest_extract, None);
+    assert!(res_empty.is_err(), "0-byte tarball must fail extraction");
+
+    // 2. extract_and_replace with 0-byte buffer: destination is clean and no temp files remain
+    let replace_res = extract_and_replace(Cursor::new(&[]), &dest_replace, None);
+    assert!(replace_res.is_err(), "0-byte extract_and_replace must fail");
+    assert!(!dest_replace.exists(), "Destination should not exist after 0-byte failure");
+
+    // Verify parent directory has no leftover staging tempdirs
+    let entries: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(
+            !name.starts_with(".rnpm-staging-") && !name.starts_with(".rnpm-trash-"),
+            "No leftover staging directories should remain: {name}"
+        );
+    }
+
+    // 3. Valid gzip stream containing 0 bytes of tar data (empty archive)
+    let empty_gz = GzEncoder::new(Vec::new(), Compression::default());
+    let empty_gz_bytes = empty_gz.finish().unwrap();
+    let summary = extract_tar_gz(Cursor::new(&empty_gz_bytes), &dest_extract, None).unwrap();
+    assert_eq!(summary.entries_extracted, 0);
+    assert_eq!(summary.total_uncompressed_bytes, 0);
+}
+
+#[test]
+fn test_extreme_archive_truncated_tarball() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest_trunc");
+
+    let full_content = vec![b'T'; 40_000];
+    let valid_tar = create_test_tarball(&[
+        ("package/package.json", br#"{"name":"trunc-test","version":"1.0.0"}"#, 0o644),
+        ("package/large_file.dat", &full_content, 0o644),
+        ("package/index.js", b"console.log('done');", 0o644),
+    ]);
+
+    // Test truncation at multiple cut points:
+    // a. 10 bytes (mid-gzip header)
+    assert!(extract_tar_gz(Cursor::new(&valid_tar[..10]), &dest, None).is_err());
+
+    // b. 100 bytes (mid gzip compressed block)
+    assert!(extract_tar_gz(Cursor::new(&valid_tar[..100]), &dest, None).is_err());
+
+    // c. 50% truncation (mid tar stream)
+    assert!(extract_tar_gz(Cursor::new(&valid_tar[..valid_tar.len() / 2]), &dest, None).is_err());
+
+    // d. Truncated by last 15 bytes (missing gzip trailer/crc)
+    assert!(extract_tar_gz(Cursor::new(&valid_tar[..valid_tar.len() - 15]), &dest, None).is_err());
+
+    // Test extract_and_replace with truncated tarball:
+    // Verify rollback / non-destructive behavior: existing destination remains untouched
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("precious.txt"), "precious data").unwrap();
+
+    let res = extract_and_replace(Cursor::new(&valid_tar[..valid_tar.len() / 2]), &dest, None);
+    assert!(res.is_err(), "Truncated tarball must fail in extract_and_replace");
+
+    // Existing data was NOT corrupted or lost!
+    assert_eq!(fs::read_to_string(dest.join("precious.txt")).unwrap(), "precious data");
+}
+
+struct TarStreamOfMillionEntries {
+    entry_index: usize,
+    total_entries: usize,
+    current_header: [u8; 512],
+    header_offset: usize,
+}
+
+impl TarStreamOfMillionEntries {
+    fn new(total_entries: usize) -> Self {
+        Self {
+            entry_index: 0,
+            total_entries,
+            current_header: [0u8; 512],
+            header_offset: 512,
+        }
+    }
+
+    fn prepare_next_header(&mut self) -> bool {
+        if self.entry_index >= self.total_entries {
+            return false;
+        }
+        let i = self.entry_index;
+        self.entry_index += 1;
+
+        let mut header = Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        let path = format!("package/f_{i}.txt");
+        let path_bytes = path.as_bytes();
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+
+        self.current_header.copy_from_slice(header.as_bytes());
+        self.header_offset = 0;
+        true
+    }
+}
+
+impl std::io::Read for TarStreamOfMillionEntries {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.header_offset >= 512 {
+            if !self.prepare_next_header() {
+                return Ok(0);
+            }
+        }
+
+        let available = 512 - self.header_offset;
+        let to_copy = available.min(buf.len());
+        buf[..to_copy].copy_from_slice(&self.current_header[self.header_offset..self.header_offset + to_copy]);
+        self.header_offset += to_copy;
+        Ok(to_copy)
+    }
+}
+
+#[test]
+fn test_extreme_archive_millions_of_entries_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest_entries_bomb");
+
+    // 1. With an archive streaming 1,000,000 tiny entries, test entry count limit enforcement
+    // halts promptly at entry 501 without exhausting memory, file handles, or disk space
+    let start = std::time::Instant::now();
+    let stream_1 = flate2::read::GzEncoder::new(TarStreamOfMillionEntries::new(1_000_000), Compression::none());
+    let limits_500 = TarLimits {
+        max_entries: 500,
+        ..Default::default()
+    };
+    let res = extract_tar_gz(stream_1, &dest, Some(limits_500));
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "entry count"),
+        "Must trigger entry count limit for 1,000,000 entries stream: {res:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(3), "Must halt fast without processing all 1M entries: {:?}", elapsed);
+
+    // 2. With extract_and_replace: verify staging directory is cleaned up and no files leaked to dest
+    let stream_replace = flate2::read::GzEncoder::new(TarStreamOfMillionEntries::new(1_000_000), Compression::none());
+    let dest_replace = dir.path().join("dest_replace_bomb");
+    let limits_replace = TarLimits {
+        max_entries: 200,
+        ..Default::default()
+    };
+    let replace_res = extract_and_replace(stream_replace, &dest_replace, Some(limits_replace));
+    assert!(replace_res.is_err());
+    assert!(!dest_replace.exists(), "Destination should not exist after entry bomb failure");
+
+    // 3. Low limit (50 entries), halts at entry 51 in under 300ms!
+    let start_low = std::time::Instant::now();
+    let stream_low = flate2::read::GzEncoder::new(TarStreamOfMillionEntries::new(1_000_000), Compression::none());
+    let low_limit = TarLimits {
+        max_entries: 50,
+        ..Default::default()
+    };
+    let res_low = extract_tar_gz(stream_low, &dest, Some(low_limit));
+    let elapsed_low = start_low.elapsed();
+    assert!(
+        matches!(res_low, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "entry count"),
+        "Must trigger entry count limit for low_limit: {res_low:?}"
+    );
+    assert!(elapsed_low < std::time::Duration::from_millis(300), "Must fail fast: took {:?}", elapsed_low);
+}
+
+#[test]
+fn test_deeply_nested_paths_exceeding_max_path() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("deep_dest");
+
+    // Construct a deeply nested path exceeding standard Windows MAX_PATH (260 characters).
+    // E.g. package/ + 12 levels of 25 characters + filename -> total length > 350 chars
+    let mut deep_rel = String::from("package");
+    for i in 0..12 {
+        deep_rel.push_str(&format!("/level_{i}_abcdefghijklmnop"));
+    }
+    deep_rel.push_str("/very_long_nested_filename_exceeding_windows_max_path_260_limit.txt");
+
+    let expected_content = b"deeply nested payload content that survived long path extraction";
+    let tar_bytes = create_test_tarball(&[
+        ("package/package.json", br#"{"name":"deep-pkg","version":"1.0.0"}"#, 0o644),
+        (&deep_rel, expected_content, 0o644),
+    ]);
+
+    // 1. Extract with extract_and_replace
+    let summary = extract_and_replace(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 2);
+
+    // Verify file exists and content matches
+    let sub_path = deep_rel.strip_prefix("package/").unwrap();
+    let extracted_file = dest.join(sub_path);
+    assert!(extracted_file.exists(), "Deeply nested file must exist on disk");
+    let read_back = fs::read(&extracted_file).unwrap();
+    assert_eq!(read_back, expected_content);
+
+    // Total path string length should be > 260 characters
+    let full_path_str = extracted_file.to_string_lossy();
+    assert!(
+        full_path_str.len() > 260,
+        "Test path length was {} (expected > 260): {}",
+        full_path_str.len(),
+        full_path_str
+    );
+
+    // 2. Safe recursive deletion must handle paths > MAX_PATH without error
+    crate::junction::remove_dir_all_safe(&dest).unwrap();
+    assert!(!dest.exists(), "Deeply nested directory must be completely removed");
+}
+
+#[test]
+fn test_stress_atomic_replacement_under_antivirus_contention() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("av_contended_package");
+
+    // Initialize version 1
+    let tar_v1 = create_test_tarball(&[
+        ("package/package.json", br#"{"name":"av-pkg","version":"1.0.0"}"#, 0o644),
+        ("package/index.js", b"console.log('v1.0.0');", 0o644),
+        ("package/lib/helper.js", b"module.exports = 1;", 0o644),
+    ]);
+    extract_and_replace(Cursor::new(&tar_v1), &dest, None).unwrap();
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Anti-virus simulator thread:
+    // Repeatedly opens files inside dest with exclusive access for 5-10ms bursts
+    let dest_av = dest.clone();
+    let r_av = Arc::clone(&running);
+    let av_handle = thread::spawn(move || {
+        let targets = ["index.js", "package.json", "lib/helper.js"];
+        let mut idx = 0;
+        while r_av.load(Ordering::Relaxed) {
+            let target_rel = targets[idx % targets.len()];
+            idx += 1;
+            let file_path = dest_av.join(target_rel);
+            if let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&file_path) {
+                // Hold lock for 8ms simulating AV scan
+                thread::sleep(Duration::from_millis(8));
+                drop(file);
+            }
+            thread::sleep(Duration::from_millis(3));
+        }
+    });
+
+    // 3 parallel worker threads racing to atomically replace dest with different versions
+    let mut workers = Vec::new();
+    for worker_id in 0..3 {
+        let dest_w = dest.clone();
+        let w_handle = thread::spawn(move || {
+            for v in 1..=4 {
+                let v_str = format!("2.{worker_id}.{v}");
+                let pkg_json = format!(r#"{{"name":"av-pkg","version":"{v_str}"}}"#);
+                let idx_js = format!("console.log('{v_str}');");
+                let tar_bytes = create_test_tarball(&[
+                    ("package/package.json", pkg_json.as_bytes(), 0o644),
+                    ("package/index.js", idx_js.as_bytes(), 0o644),
+                    ("package/lib/helper.js", b"helper code", 0o644),
+                ]);
+
+                // extract_and_replace must succeed despite transient AV sharing violations
+                let res = extract_and_replace(Cursor::new(&tar_bytes), &dest_w, None);
+                assert!(
+                    res.is_ok(),
+                    "Worker {worker_id} iter {v} failed atomic replacement under AV contention: {:?}",
+                    res.err()
+                );
+            }
+        });
+        workers.push(w_handle);
+    }
+
+    for w in workers {
+        w.join().expect("Worker thread panicked under AV contention");
+    }
+
+    // Stop anti-virus simulation thread
+    running.store(false, Ordering::Relaxed);
+    av_handle.join().unwrap();
+
+    // Verify destination is intact, contains valid files, and no temp files remain
+    assert!(dest.join("package.json").exists());
+    assert!(dest.join("index.js").exists());
+    assert!(dest.join("lib/helper.js").exists());
+
+    let final_pkg = fs::read_to_string(dest.join("package.json")).unwrap();
+    assert!(final_pkg.contains("av-pkg"));
+
+    // Verify no .rnpm-trash or .rnpm-staging leftover directories
+    let parent = dest.parent().unwrap();
+    for entry in fs::read_dir(parent).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(
+            !name.starts_with(".rnpm-trash-") && !name.starts_with(".rnpm-staging-"),
+            "Leftover staging/trash dir found: {name}"
+        );
+    }
+}
+
+#[test]
+fn test_stress_ntfs_junction_handling_under_high_parallel_contention() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // Create 4 target packages with precious contents
+    let mut targets = Vec::new();
+    for t in 0..4 {
+        let target_dir = root.join(format!("target_pkg_{t}"));
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join("data.txt"), format!("precious data {t}")).unwrap();
+        targets.push(target_dir);
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    // AV scanner thread continuously reading target files
+    let targets_clone = targets.clone();
+    let r_av = Arc::clone(&running);
+    let av_handle = thread::spawn(move || {
+        while r_av.load(Ordering::Relaxed) {
+            for t in &targets_clone {
+                let _ = fs::read(t.join("data.txt"));
+            }
+            thread::sleep(Duration::from_millis(3));
+        }
+    });
+
+    let targets_arc = Arc::new(targets);
+    let mut junction_threads = Vec::new();
+
+    // 8 parallel threads creating, reading through, and safely removing junctions
+    for thread_id in 0..8 {
+        let t_arc = Arc::clone(&targets_arc);
+        let link_parent = root.join(format!("links_thread_{thread_id}"));
+        fs::create_dir_all(&link_parent).unwrap();
+
+        let h = thread::spawn(move || {
+            for iter in 0..6 {
+                let target = &t_arc[iter % t_arc.len()];
+                let link = link_parent.join(format!("link_iter_{iter}"));
+
+                // 1. Create junction
+                create_junction(&link, target).expect("Failed to create junction");
+                assert!(is_junction(&link).unwrap());
+
+                // 2. Read through junction
+                let data = fs::read_to_string(link.join("data.txt")).expect("Failed to read through junction");
+                assert!(data.starts_with("precious data"));
+
+                // 3. Safely remove junction
+                remove_junction(&link).expect("Failed to safely remove junction");
+                assert!(!link.exists());
+            }
+
+            // Cleanup links directory using remove_dir_all_safe
+            crate::junction::remove_dir_all_safe(&link_parent).expect("Failed to clean link parent");
+        });
+        junction_threads.push(h);
+    }
+
+    for h in junction_threads {
+        h.join().expect("Junction thread panicked");
+    }
+
+    running.store(false, Ordering::Relaxed);
+    av_handle.join().unwrap();
+
+    // CRITICAL: Verify ALL target directories and files are 100% untouched and intact!
+    for (t, target_dir) in targets_arc.iter().enumerate() {
+        assert!(target_dir.exists(), "Target directory must NOT be deleted");
+        let data = fs::read_to_string(target_dir.join("data.txt")).unwrap();
+        assert_eq!(data, format!("precious data {t}"), "Target data must never be modified or destroyed");
+    }
 }
 
 

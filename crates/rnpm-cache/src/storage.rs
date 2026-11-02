@@ -76,6 +76,8 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    lock_timeout: Duration,
+    stale_threshold: Duration,
 }
 
 impl Cache {
@@ -86,7 +88,23 @@ impl Cache {
         fs::create_dir_all(root.join("index-v5"))?;
         fs::create_dir_all(root.join("tmp"))?;
         fs::create_dir_all(root.join("locks"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            lock_timeout: CacheLock::DEFAULT_TIMEOUT,
+            stale_threshold: CacheLock::DEFAULT_STALE_THRESHOLD,
+        })
+    }
+
+    /// Configure custom lock acquisition timeout.
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
+    /// Configure custom stale lock threshold.
+    pub fn with_stale_threshold(mut self, threshold: Duration) -> Self {
+        self.stale_threshold = threshold;
+        self
     }
 
     /// Root directory of this cache.
@@ -121,13 +139,40 @@ impl Cache {
         self.root.join("locks").join(format!("{safe_name}.lock"))
     }
 
-    /// Acquire an exclusive cross-process lock for a key.
-    pub fn lock_key(&self, key: &str) -> Result<CacheLock, CacheError> {
+    /// Acquire an exclusive cross-process lock for a key with custom options.
+    pub fn lock_key_with_options(
+        &self,
+        key: &str,
+        timeout: Duration,
+        stale_threshold: Duration,
+    ) -> Result<CacheLock, CacheError> {
         let mut hasher = sha2::Sha256::new();
         hasher.update(key.as_bytes());
         let hash = HEXLOWER.encode(&hasher.finalize());
         let lock_path = self.lock_path(&format!("idx_{hash}"));
-        CacheLock::acquire_exclusive(&lock_path).map_err(|e| {
+        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                CacheError::LockFailed(lock_path.display().to_string())
+            } else {
+                CacheError::Io(e)
+            }
+        })
+    }
+
+    /// Acquire an exclusive cross-process lock for a key.
+    pub fn lock_key(&self, key: &str) -> Result<CacheLock, CacheError> {
+        self.lock_key_with_options(key, self.lock_timeout, self.stale_threshold)
+    }
+
+    /// Acquire an exclusive cross-process lock for a blob digest with custom options.
+    pub fn lock_blob_with_options(
+        &self,
+        sha512_hex: &str,
+        timeout: Duration,
+        stale_threshold: Duration,
+    ) -> Result<CacheLock, CacheError> {
+        let lock_path = self.lock_path(&format!("blob_{sha512_hex}"));
+        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(|e| {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 CacheError::LockFailed(lock_path.display().to_string())
             } else {
@@ -138,14 +183,7 @@ impl Cache {
 
     /// Acquire an exclusive cross-process lock for a blob digest.
     pub fn lock_blob(&self, sha512_hex: &str) -> Result<CacheLock, CacheError> {
-        let lock_path = self.lock_path(&format!("blob_{sha512_hex}"));
-        CacheLock::acquire_exclusive(&lock_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                CacheError::LockFailed(lock_path.display().to_string())
-            } else {
-                CacheError::Io(e)
-            }
-        })
+        self.lock_blob_with_options(sha512_hex, self.lock_timeout, self.stale_threshold)
     }
 
     /// Create a unique temporary file path within `<cache_root>/tmp` (guaranteed on same volume).

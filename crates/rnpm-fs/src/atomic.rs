@@ -48,7 +48,7 @@ pub fn extract_and_replace<R: Read>(
     })?;
 
     // Staging succeeded: replace destination with staging directory
-    replace_dir_with_retries(staging_path, destination, 10)?;
+    replace_dir_with_retries(staging_path, destination, 15)?;
 
     // Extraction and atomic rename succeeded; disable tempdir auto-deletion
     std::mem::forget(staging_temp);
@@ -117,18 +117,26 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
     }
 
     // Rename destination -> trash_path
-    fs::rename(destination, &trash_path)?;
+    match fs::rename(destination, &trash_path) {
+        Ok(()) => {
+            // Rename staging -> destination
+            if let Err(rename_err) = fs::rename(staging, destination) {
+                // Attempt rollback if staging -> destination failed
+                let _ = fs::rename(&trash_path, destination);
+                return Err(rename_err);
+            }
 
-    // Rename staging -> destination
-    if let Err(rename_err) = fs::rename(staging, destination) {
-        // Attempt rollback if staging -> destination failed
-        let _ = fs::rename(&trash_path, destination);
-        return Err(rename_err);
+            // Successfully replaced; safely cleanup trash using non-recursive junction pruning
+            let _ = crate::junction::remove_dir_all_safe(&trash_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Race condition: another concurrent thread just renamed or removed destination!
+            // Directly rename staging -> destination
+            fs::rename(staging, destination)
+        }
+        Err(e) => Err(e),
     }
-
-    // Successfully replaced; safely cleanup trash using non-recursive junction pruning
-    let _ = crate::junction::remove_dir_all_safe(&trash_path);
-    Ok(())
 }
 
 /// Opportunistic cleanup of any leftover .rnpm-trash-* directories in parent.
@@ -150,20 +158,24 @@ pub(crate) fn is_retryable_error(err: &std::io::Error) -> bool {
         ErrorKind::PermissionDenied
         | ErrorKind::WouldBlock
         | ErrorKind::Interrupted
-        | ErrorKind::ResourceBusy => true,
+        | ErrorKind::ResourceBusy
+        | ErrorKind::NotFound
+        | ErrorKind::AlreadyExists => true,
         _ => {
             // Check raw OS error codes for Windows:
-            // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+            // ERROR_FILE_NOT_FOUND (2), ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
             // ERROR_DIR_NOT_EMPTY (145), ERROR_FILE_CHECKED_OUT (149),
-            // ERROR_BUSY (170), ERROR_USER_MAPPED_FILE (1224)
+            // ERROR_BUSY (170), ERROR_ALREADY_EXISTS (183), ERROR_USER_MAPPED_FILE (1224)
             #[cfg(windows)]
             if let Some(code) = err.raw_os_error() {
-                return code == 5
+                return code == 2
+                    || code == 5
                     || code == 32
                     || code == 33
                     || code == 145
                     || code == 149
                     || code == 170
+                    || code == 183
                     || code == 1224;
             }
             #[cfg(windows)]
