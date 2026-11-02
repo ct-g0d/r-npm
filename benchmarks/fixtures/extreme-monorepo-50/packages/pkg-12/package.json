@@ -1,0 +1,12 @@
+{
+  "name": "pkg-12",
+  "version": "1.0.0",
+  "description": "pkg-12 (Tier 1) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-02": "^1.0.0",
+    "pkg-03": "~1.0.0",
+    "commander": "^11.1.0"
+  },
+  "scripts": {}
+}

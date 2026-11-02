@@ -1,0 +1,11 @@
+{
+  "name": "pkg-20",
+  "version": "1.0.0",
+  "description": "pkg-20 (Tier 1) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-10": "*",
+    "pkg-01": "^1.0.0"
+  },
+  "scripts": {}
+}

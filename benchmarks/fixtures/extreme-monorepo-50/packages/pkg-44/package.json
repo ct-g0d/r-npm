@@ -1,0 +1,11 @@
+{
+  "name": "pkg-44",
+  "version": "1.0.0",
+  "description": "pkg-44 (Tier 3) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-14": "*",
+    "pkg-29": "^1.0.0"
+  },
+  "scripts": {}
+}

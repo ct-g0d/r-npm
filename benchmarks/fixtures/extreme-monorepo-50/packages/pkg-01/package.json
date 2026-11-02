@@ -1,0 +1,13 @@
+{
+  "name": "pkg-01",
+  "version": "1.0.0",
+  "description": "pkg-01 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "bytes": "^3.1.2"
+  },
+  "scripts": {
+    "postinstall": "node build.js",
+    "prepare": "node build.js"
+  }
+}

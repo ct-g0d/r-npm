@@ -1,0 +1,13 @@
+{
+  "name": "pkg-27",
+  "version": "1.0.0",
+  "description": "pkg-27 (Tier 2) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-12": "^1.0.0",
+    "pkg-13": "~1.0.0",
+    "pkg-02": "*",
+    "lodash": "^4.17.21"
+  },
+  "scripts": {}
+}

@@ -1,0 +1,10 @@
+{
+  "name": "pkg-03",
+  "version": "1.0.0",
+  "description": "pkg-03 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "mime-types": "^2.1.35"
+  },
+  "scripts": {}
+}

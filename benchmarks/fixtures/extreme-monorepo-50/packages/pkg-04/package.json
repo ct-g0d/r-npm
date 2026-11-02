@@ -1,0 +1,10 @@
+{
+  "name": "pkg-04",
+  "version": "1.0.0",
+  "description": "pkg-04 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "supports-color": "^7.2.0"
+  },
+  "scripts": {}
+}

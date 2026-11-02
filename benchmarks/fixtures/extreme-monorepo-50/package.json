@@ -1,0 +1,13 @@
+{
+  "name": "extreme-monorepo-50",
+  "version": "1.0.0",
+  "description": "Extreme 52-package workspace monorepo fixture with multi-tier DAG, hoisting contention, and cross-package artifact pipelines",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "prettier": "^3.2.5"
+  }
+}

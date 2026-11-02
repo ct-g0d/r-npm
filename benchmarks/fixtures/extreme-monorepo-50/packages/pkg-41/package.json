@@ -1,0 +1,13 @@
+{
+  "name": "pkg-41",
+  "version": "1.0.0",
+  "description": "pkg-41 (Tier 3) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-11": "*",
+    "pkg-26": "^1.0.0",
+    "pkg-15": "^1.0.0",
+    "cors": "^2.8.5"
+  },
+  "scripts": {}
+}

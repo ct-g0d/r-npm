@@ -554,15 +554,22 @@ function Run-Scenario {
     $mad = $initialStats.mad
     $outlierThreshold = [Math]::Max(10.0, 3.0 * $mad)
 
+    $maxDiff = 0.0
+    $maxDiffIndex = -1
     for ($i = 0; $i -lt $rawTrials.Count; $i++) {
         $diff = [Math]::Abs($rawTrials[$i].wall_time_ms - $median)
-        if ($diff -gt $outlierThreshold -and $outliersReplaced -eq 0) {
-            Write-Host "[harness] Environmental outlier detected at trial $i ($($rawTrials[$i].wall_time_ms)ms vs median ${median}ms, threshold ${outlierThreshold}ms). Running replacement trial..." -ForegroundColor Yellow
-            $replacement = Execute-Trial -Index $i -IsReplacement
-            $rawTrials[$i] = $replacement
-            $outliersReplaced++
-            break
+        if ($diff -gt $outlierThreshold -and $diff -gt $maxDiff) {
+            $maxDiff = $diff
+            $maxDiffIndex = $i
         }
+    }
+
+    if ($maxDiffIndex -ge 0 -and $outliersReplaced -eq 0) {
+        $i = $maxDiffIndex
+        Write-Host "[harness] Environmental outlier detected at trial $i ($($rawTrials[$i].wall_time_ms)ms vs median ${median}ms, threshold ${outlierThreshold}ms). Running replacement trial..." -ForegroundColor Yellow
+        $replacement = Execute-Trial -Index $i -IsReplacement
+        $rawTrials[$i] = $replacement
+        $outliersReplaced++
     }
 
     # Compute Final Metric Summaries

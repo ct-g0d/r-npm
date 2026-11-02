@@ -1,0 +1,16 @@
+{
+  "name": "pkg-50",
+  "version": "1.0.0",
+  "description": "pkg-50 (Tier 4) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-42": "^1.0.0",
+    "pkg-43": "^1.0.0",
+    "pkg-26": "~1.0.0",
+    "commander": "^11.1.0"
+  },
+  "scripts": {},
+  "bin": {
+    "pkg-50-cli": "./bin/cli.js"
+  }
+}
