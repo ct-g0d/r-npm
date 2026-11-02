@@ -1028,6 +1028,8 @@ dependencies = [
  "clap",
  "flate2",
  "reqwest",
+ "rnpm-cache",
+ "rnpm-config",
  "rnpm-core",
  "rnpm-fs",
  "rnpm-install",

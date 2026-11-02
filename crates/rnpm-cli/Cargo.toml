@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 rnpm-core = { workspace = true }
+rnpm-cache = { workspace = true }
+rnpm-config = { workspace = true }
 rnpm-fs = { workspace = true }
 rnpm-install = { workspace = true }
 rnpm-lifecycle = { workspace = true }

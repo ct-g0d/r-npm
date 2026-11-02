@@ -4,7 +4,7 @@ pub mod junction;
 pub mod parallel;
 pub mod tarball;
 
-pub use atomic::{extract_and_replace, replace_dir_with_retries};
+pub use atomic::{extract_and_replace, recover_atomic_writes, replace_dir_with_retries};
 pub use error::FsError;
 pub use junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
 pub use parallel::{extract_batch_parallel, BatchExtractionItem};

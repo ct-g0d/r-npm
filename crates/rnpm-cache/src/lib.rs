@@ -14,7 +14,7 @@ pub mod storage;
 pub use error::CacheError;
 pub use index::IndexEntry;
 pub use lock::CacheLock;
-pub use storage::Cache;
+pub use storage::{Cache, VerifyReport};
 
 #[cfg(test)]
 mod tests {
@@ -535,5 +535,362 @@ mod tests {
         // Clean temp sweep
         let remaining_tmp = cache.clean_stale_temp_files(std::time::Duration::from_secs(0)).unwrap();
         assert_eq!(remaining_tmp, 0, "No temporary files should be orphaned");
+    }
+
+    #[test]
+    fn test_verify_healthy_cache() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        for i in 0..5 {
+            let key = format!("https://registry.npmjs.org/healthy-pkg-{i}/-/healthy-{i}.tgz");
+            let data = format!("healthy payload content {i}").into_bytes();
+            cache.put(&key, &data, None).unwrap();
+        }
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 5);
+        assert_eq!(report.verified_indices, 5);
+        assert_eq!(report.corrupted_blobs, 0);
+        assert_eq!(report.corrupted_indices, 0);
+        assert_eq!(report.orphaned_indices, 0);
+        assert_eq!(report.stale_temp_files_cleaned, 0);
+        assert!(report.is_clean());
+        assert_eq!(report.total_purged(), 0);
+        assert_eq!(report.total_verified(), 10);
+        assert!(report.total_blob_bytes > 0);
+
+        // Verify Display trait
+        let display_str = format!("{report}");
+        assert!(display_str.contains("5 blobs verified"));
+        assert!(display_str.contains("5 index entries verified"));
+
+        // Verify that all entries can still be read
+        for i in 0..5 {
+            let key = format!("https://registry.npmjs.org/healthy-pkg-{i}/-/healthy-{i}.tgz");
+            let expected_data = format!("healthy payload content {i}").into_bytes();
+            let (_, data) = cache.get(&key).unwrap().expect("Must find entry");
+            assert_eq!(data, expected_data);
+        }
+    }
+
+    #[test]
+    fn test_verify_corrupted_blob_and_orphaned_index() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key1 = "https://registry.npmjs.org/pkg-corrupt/-/pkg-corrupt-1.0.0.tgz";
+        let entry1 = cache.put(key1, b"valid original data 1", None).unwrap();
+
+        let key2 = "https://registry.npmjs.org/pkg-intact/-/pkg-intact-1.0.0.tgz";
+        let _entry2 = cache.put(key2, b"valid original data 2", None).unwrap();
+
+        // Deliberately corrupt blob 1 on disk
+        let blob1_path = cache.blob_path(&entry1.sha512_hex);
+        assert!(blob1_path.exists());
+        std::fs::write(&blob1_path, b"bad checksum bytes").unwrap();
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.corrupted_blobs, 1, "Blob 1 must be detected as corrupted and purged");
+        assert_eq!(report.verified_blobs, 1, "Blob 2 must be verified successfully");
+        assert_eq!(report.orphaned_indices, 1, "Index 1 must be purged as orphan since its blob was purged");
+        assert_eq!(report.verified_indices, 1, "Index 2 must remain verified");
+        assert_eq!(report.corrupted_indices, 0);
+        assert_eq!(report.stale_temp_files_cleaned, 0);
+        assert!(!report.is_clean());
+
+        // Blob 1 must be deleted from disk
+        assert!(!blob1_path.exists(), "Corrupted blob 1 must no longer exist");
+
+        // Index 1 must be deleted from disk
+        let index1_path = IndexEntry::path_for_key(cache.root(), key1);
+        assert!(!index1_path.exists(), "Orphaned index 1 must no longer exist");
+
+        // get(key1) should now return None (miss)
+        let get1 = cache.get(key1).unwrap();
+        assert!(get1.is_none());
+
+        // get(key2) should still succeed
+        let (_, get2_data) = cache.get(key2).unwrap().expect("Key 2 must be intact");
+        assert_eq!(get2_data, b"valid original data 2");
+    }
+
+    #[test]
+    fn test_verify_corrupted_index_purged() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key1 = "https://registry.npmjs.org/idx-corrupt/-/idx-corrupt-1.0.0.tgz";
+        let entry1 = cache.put(key1, b"blob data 1", None).unwrap();
+
+        let key2 = "https://registry.npmjs.org/idx-intact/-/idx-intact-1.0.0.tgz";
+        let _ = cache.put(key2, b"blob data 2", None).unwrap();
+
+        // Corrupt index 1 with invalid JSON syntax
+        let index1_path = IndexEntry::path_for_key(cache.root(), key1);
+        assert!(index1_path.exists());
+        std::fs::write(&index1_path, b"{{{{ invalid json content").unwrap();
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 2, "Both blobs are intact");
+        assert_eq!(report.corrupted_blobs, 0);
+        assert_eq!(report.corrupted_indices, 1, "Index 1 must be purged as corrupted");
+        assert_eq!(report.verified_indices, 1, "Index 2 must be verified");
+        assert_eq!(report.orphaned_indices, 0);
+
+        assert!(!index1_path.exists(), "Corrupt index 1 must be purged");
+        // But blob 1 is still preserved in CAS storage
+        let blob1_path = cache.blob_path(&entry1.sha512_hex);
+        assert!(blob1_path.exists(), "Intact blob 1 must be preserved in content-v2");
+
+        // get(key1) is a miss, get(key2) is a hit
+        assert!(cache.get(key1).unwrap().is_none());
+        assert!(cache.get(key2).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_verify_missing_blob_orphaned_index() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key = "https://registry.npmjs.org/orphan-pkg/-/orphan-pkg-1.0.0.tgz";
+        let entry = cache.put(key, b"ephemeral data", None).unwrap();
+
+        let blob_path = cache.blob_path(&entry.sha512_hex);
+        let index_path = IndexEntry::path_for_key(cache.root(), key);
+        assert!(blob_path.exists());
+        assert!(index_path.exists());
+
+        // Remove blob directly from disk
+        std::fs::remove_file(&blob_path).unwrap();
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 0);
+        assert_eq!(report.corrupted_blobs, 0);
+        assert_eq!(report.orphaned_indices, 1, "Index pointing to missing blob must be purged");
+        assert_eq!(report.verified_indices, 0);
+        assert!(!index_path.exists(), "Orphaned index must be purged from disk");
+    }
+
+    #[test]
+    fn test_verify_stale_temp_files() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key = "https://registry.npmjs.org/temp-pkg/-/temp-pkg-1.0.0.tgz";
+        cache.put(key, b"valid payload", None).unwrap();
+
+        // Create 3 stale temp files and a temp subdirectory in tmp
+        let tmp1 = cache.tmp_dir().join("stale_worker1.tmp");
+        let tmp2 = cache.tmp_dir().join("stale_worker2.tmp");
+        let tmp3 = cache.tmp_dir().join("stale_worker3.tmp");
+        let tmp_sub = cache.tmp_dir().join("stale_subdir");
+        std::fs::create_dir_all(&tmp_sub).unwrap();
+        let tmp4 = tmp_sub.join("nested.tmp");
+        std::fs::write(&tmp1, b"partial write 1").unwrap();
+        std::fs::write(&tmp2, b"partial write 2").unwrap();
+        std::fs::write(&tmp3, b"partial write 3").unwrap();
+        std::fs::write(&tmp4, b"nested tmp").unwrap();
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 1);
+        assert_eq!(report.verified_indices, 1);
+        assert!(report.stale_temp_files_cleaned >= 3);
+
+        // Verify tmp_dir is empty
+        let remaining_tmp: Vec<_> = std::fs::read_dir(cache.tmp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining_tmp.len(), 0);
+
+        // Second verification should be completely clean
+        let clean_report = cache.verify().unwrap();
+        assert!(clean_report.is_clean());
+    }
+
+    #[test]
+    fn test_verify_complex_combined_corruptions() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        // 1. Two healthy entries
+        cache.put("key-healthy-1", b"healthy-data-1", None).unwrap();
+        cache.put("key-healthy-2", b"healthy-data-2", None).unwrap();
+
+        // 2. Corrupted blob entry
+        let corrupt_entry = cache.put("key-corrupt-blob", b"original data before corruption", None).unwrap();
+        let corrupt_blob_path = cache.blob_path(&corrupt_entry.sha512_hex);
+        std::fs::write(&corrupt_blob_path, b"totally mismatched digest content").unwrap();
+
+        // 3. Corrupted index entry (garbage UTF-8)
+        let corrupt_idx_key = "key-corrupt-index";
+        cache.put(corrupt_idx_key, b"valid blob but broken index", None).unwrap();
+        let corrupt_idx_path = IndexEntry::path_for_key(cache.root(), corrupt_idx_key);
+        std::fs::write(&corrupt_idx_path, [0x80, 0x81, 0xFF, 0xFE, 0x00]).unwrap();
+
+        // 4. Orphaned index entry (delete blob)
+        let orphan_key = "key-orphan";
+        let orphan_entry = cache.put(orphan_key, b"orphan payload", None).unwrap();
+        std::fs::remove_file(cache.blob_path(&orphan_entry.sha512_hex)).unwrap();
+
+        // 5. Stale temp files
+        let tmp_file1 = cache.tmp_dir().join("crash_leftover_1.tmp");
+        let tmp_file2 = cache.tmp_dir().join("crash_leftover_2.tmp");
+        std::fs::write(&tmp_file1, b"abandoned write").unwrap();
+        std::fs::write(&tmp_file2, b"abandoned write").unwrap();
+
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 3, "2 healthy blobs + 1 orphan-index blob");
+        assert_eq!(report.corrupted_blobs, 1, "1 corrupted blob purged");
+        assert_eq!(report.verified_indices, 2, "2 healthy indices");
+        assert_eq!(report.corrupted_indices, 1, "1 non-utf8 corrupted index purged");
+        assert_eq!(report.orphaned_indices, 2, "1 orphan-key + 1 corrupt-blob-key orphaned indices");
+        assert_eq!(report.stale_temp_files_cleaned, 2, "2 stale temp files cleaned");
+        assert_eq!(report.total_purged(), 6);
+        assert!(!report.is_clean());
+
+        // Now run verify again - cache must be 100% clean
+        let second_report = cache.verify().unwrap();
+        assert!(second_report.is_clean());
+        assert_eq!(second_report.verified_blobs, 3);
+        assert_eq!(second_report.verified_indices, 2);
+        assert_eq!(second_report.total_purged(), 0);
+
+        // Healthy entries still retrieve correctly
+        assert_eq!(cache.get("key-healthy-1").unwrap().unwrap().1, b"healthy-data-1");
+        assert_eq!(cache.get("key-healthy-2").unwrap().unwrap().1, b"healthy-data-2");
+    }
+
+    #[test]
+    fn test_clean_purges_all_contents_and_handles_readonly_attributes() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        // Populate with multiple entries
+        for i in 0..6 {
+            let key = format!("https://registry.npmjs.org/clean-pkg-{i}/-/pkg-{i}.tgz");
+            let data = format!("clean test payload {i}").into_bytes();
+            let entry = cache.put(&key, &data, None).unwrap();
+
+            // Set readonly attribute on some blob files and index files
+            if i % 2 == 0 {
+                let blob_path = cache.blob_path(&entry.sha512_hex);
+                let mut perms = std::fs::metadata(&blob_path).unwrap().permissions();
+                perms.set_readonly(true);
+                std::fs::set_permissions(&blob_path, perms).unwrap();
+
+                let index_path = IndexEntry::path_for_key(cache.root(), &key);
+                let mut iperms = std::fs::metadata(&index_path).unwrap().permissions();
+                iperms.set_readonly(true);
+                std::fs::set_permissions(&index_path, iperms).unwrap();
+            }
+        }
+
+        // Add readonly temp file
+        let tmp_file = cache.tmp_dir().join("readonly_temp.tmp");
+        std::fs::write(&tmp_file, b"readonly temp file").unwrap();
+        let mut tperms = std::fs::metadata(&tmp_file).unwrap().permissions();
+        tperms.set_readonly(true);
+        std::fs::set_permissions(&tmp_file, tperms).unwrap();
+
+        // Add lock file
+        let lock_path = cache.lock_path("sample_lock");
+        std::fs::write(&lock_path, b"dummy lock").unwrap();
+
+        // Execute cache clean
+        cache.clean().expect("Cache clean must succeed even with readonly files");
+
+        // Verify content-v2, index-v5, tmp, locks directories exist but are empty
+        assert!(cache.root().join("content-v2").join("sha512").exists());
+        assert!(cache.root().join("index-v5").exists());
+        assert!(cache.tmp_dir().exists());
+        assert!(cache.root().join("locks").exists());
+
+        let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir()).unwrap().collect();
+        assert_eq!(tmp_entries.len(), 0);
+
+        let index_entries: Vec<_> = std::fs::read_dir(cache.root().join("index-v5")).unwrap().collect();
+        assert_eq!(index_entries.len(), 0);
+
+        // Verify cache is immediately usable for put and get
+        let post_clean_key = "https://registry.npmjs.org/fresh-pkg/-/fresh-1.0.0.tgz";
+        let post_clean_data = b"post clean valid content";
+        let entry = cache.put(post_clean_key, post_clean_data, None).unwrap();
+        assert_eq!(entry.size, post_clean_data.len() as u64);
+
+        let (_, retrieved) = cache.get(post_clean_key).unwrap().expect("Must retrieve post-clean entry");
+        assert_eq!(retrieved, post_clean_data);
+
+        // Verification on post-clean cache is clean
+        let report = cache.verify().unwrap();
+        assert_eq!(report.verified_blobs, 1);
+        assert_eq!(report.verified_indices, 1);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn test_stress_concurrent_writes_verify_and_clean() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path()).unwrap());
+        let running = Arc::new(AtomicBool::new(true));
+
+        let mut workers = Vec::new();
+
+        // 6 writer threads performing concurrent puts
+        for w in 0..6 {
+            let c = Arc::clone(&cache);
+            let handle = thread::spawn(move || {
+                for iter in 0..10 {
+                    let key = format!("https://registry.npmjs.org/stress-w{w}-{iter}/-/pkg.tgz");
+                    let data = format!("stress payload w{w} iter {iter}").into_bytes();
+                    c.put(&key, &data, None).expect("Worker put failed");
+                    let (_, retrieved) = c.get(&key).expect("Worker get failed").expect("Must hit cache");
+                    assert_eq!(retrieved, data);
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            workers.push(handle);
+        }
+
+        // 2 verifier threads continuously running verify concurrently with writers
+        for _v in 0..2 {
+            let c = Arc::clone(&cache);
+            let r = Arc::clone(&running);
+            let handle = thread::spawn(move || {
+                while r.load(Ordering::Relaxed) {
+                    let _ = c.verify();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            workers.push(handle);
+        }
+
+        // Let threads stress the cache concurrently
+        thread::sleep(Duration::from_millis(150));
+        running.store(false, Ordering::Relaxed);
+
+        for w in workers {
+            w.join().expect("Stress thread panicked");
+        }
+
+        // Cache verification after stress
+        let report = cache.verify().unwrap();
+        assert!(report.verified_blobs > 0);
+        assert!(report.verified_indices > 0);
+
+        // Cache clean after stress
+        cache.clean().unwrap();
+
+        // Cache must be usable again
+        let final_entry = cache.put("final-key", b"final data", None).unwrap();
+        assert_eq!(final_entry.size, 10);
+        let (_, final_data) = cache.get("final-key").unwrap().expect("Must retrieve final entry");
+        assert_eq!(final_data, b"final data");
     }
 }

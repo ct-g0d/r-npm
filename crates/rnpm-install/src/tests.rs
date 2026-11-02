@@ -1425,3 +1425,158 @@ async fn test_install_reification_path_containment_and_illegal_package_names() {
     }
 }
 
+#[tokio::test]
+async fn test_file_directory_dependency_installation_and_ci() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create a local package in ../packages/local-pkg
+    let local_pkg_dir = root.join("packages").join("local-pkg");
+    fs::create_dir_all(&local_pkg_dir).unwrap();
+    let local_manifest = serde_json::json!({
+        "name": "local-pkg",
+        "version": "2.5.0",
+        "bin": {
+            "local-cmd": "./bin/run.js"
+        }
+    });
+    fs::write(local_pkg_dir.join("package.json"), serde_json::to_string_pretty(&local_manifest).unwrap()).unwrap();
+    fs::create_dir_all(local_pkg_dir.join("bin")).unwrap();
+    fs::write(local_pkg_dir.join("bin").join("run.js"), "#!/usr/bin/env node\nconsole.log('hello');\n").unwrap();
+
+    // 2. Create the main app project depending on "file:../packages/local-pkg"
+    let app_dir = root.join("app");
+    fs::create_dir_all(&app_dir).unwrap();
+    let app_manifest = serde_json::json!({
+        "name": "app",
+        "version": "1.0.0",
+        "dependencies": {
+            "local-pkg": "file:../packages/local-pkg"
+        }
+    });
+    fs::write(app_dir.join("package.json"), serde_json::to_string_pretty(&app_manifest).unwrap()).unwrap();
+
+    let options = InstallOptions {
+        project_dir: app_dir.clone(),
+        offline: true,
+        ..Default::default()
+    };
+
+    // 3. Run install
+    let mut installer = Installer::new(options.clone()).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    // 4. Verify junction / link in node_modules
+    let link_path = app_dir.join("node_modules").join("local-pkg");
+    assert!(link_path.exists());
+    assert!(is_junction(&link_path).unwrap());
+    let installed_json = fs::read_to_string(link_path.join("package.json")).unwrap();
+    assert!(installed_json.contains("\"version\": \"2.5.0\""));
+
+    // Verify bin shim
+    #[cfg(windows)]
+    assert!(app_dir.join("node_modules").join(".bin").join("local-cmd.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(app_dir.join("node_modules").join(".bin").join("local-cmd").exists());
+
+    // 5. Verify package-lock.json
+    let lockfile = LockfileV3::load_from_file(&app_dir.join("package-lock.json")).unwrap();
+    let lock_link = lockfile.packages.get("node_modules/local-pkg").expect("Lockfile must contain node_modules/local-pkg");
+    assert_eq!(lock_link.link, Some(true));
+    assert_eq!(lock_link.resolved.as_deref(), Some("../packages/local-pkg"));
+
+    let lock_target = lockfile.packages.get("../packages/local-pkg").expect("Lockfile must contain physical package info");
+    assert_eq!(lock_target.version.as_deref(), Some("2.5.0"));
+
+    // 6. Test CI installation (run_ci)
+    let _ = rnpm_fs::remove_junction(&link_path);
+    let _ = fs::remove_dir_all(app_dir.join("node_modules"));
+    assert!(!app_dir.join("node_modules").exists());
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(ci_summary.packages_installed, 1);
+    assert!(link_path.exists());
+    assert!(is_junction(&link_path).unwrap());
+}
+
+#[tokio::test]
+async fn test_file_archive_dependency_installation_and_ci() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create a tarball fixture for "archive-lib" version 3.0.0
+    let tarball_bytes = {
+        let manifest_json = serde_json::json!({
+            "name": "archive-lib",
+            "version": "3.0.0",
+            "description": "packed tarball dependency"
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut gz);
+            let mut header = Header::new_gnu();
+            header.set_size(manifest_bytes.len() as u64);
+            header.set_mode(0o644);
+            let path = "package/package.json";
+            header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_cksum();
+            builder.append(&header, Cursor::new(manifest_bytes)).unwrap();
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+
+    let pkgs_dir = root.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    let tarball_path = pkgs_dir.join("archive-lib-3.0.0.tgz");
+    fs::write(&tarball_path, &tarball_bytes).unwrap();
+
+    // 2. Create the main app project depending on "file:./pkgs/archive-lib-3.0.0.tgz"
+    let app_manifest = serde_json::json!({
+        "name": "archive-app",
+        "version": "1.0.0",
+        "dependencies": {
+            "archive-lib": "file:./pkgs/archive-lib-3.0.0.tgz"
+        }
+    });
+    fs::write(root.join("package.json"), serde_json::to_string_pretty(&app_manifest).unwrap()).unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    };
+
+    // 3. Run install
+    let mut installer = Installer::new(options.clone()).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    // 4. Verify extraction in node_modules
+    let pkg_dir = root.join("node_modules").join("archive-lib");
+    assert!(pkg_dir.exists());
+    let pkg_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(pkg_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(pkg_json["name"], "archive-lib");
+    assert_eq!(pkg_json["version"], "3.0.0");
+
+    // 5. Verify package-lock.json
+    let lockfile = LockfileV3::load_from_file(&root.join("package-lock.json")).unwrap();
+    let lock_pkg = lockfile.packages.get("node_modules/archive-lib").expect("Lockfile must contain node_modules/archive-lib");
+    assert_eq!(lock_pkg.version.as_deref(), Some("3.0.0"));
+    assert_eq!(lock_pkg.resolved.as_deref(), Some("file:./pkgs/archive-lib-3.0.0.tgz"));
+    assert!(lock_pkg.integrity.as_ref().unwrap().starts_with("sha512-"));
+
+    // 6. Test CI installation (run_ci)
+    fs::remove_dir_all(root.join("node_modules")).unwrap();
+    assert!(!root.join("node_modules").exists());
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(ci_summary.packages_installed, 1);
+    assert!(pkg_dir.join("package.json").exists());
+}
+

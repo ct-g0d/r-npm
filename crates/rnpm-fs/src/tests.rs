@@ -1224,4 +1224,102 @@ fn test_stress_ntfs_junction_handling_under_high_parallel_contention() {
     }
 }
 
+#[test]
+fn test_readonly_file_overwriting_and_removal() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("readonly_pkg");
+    fs::create_dir_all(&dest).unwrap();
+
+    // 1. Create existing read-only file in destination
+    let test_file = dest.join("file.txt");
+    fs::write(&test_file, b"initial content").unwrap();
+
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(&test_file).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&test_file, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&test_file).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&test_file, perms).unwrap();
+    }
+
+    // 2. Extract tarball that overwrites the existing read-only file
+    let tar_bytes = create_test_tarball(&[
+        ("package/package.json", br#"{"name":"ro-pkg","version":"1.0.0"}"#, 0o644),
+        ("package/file.txt", b"overwritten content with new permissions", 0o644),
+    ]);
+
+    let summary = extract_and_replace(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 2);
+
+    let content = fs::read(&dest.join("file.txt")).unwrap();
+    assert_eq!(content, b"overwritten content with new permissions");
+
+    // 3. Mark extracted file as read-only again
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(&test_file).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&test_file, perms).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&test_file).unwrap().permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&test_file, perms).unwrap();
+    }
+
+    // 4. Safe removal of tree containing read-only file must succeed cleanly
+    crate::junction::remove_dir_all_safe(&dest).unwrap();
+    assert!(!dest.exists());
+}
+
+#[test]
+fn test_atomic_write_recovery_cleans_abandoned_staging_and_trash() {
+    let dir = tempdir().unwrap();
+    let parent = dir.path();
+
+    // Simulate abandoned staging and trash directories left behind by a killed process
+    let stale_trash1 = parent.join(".rnpm-trash-999-12345-1");
+    let stale_staging1 = parent.join(".rnpm-staging-999-12345-2");
+    fs::create_dir_all(&stale_trash1).unwrap();
+    fs::create_dir_all(&stale_staging1).unwrap();
+    fs::write(stale_trash1.join("orphan.txt"), b"orphaned trash content").unwrap();
+    fs::write(stale_staging1.join("orphan.txt"), b"orphaned staging content").unwrap();
+
+    assert!(stale_trash1.exists());
+    assert!(stale_staging1.exists());
+
+    // Recover atomic writes
+    crate::atomic::recover_atomic_writes(parent);
+
+    assert!(!stale_trash1.exists(), "Stale trash directory must be cleaned up");
+    assert!(!stale_staging1.exists(), "Stale staging directory must be cleaned up");
+}
+
+#[test]
+fn test_broken_junction_safe_removal() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    fs::create_dir_all(&target).unwrap();
+
+    let link = dir.path().join("junction_link");
+    create_junction(&link, &target).unwrap();
+    assert!(is_junction(&link).unwrap());
+
+    // Delete target, making the junction broken
+    fs::remove_dir_all(&target).unwrap();
+    assert!(!target.exists());
+
+    // remove_junction must still safely unlink the broken junction
+    remove_junction(&link).unwrap();
+    assert!(!link.exists());
+}
+
 
