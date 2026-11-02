@@ -1,3 +1,5 @@
+use rnpm_core::semver::Version;
+use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -169,12 +171,35 @@ impl LockfileV3 {
     pub const HIDDEN_LOCKFILE_PATH: &'static str = "node_modules/.package-lock.json";
 
     /// Checks if this lockfile v3 matches the given package.json manifest.
-    /// Returns true if all direct dependencies in the manifest match the root package descriptor
-    /// and every required package exists in the lockfile `packages` map.
+    /// Returns true if all direct dependencies in the manifest match the root package descriptor,
+    /// overrides match, and every required package exists in the lockfile `packages` map satisfying its spec.
     pub fn matches_manifest(&self, manifest: &rnpm_core::manifest::Manifest, include_dev: bool) -> bool {
         let Some(root_pkg) = self.root_package() else {
             return false;
         };
+
+        // Check package name if defined in manifest
+        if let Some(ref m_name) = manifest.name {
+            if let Some(ref r_name) = root_pkg.name {
+                if m_name != r_name {
+                    return false;
+                }
+            }
+        }
+
+        // Check package version if defined in manifest
+        if let Some(ref m_ver) = manifest.version {
+            if let Some(ref r_ver) = root_pkg.version {
+                if m_ver != r_ver {
+                    return false;
+                }
+            }
+        }
+
+        // Check overrides metadata match
+        if manifest.extra.get("overrides") != root_pkg.extra.get("overrides") {
+            return false;
+        }
 
         // 1. Check dependencies
         if !Self::map_matches(&manifest.dependencies, &root_pkg.dependencies) {
@@ -198,24 +223,89 @@ impl LockfileV3 {
             return false;
         }
 
-        // 5. Verify direct dependencies exist in packages map
-        for dep in manifest.dependencies.keys() {
+        // 5. Verify direct dependencies exist in packages map and satisfy specs
+        for (dep, spec) in &manifest.dependencies {
             let key = format!("node_modules/{dep}");
-            if !self.packages.contains_key(&key) {
+            let Some(pkg) = self.packages.get(&key) else {
+                return false;
+            };
+            if !Self::package_satisfies_spec(dep, pkg, spec) {
                 return false;
             }
         }
 
         if include_dev {
-            for dep in manifest.dev_dependencies.keys() {
+            for (dep, spec) in &manifest.dev_dependencies {
                 let key = format!("node_modules/{dep}");
-                if !self.packages.contains_key(&key) {
+                let Some(pkg) = self.packages.get(&key) else {
+                    return false;
+                };
+                if !Self::package_satisfies_spec(dep, pkg, spec) {
+                    return false;
+                }
+            }
+        }
+
+        for (dep, spec) in &manifest.optional_dependencies {
+            let key = format!("node_modules/{dep}");
+            if let Some(pkg) = self.packages.get(&key) {
+                if !Self::package_satisfies_spec(dep, pkg, spec) {
                     return false;
                 }
             }
         }
 
         true
+    }
+
+    fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
+        let Some(ref ver_str) = pkg.version else {
+            return false;
+        };
+        let Ok(target) = PackageTarget::parse(spec) else {
+            return false;
+        };
+        match &target {
+            PackageTarget::Alias { name, target } => {
+                if pkg.name.as_deref() != Some(name) {
+                    return false;
+                }
+                Self::version_matches_target(ver_str, target)
+            }
+            other => {
+                if let Some(ref real_name) = pkg.name {
+                    if real_name != install_name {
+                        return false;
+                    }
+                }
+                Self::version_matches_target(ver_str, other)
+            }
+        }
+    }
+
+    fn version_matches_target(ver_str: &str, target: &PackageTarget) -> bool {
+        let Ok(v) = Version::parse(ver_str) else {
+            return false;
+        };
+        match target {
+            PackageTarget::Version(expected) => &v == expected,
+            PackageTarget::Range(range) => range.satisfies(&v),
+            PackageTarget::Tag(_) => true,
+            PackageTarget::File(_) => true,
+            PackageTarget::Workspace(ws_spec) => {
+                let s = ws_spec.trim();
+                if s == "*" || s == "^" || s == "~" || s.is_empty() {
+                    true
+                } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
+                    range.satisfies(&v)
+                } else if let Ok(expected) = Version::parse(s) {
+                    &v == &expected
+                } else {
+                    true
+                }
+            }
+            PackageTarget::Alias { target, .. } => Self::version_matches_target(ver_str, target),
+        }
     }
 
     fn map_matches(
@@ -231,14 +321,20 @@ impl LockfileV3 {
 
     /// Deterministic serialization to formatted JSON string (2-space indent, trailing newline).
     /// Guarantees strict LF line endings and normalized POSIX forward-slash package keys.
+    /// Fast-path avoids cloning the entire package tree when all keys are already normalized POSIX paths.
     pub fn to_json_string(&self) -> Result<String, LockfileError> {
-        let mut normalized_packages = BTreeMap::new();
-        for (k, v) in &self.packages {
-            normalized_packages.insert(to_posix_path(k), v.clone());
-        }
-        let mut copy = self.clone();
-        copy.packages = normalized_packages;
-        let json = serde_json::to_string_pretty(&copy)?;
+        let has_non_posix = self.packages.keys().any(|k| k.contains('\\'));
+        let json = if has_non_posix {
+            let mut normalized_packages = BTreeMap::new();
+            for (k, v) in &self.packages {
+                normalized_packages.insert(to_posix_path(k), v.clone());
+            }
+            let mut copy = self.clone();
+            copy.packages = normalized_packages;
+            serde_json::to_string_pretty(&copy)?
+        } else {
+            serde_json::to_string_pretty(self)?
+        };
         let mut lf_json = json.replace("\r\n", "\n");
         if !lf_json.ends_with('\n') {
             lf_json.push('\n');

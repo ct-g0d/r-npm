@@ -141,38 +141,40 @@ impl DependencyGraph {
     /// Returns the set of node locations that were pruned.
     pub fn prune_unreferenced(&mut self) -> std::collections::HashSet<String> {
         use std::collections::{HashMap, HashSet, VecDeque};
-        let mut reachable = HashSet::new();
+        let mut reachable: HashSet<String> = HashSet::new();
         reachable.insert(self.root_location.clone());
 
-        // Build adjacency index O(E) once to avoid O(V * E) lookups and allocations
-        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
-        for edge in &self.edges {
-            adj.entry(edge.from_location.as_str())
-                .or_default()
-                .push(edge.to_location.as_str());
-        }
+        {
+            // Build adjacency index O(E) once to avoid O(V * E) lookups and allocations
+            let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+            for edge in &self.edges {
+                adj.entry(edge.from_location.as_str())
+                    .or_default()
+                    .push(edge.to_location.as_str());
+            }
 
-        let mut queue = VecDeque::new();
-        queue.push_back(self.root_location.as_str());
+            let mut queue = VecDeque::new();
+            queue.push_back(self.root_location.as_str());
 
-        while let Some(curr) = queue.pop_front() {
-            if let Some(targets) = adj.get(curr) {
-                for &target in targets {
-                    if reachable.insert(target.to_string()) {
-                        queue.push_back(target);
+            while let Some(curr) = queue.pop_front() {
+                if let Some(targets) = adj.get(curr) {
+                    for &target in targets {
+                        if reachable.insert(target.to_string()) {
+                            queue.push_back(target);
+                        }
                     }
                 }
             }
         }
 
         let mut pruned = HashSet::new();
-        let all_locations: Vec<String> = self.nodes.keys().cloned().collect();
-        for loc in all_locations {
-            if !reachable.contains(&loc) {
-                self.nodes.remove(&loc);
-                pruned.insert(loc);
+        self.nodes.retain(|loc, _| {
+            let is_reachable = reachable.contains(loc);
+            if !is_reachable {
+                pruned.insert(loc.clone());
             }
-        }
+            is_reachable
+        });
 
         self.edges.retain(|e| reachable.contains(&e.from_location) && reachable.contains(&e.to_location));
         pruned
@@ -304,58 +306,46 @@ impl DependencyGraph {
             graph.nodes.insert(loc.clone(), node);
         }
 
+        // Helper buffer to locate package in scope hierarchy without allocations
+        let mut candidate_buf = String::with_capacity(128);
+
         // Build edges based on dependencies
         for (loc, node) in &graph.nodes {
-            let mut all_deps = Vec::new();
-            for (dep_name, dep_spec) in &node.dependencies {
-                all_deps.push((dep_name.clone(), dep_spec.clone(), DependencyType::Prod));
-            }
-            for (dep_name, dep_spec) in &node.dev_dependencies {
-                all_deps.push((dep_name.clone(), dep_spec.clone(), DependencyType::Dev));
-            }
-            for (dep_name, dep_spec) in &node.optional_dependencies {
-                all_deps.push((dep_name.clone(), dep_spec.clone(), DependencyType::Optional));
-            }
+            let all_deps = node
+                .dependencies
+                .iter()
+                .map(|(n, s)| (n, s, DependencyType::Prod))
+                .chain(
+                    node.dev_dependencies
+                        .iter()
+                        .map(|(n, s)| (n, s, DependencyType::Dev)),
+                )
+                .chain(
+                    node.optional_dependencies
+                        .iter()
+                        .map(|(n, s)| (n, s, DependencyType::Optional)),
+                );
 
             for (dep_name, dep_spec, dep_type) in all_deps {
-                let target_loc = if loc.is_empty() {
-                    let direct = format!("node_modules/{dep_name}");
-                    if graph.nodes.contains_key(&direct) {
-                        Some(direct)
-                    } else {
-                        None
-                    }
-                } else {
-                    let nested = format!("{loc}/node_modules/{dep_name}");
-                    let hoisted = format!("node_modules/{dep_name}");
-                    if graph.nodes.contains_key(&nested) {
-                        Some(nested)
-                    } else if graph.nodes.contains_key(&hoisted) {
-                        Some(hoisted)
-                    } else {
-                        // Check ancestor scopes
-                        let mut found = None;
-                        let parts: Vec<&str> = loc.split("/node_modules/").collect();
-                        for i in (1..parts.len()).rev() {
-                            let ancestor = parts[..i].join("/node_modules/");
-                            let candidate = format!("{ancestor}/node_modules/{dep_name}");
-                            if graph.nodes.contains_key(&candidate) {
-                                found = Some(candidate);
-                                break;
-                            }
-                        }
-                        found
-                    }
-                };
+                let target_loc = Self::find_in_scope_hierarchy(
+                    &graph.nodes,
+                    loc,
+                    dep_name,
+                    &mut candidate_buf,
+                );
 
                 if let Some(target) = target_loc {
-                    let target_pkg_name = graph.nodes.get(&target).map(|n| n.name.clone()).unwrap_or_else(|| dep_name.clone());
+                    let target_pkg_name = graph
+                        .nodes
+                        .get(target)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_else(|| dep_name.clone());
                     graph.edges.push(DependencyEdge {
                         from_location: loc.clone(),
-                        to_location: target,
+                        to_location: target.to_string(),
                         install_name: dep_name.clone(),
                         package_name: target_pkg_name,
-                        spec: dep_spec,
+                        spec: dep_spec.clone(),
                         dep_type,
                     });
                 }
@@ -363,5 +353,51 @@ impl DependencyGraph {
         }
 
         graph
+    }
+
+    /// Locates a dependency in the scope hierarchy (from closest enclosing node_modules up to root).
+    /// Returns the exact location key borrowed from `nodes`.
+    pub fn find_in_scope_hierarchy<'a>(
+        nodes: &'a BTreeMap<String, Node>,
+        from_loc: &str,
+        dep_name: &str,
+        buf: &mut String,
+    ) -> Option<&'a str> {
+        if from_loc.is_empty() {
+            buf.clear();
+            buf.push_str("node_modules/");
+            buf.push_str(dep_name);
+            return nodes.get_key_value(buf.as_str()).map(|(k, _)| k.as_str());
+        }
+
+        // 1. Closest scope: under from_loc
+        buf.clear();
+        buf.push_str(from_loc);
+        buf.push_str("/node_modules/");
+        buf.push_str(dep_name);
+        if let Some((k, _)) = nodes.get_key_value(buf.as_str()) {
+            return Some(k.as_str());
+        }
+
+        // 2. Ancestor scopes: from closest ancestor up to root
+        let mut curr = from_loc;
+        while let Some(idx) = curr.rfind("/node_modules/") {
+            curr = &curr[..idx];
+            if !curr.is_empty() {
+                buf.clear();
+                buf.push_str(curr);
+                buf.push_str("/node_modules/");
+                buf.push_str(dep_name);
+                if let Some((k, _)) = nodes.get_key_value(buf.as_str()) {
+                    return Some(k.as_str());
+                }
+            }
+        }
+
+        // 3. Root scope
+        buf.clear();
+        buf.push_str("node_modules/");
+        buf.push_str(dep_name);
+        nodes.get_key_value(buf.as_str()).map(|(k, _)| k.as_str())
     }
 }
