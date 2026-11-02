@@ -254,6 +254,95 @@ mod tests {
         let mut broken_lockfile = lockfile.clone();
         broken_lockfile.packages.remove("node_modules/chalk");
         assert!(!broken_lockfile.matches_manifest(&manifest, true));
+
+        // 5. Dev dependency mutated in manifest (e.g. range spec changed)
+        let mut dev_mutated = manifest.clone();
+        dev_mutated.dev_dependencies.insert("typescript".to_string(), "^5.5.0".to_string());
+        assert!(!lockfile.matches_manifest(&dev_mutated, true), "Must detect mutated devDependencies");
+
+        // 6. Dev dependency deleted from manifest but still present in lockfile
+        let mut dev_deleted = manifest.clone();
+        dev_deleted.dev_dependencies.remove("typescript");
+        assert!(!lockfile.matches_manifest(&dev_deleted, true), "Must detect deleted devDependency");
+
+        // 7. Production dependency deleted from manifest but present in lockfile
+        let mut dep_deleted = manifest.clone();
+        dep_deleted.dependencies.remove("debug");
+        assert!(!lockfile.matches_manifest(&dep_deleted, true), "Must detect deleted dependency");
+
+        // 8. Dependency version in packages map does not satisfy manifest spec
+        let mut unsatisfied_lockfile = lockfile.clone();
+        unsatisfied_lockfile.packages.get_mut("node_modules/debug").unwrap().version = Some("3.2.0".to_string());
+        assert!(!unsatisfied_lockfile.matches_manifest(&manifest, true), "Must detect unsatisfying package version");
+    }
+
+    #[test]
+    fn test_bidirectional_drift_detection_comprehensive() {
+        use rnpm_core::Manifest;
+
+        let mut lockfile = LockfileV3::new("drift-app", Some("1.0.0".to_string()));
+        let mut deps = BTreeMap::new();
+        deps.insert("express".to_string(), "^4.18.0".to_string());
+        let mut dev_deps = BTreeMap::new();
+        dev_deps.insert("vitest".to_string(), "^1.0.0".to_string());
+        let mut opt_deps = BTreeMap::new();
+        opt_deps.insert("fsevents".to_string(), "~2.3.2".to_string());
+
+        if let Some(root) = lockfile.root_package_mut() {
+            root.dependencies = Some(deps.clone());
+            root.dev_dependencies = Some(dev_deps.clone());
+            root.optional_dependencies = Some(opt_deps.clone());
+        }
+
+        lockfile.insert_package("node_modules/express", LockfilePackage {
+            version: Some("4.18.2".to_string()),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/vitest", LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/fsevents", LockfilePackage {
+            version: Some("2.3.3".to_string()),
+            optional: Some(true),
+            ..Default::default()
+        });
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some("drift-app".to_string());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.dependencies = deps;
+        manifest.dev_dependencies = dev_deps;
+        manifest.optional_dependencies = opt_deps;
+
+        // Baseline: perfectly in sync
+        assert!(lockfile.matches_manifest(&manifest, true));
+
+        // Case 1: devDependencies spec changed in package.json
+        let mut m1 = manifest.clone();
+        m1.dev_dependencies.insert("vitest".to_string(), "^2.0.0".to_string());
+        assert!(!lockfile.matches_manifest(&m1, true), "Dev dependency range mutation must be detected");
+
+        // Case 2: devDependency removed from package.json
+        let mut m2 = manifest.clone();
+        m2.dev_dependencies.remove("vitest");
+        assert!(!lockfile.matches_manifest(&m2, true), "Dev dependency removal must be detected");
+
+        // Case 3: prod dependency removed from package.json
+        let mut m3 = manifest.clone();
+        m3.dependencies.remove("express");
+        assert!(!lockfile.matches_manifest(&m3, true), "Prod dependency removal must be detected");
+
+        // Case 4: optional dependency mutated in package.json
+        let mut m4 = manifest.clone();
+        m4.optional_dependencies.insert("fsevents".to_string(), "^3.0.0".to_string());
+        assert!(!lockfile.matches_manifest(&m4, true), "Optional dependency mutation must be detected");
+
+        // Case 5: optional dependency removed from package.json
+        let mut m5 = manifest.clone();
+        m5.optional_dependencies.remove("fsevents");
+        assert!(!lockfile.matches_manifest(&m5, true), "Optional dependency removal must be detected");
     }
 
     #[test]

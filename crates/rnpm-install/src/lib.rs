@@ -890,6 +890,10 @@ impl Installer {
         lockfile.save_to_file(&lockfile_path)
             .context("Failed to save package-lock.json")?;
 
+        // 5. Persist hidden lockfile to node_modules/.package-lock.json
+        lockfile.save_hidden(&self.options.project_dir)
+            .context("Failed to save hidden package-lock.json")?;
+
         Ok(InstallSummary {
             packages_installed,
             cache_hits,
@@ -927,29 +931,98 @@ impl Installer {
             None
         };
 
-        // Strict drift check between manifest and lockfile
-        if let Some(root_pkg) = lockfile.packages.get("") {
-            if let Some(lock_deps) = &root_pkg.dependencies {
-                for (dep_name, dep_spec) in &manifest.dependencies {
-                    if let Some(lock_spec) = lock_deps.get(dep_name) {
-                        if lock_spec != dep_spec {
-                            return Err(anyhow!(
-                                "rnpm ERR! code EUSAGE: package.json dependency {}@{} does not match lockfile spec {}",
-                                dep_name, dep_spec, lock_spec
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow!(
-                            "rnpm ERR! code EUSAGE: package.json dependency {} missing from package-lock.json",
-                            dep_name
-                        ));
-                    }
+        // Comprehensive bidirectional drift check between manifest and lockfile
+        let root_pkg = lockfile.packages.get("").ok_or_else(|| {
+            anyhow!("rnpm ERR! code EUSAGE: package-lock.json missing root package descriptor")
+        })?;
+
+        // 1. Production dependencies drift check
+        let empty_deps = BTreeMap::new();
+        let lock_deps = root_pkg.dependencies.as_ref().unwrap_or(&empty_deps);
+
+        for (dep_name, dep_spec) in &manifest.dependencies {
+            if let Some(lock_spec) = lock_deps.get(dep_name) {
+                if lock_spec != dep_spec {
+                    return Err(anyhow!(
+                        "rnpm ERR! code EUSAGE: package.json dependency {}@{} does not match lockfile spec {}",
+                        dep_name, dep_spec, lock_spec
+                    ));
                 }
-            } else if !manifest.dependencies.is_empty() {
+            } else {
                 return Err(anyhow!(
-                    "rnpm ERR! code EUSAGE: package.json defines dependencies but lockfile has none"
+                    "rnpm ERR! code EUSAGE: package.json dependency {} missing from package-lock.json",
+                    dep_name
                 ));
             }
+        }
+        for dep_name in lock_deps.keys() {
+            if !manifest.dependencies.contains_key(dep_name) {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: dependency {} present in package-lock.json but removed from package.json",
+                    dep_name
+                ));
+            }
+        }
+
+        // 2. Dev dependencies drift check
+        let lock_dev_deps = root_pkg.dev_dependencies.as_ref().unwrap_or(&empty_deps);
+
+        for (dep_name, dep_spec) in &manifest.dev_dependencies {
+            if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
+                if lock_spec != dep_spec {
+                    return Err(anyhow!(
+                        "rnpm ERR! code EUSAGE: package.json devDependency {}@{} does not match lockfile spec {}",
+                        dep_name, dep_spec, lock_spec
+                    ));
+                }
+            } else {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: package.json devDependency {} missing from package-lock.json",
+                    dep_name
+                ));
+            }
+        }
+        for dep_name in lock_dev_deps.keys() {
+            if !manifest.dev_dependencies.contains_key(dep_name) {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: devDependency {} present in package-lock.json but removed from package.json",
+                    dep_name
+                ));
+            }
+        }
+
+        // 3. Optional dependencies drift check
+        let lock_opt_deps = root_pkg.optional_dependencies.as_ref().unwrap_or(&empty_deps);
+
+        for (dep_name, dep_spec) in &manifest.optional_dependencies {
+            if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
+                if lock_spec != dep_spec {
+                    return Err(anyhow!(
+                        "rnpm ERR! code EUSAGE: package.json optionalDependency {}@{} does not match lockfile spec {}",
+                        dep_name, dep_spec, lock_spec
+                    ));
+                }
+            } else {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: package.json optionalDependency {} missing from package-lock.json",
+                    dep_name
+                ));
+            }
+        }
+        for dep_name in lock_opt_deps.keys() {
+            if !manifest.optional_dependencies.contains_key(dep_name) {
+                return Err(anyhow!(
+                    "rnpm ERR! code EUSAGE: optionalDependency {} present in package-lock.json but removed from package.json",
+                    dep_name
+                ));
+            }
+        }
+
+        // 4. Comprehensive lockfile validation via matches_manifest
+        if !lockfile.matches_manifest(&manifest, true) {
+            return Err(anyhow!(
+                "rnpm ERR! code EUSAGE: package.json and package-lock.json are out of sync. Please run `rnpm install` to update your lockfile."
+            ));
         }
 
         // Clean-slate: remove node_modules completely
@@ -1010,7 +1083,7 @@ impl Installer {
             }
         }
 
-        let mut packages_to_download: Vec<(&String, &String, &String, bool)> = Vec::new();
+        let mut packages_to_download: Vec<(&String, &String, &str, bool)> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
@@ -1122,23 +1195,93 @@ impl Installer {
                 }
             };
 
-            if resolved_url.starts_with("file:") {
-                let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
-                let abs_path = if Path::new(file_path).is_absolute() {
-                    PathBuf::from(file_path)
-                } else {
-                    self.options.project_dir.join(file_path)
-                };
-                if !abs_path.exists() {
+            // Validate that lockfile packages have non-empty valid integrity hashes
+            let integrity_str = match pkg_info.integrity.as_deref() {
+                Some(i) if !i.trim().is_empty() => {
+                    if let Err(e) = i.trim().parse::<Integrity>() {
+                        if is_optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} has invalid integrity in lockfile: {}",
+                                pkg_key, e
+                            );
+                            continue;
+                        } else {
+                            return Err(anyhow!("Package {} has invalid integrity in lockfile: {}", pkg_key, e));
+                        }
+                    }
+                    i.trim()
+                }
+                _ => {
                     if is_optional {
-                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", abs_path.display());
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} missing or empty integrity in lockfile",
+                            pkg_key
+                        );
                         continue;
                     } else {
-                        return Err(anyhow!("Archive file not found: {}", abs_path.display()));
+                        return Err(anyhow!("Package {} missing or empty integrity in lockfile", pkg_key));
                     }
                 }
-                let bytes = std::fs::read(&abs_path)
-                    .with_context(|| format!("Failed to read local archive file '{}'", abs_path.display()))?;
+            };
+
+            if resolved_url.starts_with("file:") {
+                let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
+                if file_path.contains('\0') {
+                    return Err(anyhow!("Resolved file URL contains null bytes: {resolved_url}"));
+                }
+                let project_dir_abs = if self.options.project_dir.is_absolute() {
+                    self.options.project_dir.clone()
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(&self.options.project_dir)
+                };
+                let clean_project_dir = path_clean::clean(&project_dir_abs);
+                let candidate_path = if Path::new(file_path).is_absolute() {
+                    PathBuf::from(file_path)
+                } else {
+                    clean_project_dir.join(file_path)
+                };
+                let clean_file_path = path_clean::clean(&candidate_path);
+                if !clean_file_path.starts_with(&clean_project_dir) {
+                    return Err(anyhow!(
+                        "Security error: resolved file URL '{}' escapes project directory '{}'",
+                        resolved_url,
+                        clean_project_dir.display()
+                    ));
+                }
+                if let (Ok(canon_proj), Ok(canon_file)) = (clean_project_dir.canonicalize(), clean_file_path.canonicalize()) {
+                    if !canon_file.starts_with(&canon_proj) {
+                        return Err(anyhow!(
+                            "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
+                            resolved_url,
+                            canon_file.display(),
+                            canon_proj.display()
+                        ));
+                    }
+                }
+                if !clean_file_path.exists() {
+                    if is_optional {
+                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", clean_file_path.display());
+                        continue;
+                    } else {
+                        return Err(anyhow!("Archive file not found: {}", clean_file_path.display()));
+                    }
+                }
+                let bytes = std::fs::read(&clean_file_path)
+                    .with_context(|| format!("Failed to read local archive file '{}'", clean_file_path.display()))?;
+
+                let expected_integrity: Integrity = integrity_str
+                    .parse()
+                    .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+                if let Err(e) = expected_integrity.verify(&bytes) {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
+                        );
+                        continue;
+                    } else {
+                        return Err(anyhow!("Integrity verification failed for local archive {pkg_key}: {e}"));
+                    }
+                }
 
                 let target_path = self.options.project_dir.join(pkg_key);
                 extract_and_replace(Cursor::new(&bytes), &target_path, None)
@@ -1177,21 +1320,6 @@ impl Installer {
                 cache_hits += 1;
                 continue;
             }
-
-            let integrity_str = match pkg_info.integrity.as_ref() {
-                Some(i) => i,
-                None => {
-                    if is_optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} missing integrity in lockfile",
-                            pkg_key
-                        );
-                        continue;
-                    } else {
-                        return Err(anyhow!("Package {} missing integrity in lockfile", pkg_key));
-                    }
-                }
-            };
 
             packages_to_download.push((pkg_key, resolved_url, integrity_str, is_optional));
         }
@@ -1348,6 +1476,10 @@ impl Installer {
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
+
+        // Persist hidden lockfile to node_modules/.package-lock.json
+        lockfile.save_hidden(&self.options.project_dir)
+            .context("Failed to save hidden package-lock.json")?;
 
         Ok(InstallSummary {
             packages_installed,
@@ -1991,6 +2123,10 @@ impl Installer {
         lockfile.save_to_file(&lockfile_path)
             .context("Failed to save package-lock.json")?;
 
+        // 7. Persist hidden lockfile to node_modules/.package-lock.json
+        lockfile.save_hidden(&self.options.project_dir)
+            .context("Failed to save hidden package-lock.json")?;
+
         Ok(UpdateSummary {
             packages_updated: updated_packages.len(),
             updated_packages,
@@ -2111,6 +2247,9 @@ impl Installer {
             // Write updated deterministic package-lock.json
             lockfile.save_to_file(&lockfile_path)
                 .context("Failed to save updated package-lock.json")?;
+
+            // Persist hidden lockfile to node_modules/.package-lock.json
+            let _ = lockfile.save_hidden(&self.options.project_dir);
         }
 
         // Remove deleted package directories from node_modules

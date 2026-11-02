@@ -103,7 +103,10 @@ fn is_wildcard(s: &str) -> bool {
 fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
     let s = input.trim().trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
     let s = s.trim();
-    if s.is_empty() || is_wildcard(s) {
+    if s.is_empty() {
+        return Err(SemverError::InvalidRange(input.to_string()));
+    }
+    if is_wildcard(s) {
         return Ok(PartialVersion {
             major: None,
             minor: None,
@@ -122,9 +125,15 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
     // Split off prerelease
     let (ver_part, prerelease) = if let Some(idx) = s.find('-') {
         let p_str = &s[idx + 1..];
+        if p_str.is_empty() {
+            return Err(SemverError::InvalidRange(input.to_string()));
+        }
         let mut pres = Vec::new();
         for part in p_str.split('.') {
             let part = part.trim();
+            if part.is_empty() {
+                return Err(SemverError::InvalidRange(input.to_string()));
+            }
             if part.chars().all(|c| c.is_ascii_digit())
                 && !part.is_empty()
                 && (part.len() == 1 || !part.starts_with('0'))
@@ -142,7 +151,11 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
     };
 
     let parts: Vec<&str> = ver_part.split('.').collect();
-    let major = if parts.is_empty() || is_wildcard(parts[0].trim()) {
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(SemverError::InvalidRange(input.to_string()));
+    }
+
+    let major = if is_wildcard(parts[0].trim()) {
         None
     } else {
         Some(parts[0].trim().parse::<u64>().map_err(|_| SemverError::InvalidRange(input.to_string()))?)
@@ -224,10 +237,16 @@ fn parse_comparator_set(input: &str) -> Result<Vec<Comparator>, SemverError> {
                 );
                 comparators.push(Comparator::new(Op::Lte, to_ver));
             } else if let Some(minor) = to.minor {
-                let to_ver = upper_bound_version(to.major.unwrap_or(0), minor + 1, 0);
+                let next_minor = minor
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                let to_ver = upper_bound_version(to.major.unwrap_or(0), next_minor, 0);
                 comparators.push(Comparator::new(Op::Lt, to_ver));
             } else if let Some(major) = to.major {
-                let to_ver = upper_bound_version(major + 1, 0, 0);
+                let next_major = major
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                let to_ver = upper_bound_version(next_major, 0, 0);
                 comparators.push(Comparator::new(Op::Lt, to_ver));
             }
 
@@ -302,14 +321,21 @@ fn tokenize_set(input: &str) -> Vec<String> {
     tokens
 }
 
-fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
-    let t = token.trim();
-    if t.is_empty() || is_wildcard(t) {
+fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Err(SemverError::InvalidRange(format!("Standalone operator without version or wildcard: {input}")));
+    }
+    if is_wildcard(t) {
         return Ok(vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))]);
     }
 
     // Caret ranges: ^1.2.3
     if let Some(rest) = t.strip_prefix('^') {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(SemverError::InvalidRange(format!("Standalone operator without version or wildcard: {input}")));
+        }
         let p = parse_partial_version(rest)?;
         let major = p.major.unwrap_or(0);
         let minor = p.minor.unwrap_or(0);
@@ -323,19 +349,28 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             return Ok(vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))]);
         } else if major > 0 {
             // ^1.2.3 -> <2.0.0-0
-            upper_bound_version(major + 1, 0, 0)
+            let next_major = major
+                .checked_add(1)
+                .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+            upper_bound_version(next_major, 0, 0)
         } else if p.minor.is_none() {
             // ^0.x -> <1.0.0-0
             upper_bound_version(1, 0, 0)
         } else if minor > 0 {
             // ^0.2.3 -> <0.3.0-0
-            upper_bound_version(0, minor + 1, 0)
+            let next_minor = minor
+                .checked_add(1)
+                .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+            upper_bound_version(0, next_minor, 0)
         } else if p.patch.is_none() {
             // ^0.0.x -> <0.1.0-0
             upper_bound_version(0, 1, 0)
         } else {
             // ^0.0.3 -> <0.0.4-0
-            upper_bound_version(0, 0, patch + 1)
+            let next_patch = patch
+                .checked_add(1)
+                .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+            upper_bound_version(0, 0, next_patch)
         };
 
         return Ok(vec![
@@ -351,6 +386,10 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
         t.strip_prefix('~')
     };
     if let Some(rest) = t_stripped {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(SemverError::InvalidRange(format!("Standalone operator without version or wildcard: {input}")));
+        }
         let p = parse_partial_version(rest)?;
         let major = p.major.unwrap_or(0);
         let minor = p.minor.unwrap_or(0);
@@ -362,10 +401,16 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             return Ok(vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))]);
         } else if p.minor.is_none() {
             // ~1 -> <2.0.0-0
-            upper_bound_version(major + 1, 0, 0)
+            let next_major = major
+                .checked_add(1)
+                .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+            upper_bound_version(next_major, 0, 0)
         } else {
             // ~1.2 or ~1.2.3 -> <1.3.0-0
-            upper_bound_version(major, minor + 1, 0)
+            let next_minor = minor
+                .checked_add(1)
+                .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+            upper_bound_version(major, next_minor, 0)
         };
 
         return Ok(vec![
@@ -389,6 +434,11 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
         (None, t)
     };
 
+    let rest = rest.trim();
+    if op_opt.is_some() && rest.is_empty() {
+        return Err(SemverError::InvalidRange(format!("Standalone operator without version: {input}")));
+    }
+
     let p = parse_partial_version(rest)?;
 
     match op_opt {
@@ -400,17 +450,23 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             } else if p.minor.is_none() {
                 // "1" -> >=1.0.0 <2.0.0-0
                 let major = p.major.unwrap();
+                let next_major = major
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
                 Ok(vec![
                     Comparator::new(Op::Gte, Version::new(major, 0, 0)),
-                    Comparator::new(Op::Lt, upper_bound_version(major + 1, 0, 0)),
+                    Comparator::new(Op::Lt, upper_bound_version(next_major, 0, 0)),
                 ])
             } else if p.patch.is_none() {
                 // "1.2" -> >=1.2.0 <1.3.0-0
                 let major = p.major.unwrap();
                 let minor = p.minor.unwrap();
+                let next_minor = minor
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
                 Ok(vec![
                     Comparator::new(Op::Gte, Version::new(major, minor, 0)),
-                    Comparator::new(Op::Lt, upper_bound_version(major, minor + 1, 0)),
+                    Comparator::new(Op::Lt, upper_bound_version(major, next_minor, 0)),
                 ])
             } else {
                 // Exact version
@@ -419,22 +475,30 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             }
         }
         Some(Op::Eq) => {
-            // "=1.2.3" or "=1.2"
-            if p.minor.is_none() {
-                let major = p.major.unwrap_or(0);
+            // "=1.2.3" or "=1.2" or "=*"
+            if p.major.is_none() {
+                Ok(vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))])
+            } else if p.minor.is_none() {
+                let major = p.major.unwrap();
+                let next_major = major
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
                 Ok(vec![
                     Comparator::new(Op::Gte, Version::new(major, 0, 0)),
-                    Comparator::new(Op::Lt, upper_bound_version(major + 1, 0, 0)),
+                    Comparator::new(Op::Lt, upper_bound_version(next_major, 0, 0)),
                 ])
             } else if p.patch.is_none() {
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 let minor = p.minor.unwrap();
+                let next_minor = minor
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
                 Ok(vec![
                     Comparator::new(Op::Gte, Version::new(major, minor, 0)),
-                    Comparator::new(Op::Lt, upper_bound_version(major, minor + 1, 0)),
+                    Comparator::new(Op::Lt, upper_bound_version(major, next_minor, 0)),
                 ])
             } else {
-                let v = make_version_with_pre(p.major.unwrap_or(0), p.minor.unwrap(), p.patch.unwrap(), p.prerelease);
+                let v = make_version_with_pre(p.major.unwrap(), p.minor.unwrap(), p.patch.unwrap(), p.prerelease);
                 Ok(vec![Comparator::new(Op::Eq, v)])
             }
         }
@@ -451,12 +515,18 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             if p.minor.is_none() {
                 // >1.x -> >=2.0.0
                 let major = p.major.unwrap_or(0);
-                Ok(vec![Comparator::new(Op::Gte, Version::new(major + 1, 0, 0))])
+                let next_major = major
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                Ok(vec![Comparator::new(Op::Gte, Version::new(next_major, 0, 0))])
             } else if p.patch.is_none() {
                 // >1.2.x -> >=1.3.0
                 let major = p.major.unwrap_or(0);
                 let minor = p.minor.unwrap();
-                Ok(vec![Comparator::new(Op::Gte, Version::new(major, minor + 1, 0))])
+                let next_minor = minor
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                Ok(vec![Comparator::new(Op::Gte, Version::new(major, next_minor, 0))])
             } else {
                 let v = make_version_with_pre(p.major.unwrap_or(0), p.minor.unwrap(), p.patch.unwrap(), p.prerelease);
                 Ok(vec![Comparator::new(Op::Gt, v)])
@@ -478,17 +548,25 @@ fn expand_token(token: &str) -> Result<Vec<Comparator>, SemverError> {
             }
         }
         Some(Op::Lte) => {
-            if p.minor.is_none() {
+            if p.major.is_none() {
+                Ok(vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))])
+            } else if p.minor.is_none() {
                 // <=1.x -> <2.0.0-0
-                let major = p.major.unwrap_or(0);
-                Ok(vec![Comparator::new(Op::Lt, upper_bound_version(major + 1, 0, 0))])
+                let major = p.major.unwrap();
+                let next_major = major
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                Ok(vec![Comparator::new(Op::Lt, upper_bound_version(next_major, 0, 0))])
             } else if p.patch.is_none() {
                 // <=1.2.x -> <1.3.0-0
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 let minor = p.minor.unwrap();
-                Ok(vec![Comparator::new(Op::Lt, upper_bound_version(major, minor + 1, 0))])
+                let next_minor = minor
+                    .checked_add(1)
+                    .ok_or_else(|| SemverError::InvalidRange(format!("Version number overflow: {input}")))?;
+                Ok(vec![Comparator::new(Op::Lt, upper_bound_version(major, next_minor, 0))])
             } else {
-                let v = make_version_with_pre(p.major.unwrap_or(0), p.minor.unwrap(), p.patch.unwrap(), p.prerelease);
+                let v = make_version_with_pre(p.major.unwrap(), p.minor.unwrap(), p.patch.unwrap(), p.prerelease);
                 Ok(vec![Comparator::new(Op::Lte, v)])
             }
         }
