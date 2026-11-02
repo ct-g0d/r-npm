@@ -1076,3 +1076,154 @@ fn test_hidden_tree_metadata_preservation_in_graph() {
     assert_eq!(gen_pkg.extra.get("funding"), extra.get("funding"));
     assert_eq!(gen_pkg.extra.get("deprecated"), extra.get("deprecated"));
 }
+
+#[test]
+fn test_fast_path_detects_lockfile_drift_missing_transitive_dep() {
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+    use crate::solver::resolve_fast_path;
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("drift-app".to_string());
+    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+
+    let mut lockfile = LockfileV3::new("drift-app", Some("1.0.0".to_string()));
+    let mut lock_deps = BTreeMap::new();
+    lock_deps.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(lock_deps);
+    }
+
+    // pkg-a is in lockfile, and declares dependency on missing-b
+    let mut a_deps = BTreeMap::new();
+    a_deps.insert("missing-b".to_string(), "^1.0.0".to_string());
+    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        dependencies: Some(a_deps),
+        ..Default::default()
+    });
+    // Note: missing-b is intentionally NOT added to lockfile.packages!
+
+    let options = ResolverOptions::default();
+    // Fast path must detect drift and return None
+    assert!(resolve_fast_path(&manifest, &lockfile, &options).is_none());
+}
+
+#[test]
+fn test_fast_path_detects_lockfile_version_constraint_mismatch() {
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+    use crate::solver::resolve_fast_path;
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("drift-mismatch-app".to_string());
+    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+
+    let mut lockfile = LockfileV3::new("drift-mismatch-app", Some("1.0.0".to_string()));
+    let mut lock_deps = BTreeMap::new();
+    lock_deps.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(lock_deps);
+    }
+
+    let mut a_deps = BTreeMap::new();
+    a_deps.insert("dep-b".to_string(), "^2.0.0".to_string());
+    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        dependencies: Some(a_deps),
+        ..Default::default()
+    });
+
+    // dep-b is locked at 1.5.0, which violates ^2.0.0 constraint
+    lockfile.insert_package("node_modules/dep-b", LockfilePackage {
+        version: Some("1.5.0".to_string()),
+        ..Default::default()
+    });
+
+    let options = ResolverOptions::default();
+    // Fast path must detect version mismatch drift and return None
+    assert!(resolve_fast_path(&manifest, &lockfile, &options).is_none());
+}
+
+#[test]
+fn test_fast_path_detects_overrides_drift() {
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+    use crate::solver::resolve_fast_path;
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("overrides-drift-app".to_string());
+    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    // Manifest adds an override for dep-b -> 2.5.0
+    manifest.extra.insert("overrides".to_string(), serde_json::json!({
+        "dep-b": "2.5.0"
+    }));
+
+    let mut lockfile = LockfileV3::new("overrides-drift-app", Some("1.0.0".to_string()));
+    let mut lock_deps = BTreeMap::new();
+    lock_deps.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(lock_deps);
+        // Lockfile has no overrides in extra
+    }
+
+    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    });
+
+    let options = ResolverOptions::default();
+    // Fast path must detect overrides drift and return None
+    assert!(resolve_fast_path(&manifest, &lockfile, &options).is_none());
+}
+
+#[test]
+fn test_intermediate_ancestor_hoisting() {
+    use crate::hoisting::{determine_placement, PlacementDecision};
+    use crate::graph::Node;
+    use rnpm_core::spec::PackageTarget;
+    use rnpm_core::semver::Range;
+
+    let mut graph = crate::graph::DependencyGraph::new();
+
+    // Root node_modules has C@1.0.0
+    graph.nodes.insert("node_modules/C".to_string(), Node {
+        location: "node_modules/C".to_string(),
+        install_name: "C".to_string(),
+        name: "C".to_string(),
+        version: "1.0.0".to_string(),
+        parsed_version: rnpm_core::semver::Version::parse("1.0.0").ok(),
+        ..Default::default()
+    });
+
+    // Node A is at node_modules/A
+    graph.nodes.insert("node_modules/A".to_string(), Node {
+        location: "node_modules/A".to_string(),
+        install_name: "A".to_string(),
+        name: "A".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    });
+
+    // Node B is nested at node_modules/A/node_modules/B
+    graph.nodes.insert("node_modules/A/node_modules/B".to_string(), Node {
+        location: "node_modules/A/node_modules/B".to_string(),
+        install_name: "B".to_string(),
+        name: "B".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    });
+
+    // Dependent B requires C@^2.0.0
+    let target = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
+    let decision = determine_placement(
+        &graph,
+        "node_modules/A/node_modules/B",
+        "C",
+        "C",
+        &target,
+    );
+
+    // Root has incompatible C@1.0.0, so C@^2.0.0 hoists to intermediate ancestor node_modules/A/node_modules/C!
+    assert_eq!(
+        decision,
+        PlacementDecision::PlaceNew("node_modules/A/node_modules/C".to_string())
+    );
+}

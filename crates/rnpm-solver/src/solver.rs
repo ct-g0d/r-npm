@@ -123,7 +123,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
             parsed_version: None,
-            extra: BTreeMap::new(),
+            extra: root_manifest.extra.clone(),
         };
         self.graph.nodes.insert(String::new(), root_node);
 
@@ -484,23 +484,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         Ok(())
     }
 
-    /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations).
-    fn select_version(
+    /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
+    fn select_version<'b>(
         &self,
-        meta: &PackageMetadata,
+        meta: &'b PackageMetadata,
         target: &PackageTarget,
-    ) -> Option<PackageVersionMetadata> {
+    ) -> Option<&'b PackageVersionMetadata> {
         match target {
             PackageTarget::Version(expected) => {
                 let v_str = expected.to_string();
-                meta.versions.get(&v_str).cloned()
+                meta.versions.get(&v_str)
             }
             PackageTarget::Tag(tag) => {
                 let tagged_version = meta.dist_tags.get(tag)?;
-                meta.versions.get(tagged_version).cloned()
+                meta.versions.get(tagged_version)
             }
             PackageTarget::Range(range) => {
-                let mut best: Option<(&PackageVersionMetadata, Version)> = None;
+                let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {
                         if range.satisfies(&parsed) {
@@ -517,19 +517,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         }
                     }
                 }
-                best.map(|(v_meta, _)| (*v_meta).clone())
+                best.map(|(v_meta, _)| v_meta)
             }
             PackageTarget::Alias { target, .. } => self.select_version(meta, target),
             PackageTarget::File(_) => {
-                // If versions exist, return highest/latest, else None
-                meta.versions.values().last().cloned()
+                meta.versions.values().last()
             }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
-                    meta.versions.values().last().cloned()
+                    meta.versions.values().last()
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    let mut best: Option<(&PackageVersionMetadata, Version)> = None;
+                    let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                     for (ver_str, v_meta) in &meta.versions {
                         if let Ok(parsed) = Version::parse(ver_str) {
                             if range.satisfies(&parsed) {
@@ -546,9 +545,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             }
                         }
                     }
-                    best.map(|(v_meta, _)| (*v_meta).clone())
+                    best.map(|(v_meta, _)| v_meta)
                 } else {
-                    meta.versions.values().last().cloned()
+                    meta.versions.values().last()
                 }
             }
         }
@@ -556,33 +555,211 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 }
 
 /// Attempts fast-path dependency graph construction from a lockfile v3 without tree traversal.
-/// Returns `Some(DependencyGraph)` if the lockfile matches the manifest, or `None` otherwise.
+/// Returns `Some(DependencyGraph)` if the lockfile matches the manifest and all dependencies
+/// and constraints are verified, or `None` if any lockfile drift is detected.
 pub fn resolve_fast_path(
     manifest: &Manifest,
     lockfile: &rnpm_lockfile::LockfileV3,
     options: &ResolverOptions,
 ) -> Option<DependencyGraph> {
-    if lockfile.matches_manifest(manifest, options.dev) {
-        let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
-        // Apply platform filters for optional dependencies
-        for node in graph.nodes.values_mut() {
-            if node.flags.optional {
-                let compatible = options.platform.matches_with_libc(
-                    node.os.as_deref(),
-                    node.cpu.as_deref(),
-                    node.libc.as_deref(),
-                );
-                if !compatible {
-                    node.flags.skipped = true;
-                    graph.skipped.insert(node.name.clone());
-                    graph.skipped.insert(node.install_name.clone());
+    if !lockfile.matches_manifest(manifest, options.dev) {
+        return None;
+    }
+
+    let overrides = Overrides::from_json_value(
+        manifest.extra.get("overrides"),
+        manifest.dependencies.clone(),
+    );
+
+    let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
+
+    // Apply platform filters for optional dependencies
+    for node in graph.nodes.values_mut() {
+        if node.flags.optional {
+            let compatible = options.platform.matches_with_libc(
+                node.os.as_deref(),
+                node.cpu.as_deref(),
+                node.libc.as_deref(),
+            );
+            if !compatible {
+                node.flags.skipped = true;
+                graph.skipped.insert(node.name.clone());
+                graph.skipped.insert(node.install_name.clone());
+            }
+        }
+    }
+
+    // Comprehensive lockfile drift check: verify that all non-skipped dependencies
+    // exist in the lockfile and satisfy their version/override constraints.
+    if !validate_fast_path_graph(&graph, options, &overrides) {
+        debug!("Fast-path: lockfile drift detected; falling back to full resolution");
+        return None;
+    }
+
+    Some(graph)
+}
+
+fn validate_fast_path_graph(
+    graph: &DependencyGraph,
+    options: &ResolverOptions,
+    overrides: &Overrides,
+) -> bool {
+    let mut buf = String::with_capacity(128);
+
+    for (loc, node) in &graph.nodes {
+        if node.flags.skipped {
+            continue;
+        }
+
+        // Direct prod dependencies
+        for (dep_name, dep_spec) in &node.dependencies {
+            if !validate_fast_path_dep(
+                graph,
+                loc,
+                dep_name,
+                dep_spec,
+                DependencyType::Prod,
+                options,
+                overrides,
+                &mut buf,
+            ) {
+                return false;
+            }
+        }
+
+        // devDependencies (only checked on root node if options.dev)
+        if loc.is_empty() && options.dev {
+            for (dep_name, dep_spec) in &node.dev_dependencies {
+                if !validate_fast_path_dep(
+                    graph,
+                    loc,
+                    dep_name,
+                    dep_spec,
+                    DependencyType::Dev,
+                    options,
+                    overrides,
+                    &mut buf,
+                ) {
+                    return false;
                 }
             }
         }
-        Some(graph)
-    } else {
-        None
+
+        // optionalDependencies (if target exists and is not skipped, must satisfy constraint)
+        for (dep_name, dep_spec) in &node.optional_dependencies {
+            if !validate_fast_path_dep(
+                graph,
+                loc,
+                dep_name,
+                dep_spec,
+                DependencyType::Optional,
+                options,
+                overrides,
+                &mut buf,
+            ) {
+                return false;
+            }
+        }
+
+        // peerDependencies (if !options.legacy_peer_deps)
+        if !options.legacy_peer_deps {
+            for (dep_name, dep_spec) in &node.peer_dependencies {
+                if !validate_fast_path_dep(
+                    graph,
+                    loc,
+                    dep_name,
+                    dep_spec,
+                    DependencyType::Peer,
+                    options,
+                    overrides,
+                    &mut buf,
+                ) {
+                    return false;
+                }
+            }
+        }
     }
+
+    true
+}
+
+fn validate_fast_path_dep(
+    graph: &DependencyGraph,
+    from_loc: &str,
+    dep_name: &str,
+    raw_spec: &str,
+    dep_type: DependencyType,
+    options: &ResolverOptions,
+    overrides: &Overrides,
+    buf: &mut String,
+) -> bool {
+    let target_loc = DependencyGraph::find_in_scope_hierarchy(&graph.nodes, from_loc, dep_name, buf);
+
+    let Some(target) = target_loc else {
+        // Missing target
+        if dep_type == DependencyType::Optional {
+            return true;
+        }
+        if dep_type == DependencyType::Peer {
+            return !options.strict_peers;
+        }
+        // Required dependency missing in lockfile -> drift!
+        return false;
+    };
+
+    let Some(target_node) = graph.nodes.get(target) else {
+        return false;
+    };
+
+    if target_node.flags.skipped {
+        return dep_type == DependencyType::Optional;
+    }
+
+    // Determine effective spec taking overrides into account
+    let effective_spec = if overrides.rules.is_empty() {
+        raw_spec
+    } else {
+        let mut ancestors = Vec::new();
+        if !from_loc.is_empty() {
+            let mut curr = from_loc;
+            while !curr.is_empty() {
+                if let Some(n) = graph.nodes.get(curr) {
+                    ancestors.push(n.name.as_str());
+                }
+                if let Some(idx) = curr.rfind("/node_modules/") {
+                    curr = &curr[..idx];
+                } else {
+                    break;
+                }
+            }
+            ancestors.reverse();
+        }
+        if let Some(overridden) = overrides.resolve_override(dep_name, raw_spec, &ancestors) {
+            if let Ok(parsed_override) = DependencySpec::parse(dep_name, &overridden) {
+                return target_node.name == parsed_override.package_name
+                    && crate::hoisting::node_satisfies_target(target_node, &parsed_override.target);
+            }
+            return false;
+        }
+        raw_spec
+    };
+
+    let Ok(parsed_spec) = DependencySpec::parse(dep_name, effective_spec) else {
+        return false;
+    };
+
+    if target_node.name != parsed_spec.package_name {
+        return false;
+    }
+
+    if !crate::hoisting::node_satisfies_target(target_node, &parsed_spec.target) {
+        if dep_type == DependencyType::Peer {
+            return !options.strict_peers;
+        }
+        return false;
+    }
+
+    true
 }
 
 /// Convenience function to resolve a dependency graph from a manifest and package provider.

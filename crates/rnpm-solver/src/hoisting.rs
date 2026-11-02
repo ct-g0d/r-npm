@@ -68,7 +68,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
 /// Determines the tree placement for a dependency according to npm/Arborist hoisting rules:
 /// 1. Top-Level Hoisting: Try to place at root `node_modules/<install_name>`.
 /// 2. Deduplication: If already occupied by a compatible version, reuse the existing node.
-/// 3. Conflict Nesting: If root is occupied by an incompatible version, nest at
+/// 3. Intermediate Hoisting: If root is occupied by an incompatible version, hoist/deduplicate to
+///    an intermediate ancestor scope if valid and unshadowed.
+/// 4. Conflict Nesting: If all ancestor scopes are blocked by conflicts, nest at
 ///    `<parent_location>/node_modules/<install_name>`.
 pub fn determine_placement(
     graph: &DependencyGraph,
@@ -77,7 +79,9 @@ pub fn determine_placement(
     package_name: &str,
     target: &PackageTarget,
 ) -> PlacementDecision {
-    let root_target = format!("node_modules/{}", install_name);
+    let mut root_target = String::with_capacity(14 + install_name.len());
+    root_target.push_str("node_modules/");
+    root_target.push_str(install_name);
 
     // If parent is root (""), location is directly under root
     if parent_location.is_empty() {
@@ -93,18 +97,51 @@ pub fn determine_placement(
     if let Some(existing) = graph.nodes.get(&root_target) {
         if existing.name == package_name && node_satisfies_target(existing, target) {
             // Check if there is an intermediate shadowing conflict between parent and root
-            if !is_shadowed_by_incompatible(graph, parent_location, install_name, target) {
+            if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target) {
                 return PlacementDecision::Reuse(root_target);
             }
         }
         // Root is occupied and either incompatible or shadowed -> conflict!
     } else {
-        // Root is vacant. Hoist to root!
-        return PlacementDecision::PlaceNew(root_target);
+        // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
+        if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target) {
+            return PlacementDecision::PlaceNew(root_target);
+        }
     }
 
-    // Attempt 2: Conflict nesting under parent
-    let nested_target = format!("{}/node_modules/{}", parent_location, install_name);
+    // Attempt 2: Check intermediate ancestor scopes from root towards parent
+    let mut ancestors = Vec::new();
+    let mut curr = parent_location;
+    while let Some(idx) = curr.rfind("/node_modules/") {
+        curr = &curr[..idx];
+        if !curr.is_empty() {
+            ancestors.push(curr);
+        }
+    }
+
+    for ancestor in ancestors.into_iter().rev() {
+        let mut candidate = String::with_capacity(ancestor.len() + 14 + install_name.len());
+        candidate.push_str(ancestor);
+        candidate.push_str("/node_modules/");
+        candidate.push_str(install_name);
+
+        if let Some(existing) = graph.nodes.get(&candidate) {
+            if existing.name == package_name && node_satisfies_target(existing, target) {
+                if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
+                    return PlacementDecision::Reuse(candidate);
+                }
+            }
+        } else if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
+            return PlacementDecision::PlaceNew(candidate);
+        }
+    }
+
+    // Attempt 3: Conflict nesting under parent
+    let mut nested_target = String::with_capacity(parent_location.len() + 14 + install_name.len());
+    nested_target.push_str(parent_location);
+    nested_target.push_str("/node_modules/");
+    nested_target.push_str(install_name);
+
     if let Some(existing) = graph.nodes.get(&nested_target) {
         if existing.name == package_name && node_satisfies_target(existing, target) {
             return PlacementDecision::Reuse(nested_target);
@@ -114,17 +151,18 @@ pub fn determine_placement(
     PlacementDecision::PlaceNew(nested_target)
 }
 
-/// Checks if any intermediate scope between parent and root has a node for `install_name`
+/// Checks if any intermediate scope between `from_scope` and `to_ancestor` has a node for `install_name`
 /// that does NOT satisfy `target`.
-fn is_shadowed_by_incompatible(
+fn is_shadowed_by_incompatible_between(
     graph: &DependencyGraph,
-    parent_location: &str,
+    from_scope: &str,
+    to_ancestor: &str,
     install_name: &str,
     target: &PackageTarget,
 ) -> bool {
-    let mut current = parent_location;
-    let mut candidate_buf = String::with_capacity(parent_location.len() + 14 + install_name.len());
-    while !current.is_empty() {
+    let mut current = from_scope;
+    let mut candidate_buf = String::with_capacity(from_scope.len() + 14 + install_name.len());
+    while !current.is_empty() && current != to_ancestor {
         candidate_buf.clear();
         candidate_buf.push_str(current);
         candidate_buf.push_str("/node_modules/");
@@ -134,7 +172,6 @@ fn is_shadowed_by_incompatible(
                 return true;
             }
         }
-        // Go up one level in node_modules path
         if let Some(idx) = current.rfind("/node_modules/") {
             current = &current[..idx];
         } else {
