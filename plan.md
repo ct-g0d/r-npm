@@ -115,43 +115,43 @@ This is a planning cadence, not a promise that every milestone fits in exactly s
 
 ### Week 1 - foundations and oracle baseline
 
-- `[ ]` Complete Phase 0 environment inventory and Cargo workspace skeleton.
-- `[ ]` Deliver source, resolver, cache, lockfile, lifecycle, and platform contracts.
+- `[x]` Complete Phase 0 environment inventory and Cargo workspace skeleton.
+- `[x]` Deliver source, resolver, cache, lockfile, lifecycle, and platform contracts.
 - `[x]` Create Tier 1 fixtures and the local mock registry.
 - `[x]` Capture reproducible npm baseline results.
 - **Exit gate:** Gate A.
 
 ### Week 2 - minimal `install`
 
-- `[ ]` Parse manifests and package specs.
-- `[ ]` Resolve the first supported semver ranges.
-- `[ ]` Fetch metadata and tarballs from the mock registry.
-- `[ ]` Verify SSRI and safely extract one dependency.
-- `[ ]` Write deterministic lockfile v3 output.
+- `[x]` Parse manifests and package specs.
+- `[x]` Resolve the first supported semver ranges.
+- `[x]` Fetch metadata and tarballs from the mock registry.
+- `[x]` Verify SSRI and safely extract one dependency.
+- `[x]` Write deterministic lockfile v3 output.
 - **Exit gate:** Gate B for the single-dependency fixture.
 
 ### Week 3 - graph and lockfile engine
 
-- `[ ]` Build the in-memory dependency graph.
-- `[ ]` Add deduplication, hoisting, aliases, and overrides.
-- `[ ]` Read lockfile v2 and write v3 with hidden-tree metadata.
-- `[ ]` Match all Tier 1 resolution fixtures against npm.
+- `[x]` Build the in-memory dependency graph.
+- `[x]` Add deduplication, hoisting, aliases, and overrides.
+- `[x]` Read lockfile v2 and write v3 with hidden-tree metadata.
+- `[x]` Match all Tier 1 resolution fixtures against npm.
 - **Exit gate:** Tier 1 resolution parity and deterministic lockfile migration.
 
 ### Week 4 - reification, shims, lifecycle, and `ci`
 
-- `[ ]` Add safe extraction, atomic replacement, and Windows retries.
-- `[ ]` Generate Unix, `.cmd`, and `.ps1` executable shims.
-- `[ ]` Run lifecycle scripts with the npm environment contract and credential scrubbing.
-- `[ ]` Implement `ci` and process-tree cleanup.
+- `[x]` Add safe extraction, atomic replacement, and Windows retries.
+- `[x]` Generate Unix, `.cmd`, and `.ps1` executable shims.
+- `[x]` Run lifecycle scripts with the npm environment contract and credential scrubbing.
+- `[x]` Implement `ci` and process-tree cleanup.
 - **Exit gate:** Tier 1 execution, shim, credential-scrubbing, and `ci` fixtures pass.
 
 ### Week 5 - peers, optional dependencies, workspaces, and mutations
 
-- `[ ]` Add peer cycles/conflicts and optional failure isolation.
-- `[ ]` Add local dependencies, workspace protocols, links, and topological scripts.
-- `[ ]` Add `uninstall`, `update`, and `pack`.
-- `[ ]` Validate named Tier 2 projects.
+- `[x]` Add peer cycles/conflicts and optional failure isolation.
+- `[x]` Add local dependencies, workspace protocols, links, and topological scripts.
+- `[x]` Add `uninstall`, `update`, and `pack`.
+- `[x]` Validate named Tier 2 projects.
 - **Exit gate:** Gate C, including `install`, `ci`, `run`, `uninstall`, `update`, and `pack` coverage.
 
 ### Week 6 and later - performance and compatibility expansion
