@@ -56,13 +56,25 @@ fn format_peer_conflict(
 ) -> String {
     let mut out = format!("ERESOLVE: Conflicting peer dependency '{peer}' required by '{parent}': {message}\n");
     out.push_str(&format!("  Could not resolve dependency:\n    peer {peer}@\"{required_spec}\" from {parent}\n"));
-    if let (Some(ver), Some(loc)) = (found_version, found_location) {
-        out.push_str(&format!("  Found: {peer}@{ver} at {loc}\n"));
+    match (found_version, found_location) {
+        (Some(ver), Some(loc)) => {
+            out.push_str(&format!("  Found: {peer}@{ver} at {loc}\n"));
+        }
+        (Some(ver), None) => {
+            out.push_str(&format!("  Found: {peer}@{ver}\n"));
+        }
+        (None, Some(loc)) => {
+            out.push_str(&format!("  Found at: {loc}\n"));
+        }
+        (None, None) => {}
     }
     if !required_by.is_empty() {
         out.push_str("  Dependency chain:\n    ");
         out.push_str(&required_by.join(" -> "));
-        out.push_str(&format!(" -> {parent}\n"));
+        if required_by.last().map(|s| s.as_str()) != Some(parent) {
+            out.push_str(&format!(" -> {parent}"));
+        }
+        out.push('\n');
     }
     out.push_str("  Suggested resolutions:\n");
     out.push_str(&format!("    1. Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}\n"));
@@ -94,6 +106,37 @@ impl SolverError {
             found_location,
             required_by,
             message: message.into(),
+        }
+    }
+
+    /// Returns true if this error represents an ERESOLVE peer dependency conflict.
+    pub fn is_peer_conflict(&self) -> bool {
+        matches!(self, SolverError::PeerConflict { .. })
+    }
+
+    /// Accessor for peer conflict details: (parent, peer, required_spec, found_version, found_location, required_by, message)
+    pub fn peer_conflict_details(
+        &self,
+    ) -> Option<(&str, &str, &str, Option<&str>, Option<&str>, &[String], &str)> {
+        match self {
+            SolverError::PeerConflict {
+                parent,
+                peer,
+                required_spec,
+                found_version,
+                found_location,
+                required_by,
+                message,
+            } => Some((
+                parent.as_str(),
+                peer.as_str(),
+                required_spec.as_str(),
+                found_version.as_deref(),
+                found_location.as_deref(),
+                required_by.as_slice(),
+                message.as_str(),
+            )),
+            _ => None,
         }
     }
 
