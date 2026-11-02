@@ -182,6 +182,86 @@ fn test_package_spec_parsing() {
             target: Box::new(PackageTarget::Range(Range::parse("~1.0.0").unwrap())),
         }
     );
+
+    // Git dependency: github:user/repo
+    let s8 = PackageSpec::parse("github:user/repo").unwrap();
+    assert_eq!(s8.name, "repo");
+    assert_eq!(
+        s8.target,
+        PackageTarget::Git {
+            url: "github:user/repo".to_string(),
+            committish: None,
+        }
+    );
+
+    // Git dependency: git+https://...#v1.0.0
+    let s9 = PackageSpec::parse_dependency("my-lib", "git+https://github.com/org/repo.git#v1.0.0").unwrap();
+    assert_eq!(s9.name, "my-lib");
+    assert_eq!(
+        s9.target,
+        PackageTarget::Git {
+            url: "git+https://github.com/org/repo.git".to_string(),
+            committish: Some("v1.0.0".to_string()),
+        }
+    );
+    assert_eq!(
+        s9.target.git_clone_url().unwrap(),
+        "https://github.com/org/repo.git"
+    );
+
+    // Remote tarball URL dependency
+    let s10 = PackageSpec::parse_dependency("pkg", "https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap();
+    assert_eq!(s10.name, "pkg");
+    assert_eq!(
+        s10.target,
+        PackageTarget::Url(url::Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap())
+    );
+}
+
+#[test]
+fn test_git_spec_edge_cases_and_clone_urls() {
+    use url::Url;
+
+    // 1. github with tag
+    let t1 = PackageTarget::parse("github:facebook/react#v18.2.0").unwrap();
+    assert_eq!(t1.git().unwrap().0, "github:facebook/react");
+    assert_eq!(t1.git().unwrap().1, Some("v18.2.0"));
+    assert_eq!(t1.git_clone_url().unwrap(), "https://github.com/facebook/react.git");
+    assert_eq!(t1.git_committish(), Some("v18.2.0"));
+
+    // 2. gitlab with commit sha
+    let t2 = PackageTarget::parse("gitlab:gitlab-org/gitlab#abcdef123456").unwrap();
+    assert_eq!(t2.git_clone_url().unwrap(), "https://gitlab.com/gitlab-org/gitlab.git");
+    assert_eq!(t2.git_committish(), Some("abcdef123456"));
+
+    // 3. bitbucket with branch
+    let t3 = PackageTarget::parse("bitbucket:atlassian/repo#feature-branch").unwrap();
+    assert_eq!(t3.git_clone_url().unwrap(), "https://bitbucket.org/atlassian/repo.git");
+    assert_eq!(t3.git_committish(), Some("feature-branch"));
+
+    // 4. git+ssh
+    let t4 = PackageTarget::parse("git+ssh://git@github.com/owner/repo.git#main").unwrap();
+    assert_eq!(t4.git_clone_url().unwrap(), "ssh://git@github.com/owner/repo.git");
+    assert_eq!(t4.git_committish(), Some("main"));
+
+    // 5. git://
+    let t5 = PackageTarget::parse("git://github.com/owner/repo.git").unwrap();
+    assert_eq!(t5.git_clone_url().unwrap(), "git://github.com/owner/repo.git");
+    assert_eq!(t5.git_committish(), None);
+
+    // 6. Direct HTTP URL
+    let u1 = PackageTarget::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap();
+    assert!(u1.is_url());
+    assert_eq!(u1.url().unwrap(), &Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap());
+
+    // 7. Display roundtrip
+    assert_eq!(t1.to_string(), "github:facebook/react#v18.2.0");
+    assert_eq!(t4.to_string(), "git+ssh://git@github.com/owner/repo.git#main");
+    assert_eq!(u1.to_string(), "https://cdn.example.com/packages/pkg-1.0.0.tgz");
+
+    assert_eq!(PackageTarget::parse(&t1.to_string()).unwrap(), t1);
+    assert_eq!(PackageTarget::parse(&t4.to_string()).unwrap(), t4);
+    assert_eq!(PackageTarget::parse(&u1.to_string()).unwrap(), u1);
 }
 
 #[test]

@@ -453,3 +453,99 @@ fn test_mixed_case_scopes_and_alternate_syntaxes() {
         "https://npm.myorg.internal/@MyOrg%2fPackage-A"
     );
 }
+
+#[test]
+fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
+    use crate::npmrc::{is_sensitive_credential_key, mask_credential, scrub_credentials};
+
+    let mut env_map = HashMap::new();
+    env_map.insert("NPM_TOKEN".to_string(), "npm_live_prod_secret_token_1234567890".to_string());
+    env_map.insert("CI_AUTH_KEY".to_string(), "ghp_ci_runner_key_9876543210abcdef".to_string());
+    env_map.insert("CUSTOM_REGISTRY_HOST".to_string(), "npm.internal.corp".to_string());
+
+    let lookup = |var: &str| env_map.get(var).cloned();
+
+    let content = r#"
+    registry = https://registry.npmjs.org/
+    //registry.npmjs.org/:_authToken = ${NPM_TOKEN}
+    @corp:registry = https://${CUSTOM_REGISTRY_HOST}/
+    //${CUSTOM_REGISTRY_HOST}/:_authToken = ${CI_AUTH_KEY}
+    //fallback.internal/:_authToken = ${UNSET_SECRET:-fallback_secret_token}
+    escaped_val = \${NPM_TOKEN}
+    save-exact = true
+    "#;
+
+    let npmrc = Npmrc::parse_with_env(content, &lookup).unwrap();
+
+    // 1. Verify NPM_TOKEN was expanded correctly
+    let npmjs_url = Url::parse("https://registry.npmjs.org/@scope/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&npmjs_url),
+        Some("npm_live_prod_secret_token_1234567890")
+    );
+
+    // 2. Verify CI_AUTH_KEY and CUSTOM_REGISTRY_HOST expansion
+    let corp_url = Url::parse("https://npm.internal.corp/@corp/tools").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&corp_url),
+        Some("ghp_ci_runner_key_9876543210abcdef")
+    );
+
+    // 3. Verify fallback default expansion
+    let fallback_url = Url::parse("https://fallback.internal/tarball.tgz").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&fallback_url),
+        Some("fallback_secret_token")
+    );
+
+    // 4. Verify escaped syntax remains literal
+    assert_eq!(
+        npmrc.settings.get("escaped_val").unwrap(),
+        "${NPM_TOKEN}"
+    );
+
+    // 5. Verify Debug formatting DOES NOT leak credentials
+    let debug_repr = format!("{:?}", npmrc);
+    assert!(
+        !debug_repr.contains("npm_live_prod_secret_token_1234567890"),
+        "Debug formatting must NOT leak raw NPM_TOKEN: {debug_repr}"
+    );
+    assert!(
+        !debug_repr.contains("ghp_ci_runner_key_9876543210abcdef"),
+        "Debug formatting must NOT leak raw CI_AUTH_KEY: {debug_repr}"
+    );
+    assert!(
+        debug_repr.contains("npm_***7890"),
+        "Debug formatting should display masked token: {debug_repr}"
+    );
+
+    // 6. Verify scrubbed_settings and format_scrubbed
+    let scrubbed_settings = npmrc.scrubbed_settings();
+    assert_eq!(scrubbed_settings.get("save-exact").unwrap(), "true");
+
+    let scrubbed_export = npmrc.format_scrubbed();
+    assert!(!scrubbed_export.contains("npm_live_prod_secret_token_1234567890"));
+    assert!(!scrubbed_export.contains("ghp_ci_runner_key_9876543210abcdef"));
+    assert!(scrubbed_export.contains("[REDACTED]"));
+
+    // 7. Test standalone credential scrubbing
+    let raw_log = "Error 401 connecting with Bearer npm_live_prod_secret_token_1234567890 to //registry.npmjs.org/:_authToken=npm_live_prod_secret_token_1234567890";
+    let cleaned = scrub_credentials(raw_log);
+    assert!(!cleaned.contains("npm_live_prod_secret_token_1234567890"));
+    assert!(cleaned.contains("[REDACTED]"));
+
+    // 8. Test key sensitivity detection
+    assert!(is_sensitive_credential_key("//registry.npmjs.org/:_authToken"));
+    assert!(is_sensitive_credential_key("NPM_TOKEN"));
+    assert!(is_sensitive_credential_key("CI_AUTH_KEY"));
+    assert!(is_sensitive_credential_key("_authToken"));
+    assert!(!is_sensitive_credential_key("registry"));
+    assert!(!is_sensitive_credential_key("save-exact"));
+    assert!(!is_sensitive_credential_key("author"));
+
+    // 9. Test mask_credential
+    assert_eq!(mask_credential("npm_1234567890abcdef"), "npm_***cdef");
+    assert_eq!(mask_credential("ghp_1234567890abcdef"), "ghp_***cdef");
+    assert_eq!(mask_credential("short"), "[REDACTED]");
+    assert_eq!(mask_credential(""), "");
+}

@@ -174,11 +174,10 @@ use tokio::net::TcpListener;
     fn test_unsupported_protocol_spec_gate_e_diagnostics() {
         use rnpm_core::spec::PackageTarget;
         let unsupported_specs = [
-            "git+ssh://git@github.com:foo/bar.git",
-            "git://github.com/foo/bar.git",
-            "github:user/repo",
-            "bitbucket:user/repo",
-            "gitlab:user/repo",
+            "svn://svn.example.com/repo/trunk",
+            "ftp://ftp.example.com/packages/pkg.tgz",
+            "hg+https://hg.example.com/repo",
+            "cvs://pserver:anonymous@example.com/cvsroot",
         ];
 
         for spec in unsupported_specs {
@@ -191,6 +190,26 @@ use tokio::net::TcpListener;
                 "Expected UnsupportedProtocol error, got: {err_str}"
             );
         }
+
+        // Verify AGY 3 supported Git & URL specifications parse cleanly
+        let git_specs = [
+            "git+ssh://git@github.com:foo/bar.git",
+            "git://github.com/foo/bar.git",
+            "github:user/repo",
+            "bitbucket:user/repo",
+            "gitlab:user/repo",
+            "git+https://github.com/org/repo.git#v1.0.0",
+        ];
+        for spec in git_specs {
+            let res = PackageTarget::parse(spec);
+            assert!(res.is_ok(), "Expected successful Git parse for: {spec}");
+            assert!(matches!(res.unwrap(), PackageTarget::Git { .. }));
+        }
+
+        let url_spec = "https://cdn.example.com/packages/pkg-1.0.0.tgz";
+        let res = PackageTarget::parse(url_spec);
+        assert!(res.is_ok(), "Expected successful URL parse for: {url_spec}");
+        assert!(matches!(res.unwrap(), PackageTarget::Url(_)));
     }
 
     #[tokio::test]

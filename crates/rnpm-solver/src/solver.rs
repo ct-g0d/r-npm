@@ -614,7 +614,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 best.map(|(v_meta, _)| v_meta)
             }
             PackageTarget::Alias { target, .. } => self.select_version(meta, target),
-            PackageTarget::File(_) => {
+            PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
                 meta.versions.values().last()
             }
             PackageTarget::Workspace(ws_spec) => {

@@ -292,6 +292,8 @@ impl LockfileV3 {
             PackageTarget::Range(range) => range.satisfies(&v),
             PackageTarget::Tag(_) => true,
             PackageTarget::File(_) => true,
+            PackageTarget::Git { .. } => true,
+            PackageTarget::Url(_) => true,
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {

@@ -1429,3 +1429,72 @@ async fn test_scoped_registry_routing_mixed_case_and_unicode_spoofing() {
     public_server.stop();
     corp_server.stop();
 }
+
+#[tokio::test]
+async fn test_direct_remote_tarball_url_download_and_auth_security() {
+    let sample_tarball_bytes = b"fake-tarball-archive-contents-for-direct-url-test".to_vec();
+    let sample_tarball_clone = sample_tarball_bytes.clone();
+
+    // 1. Setup Mock CDN server hosting direct remote tarball URLs
+    let cdn_server = MockHttpServer::start(move |req| {
+        if req.contains("GET /packages/pkg-1.0.0.tgz") {
+            let has_auth = req.contains("authorization: Bearer npm_cdn_token_12345");
+            let mut headers = vec![
+                ("Content-Type", "application/octet-stream".to_string()),
+                ("ETag", "\"tarball-hash-xyz\"".to_string()),
+            ];
+            if has_auth {
+                headers.push(("X-Auth-Received", "true".to_string()));
+            }
+            (200, headers, sample_tarball_clone.clone())
+        } else if req.contains("GET /redirect-to-untrusted") {
+            // Redirects to untrusted external mirror
+            (
+                302,
+                vec![("Location", "http://untrusted.cdn.mirror.com/pkg.tgz".to_string())],
+                b"Redirecting".to_vec(),
+            )
+        } else {
+            (404, vec![], b"Tarball Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let cdn_host = cdn_server.addr.to_string();
+    let mut auth_tokens = std::collections::BTreeMap::new();
+    auth_tokens.insert(format!("//{cdn_host}/"), "npm_cdn_token_12345".to_string());
+
+    let mut trusted_hosts = HashSet::new();
+    trusted_hosts.insert(cdn_host.clone());
+
+    let config = RegistryClientConfig {
+        default_registry: Url::parse("https://registry.npmjs.org/").unwrap(),
+        user_agent: "test-direct-urls".into(),
+        auth_tokens,
+        trusted_hosts,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // 2. Download direct HTTP remote tarball URL
+    let tarball_url = format!("{}/packages/pkg-1.0.0.tgz", cdn_server.url().as_str().trim_end_matches('/'));
+    let downloaded_bytes = client.download_tarball_bytes(&tarball_url).await.unwrap();
+    assert_eq!(downloaded_bytes, sample_tarball_bytes);
+
+    // 3. Conditional download using ETag
+    let not_modified_res = client
+        .download_tarball_bytes_conditional(&tarball_url, Some("\"tarball-hash-xyz\""))
+        .await
+        .unwrap();
+    // (Server returns 200 since mock doesn't implement 304 logic, but returns fresh bytes with ETag)
+    assert!(not_modified_res.is_fresh());
+    assert_eq!(not_modified_res.etag(), Some("\"tarball-hash-xyz\""));
+
+    // 4. Download 404 direct URL returns error
+    let missing_url = format!("{}/packages/missing.tgz", cdn_server.url().as_str().trim_end_matches('/'));
+    let not_found_err = client.download_tarball_bytes(&missing_url).await.unwrap_err();
+    assert_eq!(not_found_err.status_code(), Some(404));
+
+    cdn_server.stop();
+}

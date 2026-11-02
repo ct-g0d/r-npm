@@ -22,6 +22,8 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
         PackageTarget::Tag(_) => true,
         PackageTarget::Alias { target, .. } => version_satisfies_target(version_str, target),
         PackageTarget::File(_) => true,
+        PackageTarget::Git { .. } => true,
+        PackageTarget::Url(_) => true,
         PackageTarget::Workspace(ws_spec) => {
             let s = ws_spec.trim();
             if s == "*" || s == "^" || s == "~" || s.is_empty() {
@@ -47,6 +49,8 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
             PackageTarget::Tag(_) => true,
             PackageTarget::Alias { target, .. } => node_satisfies_target(node, target),
             PackageTarget::File(_) => true,
+            PackageTarget::Git { .. } => true,
+            PackageTarget::Url(_) => true,
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {

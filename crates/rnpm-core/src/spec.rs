@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use serde::{Deserialize, Serialize};
+use url::Url;
 use crate::error::SpecError;
 use crate::semver::range::Range;
 use crate::semver::version::Version;
@@ -17,6 +18,11 @@ pub enum PackageTarget {
     },
     File(PathBuf),
     Workspace(String),
+    Git {
+        url: String,
+        committish: Option<String>,
+    },
+    Url(Url),
 }
 
 impl PackageTarget {
@@ -43,10 +49,9 @@ impl PackageTarget {
             return Self::parse_alias(alias_str);
         }
 
-        // Unsupported protocols (e.g. git+ssh://, git://, github:, bitbucket:, gitlab:, http://, https://)
+        // Unsupported protocols (e.g. svn://, ftp://, hg+https://, cvs://)
         let unsupported_protocols = [
-            "git+ssh://", "git+https://", "git://", "github:",
-            "bitbucket:", "gitlab:",
+            "svn://", "ftp://", "hg+https://", "hg+ssh://", "cvs://",
         ];
         for proto in unsupported_protocols {
             if s.starts_with(proto) {
@@ -56,11 +61,37 @@ impl PackageTarget {
                 });
             }
         }
+
+        // Git dependency specifications:
+        // "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0",
+        // "git+ssh://git@github.com/org/repo.git", "git://github.com/org/repo.git",
+        // "gitlab:user/repo", "bitbucket:user/repo", "git+file:///path/to/repo"
+        let git_prefixes = [
+            "git+ssh://", "git+https://", "git+file://", "git://",
+            "github:", "gitlab:", "bitbucket:",
+        ];
+        for prefix in git_prefixes {
+            if s.starts_with(prefix) {
+                let (url_part, committish) = if let Some(hash_idx) = s.find('#') {
+                    let u = s[..hash_idx].trim().to_string();
+                    let c = s[hash_idx + 1..].trim().to_string();
+                    (u, if c.is_empty() { None } else { Some(c) })
+                } else {
+                    (s.trim().to_string(), None)
+                };
+                return Ok(PackageTarget::Git {
+                    url: url_part,
+                    committish,
+                });
+            }
+        }
+
+        // Direct HTTP/HTTPS remote tarball URL dependencies:
+        // e.g. "https://cdn.example.com/packages/pkg-1.0.0.tgz"
         if s.starts_with("http://") || s.starts_with("https://") {
-            return Err(SpecError::UnsupportedProtocol {
-                protocol: if s.starts_with("https://") { "https:".to_string() } else { "http:".to_string() },
-                spec: s.to_string(),
-            });
+            let parsed_url = Url::parse(s)
+                .map_err(|e| SpecError::InvalidFormat(format!("Invalid URL '{s}': {e}")))?;
+            return Ok(PackageTarget::Url(parsed_url));
         }
 
         // Try exact version
@@ -94,6 +125,71 @@ impl PackageTarget {
         }
     }
 
+    /// Returns the raw git URL and optional committish if this target is a Git dependency.
+    pub fn git(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            PackageTarget::Git { url, committish } => Some((url.as_str(), committish.as_deref())),
+            _ => None,
+        }
+    }
+
+    /// Returns the normalized git clone URL for cloning/fetching.
+    /// E.g.
+    /// - `"github:user/repo"` -> `"https://github.com/user/repo.git"`
+    /// - `"gitlab:user/repo"` -> `"https://gitlab.com/user/repo.git"`
+    /// - `"bitbucket:user/repo"` -> `"https://bitbucket.org/user/repo.git"`
+    /// - `"git+https://..."` -> `"https://..."`
+    /// - `"git+ssh://..."` -> `"ssh://..."`
+    /// - `"git+file://..."` -> `"file://..."`
+    /// - `"git://..."` -> `"git://..."`
+    pub fn git_clone_url(&self) -> Option<String> {
+        match self {
+            PackageTarget::Git { url, .. } => {
+                if let Some(rest) = url.strip_prefix("github:") {
+                    let repo = rest.trim_end_matches(".git");
+                    Some(format!("https://github.com/{repo}.git"))
+                } else if let Some(rest) = url.strip_prefix("gitlab:") {
+                    let repo = rest.trim_end_matches(".git");
+                    Some(format!("https://gitlab.com/{repo}.git"))
+                } else if let Some(rest) = url.strip_prefix("bitbucket:") {
+                    let repo = rest.trim_end_matches(".git");
+                    Some(format!("https://bitbucket.org/{repo}.git"))
+                } else if let Some(rest) = url.strip_prefix("git+") {
+                    Some(rest.to_string())
+                } else {
+                    Some(url.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the committish (tag, branch, commit sha, or semver spec) if this is a Git dependency.
+    pub fn git_committish(&self) -> Option<&str> {
+        match self {
+            PackageTarget::Git { committish, .. } => committish.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the URL reference if this target is a direct HTTP/HTTPS URL dependency.
+    pub fn url(&self) -> Option<&Url> {
+        match self {
+            PackageTarget::Url(u) => Some(u),
+            _ => None,
+        }
+    }
+
+    /// Checks if this target is a Git dependency.
+    pub fn is_git(&self) -> bool {
+        matches!(self, PackageTarget::Git { .. })
+    }
+
+    /// Checks if this target is a direct URL dependency.
+    pub fn is_url(&self) -> bool {
+        matches!(self, PackageTarget::Url(_))
+    }
+
     fn parse_alias(alias_str: &str) -> Result<Self, SpecError> {
         let trimmed = alias_str.trim();
         if trimmed.is_empty() {
@@ -124,6 +220,14 @@ impl fmt::Display for PackageTarget {
             PackageTarget::Alias { name, target } => write!(f, "npm:{name}@{target}"),
             PackageTarget::File(p) => write!(f, "file:{}", p.display()),
             PackageTarget::Workspace(w) => write!(f, "workspace:{w}"),
+            PackageTarget::Git { url, committish } => {
+                if let Some(c) = committish {
+                    write!(f, "{url}#{c}")
+                } else {
+                    write!(f, "{url}")
+                }
+            }
+            PackageTarget::Url(u) => write!(f, "{u}"),
         }
     }
 }
@@ -143,7 +247,8 @@ impl PackageSpec {
     }
 
     /// Parse a package specifier as provided in CLI arguments or manifests:
-    /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar", "foo@workspace:*"
+    /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar", "foo@workspace:*",
+    /// "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0", "https://cdn.example.com/packages/pkg-1.0.0.tgz"
     pub fn parse(input: &str) -> Result<Self, SpecError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -181,6 +286,26 @@ impl PackageSpec {
                     target,
                 });
             }
+        }
+
+        // Direct Git specifier without name (e.g. "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0")
+        let git_prefixes = [
+            "git+ssh://", "git+https://", "git+file://", "git://",
+            "github:", "gitlab:", "bitbucket:",
+        ];
+        for prefix in git_prefixes {
+            if trimmed.starts_with(prefix) {
+                let name = extract_git_repo_name(trimmed);
+                let target = PackageTarget::parse(trimmed)?;
+                return Ok(Self { name, target });
+            }
+        }
+
+        // Direct HTTP/HTTPS remote tarball URL without name
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let target = PackageTarget::parse(trimmed)?;
+            let name = extract_url_package_name(trimmed);
+            return Ok(Self { name, target });
         }
 
         let (name, spec_opt) = split_name_and_spec(trimmed)?;
@@ -263,4 +388,38 @@ fn is_valid_tag(s: &str) -> bool {
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
         && s.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+}
+
+fn extract_git_repo_name(spec: &str) -> String {
+    let clean = spec.split('#').next().unwrap_or(spec);
+    let clean = clean.trim_end_matches(".git").trim_end_matches('/');
+    if let Some(slash_idx) = clean.rfind('/') {
+        clean[slash_idx + 1..].to_string()
+    } else if let Some(colon_idx) = clean.rfind(':') {
+        clean[colon_idx + 1..].to_string()
+    } else {
+        clean.to_string()
+    }
+}
+
+fn extract_url_package_name(url_str: &str) -> String {
+    if let Ok(u) = Url::parse(url_str) {
+        if let Some(mut last_seg) = u.path_segments().and_then(|mut s| s.next_back()) {
+            if last_seg.ends_with(".tgz") {
+                last_seg = &last_seg[..last_seg.len() - 4];
+            } else if last_seg.ends_with(".tar.gz") {
+                last_seg = &last_seg[..last_seg.len() - 7];
+            }
+            if let Some(dash_idx) = last_seg.rfind('-') {
+                let suffix = &last_seg[dash_idx + 1..];
+                if suffix.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    return last_seg[..dash_idx].to_string();
+                }
+            }
+            if !last_seg.is_empty() {
+                return last_seg.to_string();
+            }
+        }
+    }
+    "unnamed".to_string()
 }

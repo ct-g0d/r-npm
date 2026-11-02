@@ -7,7 +7,7 @@ use crate::error::ConfigError;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Npmrc {
     /// Raw key-value configuration pairs
     pub settings: BTreeMap<String, String>,
@@ -17,6 +17,35 @@ pub struct Npmrc {
     pub scoped_registries: BTreeMap<String, Url>,
     /// Auth tokens keyed by normalized URI prefix, e.g. "//registry.npmjs.org/" -> "npm_secret123"
     pub auth_tokens: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for Npmrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scrubbed_tokens: BTreeMap<_, _> = self
+            .auth_tokens
+            .iter()
+            .map(|(k, v)| (k.clone(), mask_credential(v)))
+            .collect();
+
+        let scrubbed_settings: BTreeMap<_, _> = self
+            .settings
+            .iter()
+            .map(|(k, v)| {
+                if is_sensitive_credential_key(k) {
+                    (k.clone(), mask_credential(v))
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+
+        f.debug_struct("Npmrc")
+            .field("settings", &scrubbed_settings)
+            .field("registry", &self.registry)
+            .field("scoped_registries", &self.scoped_registries)
+            .field("auth_tokens", &scrubbed_tokens)
+            .finish()
+    }
 }
 
 impl Default for Npmrc {
@@ -261,6 +290,47 @@ impl Npmrc {
         }
 
         None
+    }
+
+    /// Returns a copy of the settings map with all sensitive tokens safely redacted.
+    pub fn scrubbed_settings(&self) -> BTreeMap<String, String> {
+        self.settings
+            .iter()
+            .map(|(k, v)| {
+                if is_sensitive_credential_key(k) {
+                    (k.clone(), "[REDACTED]".to_string())
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Formats the configuration into an .npmrc-compatible string with all credentials safely redacted.
+    pub fn format_scrubbed(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("registry={}\n", self.registry));
+        for (scope, url) in &self.scoped_registries {
+            out.push_str(&format!("{scope}:registry={url}\n"));
+        }
+        for (prefix, _) in &self.auth_tokens {
+            out.push_str(&format!("{prefix}:_authToken=[REDACTED]\n"));
+        }
+        for (k, v) in &self.settings {
+            if k == "registry"
+                || k.ends_with(":registry")
+                || k.ends_with("/registry")
+                || k.ends_with(":_authToken")
+            {
+                continue;
+            }
+            if is_sensitive_credential_key(k) {
+                out.push_str(&format!("{k}=[REDACTED]\n"));
+            } else {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
+        out
     }
 }
 
@@ -548,4 +618,131 @@ where
     }
 
     result
+}
+
+/// Redact sensitive tokens and passwords from configuration strings, logs, or error traces.
+pub fn scrub_credentials(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // 1. Redact Bearer tokens
+    result = replace_bearer(&result);
+
+    // 2. Redact npm / ghp tokens
+    result = replace_npm_tokens(&result);
+
+    // 3. Redact :_authToken=<val> and other key-value credentials
+    for key in &[
+        "_authtoken", "_authToken", "authtoken", "password", "secret", "token", "_auth",
+        "npm_token", "ci_auth_key", "auth_key",
+    ] {
+        result = replace_kv_pairs(&result, key);
+    }
+
+    result
+}
+
+/// Checks if a key name corresponds to a sensitive credential.
+pub fn is_sensitive_credential_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("auth_key")
+        || lower.contains("auth_token")
+        || lower.contains("_authtoken")
+        || lower.contains("_auth")
+        || lower.contains("apikey")
+        || lower.contains("api_key")
+    {
+        return true;
+    }
+    if lower.contains("auth") && !lower.contains("author") {
+        return true;
+    }
+    false
+}
+
+/// Masks a credential for display (e.g. "npm_1234567890abcdef" -> "npm_***cdef").
+pub fn mask_credential(token: &str) -> String {
+    if token.is_empty() {
+        return String::new();
+    }
+    if token.len() <= 6 {
+        return "[REDACTED]".to_string();
+    }
+    let prefix = if token.starts_with("npm_") {
+        "npm_***"
+    } else if token.starts_with("ghp_") {
+        "ghp_***"
+    } else {
+        "***"
+    };
+    let tail = &token[token.len().saturating_sub(4)..];
+    format!("{prefix}{tail}")
+}
+
+fn replace_bearer(text: &str) -> String {
+    let mut out = String::new();
+    let lower = text.to_ascii_lowercase();
+    let mut last_idx = 0;
+
+    for (idx, _) in lower.match_indices("bearer ") {
+        if idx < last_idx {
+            continue;
+        }
+        out.push_str(&text[last_idx..idx + 7]);
+        let remainder = &text[idx + 7..];
+        let end_token = remainder
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';')
+            .unwrap_or(remainder.len());
+        out.push_str("[REDACTED]");
+        last_idx = idx + 7 + end_token;
+    }
+    out.push_str(&text[last_idx..]);
+    out
+}
+
+fn replace_npm_tokens(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_idx = 0;
+
+    for (idx, _) in text.match_indices("npm_") {
+        if idx < last_idx {
+            continue;
+        }
+        let remainder = &text[idx + 4..];
+        let end_token = remainder
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .unwrap_or(remainder.len());
+        if end_token >= 16 {
+            out.push_str(&text[last_idx..idx]);
+            out.push_str("npm_[REDACTED]");
+            last_idx = idx + 4 + end_token;
+        }
+    }
+    out.push_str(&text[last_idx..]);
+    out
+}
+
+fn replace_kv_pairs(text: &str, key_name: &str) -> String {
+    let mut out = String::new();
+    let lower = text.to_ascii_lowercase();
+    let pattern = format!("{key_name}=");
+    let mut last_idx = 0;
+
+    for (idx, _) in lower.match_indices(&pattern) {
+        if idx < last_idx {
+            continue;
+        }
+        let key_len = pattern.len();
+        out.push_str(&text[last_idx..idx + key_len]);
+        let remainder = &text[idx + key_len..];
+        let end_token = remainder
+            .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '"' || c == '\'' || c == '\n' || c == '\r')
+            .unwrap_or(remainder.len());
+        out.push_str("[REDACTED]");
+        last_idx = idx + key_len + end_token;
+    }
+    out.push_str(&text[last_idx..]);
+    out
 }
