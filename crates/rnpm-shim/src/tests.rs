@@ -360,3 +360,44 @@ fn test_extreme_shim_live_invocation_on_disk() {
         }
     }
 }
+
+#[test]
+fn test_shim_exit_code_fidelity() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let target_dir = dir.path().join("node_modules").join("exit-pkg");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let target_script = target_dir.join("cli.js");
+    fs::write(&target_script, b"process.exit(42);\n").unwrap();
+
+    create_shims(&bin_dir, "exit-pkg", "exit-pkg/cli.js").unwrap();
+
+    #[cfg(windows)]
+    {
+        let cmd_shim = bin_dir.join("exit-pkg.cmd");
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.current_dir(&bin_dir);
+        let status = cmd
+            .arg("/c")
+            .arg(&cmd_shim)
+            .status()
+            .expect("Failed to execute cmd shim");
+
+        assert_eq!(status.code(), Some(42), "CMD shim must faithfully propagate exit code 42");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let sh_shim = bin_dir.join("exit-pkg");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.current_dir(&bin_dir);
+        let status = cmd
+            .arg(&sh_shim)
+            .status()
+            .expect("Failed to execute posix shim");
+
+        assert_eq!(status.code(), Some(42), "POSIX shim must faithfully propagate exit code 42");
+    }
+}

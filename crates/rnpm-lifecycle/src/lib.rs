@@ -557,6 +557,9 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();
     cmd.envs(env);
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
 
     let guard = process_guard::ProcessTreeGuard::new();
 
@@ -632,6 +635,9 @@ where
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();
     cmd.envs(env);
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
 
     let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new());
 
@@ -749,6 +755,558 @@ where
 /// If cancelled or aborted by SIGINT/SIGTERM, runaway child processes are cleanly terminated immediately.
 pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<ExitStatus> {
     execute_lifecycle_script_with_abort(ctx, std::future::pending()).await
+}
+
+/// Detailed error holding the exact non-zero exit code of a process or script execution.
+#[derive(Debug, Clone)]
+pub struct ScriptExitError {
+    pub exit_code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ScriptExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ScriptExitError {}
+
+/// Extracts the exact exit code from ExitStatus across Windows and Unix platforms,
+/// handling signal terminations on Unix (128 + signal) and non-zero exit codes.
+pub fn extract_exit_status_code(status: &ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(code) = status.code() {
+            code
+        } else if let Some(sig) = status.signal() {
+            128 + sig
+        } else {
+            1
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(1)
+    }
+}
+
+/// Simple, zero-dependency wildcard matching supporting `*` and `?`.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p_bytes = pattern.as_bytes();
+    let t_bytes = text.as_bytes();
+    let mut p_idx = 0;
+    let mut t_idx = 0;
+    let mut star_idx = None;
+    let mut match_idx = 0;
+
+    while t_idx < t_bytes.len() {
+        if p_idx < p_bytes.len() && (p_bytes[p_idx] == b'?' || p_bytes[p_idx] == t_bytes[t_idx]) {
+            p_idx += 1;
+            t_idx += 1;
+        } else if p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
+            star_idx = Some(p_idx);
+            p_idx += 1;
+            match_idx = t_idx;
+        } else if let Some(star) = star_idx {
+            p_idx = star + 1;
+            match_idx += 1;
+            t_idx = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while p_idx < p_bytes.len() && p_bytes[p_idx] == b'*' {
+        p_idx += 1;
+    }
+
+    p_idx == p_bytes.len()
+}
+
+/// Matches a workspace member name or path against a filter pattern.
+/// Supports exact names ("foo"), scopes ("@scope" or "@scope/*"), wildcards ("ui-*", "*-app"),
+/// and relative filesystem paths ("packages/foo" or "./packages/foo").
+pub fn matches_filter(filter: &str, member_name: &str, member_path: &Path, root_dir: &Path) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return false;
+    }
+
+    // 1. Exact package name match
+    if filter == member_name {
+        return true;
+    }
+
+    // 2. Scope prefix match: e.g. "@scope" or "@scope/*"
+    if filter.starts_with('@') {
+        if let Some(scope_name) = filter.strip_suffix("/*") {
+            if member_name.starts_with(scope_name) && member_name[scope_name.len()..].starts_with('/') {
+                return true;
+            }
+        } else if !filter.contains('/') {
+            if member_name.starts_with(filter) && member_name[filter.len()..].starts_with('/') {
+                return true;
+            }
+        }
+    }
+
+    // 3. Glob wildcard matching
+    if filter.contains('*') || filter.contains('?') {
+        if glob_match(filter, member_name) {
+            return true;
+        }
+    }
+
+    // 4. Path matching relative to root_dir
+    let norm_filter = filter.replace('\\', "/").trim_start_matches("./").to_string();
+    if let Ok(rel) = member_path.strip_prefix(root_dir) {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == norm_filter || glob_match(&norm_filter, &rel_str) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Traverses ancestor directories starting from `start_dir` searching for `bin_name` in `node_modules/.bin/`.
+pub fn find_local_binary(start_dir: &Path, bin_name: &str) -> Option<PathBuf> {
+    let mut current = Some(start_dir);
+
+    let clean_name = bin_name
+        .trim_end_matches(".cmd")
+        .trim_end_matches(".exe")
+        .trim_end_matches(".ps1")
+        .trim_end_matches(".bat");
+
+    let unscoped_name = if clean_name.contains('/') {
+        clean_name.rsplit('/').next().unwrap_or(clean_name)
+    } else {
+        clean_name
+    };
+
+    while let Some(dir) = current {
+        let bin_dir = dir.join("node_modules").join(".bin");
+        if bin_dir.is_dir() {
+            #[cfg(windows)]
+            {
+                let names = if unscoped_name != clean_name {
+                    vec![clean_name, unscoped_name]
+                } else {
+                    vec![clean_name]
+                };
+
+                for n in names {
+                    let candidates = [
+                        bin_dir.join(format!("{n}.cmd")),
+                        bin_dir.join(format!("{n}.exe")),
+                        bin_dir.join(format!("{n}.bat")),
+                        bin_dir.join(format!("{n}.ps1")),
+                        bin_dir.join(n),
+                    ];
+                    for candidate in candidates {
+                        if candidate.exists() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let candidate1 = bin_dir.join(clean_name);
+                if candidate1.exists() {
+                    return Some(candidate1);
+                }
+                if unscoped_name != clean_name {
+                    let candidate2 = bin_dir.join(unscoped_name);
+                    if candidate2.exists() {
+                        return Some(candidate2);
+                    }
+                }
+            }
+        }
+        current = dir.parent();
+    }
+
+    None
+}
+
+/// Collects all `node_modules/.bin` directories from `start_dir` and all its ancestors.
+pub fn collect_ancestor_bin_dirs(start_dir: &Path) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        let bin_dir = dir.join("node_modules").join(".bin");
+        if bin_dir.is_dir() && !entries.contains(&bin_dir) {
+            entries.push(bin_dir);
+        }
+        current = dir.parent();
+    }
+    entries
+}
+
+/// Spawns and executes a standalone binary or command with full TTY stdin/stdout forwarding,
+/// process tree guard containment (Windows Job Object or Unix process group),
+/// signal propagation, and non-zero exit code fidelity.
+pub fn execute_binary(
+    binary_path: &Path,
+    args: &[String],
+    current_dir: &Path,
+    path_entries: &[PathBuf],
+    extra_env: &HashMap<String, String>,
+) -> Result<ExitStatus> {
+    info!(
+        "Executing binary {} in {}",
+        binary_path.display(),
+        current_dir.display()
+    );
+
+    let mut env: HashMap<String, String> = HashMap::new();
+    for (k, v) in std::env::vars() {
+        if !is_sensitive_credential_key(&k) {
+            env.insert(k, v);
+        }
+    }
+    for (k, v) in extra_env {
+        if !is_sensitive_credential_key(k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+
+    let existing_path = std::env::var("PATH")
+        .or_else(|_| std::env::var("Path"))
+        .unwrap_or_default();
+    let joined_custom = std::env::join_paths(path_entries)
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let final_path = if joined_custom.is_empty() {
+        existing_path
+    } else if existing_path.is_empty() {
+        joined_custom
+    } else {
+        format!("{joined_custom}{}{existing_path}", if cfg!(windows) { ";" } else { ":" })
+    };
+    env.remove("Path");
+    env.remove("path");
+    env.insert("PATH".to_string(), final_path.clone());
+    #[cfg(windows)]
+    env.insert("Path".to_string(), final_path);
+
+    env.insert("INIT_CWD".to_string(), current_dir.to_string_lossy().to_string());
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let ext = binary_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/c").arg(binary_path);
+            c.args(args);
+            c
+        } else if ext.eq_ignore_ascii_case("ps1") {
+            let mut c = Command::new("powershell.exe");
+            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+            c.arg(binary_path);
+            c.args(args);
+            c
+        } else {
+            let is_js = ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("cjs") || ext.eq_ignore_ascii_case("mjs");
+            let has_shebang = if binary_path.exists() {
+                if let Ok(bytes) = std::fs::read(binary_path) {
+                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_js || has_shebang {
+                let mut c = Command::new("node");
+                c.arg(binary_path);
+                c.args(args);
+                c
+            } else {
+                let mut c = Command::new(binary_path);
+                c.args(args);
+                c
+            }
+        }
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new(binary_path);
+        c.args(args);
+        c.process_group(0);
+        c
+    };
+
+    cmd.current_dir(current_dir);
+    cmd.env_clear();
+    cmd.envs(env);
+
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let guard = process_guard::ProcessTreeGuard::new();
+
+    let mut child = cmd.spawn()
+        .with_context(|| format!("Failed to spawn binary '{}'", binary_path.display()))?;
+
+    #[cfg(windows)]
+    if let Some(ref g) = guard {
+        use std::os::windows::io::AsRawHandle;
+        if !g.assign_process(child.as_raw_handle()) {
+            warn!("Failed to assign process to Windows Job Object for {}", binary_path.display());
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(ref g) = guard {
+        g.assign_process(child.id());
+    }
+
+    let status = child.wait()
+        .with_context(|| format!("Failed to wait for binary '{}'", binary_path.display()))?;
+
+    if let Some(ref g) = guard {
+        let code = status.code().unwrap_or(0) as u32;
+        g.terminate(code);
+    }
+
+    Ok(status)
+}
+
+/// Executes a binary asynchronously with process tree signal cleanup and optional abort future.
+pub async fn execute_binary_with_abort<F>(
+    binary_path: &Path,
+    args: &[String],
+    current_dir: &Path,
+    path_entries: &[PathBuf],
+    extra_env: &HashMap<String, String>,
+    abort_fut: F,
+) -> Result<ExitStatus>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    info!(
+        "Executing async binary {} in {}",
+        binary_path.display(),
+        current_dir.display()
+    );
+
+    let mut env: HashMap<String, String> = HashMap::new();
+    for (k, v) in std::env::vars() {
+        if !is_sensitive_credential_key(&k) {
+            env.insert(k, v);
+        }
+    }
+    for (k, v) in extra_env {
+        if !is_sensitive_credential_key(k) {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+
+    let existing_path = std::env::var("PATH")
+        .or_else(|_| std::env::var("Path"))
+        .unwrap_or_default();
+    let joined_custom = std::env::join_paths(path_entries)
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let final_path = if joined_custom.is_empty() {
+        existing_path
+    } else if existing_path.is_empty() {
+        joined_custom
+    } else {
+        format!("{joined_custom}{}{existing_path}", if cfg!(windows) { ";" } else { ":" })
+    };
+    env.remove("Path");
+    env.remove("path");
+    env.insert("PATH".to_string(), final_path.clone());
+    #[cfg(windows)]
+    env.insert("Path".to_string(), final_path);
+
+    env.insert("INIT_CWD".to_string(), current_dir.to_string_lossy().to_string());
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let ext = binary_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/c").arg(binary_path);
+            c.args(args);
+            c
+        } else if ext.eq_ignore_ascii_case("ps1") {
+            let mut c = Command::new("powershell.exe");
+            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+            c.arg(binary_path);
+            c.args(args);
+            c
+        } else {
+            let is_js = ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("cjs") || ext.eq_ignore_ascii_case("mjs");
+            let has_shebang = if binary_path.exists() {
+                if let Ok(bytes) = std::fs::read(binary_path) {
+                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_js || has_shebang {
+                let mut c = Command::new("node");
+                c.arg(binary_path);
+                c.args(args);
+                c
+            } else {
+                let mut c = Command::new(binary_path);
+                c.args(args);
+                c
+            }
+        }
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new(binary_path);
+        c.args(args);
+        c.process_group(0);
+        c
+    };
+
+    cmd.current_dir(current_dir);
+    cmd.env_clear();
+    cmd.envs(env);
+
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new());
+
+    let mut child = cmd.spawn()
+        .with_context(|| format!("Failed to spawn binary '{}'", binary_path.display()))?;
+
+    #[cfg(windows)]
+    if let Some(ref g) = *guard {
+        use std::os::windows::io::AsRawHandle;
+        if !g.assign_process(child.as_raw_handle()) {
+            warn!("Failed to assign process to Windows Job Object for {}", binary_path.display());
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(ref g) = *guard {
+        g.assign_process(child.id());
+    }
+
+    let bin_display = binary_path.display().to_string();
+    let guard_clone = guard.clone();
+
+    struct CancellationGuard {
+        guard: std::sync::Arc<Option<process_guard::ProcessTreeGuard>>,
+        completed: bool,
+    }
+    impl Drop for CancellationGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                if let Some(ref g) = *self.guard {
+                    g.terminate(1);
+                }
+            }
+        }
+    }
+
+    let mut cancel_guard = CancellationGuard {
+        guard: guard.clone(),
+        completed: false,
+    };
+
+    let mut wait_handle = tokio::task::spawn_blocking(move || {
+        let res = child.wait();
+        (child, res)
+    });
+
+    let signal_fut = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = async {
+                    if let Some(ref mut s) = sigterm {
+                        s.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    };
+
+    let status_res = tokio::select! {
+        res = &mut wait_handle => {
+            cancel_guard.completed = true;
+            let (_child, wait_res) = res
+                .map_err(|e| anyhow::anyhow!("Process execution task for {bin_display} interrupted: {e}"))?;
+            wait_res
+        }
+        sig = signal_fut => {
+            warn!("Received {sig}; terminating process tree for {bin_display}");
+            let exit_code = if sig == "SIGINT" { 130 } else { 143 };
+            if let Some(ref g) = *guard_clone {
+                g.terminate(exit_code);
+            }
+            cancel_guard.completed = true;
+            return Err(anyhow::anyhow!("Process execution for {bin_display} terminated by {sig}"));
+        }
+        _ = abort_fut => {
+            warn!("Abort signal triggered; terminating process tree for {bin_display}");
+            if let Some(ref g) = *guard_clone {
+                g.terminate(143);
+            }
+            cancel_guard.completed = true;
+            return Err(anyhow::anyhow!("Process execution for {bin_display} aborted by signal"));
+        }
+    };
+
+    if let Some(ref g) = *guard {
+        g.terminate(0);
+    }
+
+    let status = status_res
+        .with_context(|| format!("Failed to wait for binary '{bin_display}'"))?;
+
+    Ok(status)
+}
+
+/// Executes a binary asynchronously with process tree signal cleanup.
+pub async fn execute_binary_async(
+    binary_path: &Path,
+    args: &[String],
+    current_dir: &Path,
+    path_entries: &[PathBuf],
+    extra_env: &HashMap<String, String>,
+) -> Result<ExitStatus> {
+    execute_binary_with_abort(
+        binary_path,
+        args,
+        current_dir,
+        path_entries,
+        extra_env,
+        std::future::pending(),
+    ).await
 }
 
 /// Executes dependency lifecycle scripts bottom-up (topologically), followed by root hooks,
@@ -995,6 +1553,18 @@ pub async fn execute_workspace_scripts_topological_with_abort(
         }
     }
 
+    if let Some(ref filters) = opts.filter_members {
+        let any_match = members.iter().any(|m| {
+            filters.iter().any(|f| matches_filter(f, &m.name, &m.path, root_dir))
+        });
+        if !any_match {
+            return Err(anyhow::anyhow!(
+                "No workspace packages matched the filter/scope criteria: {}",
+                filters.join(", ")
+            ));
+        }
+    }
+
     let mut name_to_member: HashMap<&str, &WorkspaceScriptMember> = HashMap::new();
     for m in members {
         name_to_member.insert(m.name.as_str(), m);
@@ -1011,75 +1581,81 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             }
         }
 
+        let member = match name_to_member.get(pkg_name.as_str()) {
+            Some(m) => *m,
+            None => continue,
+        };
+
         if let Some(ref filter) = opts.filter_members {
-            if !filter.iter().any(|f| f == pkg_name) {
+            if !filter.iter().any(|f| matches_filter(f, &member.name, &member.path, root_dir)) {
                 continue;
             }
         }
 
-        if let Some(member) = name_to_member.get(pkg_name.as_str()) {
-            executed_or_skipped.insert(pkg_name.clone());
-            if let Some(cmd) = member.manifest.scripts.get(&opts.script) {
-                let full_cmd = if opts.args.is_empty() {
-                    cmd.clone()
-                } else {
-                    format!("{cmd} {}", opts.args.join(" "))
-                };
+        executed_or_skipped.insert(pkg_name.clone());
+        if let Some(cmd) = member.manifest.scripts.get(&opts.script) {
+            let full_cmd = if opts.args.is_empty() {
+                cmd.clone()
+            } else {
+                format!("{cmd} {}", opts.args.join(" "))
+            };
 
-                println!(
-                    "\n> {}@{} {} {}",
-                    member.name,
-                    member.manifest.version.as_deref().unwrap_or("0.0.0"),
-                    opts.script,
-                    member.path.display()
-                );
-                println!("> {full_cmd}\n");
+            println!(
+                "\n> {}@{} {} {}",
+                member.name,
+                member.manifest.version.as_deref().unwrap_or("0.0.0"),
+                opts.script,
+                member.path.display()
+            );
+            println!("> {full_cmd}\n");
 
-                let mut ctx = LifecycleContext::new(
-                    root_dir,
-                    &member.path,
-                    &member.name,
-                    &opts.script,
-                    &full_cmd,
-                );
-                ctx.package_version = member.manifest.version.clone();
+            let mut ctx = LifecycleContext::new(
+                root_dir,
+                &member.path,
+                &member.name,
+                &opts.script,
+                &full_cmd,
+            );
+            ctx.package_version = member.manifest.version.clone();
 
-                let abort_fut = {
-                    let mut rx_opt = abort_rx.clone();
-                    async move {
-                        if let Some(ref mut rx) = rx_opt {
-                            let _ = rx.wait_for(|&val| val).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
+            let abort_fut = {
+                let mut rx_opt = abort_rx.clone();
+                async move {
+                    if let Some(ref mut rx) = rx_opt {
+                        let _ = rx.wait_for(|&val| val).await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
-                };
+                }
+            };
 
-                let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
-                if !status.success() {
-                    let code = status.code().unwrap_or(1);
-                    return Err(anyhow::anyhow!(
+            let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
+            if !status.success() {
+                let code = extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(ScriptExitError {
+                    exit_code: code,
+                    message: format!(
                         "Workspace member '{}' script '{}' exited with status code: {}",
                         member.name,
                         opts.script,
                         code
-                    ));
-                }
-                summary.executed_packages.push(member.name.clone());
+                    ),
+                }));
+            }
+            summary.executed_packages.push(member.name.clone());
+        } else {
+            if opts.if_present || opts.filter_members.is_none() {
+                debug!(
+                    "Skipping package '{}': script '{}' not found",
+                    member.name, opts.script
+                );
+                summary.skipped_packages.push(member.name.clone());
             } else {
-                if opts.if_present || opts.filter_members.is_none() {
-                    debug!(
-                        "Skipping package '{}': script '{}' not found",
-                        member.name, opts.script
-                    );
-                    summary.skipped_packages.push(member.name.clone());
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "rnpm ERR! missing script: {} in workspace package {}",
-                        opts.script,
-                        member.name
-                    ));
-                }
+                return Err(anyhow::anyhow!(
+                    "rnpm ERR! missing script: {} in workspace package {}",
+                    opts.script,
+                    member.name
+                ));
             }
         }
     }
@@ -1096,7 +1672,7 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             continue;
         }
         if let Some(ref filter) = opts.filter_members {
-            if !filter.iter().any(|f| f == &member.name) {
+            if !filter.iter().any(|f| matches_filter(f, &member.name, &member.path, root_dir)) {
                 continue;
             }
         }
@@ -1139,13 +1715,16 @@ pub async fn execute_workspace_scripts_topological_with_abort(
 
             let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
-                let code = status.code().unwrap_or(1);
-                return Err(anyhow::anyhow!(
-                    "Workspace member '{}' script '{}' exited with status code: {}",
-                    member.name,
-                    opts.script,
-                    code
-                ));
+                let code = extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(ScriptExitError {
+                    exit_code: code,
+                    message: format!(
+                        "Workspace member '{}' script '{}' exited with status code: {}",
+                        member.name,
+                        opts.script,
+                        code
+                    ),
+                }));
             }
             summary.executed_packages.push(member.name.clone());
         } else if opts.if_present || opts.filter_members.is_none() {
