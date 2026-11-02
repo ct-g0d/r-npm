@@ -438,3 +438,123 @@ fn test_workspace_discovery_malformed_json_error() {
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), WorkspaceError::Manifest(_)));
 }
+
+#[test]
+fn test_semver_pathological_ranges_and_build_tags() {
+    // 1. Wildcards: bare and partial
+    let r_bare_star = Range::parse("*").unwrap();
+    let r_bare_x = Range::parse("x").unwrap();
+    let r_bare_cap_x = Range::parse("X").unwrap();
+    let r_empty = Range::parse("").unwrap();
+    let test_ver = Version::parse("3.14.159").unwrap();
+    assert!(r_bare_star.satisfies(&test_ver));
+    assert!(r_bare_x.satisfies(&test_ver));
+    assert!(r_bare_cap_x.satisfies(&test_ver));
+    assert!(r_empty.satisfies(&test_ver));
+
+    let r_1_x = Range::parse("1.x").unwrap();
+    let r_1_cap_x = Range::parse("1.X").unwrap();
+    let r_1_star = Range::parse("1.*").unwrap();
+    let v_1_5_0 = Version::parse("1.5.0").unwrap();
+    let v_2_0_0 = Version::parse("2.0.0").unwrap();
+    assert!(r_1_x.satisfies(&v_1_5_0));
+    assert!(r_1_cap_x.satisfies(&v_1_5_0));
+    assert!(r_1_star.satisfies(&v_1_5_0));
+    assert!(!r_1_x.satisfies(&v_2_0_0));
+
+    let r_1_2_star = Range::parse("1.2.*").unwrap();
+    let r_1_2_x = Range::parse("1.2.x").unwrap();
+    let r_1_2_cap_x = Range::parse("1.2.X").unwrap();
+    let v_1_2_9 = Version::parse("1.2.9").unwrap();
+    let v_1_3_0 = Version::parse("1.3.0").unwrap();
+    assert!(r_1_2_star.satisfies(&v_1_2_9));
+    assert!(r_1_2_x.satisfies(&v_1_2_9));
+    assert!(r_1_2_cap_x.satisfies(&v_1_2_9));
+    assert!(!r_1_2_star.satisfies(&v_1_3_0));
+
+    // Multi-segment wildcards
+    let r_xxx = Range::parse("x.x.x").unwrap();
+    let r_stars = Range::parse("*.*.*").unwrap();
+    assert!(r_xxx.satisfies(&v_1_5_0));
+    assert!(r_stars.satisfies(&v_1_5_0));
+
+    // 2. Build tags equality and precedence (SemVer 2.0.0)
+    let v_b1 = Version::parse("1.0.0+build.1").unwrap();
+    let v_b2 = Version::parse("1.0.0+build.2").unwrap();
+    let v_plain = Version::parse("1.0.0").unwrap();
+    assert_eq!(v_b1, v_b2);
+    assert_eq!(v_b1, v_plain);
+    assert_eq!(v_b1.cmp(&v_b2), std::cmp::Ordering::Equal);
+
+    let v_next = Version::parse("1.0.1+exp.sha.123").unwrap();
+    assert!(v_b1 < v_next);
+
+    // Range matching with build tags in range and versions
+    let r_caret_build = Range::parse("^1.2.3+build.1").unwrap();
+    assert!(r_caret_build.satisfies(&Version::parse("1.2.3").unwrap()));
+    assert!(r_caret_build.satisfies(&Version::parse("1.2.4+build.99").unwrap()));
+    assert!(!r_caret_build.satisfies(&Version::parse("2.0.0").unwrap()));
+
+    let r_hyphen_build = Range::parse("1.0.0+build1 - 2.0.0+build2").unwrap();
+    assert!(r_hyphen_build.satisfies(&Version::parse("1.0.0").unwrap()));
+    assert!(r_hyphen_build.satisfies(&Version::parse("1.5.0+xyz").unwrap()));
+    assert!(r_hyphen_build.satisfies(&Version::parse("2.0.0").unwrap()));
+    assert!(!r_hyphen_build.satisfies(&Version::parse("2.0.1").unwrap()));
+
+    // 3. Multi-hyphen ranges & multiple hyphens in prereleases
+    let r_multi_hyphen = Range::parse("1.0.0 - 2.0.0 || 3.0.0 - 4.0.0 || 5.0.0 - 6.0.0").unwrap();
+    assert!(r_multi_hyphen.satisfies(&Version::parse("1.5.0").unwrap()));
+    assert!(!r_multi_hyphen.satisfies(&Version::parse("2.5.0").unwrap()));
+    assert!(r_multi_hyphen.satisfies(&Version::parse("3.5.0").unwrap()));
+    assert!(!r_multi_hyphen.satisfies(&Version::parse("4.5.0").unwrap()));
+    assert!(r_multi_hyphen.satisfies(&Version::parse("5.5.0").unwrap()));
+
+    let r_pre_hyphens = Range::parse("1.0.0-rc-1.0 - 2.0.0-rc-2.0").unwrap();
+    let v_pre1 = Version::parse("1.0.0-rc-1.0").unwrap();
+    let v_pre_mid = Version::parse("1.5.0").unwrap();
+    let v_pre2 = Version::parse("2.0.0-rc-2.0").unwrap();
+    assert!(r_pre_hyphens.satisfies(&v_pre1));
+    assert!(r_pre_hyphens.satisfies(&v_pre_mid));
+    assert!(r_pre_hyphens.satisfies(&v_pre2));
+
+    let v_multi_dash = Version::parse("1.0.0-alpha-beta-gamma.1").unwrap();
+    assert_eq!(v_multi_dash.to_string(), "1.0.0-alpha-beta-gamma.1");
+    let r_multi_dash = Range::parse("^1.0.0-alpha-beta-gamma.1").unwrap();
+    assert!(r_multi_dash.satisfies(&v_multi_dash));
+}
+
+#[test]
+fn test_pathological_scoped_alias_targets() {
+    // Scoped alias pointing to scoped package
+    let s1 = PackageSpec::parse_dependency("@client/core", "npm:@infra/core@^2.1.0").unwrap();
+    assert_eq!(s1.name, "@client/core");
+    match s1.target {
+        PackageTarget::Alias { name, target } => {
+            assert_eq!(name, "@infra/core");
+            assert!(matches!(*target, PackageTarget::Range(_)));
+        }
+        other => panic!("Expected Alias target, got: {:?}", other),
+    }
+
+    // Bare scoped alias (implicit latest)
+    let s2 = PackageSpec::parse_dependency("local-helper", "npm:@company/helper").unwrap();
+    assert_eq!(s2.name, "local-helper");
+    match s2.target {
+        PackageTarget::Alias { name, target } => {
+            assert_eq!(name, "@company/helper");
+            assert_eq!(*target, PackageTarget::Tag("latest".to_string()));
+        }
+        other => panic!("Expected Alias target, got: {:?}", other),
+    }
+
+    // Scoped alias with build tag
+    let s3 = PackageSpec::parse_dependency("@alias/lib", "npm:@target/lib@1.2.3+sha.abc").unwrap();
+    assert_eq!(s3.name, "@alias/lib");
+    match s3.target {
+        PackageTarget::Alias { name, target } => {
+            assert_eq!(name, "@target/lib");
+            assert!(matches!(*target, PackageTarget::Version(_)));
+        }
+        other => panic!("Expected Alias target, got: {:?}", other),
+    }
+}

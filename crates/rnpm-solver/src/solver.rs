@@ -201,6 +201,41 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 task.install_name, task.raw_spec, overridden
             );
             overridden
+        } else if let Some(alias_str) = task.raw_spec.strip_prefix("npm:") {
+            let (real_pkg, inner_spec) = if alias_str.starts_with('@') {
+                if let Some(slash) = alias_str.find('/') {
+                    let after = &alias_str[slash + 1..];
+                    if let Some(at) = after.find('@') {
+                        (&alias_str[..slash + 1 + at], &after[at + 1..])
+                    } else {
+                        (alias_str, "*")
+                    }
+                } else {
+                    (alias_str, "*")
+                }
+            } else if let Some(at) = alias_str.find('@') {
+                (&alias_str[..at], &alias_str[at + 1..])
+            } else {
+                (alias_str, "*")
+            };
+
+            if let Some(overridden) = self.overrides.resolve_override_strings(
+                real_pkg,
+                inner_spec,
+                &task.ancestors,
+            ) {
+                debug!(
+                    "Overriding aliased package '{}' (install: '{}'): '{}' -> '{}'",
+                    real_pkg, task.install_name, inner_spec, overridden
+                );
+                if overridden.starts_with("npm:") {
+                    overridden
+                } else {
+                    format!("npm:{}@{}", real_pkg, overridden)
+                }
+            } else {
+                task.raw_spec.clone()
+            }
         } else {
             task.raw_spec.clone()
         };
@@ -541,7 +576,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         match target {
             PackageTarget::Version(expected) => {
                 let v_str = expected.to_string();
-                meta.versions.get(&v_str)
+                if let Some(v) = meta.versions.get(&v_str) {
+                    Some(v)
+                } else {
+                    meta.versions.iter().find_map(|(ver_str, v_meta)| {
+                        if let Ok(parsed) = Version::parse(ver_str) {
+                            if &parsed == expected {
+                                return Some(v_meta);
+                            }
+                        }
+                        None
+                    })
+                }
             }
             PackageTarget::Tag(tag) => {
                 let tagged_version = meta.dist_tags.get(tag)?;

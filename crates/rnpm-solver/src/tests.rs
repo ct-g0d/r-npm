@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
+use crate::graph::DependencyType;
 use crate::platform::Platform;
 use crate::solver::{resolve_dependency_graph, ResolverOptions};
 use crate::types::{InMemoryPackageProvider, PackageVersionMetadata};
@@ -1433,4 +1434,502 @@ fn test_root_peer_dependencies_auto_installed() {
     assert!(graph.nodes.contains_key("node_modules/react"));
     assert_eq!(graph.nodes.get("node_modules/react").unwrap().version, "18.2.0");
 }
+
+#[test]
+fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections() {
+    use rnpm_lockfile::LockfileV3;
+    use crate::solver::resolve_fast_path;
+
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 1. Shared utilities at the bottom of the graph
+    provider.add_version("shared-utils", "1.0.0", |_| {});
+    provider.add_version("shared-utils", "1.5.0", |_| {});
+    provider.add_version("shared-utils", "2.0.0", |_| {});
+
+    // 2. Convergent diamond hubs that bridge across different branches
+    provider.add_version("diamond-hub-core", "1.0.0", |v| {
+        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("diamond-hub-crypto", "1.0.0", |v| {
+        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("diamond-hub-telemetry", "1.0.0", |v| {
+        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+    });
+
+    // 3. Construct 12 layers with 10 packages per layer (120 layer packages)
+    // Connecting each layer to the next in an interlocking diamond lattice:
+    // pkg-l{L}-{i} depends on pkg-l{L+1}-{i} and pkg-l{L+1}-{(i+1)%10}.
+    // Additionally, layers connect to diamond hubs.
+    const NUM_LAYERS: usize = 12;
+    const PKGS_PER_LAYER: usize = 10;
+
+    for l in 0..NUM_LAYERS {
+        for i in 0..PKGS_PER_LAYER {
+            let pkg_name = format!("pkg-l{}-{}", l, i);
+            provider.add_version(&pkg_name, "1.0.0", |v| {
+                if l + 1 < NUM_LAYERS {
+                    // Diamond intersection: 2 edges down to next layer
+                    let next_a = format!("pkg-l{}-{}", l + 1, i);
+                    let next_b = format!("pkg-l{}-{}", l + 1, (i + 1) % PKGS_PER_LAYER);
+                    v.dependencies.insert(next_a, "1.0.0".to_string());
+                    v.dependencies.insert(next_b, "1.0.0".to_string());
+                } else {
+                    // Bottom layer: all depend on shared-utils ^1.0.0
+                    v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+                }
+
+                // Cross-cutting diamond hub intersections
+                if l % 3 == 0 && i % 3 == 0 {
+                    v.dependencies.insert("diamond-hub-core".to_string(), "^1.0.0".to_string());
+                }
+                if l % 4 == 0 && i % 4 == 0 {
+                    v.dependencies.insert("diamond-hub-crypto".to_string(), "^1.0.0".to_string());
+                }
+                if l % 5 == 0 && i % 5 == 0 {
+                    v.dependencies.insert("diamond-hub-telemetry".to_string(), "^1.0.0".to_string());
+                }
+
+                // Sub-branch conflict: layer 8, pkg 5 requires incompatible shared-utils ^2.0.0
+                if l == 8 && i == 5 {
+                    v.dependencies.insert("shared-utils".to_string(), "^2.0.0".to_string());
+                }
+            });
+        }
+    }
+
+    // Root project depends on the 10 packages in layer 0
+    let mut manifest = Manifest::default();
+    manifest.name = Some("stress-100-project".to_string());
+    for i in 0..PKGS_PER_LAYER {
+        manifest.dependencies.insert(format!("pkg-l0-{}", i), "1.0.0".to_string());
+    }
+
+    let start = std::time::Instant::now();
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Resolution of 100+ dependency diamond stress graph must succeed");
+    let elapsed = start.elapsed();
+    println!("Resolved {} nodes in {:?}", graph.nodes.len(), elapsed);
+
+    // Assert graph size exceeds 100 dependencies (120 layer pkgs + 3 hubs + shared-utils + root)
+    assert!(
+        graph.nodes.len() > 100,
+        "Graph nodes count {} must exceed 100",
+        graph.nodes.len()
+    );
+
+    // Verify root-hoisted shared-utils resolved to 1.5.0 (highest matching ^1.0.0)
+    assert!(graph.nodes.contains_key("node_modules/shared-utils"));
+    let root_shared = graph.nodes.get("node_modules/shared-utils").unwrap();
+    assert_eq!(root_shared.version, "1.5.0");
+
+    // Verify diamond hubs are hoisted to root node_modules
+    assert!(graph.nodes.contains_key("node_modules/diamond-hub-core"));
+    assert!(graph.nodes.contains_key("node_modules/diamond-hub-crypto"));
+    assert!(graph.nodes.contains_key("node_modules/diamond-hub-telemetry"));
+
+    // Verify conflict-nested shared-utils@2.0.0 exists for pkg-l8-5
+    let nested_node = graph.nodes.iter().find(|(path, node)| {
+        node.name == "shared-utils" && node.version == "2.0.0" && path.contains("pkg-l8-5")
+    });
+    assert!(
+        nested_node.is_some(),
+        "Expected conflict-nested shared-utils@2.0.0 under pkg-l8-5"
+    );
+
+    // Verify Lockfile v3 generation and deterministic serialization
+    let lockfile = graph.to_lockfile_v3("stress-100-project", Some("1.0.0"));
+    assert!(
+        lockfile.packages.len() > 100,
+        "Lockfile packages count {} must exceed 100",
+        lockfile.packages.len()
+    );
+
+    // All paths in lockfile must be POSIX
+    for path in lockfile.packages.keys() {
+        assert!(!path.contains('\\'), "Lockfile key {} contains backslash", path);
+    }
+
+    let lock_json = lockfile.to_json_string().unwrap();
+    let parsed_lock = LockfileV3::from_json_str(&lock_json).unwrap();
+    assert_eq!(parsed_lock.packages.len(), lockfile.packages.len());
+
+    // Verify fast-path resolution with lockfile
+    let fast_graph = resolve_fast_path(&manifest, &parsed_lock, &options)
+        .expect("Fast-path resolution must succeed from lockfile");
+    assert_eq!(fast_graph.nodes.len(), graph.nodes.len());
+}
+
+#[test]
+fn test_cyclic_peer_resolution_extreme_density_clique() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 6-node dense peer clique: P0 through P5
+    // Every package has peer dependencies on all 5 other packages (30 mutual peer edges)
+    let packages = ["clique-p0", "clique-p1", "clique-p2", "clique-p3", "clique-p4", "clique-p5"];
+
+    for &pkg in &packages {
+        provider.add_version(pkg, "1.0.0", |v| {
+            for &peer in &packages {
+                if peer != pkg {
+                    v.peer_dependencies.insert(peer.to_string(), "^1.0.0".to_string());
+                }
+            }
+        });
+    }
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("peer-clique-app".to_string());
+    // Root depends on the first node
+    manifest.dependencies.insert("clique-p0".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Dense 6-node peer clique (30 edges) must resolve cleanly without stack overflow");
+
+    // All 6 packages must be installed in root node_modules
+    for &pkg in &packages {
+        let loc = format!("node_modules/{}", pkg);
+        assert!(graph.nodes.contains_key(&loc), "Missing clique node: {}", loc);
+    }
+
+    // Verify peer dependency edges exist between the clique members
+    let p0_edges = graph.get_outgoing_edges("node_modules/clique-p0");
+    assert_eq!(p0_edges.len(), 5, "P0 must have 5 peer edges to other clique members");
+    for edge in p0_edges {
+        assert_eq!(edge.dep_type, DependencyType::Peer);
+        assert!(packages.contains(&edge.package_name.as_str()));
+    }
+}
+
+#[test]
+fn test_cyclic_peer_resolution_multi_level_overlapping_requirements() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Multi-level overlapping peer cycles:
+    // Cycle 1: alpha <-> beta
+    // Cycle 2: beta <-> gamma <-> delta (overlaps at beta)
+    // Cycle 3: delta <-> epsilon <-> alpha (overlaps at delta and alpha)
+    // Multi-level: beta also has a regular production dependency on sub-widget,
+    // which itself has a peer dependency on gamma!
+
+    provider.add_version("alpha", "1.0.0", |v| {
+        v.peer_dependencies.insert("beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("epsilon".to_string(), "^1.0.0".to_string());
+    });
+
+    provider.add_version("beta", "1.0.0", |v| {
+        v.peer_dependencies.insert("alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("sub-widget".to_string(), "1.0.0".to_string());
+    });
+
+    provider.add_version("gamma", "1.0.0", |v| {
+        v.peer_dependencies.insert("beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("delta".to_string(), "^1.0.0".to_string());
+    });
+
+    provider.add_version("delta", "1.0.0", |v| {
+        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("epsilon".to_string(), "^1.0.0".to_string());
+    });
+
+    provider.add_version("epsilon", "1.0.0", |v| {
+        v.peer_dependencies.insert("delta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("alpha".to_string(), "^1.0.0".to_string());
+    });
+
+    provider.add_version("sub-widget", "1.0.0", |v| {
+        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("multi-level-peer-app".to_string());
+    manifest.dependencies.insert("alpha".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Multi-level overlapping cyclic peers must resolve cleanly");
+
+    assert!(graph.nodes.contains_key("node_modules/alpha"));
+    assert!(graph.nodes.contains_key("node_modules/beta"));
+    assert!(graph.nodes.contains_key("node_modules/gamma"));
+    assert!(graph.nodes.contains_key("node_modules/delta"));
+    assert!(graph.nodes.contains_key("node_modules/epsilon"));
+    assert!(graph.nodes.contains_key("node_modules/sub-widget"));
+}
+
+#[test]
+fn test_cyclic_peer_resolution_dense_mixed_optional_and_conflicts() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Node A peers B (required), C (optional present), D (optional absent)
+    provider.add_version("node-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("node-b".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("opt-present".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("opt-absent".to_string(), "^1.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("opt-present".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert("opt-absent".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    // Node B peers Node A (cyclic) and opt-present (cyclic optional)
+    provider.add_version("node-b", "1.0.0", |v| {
+        v.peer_dependencies.insert("node-a".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("opt-present".to_string(), "^1.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("opt-present".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    // opt-present is in provider and peers node-a
+    provider.add_version("opt-present", "1.0.0", |v| {
+        v.peer_dependencies.insert("node-a".to_string(), "^1.0.0".to_string());
+    });
+    // Note: opt-absent is NOT in provider
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dense-mixed-peer-app".to_string());
+    manifest.dependencies.insert("node-a".to_string(), "1.0.0".to_string());
+    // Explicitly include opt-present in root so it is present in scope
+    manifest.dependencies.insert("opt-present".to_string(), "1.0.0".to_string());
+
+    // Scenario 1: Clean resolution with mixed optional cyclic peers
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Dense mixed optional cyclic peers must resolve cleanly");
+
+    assert!(graph.nodes.contains_key("node_modules/node-a"));
+    assert!(graph.nodes.contains_key("node_modules/node-b"));
+    assert!(graph.nodes.contains_key("node_modules/opt-present"));
+    assert!(!graph.nodes.contains_key("node_modules/opt-absent"));
+
+    // Scenario 2: Strict peer conflict within cyclic relationship
+    // Create an incompatible node-b-v2 requiring node-a@^2.0.0
+    provider.add_version("node-b-conflict", "1.0.0", |v| {
+        v.peer_dependencies.insert("node-a".to_string(), "^2.0.0".to_string());
+    });
+
+    let mut conflict_manifest = Manifest::default();
+    conflict_manifest.name = Some("peer-conflict-app".to_string());
+    conflict_manifest.dependencies.insert("node-a".to_string(), "1.0.0".to_string());
+    conflict_manifest.dependencies.insert("node-b-conflict".to_string(), "1.0.0".to_string());
+
+    let strict_opts = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&conflict_manifest, &provider, &strict_opts).unwrap_err();
+    assert!(err.is_peer_conflict());
+    let err_str = err.to_string();
+    assert!(err_str.contains("ERESOLVE: Conflicting peer dependency 'node-a'"));
+
+    // Scenario 3: Legacy peer deps bypasses conflict
+    let legacy_opts = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
+    let legacy_graph = resolve_dependency_graph(&conflict_manifest, &provider, &legacy_opts)
+        .expect("legacy_peer_deps must bypass peer conflict");
+    assert!(legacy_graph.nodes.contains_key("node_modules/node-a"));
+    assert!(legacy_graph.nodes.contains_key("node_modules/node-b-conflict"));
+}
+
+#[test]
+fn test_pathological_overrides_deep_scoped_and_spec_targeted() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 5-level deep chain: app -> lev1 -> lev2 -> lev3 -> lev4 -> deep-target
+    provider.add_version("lev1", "1.0.0", |v| {
+        v.dependencies.insert("lev2".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("lev2", "1.0.0", |v| {
+        v.dependencies.insert("lev3".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("lev3", "1.0.0", |v| {
+        v.dependencies.insert("lev4".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("lev4", "1.0.0", |v| {
+        v.dependencies.insert("deep-target".to_string(), "^1.0.0".to_string());
+    });
+
+    // Another branch: app -> other-lev1 -> lev2 -> lev3 -> lev4 -> deep-target
+    provider.add_version("other-lev1", "1.0.0", |v| {
+        v.dependencies.insert("lev2".to_string(), "1.0.0".to_string());
+    });
+
+    provider.add_version("deep-target", "1.0.0", |_| {});
+    provider.add_version("deep-target", "5.0.0", |_| {});
+
+    // Wildcard-overridden target
+    provider.add_version("wildcard-pkg", "1.0.0", |_| {});
+    provider.add_version("wildcard-pkg", "3.0.0", |_| {});
+
+    // Range-overridden target
+    provider.add_version("range-pkg", "1.2.0", |_| {});
+    provider.add_version("range-pkg", "2.9.9", |_| {});
+
+    // Reference-overridden target ($canon-pkg)
+    provider.add_version("canon-pkg", "4.2.0", |_| {});
+    provider.add_version("shadow-pkg", "1.0.0", |_| {});
+    provider.add_version("shadow-pkg", "4.2.0", |_| {});
+
+    // Scoped package override
+    provider.add_version("@deep/scoped-pkg", "1.0.0", |_| {});
+    provider.add_version("@deep/scoped-pkg", "1.9.9", |_| {});
+
+    // Package that uses all these
+    provider.add_version("consumer-pkg", "1.0.0", |v| {
+        v.dependencies.insert("wildcard-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("range-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("shadow-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("@deep/scoped-pkg".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("pathological-overrides-app".to_string());
+    manifest.dependencies.insert("lev1".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("canon-pkg".to_string(), "4.2.0".to_string());
+    manifest.dependencies.insert("consumer-pkg".to_string(), "1.0.0".to_string());
+
+    // Configure pathological overrides:
+    // 1. Deep 4-level nested override: lev1 -> lev2 -> lev3 -> lev4 -> deep-target = 5.0.0
+    // 2. Wildcard spec override: wildcard-pkg@* = 3.0.0
+    // 3. Range spec override: range-pkg@>=1.0.0 <2.0.0 = 2.9.9
+    // 4. Reference override: shadow-pkg = $canon-pkg (pulls 4.2.0)
+    // 5. Scoped package override: @deep/scoped-pkg@^1.0.0 = 1.9.9
+    let overrides_json = serde_json::json!({
+        "lev1": {
+            "lev2": {
+                "lev3": {
+                    "lev4": {
+                        "deep-target": "5.0.0"
+                    }
+                }
+            }
+        },
+        "wildcard-pkg@*": "3.0.0",
+        "range-pkg@>=1.0.0 <2.0.0": "2.9.9",
+        "shadow-pkg": "$canon-pkg",
+        "@deep/scoped-pkg@^1.0.0": "1.9.9"
+    });
+    manifest.extra.insert("overrides".to_string(), overrides_json);
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Pathological overrides resolution must succeed");
+
+    // 1. Verify deep nested override
+    let deep_node = graph.nodes.values().find(|n| n.name == "deep-target").unwrap();
+    assert_eq!(deep_node.version, "5.0.0");
+
+    // 2. Verify wildcard spec override
+    let wildcard_node = graph.nodes.get("node_modules/wildcard-pkg").unwrap();
+    assert_eq!(wildcard_node.version, "3.0.0");
+
+    // 3. Verify range spec override
+    let range_node = graph.nodes.get("node_modules/range-pkg").unwrap();
+    assert_eq!(range_node.version, "2.9.9");
+
+    // 4. Verify reference override ($canon-pkg -> 4.2.0)
+    let shadow_node = graph.nodes.get("node_modules/shadow-pkg").unwrap();
+    assert_eq!(shadow_node.version, "4.2.0");
+
+    // 5. Verify scoped package override
+    let scoped_node = graph.nodes.get("node_modules/@deep/scoped-pkg").unwrap();
+    assert_eq!(scoped_node.version, "1.9.9");
+}
+
+#[test]
+fn test_pathological_scoped_aliases_and_overrides() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Provider versions
+    provider.add_version("@org/real-core", "1.0.0", |_| {});
+    provider.add_version("@org/real-core", "1.8.8", |_| {});
+
+    provider.add_version("@org/real-client", "2.0.0", |_| {});
+    provider.add_version("@org/real-client", "2.9.0", |_| {});
+
+    provider.add_version("unscoped-lib", "3.1.5+build.2024", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("alias-overrides-app".to_string());
+
+    // 1. Scoped alias pointing to scoped package:
+    // "@scope/alias-core": "npm:@org/real-core@^1.0.0"
+    manifest.dependencies.insert(
+        "@scope/alias-core".to_string(),
+        "npm:@org/real-core@^1.0.0".to_string(),
+    );
+
+    // 2. Unscoped alias pointing to scoped package:
+    // "alias-client": "npm:@org/real-client@^2.0.0"
+    manifest.dependencies.insert(
+        "alias-client".to_string(),
+        "npm:@org/real-client@^2.0.0".to_string(),
+    );
+
+    // 3. Scoped alias pointing to unscoped package with build tag:
+    // "@scope/alias-lib": "npm:unscoped-lib@~3.1.0"
+    manifest.dependencies.insert(
+        "@scope/alias-lib".to_string(),
+        "npm:unscoped-lib@~3.1.0".to_string(),
+    );
+
+    // Overrides:
+    // - Override @org/real-core (real package name) to 1.8.8
+    // - Override alias-client (install name) to npm:@org/real-client@2.9.0
+    let overrides_json = serde_json::json!({
+        "@org/real-core": "1.8.8",
+        "alias-client": "npm:@org/real-client@2.9.0"
+    });
+    manifest.extra.insert("overrides".to_string(), overrides_json);
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Scoped aliases with overrides must resolve cleanly");
+
+    // 1. @scope/alias-core is placed at node_modules/@scope/alias-core
+    // Real package is @org/real-core, overridden to 1.8.8
+    assert!(graph.nodes.contains_key("node_modules/@scope/alias-core"));
+    let node_core = graph.nodes.get("node_modules/@scope/alias-core").unwrap();
+    assert_eq!(node_core.install_name, "@scope/alias-core");
+    assert_eq!(node_core.name, "@org/real-core");
+    assert_eq!(node_core.version, "1.8.8");
+
+    // 2. alias-client is placed at node_modules/alias-client
+    // Real package is @org/real-client, overridden to 2.9.0
+    assert!(graph.nodes.contains_key("node_modules/alias-client"));
+    let node_client = graph.nodes.get("node_modules/alias-client").unwrap();
+    assert_eq!(node_client.install_name, "alias-client");
+    assert_eq!(node_client.name, "@org/real-client");
+    assert_eq!(node_client.version, "2.9.0");
+
+    // 3. @scope/alias-lib is placed at node_modules/@scope/alias-lib
+    // Real package is unscoped-lib with build tag
+    assert!(graph.nodes.contains_key("node_modules/@scope/alias-lib"));
+    let node_lib = graph.nodes.get("node_modules/@scope/alias-lib").unwrap();
+    assert_eq!(node_lib.install_name, "@scope/alias-lib");
+    assert_eq!(node_lib.name, "unscoped-lib");
+    assert_eq!(node_lib.version, "3.1.5+build.2024");
+
+    // Verify Lockfile v3 serialization preserves alias real names and POSIX paths
+    let lockfile = graph.to_lockfile_v3("alias-overrides-app", Some("1.0.0"));
+    let pkg_core = lockfile.packages.get("node_modules/@scope/alias-core").unwrap();
+    assert_eq!(pkg_core.name.as_deref(), Some("@org/real-core"));
+    assert_eq!(pkg_core.version.as_deref(), Some("1.8.8"));
+
+    let pkg_client = lockfile.packages.get("node_modules/alias-client").unwrap();
+    assert_eq!(pkg_client.name.as_deref(), Some("@org/real-client"));
+    assert_eq!(pkg_client.version.as_deref(), Some("2.9.0"));
+
+    let pkg_lib = lockfile.packages.get("node_modules/@scope/alias-lib").unwrap();
+    assert_eq!(pkg_lib.name.as_deref(), Some("unscoped-lib"));
+    assert_eq!(pkg_lib.version.as_deref(), Some("3.1.5+build.2024"));
+}
+
 

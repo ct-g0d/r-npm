@@ -37,7 +37,7 @@ impl fmt::Display for PrereleaseId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
@@ -168,6 +168,23 @@ impl Ord for Version {
                 self.prerelease.len().cmp(&other.prerelease.len())
             }
         }
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Version {}
+
+impl std::hash::Hash for Version {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.major.hash(state);
+        self.minor.hash(state);
+        self.patch.hash(state);
+        self.prerelease.hash(state);
     }
 }
 

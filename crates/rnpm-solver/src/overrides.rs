@@ -204,9 +204,25 @@ fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
         return true;
     }
 
-    // Try semver range matching if both can be parsed as ranges
+    // Wildcards: "*" or "x" or "X" match anything
+    if p == "*" || p.eq_ignore_ascii_case("x") {
+        return true;
+    }
+
+    // Try semver range matching if requested_spec is an exact version
     if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r)) {
         return p_range.satisfies(&r_ver);
+    }
+
+    // If both can be parsed as ranges, check if requested range's lower bound satisfies pattern range
+    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r)) {
+        if let Some(first_set) = r_range.sets.first() {
+            if let Some(first_comp) = first_set.comparators.first() {
+                if p_range.satisfies(&first_comp.version) {
+                    return true;
+                }
+            }
+        }
     }
 
     false
