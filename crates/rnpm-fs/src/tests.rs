@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::io::Cursor;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -312,3 +312,136 @@ fn test_junction_nonexistent_path_safety() {
     // Removing nonexistent path must be idempotent and succeed
     assert!(remove_junction(&non_existent).is_ok());
 }
+#[test]
+fn test_pack_directory_tarball_generation_and_integrity() {
+    let dir = tempdir().unwrap();
+    let pkg_dir = dir.path().join("my-test-package");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    // Setup package.json
+    let package_json = serde_json::json!({
+        "name": "@my-scope/test-pack",
+        "version": "1.2.3",
+        "description": "Testing pack functionality",
+        "main": "index.js",
+        "bin": {
+            "my-cli": "./bin/cli.js"
+        }
+    });
+    fs::write(pkg_dir.join("package.json"), package_json.to_string()).unwrap();
+    fs::write(pkg_dir.join("index.js"), "module.exports = 42;\n").unwrap();
+    fs::create_dir_all(pkg_dir.join("bin")).unwrap();
+    fs::write(pkg_dir.join("bin/cli.js"), "#!/usr/bin/env node\nconsole.log(42);\n").unwrap();
+    fs::write(pkg_dir.join("README.md"), "# Test Package\n").unwrap();
+    fs::write(pkg_dir.join("LICENSE"), "MIT License\n").unwrap();
+
+    // Files that MUST be excluded
+    fs::create_dir_all(pkg_dir.join("node_modules/dep")).unwrap();
+    fs::write(pkg_dir.join("node_modules/dep/index.js"), "evil").unwrap();
+    fs::create_dir_all(pkg_dir.join(".git")).unwrap();
+    fs::write(pkg_dir.join(".git/config"), "secret").unwrap();
+    fs::write(pkg_dir.join("package-lock.json"), "{}").unwrap();
+    fs::write(pkg_dir.join(".npmrc"), "//token").unwrap();
+
+    let dest_tarball = dir.path().join("output.tgz");
+    let (summary, compressed_bytes) = crate::tarball::pack_directory(&pkg_dir, Some(&dest_tarball)).unwrap();
+
+    assert_eq!(summary.name, "@my-scope/test-pack");
+    assert_eq!(summary.version, "1.2.3");
+    assert_eq!(summary.filename, "my-scope-test-pack-1.2.3.tgz");
+    assert!(dest_tarball.exists());
+
+    // Verify SSRI integrity
+    let integrity = rnpm_core::integrity::Integrity::parse(&summary.integrity).unwrap();
+    integrity.verify(&compressed_bytes).unwrap();
+
+    // Verify tarball contents by extracting with extract_tar_gz
+    let extract_dir = dir.path().join("extracted");
+    let extraction = crate::tarball::extract_tar_gz(Cursor::new(&compressed_bytes), &extract_dir, None).unwrap();
+
+    assert!(extract_dir.join("package.json").exists());
+    assert!(extract_dir.join("index.js").exists());
+    assert!(extract_dir.join("bin/cli.js").exists());
+    assert!(extract_dir.join("README.md").exists());
+    assert!(extract_dir.join("LICENSE").exists());
+
+    // Verify exclusions
+    assert!(!extract_dir.join("node_modules").exists());
+    assert!(!extract_dir.join(".git").exists());
+    assert!(!extract_dir.join("package-lock.json").exists());
+    assert!(!extract_dir.join(".npmrc").exists());
+
+    assert_eq!(extraction.entries_extracted, summary.entry_count);
+}
+
+#[test]
+fn test_pack_files_array_and_ignore_rules() {
+    let dir = tempdir().unwrap();
+    let pkg_dir = dir.path().join("files-pkg");
+    fs::create_dir_all(pkg_dir.join("src")).unwrap();
+    fs::create_dir_all(pkg_dir.join("test")).unwrap();
+
+    let package_json = serde_json::json!({
+        "name": "files-pkg",
+        "version": "2.0.0",
+        "files": ["src", "extra.txt"]
+    });
+    fs::write(pkg_dir.join("package.json"), package_json.to_string()).unwrap();
+    fs::write(pkg_dir.join("src/index.js"), "src").unwrap();
+    fs::write(pkg_dir.join("src/utils.js"), "util").unwrap();
+    fs::write(pkg_dir.join("extra.txt"), "extra").unwrap();
+    fs::write(pkg_dir.join("test/test.js"), "test").unwrap();
+    fs::write(pkg_dir.join("README.txt"), "readme text").unwrap();
+
+    // .npmignore inside src
+    fs::write(pkg_dir.join(".npmignore"), "src/utils.js\n").unwrap();
+
+    let (_summary, compressed_bytes) = crate::tarball::pack_directory(&pkg_dir, None).unwrap();
+
+    let extract_dir = dir.path().join("extracted");
+    crate::tarball::extract_tar_gz(Cursor::new(&compressed_bytes), &extract_dir, None).unwrap();
+
+    // Should include: package.json (always), README.txt (always), src/index.js, extra.txt
+    assert!(extract_dir.join("package.json").exists());
+    assert!(extract_dir.join("README.txt").exists());
+    assert!(extract_dir.join("src/index.js").exists());
+    assert!(extract_dir.join("extra.txt").exists());
+
+    // Should NOT include: src/utils.js (ignored by .npmignore), test/test.js (not in files)
+    assert!(!extract_dir.join("src/utils.js").exists());
+    assert!(!extract_dir.join("test/test.js").exists());
+}
+
+#[test]
+fn test_pack_edge_cases_and_error_handling() {
+    let dir = tempdir().unwrap();
+
+    // 1. Missing package.json
+    let empty_dir = dir.path().join("empty");
+    fs::create_dir_all(&empty_dir).unwrap();
+    assert!(crate::tarball::pack_directory(&empty_dir, None).is_err());
+
+    // 2. Malformed package.json
+    let malformed_dir = dir.path().join("malformed");
+    fs::create_dir_all(&malformed_dir).unwrap();
+    fs::write(malformed_dir.join("package.json"), "NOT VALID JSON {{{{").unwrap();
+    assert!(crate::tarball::pack_directory(&malformed_dir, None).is_err());
+
+    // 3. Fallback to .gitignore when .npmignore is absent
+    let gitignore_dir = dir.path().join("gitignore-fallback");
+    fs::create_dir_all(&gitignore_dir).unwrap();
+    fs::write(gitignore_dir.join("package.json"), r#"{"name":"gi-fallback","version":"1.0.0"}"#).unwrap();
+    fs::write(gitignore_dir.join("kept.js"), "kept").unwrap();
+    fs::write(gitignore_dir.join("ignored.log"), "log").unwrap();
+    fs::write(gitignore_dir.join(".gitignore"), "*.log\n").unwrap();
+
+    let (summary, compressed) = crate::tarball::pack_directory(&gitignore_dir, None).unwrap();
+    assert_eq!(summary.name, "gi-fallback");
+    let extract_dir = dir.path().join("gi-extract");
+    crate::tarball::extract_tar_gz(Cursor::new(&compressed), &extract_dir, None).unwrap();
+    assert!(extract_dir.join("kept.js").exists());
+    assert!(!extract_dir.join("ignored.log").exists());
+    assert!(!extract_dir.join(".gitignore").exists());
+}
+
+

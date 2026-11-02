@@ -1027,8 +1027,10 @@ dependencies = [
  "anyhow",
  "clap",
  "rnpm-core",
+ "rnpm-fs",
  "rnpm-install",
  "rnpm-lifecycle",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1064,9 +1066,11 @@ dependencies = [
 name = "rnpm-fs"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "flate2",
  "path-clean",
  "rnpm-core",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror",

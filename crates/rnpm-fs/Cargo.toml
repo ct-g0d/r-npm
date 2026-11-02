@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 rnpm-core = { workspace = true }
+data-encoding = { workspace = true }
 thiserror = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
@@ -17,3 +18,4 @@ path-clean = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }
