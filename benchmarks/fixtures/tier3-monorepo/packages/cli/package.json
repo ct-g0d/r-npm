@@ -1,0 +1,13 @@
+{
+  "name": "@tier3-mono/cli",
+  "version": "1.0.0",
+  "description": "Monorepo command line tool",
+  "main": "index.js",
+  "bin": {
+    "mono-cli": "./bin/tool.js"
+  },
+  "dependencies": {
+    "@tier3-mono/utils": "^1.0.0",
+    "commander": "^11.1.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "tier3-100-packages",
+  "version": "1.0.0",
+  "description": "Tier 3 stress benchmark fixture with 100+ package dependency graph",
+  "private": true,
+  "dependencies": {
+    "pkg-tier3-stress-001": "^1.0.0",
+    "pkg-tier3-stress-002": "^1.0.0",
+    "pkg-tier3-stress-003": "^1.0.0",
+    "pkg-tier3-stress-004": "^1.0.0",
+    "pkg-tier3-stress-005": "^1.0.0",
+    "pkg-tier3-stress-006": "^1.0.0",
+    "pkg-tier3-stress-007": "^1.0.0",
+    "pkg-tier3-stress-008": "^1.0.0",
+    "pkg-tier3-stress-009": "^1.0.0",
+    "pkg-tier3-stress-010": "^1.0.0"
+  }
+}

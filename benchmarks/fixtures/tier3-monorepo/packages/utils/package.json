@@ -1,0 +1,10 @@
+{
+  "name": "@tier3-mono/utils",
+  "version": "1.0.0",
+  "description": "Monorepo shared utility library",
+  "main": "index.js",
+  "dependencies": {
+    "@tier3-mono/core": "^1.0.0",
+    "bytes": "^3.1.2"
+  }
+}

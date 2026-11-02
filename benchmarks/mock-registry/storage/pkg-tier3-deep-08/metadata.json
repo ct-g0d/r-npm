@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-tier3-deep-08",
+  "name": "pkg-tier3-deep-08",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-deep-08",
+      "version": "1.0.0",
+      "description": "Tier 3 deep dependency chain level 8",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-deep-09": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "17a28219b11b9149ad61a216cb2ef481c5d5402c",
+        "integrity": "sha512-skb0jw9OMKkrg1/w1Rwmh/xDfCzkZdTnGoo4O5ZgxSeVwJeG/HF33oW+geRNcNXrzSzcE5dmv3gZ+I4OhNcGWA==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-deep-08/-/pkg-tier3-deep-08-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

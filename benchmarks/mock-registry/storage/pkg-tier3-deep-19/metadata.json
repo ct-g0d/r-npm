@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-tier3-deep-19",
+  "name": "pkg-tier3-deep-19",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-deep-19",
+      "version": "1.0.0",
+      "description": "Tier 3 deep dependency chain level 19",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-deep-20": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "0481148d37a2f881948d1b25c700bdfe7a4de503",
+        "integrity": "sha512-TcTtiq5gJQXbWmaskzhTkh/okUo/beZfAMY6HcHIgy1isPOGCrY5YIpnPMw5DiO62TFusQbax/3C0zdifG9sLA==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-deep-19/-/pkg-tier3-deep-19-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

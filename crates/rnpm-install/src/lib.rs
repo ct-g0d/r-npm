@@ -457,8 +457,26 @@ impl Installer {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
                 let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&node.resolved_url) {
-                    debug!("Cache hit for {}", node.resolved_url);
-                    Ok((data, true))
+                    let is_valid = if let Ok(expected) = node.integrity.parse::<Integrity>() {
+                        expected.verify(&data).is_ok()
+                    } else {
+                        true
+                    };
+
+                    if is_valid {
+                        debug!("Cache hit for {}", node.resolved_url);
+                        Ok((data, true))
+                    } else {
+                        debug!("Cached blob for {} failed integrity, purging and re-fetching", node.resolved_url);
+                        let _ = cache.purge_key(&node.resolved_url);
+                        match registry_client.download_tarball_bytes(&node.resolved_url).await {
+                            Ok(bytes) => {
+                                let _ = cache.put(&node.resolved_url, &bytes, None);
+                                Ok((bytes, false))
+                            }
+                            Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
+                        }
+                    }
                 } else {
                     info!("Downloading {}", node.resolved_url);
                     match registry_client.download_tarball_bytes(&node.resolved_url).await {
@@ -852,16 +870,50 @@ impl Installer {
                 }
             };
 
-            if let Err(e) = expected_integrity.verify(&bytes) {
-                if is_optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
-                    );
-                    continue;
+            let bytes = if let Err(e) = expected_integrity.verify(&bytes) {
+                if was_hit {
+                    debug!("Cached blob for {pkg_key} failed integrity ({e}), re-fetching from registry");
+                    let _ = self.cache.purge_key(_resolved_url);
+                    match self.registry_client.download_tarball_bytes(_resolved_url).await {
+                        Ok(fresh_bytes) => {
+                            if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                if is_optional {
+                                    warn!(
+                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                    );
+                                    continue;
+                                } else {
+                                    return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                }
+                            }
+                            let _ = self.cache.put(_resolved_url, &fresh_bytes, None);
+                            fresh_bytes
+                        }
+                        Err(fetch_err) => {
+                            if is_optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                                    pkg_key, fetch_err
+                                );
+                                continue;
+                            } else {
+                                return Err(fetch_err.into());
+                            }
+                        }
+                    }
                 } else {
-                    return Err(anyhow!("Integrity verification failed for {pkg_key}: {e}"));
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
+                        );
+                        continue;
+                    } else {
+                        return Err(anyhow!("Integrity verification failed for {pkg_key}: {e}"));
+                    }
                 }
-            }
+            } else {
+                bytes
+            };
 
             let target_path = self.options.project_dir.join(pkg_key);
             if let Err(e) = extract_and_replace(Cursor::new(&bytes), &target_path, None) {

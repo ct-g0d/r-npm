@@ -1,0 +1,11 @@
+{
+  "name": "@tier3-mono/app",
+  "version": "1.0.0",
+  "description": "Monorepo main client web application",
+  "main": "index.js",
+  "dependencies": {
+    "@tier3-mono/ui": "^1.0.0",
+    "@tier3-mono/api": "^1.0.0",
+    "cors": "^2.8.5"
+  }
+}

@@ -637,6 +637,72 @@ const PACKAGES = [
     }
 ];
 
+// ==========================================
+// Tier 3: Deeply Nested Dependency Chain (25+ levels)
+// ==========================================
+for (let i = 0; i <= 25; i++) {
+    const pkgName = `pkg-tier3-deep-${String(i).padStart(2, '0')}`;
+    const nextPkg = i < 25 ? `pkg-tier3-deep-${String(i + 1).padStart(2, '0')}` : null;
+    const deps = nextPkg ? { [nextPkg]: '^1.0.0' } : {};
+    PACKAGES.push({
+        name: pkgName,
+        version: '1.0.0',
+        description: `Tier 3 deep dependency chain level ${i}`,
+        main: 'index.js',
+        files: {
+            'package/index.js': `module.exports = { level: ${i}, name: "${pkgName}" };\n`
+        },
+        dependencies: deps
+    });
+}
+PACKAGES.push({
+    name: 'pkg-tier3-deep-branch',
+    version: '1.0.0',
+    description: 'Tier 3 deep diamond branch',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = { branch: true };\n'
+    },
+    dependencies: {
+        'pkg-tier3-deep-15': '^1.0.0'
+    }
+});
+
+// ==========================================
+// Tier 3: 100+ Package Tree Stress Graph
+// ==========================================
+// Generate 110 packages: pkg-tier3-stress-001 through pkg-tier3-stress-110
+for (let i = 1; i <= 110; i++) {
+    const pkgName = `pkg-tier3-stress-${String(i).padStart(3, '0')}`;
+    const deps = {};
+    if (i <= 10) {
+        // Root / high-level packages (1..10) depend on mid-tier packages (11..50)
+        const midBase = 11 + ((i - 1) * 4);
+        for (let m = 0; m < 4 && (midBase + m) <= 50; m++) {
+            deps[`pkg-tier3-stress-${String(midBase + m).padStart(3, '0')}`] = '^1.0.0';
+        }
+    } else if (i <= 50) {
+        // Mid-tier packages (11..50) depend on leaf packages (51..110)
+        // Ensure all 60 leaf packages (51..110) are evenly distributed across the 40 mid-tier packages
+        const leafOffset = ((i - 11) * 3) % 60;
+        for (let l = 0; l < 3; l++) {
+            const targetLeaf = 51 + ((leafOffset + l) % 60);
+            deps[`pkg-tier3-stress-${String(targetLeaf).padStart(3, '0')}`] = '^1.0.0';
+        }
+    }
+    // Leaf packages (51..110) have empty deps
+    PACKAGES.push({
+        name: pkgName,
+        version: '1.0.0',
+        description: `Tier 3 stress tree package ${i} of 110`,
+        main: 'index.js',
+        files: {
+            'package/index.js': `module.exports = { id: ${i}, name: "${pkgName}" };\n`
+        },
+        dependencies: deps
+    });
+}
+
 const STORAGE_DIR = path.resolve(__dirname, 'storage');
 
 function build() {
