@@ -147,6 +147,26 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             root_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
         }
 
+        // 4. peerDependencies from root (auto-install if not legacy_peer_deps and not already present)
+        if !self.options.legacy_peer_deps {
+            for (k, v) in &root_manifest.peer_dependencies {
+                let is_opt_peer = root_manifest
+                    .peer_dependencies_meta
+                    .get(k)
+                    .map(|m| m.optional)
+                    .unwrap_or(false);
+                let p_type = if is_opt_peer {
+                    DependencyType::PeerOptional
+                } else {
+                    DependencyType::Peer
+                };
+                root_deps
+                    .entry(k.clone())
+                    .or_insert_with(|| (v.clone(), p_type));
+                self.peer_ctx.enter(&root_name, k);
+            }
+        }
+
         let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
         for (install_name, (raw_spec, dep_type)) in root_deps {
             self.queue.push_back(ResolveTask {
@@ -196,20 +216,32 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 .peer_ctx
                 .is_cycle(&task.parent_package_name, &dep_spec.package_name)
             {
+                let cycle_path_str = self
+                    .peer_ctx
+                    .find_cycle_path(&task.parent_package_name, &dep_spec.package_name)
+                    .map(|p| p.join(" -> "))
+                    .unwrap_or_else(|| {
+                        format!("{} -> {}", task.parent_package_name, dep_spec.package_name)
+                    });
                 debug!(
-                    "Peer cycle detected between '{}' and '{}', resolving to active instance",
-                    task.parent_package_name, dep_spec.package_name
+                    "Peer cycle detected: {}, resolving to active instance",
+                    cycle_path_str
                 );
-                // Look for existing node with package_name in tree
-                if let Some((loc, _)) = self
-                    .graph
-                    .nodes
-                    .iter()
-                    .find(|(_, n)| n.name == dep_spec.package_name)
-                {
+                // Look for existing node with package_name visible in ancestor scope or anywhere in graph
+                if let Some(existing) = crate::hoisting::find_visible_node(
+                    &self.graph,
+                    &task.parent_location,
+                    &dep_spec.install_name,
+                ).or_else(|| {
+                    self.graph
+                        .nodes
+                        .iter()
+                        .find(|(_, n)| n.name == dep_spec.package_name)
+                        .map(|(_, n)| n)
+                }) {
                     self.graph.edges.push(DependencyEdge {
                         from_location: task.parent_location,
-                        to_location: loc.clone(),
+                        to_location: existing.location.clone(),
                         install_name: task.install_name,
                         package_name: dep_spec.package_name,
                         spec: effective_spec,
@@ -220,17 +252,20 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
 
             // Check if peer is already satisfied in ancestor/root scope
-            let root_candidate = format!("node_modules/{}", dep_spec.install_name);
-            if let Some(existing) = self.graph.nodes.get(&root_candidate) {
+            if let Some(existing) = crate::hoisting::find_visible_node(
+                &self.graph,
+                &task.parent_location,
+                &dep_spec.install_name,
+            ) {
                 if existing.name == dep_spec.package_name {
                     if crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         debug!(
                             "Peer dependency '{}@{}' satisfied by existing node at '{}'",
-                            dep_spec.package_name, effective_spec, root_candidate
+                            dep_spec.package_name, effective_spec, existing.location
                         );
                         self.graph.edges.push(DependencyEdge {
                             from_location: task.parent_location,
-                            to_location: root_candidate,
+                            to_location: existing.location.clone(),
                             install_name: task.install_name,
                             package_name: dep_spec.package_name,
                             spec: effective_spec,
@@ -257,8 +292,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 task.parent_package_name, dep_spec.package_name, effective_spec, dep_spec.package_name, existing.version
                             );
                         }
+                    } else if task.dep_type == DependencyType::PeerOptional {
+                        debug!(
+                            "Optional peer dependency '{}' for '{}' conflicts with installed {}@{} at '{}'; omitting optional peer",
+                            dep_spec.package_name, task.parent_package_name, existing.name, existing.version, existing.location
+                        );
+                        return Ok(());
                     }
                 }
+            } else if task.dep_type == DependencyType::PeerOptional {
+                // If an optional peer is NOT present in the scope, npm does not automatically download/install it
+                debug!(
+                    "Optional peer dependency '{}@{}' for '{}' is not present in scope; skipping auto-install",
+                    dep_spec.package_name, effective_spec, task.parent_package_name
+                );
+                return Ok(());
             }
         }
 

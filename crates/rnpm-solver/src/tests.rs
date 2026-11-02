@@ -1227,3 +1227,210 @@ fn test_intermediate_ancestor_hoisting() {
         PlacementDecision::PlaceNew("node_modules/A/node_modules/C".to_string())
     );
 }
+
+#[test]
+fn test_multi_node_peer_cycles_3_node() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 3-node peer cycle:
+    // pkg-a peers pkg-b (^1.0.0)
+    // pkg-b peers pkg-c (^1.0.0)
+    // pkg-c peers pkg-a (^1.0.0)
+    provider.add_version("pkg-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("pkg-b", "1.0.0", |v| {
+        v.peer_dependencies.insert("pkg-c".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("pkg-c", "1.0.0", |v| {
+        v.peer_dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("peer-cycle-3-app".to_string());
+    manifest.dependencies.insert("pkg-a".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("3-node cyclic peer dependencies must resolve without stack overflow or error");
+
+    assert!(graph.nodes.contains_key("node_modules/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-b"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-c"));
+}
+
+#[test]
+fn test_optional_peer_when_present_and_compatible() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    provider.add_version("canvas", "2.8.0", |_| {});
+    provider.add_version("chart-pkg", "1.0.0", |v| {
+        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("opt-peer-present".to_string());
+    // Both chart-pkg and canvas installed explicitly
+    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("canvas".to_string(), "2.8.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    assert!(graph.nodes.contains_key("node_modules/chart-pkg"));
+    assert!(graph.nodes.contains_key("node_modules/canvas"));
+
+    // Edge from chart-pkg to canvas exists
+    let edges = graph.get_outgoing_edges("node_modules/chart-pkg");
+    let canvas_edge = edges.iter().find(|e| e.package_name == "canvas");
+    assert!(canvas_edge.is_some());
+    assert_eq!(canvas_edge.unwrap().to_location, "node_modules/canvas");
+}
+
+#[test]
+fn test_optional_peer_when_present_and_incompatible() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // canvas installed at 1.0.0
+    provider.add_version("canvas", "1.0.0", |_| {});
+    // chart-pkg optionally peers canvas ^2.0.0
+    provider.add_version("chart-pkg", "1.0.0", |v| {
+        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("opt-peer-incompat".to_string());
+    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("canvas".to_string(), "1.0.0".to_string());
+
+    // In strict mode (strict_peers: true), incompatible optional peer must NOT fail with ERESOLVE!
+    let options = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Incompatible optional peer must be omitted silently, not fail resolution");
+
+    assert!(graph.nodes.contains_key("node_modules/chart-pkg"));
+    assert!(graph.nodes.contains_key("node_modules/canvas"));
+    assert_eq!(graph.nodes.get("node_modules/canvas").unwrap().version, "1.0.0");
+}
+
+#[test]
+fn test_optional_peer_absent_not_auto_downloaded() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // canvas exists in registry provider
+    provider.add_version("canvas", "2.8.0", |_| {});
+    // chart-pkg optionally peers canvas ^2.0.0
+    provider.add_version("chart-pkg", "1.0.0", |v| {
+        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        let mut meta = BTreeMap::new();
+        meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies_meta = meta;
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("opt-peer-absent".to_string());
+    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    // chart-pkg is installed, but canvas was NOT auto-downloaded
+    assert!(graph.nodes.contains_key("node_modules/chart-pkg"));
+    assert!(!graph.nodes.contains_key("node_modules/canvas"));
+}
+
+#[test]
+fn test_peer_conflict_rich_diagnostics() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    provider.add_version("react", "18.2.0", |_| {});
+    provider.add_version("plugin", "1.0.0", |v| {
+        v.peer_dependencies.insert("react".to_string(), "^17.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("app".to_string());
+    manifest.dependencies.insert("react".to_string(), "18.2.0".to_string());
+    manifest.dependencies.insert("plugin".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+
+    assert!(err.is_peer_conflict());
+    let (parent, peer, req_spec, found_ver, found_loc, req_by, msg) =
+        err.peer_conflict_details().expect("Should be PeerConflict");
+    assert_eq!(parent, "plugin");
+    assert_eq!(peer, "react");
+    assert_eq!(req_spec, "^17.0.0");
+    assert_eq!(found_ver, Some("18.2.0"));
+    assert_eq!(found_loc, Some("node_modules/react"));
+    assert_eq!(req_by, &["app".to_string(), "plugin".to_string()][..]);
+    assert!(msg.contains("does not satisfy peer constraint"));
+
+    let err_str = err.to_string();
+    // Verify no duplicated parent in chain: "app -> plugin", not "app -> plugin -> plugin"
+    assert!(err_str.contains("app -> plugin\n"));
+    assert!(!err_str.contains("plugin -> plugin"));
+}
+
+#[test]
+fn test_platform_filtering_isolation_before_download() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Incompatible platform package with transitive dependencies
+    provider.add_version("linux-bundle", "1.0.0", |v| {
+        v.os = Some(vec!["linux".to_string()]);
+        v.libc = Some(vec!["glibc".to_string()]);
+        v.dependencies.insert("cuda-driver".to_string(), "1.0.0".to_string());
+        v.dependencies.insert("large-weights".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("cuda-driver", "1.0.0", |_| {});
+    provider.add_version("large-weights", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("platform-isolation-test".to_string());
+    manifest.optional_dependencies.insert("linux-bundle".to_string(), "1.0.0".to_string());
+
+    // Host: Windows x64
+    let win_opts = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &win_opts).unwrap();
+
+    // Verify complete isolation: linux-bundle is marked skipped
+    assert!(graph.is_skipped("linux-bundle"));
+    // Neither linux-bundle NOR its transitive dependencies exist in graph
+    assert!(!graph.nodes.contains_key("node_modules/linux-bundle"));
+    assert!(!graph.nodes.contains_key("node_modules/cuda-driver"));
+    assert!(!graph.nodes.contains_key("node_modules/large-weights"));
+}
+
+#[test]
+fn test_root_peer_dependencies_auto_installed() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("react", "18.2.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("root-peer-app".to_string());
+    manifest.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    assert!(graph.nodes.contains_key("node_modules/react"));
+    assert_eq!(graph.nodes.get("node_modules/react").unwrap().version, "18.2.0");
+}
+

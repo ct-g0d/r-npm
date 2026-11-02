@@ -181,6 +181,39 @@ fn is_shadowed_by_incompatible_between(
     false
 }
 
+/// Finds the closest visible node for `install_name` starting from `from_location`
+/// and walking up the `node_modules` hierarchy to root.
+pub fn find_visible_node<'a>(
+    graph: &'a DependencyGraph,
+    from_location: &str,
+    install_name: &str,
+) -> Option<&'a crate::graph::Node> {
+    let mut current = from_location;
+    let mut candidate_buf = String::with_capacity(from_location.len() + 14 + install_name.len());
+    while !current.is_empty() {
+        candidate_buf.clear();
+        candidate_buf.push_str(current);
+        candidate_buf.push_str("/node_modules/");
+        candidate_buf.push_str(install_name);
+        if let Some(node) = graph.nodes.get(&candidate_buf) {
+            return Some(node);
+        }
+        // Ascend one directory level in node_modules hierarchy
+        if let Some(idx) = current.rfind("/node_modules/") {
+            current = &current[..idx];
+        } else if let Some(idx) = current.rfind('/') {
+            // For workspace packages like "packages/app", ascend to parent directory
+            current = &current[..idx];
+        } else {
+            break;
+        }
+    }
+
+    // Finally, check root `node_modules/<install_name>`
+    let root_target = format!("node_modules/{install_name}");
+    graph.nodes.get(&root_target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +263,36 @@ mod tests {
             decision,
             PlacementDecision::PlaceNew("node_modules/A/node_modules/B".to_string())
         );
+    }
+
+    #[test]
+    fn test_find_visible_node() {
+        let mut graph = DependencyGraph::new();
+        // Root node_modules/react
+        graph.nodes.insert("node_modules/react".to_string(), make_test_node("node_modules/react", "react", "18.2.0"));
+        // Nested node_modules/nested-lib/node_modules/local-dep
+        graph.nodes.insert(
+            "node_modules/nested-lib/node_modules/local-dep".to_string(),
+            make_test_node("node_modules/nested-lib/node_modules/local-dep", "local-dep", "1.0.0"),
+        );
+
+        // From root: can see react
+        let vis1 = find_visible_node(&graph, "", "react");
+        assert!(vis1.is_some());
+        assert_eq!(vis1.unwrap().version, "18.2.0");
+
+        // From nested-lib: can see react from ancestor root
+        let vis2 = find_visible_node(&graph, "node_modules/nested-lib", "react");
+        assert!(vis2.is_some());
+        assert_eq!(vis2.unwrap().version, "18.2.0");
+
+        // From nested-lib: can see local-dep under itself
+        let vis3 = find_visible_node(&graph, "node_modules/nested-lib", "local-dep");
+        assert!(vis3.is_some());
+        assert_eq!(vis3.unwrap().location, "node_modules/nested-lib/node_modules/local-dep");
+
+        // From root: CANNOT see nested-lib's local-dep
+        let vis4 = find_visible_node(&graph, "", "local-dep");
+        assert!(vis4.is_none());
     }
 }
