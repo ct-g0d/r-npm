@@ -165,7 +165,7 @@ This is a planning cadence, not a promise that every milestone fits in exactly s
 
 - `[x]` Emit checkpoint schema v1 artifacts.
 - `[x]` Tune bounded concurrency, cache access, extraction, and filesystem operations.
-- `[ ]` Run Tier 3 stress fixtures.
+- `[x]` Run Tier 3 stress fixtures.
 - `[x]` Repeat the review/benchmark loop for every material change.
 - **Exit gates:** Gate C, Gate D, and Gate F passed.
 
