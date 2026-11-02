@@ -1148,9 +1148,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rnpm-core",
+ "rnpm-lockfile",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

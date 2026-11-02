@@ -285,3 +285,156 @@ fn test_manifest_parsing_and_bom_tolerance() {
     let err = Manifest::from_str(malformed).unwrap_err();
     assert!(matches!(err, crate::error::ManifestError::MalformedJson { .. }));
 }
+
+#[test]
+fn test_workspace_spec_parsing() {
+    let t_star = PackageTarget::parse("workspace:*").unwrap();
+    assert_eq!(t_star, PackageTarget::Workspace("*".to_string()));
+    assert_eq!(t_star.to_string(), "workspace:*");
+
+    let t_caret = PackageTarget::parse("workspace:^").unwrap();
+    assert_eq!(t_caret, PackageTarget::Workspace("^".to_string()));
+    assert_eq!(t_caret.to_string(), "workspace:^");
+
+    let t_tilde = PackageTarget::parse("workspace:~").unwrap();
+    assert_eq!(t_tilde, PackageTarget::Workspace("~".to_string()));
+    assert_eq!(t_tilde.to_string(), "workspace:~");
+
+    let t_range = PackageTarget::parse("workspace:^1.2.0").unwrap();
+    assert_eq!(t_range, PackageTarget::Workspace("^1.2.0".to_string()));
+
+    let spec = PackageSpec::parse("pkg-a@workspace:*").unwrap();
+    assert_eq!(spec.name, "pkg-a");
+    assert_eq!(spec.target, PackageTarget::Workspace("*".to_string()));
+
+    let dep_spec = PackageSpec::parse_dependency("pkg-b", "workspace:^").unwrap();
+    assert_eq!(dep_spec.name, "pkg-b");
+    assert_eq!(dep_spec.target, PackageTarget::Workspace("^".to_string()));
+}
+
+#[test]
+fn test_workspace_discovery() {
+    use std::fs;
+    use tempfile::tempdir;
+    use crate::workspace::discover_workspaces;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    let root_json = r#"{
+        "name": "my-monorepo",
+        "private": true,
+        "workspaces": [
+            "packages/*",
+            "apps/**",
+            "!packages/ignored"
+        ]
+    }"#;
+    fs::write(root.join("package.json"), root_json).unwrap();
+
+    // Create packages/pkg-a
+    let pkg_a_dir = root.join("packages").join("pkg-a");
+    fs::create_dir_all(&pkg_a_dir).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        r#"{"name": "pkg-a", "version": "1.0.0"}"#,
+    ).unwrap();
+
+    // Create packages/pkg-b
+    let pkg_b_dir = root.join("packages").join("pkg-b");
+    fs::create_dir_all(&pkg_b_dir).unwrap();
+    fs::write(
+        pkg_b_dir.join("package.json"),
+        r#"{"name": "pkg-b", "version": "2.1.0", "dependencies": {"pkg-a": "workspace:*"}}"#,
+    ).unwrap();
+
+    // Create packages/ignored
+    let ignored_dir = root.join("packages").join("ignored");
+    fs::create_dir_all(&ignored_dir).unwrap();
+    fs::write(
+        ignored_dir.join("package.json"),
+        r#"{"name": "ignored", "version": "0.0.1"}"#,
+    ).unwrap();
+
+    // Create apps/nested/app-1
+    let app_1_dir = root.join("apps").join("nested").join("app-1");
+    fs::create_dir_all(&app_1_dir).unwrap();
+    fs::write(
+        app_1_dir.join("package.json"),
+        r#"{"name": "@myorg/app-1", "version": "0.1.0"}"#,
+    ).unwrap();
+
+    let members = discover_workspaces(root).unwrap();
+    assert_eq!(members.len(), 3);
+
+    let member_names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+    assert!(member_names.contains(&"pkg-a"));
+    assert!(member_names.contains(&"pkg-b"));
+    assert!(member_names.contains(&"@myorg/app-1"));
+    assert!(!member_names.contains(&"ignored"));
+
+    let pkg_b_member = members.iter().find(|m| m.name == "pkg-b").unwrap();
+    assert_eq!(pkg_b_member.relative_path, "packages/pkg-b");
+    assert_eq!(pkg_b_member.version.as_deref(), Some("2.1.0"));
+    assert_eq!(pkg_b_member.manifest.dependencies.get("pkg-a").unwrap(), "workspace:*");
+
+    let app_1_member = members.iter().find(|m| m.name == "@myorg/app-1").unwrap();
+    assert_eq!(app_1_member.relative_path, "apps/nested/app-1");
+}
+
+#[test]
+fn test_workspace_discovery_duplicate_names_error() {
+    use std::fs;
+    use tempfile::tempdir;
+    use crate::workspace::discover_workspaces;
+    use crate::error::WorkspaceError;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+    ).unwrap();
+
+    let d1 = root.join("packages").join("dir-1");
+    let d2 = root.join("packages").join("dir-2");
+    fs::create_dir_all(&d1).unwrap();
+    fs::create_dir_all(&d2).unwrap();
+
+    fs::write(d1.join("package.json"), r#"{"name": "conflict-pkg", "version": "1.0.0"}"#).unwrap();
+    fs::write(d2.join("package.json"), r#"{"name": "conflict-pkg", "version": "2.0.0"}"#).unwrap();
+
+    let result = discover_workspaces(root);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        WorkspaceError::DuplicatePackage { name, .. } => {
+            assert_eq!(name, "conflict-pkg");
+        }
+        other => panic!("Expected DuplicatePackage error, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_workspace_discovery_malformed_json_error() {
+    use std::fs;
+    use tempfile::tempdir;
+    use crate::workspace::discover_workspaces;
+    use crate::error::WorkspaceError;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+    ).unwrap();
+
+    let d = root.join("packages").join("broken");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("package.json"), r#"{"name": "broken", invalid_json"#).unwrap();
+
+    let result = discover_workspaces(root);
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), WorkspaceError::Manifest(_)));
+}

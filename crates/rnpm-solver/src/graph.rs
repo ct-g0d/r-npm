@@ -20,6 +20,7 @@ pub struct NodeFlags {
     pub peer: bool,
     pub bundled: bool,
     pub has_install_script: bool,
+    pub link: bool,
 }
 
 /// A directed edge in the dependency graph.
@@ -132,6 +133,7 @@ impl DependencyGraph {
                     version: Some(node.version.clone()),
                     resolved: node.resolved.clone(),
                     integrity: node.integrity.clone(),
+                    link: if node.flags.link { Some(true) } else { None },
                     dev: if node.flags.dev { Some(true) } else { None },
                     optional: if node.flags.optional { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {

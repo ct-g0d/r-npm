@@ -83,6 +83,9 @@ pub struct LockfilePackage {
 
     #[serde(rename = "optionalDependencies", skip_serializing_if = "Option::is_none", default)]
     pub optional_dependencies: Option<BTreeMap<String, String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub workspaces: Option<Vec<String>>,
 }
 
 /// npm `package-lock.json` lockfile version 3 document.

@@ -78,6 +78,10 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     // Target must exist for a junction
     let target_canonical = target.canonicalize().map_err(FsError::Io)?;
 
+    let link_str = link.to_string_lossy().replace('/', "\\");
+    let target_str = target_canonical.to_string_lossy().replace('/', "\\");
+    let clean_target = target_str.strip_prefix(r"\\?\").unwrap_or(&target_str);
+
     // cmd.exe /C mklink /J "<link>" "<target>"
     // mklink /J creates directory junctions without administrator privileges.
     let output = Command::new("cmd.exe")
@@ -85,8 +89,8 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
             "/C",
             "mklink",
             "/J",
-            &link.to_string_lossy(),
-            &target_canonical.to_string_lossy(),
+            &link_str,
+            clean_target,
         ])
         .output()
         .map_err(|err| FsError::JunctionError {

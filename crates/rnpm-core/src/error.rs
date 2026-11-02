@@ -13,6 +13,9 @@ pub enum CoreError {
 
     #[error("Manifest error: {0}")]
     Manifest(#[from] ManifestError),
+
+    #[error("Workspace error: {0}")]
+    Workspace(#[from] WorkspaceError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -90,5 +93,24 @@ pub enum ManifestError {
     InvalidField {
         field: String,
         detail: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum WorkspaceError {
+    #[error("Manifest error: {0}")]
+    Manifest(#[from] ManifestError),
+
+    #[error("IO error in workspace: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Workspace member missing name at '{0}'")]
+    MissingName(std::path::PathBuf),
+
+    #[error("Duplicate workspace package name '{name}' at '{first}' and '{second}'")]
+    DuplicatePackage {
+        name: String,
+        first: std::path::PathBuf,
+        second: std::path::PathBuf,
     },
 }
