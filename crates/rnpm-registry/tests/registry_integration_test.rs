@@ -133,6 +133,7 @@ async fn test_mock_fetch_abbreviated_metadata() {
         auth_token: None,
         trusted_hosts: HashSet::new(),
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
 
     let client = RegistryClient::with_config(config).unwrap();
@@ -172,6 +173,7 @@ async fn test_mock_scoped_package_encoding() {
         auth_token: None,
         trusted_hosts: HashSet::new(),
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
 
     let client = RegistryClient::with_config(config).unwrap();
@@ -204,6 +206,7 @@ async fn test_mock_streaming_tarball_download() {
         auth_token: None,
         trusted_hosts: HashSet::new(),
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
 
     let client = RegistryClient::with_config(config).unwrap();
@@ -249,6 +252,7 @@ async fn test_security_auth_header_stripped_on_cross_host_redirect() {
         auth_token: Some("secret-npm-token".into()),
         trusted_hosts,
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
 
     let client = RegistryClient::with_config(config).unwrap();
@@ -305,6 +309,7 @@ async fn test_security_auth_header_retained_on_same_host_redirect() {
         auth_token: Some("secret-npm-token".into()),
         trusted_hosts: trusted,
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
 
     let client = RegistryClient::with_config(config).unwrap();
@@ -322,6 +327,8 @@ async fn test_error_handling() {
             (404, vec![], b"{\"error\":\"Not found\"}".to_vec())
         } else if req.contains("GET /unauth") {
             (401, vec![], b"{\"error\":\"Unauthorized\"}".to_vec())
+        } else if req.contains("GET /forbidden") {
+            (403, vec![], b"{\"error\":\"Forbidden\"}".to_vec())
         } else if req.contains("GET /rate-limit") {
             (
                 429,
@@ -340,25 +347,139 @@ async fn test_error_handling() {
         auth_token: None,
         trusted_hosts: HashSet::new(),
         timeout: Duration::from_secs(5),
+        ..Default::default()
     };
     let client = RegistryClient::with_config(config).unwrap();
 
     // 404
     let err = client.get_package_metadata("not-found").await.unwrap_err();
     assert!(matches!(err, rnpm_registry::RegistryError::PackageNotFound { .. }));
+    assert_eq!(err.status_code(), Some(404));
+    assert!(err.is_not_found());
 
     // 401
     let err = client.get_package_metadata("unauth").await.unwrap_err();
     assert!(matches!(err, rnpm_registry::RegistryError::Unauthorized { .. }));
+    assert_eq!(err.status_code(), Some(401));
+    assert!(err.is_unauthorized());
+    assert!(err.is_auth_error());
+
+    // 403
+    let err = client.get_package_metadata("forbidden").await.unwrap_err();
+    assert!(matches!(err, rnpm_registry::RegistryError::Forbidden { .. }));
+    assert_eq!(err.status_code(), Some(403));
+    assert!(err.is_forbidden());
+    assert!(err.is_auth_error());
 
     // 429
     let err = client.get_package_metadata("rate-limit").await.unwrap_err();
-    match err {
+    match &err {
         rnpm_registry::RegistryError::RateLimited { retry_after } => {
-            assert_eq!(retry_after, Some(30));
+            assert_eq!(*retry_after, Some(30));
         }
         other => panic!("Expected RateLimited, got {other:?}"),
     }
+    assert_eq!(err.status_code(), Some(429));
+    assert!(err.is_rate_limited());
+    assert_eq!(err.retry_after(), Some(30));
+
+    // Tarball download structured diagnostics
+    let err_tar_404 = client
+        .download_tarball_bytes(&format!("{}not-found.tgz", server.url()))
+        .await
+        .unwrap_err();
+    assert_eq!(err_tar_404.status_code(), Some(404));
+    assert!(err_tar_404.is_not_found());
+
+    let err_tar_401 = client
+        .download_tarball_bytes(&format!("{}unauth.tgz", server.url()))
+        .await
+        .unwrap_err();
+    assert_eq!(err_tar_401.status_code(), Some(401));
+    assert!(err_tar_401.is_unauthorized());
+
+    let err_tar_403 = client
+        .download_tarball_bytes(&format!("{}forbidden.tgz", server.url()))
+        .await
+        .unwrap_err();
+    assert_eq!(err_tar_403.status_code(), Some(403));
+    assert!(err_tar_403.is_forbidden());
+
+    let err_tar_429 = client
+        .download_tarball_bytes(&format!("{}rate-limit.tgz", server.url()))
+        .await
+        .unwrap_err();
+    assert_eq!(err_tar_429.status_code(), Some(429));
+    assert!(err_tar_429.is_rate_limited());
+    assert_eq!(err_tar_429.retry_after(), Some(30));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_concurrent_metadata_and_tarball_fetching() {
+    let pkg_a_json = r#"{
+        "name": "pkg-a",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "pkg-a",
+                "version": "1.0.0",
+                "dist": { "tarball": "pkg-a.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+    let pkg_b_json = r#"{
+        "name": "pkg-b",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "2.0.0": {
+                "name": "pkg-b",
+                "version": "2.0.0",
+                "dist": { "tarball": "pkg-b.tgz", "integrity": "sha512-test" }
+            }
+        }
+    }"#;
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /pkg-a") {
+            (200, vec![("Content-Type", "application/json".into())], pkg_a_json.as_bytes().to_vec())
+        } else if req.contains("GET /pkg-b") {
+            (200, vec![("Content-Type", "application/json".into())], pkg_b_json.as_bytes().to_vec())
+        } else if req.contains("GET /tarballs/pkg-a.tgz") {
+            (200, vec![("Content-Type", "application/octet-stream".into())], b"bytes-a".to_vec())
+        } else if req.contains("GET /tarballs/pkg-b.tgz") {
+            (200, vec![("Content-Type", "application/octet-stream".into())], b"bytes-b".to_vec())
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-concurrent".into(),
+        auth_token: None,
+        trusted_hosts: HashSet::new(),
+        timeout: Duration::from_secs(5),
+        max_concurrent_requests: 4,
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // Test concurrent metadata fetch
+    let metas = client.get_package_metadata_concurrent(&["pkg-a", "pkg-b"]).await;
+    assert_eq!(metas.len(), 2);
+    assert_eq!(metas[0].as_ref().unwrap().name, "pkg-a");
+    assert_eq!(metas[1].as_ref().unwrap().name, "pkg-b");
+
+    // Test concurrent tarball fetch
+    let url_a = format!("{}tarballs/pkg-a.tgz", server.url());
+    let url_b = format!("{}tarballs/pkg-b.tgz", server.url());
+    let tarballs = client.download_tarballs_concurrent(&[&url_a, &url_b]).await;
+    assert_eq!(tarballs.len(), 2);
+    assert_eq!(tarballs[0].as_ref().unwrap(), b"bytes-a");
+    assert_eq!(tarballs[1].as_ref().unwrap(), b"bytes-b");
 
     server.stop();
 }
