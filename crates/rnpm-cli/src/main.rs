@@ -139,6 +139,37 @@ pub(crate) enum Commands {
         #[arg(long)]
         ignore_scripts: bool,
     },
+
+    /// Manage the package cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CacheAction {
+    /// Delete all data out of the cache folder
+    Clean {
+        /// Force clean without warning
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Verify the contents of the cache folder, garbage collect unneeded data, and validate integrity
+    Verify {
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
 }
 
 pub(crate) fn check_unsupported_cli_invocation<I, T>(raw_args: I) -> Option<(String, String)>
@@ -474,6 +505,56 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
                     summary.packages_updated, summary.cache_hits, summary.cache_misses
                 );
+            }
+        }
+        Commands::Cache { action, cache } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let cache_path = cache
+                .or_else(|| match &action {
+                    CacheAction::Clean { cache: c, .. } => c.clone(),
+                    CacheAction::Verify { cache: c } => c.clone(),
+                })
+                .unwrap_or_else(|| {
+                    if let Some(user_cache) = config.npmrc.settings.get("cache") {
+                        PathBuf::from(user_cache)
+                    } else if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                        PathBuf::from(appdata).join("rnpm").join("cache")
+                    } else {
+                        std::env::temp_dir().join(".rnpm-cache")
+                    }
+                });
+
+            let cache = rnpm_cache::Cache::new(&cache_path)?;
+
+            match action {
+                CacheAction::Clean { force, .. } => {
+                    if !force {
+                        eprintln!("npm error code EUSAGE");
+                        eprintln!("npm error As of npm@5, the npm cache self-heals from corruption issues");
+                        eprintln!("npm error and data extracted from the cache is guaranteed to be valid.");
+                        eprintln!("npm error If you want to make sure everything is healthy, use 'rnpm cache verify' instead.");
+                        eprintln!("npm error If you are sure you want to delete the entire cache, run:");
+                        eprintln!("npm error   rnpm cache clean --force");
+                        std::process::exit(1);
+                    }
+                    cache.clean()?;
+                    println!("rnpm: cache cleared successfully ({})", cache_path.display());
+                }
+                CacheAction::Verify { .. } => {
+                    let start = std::time::Instant::now();
+                    let report = cache.verify()?;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    println!("Cache verified and compacted ({})", cache_path.display());
+                    println!("Content verified: {} ({} bytes)", report.verified_blobs, report.total_blob_bytes);
+                    println!("Index entries: {}", report.verified_indices);
+                    if report.corrupted_blobs > 0 || report.corrupted_indices > 0 || report.orphaned_indices > 0 || report.stale_temp_files_cleaned > 0 {
+                        println!(
+                            "Cleaned: {} corrupt blob(s), {} corrupt index file(s), {} orphaned index pointer(s), {} stale temp file(s)",
+                            report.corrupted_blobs, report.corrupted_indices, report.orphaned_indices, report.stale_temp_files_cleaned
+                        );
+                    }
+                    println!("Finished in {:.3}s", elapsed);
+                }
             }
         }
     }

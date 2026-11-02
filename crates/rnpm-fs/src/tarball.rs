@@ -236,7 +236,27 @@ pub fn extract_tar_gz<R: Read>(
             }
 
             if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)?;
+                if !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                } else {
+                    #[cfg(windows)]
+                    if let Ok(meta) = fs::metadata(parent) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(parent, perms);
+                        }
+                    }
+                    #[cfg(unix)]
+                    if let Ok(meta) = fs::metadata(parent) {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = meta.permissions();
+                        if perms.mode() & 0o200 == 0 {
+                            perms.set_mode(perms.mode() | 0o700);
+                            let _ = fs::set_permissions(parent, perms);
+                        }
+                    }
+                }
             }
 
             // If target_path is already a symlink, remove it to prevent writing through symlink
@@ -244,7 +264,49 @@ pub fn extract_tar_gz<R: Read>(
                 let _ = fs::remove_file(&target_path);
             }
 
-            let mut out_file = File::create(&target_path)?;
+            // Clear read-only permissions on existing target file if present
+            if target_path.exists() {
+                #[cfg(windows)]
+                if let Ok(meta) = fs::metadata(&target_path) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(&target_path, perms);
+                    }
+                }
+                #[cfg(unix)]
+                if let Ok(meta) = fs::metadata(&target_path) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = meta.permissions();
+                    if perms.mode() & 0o200 == 0 {
+                        perms.set_mode(perms.mode() | 0o200);
+                        let _ = fs::set_permissions(&target_path, perms);
+                    }
+                }
+            }
+
+            let mut out_file = match File::create(&target_path) {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    #[cfg(windows)]
+                    if let Ok(meta) = fs::metadata(&target_path) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(&target_path, perms);
+                        }
+                    }
+                    #[cfg(unix)]
+                    if let Ok(meta) = fs::metadata(&target_path) {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = meta.permissions();
+                        perms.set_mode(perms.mode() | 0o600);
+                        let _ = fs::set_permissions(&target_path, perms);
+                    }
+                    File::create(&target_path)?
+                }
+                Err(err) => return Err(err.into()),
+            };
             let mut buf = [0u8; 65536];
             loop {
                 let n = entry.read(&mut buf).map_err(FsError::Io)?;

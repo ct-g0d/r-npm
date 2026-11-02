@@ -93,6 +93,25 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
     };
 
     if meta.is_dir() {
+        // Ensure directory has write permissions so its child items can be deleted
+        #[cfg(windows)]
+        {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o200 == 0 {
+                perms.set_mode(perms.mode() | 0o700);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+
         // Read directory entries
         match fs::read_dir(path) {
             Ok(entries) => {
@@ -143,6 +162,15 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o200 == 0 {
+                perms.set_mode(perms.mode() | 0o600);
                 let _ = fs::set_permissions(path, perms);
             }
         }

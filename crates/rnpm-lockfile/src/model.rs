@@ -259,6 +259,14 @@ impl LockfileV3 {
     }
 
     fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
+        if pkg.link == Some(true) {
+            if let Ok(target) = PackageTarget::parse(spec) {
+                match target {
+                    PackageTarget::File(_) | PackageTarget::Workspace(_) => return true,
+                    _ => {}
+                }
+            }
+        }
         let Some(ref ver_str) = pkg.version else {
             return false;
         };

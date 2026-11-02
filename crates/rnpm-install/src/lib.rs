@@ -102,6 +102,71 @@ pub struct ResolvedNode {
     pub os: Vec<String>,
     pub cpu: Vec<String>,
     pub libc: Vec<String>,
+    pub is_file_dir: bool,
+    pub is_file_archive: bool,
+    pub local_path: Option<PathBuf>,
+}
+
+/// Helper to compute normalized POSIX relative path from one directory to another.
+pub fn relative_posix_path(from: &Path, to: &Path) -> String {
+    if let Ok(rel) = to.strip_prefix(from) {
+        let s = rel.to_string_lossy();
+        if s.is_empty() {
+            return ".".to_string();
+        }
+        return rnpm_core::to_posix_path(&s);
+    }
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+    let mut common = 0;
+    while common < from_components.len()
+        && common < to_components.len()
+        && from_components[common] == to_components[common]
+    {
+        common += 1;
+    }
+    let mut result = PathBuf::new();
+    for _ in common..from_components.len() {
+        result.push("..");
+    }
+    for comp in &to_components[common..] {
+        result.push(comp);
+    }
+    let s = result.to_string_lossy();
+    if s.is_empty() {
+        ".".to_string()
+    } else {
+        rnpm_core::to_posix_path(&s)
+    }
+}
+
+/// Helper to read package.json directly from a tarball in memory without extracting to disk.
+pub fn inspect_manifest_from_tarball(bytes: &[u8]) -> Result<Manifest> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let decoder = GzDecoder::new(Cursor::new(bytes));
+    let mut archive = Archive::new(decoder);
+    if let Ok(entries) = archive.entries() {
+        for entry_res in entries.flatten() {
+            let mut entry = entry_res;
+            if let Ok(path) = entry.path() {
+                let path_str = path.to_string_lossy();
+                if path_str == "package/package.json"
+                    || path_str.ends_with("/package.json")
+                    || path_str == "package.json"
+                {
+                    let mut manifest_bytes = Vec::new();
+                    if std::io::Read::read_to_end(&mut entry, &mut manifest_bytes).is_ok() {
+                        if let Ok(manifest) = Manifest::from_slice(&manifest_bytes) {
+                            return Ok(manifest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(anyhow!("No valid package.json found inside tarball"))
 }
 
 pub struct Installer {
@@ -283,7 +348,11 @@ impl Installer {
             }
         }
 
-        let initial_names: Vec<&str> = queue.iter().map(|(n, _, _)| n.as_str()).collect();
+        let initial_names: Vec<&str> = queue
+            .iter()
+            .filter(|(_, r, _)| !r.starts_with("file:"))
+            .map(|(n, _, _)| n.as_str())
+            .collect();
         let _ = self.prefetch_metadata(&initial_names).await;
 
         while let Some((dep_name, dep_range, is_optional)) = queue.pop_front() {
@@ -439,6 +508,137 @@ impl Installer {
             }
         }
 
+        let mut packages_to_download = Vec::new();
+        for (pkg_name, node) in packages_to_reify {
+            if node.is_file_dir {
+                let local_dir = node.local_path.as_ref().unwrap();
+                let link_path = node_modules_dir.join(&pkg_name);
+                if let Some(parent) = link_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&link_path);
+                    if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(&link_path);
+                    }
+                }
+                rnpm_fs::create_junction(&link_path, local_dir)
+                    .map_err(|e| anyhow!("Failed to link file package '{pkg_name}' at '{}': {e}", link_path.display()))?;
+
+                packages_installed += 1;
+
+                let pkg_manifest_path = local_dir.join("package.json");
+                if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                    for (bin_name, script_rel) in m.bin_entries() {
+                        let target_rel = format!("{pkg_name}/{script_rel}");
+                        let script_path = local_dir.join(&script_rel);
+                        let _ = normalize_shebang(&script_path);
+                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                    }
+
+                    if m.scripts.contains_key("preinstall")
+                        || m.scripts.contains_key("install")
+                        || m.scripts.contains_key("postinstall")
+                        || m.scripts.contains_key("prepare")
+                    {
+                        lifecycle_nodes.push(LifecyclePackageNode {
+                            package_path: format!("node_modules/{pkg_name}"),
+                            disk_path: local_dir.clone(),
+                            manifest: m.clone(),
+                            source: PackageSource::Local,
+                            dependencies: m.dependencies.keys().cloned().collect(),
+                            optional: false,
+                        });
+                    }
+
+                    let rel_posix = relative_posix_path(&self.options.project_dir, local_dir);
+                    let mut source_pkg = LockfilePackage {
+                        name: Some(node.name.clone()),
+                        version: Some(node.version.clone()),
+                        ..Default::default()
+                    };
+                    if !m.dependencies.is_empty() {
+                        source_pkg.dependencies = Some(m.dependencies.clone());
+                    }
+                    if !m.dev_dependencies.is_empty() {
+                        source_pkg.dev_dependencies = Some(m.dev_dependencies.clone());
+                    }
+                    lockfile.insert_package(&rel_posix, source_pkg);
+
+                    let link_pkg = LockfilePackage {
+                        resolved: Some(rel_posix),
+                        link: Some(true),
+                        ..Default::default()
+                    };
+                    lockfile.insert_package(&format!("node_modules/{pkg_name}"), link_pkg);
+                }
+            } else if node.is_file_archive {
+                let local_archive = node.local_path.as_ref().unwrap();
+                let archive_bytes = std::fs::read(local_archive)?;
+                let dest_dir = node_modules_dir.join(&pkg_name);
+                extract_and_replace(Cursor::new(&archive_bytes), &dest_dir, None)
+                    .map_err(|e| anyhow!("Failed to extract local archive {}: {e}", pkg_name))?;
+
+                packages_installed += 1;
+                cache_hits += 1;
+
+                let manifest_path = dest_dir.join("package.json");
+                let (manifest, lifecycle_node) = if manifest_path.exists() {
+                    if let Ok(m) = Manifest::from_file(&manifest_path) {
+                        for (bin_name, script_rel) in m.bin_entries() {
+                            let target_rel = format!("{pkg_name}/{script_rel}");
+                            let script_path = dest_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                        }
+                        let l_node = if m.scripts.contains_key("preinstall")
+                            || m.scripts.contains_key("install")
+                            || m.scripts.contains_key("postinstall")
+                        {
+                            Some(LifecyclePackageNode {
+                                package_path: format!("node_modules/{pkg_name}"),
+                                disk_path: dest_dir.clone(),
+                                manifest: m.clone(),
+                                source: PackageSource::Registry,
+                                dependencies: m.dependencies.keys().cloned().collect(),
+                                optional: node.optional,
+                            })
+                        } else {
+                            None
+                        };
+                        (Some(m), l_node)
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
+                if let Some(l) = lifecycle_node {
+                    lifecycle_nodes.push(l);
+                }
+
+                let mut lock_entry = LockfilePackage {
+                    version: Some(node.version.clone()),
+                    resolved: Some(node.resolved_url.clone()),
+                    integrity: if !node.integrity.is_empty() {
+                        Some(node.integrity.clone())
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                };
+                if let Some(m) = manifest {
+                    if !m.dependencies.is_empty() {
+                        lock_entry.dependencies = Some(m.dependencies);
+                    }
+                }
+                lockfile.insert_package(&format!("node_modules/{pkg_name}"), lock_entry);
+            } else {
+                packages_to_download.push((pkg_name, node));
+            }
+        }
+
         let concurrency = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -446,7 +646,7 @@ impl Installer {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut join_set = tokio::task::JoinSet::new();
 
-        for (pkg_name, node) in packages_to_reify {
+        for (pkg_name, node) in packages_to_download {
             let sem = Arc::clone(&semaphore);
             let cache = self.cache.clone();
             let registry_client = self.registry_client.clone();
@@ -807,6 +1007,45 @@ impl Installer {
                 }
             };
 
+            if resolved_url.starts_with("file:") {
+                let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
+                let abs_path = if Path::new(file_path).is_absolute() {
+                    PathBuf::from(file_path)
+                } else {
+                    self.options.project_dir.join(file_path)
+                };
+                if !abs_path.exists() {
+                    if is_optional {
+                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", abs_path.display());
+                        continue;
+                    } else {
+                        return Err(anyhow!("Archive file not found: {}", abs_path.display()));
+                    }
+                }
+                let bytes = std::fs::read(&abs_path)
+                    .with_context(|| format!("Failed to read local archive file '{}'", abs_path.display()))?;
+
+                let target_path = self.options.project_dir.join(pkg_key);
+                extract_and_replace(Cursor::new(&bytes), &target_path, None)
+                    .map_err(|e| anyhow!("Failed to extract local archive {pkg_key}: {e}"))?;
+
+                let manifest_path = target_path.join("package.json");
+                if manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&manifest_path) {
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                            let target_rel_bin = format!("{clean_pkg_name}/{script_rel}");
+                            let script_path = target_path.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        }
+                    }
+                }
+                packages_installed += 1;
+                cache_hits += 1;
+                continue;
+            }
+
             let integrity_str = match pkg_info.integrity.as_ref() {
                 Some(i) => i,
                 None => {
@@ -1006,6 +1245,104 @@ impl Installer {
         range_str: &str,
         is_optional: bool,
     ) -> Result<ResolvedNode> {
+        if let Some(file_spec) = range_str.strip_prefix("file:") {
+            let file_spec_clean = file_spec.trim();
+            let rel_path = PathBuf::from(file_spec_clean);
+            let abs_path = if rel_path.is_absolute() {
+                rel_path
+            } else {
+                self.options.project_dir.join(&rel_path)
+            };
+
+            let is_archive = file_spec_clean.ends_with(".tgz")
+                || file_spec_clean.ends_with(".tar.gz")
+                || file_spec_clean.ends_with(".tar")
+                || (abs_path.exists() && abs_path.is_file());
+
+            if is_archive {
+                if !abs_path.exists() {
+                    return Err(anyhow!(
+                        "Archive file not found for dependency '{}' at '{}'",
+                        name,
+                        abs_path.display()
+                    ));
+                }
+                let archive_bytes = std::fs::read(&abs_path).with_context(|| {
+                    format!("Failed to read local archive file '{}'", abs_path.display())
+                })?;
+                let integrity = Integrity::from_bytes(
+                    &archive_bytes,
+                    rnpm_core::integrity::Algorithm::Sha512,
+                )
+                .to_string();
+
+                let manifest = match inspect_manifest_from_tarball(&archive_bytes) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let mut m = Manifest::default();
+                        m.name = Some(name.to_string());
+                        m.version = Some("1.0.0".to_string());
+                        m
+                    }
+                };
+
+                let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
+                let resolved_url = format!("file:{posix_rel}");
+
+                return Ok(ResolvedNode {
+                    name: manifest.name.clone().unwrap_or_else(|| name.to_string()),
+                    version,
+                    resolved_url,
+                    integrity,
+                    dependencies: manifest.dependencies,
+                    optional_dependencies: manifest.optional_dependencies,
+                    optional: is_optional,
+                    skipped: false,
+                    os: manifest.os.unwrap_or_default(),
+                    cpu: manifest.cpu.unwrap_or_default(),
+                    libc: manifest.libc.unwrap_or_default(),
+                    is_file_dir: false,
+                    is_file_archive: true,
+                    local_path: Some(abs_path),
+                });
+            } else {
+                // Local directory dependency
+                let manifest_path = abs_path.join("package.json");
+                if !manifest_path.exists() {
+                    return Err(anyhow!(
+                        "package.json not found in local file dependency '{}' at '{}'",
+                        name,
+                        abs_path.display()
+                    ));
+                }
+                let manifest = Manifest::from_file(&manifest_path).with_context(|| {
+                    format!("Failed to parse package.json at '{}'", manifest_path.display())
+                })?;
+
+                let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
+                let resolved_url = format!("file:{posix_rel}");
+
+                return Ok(ResolvedNode {
+                    name: manifest.name.clone().unwrap_or_else(|| name.to_string()),
+                    version,
+                    resolved_url,
+                    integrity: String::new(),
+                    dependencies: manifest.dependencies,
+                    optional_dependencies: manifest.optional_dependencies,
+                    optional: is_optional,
+                    skipped: false,
+                    os: manifest.os.unwrap_or_default(),
+                    cpu: manifest.cpu.unwrap_or_default(),
+                    libc: manifest.libc.unwrap_or_default(),
+                    is_file_dir: true,
+                    is_file_archive: false,
+                    local_path: Some(abs_path),
+                });
+            }
+        }
+
         let metadata = if let Some(cached) = self.metadata_cache.get(name) {
             cached.clone()
         } else {
@@ -1069,6 +1406,9 @@ impl Installer {
             os: ver_info.os.clone(),
             cpu: ver_info.cpu.clone(),
             libc: ver_info.libc.clone(),
+            is_file_dir: false,
+            is_file_archive: false,
+            local_path: None,
         })
     }
 
@@ -1778,6 +2118,14 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
 
     while let Some(current_key) = queue.pop_front() {
         if let Some(pkg) = lockfile.packages.get(&current_key) {
+            if pkg.link == Some(true) {
+                if let Some(target_rel) = &pkg.resolved {
+                    if !reachable_keys.contains(target_rel) {
+                        reachable_keys.insert(target_rel.clone());
+                        queue.push_back(target_rel.clone());
+                    }
+                }
+            }
             let mut all_deps = Vec::new();
             if let Some(deps) = &pkg.dependencies {
                 all_deps.extend(deps.keys().cloned());

@@ -122,7 +122,8 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
             // Rename staging -> destination
             if let Err(rename_err) = fs::rename(staging, destination) {
                 // Attempt rollback if staging -> destination failed
-                let _ = fs::rename(&trash_path, destination);
+                // Attempt rollback if staging -> destination failed, with exponential backoff retries
+                let _ = replace_dir_with_retries(&trash_path, destination, 5);
                 return Err(rename_err);
             }
 
@@ -139,13 +140,39 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
     }
 }
 
-/// Opportunistic cleanup of any leftover .rnpm-trash-* directories in parent.
+/// Opportunistic cleanup of any leftover .rnpm-trash-* and .rnpm-staging-* directories in parent.
 fn cleanup_stale_trash(parent: &Path) {
+    let now = SystemTime::now();
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy();
             if name_str.starts_with(".rnpm-trash-") {
+                let _ = crate::junction::remove_dir_all_safe(&entry.path());
+            } else if name_str.starts_with(".rnpm-staging-") {
+                // Only clean staging dirs older than 30 seconds to avoid deleting in-flight extractions
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = now.duration_since(mtime) {
+                            if age < Duration::from_secs(30) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let _ = crate::junction::remove_dir_all_safe(&entry.path());
+            }
+        }
+    }
+}
+
+/// Recovers and cleans any leftover staging or trash directories from aborted or crashed operations.
+pub fn recover_atomic_writes(parent: &Path) {
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with(".rnpm-trash-") || name_str.starts_with(".rnpm-staging-") {
                 let _ = crate::junction::remove_dir_all_safe(&entry.path());
             }
         }

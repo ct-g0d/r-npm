@@ -1027,6 +1027,8 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "rnpm-cache",
+ "rnpm-config",
  "rnpm-core",
  "rnpm-fs",
  "rnpm-install",
