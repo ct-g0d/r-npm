@@ -59,8 +59,9 @@ impl Version {
 
     pub fn parse(input: &str) -> Result<Self, SemverError> {
         let trimmed = input.trim();
-        // node-semver strips leading 'v' or '='
-        let s = trimmed.trim_start_matches(|c| c == 'v' || c == '=' || c == ' ');
+        // node-semver strips leading 'v', 'V', or '='
+        let s = trimmed.trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+        let s = s.trim();
         if s.is_empty() {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
@@ -68,7 +69,7 @@ impl Version {
         // Split off build metadata first '+'
         let (ver_pre, build) = if let Some(idx) = s.find('+') {
             let b_str = &s[idx + 1..];
-            let builds: Vec<String> = b_str.split('.').map(|p| p.to_string()).collect();
+            let builds: Vec<String> = b_str.split('.').map(|p| p.trim().to_string()).collect();
             (&s[..idx], builds)
         } else {
             (s, Vec::new())
@@ -82,11 +83,14 @@ impl Version {
             }
             let mut pres = Vec::new();
             for part in p_str.split('.') {
+                let part = part.trim();
                 if part.is_empty() {
                     return Err(SemverError::InvalidPrerelease(p_str.to_string()));
                 }
                 // Check if part is purely numeric and has no leading zero (or 0 itself)
-                if part.chars().all(|c| c.is_ascii_digit()) {
+                if part.chars().all(|c| c.is_ascii_digit())
+                    && (part.len() == 1 || !part.starts_with('0'))
+                {
                     if let Ok(n) = part.parse::<u64>() {
                         pres.push(PrereleaseId::Numeric(n));
                         continue;
@@ -106,14 +110,103 @@ impl Version {
         }
 
         let major = parts[0]
+            .trim()
             .parse::<u64>()
             .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
         let minor = parts[1]
+            .trim()
             .parse::<u64>()
             .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
         let patch = parts[2]
+            .trim()
             .parse::<u64>()
             .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
+
+        Ok(Self {
+            major,
+            minor,
+            patch,
+            prerelease,
+            build,
+        })
+    }
+
+    /// Loose version parsing supporting "v", "=", leading/trailing spaces,
+    /// and partial versions like "1", "1.2" which default missing minor/patch to 0.
+    pub fn parse_loose(input: &str) -> Result<Self, SemverError> {
+        let trimmed = input.trim();
+        // node-semver loose mode strips leading 'v', 'V', '=', and whitespace
+        let s = trimmed.trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(SemverError::InvalidVersion(input.to_string()));
+        }
+
+        // Split off build metadata first '+'
+        let (ver_pre, build) = if let Some(idx) = s.find('+') {
+            let b_str = &s[idx + 1..];
+            let builds: Vec<String> = b_str.split('.').map(|p| p.trim().to_string()).collect();
+            (&s[..idx], builds)
+        } else {
+            (s, Vec::new())
+        };
+
+        // Split off prerelease '-'
+        let (ver_part, prerelease) = if let Some(idx) = ver_pre.find('-') {
+            let p_str = &ver_pre[idx + 1..];
+            if p_str.is_empty() {
+                return Err(SemverError::InvalidVersion(input.to_string()));
+            }
+            let mut pres = Vec::new();
+            for part in p_str.split('.') {
+                let part = part.trim();
+                if part.is_empty() {
+                    return Err(SemverError::InvalidPrerelease(p_str.to_string()));
+                }
+                // Check if part is numeric (no leading zeroes except 0 itself)
+                if part.chars().all(|c| c.is_ascii_digit())
+                    && (part.len() == 1 || !part.starts_with('0'))
+                {
+                    if let Ok(n) = part.parse::<u64>() {
+                        pres.push(PrereleaseId::Numeric(n));
+                        continue;
+                    }
+                }
+                pres.push(PrereleaseId::Alpha(part.to_string()));
+            }
+            (&ver_pre[..idx], pres)
+        } else {
+            (ver_pre, Vec::new())
+        };
+
+        // Parse major[.minor[.patch]]
+        let parts: Vec<&str> = ver_part.split('.').collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return Err(SemverError::InvalidVersion(input.to_string()));
+        }
+
+        let major = parts[0]
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
+
+        let minor = if parts.len() > 1 {
+            parts[1]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
+        } else {
+            0
+        };
+
+        let patch = if parts.len() > 2 {
+            parts[2]
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
+        } else {
+            0
+        };
 
         Ok(Self {
             major,

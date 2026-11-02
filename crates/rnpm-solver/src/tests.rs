@@ -1932,4 +1932,412 @@ fn test_pathological_scoped_aliases_and_overrides() {
     assert_eq!(pkg_lib.version.as_deref(), Some("3.1.5+build.2024"));
 }
 
+#[test]
+fn test_stress_cyclic_peer_web_mesh() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 8-node cyclic peer mesh:
+    // P0 -> P1, P2
+    // P1 -> P2, P3
+    // P2 -> P3, P4
+    // P3 -> P4, P5
+    // P4 -> P5, P6
+    // P5 -> P6, P7
+    // P6 -> P7, P0 (back-edge completing 7-node ring)
+    // P7 -> P0, P3 (cross-mesh shortcuts)
+    let packages = [
+        ("mesh-p0", vec!["mesh-p1", "mesh-p2"]),
+        ("mesh-p1", vec!["mesh-p2", "mesh-p3"]),
+        ("mesh-p2", vec!["mesh-p3", "mesh-p4"]),
+        ("mesh-p3", vec!["mesh-p4", "mesh-p5"]),
+        ("mesh-p4", vec!["mesh-p5", "mesh-p6"]),
+        ("mesh-p5", vec!["mesh-p6", "mesh-p7"]),
+        ("mesh-p6", vec!["mesh-p7", "mesh-p0"]),
+        ("mesh-p7", vec!["mesh-p0", "mesh-p3"]),
+    ];
+
+    for (pkg, peers) in &packages {
+        provider.add_version(*pkg, "1.0.0", |v| {
+            for peer in peers {
+                v.peer_dependencies.insert(peer.to_string(), "^1.0.0".to_string());
+            }
+        });
+    }
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("stress-cyclic-mesh-app".to_string());
+    manifest.dependencies.insert("mesh-p0".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Complex 8-node cyclic peer mesh must resolve cleanly without stack overflow");
+
+    for (pkg, _) in &packages {
+        let loc = format!("node_modules/{pkg}");
+        assert!(graph.nodes.contains_key(&loc), "Missing mesh node: {loc}");
+    }
+
+    // Verify all peer edges exist in graph
+    for (pkg, peers) in &packages {
+        let from_loc = format!("node_modules/{pkg}");
+        let outgoing = graph.get_outgoing_edges(&from_loc);
+        for peer in peers {
+            let edge = outgoing.iter().find(|e| e.package_name == *peer);
+            assert!(edge.is_some(), "Edge from {pkg} to {peer} must exist");
+            assert_eq!(edge.unwrap().dep_type, DependencyType::Peer);
+        }
+    }
+}
+
+#[test]
+fn test_stress_deep_peer_deduplication_and_ancestor_hoisting() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Deep 6-level linear chain:
+    // app -> deep-l1 -> deep-l2 -> deep-l3 -> deep-l4 -> deep-l5 -> deep-l6
+    provider.add_version("deep-l1", "1.0.0", |v| {
+        v.dependencies.insert("deep-l2".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("deep-l2", "1.0.0", |v| {
+        v.dependencies.insert("deep-l3".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("deep-l3", "1.0.0", |v| {
+        v.dependencies.insert("deep-l4".to_string(), "1.0.0".to_string());
+        // deep-l3 peers root-peer@^1.0.0
+        v.peer_dependencies.insert("root-peer".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("deep-l4", "1.0.0", |v| {
+        v.dependencies.insert("deep-l5".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("deep-l5", "1.0.0", |v| {
+        v.dependencies.insert("deep-l6".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("deep-l6", "1.0.0", |v| {
+        // deep-l6 also peers root-peer@^1.0.0
+        v.peer_dependencies.insert("root-peer".to_string(), "^1.0.0".to_string());
+    });
+
+    provider.add_version("root-peer", "1.2.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("deep-peer-dedup-app".to_string());
+    manifest.dependencies.insert("deep-l1".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("root-peer".to_string(), "1.2.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Deep peer deduplication through 6 ancestor scopes must succeed");
+
+    // root-peer is hoisted at root node_modules/root-peer
+    assert!(graph.nodes.contains_key("node_modules/root-peer"));
+    assert_eq!(graph.nodes.get("node_modules/root-peer").unwrap().version, "1.2.0");
+
+    // Both deep-l3 and deep-l6 must reuse the root instance (no duplicate nested root-peer)
+    for (loc, node) in &graph.nodes {
+        if node.name == "root-peer" {
+            assert_eq!(loc, "node_modules/root-peer", "root-peer must only exist at root, found at {loc}");
+        }
+    }
+
+    // Verify outgoing edges from both deep-l3 and deep-l6 point directly to node_modules/root-peer
+    let l3_edges = graph.get_outgoing_edges("node_modules/deep-l3");
+    let l3_peer_edge = l3_edges.iter().find(|e| e.package_name == "root-peer").unwrap();
+    assert_eq!(l3_peer_edge.to_location, "node_modules/root-peer");
+
+    let l6_edges = graph.get_outgoing_edges("node_modules/deep-l6");
+    let l6_peer_edge = l6_edges.iter().find(|e| e.package_name == "root-peer").unwrap();
+    assert_eq!(l6_peer_edge.to_location, "node_modules/root-peer");
+}
+
+#[test]
+fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Packages
+    provider.add_version("builder", "1.0.0", |v| {
+        v.dependencies.insert("bundler".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("@core/plugin".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("bundler", "1.0.0", |_| {});
+    provider.add_version("bundler", "2.0.0", |_| {});
+
+    provider.add_version("@core/plugin", "1.0.0", |_| {});
+    provider.add_version("@core/plugin", "1.5.0", |_| {});
+
+    // Scoped multi-hop: @scope/framework -> @scope/nested-dep -> deep-leaf
+    provider.add_version("@scope/framework", "1.0.0", |v| {
+        v.dependencies.insert("@scope/nested-dep".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("@scope/nested-dep", "1.0.0", |v| {
+        v.dependencies.insert("deep-leaf".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("deep-leaf", "1.0.0", |_| {});
+    provider.add_version("deep-leaf", "3.2.1", |_| {});
+
+    // Independent consumer requesting bundler and deep-leaf
+    provider.add_version("standard-consumer", "1.0.0", |v| {
+        v.dependencies.insert("bundler".to_string(), "^1.0.0".to_string());
+        v.dependencies.insert("deep-leaf".to_string(), "^1.0.0".to_string());
+    });
+
+    // Spec-targeted override on target-tool
+    provider.add_version("consumer-old-tool", "1.0.0", |v| {
+        v.dependencies.insert("target-tool".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("consumer-new-tool", "1.0.0", |v| {
+        v.dependencies.insert("target-tool".to_string(), "^2.0.0".to_string());
+    });
+    provider.add_version("target-tool", "1.0.0", |_| {});
+    provider.add_version("target-tool", "2.0.0", |_| {});
+    provider.add_version("target-tool", "2.9.9", |_| {});
+
+    // Mixed nested object + arrow: server -> engine -> worker
+    provider.add_version("server", "1.0.0", |v| {
+        v.dependencies.insert("engine".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("engine", "1.0.0", |v| {
+        v.dependencies.insert("worker".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("worker", "1.0.0", |_| {});
+    provider.add_version("worker", "4.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("arrow-stress-app".to_string());
+    manifest.dependencies.insert("builder".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("@scope/framework".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("consumer-old-tool".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("consumer-new-tool".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("server".to_string(), "1.0.0".to_string());
+
+    let overrides_json = serde_json::json!({
+        "builder > bundler": "2.0.0",
+        "builder > @core/plugin": "1.5.0",
+        "@scope/framework > @scope/nested-dep > deep-leaf": "3.2.1",
+        "target-tool@^2.0.0": "2.9.9",
+        "server": {
+            "engine > worker": "4.0.0"
+        }
+    });
+    manifest.extra.insert("overrides".to_string(), overrides_json);
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Arrow syntax and spec-targeted overrides must resolve cleanly");
+
+    // 1. builder > bundler overridden to 2.0.0
+    let builder_edges = graph.get_outgoing_edges("node_modules/builder");
+    let bundler_edge = builder_edges.iter().find(|e| e.package_name == "bundler").unwrap();
+    let bundler_node = graph.nodes.get(&bundler_edge.to_location).unwrap();
+    assert_eq!(bundler_node.version, "2.0.0");
+
+    // 2. builder > @core/plugin overridden to 1.5.0
+    let plugin_edge = builder_edges.iter().find(|e| e.package_name == "@core/plugin").unwrap();
+    let plugin_node = graph.nodes.get(&plugin_edge.to_location).unwrap();
+    assert_eq!(plugin_node.version, "1.5.0");
+
+    // 3. Multi-hop scoped: @scope/framework > @scope/nested-dep > deep-leaf overridden to 3.2.1
+    let nested_edges = graph.get_outgoing_edges("node_modules/@scope/nested-dep");
+    let leaf_edge = nested_edges.iter().find(|e| e.package_name == "deep-leaf").unwrap();
+    let leaf_node = graph.nodes.get(&leaf_edge.to_location).unwrap();
+    assert_eq!(leaf_node.version, "3.2.1");
+
+    // 4. Spec-targeted override on target-tool@^2.0.0 -> 2.9.9, while ^1.0.0 -> 1.0.0
+    let old_tool_edges = graph.get_outgoing_edges("node_modules/consumer-old-tool");
+    let old_edge = old_tool_edges.iter().find(|e| e.package_name == "target-tool").unwrap();
+    let old_node = graph.nodes.get(&old_edge.to_location).unwrap();
+    assert_eq!(old_node.version, "1.0.0");
+
+    let new_tool_edges = graph.get_outgoing_edges("node_modules/consumer-new-tool");
+    let new_edge = new_tool_edges.iter().find(|e| e.package_name == "target-tool").unwrap();
+    let new_node = graph.nodes.get(&new_edge.to_location).unwrap();
+    assert_eq!(new_node.version, "2.9.9");
+
+    // 5. Nested object + arrow key: server -> engine -> worker overridden to 4.0.0
+    let engine_edges = graph.get_outgoing_edges("node_modules/engine");
+    let worker_edge = engine_edges.iter().find(|e| e.package_name == "worker").unwrap();
+    let worker_node = graph.nodes.get(&worker_edge.to_location).unwrap();
+    assert_eq!(worker_node.version, "4.0.0");
+}
+
+#[test]
+fn test_stress_npm_aliases_with_peers_and_overrides() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Real package react
+    provider.add_version("react", "18.0.0", |_| {});
+    provider.add_version("react", "18.2.0", |_| {});
+    provider.add_version("react", "18.3.1", |_| {});
+
+    // Package react-router peers "react"
+    provider.add_version("react-router", "6.14.0", |v| {
+        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+    });
+
+    // Package custom-ui peers alias name "my-react"
+    provider.add_version("custom-ui", "1.0.0", |v| {
+        v.peer_dependencies.insert("my-react".to_string(), "^18.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("alias-peer-override-app".to_string());
+    // Install react via npm: alias "my-react"
+    manifest.dependencies.insert("my-react".to_string(), "npm:react@^18.0.0".to_string());
+    manifest.dependencies.insert("react-router".to_string(), "6.14.0".to_string());
+    manifest.dependencies.insert("custom-ui".to_string(), "1.0.0".to_string());
+
+    // Override real package react to 18.3.1
+    let overrides_json = serde_json::json!({
+        "react": "18.3.1"
+    });
+    manifest.extra.insert("overrides".to_string(), overrides_json);
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("npm: alias combined with peers and overrides must resolve cleanly");
+
+    // my-react is placed at node_modules/my-react with name="react" and version="18.3.1"
+    assert!(graph.nodes.contains_key("node_modules/my-react"));
+    let react_node = graph.nodes.get("node_modules/my-react").unwrap();
+    assert_eq!(react_node.install_name, "my-react");
+    assert_eq!(react_node.name, "react");
+    assert_eq!(react_node.version, "18.3.1");
+
+    // react-router is placed at node_modules/react-router
+    assert!(graph.nodes.contains_key("node_modules/react-router"));
+    let rr_edges = graph.get_outgoing_edges("node_modules/react-router");
+    let rr_peer_edge = rr_edges.iter().find(|e| e.package_name == "react").unwrap();
+    assert_eq!(rr_peer_edge.to_location, "node_modules/my-react");
+    assert_eq!(rr_peer_edge.dep_type, DependencyType::Peer);
+
+    // custom-ui is placed at node_modules/custom-ui
+    assert!(graph.nodes.contains_key("node_modules/custom-ui"));
+    let ui_edges = graph.get_outgoing_edges("node_modules/custom-ui");
+    let ui_peer_edge = ui_edges.iter().find(|e| e.install_name == "my-react" || e.package_name == "my-react" || e.package_name == "react").unwrap();
+    assert_eq!(ui_peer_edge.to_location, "node_modules/my-react");
+    assert_eq!(ui_peer_edge.dep_type, DependencyType::Peer);
+
+    // Lockfile check: node_modules/my-react records name: "react"
+    let lockfile = graph.to_lockfile_v3("alias-peer-override-app", Some("1.0.0"));
+    let lock_pkg = lockfile.packages.get("node_modules/my-react").unwrap();
+    assert_eq!(lock_pkg.name.as_deref(), Some("react"));
+    assert_eq!(lock_pkg.version.as_deref(), Some("18.3.1"));
+}
+
+#[test]
+fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Linux glibc optional addon + heavy subdependencies
+    provider.add_version("addon-linux-glibc", "1.0.0", |v| {
+        v.os = Some(vec!["linux".to_string()]);
+        v.cpu = Some(vec!["x64".to_string()]);
+        v.libc = Some(vec!["glibc".to_string()]);
+        v.dependencies.insert("cuda-core".to_string(), "1.0.0".to_string());
+        v.dependencies.insert("blas".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("cuda-core", "1.0.0", |_| {});
+    provider.add_version("blas", "1.0.0", |_| {});
+
+    // Linux musl optional addon + subdependency
+    provider.add_version("addon-linux-musl", "1.0.0", |v| {
+        v.os = Some(vec!["linux".to_string()]);
+        v.cpu = Some(vec!["x64".to_string()]);
+        v.libc = Some(vec!["musl".to_string()]);
+        v.dependencies.insert("musl-shim".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("musl-shim", "1.0.0", |_| {});
+
+    // macOS arm64 optional addon + subdependency
+    provider.add_version("addon-darwin-arm64", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".to_string()]);
+        v.cpu = Some(vec!["arm64".to_string()]);
+        v.dependencies.insert("metal-framework".to_string(), "1.0.0".to_string());
+    });
+
+    // macOS x64 optional addon + subdependency
+    provider.add_version("addon-darwin-x64", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".to_string()]);
+        v.cpu = Some(vec!["x64".to_string()]);
+        v.dependencies.insert("metal-framework".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("metal-framework", "1.0.0", |_| {});
+
+    // Windows x64 optional addon + subdependency
+    provider.add_version("addon-win32-x64", "1.0.0", |v| {
+        v.os = Some(vec!["win32".to_string()]);
+        v.cpu = Some(vec!["x64".to_string()]);
+        v.dependencies.insert("directx-helper".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("directx-helper", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("platform-matrix-app".to_string());
+    manifest.optional_dependencies.insert("addon-linux-glibc".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("addon-linux-musl".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("addon-darwin-arm64".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("addon-darwin-x64".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("addon-win32-x64".to_string(), "1.0.0".to_string());
+
+    // Host 1: Linux x64 glibc
+    let opts_glibc = ResolverOptions {
+        platform: Platform::with_libc("linux", "x64", Some("glibc".to_string())),
+        ..Default::default()
+    };
+    let graph1 = resolve_dependency_graph(&manifest, &provider, &opts_glibc).unwrap();
+    assert!(graph1.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(graph1.nodes.contains_key("node_modules/cuda-core"));
+    assert!(graph1.nodes.contains_key("node_modules/blas"));
+    assert!(!graph1.nodes.contains_key("node_modules/addon-linux-musl"));
+    assert!(!graph1.nodes.contains_key("node_modules/musl-shim"));
+    assert!(!graph1.nodes.contains_key("node_modules/addon-darwin-arm64"));
+    assert!(!graph1.nodes.contains_key("node_modules/addon-win32-x64"));
+    assert!(graph1.is_skipped("addon-linux-musl"));
+    assert!(graph1.is_skipped("addon-darwin-arm64"));
+    assert!(graph1.is_skipped("addon-win32-x64"));
+
+    // Host 2: Linux x64 musl (Alpine)
+    let opts_musl = ResolverOptions {
+        platform: Platform::with_libc("linux", "x64", Some("musl".to_string())),
+        ..Default::default()
+    };
+    let graph2 = resolve_dependency_graph(&manifest, &provider, &opts_musl).unwrap();
+    assert!(graph2.nodes.contains_key("node_modules/addon-linux-musl"));
+    assert!(graph2.nodes.contains_key("node_modules/musl-shim"));
+    assert!(!graph2.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(!graph2.nodes.contains_key("node_modules/cuda-core"));
+    assert!(!graph2.nodes.contains_key("node_modules/blas"));
+    assert!(graph2.is_skipped("addon-linux-glibc"));
+
+    // Host 3: macOS arm64 (Apple Silicon)
+    let opts_mac = ResolverOptions {
+        platform: Platform::new("darwin", "arm64"),
+        ..Default::default()
+    };
+    let graph3 = resolve_dependency_graph(&manifest, &provider, &opts_mac).unwrap();
+    assert!(graph3.nodes.contains_key("node_modules/addon-darwin-arm64"));
+    assert!(graph3.nodes.contains_key("node_modules/metal-framework"));
+    assert!(!graph3.nodes.contains_key("node_modules/addon-darwin-x64"));
+    assert!(!graph3.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(!graph3.nodes.contains_key("node_modules/addon-win32-x64"));
+    assert!(graph3.is_skipped("addon-darwin-x64"));
+    assert!(graph3.is_skipped("addon-linux-glibc"));
+    assert!(graph3.is_skipped("addon-win32-x64"));
+
+    // Host 4: Windows x64
+    let opts_win = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let graph4 = resolve_dependency_graph(&manifest, &provider, &opts_win).unwrap();
+    assert!(graph4.nodes.contains_key("node_modules/addon-win32-x64"));
+    assert!(graph4.nodes.contains_key("node_modules/directx-helper"));
+    assert!(!graph4.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(!graph4.nodes.contains_key("node_modules/addon-linux-musl"));
+    assert!(!graph4.nodes.contains_key("node_modules/addon-darwin-arm64"));
+    assert!(graph4.is_skipped("addon-linux-glibc"));
+    assert!(graph4.is_skipped("addon-linux-musl"));
+    assert!(graph4.is_skipped("addon-darwin-arm64"));
+}
+
+
 

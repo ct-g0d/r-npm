@@ -16,18 +16,38 @@ impl PeerContext {
     ///
     /// Detects self-cycles (A -> A), 2-node cycles (A -> B -> A), and multi-node cycles (A -> B -> C -> A).
     pub fn is_cycle(&self, dependent: &str, peer: &str) -> bool {
-        if dependent == peer {
+        self.is_cycle_with_alias(dependent, None, peer, None)
+    }
+
+    /// Checks if adding a peer dependency edge creates a cycle, considering optional aliases.
+    pub fn is_cycle_with_alias(
+        &self,
+        dependent: &str,
+        dep_alias: Option<&str>,
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) -> bool {
+        let dep_matches = |name: &str| -> bool {
+            name == dependent || dep_alias.map_or(false, |a| a == name)
+        };
+
+        if dep_matches(peer) || peer_alias.map_or(false, |pa| dep_matches(pa)) {
             return true;
         }
 
-        // Cycle exists if `dependent` is reachable from `peer` in the active peer graph
+        // Cycle exists if `dependent` (or alias) is reachable from `peer` (or alias) in active graph
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(peer);
         visited.insert(peer);
+        if let Some(pa) = peer_alias {
+            if visited.insert(pa) {
+                queue.push_back(pa);
+            }
+        }
 
         while let Some(curr) = queue.pop_front() {
-            if curr == dependent {
+            if dep_matches(curr) {
                 return true;
             }
             if let Some(neighbors) = self.active_graph.get(curr) {
@@ -46,22 +66,47 @@ impl PeerContext {
     ///
     /// Returns e.g. `vec!["A", "B", "C", "A"]`.
     pub fn find_cycle_path(&self, dependent: &str, peer: &str) -> Option<Vec<String>> {
-        if dependent == peer {
-            return Some(vec![dependent.to_string(), dependent.to_string()]);
+        self.find_cycle_path_with_alias(dependent, None, peer, None)
+    }
+
+    /// Finds the cycle path from `dependent` to `peer` and back to `dependent`, considering optional aliases.
+    pub fn find_cycle_path_with_alias(
+        &self,
+        dependent: &str,
+        dep_alias: Option<&str>,
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let dep_matches = |name: &str| -> bool {
+            name == dependent || dep_alias.map_or(false, |a| a == name)
+        };
+
+        if dep_matches(peer) {
+            return Some(vec![dependent.to_string(), peer.to_string()]);
+        }
+        if let Some(pa) = peer_alias {
+            if dep_matches(pa) {
+                return Some(vec![dependent.to_string(), pa.to_string()]);
+            }
         }
 
-        // BFS with predecessor map to reconstruct shortest path from `peer` to `dependent`
+        // BFS with predecessor map to reconstruct shortest path from `peer` (or alias) to `dependent`
         let mut visited = BTreeSet::new();
         let mut queue = VecDeque::new();
         let mut parent_map: BTreeMap<&str, &str> = BTreeMap::new();
 
         queue.push_back(peer);
         visited.insert(peer);
+        if let Some(pa) = peer_alias {
+            if visited.insert(pa) {
+                queue.push_back(pa);
+            }
+        }
 
-        let mut found = false;
+        let mut matched_target = None;
         while let Some(curr) = queue.pop_front() {
-            if curr == dependent {
-                found = true;
+            if dep_matches(curr) {
+                matched_target = Some(curr);
                 break;
             }
             if let Some(neighbors) = self.active_graph.get(curr) {
@@ -74,15 +119,13 @@ impl PeerContext {
             }
         }
 
-        if !found {
-            return None;
-        }
+        let target = matched_target?;
 
-        // Reconstruct path: peer -> ... -> dependent
+        // Reconstruct path: peer -> ... -> target
         let mut path = Vec::new();
-        let mut curr = dependent;
+        let mut curr = target;
         path.push(curr.to_string());
-        while curr != peer {
+        while curr != peer && peer_alias.map_or(true, |pa| curr != pa) {
             if let Some(&p) = parent_map.get(curr) {
                 path.push(p.to_string());
                 curr = p;
@@ -92,7 +135,7 @@ impl PeerContext {
         }
         path.reverse();
 
-        // Cycle path starts at `dependent`, goes through `path`, and ends at `dependent`
+        // Cycle path starts at `dependent`, goes through `path`, and ends at `target`
         let mut full_cycle = Vec::with_capacity(path.len() + 1);
         full_cycle.push(dependent.to_string());
         full_cycle.extend(path);
@@ -165,5 +208,18 @@ mod tests {
         assert!(!diamond_ctx.is_cycle("a", "d"));
         assert!(!diamond_ctx.is_cycle("b", "c"));
         assert!(diamond_ctx.is_cycle("d", "a"));
+    }
+
+    #[test]
+    fn test_peer_cycle_detection_with_alias() {
+        let mut ctx = PeerContext::new();
+        // react-dom peers aliased package "my-react"
+        ctx.enter("react-dom", "my-react");
+        // Check cycle from "react" (whose alias is "my-react") back to "react-dom"
+        assert!(ctx.is_cycle_with_alias("react", Some("my-react"), "react-dom", None));
+        let path = ctx
+            .find_cycle_path_with_alias("react", Some("my-react"), "react-dom", None)
+            .unwrap();
+        assert_eq!(path, vec!["react", "react-dom", "my-react"]);
     }
 }
