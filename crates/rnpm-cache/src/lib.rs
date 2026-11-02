@@ -205,4 +205,94 @@ mod tests {
         assert!(res.is_none(), "Corrupted index must return cache miss");
         assert!(!index_path.exists(), "Corrupted index must be purged");
     }
+
+    #[test]
+    fn test_non_utf8_index_corruption_recovery() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key = "https://registry.npmjs.org/binary-corrupt/-/binary-corrupt-1.0.0.tgz";
+        let data = b"payload";
+        let _ = cache.put(key, data, None).unwrap();
+
+        let index_path = IndexEntry::path_for_key(cache.root(), key);
+        assert!(index_path.exists());
+
+        // Corrupt the index file with invalid UTF-8 binary bytes
+        std::fs::write(&index_path, [0xFF, 0xFE, 0xFD, 0x00, 0x80]).unwrap();
+
+        let res = cache.get(key).unwrap();
+        assert!(res.is_none(), "Non-UTF8 corrupt index must return cache miss");
+        assert!(!index_path.exists(), "Non-UTF8 corrupt index must be purged");
+    }
+
+    #[test]
+    fn test_lock_timeout_and_recovery() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let lock_path = cache.lock_path("test-timeout-lock");
+
+        // Acquire lock1
+        let lock1 = CacheLock::acquire_exclusive(&lock_path).unwrap();
+
+        // Attempting to acquire with a very short timeout should fail with TimedOut / LockFailed
+        let start = std::time::Instant::now();
+        let err = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(45));
+
+        drop(lock1);
+
+        // After dropping lock1, lock can be acquired immediately
+        let lock2 = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(500));
+        assert!(lock2.is_ok());
+    }
+
+    #[test]
+    fn test_clean_stale_temp_files() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        // Create dummy temp files
+        let tmp1 = cache.tmp_dir().join("test_old.tmp");
+        let tmp2 = cache.tmp_dir().join("test_fresh.tmp");
+        std::fs::write(&tmp1, b"old temp").unwrap();
+        std::fs::write(&tmp2, b"fresh temp").unwrap();
+
+        // Clean files older than 0 seconds (all files)
+        let cleaned = cache.clean_stale_temp_files(Duration::from_secs(0)).unwrap();
+        assert_eq!(cleaned, 2);
+        assert!(!tmp1.exists());
+        assert!(!tmp2.exists());
+    }
+
+    #[test]
+    fn test_purge_corrupted_sweep() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        // 1. Put valid entry
+        let key = "https://registry.npmjs.org/sweep-test/-/sweep-test-1.0.0.tgz";
+        let data = b"valid sweep data";
+        let entry = cache.put(key, data, None).unwrap();
+
+        // 2. Put corrupted file in content-v2
+        let blob_path = cache.blob_path(&entry.sha512_hex);
+        std::fs::write(&blob_path, b"corrupted bytes").unwrap();
+
+        // 3. Put corrupted index
+        let index_path = IndexEntry::path_for_key(cache.root(), key);
+        std::fs::write(&index_path, b"not json").unwrap();
+
+        // Run sweep
+        let purged = cache.purge_corrupted().unwrap();
+        assert!(purged >= 2, "Sweep must purge both corrupted blob and corrupted index");
+        assert!(!blob_path.exists());
+        assert!(!index_path.exists());
+    }
 }
