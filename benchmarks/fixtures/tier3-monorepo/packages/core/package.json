@@ -1,0 +1,9 @@
+{
+  "name": "@tier3-mono/core",
+  "version": "1.0.0",
+  "description": "Monorepo core shared library",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-single-a": "^1.0.0"
+  }
+}

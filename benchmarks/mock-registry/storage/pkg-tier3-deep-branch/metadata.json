@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-tier3-deep-branch",
+  "name": "pkg-tier3-deep-branch",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-deep-branch",
+      "version": "1.0.0",
+      "description": "Tier 3 deep diamond branch",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-deep-15": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "adbf168cc2354f94c4383c936117313441a3c189",
+        "integrity": "sha512-xgDfTxVvJHXcL1xS+Nd8pwlyAekiHXAP3IB7nZGdKozISRYS3IrELEE+Vn6aXx+qOMCjJcYy6YTQzv7LdWJvdQ==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-deep-branch/-/pkg-tier3-deep-branch-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

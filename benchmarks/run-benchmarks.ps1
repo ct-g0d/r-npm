@@ -64,17 +64,26 @@ if ($LASTEXITCODE -ne 0) {
 
 # 2. Run Tier 2 Mutation Differential Suite
 Write-Host "`n--------------------------------------------------------" -ForegroundColor Yellow
-Write-Host "[Step 2/3] Running Tier 2 Mutation Differential Suite..." -ForegroundColor Yellow
+Write-Host "[Step 2/4] Running Tier 2 Mutation Differential Suite..." -ForegroundColor Yellow
 Write-Host "--------------------------------------------------------" -ForegroundColor Yellow
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "test-differential-tier2-mutations.ps1") -RegistryUrl $RegistryUrl -RnpmPath $RnpmPath -NpmPath $NpmPath
 if ($LASTEXITCODE -ne 0) {
     throw "Tier 2 Mutation Differential Suite failed with exit code $LASTEXITCODE"
 }
 
-# 3. Run Benchmark Scenarios & Differential Performance Checks
+# 3. Run Tier 3 Differential Stress & Stability Suite
+Write-Host "`n--------------------------------------------------------" -ForegroundColor Yellow
+Write-Host "[Step 3/4] Running Tier 3 Differential Stress Suite..." -ForegroundColor Yellow
+Write-Host "--------------------------------------------------------" -ForegroundColor Yellow
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDir "test-differential-tier3-stress.ps1") -RegistryUrl $RegistryUrl -RnpmPath $RnpmPath -NpmPath $NpmPath
+if ($LASTEXITCODE -ne 0) {
+    throw "Tier 3 Differential Stress Suite failed with exit code $LASTEXITCODE"
+}
+
+# 4. Run Benchmark Scenarios & Differential Performance Checks
 if (-not $SkipBenchmarks) {
     Write-Host "`n--------------------------------------------------------" -ForegroundColor Yellow
-    Write-Host "[Step 3/3] Running Gate F Benchmarks (Cold, Warm, Hot)..." -ForegroundColor Yellow
+    Write-Host "[Step 4/4] Running Gate F Benchmarks (Cold, Warm, Hot)..." -ForegroundColor Yellow
     Write-Host "--------------------------------------------------------" -ForegroundColor Yellow
 
     $scenarios = if ($CacheState) { @($CacheState) } else { @("pristine-cold", "warm-install", "hot-noop") }

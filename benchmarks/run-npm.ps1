@@ -44,7 +44,10 @@ param(
     [string]$OutputDir = "",
     [string]$OutputFile = "",
     [switch]$StartMockServer,
-    [switch]$PurgeOsCache
+    [switch]$PurgeOsCache,
+    [switch]$SimulateLoad,
+    [int]$InjectOutlierTrial = -1,
+    [double]$InjectOutlierDelayMs = 350.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -451,7 +454,10 @@ function Run-Scenario {
     $outliersReplaced = 0
 
     function Execute-Trial {
-        param([int]$Index)
+        param(
+            [int]$Index,
+            [switch]$IsReplacement
+        )
 
         if ($CurrentCacheState -in @("pristine-cold", "cold-ci")) {
             Reset-Cache
@@ -468,6 +474,17 @@ function Run-Scenario {
             $null = Invoke-RestMethod -Uri "$RegistryUrl/api/reset" -Method POST -TimeoutSec 1 -ErrorAction SilentlyContinue
         } catch { }
 
+        $loadProcs = @()
+        $shouldInject = (-not $IsReplacement) -and (($SimulateLoad -and $Index -eq 1) -or ($InjectOutlierTrial -eq $Index))
+        if ($shouldInject) {
+            Write-Host "  [harness] Simulating environmental system load on trial $Index ($InjectOutlierDelayMs ms)..." -ForegroundColor Yellow
+            $coreCount = [Environment]::ProcessorCount
+            for ($c = 0; $c -lt [Math]::Min(2, $coreCount); $c++) {
+                $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -Command `"`$sw=[Diagnostics.Stopwatch]::StartNew(); while(`$sw.ElapsedMilliseconds -lt $InjectOutlierDelayMs){ [Math]::Sin(1.23) }`"" -PassThru
+                $loadProcs += $p
+            }
+        }
+
         $run = $null
         if ($Tool -eq "rnpm") {
             $rnpmArgs = "$Command --registry $RegistryUrl --cache `"$CacheDir`""
@@ -475,6 +492,10 @@ function Run-Scenario {
         } else {
             $npmArgs = "/c $NpmPath $Command --registry $RegistryUrl --cache `"$CacheDir`" --no-audit --no-fund"
             $run = [JobTracker]::Execute("cmd.exe", $npmArgs, $TargetDir)
+        }
+
+        foreach ($lp in $loadProcs) {
+            if (-not $lp.HasExited) { Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue }
         }
 
         # Query request count from mock registry
@@ -488,10 +509,17 @@ function Run-Scenario {
             }
         } catch { }
 
+        $trialWallTime = $run.WallTimeMs
+        $trialUserCpu = $run.UserCpuMs
+        if ($shouldInject) {
+            $trialWallTime += $InjectOutlierDelayMs
+            $trialUserCpu += ($InjectOutlierDelayMs * 0.8)
+        }
+
         $trial = [PSCustomObject]@{
             trial_index = $Index
-            wall_time_ms = [Math]::Round($run.WallTimeMs, 2)
-            user_cpu_ms = [Math]::Round($run.UserCpuMs, 2)
+            wall_time_ms = [Math]::Round($trialWallTime, 2)
+            user_cpu_ms = [Math]::Round($trialUserCpu, 2)
             system_cpu_ms = [Math]::Round($run.SystemCpuMs, 2)
             peak_working_set_bytes = [int64]$run.PeakWorkingSetBytes
             peak_commit_charge_bytes = [int64]$run.PeakCommitBytes
@@ -530,7 +558,7 @@ function Run-Scenario {
         $diff = [Math]::Abs($rawTrials[$i].wall_time_ms - $median)
         if ($diff -gt $outlierThreshold -and $outliersReplaced -eq 0) {
             Write-Host "[harness] Environmental outlier detected at trial $i ($($rawTrials[$i].wall_time_ms)ms vs median ${median}ms, threshold ${outlierThreshold}ms). Running replacement trial..." -ForegroundColor Yellow
-            $replacement = Execute-Trial -Index $i
+            $replacement = Execute-Trial -Index $i -IsReplacement
             $rawTrials[$i] = $replacement
             $outliersReplaced++
             break

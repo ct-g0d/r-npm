@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-tier3-deep-23",
+  "name": "pkg-tier3-deep-23",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-deep-23",
+      "version": "1.0.0",
+      "description": "Tier 3 deep dependency chain level 23",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-deep-24": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "6a4f97fce87ea8a6cd51ff4c5baf1952ba93c5af",
+        "integrity": "sha512-gbjHxlB92qRFgKjMcOcYe1xn7FdNP3lL8CnR/afTbEZIfM4vRoFksuNCPYpLd9IxDzbXbMZi57FNEuWzgNOGCw==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-deep-23/-/pkg-tier3-deep-23-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

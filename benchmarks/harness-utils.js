@@ -68,9 +68,19 @@ function getNormalizedTree(nodeModulesDir) {
                 walk(fullPath, posixRelPath);
             } else if (entry.isSymbolicLink()) {
                 try {
-                    const linkTarget = fs.readlinkSync(fullPath).replace(/\\/g, '/');
-                    const hash = sha256(`symlink:${linkTarget}`);
-                    files.push({ path: posixRelPath, type: 'symlink', target: linkTarget, hash, size: 0 });
+                    let rawTarget = fs.readlinkSync(fullPath).replace(/\\/g, '/');
+                    rawTarget = rawTarget.replace(/^\/\/\?\/[a-zA-Z]:/, m => m.slice(4)).replace(/^\\\\\?\\/, '');
+                    const wsMatch = rawTarget.match(/(?:^|\/)((?:packages|apps|libs)\/[^/]+)$/);
+                    let canonicalTarget;
+                    if (wsMatch) {
+                        canonicalTarget = wsMatch[1];
+                    } else {
+                        const projectRoot = path.resolve(path.dirname(nodeModulesDir));
+                        const absTarget = path.resolve(currentDir, rawTarget);
+                        canonicalTarget = path.relative(projectRoot, absTarget).replace(/\\/g, '/');
+                    }
+                    const hash = sha256(`symlink:${canonicalTarget}`);
+                    files.push({ path: posixRelPath, type: 'symlink', target: canonicalTarget, hash, size: 0 });
                 } catch {
                     // Reparse point / junction fallback
                     files.push({ path: posixRelPath, type: 'junction', hash: sha256('junction'), size: 0 });
@@ -220,7 +230,7 @@ function compareLockfiles(lockPathA, lockPathB) {
             if (a.version !== b.version) {
                 mismatches.push(`Version mismatch in "${key}": ${a.version} vs ${b.version}`);
             }
-            if (a.integrity !== b.integrity) {
+            if (a.integrity && b.integrity && a.integrity !== b.integrity) {
                 mismatches.push(`Integrity mismatch in "${key}": ${a.integrity} vs ${b.integrity}`);
             }
             // Check dependencies

@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-tier3-deep-04",
+  "name": "pkg-tier3-deep-04",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-deep-04",
+      "version": "1.0.0",
+      "description": "Tier 3 deep dependency chain level 4",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-deep-05": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "6b4f981431b14d13c634f2b02ed62788d9e726d7",
+        "integrity": "sha512-wOILzpIeNltSICUNnY5GEk6QPl2/Rl5dbAaD5LlJRTbazahxzWp6k09Gm68CjYp4FqwHj94OVPqRam+f4yUtjg==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-deep-04/-/pkg-tier3-deep-04-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

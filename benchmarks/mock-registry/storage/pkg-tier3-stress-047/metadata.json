@@ -1,0 +1,29 @@
+{
+  "_id": "pkg-tier3-stress-047",
+  "name": "pkg-tier3-stress-047",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-stress-047",
+      "version": "1.0.0",
+      "description": "Tier 3 stress tree package 47 of 110",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-stress-099": "^1.0.0",
+        "pkg-tier3-stress-100": "^1.0.0",
+        "pkg-tier3-stress-101": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "a2f3ef4a91ed701feb82598651a575202a8339ca",
+        "integrity": "sha512-cx5ceUwmo4Glqn+JfjiSmb2s0x/ngurzxh57Mz9JZUlgyClsmixKOifgEbos2TTM/DfFTK+/O7fOm7tPLLrQTQ==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-stress-047/-/pkg-tier3-stress-047-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

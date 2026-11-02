@@ -1,0 +1,10 @@
+{
+  "name": "@tier3-mono/ui",
+  "version": "1.0.0",
+  "description": "Monorepo UI components library",
+  "main": "index.js",
+  "dependencies": {
+    "@tier3-mono/core": "^1.0.0",
+    "@tier3-mono/utils": "^1.0.0"
+  }
+}

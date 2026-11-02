@@ -1,0 +1,9 @@
+{
+  "name": "tier3-monorepo",
+  "version": "1.0.0",
+  "description": "Tier 3 stress benchmark fixture with multi-package monorepo workspaces",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}

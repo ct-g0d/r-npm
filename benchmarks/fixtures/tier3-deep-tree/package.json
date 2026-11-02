@@ -1,0 +1,10 @@
+{
+  "name": "tier3-deep-tree",
+  "version": "1.0.0",
+  "description": "Tier 3 stress benchmark fixture with 25+ level deep dependency chain and diamond branches",
+  "private": true,
+  "dependencies": {
+    "pkg-tier3-deep-00": "^1.0.0",
+    "pkg-tier3-deep-branch": "^1.0.0"
+  }
+}

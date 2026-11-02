@@ -1,0 +1,30 @@
+{
+  "_id": "pkg-tier3-stress-008",
+  "name": "pkg-tier3-stress-008",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-tier3-stress-008",
+      "version": "1.0.0",
+      "description": "Tier 3 stress tree package 8 of 110",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-tier3-stress-039": "^1.0.0",
+        "pkg-tier3-stress-040": "^1.0.0",
+        "pkg-tier3-stress-041": "^1.0.0",
+        "pkg-tier3-stress-042": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "e878595706f04a731190cb8959171c0101a0feda",
+        "integrity": "sha512-3KX1qaSY/j0jxiUckkGUk5rhE33NL8QHrIZtoyXaQSskm58haE7GmTdCp8cRgmCNfjFRdP0RbkkPPtcakCWS2g==",
+        "tarball": "http://127.0.0.1:4873/pkg-tier3-stress-008/-/pkg-tier3-stress-008-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}
