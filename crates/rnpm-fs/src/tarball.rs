@@ -25,6 +25,8 @@ pub struct TarLimits {
     pub max_entries: usize,
     pub max_uncompressed_size: u64,
     pub max_compression_ratio: f64,
+    pub max_single_entry_size: u64,
+    pub max_symlinks: usize,
 }
 
 impl Default for TarLimits {
@@ -33,6 +35,8 @@ impl Default for TarLimits {
             max_entries: 50_000,
             max_uncompressed_size: 512 * 1024 * 1024, // 512 MB
             max_compression_ratio: 100.0,
+            max_single_entry_size: 256 * 1024 * 1024, // 256 MB
+            max_symlinks: 5_000,
         }
     }
 }
@@ -96,7 +100,8 @@ pub fn extract_tar_gz<R: Read>(
     let mut archive = Archive::new(gz);
 
     let mut entry_count = 0;
-    let mut total_uncompressed = 0;
+    let mut symlink_count = 0;
+    let mut total_uncompressed = 0u64;
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -123,6 +128,9 @@ pub fn extract_tar_gz<R: Read>(
         // Get raw entry path
         let raw_path = entry.path().map_err(FsError::Io)?.to_path_buf();
 
+        // Security check raw path before stripping prefix
+        validate_entry_path(&raw_path)?;
+
         // Strip standard "package/" prefix
         let relative_path = match strip_package_prefix(&raw_path) {
             Some(p) => p,
@@ -132,19 +140,42 @@ pub fn extract_tar_gz<R: Read>(
             }
         };
 
-        // Security check: path traversal, absolute paths, device names, trailing dots/spaces
+        // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
         validate_entry_path(&relative_path)?;
 
         let target_path = destination.join(&relative_path);
 
+        // Security check against Symlink Slip:
+        // Ensure no ancestor directory between destination and target_path is a symlink or junction
+        ensure_no_symlink_ancestors(&target_path, destination)?;
+
         // Security check: escaping symlinks/hardlinks
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
+            symlink_count += 1;
+            if symlink_count > limits.max_symlinks {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "symlink count".to_string(),
+                    detail: format!(
+                        "Tarball exceeded maximum allowed symlinks/hardlinks: {}",
+                        limits.max_symlinks
+                    ),
+                });
+            }
+
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
-                validate_link_target(&relative_path, &link_target, destination)?;
+                // For hardlinks, the target is often archived as package/...
+                let normalized_target = strip_package_prefix(&link_target)
+                    .unwrap_or_else(|| link_target.to_path_buf());
+                let cleaned_rel = validate_link_target(&relative_path, &normalized_target, destination)?;
 
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent)?;
+                }
+
+                // If target_path exists, remove it before creating link
+                if target_path.is_symlink() || target_path.exists() {
+                    let _ = fs::remove_file(&target_path);
                 }
 
                 if entry_type.is_symlink() {
@@ -154,7 +185,7 @@ pub fn extract_tar_gz<R: Read>(
                     }
                     #[cfg(windows)]
                     {
-                        let target_full = destination.join(&link_target);
+                        let target_full = destination.join(&cleaned_rel);
                         if target_full.is_dir() {
                             let _ = crate::junction::create_junction(&target_path, &target_full);
                         } else if target_full.is_file() {
@@ -162,22 +193,55 @@ pub fn extract_tar_gz<R: Read>(
                         }
                     }
                 } else if entry_type.is_hard_link() {
-                    let source_full = destination.join(&link_target);
-                    if fs::hard_link(&source_full, &target_path).is_err() {
-                        if source_full.is_file() {
-                            let _ = fs::copy(&source_full, &target_path);
+                    let source_full = destination.join(&cleaned_rel);
+                    if source_full.exists() && !source_full.is_symlink() {
+                        if fs::hard_link(&source_full, &target_path).is_err() {
+                            if source_full.is_file() {
+                                let _ = fs::copy(&source_full, &target_path);
+                            }
                         }
                     }
                 }
             }
+            continue;
         }
 
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
+            if target_path.is_symlink() {
+                let _ = fs::remove_file(&target_path);
+            }
             fs::create_dir_all(&target_path)?;
         } else if entry_type.is_file() {
+            // Check single entry size limit from header if available
+            if let Ok(entry_size) = entry.header().size() {
+                if entry_size > limits.max_single_entry_size {
+                    return Err(FsError::TarBombLimitExceeded {
+                        limit_type: "entry size".to_string(),
+                        detail: format!(
+                            "Entry size {} exceeded single file limit of {} bytes",
+                            entry_size, limits.max_single_entry_size
+                        ),
+                    });
+                }
+                if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
+                    return Err(FsError::TarBombLimitExceeded {
+                        limit_type: "uncompressed size".to_string(),
+                        detail: format!(
+                            "Projected uncompressed size exceeds limit of {} bytes",
+                            limits.max_uncompressed_size
+                        ),
+                    });
+                }
+            }
+
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
+            }
+
+            // If target_path is already a symlink, remove it to prevent writing through symlink
+            if target_path.is_symlink() {
+                let _ = fs::remove_file(&target_path);
             }
 
             let mut out_file = File::create(&target_path)?;
@@ -204,17 +268,19 @@ pub fn extract_tar_gz<R: Read>(
                 // Real-time check for high-ratio tar bombs in-flight (threshold 50KB)
                 if total_uncompressed > 50_000 {
                     let compressed_so_far = compressed_counter.load(Ordering::Relaxed);
-                    if compressed_so_far > 0 {
-                        let ratio = total_uncompressed as f64 / compressed_so_far as f64;
-                        if ratio > limits.max_compression_ratio {
-                            return Err(FsError::TarBombLimitExceeded {
-                                limit_type: "compression ratio".to_string(),
-                                detail: format!(
-                                    "Compression ratio {:.1}:1 exceeded limit of {:.1}:1",
-                                    ratio, limits.max_compression_ratio
-                                ),
-                            });
-                        }
+                    let ratio = if compressed_so_far == 0 {
+                        f64::INFINITY
+                    } else {
+                        total_uncompressed as f64 / compressed_so_far as f64
+                    };
+                    if ratio > limits.max_compression_ratio {
+                        return Err(FsError::TarBombLimitExceeded {
+                            limit_type: "compression ratio".to_string(),
+                            detail: format!(
+                                "Compression ratio {:.1}:1 exceeded limit of {:.1}:1",
+                                ratio, limits.max_compression_ratio
+                            ),
+                        });
                     }
                 }
             }
@@ -223,8 +289,12 @@ pub fn extract_tar_gz<R: Read>(
 
     // Final check for compression ratio after extraction
     let compressed_bytes = compressed_counter.load(Ordering::Relaxed);
-    if compressed_bytes > 0 && total_uncompressed > 50_000 {
-        let ratio = total_uncompressed as f64 / compressed_bytes as f64;
+    if total_uncompressed > 50_000 {
+        let ratio = if compressed_bytes == 0 {
+            f64::INFINITY
+        } else {
+            total_uncompressed as f64 / compressed_bytes as f64
+        };
         if ratio > limits.max_compression_ratio {
             return Err(FsError::TarBombLimitExceeded {
                 limit_type: "compression ratio".to_string(),
@@ -242,12 +312,48 @@ pub fn extract_tar_gz<R: Read>(
     })
 }
 
-/// Strips the standard "package/" prefix from tar entry path.
-/// If path is exactly "package" or "package/", returns None.
-pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
-    let mut components = path.components();
-    let first = components.next()?;
+/// Security helper ensuring no ancestor between destination and target is a symlink or junction.
+fn ensure_no_symlink_ancestors(target: &Path, destination: &Path) -> Result<(), FsError> {
+    let mut current = target.parent();
+    while let Some(parent) = current {
+        if parent == destination || parent.as_os_str().is_empty() {
+            break;
+        }
+        if !parent.starts_with(destination) {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() {
+                return Err(FsError::EscapingSymlink {
+                    link: parent.to_path_buf(),
+                    target: target.to_path_buf(),
+                });
+            }
+            #[cfg(windows)]
+            {
+                if crate::junction::is_junction(parent).unwrap_or(false) {
+                    return Err(FsError::EscapingSymlink {
+                        link: parent.to_path_buf(),
+                        target: target.to_path_buf(),
+                    });
+                }
+            }
+        }
+        current = parent.parent();
+    }
+    Ok(())
+}
 
+/// Strips the standard "package/" prefix from tar entry path.
+/// Handles leading "./" components (e.g. "./package/index.js").
+/// If path is exactly "package" or "./package", returns None.
+pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components().peekable();
+    while let Some(Component::CurDir) = components.peek() {
+        components.next();
+    }
+
+    let first = components.next()?;
     if let Component::Normal(os_str) = first {
         if os_str == "package" {
             let remainder: PathBuf = components.collect();
@@ -293,6 +399,13 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
                     });
                 }
 
+                // Reject ASCII control characters (0x00 to 0x1F)
+                if name.chars().any(|c| (c as u32) < 0x20) {
+                    return Err(FsError::PathTraversal {
+                        path: path.to_path_buf(),
+                    });
+                }
+
                 // Reject trailing dot or trailing space in component
                 if name.ends_with('.') || name.ends_with(' ') {
                     return Err(FsError::TrailingDotOrSpace {
@@ -301,7 +414,7 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
                     });
                 }
 
-                // Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9, CONIN$, CONOUT$
+                // Reject Windows reserved device names: CON, PRN, AUX, NUL, COM0-9, LPT0-9, CLOCK$, CONIN$, CONOUT$
                 if is_windows_reserved_name(&name) {
                     return Err(FsError::WindowsReservedDeviceName {
                         name: name.to_string(),
@@ -316,13 +429,19 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
-    let base = name.split('.').next().unwrap_or(name);
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(|c: char| c == ' ' || c == '.');
     let upper = base.to_ascii_uppercase();
 
     match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
-        "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => true,
-        "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => true,
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$" => true,
+        "COM0" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => true,
+        "LPT0" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => true,
+        "COM\u{00B9}" | "COM\u{00B2}" | "COM\u{00B3}" => true,
+        "LPT\u{00B9}" | "LPT\u{00B2}" | "LPT\u{00B3}" => true,
         _ => false,
     }
 }
@@ -331,7 +450,7 @@ pub fn validate_link_target(
     link_path: &Path,
     target: &Path,
     _destination: &Path,
-) -> Result<(), FsError> {
+) -> Result<PathBuf, FsError> {
     if target.is_absolute() || target.has_root() {
         return Err(FsError::AbsolutePath {
             path: target.to_path_buf(),
@@ -359,7 +478,10 @@ pub fn validate_link_target(
         });
     }
 
-    Ok(())
+    // Also validate the cleaned destination-relative path against traversal and reserved names
+    validate_entry_path(&cleaned)?;
+
+    Ok(cleaned)
 }
 
 // ============================================================================

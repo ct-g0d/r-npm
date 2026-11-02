@@ -130,6 +130,7 @@ fn test_tar_bomb_entry_limit() {
         max_entries: 2,
         max_uncompressed_size: 1_000_000,
         max_compression_ratio: 100.0,
+        ..Default::default()
     };
 
     let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
@@ -152,6 +153,7 @@ fn test_tar_bomb_size_limit() {
         max_entries: 100,
         max_uncompressed_size: 10_000,
         max_compression_ratio: 100.0,
+        ..Default::default()
     };
 
     let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
@@ -391,6 +393,7 @@ fn test_tar_bomb_ratio_limit() {
         max_entries: 10_000,
         max_uncompressed_size: 10_000_000,
         max_compression_ratio: 20.0,
+        ..Default::default()
     };
 
     let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
@@ -589,5 +592,158 @@ fn test_pack_edge_cases_and_error_handling() {
     assert!(!extract_dir.join("ignored.log").exists());
     assert!(!extract_dir.join(".gitignore").exists());
 }
+
+#[test]
+fn test_security_rejection_symlink_slip_through_ancestor() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+
+    // Create a symlink/junction inside dest pointing to an external directory
+    let outside_dir = dir.path().join("outside_target");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let link_in_dest = dest.join("symlink_dir");
+    create_junction(&link_in_dest, &outside_dir).unwrap();
+
+    // Attempt to extract a file through symlink_dir: package/symlink_dir/evil.txt
+    let tar_bytes = create_test_tarball(&[
+        ("package/symlink_dir/evil.txt", b"evil content", 0o644),
+    ]);
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink when writing through ancestor symlink, got: {res:?}"
+    );
+    assert!(!outside_dir.join("evil.txt").exists(), "Must not write through symlink to outside target");
+}
+
+#[test]
+fn test_security_extended_windows_reserved_device_names() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let device_names = [
+        "package/com0.js",
+        "package/lpt0.txt",
+        "package/clock$",
+        "package/aux .txt",
+        "package/con.tar.gz",
+        "package/COM\u{00B9}.dat",
+        "package/LPT\u{00B2}.log",
+    ];
+
+    for dev in device_names {
+        let tar_bytes = create_test_tarball(&[(dev, b"device data", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::WindowsReservedDeviceName { .. })),
+            "Expected WindowsReservedDeviceName for {dev}, got: {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_security_rejection_ascii_control_characters() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let ctrl_names = [
+        "package/file\x01test.js",
+        "package/test\x1F.txt",
+        "package/line\nbreak.js",
+        "package/return\r.js",
+    ];
+
+    for name in ctrl_names {
+        let tar_bytes = create_test_tarball(&[(name, b"ctrl", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::PathTraversal { .. })),
+            "Expected PathTraversal for control char in {name:?}, got: {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_tar_bomb_single_entry_size_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let data = vec![b'X'; 50_000];
+    let tar_bytes = create_test_tarball(&[("package/huge_entry.bin", &data, 0o644)]);
+
+    let limits = TarLimits {
+        max_single_entry_size: 20_000,
+        ..Default::default()
+    };
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "entry size"),
+        "Expected TarBombLimitExceeded for single entry size, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_tar_bomb_symlink_count_limit() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        // Base file
+        let mut h0 = Header::new_gnu();
+        h0.set_size(4);
+        h0.set_mode(0o644);
+        let path0 = b"package/base.txt";
+        h0.as_mut_bytes()[..path0.len()].copy_from_slice(path0);
+        h0.set_cksum();
+        builder.append(&h0, Cursor::new(b"base")).unwrap();
+
+        // 5 symlinks
+        for i in 1..=5 {
+            let mut h = Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            let link_path = format!("package/link{i}.txt");
+            h.as_mut_bytes()[..link_path.len()].copy_from_slice(link_path.as_bytes());
+            h.set_link_name("base.txt").unwrap();
+            h.set_cksum();
+            builder.append(&h, Cursor::new(&[])).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let limits = TarLimits {
+        max_symlinks: 3,
+        ..Default::default()
+    };
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, Some(limits));
+    assert!(
+        matches!(res, Err(FsError::TarBombLimitExceeded { ref limit_type, .. }) if limit_type == "symlink count"),
+        "Expected TarBombLimitExceeded for symlink count, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_strip_package_prefix_handles_leading_dot_slash() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let tar_bytes = create_test_tarball(&[
+        ("./package/index.js", b"console.log('dot slash');", 0o644),
+    ]);
+
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 1);
+    assert!(dest.join("index.js").exists(), "Must extract to index.js, stripping ./package/");
+    assert!(!dest.join("package").exists());
+}
+
 
 
