@@ -11,8 +11,9 @@ use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
+use std::sync::Arc;
+use rnpm_fs::atomic::extract_and_replace;
 use rnpm_fs::junction::{is_junction, remove_junction};
-use rnpm_fs::tarball::extract_tar_gz;
 use rnpm_lifecycle::{
     execute_lifecycle_script, execute_topological, LifecycleContext, LifecycleOptions,
     LifecyclePackageNode, PackageSource,
@@ -366,8 +367,9 @@ impl Installer {
             }
         }
 
-        // Reify external packages
-        for (pkg_name, node) in &resolved_tree {
+        // Reify external packages with bounded parallelism and direct memory decompression
+        let mut packages_to_reify = Vec::new();
+        for (pkg_name, node) in resolved_tree {
             if node.skipped {
                 // NEVER download or extract skipped packages!
                 debug!("Package {} is marked skipped, bypassing download and extraction", pkg_name);
@@ -383,145 +385,182 @@ impl Installer {
                 if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
                 if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
                 lockfile.insert_package(&lockfile_key, lock_entry);
-                continue;
-            }
-
-            let fetch_res = self.fetch_tarball(&node.resolved_url).await;
-            let (bytes, was_hit) = match fetch_res {
-                Ok(res) => res,
-                Err(err) => {
-                    if node.optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
-                            pkg_name, err
-                        );
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
-                }
-            };
-
-            if was_hit {
-                cache_hits += 1;
             } else {
-                cache_misses += 1;
+                packages_to_reify.push((pkg_name, node));
             }
+        }
 
-            // Verify integrity
-            let expected_integrity: Result<Integrity, _> = node.integrity.parse()
-                .map_err(|e| anyhow!("Invalid integrity string: {e}"));
-            let expected_integrity = match expected_integrity {
-                Ok(i) => i,
-                Err(e) => {
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 16);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (pkg_name, node) in packages_to_reify {
+            let sem = Arc::clone(&semaphore);
+            let cache = self.cache.clone();
+            let registry_client = self.registry_client.clone();
+            let node_modules_dir = node_modules_dir.clone();
+            let bin_dir = bin_dir.clone();
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+
+                let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&node.resolved_url) {
+                    debug!("Cache hit for {}", node.resolved_url);
+                    Ok((data, true))
+                } else {
+                    info!("Downloading {}", node.resolved_url);
+                    match registry_client.download_tarball_bytes(&node.resolved_url).await {
+                        Ok(bytes) => {
+                            let _ = cache.put(&node.resolved_url, &bytes, None);
+                            Ok((bytes, false))
+                        }
+                        Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
+                    }
+                };
+
+                let (bytes, was_hit) = match fetch_res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        if node.optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                                pkg_name, err
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                };
+
+                // Verify integrity in memory
+                let expected_integrity: Result<Integrity, _> = node.integrity.parse()
+                    .map_err(|e| anyhow!("Invalid integrity string: {e}"));
+                let expected_integrity = match expected_integrity {
+                    Ok(i) => i,
+                    Err(e) => {
+                        if node.optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                pkg_name, e
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+
+                if let Err(e) = expected_integrity.verify(&bytes) {
                     if node.optional {
                         warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
                             pkg_name, e
                         );
-                        continue;
+                        return Ok(None);
                     } else {
-                        return Err(e);
+                        return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
                     }
                 }
-            };
 
-            if let Err(e) = expected_integrity.verify(&bytes) {
-                if node.optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                        pkg_name, e
-                    );
-                    continue;
-                } else {
-                    return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
-                }
-            }
+                // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
+                let dest_dir = node_modules_dir.join(&pkg_name);
+                let dest_dir_clone = dest_dir.clone();
+                let extract_res = tokio::task::spawn_blocking(move || {
+                    extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)
+                }).await?;
 
-            // Extract to node_modules/<pkg_name>
-            let dest_dir = node_modules_dir.join(pkg_name);
-            if dest_dir.exists() {
-                let _ = std::fs::remove_dir_all(&dest_dir);
-            }
-            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                if node.optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create dir for {}: {}",
-                        pkg_name, e
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
-
-            if let Err(e) = extract_tar_gz(Cursor::new(&bytes), &dest_dir, None) {
-                if node.optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
-                        pkg_name, e
-                    );
-                    let _ = std::fs::remove_dir_all(&dest_dir);
-                    continue;
-                } else {
-                    return Err(anyhow!("Failed to extract package {}: {e}", pkg_name));
-                }
-            }
-
-            packages_installed += 1;
-
-            // Generate shims if package declares bin and collect lifecycle node
-            let pkg_manifest_path = dest_dir.join("package.json");
-            let mut has_install_script = false;
-
-            if pkg_manifest_path.exists() {
-                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                    // Create companion shims
-                    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                        let target_rel = format!("{pkg_name}/{script_rel}");
-                        let script_path = dest_dir.join(&script_rel);
-                        let _ = normalize_shebang(&script_path);
-                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                if let Err(e) = extract_res {
+                    if node.optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
+                            pkg_name, e
+                        );
+                        let _ = std::fs::remove_dir_all(&dest_dir);
+                        return Ok(None);
+                    } else {
+                        return Err(anyhow!("Failed to extract package {}: {e}", pkg_name));
                     }
-
-                    has_install_script = pkg_manifest.scripts.contains_key("preinstall")
-                        || pkg_manifest.scripts.contains_key("install")
-                        || pkg_manifest.scripts.contains_key("postinstall");
-
-                    lifecycle_nodes.push(LifecyclePackageNode {
-                        package_path: format!("node_modules/{pkg_name}"),
-                        disk_path: dest_dir.clone(),
-                        manifest: pkg_manifest,
-                        source: PackageSource::Registry,
-                        dependencies: node.dependencies.keys().cloned().collect(),
-                        optional: node.optional,
-                    });
                 }
+
+                // Generate shims if package declares bin and collect lifecycle node
+                let pkg_manifest_path = dest_dir.join("package.json");
+                let mut has_install_script = false;
+                let mut lifecycle_node = None;
+
+                if pkg_manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let target_rel = format!("{pkg_name}/{script_rel}");
+                            let script_path = dest_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                        }
+
+                        has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall");
+
+                        lifecycle_node = Some(LifecyclePackageNode {
+                            package_path: format!("node_modules/{pkg_name}"),
+                            disk_path: dest_dir.clone(),
+                            manifest: pkg_manifest,
+                            source: PackageSource::Registry,
+                            dependencies: node.dependencies.keys().cloned().collect(),
+                            optional: node.optional,
+                        });
+                    }
+                }
+
+                // Add entry to lockfile v3
+                let lockfile_key = format!("node_modules/{pkg_name}");
+                let mut lock_entry = LockfilePackage {
+                    version: Some(node.version.clone()),
+                    resolved: Some(node.resolved_url.clone()),
+                    integrity: Some(node.integrity.clone()),
+                    optional: if node.optional { Some(true) } else { None },
+                    ..Default::default()
+                };
+
+                if !node.os.is_empty() { lock_entry.os = Some(node.os.clone()); }
+                if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
+                if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
+
+                if has_install_script {
+                    lock_entry.has_install_script = Some(true);
+                }
+
+                if !node.dependencies.is_empty() {
+                    lock_entry.dependencies = Some(node.dependencies.clone());
+                }
+
+                Ok(Some((
+                    pkg_name,
+                    was_hit,
+                    lockfile_key,
+                    lock_entry,
+                    lifecycle_node,
+                )))
+            });
+        }
+
+        while let Some(join_res) = join_set.join_next().await {
+            let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
+            if let Some((_pkg_name, was_hit, lockfile_key, lock_entry, lifecycle_node)) = item_opt {
+                if was_hit {
+                    cache_hits += 1;
+                } else {
+                    cache_misses += 1;
+                }
+                packages_installed += 1;
+                if let Some(l_node) = lifecycle_node {
+                    lifecycle_nodes.push(l_node);
+                }
+                lockfile.insert_package(&lockfile_key, lock_entry);
             }
-
-            // Add entry to lockfile v3
-            let lockfile_key = format!("node_modules/{pkg_name}");
-            let mut lock_entry = LockfilePackage {
-                version: Some(node.version.clone()),
-                resolved: Some(node.resolved_url.clone()),
-                integrity: Some(node.integrity.clone()),
-                optional: if node.optional { Some(true) } else { None },
-                ..Default::default()
-            };
-
-            if !node.os.is_empty() { lock_entry.os = Some(node.os.clone()); }
-            if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
-            if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
-
-            if has_install_script {
-                lock_entry.has_install_script = Some(true);
-            }
-
-            if !node.dependencies.is_empty() {
-                lock_entry.dependencies = Some(node.dependencies.clone());
-            }
-
-            lockfile.insert_package(&lockfile_key, lock_entry);
         }
 
         // 3. Execute lifecycle scripts bottom-up followed by root hooks
@@ -746,18 +785,7 @@ impl Installer {
             }
 
             let target_path = self.options.project_dir.join(pkg_key);
-            if let Err(e) = std::fs::create_dir_all(&target_path) {
-                if is_optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create target dir for {pkg_key}: {e}"
-                    );
-                    continue;
-                } else {
-                    return Err(e.into());
-                }
-            }
-
-            if let Err(e) = extract_tar_gz(Cursor::new(&bytes), &target_path, None) {
+            if let Err(e) = extract_and_replace(Cursor::new(&bytes), &target_path, None) {
                 if is_optional {
                     warn!(
                         "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract {pkg_key}: {e}"
@@ -945,12 +973,7 @@ impl Installer {
             .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
 
         let dest_dir = node_modules_dir.join(&node.name);
-        if dest_dir.exists() {
-            let _ = std::fs::remove_dir_all(&dest_dir);
-        }
-        std::fs::create_dir_all(&dest_dir)?;
-
-        extract_tar_gz(Cursor::new(&bytes), &dest_dir, None)
+        extract_and_replace(Cursor::new(&bytes), &dest_dir, None)
             .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
 
         let pkg_manifest_path = dest_dir.join("package.json");

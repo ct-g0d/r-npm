@@ -4,8 +4,8 @@ use crate::lock::CacheLock;
 use data_encoding::HEXLOWER;
 use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use sha2::{Digest, Sha512};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,24 +144,6 @@ impl Cache {
                 .open(&temp_path)?;
             file.write_all(data)?;
             file.flush()?;
-        }
-
-        // Verify checksum of written temp file
-        {
-            let mut read_file = File::open(&temp_path)?;
-            let mut buf = Vec::new();
-            read_file.read_to_end(&mut buf)?;
-            let mut verify_hasher = Sha512::new();
-            verify_hasher.update(&buf);
-            let written_hex = HEXLOWER.encode(&verify_hasher.finalize());
-            if written_hex != sha512_hex {
-                let _ = fs::remove_file(&temp_path);
-                return Err(CacheError::IntegrityMismatch {
-                    key: sha512_hex.clone(),
-                    expected: sha512_hex.clone(),
-                    actual: written_hex,
-                });
-            }
         }
 
         // Ensure target directory exists

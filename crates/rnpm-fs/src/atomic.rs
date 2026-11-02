@@ -1,10 +1,24 @@
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::FsError;
 use crate::tarball::{extract_tar_gz, ExtractionSummary, TarLimits};
+
+static TRASH_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generates a unique path for trash/staging in `parent` that does not exist on disk.
+fn generate_unique_path(parent: &Path, prefix: &str) -> PathBuf {
+    let pid = std::process::id();
+    let counter = TRASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!("{prefix}-{pid}-{nanos}-{counter}"))
+}
 
 /// Extracts a tarball into a temporary staging directory on the same filesystem as `destination`,
 /// then atomically replaces `destination` with exponential backoff retries for Windows file locking.
@@ -54,7 +68,7 @@ pub fn replace_dir_with_retries(
         .unwrap_or_else(|| Path::new("."));
 
     let mut attempt = 0;
-    let mut delay = Duration::from_millis(10);
+    let mut delay = Duration::from_millis(5);
 
     loop {
         attempt += 1;
@@ -70,8 +84,9 @@ pub fn replace_dir_with_retries(
                         source: err,
                     });
                 }
-                sleep(delay);
-                delay = delay.saturating_mul(2).min(Duration::from_millis(500));
+                let jitter_ms = (attempt as u64 * 3) % 7;
+                sleep(delay + Duration::from_millis(jitter_ms));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
             }
         }
     }
@@ -79,42 +94,43 @@ pub fn replace_dir_with_retries(
 
 fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io::Result<()> {
     if !destination.exists() {
-        // Simple atomic rename if destination doesn't exist
+        // Fast-path: Direct atomic rename when destination does not exist
         return fs::rename(staging, destination);
     }
 
     // If destination already exists:
-    // Move existing destination to a temporary trash directory on the same filesystem
-    let trash_temp = tempfile::Builder::new()
-        .prefix(".rnpm-trash-")
-        .tempdir_in(parent)?;
-    let trash_path = trash_temp.path();
+    // Move existing destination to a unique trash path (that does NOT yet exist) on the same filesystem
+    let trash_path = generate_unique_path(parent, ".rnpm-trash");
 
-    // Rename destination -> trash
-    fs::rename(destination, trash_path)?;
+    // Rename destination -> trash_path
+    fs::rename(destination, &trash_path)?;
 
     // Rename staging -> destination
     if let Err(rename_err) = fs::rename(staging, destination) {
         // Attempt rollback if staging -> destination failed
-        let _ = fs::rename(trash_path, destination);
+        let _ = fs::rename(&trash_path, destination);
         return Err(rename_err);
     }
 
-    // Successfully replaced; cleanup trash (ignore error if delayed by OS)
-    let _ = fs::remove_dir_all(trash_path);
+    // Successfully replaced; cleanup trash (ignore error if delayed by OS file lock)
+    let _ = fs::remove_dir_all(&trash_path);
     Ok(())
 }
 
 fn is_retryable_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     match err.kind() {
-        ErrorKind::PermissionDenied | ErrorKind::WouldBlock | ErrorKind::Interrupted => true,
+        ErrorKind::PermissionDenied
+        | ErrorKind::WouldBlock
+        | ErrorKind::Interrupted
+        | ErrorKind::ResourceBusy => true,
         _ => {
             // Check raw OS error codes for Windows:
-            // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33)
+            // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+            // ERROR_BUSY (170), ERROR_USER_MAPPED_FILE (1224)
             #[cfg(windows)]
             if let Some(code) = err.raw_os_error() {
-                return code == 5 || code == 32 || code == 33;
+                return code == 5 || code == 32 || code == 33 || code == 170 || code == 1224;
             }
             false
         }

@@ -43,28 +43,39 @@ pub struct ExtractionSummary {
     pub total_uncompressed_bytes: u64,
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 pub struct CountingReader<R> {
     inner: R,
-    bytes_read: u64,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<R: Read> CountingReader<R> {
     pub fn new(inner: R) -> Self {
         Self {
             inner,
-            bytes_read: 0,
+            bytes_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    pub fn with_counter(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_read }
+    }
+
     pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub fn counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.bytes_read)
     }
 }
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.bytes_read += n as u64;
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -79,7 +90,8 @@ pub fn extract_tar_gz<R: Read>(
     let limits = limits.unwrap_or_default();
     fs::create_dir_all(destination)?;
 
-    let counting_reader = CountingReader::new(reader);
+    let compressed_counter = Arc::new(AtomicU64::new(0));
+    let counting_reader = CountingReader::with_counter(reader, Arc::clone(&compressed_counter));
     let gz = GzDecoder::new(counting_reader);
     let mut archive = Archive::new(gz);
 
@@ -130,6 +142,33 @@ pub fn extract_tar_gz<R: Read>(
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
                 validate_link_target(&relative_path, &link_target, destination)?;
+
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                if entry_type.is_symlink() {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&link_target, &target_path);
+                    }
+                    #[cfg(windows)]
+                    {
+                        let target_full = destination.join(&link_target);
+                        if target_full.is_dir() {
+                            let _ = crate::junction::create_junction(&target_path, &target_full);
+                        } else if target_full.is_file() {
+                            let _ = fs::copy(&target_full, &target_path);
+                        }
+                    }
+                } else if entry_type.is_hard_link() {
+                    let source_full = destination.join(&link_target);
+                    if fs::hard_link(&source_full, &target_path).is_err() {
+                        if source_full.is_file() {
+                            let _ = fs::copy(&source_full, &target_path);
+                        }
+                    }
+                }
             }
         }
 
@@ -142,7 +181,7 @@ pub fn extract_tar_gz<R: Read>(
             }
 
             let mut out_file = File::create(&target_path)?;
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
             loop {
                 let n = entry.read(&mut buf).map_err(FsError::Io)?;
                 if n == 0 {
@@ -161,13 +200,30 @@ pub fn extract_tar_gz<R: Read>(
                         ),
                     });
                 }
+
+                // Real-time check for high-ratio tar bombs in-flight (threshold 50KB)
+                if total_uncompressed > 50_000 {
+                    let compressed_so_far = compressed_counter.load(Ordering::Relaxed);
+                    if compressed_so_far > 0 {
+                        let ratio = total_uncompressed as f64 / compressed_so_far as f64;
+                        if ratio > limits.max_compression_ratio {
+                            return Err(FsError::TarBombLimitExceeded {
+                                limit_type: "compression ratio".to_string(),
+                                detail: format!(
+                                    "Compression ratio {:.1}:1 exceeded limit of {:.1}:1",
+                                    ratio, limits.max_compression_ratio
+                                ),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Check compression ratio after extraction
-    let compressed_bytes = archive.into_inner().into_inner().bytes_read();
-    if compressed_bytes > 0 && total_uncompressed > 1_000_000 {
+    // Final check for compression ratio after extraction
+    let compressed_bytes = compressed_counter.load(Ordering::Relaxed);
+    if compressed_bytes > 0 && total_uncompressed > 50_000 {
         let ratio = total_uncompressed as f64 / compressed_bytes as f64;
         if ratio > limits.max_compression_ratio {
             return Err(FsError::TarBombLimitExceeded {
@@ -230,8 +286,8 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
             Component::Normal(os_str) => {
                 let name = os_str.to_string_lossy();
 
-                // Reject null bytes or colons (Windows Alternate Data Streams or drive colons)
-                if name.contains('\0') || name.contains(':') {
+                // Reject null bytes, colons, or backslashes (Windows Alternate Data Streams, drive colons, or traversal)
+                if name.contains('\0') || name.contains(':') || name.contains('\\') {
                     return Err(FsError::PathTraversal {
                         path: path.to_path_buf(),
                     });
