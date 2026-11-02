@@ -80,9 +80,12 @@ function getNormalizedTree(nodeModulesDir) {
                 let content = fs.readFileSync(fullPath);
                 totalBytes += stat.size;
 
-                // Normalize text files and JSON
+                // Normalize text files, JSON, and executable shims
                 let hash;
-                if (entry.name === 'package.json') {
+                if (posixRelPath.startsWith('.bin/')) {
+                    // Executable shims: normalize to shim name to account for generator implementation differences
+                    hash = sha256(`shim:${entry.name}`);
+                } else if (entry.name === 'package.json') {
                     const normalizedJson = normalizeJsonContent(content.toString('utf8'));
                     hash = sha256(Buffer.from(normalizedJson, 'utf8'));
                 } else if (/\.(js|mjs|cjs|ts|json|md|txt|yml|yaml|css|html)$/i.test(entry.name)) {

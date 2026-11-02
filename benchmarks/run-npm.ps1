@@ -36,6 +36,10 @@ param(
     [int]$Trials = 0,
     [int]$Warmup = -1,
     [string]$RegistryUrl = "http://127.0.0.1:4873",
+    [ValidateSet("npm", "rnpm")]
+    [string]$Tool = "npm",
+    [string]$RnpmPath = "",
+    [string]$CargoProfile = "release",
     [string]$NpmPath = "npm.cmd",
     [string]$OutputDir = "",
     [string]$OutputFile = "",
@@ -55,6 +59,21 @@ if (-not $ScriptDir) {
 }
 if (-not $OutputDir) {
     $OutputDir = Join-Path $ScriptDir "results\baseline"
+}
+
+if ($Tool -eq "rnpm" -and -not $RnpmPath) {
+    $RepoRoot = Split-Path -Parent $ScriptDir
+    $relCandidate = Join-Path $RepoRoot "target\release\rnpm.exe"
+    $debCandidate = Join-Path $RepoRoot "target\debug\rnpm.exe"
+    if (Test-Path $relCandidate) {
+        $RnpmPath = $relCandidate
+        $CargoProfile = "release"
+    } elseif (Test-Path $debCandidate) {
+        $RnpmPath = $debCandidate
+        $CargoProfile = "dev"
+    } else {
+        throw "rnpm executable not found in target\release or target\debug."
+    }
 }
 
 # Ensure ExecutionPolicy in current scope
@@ -330,14 +349,14 @@ function Get-EnvironmentMetadata {
             dirty = $gitDirty
         }
         tool = [PSCustomObject]@{
-            name = "npm"
-            version = $npmVer
-            commit = $null
+            name = $Tool
+            version = $(if ($Tool -eq "rnpm") { "0.1.0" } else { $npmVer })
+            commit = $(if ($Tool -eq "rnpm") { $gitRev } else { $null })
         }
         node_version = $nodeVer
-        rust_version = $rustVer
-        cargo_profile = $null
-        target_triple = $null
+        rust_version = $(if ($Tool -eq "rnpm") { $rustVer } else { $null })
+        cargo_profile = $(if ($Tool -eq "rnpm") { $CargoProfile } else { $null })
+        target_triple = $(if ($Tool -eq "rnpm") { "x86_64-pc-windows-msvc" } else { $null })
         os = "$([System.Environment]::OSVersion.VersionString) ($osCaption)"
         cpu = $cpuName
         ram_bytes = $ramBytes
@@ -410,7 +429,7 @@ function Run-Scenario {
         if (Test-Path $CacheDir) {
             Remove-Item -Path $CacheDir -Recurse -Force -ErrorAction SilentlyContinue
         }
-        New-Item -ItemType Directory -Path $CacheDir | Out-Null
+        New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
     }
 
     # Precondition warmup
@@ -418,8 +437,13 @@ function Run-Scenario {
         Write-Host "[harness] Running $CurrentWarmup warmup trial(s) to populate cache..." -ForegroundColor DarkGray
         for ($w = 0; $w -lt $CurrentWarmup; $w++) {
             Reset-Target -KeepNodeModules ($CurrentCacheState -eq "hot-noop")
-            $npmArgs = "/c $NpmPath $Command --registry $RegistryUrl --cache `"$CacheDir`" --no-audit --no-fund"
-            $null = [JobTracker]::Execute("cmd.exe", $npmArgs, $TargetDir)
+            if ($Tool -eq "rnpm") {
+                $rnpmArgs = "$Command --registry $RegistryUrl --cache `"$CacheDir`""
+                $null = [JobTracker]::Execute($RnpmPath, $rnpmArgs, $TargetDir)
+            } else {
+                $npmArgs = "/c $NpmPath $Command --registry $RegistryUrl --cache `"$CacheDir`" --no-audit --no-fund"
+                $null = [JobTracker]::Execute("cmd.exe", $npmArgs, $TargetDir)
+            }
         }
     }
 
@@ -444,8 +468,14 @@ function Run-Scenario {
             $null = Invoke-RestMethod -Uri "$RegistryUrl/api/reset" -Method POST -TimeoutSec 1 -ErrorAction SilentlyContinue
         } catch { }
 
-        $npmArgs = "/c $NpmPath $Command --registry $RegistryUrl --cache `"$CacheDir`" --no-audit --no-fund"
-        $run = [JobTracker]::Execute("cmd.exe", $npmArgs, $TargetDir)
+        $run = $null
+        if ($Tool -eq "rnpm") {
+            $rnpmArgs = "$Command --registry $RegistryUrl --cache `"$CacheDir`""
+            $run = [JobTracker]::Execute($RnpmPath, $rnpmArgs, $TargetDir)
+        } else {
+            $npmArgs = "/c $NpmPath $Command --registry $RegistryUrl --cache `"$CacheDir`" --no-audit --no-fund"
+            $run = [JobTracker]::Execute("cmd.exe", $npmArgs, $TargetDir)
+        }
 
         # Query request count from mock registry
         $reqCount = 0
@@ -641,7 +671,7 @@ function Run-Scenario {
 
     $DestFile = $OutputFile
     if (-not $DestFile) {
-        $DestFile = Join-Path $OutputDir "checkpoint-npm-$FixtureName-$CurrentCacheState.json"
+        $DestFile = Join-Path $OutputDir "checkpoint-$Tool-$FixtureName-$CurrentCacheState.json"
     }
 
     $jsonStr = $checkpoint | ConvertTo-Json -Depth 10

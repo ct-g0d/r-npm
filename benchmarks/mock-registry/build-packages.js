@@ -135,6 +135,27 @@ const PACKAGES = [
     },
     {
         name: 'commander',
+        version: '11.0.0',
+        description: 'Command-line interface framework mock for tier 2 benchmarks v11.0.0',
+        main: 'index.js',
+        files: {
+            'package/index.js': [
+                'class Command {',
+                '    constructor(name = "") { this._name = name; this._options = []; }',
+                '    name(n) { this._name = n; return this; }',
+                '    version(v) { this._version = v; return this; }',
+                '    description(d) { this._description = d; return this; }',
+                '    option(flags, desc) { this._options.push({ flags, desc }); return this; }',
+                '    parse(argv) { this.parsed = true; return this; }',
+                '}',
+                'module.exports = { Command, program: new Command("root") };',
+                ''
+            ].join('\n')
+        },
+        dependencies: {}
+    },
+    {
+        name: 'commander',
         version: '11.1.0',
         description: 'Command-line interface framework mock for tier 2 benchmarks',
         main: 'index.js',
@@ -236,6 +257,19 @@ const PACKAGES = [
                 '    json: (opts) => (req, res, next) => { if (next) next(); },',
                 '    urlencoded: (opts) => (req, res, next) => { if (next) next(); }',
                 '};',
+                ''
+            ].join('\n')
+        }
+    },
+    {
+        name: 'cors',
+        version: '2.8.4',
+        description: 'Node.js CORS middleware mock v2.8.4',
+        main: 'index.js',
+        dependencies: {},
+        files: {
+            'package/index.js': [
+                'module.exports = (opts) => (req, res, next) => { if (next) next(); };',
                 ''
             ].join('\n')
         }
