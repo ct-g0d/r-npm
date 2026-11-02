@@ -2009,4 +2009,287 @@ fn test_pathological_scoped_aliases_and_overrides() {
     assert_eq!(pkg_lib.version.as_deref(), Some("3.1.5+build.2024"));
 }
 
+#[test]
+fn test_workspace_cycle_detection_clean_messages() {
+    use rnpm_core::workspace::WorkspaceMember;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use crate::error::SolverError;
+    use std::path::PathBuf;
+
+    // 1. Direct 2-node cycle: pkg-a -> pkg-b -> pkg-a
+    let mut ma = Manifest::default();
+    ma.name = Some("pkg-a".to_string());
+    ma.version = Some("1.0.0".to_string());
+    ma.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    let mem_a = WorkspaceMember {
+        name: "pkg-a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-a"),
+        relative_path: "packages/pkg-a".to_string(),
+        manifest: ma,
+    };
+
+    let mut mb = Manifest::default();
+    mb.name = Some("pkg-b".to_string());
+    mb.version = Some("1.0.0".to_string());
+    mb.dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    let mem_b = WorkspaceMember {
+        name: "pkg-b".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-b"),
+        relative_path: "packages/pkg-b".to_string(),
+        manifest: mb,
+    };
+
+    let err2 = WorkspaceDependencyGraph::construct(&[mem_a, mem_b]).unwrap_err();
+    match err2 {
+        SolverError::CycleDetected(msg) => {
+            assert_eq!(
+                msg,
+                "Circular workspace dependency detected: pkg-a -> pkg-b -> pkg-a"
+            );
+        }
+        other => panic!("Expected CycleDetected, got: {other:?}"),
+    }
+
+    // 2. 3-node cycle: a -> b -> c -> a
+    let mut m1 = Manifest::default();
+    m1.name = Some("a".to_string());
+    m1.dependencies.insert("b".to_string(), "workspace:*".to_string());
+    let mem1 = WorkspaceMember {
+        name: "a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/a"),
+        relative_path: "packages/a".to_string(),
+        manifest: m1,
+    };
+
+    let mut m2 = Manifest::default();
+    m2.name = Some("b".to_string());
+    m2.dependencies.insert("c".to_string(), "workspace:*".to_string());
+    let mem2 = WorkspaceMember {
+        name: "b".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/b"),
+        relative_path: "packages/b".to_string(),
+        manifest: m2,
+    };
+
+    let mut m3 = Manifest::default();
+    m3.name = Some("c".to_string());
+    m3.dependencies.insert("a".to_string(), "workspace:*".to_string());
+    let mem3 = WorkspaceMember {
+        name: "c".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/c"),
+        relative_path: "packages/c".to_string(),
+        manifest: m3,
+    };
+
+    let err3 = WorkspaceDependencyGraph::construct(&[mem1, mem2, mem3]).unwrap_err();
+    match err3 {
+        SolverError::CycleDetected(msg) => {
+            assert_eq!(
+                msg,
+                "Circular workspace dependency detected: a -> b -> c -> a"
+            );
+        }
+        other => panic!("Expected CycleDetected, got: {other:?}"),
+    }
+
+    // 3. Self cycle: self-pkg -> self-pkg
+    let mut ms = Manifest::default();
+    ms.name = Some("self-pkg".to_string());
+    ms.dependencies.insert("self-pkg".to_string(), "workspace:*".to_string());
+    let mem_s = WorkspaceMember {
+        name: "self-pkg".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/self"),
+        relative_path: "packages/self".to_string(),
+        manifest: ms,
+    };
+
+    let err_s = WorkspaceDependencyGraph::construct(&[mem_s]).unwrap_err();
+    match err_s {
+        SolverError::CycleDetected(msg) => {
+            assert_eq!(
+                msg,
+                "Circular workspace dependency detected: self-pkg -> self-pkg"
+            );
+        }
+        other => panic!("Expected CycleDetected, got: {other:?}"),
+    }
+
+    // 4. Cycle with non-cycle prefix: entry -> pkg-x -> pkg-y -> pkg-x
+    // The entry package should be stripped from the cycle report
+    let mut m_entry = Manifest::default();
+    m_entry.name = Some("entry".to_string());
+    m_entry.dependencies.insert("pkg-x".to_string(), "workspace:*".to_string());
+    let mem_entry = WorkspaceMember {
+        name: "entry".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/entry"),
+        relative_path: "packages/entry".to_string(),
+        manifest: m_entry,
+    };
+
+    let mut mx = Manifest::default();
+    mx.name = Some("pkg-x".to_string());
+    mx.dependencies.insert("pkg-y".to_string(), "workspace:*".to_string());
+    let mem_x = WorkspaceMember {
+        name: "pkg-x".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-x"),
+        relative_path: "packages/pkg-x".to_string(),
+        manifest: mx,
+    };
+
+    let mut my = Manifest::default();
+    my.name = Some("pkg-y".to_string());
+    my.dependencies.insert("pkg-x".to_string(), "workspace:*".to_string());
+    let mem_y = WorkspaceMember {
+        name: "pkg-y".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-y"),
+        relative_path: "packages/pkg-y".to_string(),
+        manifest: my,
+    };
+
+    let err_prefix = WorkspaceDependencyGraph::construct(&[mem_entry, mem_x, mem_y]).unwrap_err();
+    match err_prefix {
+        SolverError::CycleDetected(msg) => {
+            assert_eq!(
+                msg,
+                "Circular workspace dependency detected: pkg-x -> pkg-y -> pkg-x"
+            );
+        }
+        other => panic!("Expected CycleDetected, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_workspace_protocol_resolution_stress_50_plus_packages() {
+    use rnpm_core::workspace::WorkspaceMember;
+    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
+    use crate::solver::ResolverOptions;
+    use crate::types::InMemoryPackageProvider;
+    use std::path::PathBuf;
+
+    // Create 60 workspace packages organized into 6 tiers
+    // Tier 0 (00..09): Base leaf packages (no deps), version 1.0.0
+    // Tier 1 (10..19): Depend on Tier 0 via workspace:*, version 1.1.0
+    // Tier 2 (20..29): Depend on Tier 1 via workspace:^, version 1.2.0
+    // Tier 3 (30..39): Depend on Tier 2 via workspace:~, version 1.3.0
+    // Tier 4 (40..49): Diamond nodes, depend on Tier 3 via workspace:* and Tier 2 via workspace:^, version 1.4.0
+    // Tier 5 (50..59): Top root nodes, depend on Tier 4 via workspace:~, version 2.0.0
+    const TOTAL_PKGS: usize = 60;
+    let mut members = Vec::new();
+
+    for i in 0..TOTAL_PKGS {
+        let name = format!("pkg-{:02}", i);
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.clone());
+
+        let ver = if i < 10 {
+            "1.0.0"
+        } else if i < 20 {
+            "1.1.0"
+        } else if i < 30 {
+            "1.2.0"
+        } else if i < 40 {
+            "1.3.0"
+        } else if i < 50 {
+            "1.4.0"
+        } else {
+            "2.0.0"
+        };
+        manifest.version = Some(ver.to_string());
+
+        if i >= 10 && i < 20 {
+            // workspace:* dependency on Tier 0
+            let dep = format!("pkg-{:02}", i - 10);
+            manifest.dependencies.insert(dep, "workspace:*".to_string());
+        } else if i >= 20 && i < 30 {
+            // workspace:^ dependency on Tier 1
+            let dep = format!("pkg-{:02}", i - 10);
+            manifest.dependencies.insert(dep, "workspace:^".to_string());
+        } else if i >= 30 && i < 40 {
+            // workspace:~ dependency on Tier 2
+            let dep = format!("pkg-{:02}", i - 10);
+            manifest.dependencies.insert(dep, "workspace:~".to_string());
+        } else if i >= 40 && i < 50 {
+            // Diamond: depends on Tier 3 via workspace:* and Tier 2 via workspace:^
+            let dep1 = format!("pkg-{:02}", i - 10);
+            let dep2 = format!("pkg-{:02}", i - 20);
+            manifest.dependencies.insert(dep1, "workspace:*".to_string());
+            manifest.dependencies.insert(dep2, "workspace:^".to_string());
+        } else if i >= 50 {
+            // Top tier: depends on Tier 4 via workspace:~
+            let dep = format!("pkg-{:02}", i - 10);
+            manifest.dependencies.insert(dep, "workspace:~".to_string());
+        }
+
+        members.push(WorkspaceMember {
+            name: name.clone(),
+            version: Some(ver.to_string()),
+            path: PathBuf::from(format!("packages/{name}")),
+            relative_path: format!("packages/{name}"),
+            manifest,
+        });
+    }
+
+    // Shuffle input members to verify order-independence
+    let mut shuffled = members.clone();
+    shuffled.reverse();
+
+    let ws_graph = WorkspaceDependencyGraph::construct(&shuffled)
+        .expect("WorkspaceDependencyGraph must resolve 60 packages across workspace:*, workspace:^, workspace:~");
+
+    assert_eq!(ws_graph.topological_order.len(), TOTAL_PKGS);
+
+    // Verify all dependencies appear before their dependents in topological_order
+    let pos_of = |pkg: &str| -> usize {
+        ws_graph.topological_order.iter().position(|p| p == pkg).unwrap()
+    };
+
+    for member in &members {
+        let member_pos = pos_of(&member.name);
+        for dep in member.manifest.dependencies.keys() {
+            let dep_pos = pos_of(dep);
+            assert!(
+                dep_pos < member_pos,
+                "Dependency {dep} (pos {dep_pos}) must precede {member_name} (pos {member_pos})",
+                member_name = member.name
+            );
+        }
+    }
+
+    // Verify full workspace graph resolution and lockfile v3 generation
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("extreme-workspace-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+
+    let provider = InMemoryPackageProvider::new();
+    let options = ResolverOptions::default();
+
+    let dep_graph = resolve_workspace_graph(&root_manifest, &members, &provider, &options)
+        .expect("resolve_workspace_graph must succeed for 60 packages");
+
+    for i in 0..TOTAL_PKGS {
+        let name = format!("pkg-{:02}", i);
+        let link_loc = format!("node_modules/{name}");
+        let phys_loc = format!("packages/{name}");
+
+        assert!(dep_graph.nodes.contains_key(&link_loc), "Missing link node: {link_loc}");
+        assert!(dep_graph.nodes.contains_key(&phys_loc), "Missing physical node: {phys_loc}");
+
+        let link_node = dep_graph.nodes.get(&link_loc).unwrap();
+        assert!(link_node.flags.link);
+        assert_eq!(link_node.resolved.as_deref(), Some(phys_loc.as_str()));
+    }
+
+    let lockfile = dep_graph.to_lockfile_v3("extreme-workspace-root", Some("1.0.0"));
+    assert_eq!(lockfile.packages.len(), TOTAL_PKGS * 2 + 1); // 60 links + 60 physical + 1 root
+}
+
 

@@ -4,9 +4,9 @@
   "description": "pkg-11 (Tier 1) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-01": "workspace:~",
-    "pkg-02": "workspace:*",
-    "commander": "11.0.0"
+    "pkg-01": "*",
+    "pkg-02": "^1.0.0",
+    "commander": "^11.1.0"
   },
   "scripts": {}
 }

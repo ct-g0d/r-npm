@@ -15,8 +15,7 @@ use std::sync::Arc;
 use rnpm_fs::atomic::extract_and_replace;
 use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_lifecycle::{
-    execute_lifecycle_script, execute_topological, LifecycleContext, LifecycleOptions,
-    LifecyclePackageNode, PackageSource,
+    execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource,
 };
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};

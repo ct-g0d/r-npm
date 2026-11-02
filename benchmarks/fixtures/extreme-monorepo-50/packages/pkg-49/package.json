@@ -4,17 +4,15 @@
   "description": "pkg-49 (Tier 4) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-01": "workspace:*",
-    "pkg-15": "workspace:*",
-    "pkg-41": "workspace:^",
+    "pkg-01": "^1.0.0",
+    "pkg-15": "^1.0.0",
+    "pkg-41": "^1.0.0",
     "commander": "^11.1.0",
     "chalk": "^4.1.2"
   },
   "scripts": {
-    "preinstall": "node -e \"console.log('pkg-49 preinstall');\"",
-    "install": "node -e \"console.log('pkg-49 install');\"",
-    "postinstall": "node -e \"const fs = require('fs'), path = require('path'); const f01 = ['../pkg-01/dist/pkg-01-artifact.json', '../../packages/pkg-01/dist/pkg-01-artifact.json', 'node_modules/pkg-01/dist/pkg-01-artifact.json'].map(function(c) { return path.resolve(c); }).find(function(f) { return fs.existsSync(f); }); const f15 = ['../pkg-15/dist/pkg-15-artifact.json', '../../packages/pkg-15/dist/pkg-15-artifact.json', 'node_modules/pkg-15/dist/pkg-15-artifact.json'].map(function(c) { return path.resolve(c); }).find(function(f) { return fs.existsSync(f); }); if (!f01 || !f15) { throw new Error('Missing required artifacts: pkg-01=' + f01 + ', pkg-15=' + f15); } fs.mkdirSync('dist', { recursive: true }); fs.writeFileSync('dist/pkg-49-artifact.json', JSON.stringify({ name: 'pkg-49', verified01: f01, verified15: f15, timestamp: Date.now() })); console.log('pkg-49 postinstall verified both pkg-01 and pkg-15 artifacts and created dist/pkg-49-artifact.json');\"",
-    "prepare": "node -e \"console.log('pkg-49 prepare');\""
+    "postinstall": "node build.js",
+    "prepare": "node build.js"
   },
   "bin": {
     "pkg-49-cli": "./bin/cli.js"

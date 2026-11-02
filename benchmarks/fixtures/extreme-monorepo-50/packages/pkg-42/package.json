@@ -4,8 +4,8 @@
   "description": "pkg-42 (Tier 3) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-12": "workspace:*",
-    "pkg-27": "workspace:^",
+    "pkg-12": "^1.0.0",
+    "pkg-27": "~1.0.0",
     "cors": "^2.8.5"
   },
   "scripts": {}

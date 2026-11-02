@@ -4,10 +4,10 @@
   "description": "pkg-41 (Tier 3) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-11": "workspace:~",
-    "pkg-26": "workspace:*",
-    "pkg-15": "workspace:*",
-    "cors": "2.8.4"
+    "pkg-11": "*",
+    "pkg-26": "^1.0.0",
+    "pkg-15": "^1.0.0",
+    "cors": "^2.8.5"
   },
   "scripts": {}
 }

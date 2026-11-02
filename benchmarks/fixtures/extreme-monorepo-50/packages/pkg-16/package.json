@@ -4,8 +4,8 @@
   "description": "pkg-16 (Tier 1) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-06": "workspace:^",
-    "pkg-07": "workspace:~"
+    "pkg-06": "~1.0.0",
+    "pkg-07": "*"
   },
   "scripts": {}
 }

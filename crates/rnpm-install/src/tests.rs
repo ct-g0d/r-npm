@@ -1580,3 +1580,94 @@ async fn test_file_archive_dependency_installation_and_ci() {
     assert!(pkg_dir.join("package.json").exists());
 }
 
+#[tokio::test]
+async fn test_workspace_member_lifecycle_prepare_dev_deps_and_ci_topological_execution() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // Root package.json with workspaces and root prepare hook
+    let root_json = r#"{
+        "name": "topo-workspace-root",
+        "version": "1.0.0",
+        "private": true,
+        "workspaces": ["packages/*"],
+        "scripts": {
+            "prepare": "node -e \"require('fs').appendFileSync(require('path').join(process.env.INIT_CWD, 'order.log'), 'root:prepare' + String.fromCharCode(10))\""
+        }
+    }"#;
+    fs::write(root.join("package.json"), root_json).unwrap();
+
+    // Member A: defines "prepare" lifecycle script (must be discovered via has_scripts)
+    let a_dir = root.join("packages").join("pkg-a");
+    fs::create_dir_all(&a_dir).unwrap();
+    let a_json = r#"{
+        "name": "pkg-a",
+        "version": "1.0.0",
+        "scripts": {
+            "prepare": "node -e \"require('fs').appendFileSync(require('path').join(process.env.INIT_CWD, 'order.log'), 'pkg-a:prepare' + String.fromCharCode(10))\""
+        }
+    }"#;
+    fs::write(a_dir.join("package.json"), a_json).unwrap();
+
+    // Member B: depends on pkg-a via devDependencies!
+    // Must execute pkg-a BEFORE pkg-b
+    let b_dir = root.join("packages").join("pkg-b");
+    fs::create_dir_all(&b_dir).unwrap();
+    let b_json = r#"{
+        "name": "pkg-b",
+        "version": "1.0.0",
+        "devDependencies": {
+            "pkg-a": "workspace:*"
+        },
+        "scripts": {
+            "postinstall": "node -e \"require('fs').appendFileSync(require('path').join(process.env.INIT_CWD, 'order.log'), 'pkg-b:postinstall' + String.fromCharCode(10))\""
+        }
+    }"#;
+    fs::write(b_dir.join("package.json"), b_json).unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.to_path_buf(),
+        offline: true,
+        ignore_scripts: false,
+        ..Default::default()
+    };
+
+    // 1. Test standard install (installer.run())
+    let mut installer = Installer::new(options.clone()).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 2);
+
+    let order_file = root.join("order.log");
+    assert!(order_file.exists(), "order.log must be created by lifecycle scripts");
+    let content = fs::read_to_string(&order_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Verify topological order: pkg-a:prepare -> pkg-b:postinstall -> root:prepare
+    assert_eq!(
+        lines,
+        vec!["pkg-a:prepare", "pkg-b:postinstall", "root:prepare"],
+        "Expected pkg-a (prepare) before pkg-b (postinstall) before root (prepare), got: {content}"
+    );
+
+    // 2. Test CI install (installer.run_ci())
+    fs::remove_file(&order_file).unwrap();
+    let _ = rnpm_fs::remove_junction(&root.join("node_modules").join("pkg-a"));
+    let _ = rnpm_fs::remove_junction(&root.join("node_modules").join("pkg-b"));
+    fs::remove_dir_all(root.join("node_modules")).unwrap();
+    assert!(!root.join("node_modules").exists());
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(ci_summary.packages_installed, 2);
+
+    assert!(order_file.exists(), "order.log must be created during run_ci");
+    let ci_content = fs::read_to_string(&order_file).unwrap();
+    let ci_lines: Vec<&str> = ci_content.lines().collect();
+
+    assert_eq!(
+        ci_lines,
+        vec!["pkg-a:prepare", "pkg-b:postinstall", "root:prepare"],
+        "Expected CI topological order pkg-a:prepare -> pkg-b:postinstall -> root:prepare, got: {ci_content}"
+    );
+}
+

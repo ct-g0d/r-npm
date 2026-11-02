@@ -4,14 +4,12 @@
   "description": "pkg-15 (Tier 1) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-05": "workspace:*",
-    "pkg-06": "workspace:^",
-    "pkg-01": "workspace:*"
+    "pkg-05": "^1.0.0",
+    "pkg-06": "~1.0.0",
+    "pkg-01": "^1.0.0"
   },
   "scripts": {
-    "preinstall": "node -e \"console.log('pkg-15 preinstall');\"",
-    "install": "node -e \"console.log('pkg-15 install');\"",
-    "postinstall": "node -e \"const fs = require('fs'), path = require('path'); const candidates = ['../pkg-01/dist/pkg-01-artifact.json', '../../packages/pkg-01/dist/pkg-01-artifact.json', 'node_modules/pkg-01/dist/pkg-01-artifact.json'].map(function(c) { return path.resolve(c); }); const found = candidates.find(function(f) { return fs.existsSync(f); }); if (!found) { throw new Error('pkg-01-artifact.json not found in ' + candidates.join(', ')); } fs.mkdirSync('dist', { recursive: true }); fs.writeFileSync('dist/pkg-15-artifact.json', JSON.stringify({ name: 'pkg-15', verifiedFrom: found, timestamp: Date.now() })); console.log('pkg-15 postinstall verified pkg-01 artifact and created dist/pkg-15-artifact.json');\"",
-    "prepare": "node -e \"console.log('pkg-15 prepare');\""
+    "postinstall": "node build.js",
+    "prepare": "node build.js"
   }
 }

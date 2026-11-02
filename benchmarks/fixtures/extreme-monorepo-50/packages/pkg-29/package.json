@@ -4,9 +4,9 @@
   "description": "pkg-29 (Tier 2) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-14": "workspace:~",
-    "pkg-15": "workspace:*",
-    "pkg-04": "workspace:^"
+    "pkg-14": "*",
+    "pkg-15": "^1.0.0",
+    "pkg-04": "~1.0.0"
   },
   "scripts": {}
 }

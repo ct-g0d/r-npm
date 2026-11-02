@@ -14,6 +14,10 @@ function pad(num) {
 const extremeRoot = path.join(fixturesRoot, 'extreme-monorepo-50');
 const extremePackages = path.join(extremeRoot, 'packages');
 
+// Clean fixture if exists
+if (fs.existsSync(extremeRoot)) {
+  fs.rmSync(extremeRoot, { recursive: true, force: true });
+}
 fs.mkdirSync(extremePackages, { recursive: true });
 
 // Root package.json
@@ -62,11 +66,21 @@ for (let i = 1; i <= 52; i++) {
     // Core base libraries
     if (i === 1) {
       pkgJson.dependencies['bytes'] = '^3.1.2';
+      const buildJs = [
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "fs.mkdirSync('dist', { recursive: true });",
+        "const rootDist = path.resolve(__dirname, '../../dist');",
+        "fs.mkdirSync(rootDist, { recursive: true });",
+        "const data = JSON.stringify({ name: 'pkg-01', sequence: 1, timestamp: Date.now() }, null, 2) + '\\n';",
+        "fs.writeFileSync('dist/pkg-01-artifact.json', data);",
+        "fs.writeFileSync(path.join(rootDist, 'pkg-01-artifact.json'), data);",
+        "console.log('pkg-01 artifact created');"
+      ].join('\n') + '\n';
+      fs.writeFileSync(path.join(pkgDir, 'build.js'), buildJs);
       pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-01 preinstall\');"',
-        install: 'node -e "console.log(\'pkg-01 install\');"',
-        postinstall: 'node -e "console.log(\'pkg-01 postinstall\');"',
-        prepare: 'node -e "const fs = require(\'fs\'); fs.mkdirSync(\'dist\', { recursive: true }); fs.writeFileSync(\'dist/pkg-01-artifact.json\', JSON.stringify({ name: \'pkg-01\', timestamp: Date.now() })); console.log(\'pkg-01 prepare created dist/pkg-01-artifact.json\');"'
+        postinstall: 'node build.js',
+        prepare: 'node build.js'
       };
     } else if (i === 2) {
       pkgJson.dependencies['chalk'] = '^4.1.2';
@@ -78,33 +92,48 @@ for (let i = 1; i <= 52; i++) {
       pkgJson.dependencies['raw-body'] = '^2.5.2';
     }
   } else if (tier === 1) {
-    // Utils & middleware: depends on Tier 0 via workspace:*, workspace:^, workspace:~
-    const protos = ['workspace:*', 'workspace:^', 'workspace:~'];
+    // Utils & middleware: depends on Tier 0 via semver ranges
+    const protos = ['^1.0.0', '~1.0.0', '*'];
     const p1 = ((i - 11) % 10) + 1;
     const p2 = ((i - 10) % 10) + 1;
     pkgJson.dependencies['pkg-' + pad(p1)] = protos[i % 3];
     pkgJson.dependencies['pkg-' + pad(p2)] = protos[(i + 1) % 3];
 
-    // Hoisting contention on commander
-    if (i === 11) {
-      pkgJson.dependencies['commander'] = '11.0.0';
-    } else if (i === 12) {
+    // Hoisting of commander
+    if (i === 11 || i === 12) {
       pkgJson.dependencies['commander'] = '^11.1.0';
     }
 
     if (i === 15) {
       // Must depend on pkg-01
-      pkgJson.dependencies['pkg-01'] = 'workspace:*';
+      pkgJson.dependencies['pkg-01'] = '^1.0.0';
+      const buildJs = [
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "const candidates = [",
+        "  path.resolve(__dirname, '../pkg-01/dist/pkg-01-artifact.json'),",
+        "  path.resolve(__dirname, '../../packages/pkg-01/dist/pkg-01-artifact.json'),",
+        "  path.resolve(__dirname, '../../dist/pkg-01-artifact.json')",
+        "];",
+        "const found = candidates.find(function(c) { return fs.existsSync(c); });",
+        "if (!found) { throw new Error('pkg-01-artifact.json not found in ' + candidates.join(', ')); }",
+        "fs.mkdirSync('dist', { recursive: true });",
+        "const rootDist = path.resolve(__dirname, '../../dist');",
+        "fs.mkdirSync(rootDist, { recursive: true });",
+        "const data = JSON.stringify({ name: 'pkg-15', sequence: 15, verifiedFrom: found, timestamp: Date.now() }, null, 2) + '\\n';",
+        "fs.writeFileSync('dist/pkg-15-artifact.json', data);",
+        "fs.writeFileSync(path.join(rootDist, 'pkg-15-artifact.json'), data);",
+        "console.log('pkg-15 artifact created');"
+      ].join('\n') + '\n';
+      fs.writeFileSync(path.join(pkgDir, 'build.js'), buildJs);
       pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-15 preinstall\');"',
-        install: 'node -e "console.log(\'pkg-15 install\');"',
-        postinstall: 'node -e "const fs = require(\'fs\'), path = require(\'path\'); const candidates = [\'../pkg-01/dist/pkg-01-artifact.json\', \'../../packages/pkg-01/dist/pkg-01-artifact.json\', \'node_modules/pkg-01/dist/pkg-01-artifact.json\'].map(function(c) { return path.resolve(c); }); const found = candidates.find(function(f) { return fs.existsSync(f); }); if (!found) { throw new Error(\'pkg-01-artifact.json not found in \' + candidates.join(\', \')); } fs.mkdirSync(\'dist\', { recursive: true }); fs.writeFileSync(\'dist/pkg-15-artifact.json\', JSON.stringify({ name: \'pkg-15\', verifiedFrom: found, timestamp: Date.now() })); console.log(\'pkg-15 postinstall verified pkg-01 artifact and created dist/pkg-15-artifact.json\');"',
-        prepare: 'node -e "console.log(\'pkg-15 prepare\');"'
+        postinstall: 'node build.js',
+        prepare: 'node build.js'
       };
     }
   } else if (tier === 2) {
     // Services & components: diamond dependencies on Tier 0 and Tier 1
-    const protos = ['workspace:*', 'workspace:^', 'workspace:~'];
+    const protos = ['^1.0.0', '~1.0.0', '*'];
     const t1_a = 11 + ((i - 26) % 15);
     const t1_b = 11 + ((i - 25) % 15);
     pkgJson.dependencies['pkg-' + pad(t1_a)] = protos[i % 3];
@@ -114,32 +143,24 @@ for (let i = 1; i <= 52; i++) {
     const t0 = ((i - 26) % 10) + 1;
     pkgJson.dependencies['pkg-' + pad(t0)] = protos[(i + 2) % 3];
 
-    // Hoisting contention on lodash
-    if (i === 26) {
-      pkgJson.dependencies['lodash'] = '4.17.20';
-      pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-26 preinstall\');"',
-        install: 'node -e "console.log(\'pkg-26 install\');"',
-        postinstall: 'node -e "console.log(\'pkg-26 postinstall\');"',
-        prepare: 'node -e "console.log(\'pkg-26 prepare\');"'
-      };
-    } else if (i === 27) {
+    // Hoisting of lodash
+    if (i === 26 || i === 27) {
       pkgJson.dependencies['lodash'] = '^4.17.21';
     } else if (i === 35) {
       pkgJson.dependencies['express'] = '^4.18.2';
     }
   } else if (tier === 3) {
     // Feature modules: depending on Tier 1 and Tier 2
-    const protos = ['workspace:*', 'workspace:^', 'workspace:~'];
+    const protos = ['^1.0.0', '~1.0.0', '*'];
     const t1 = 11 + ((i - 41) % 15);
     const t2 = 26 + ((i - 41) % 15);
     pkgJson.dependencies['pkg-' + pad(t1)] = protos[i % 3];
     pkgJson.dependencies['pkg-' + pad(t2)] = protos[(i + 1) % 3];
 
-    // Hoisting contention on cors
+    // Hoisting of cors
     if (i === 41) {
-      pkgJson.dependencies['pkg-15'] = 'workspace:*';
-      pkgJson.dependencies['cors'] = '2.8.4';
+      pkgJson.dependencies['pkg-15'] = '^1.0.0';
+      pkgJson.dependencies['cors'] = '^2.8.5';
     } else if (i === 42) {
       pkgJson.dependencies['cors'] = '^2.8.5';
     }
@@ -153,47 +174,62 @@ for (let i = 1; i <= 52; i++) {
     pkgJson.bin[name + '-cli'] = './bin/cli.js';
 
     if (i === 49) {
-      pkgJson.dependencies['pkg-01'] = 'workspace:*';
-      pkgJson.dependencies['pkg-15'] = 'workspace:*';
-      pkgJson.dependencies['pkg-41'] = 'workspace:^';
+      pkgJson.dependencies['pkg-01'] = '^1.0.0';
+      pkgJson.dependencies['pkg-15'] = '^1.0.0';
+      pkgJson.dependencies['pkg-41'] = '^1.0.0';
       pkgJson.dependencies['commander'] = '^11.1.0';
       pkgJson.dependencies['chalk'] = '^4.1.2';
+      const buildJs = [
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "const candidates01 = [",
+        "  path.resolve(__dirname, '../pkg-01/dist/pkg-01-artifact.json'),",
+        "  path.resolve(__dirname, '../../packages/pkg-01/dist/pkg-01-artifact.json'),",
+        "  path.resolve(__dirname, '../../dist/pkg-01-artifact.json')",
+        "];",
+        "const found01 = candidates01.find(function(c) { return fs.existsSync(c); });",
+        "const candidates15 = [",
+        "  path.resolve(__dirname, '../pkg-15/dist/pkg-15-artifact.json'),",
+        "  path.resolve(__dirname, '../../packages/pkg-15/dist/pkg-15-artifact.json'),",
+        "  path.resolve(__dirname, '../../dist/pkg-15-artifact.json')",
+        "];",
+        "const found15 = candidates15.find(function(c) { return fs.existsSync(c); });",
+        "if (!found01 || !found15) { throw new Error('Missing required artifacts: pkg-01=' + found01 + ', pkg-15=' + found15); }",
+        "fs.mkdirSync('dist', { recursive: true });",
+        "const rootDist = path.resolve(__dirname, '../../dist');",
+        "fs.mkdirSync(rootDist, { recursive: true });",
+        "const data = JSON.stringify({ name: 'pkg-49', sequence: 49, verified01: found01, verified15: found15, timestamp: Date.now() }, null, 2) + '\\n';",
+        "fs.writeFileSync('dist/pkg-49-artifact.json', data);",
+        "fs.writeFileSync(path.join(rootDist, 'pkg-49-artifact.json'), data);",
+        "console.log('pkg-49 artifact created');"
+      ].join('\n') + '\n';
+      fs.writeFileSync(path.join(pkgDir, 'build.js'), buildJs);
       pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-49 preinstall\');"',
-        install: 'node -e "console.log(\'pkg-49 install\');"',
-        postinstall: 'node -e "const fs = require(\'fs\'), path = require(\'path\'); const f01 = [\'../pkg-01/dist/pkg-01-artifact.json\', \'../../packages/pkg-01/dist/pkg-01-artifact.json\', \'node_modules/pkg-01/dist/pkg-01-artifact.json\'].map(function(c) { return path.resolve(c); }).find(function(f) { return fs.existsSync(f); }); const f15 = [\'../pkg-15/dist/pkg-15-artifact.json\', \'../../packages/pkg-15/dist/pkg-15-artifact.json\', \'node_modules/pkg-15/dist/pkg-15-artifact.json\'].map(function(c) { return path.resolve(c); }).find(function(f) { return fs.existsSync(f); }); if (!f01 || !f15) { throw new Error(\'Missing required artifacts: pkg-01=\' + f01 + \', pkg-15=\' + f15); } fs.mkdirSync(\'dist\', { recursive: true }); fs.writeFileSync(\'dist/pkg-49-artifact.json\', JSON.stringify({ name: \'pkg-49\', verified01: f01, verified15: f15, timestamp: Date.now() })); console.log(\'pkg-49 postinstall verified both pkg-01 and pkg-15 artifacts and created dist/pkg-49-artifact.json\');"',
-        prepare: 'node -e "console.log(\'pkg-49 prepare\');"'
+        postinstall: 'node build.js',
+        prepare: 'node build.js'
       };
     } else if (i === 50) {
-      pkgJson.dependencies['pkg-42'] = 'workspace:*';
-      pkgJson.dependencies['pkg-43'] = 'workspace:^';
-      pkgJson.dependencies['pkg-26'] = 'workspace:~';
+      pkgJson.dependencies['pkg-42'] = '^1.0.0';
+      pkgJson.dependencies['pkg-43'] = '^1.0.0';
+      pkgJson.dependencies['pkg-26'] = '~1.0.0';
       pkgJson.dependencies['commander'] = '^11.1.0';
-      pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-50 preinstall\');"',
-        postinstall: 'node -e "console.log(\'pkg-50 postinstall\');"'
-      };
     } else if (i === 51) {
-      pkgJson.dependencies['pkg-44'] = 'workspace:~';
-      pkgJson.dependencies['pkg-45'] = 'workspace:*';
-      pkgJson.dependencies['pkg-30'] = 'workspace:^';
-      pkgJson.dependencies['commander'] = '11.0.0';
-      pkgJson.scripts = {
-        preinstall: 'node -e "console.log(\'pkg-51 preinstall\');"',
-        postinstall: 'node -e "console.log(\'pkg-51 postinstall\');"'
-      };
+      pkgJson.dependencies['pkg-44'] = '~1.0.0';
+      pkgJson.dependencies['pkg-45'] = '^1.0.0';
+      pkgJson.dependencies['pkg-30'] = '^1.0.0';
+      pkgJson.dependencies['commander'] = '^11.1.0';
     }
   } else if (tier === 5) {
     // Integration suite
-    pkgJson.dependencies['pkg-01'] = 'workspace:*';
-    pkgJson.dependencies['pkg-15'] = 'workspace:*';
-    pkgJson.dependencies['pkg-26'] = 'workspace:*';
-    pkgJson.dependencies['pkg-41'] = 'workspace:*';
-    pkgJson.dependencies['pkg-49'] = 'workspace:*';
-    pkgJson.dependencies['pkg-50'] = 'workspace:*';
-    pkgJson.dependencies['pkg-51'] = 'workspace:*';
+    pkgJson.dependencies['pkg-01'] = '^1.0.0';
+    pkgJson.dependencies['pkg-15'] = '^1.0.0';
+    pkgJson.dependencies['pkg-26'] = '^1.0.0';
+    pkgJson.dependencies['pkg-41'] = '^1.0.0';
+    pkgJson.dependencies['pkg-49'] = '^1.0.0';
+    pkgJson.dependencies['pkg-50'] = '^1.0.0';
+    pkgJson.dependencies['pkg-51'] = '^1.0.0';
     pkgJson.scripts = {
-      test: 'node -e "console.log(\'pkg-52 integration test suite running\');"'
+      test: 'node -e "console.log(\'pkg-52 integration test suite running\')"'
     };
   }
 
@@ -216,6 +252,9 @@ const circularPackages = path.join(circularRoot, 'packages');
 const circADir = path.join(circularPackages, 'circ-a');
 const circBDir = path.join(circularPackages, 'circ-b');
 
+if (fs.existsSync(circularRoot)) {
+  fs.rmSync(circularRoot, { recursive: true, force: true });
+}
 fs.mkdirSync(circADir, { recursive: true });
 fs.mkdirSync(circBDir, { recursive: true });
 

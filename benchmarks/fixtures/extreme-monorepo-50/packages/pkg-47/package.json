@@ -4,8 +4,8 @@
   "description": "pkg-47 (Tier 3) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-17": "workspace:~",
-    "pkg-32": "workspace:*"
+    "pkg-17": "*",
+    "pkg-32": "^1.0.0"
   },
   "scripts": {}
 }

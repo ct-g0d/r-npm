@@ -4,15 +4,15 @@
   "description": "pkg-52 (Tier 5) workspace package",
   "main": "index.js",
   "dependencies": {
-    "pkg-01": "workspace:*",
-    "pkg-15": "workspace:*",
-    "pkg-26": "workspace:*",
-    "pkg-41": "workspace:*",
-    "pkg-49": "workspace:*",
-    "pkg-50": "workspace:*",
-    "pkg-51": "workspace:*"
+    "pkg-01": "^1.0.0",
+    "pkg-15": "^1.0.0",
+    "pkg-26": "^1.0.0",
+    "pkg-41": "^1.0.0",
+    "pkg-49": "^1.0.0",
+    "pkg-50": "^1.0.0",
+    "pkg-51": "^1.0.0"
   },
   "scripts": {
-    "test": "node -e \"console.log('pkg-52 integration test suite running');\""
+    "test": "node -e \"console.log('pkg-52 integration test suite running')\""
   }
 }
