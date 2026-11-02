@@ -252,3 +252,146 @@ use tokio::net::TcpListener;
         let executed_lines: Vec<&str> = log_content.lines().collect();
         assert_eq!(executed_lines, vec!["pkg-b", "pkg-a"]);
     }
+
+    #[tokio::test]
+    async fn test_cli_run_workspaces_large_dag_topological_stress() {
+        let root_dir = tempdir().unwrap();
+
+        // Monorepo root package.json
+        let root_pkg_json = root_dir.path().join("package.json");
+        std::fs::write(&root_pkg_json, r#"{
+            "name": "stress-monorepo",
+            "workspaces": ["packages/*"]
+        }"#).unwrap();
+
+        let marker_file = root_dir.path().join("stress_exec_log.txt");
+        let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+        let total_pkgs = 52;
+        let mut expected_deps: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+        // 1. Component 1: core-00 through core-19 (20 packages with diamonds and deep chains)
+        for i in 0..20 {
+            let name = format!("core-{i:02}");
+            let mut deps = Vec::new();
+            if i == 1 || i == 2 || i == 3 {
+                deps.push("core-00".to_string());
+            } else if i == 4 {
+                // Diamond
+                deps.push("core-01".to_string());
+                deps.push("core-02".to_string());
+            } else if i == 5 {
+                // Diamond
+                deps.push("core-02".to_string());
+                deps.push("core-03".to_string());
+            } else if (6..=15).contains(&i) {
+                // Deep chain
+                deps.push(format!("core-{:02}", i - 1));
+            } else if (16..=18).contains(&i) {
+                // Fan-out
+                deps.push("core-15".to_string());
+            } else if i == 19 {
+                // Fan-in
+                deps.push("core-16".to_string());
+                deps.push("core-17".to_string());
+                deps.push("core-18".to_string());
+            }
+            expected_deps.insert(name, deps);
+        }
+
+        // 2. Component 2: app-00 through app-24 (25 packages, disconnected from core)
+        for i in 0..25 {
+            let name = format!("app-{i:02}");
+            let mut deps = Vec::new();
+            if (2..=7).contains(&i) {
+                deps.push("app-00".to_string());
+                if i % 2 == 0 {
+                    deps.push("app-01".to_string());
+                }
+            } else if (8..=15).contains(&i) {
+                deps.push(format!("app-{:02}", i - 6));
+            } else if (16..=23).contains(&i) {
+                deps.push(format!("app-{:02}", i - 8));
+            } else if i == 24 {
+                deps.push("app-20".to_string());
+                deps.push("app-21".to_string());
+                deps.push("app-22".to_string());
+                deps.push("app-23".to_string());
+            }
+            expected_deps.insert(name, deps);
+        }
+
+        // 3. Component 3: isolated-00 through isolated-06 (7 standalone packages)
+        for i in 0..7 {
+            let name = format!("isolated-{i:02}");
+            expected_deps.insert(name, Vec::new());
+        }
+
+        assert_eq!(expected_deps.len(), total_pkgs);
+
+        // Generate package directories and package.json files
+        for (name, deps) in &expected_deps {
+            let pkg_dir = root_dir.path().join("packages").join(name);
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+
+            let mut dep_map = serde_json::Map::new();
+            for dep in deps {
+                dep_map.insert(dep.clone(), serde_json::Value::String("workspace:*".to_string()));
+            }
+
+            let pkg_json_val = serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "dependencies": dep_map,
+                "scripts": {
+                    "build": format!("node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}\\n')\"")
+                }
+            });
+
+            std::fs::write(
+                pkg_dir.join("package.json"),
+                serde_json::to_string_pretty(&pkg_json_val).unwrap(),
+            ).unwrap();
+        }
+
+        // Run `rnpm run build --workspaces`
+        let cli = Cli {
+            command: Commands::Run {
+                script: "build".to_string(),
+                args: vec![],
+                workspaces: true,
+                workspace: vec![],
+                if_present: false,
+                ignore_scripts: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(root_dir.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Expected run_cli to succeed on large monorepo DAG: {:?}", res.err());
+
+        // Verify topological execution
+        let log_content = std::fs::read_to_string(&marker_file).unwrap();
+        let executed_sequence: Vec<&str> = log_content.lines().collect();
+        assert_eq!(
+            executed_sequence.len(),
+            total_pkgs,
+            "All {total_pkgs} workspace packages must have executed"
+        );
+
+        let mut executed_index_map: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (idx, &name) in executed_sequence.iter().enumerate() {
+            executed_index_map.insert(name, idx);
+        }
+
+        // Assert topological invariant: every dependency must execute BEFORE its dependent
+        for (pkg, deps) in &expected_deps {
+            let pkg_idx = *executed_index_map.get(pkg.as_str()).unwrap();
+            for dep in deps {
+                let dep_idx = *executed_index_map.get(dep.as_str()).unwrap();
+                assert!(
+                    dep_idx < pkg_idx,
+                    "Topological ordering failed: dependency '{dep}' (index {dep_idx}) executed AFTER dependent '{pkg}' (index {pkg_idx})"
+                );
+            }
+        }
+    }

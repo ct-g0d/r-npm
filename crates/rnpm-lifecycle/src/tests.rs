@@ -1,4 +1,5 @@
 use crate::*;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 #[test]
@@ -363,4 +364,432 @@ async fn test_async_cancellation_terminates_process() {
         }
     }
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn test_process_tree_abort_signal_kills_entire_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let grandchild_pid_file = root.join("grandchild.pid");
+    let escaped_pid_file = grandchild_pid_file.to_string_lossy().replace('\\', "/");
+
+    let script_file = root.join("spawn_tree.js");
+    let script_js = format!(
+        "const {{ spawn }} = require('child_process');\n\
+        const g = spawn(process.execPath, [\n\
+            '-e',\n\
+            `require('fs').writeFileSync('{escaped_pid_file}', String(process.pid)); setInterval(() => {{}}, 1000);`\n\
+        ], {{ stdio: 'ignore' }});\n\
+        setInterval(() => {{}}, 1000);\n"
+    );
+    std::fs::write(&script_file, script_js).unwrap();
+
+    let escaped_script_file = script_file.to_string_lossy().replace('\\', "/");
+    let script_cmd = format!("node \"{escaped_script_file}\"");
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "process-tree-test",
+        "preinstall",
+        &script_cmd,
+    );
+
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+
+    let abort_fut = async move {
+        let mut rx = abort_rx;
+        let _ = rx.wait_for(|&v| v).await;
+    };
+
+    // Spawn script in background
+    let exec_task = tokio::spawn(async move {
+        execute_lifecycle_script_with_abort(&ctx, abort_fut).await
+    });
+
+    // Wait until the grandchild has started and written its PID
+    let mut grandchild_pid: Option<u32> = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if grandchild_pid_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&grandchild_pid_file) {
+                let trimmed = content.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+
+    let pid = grandchild_pid.expect("Grandchild process should have launched and written its PID");
+    assert!(
+        process_guard::is_process_running(pid),
+        "Grandchild process {pid} must be actively running"
+    );
+
+    // Send abort signal
+    let _ = abort_tx.send(true);
+
+    // Wait for task to finish with error
+    let res = exec_task.await.unwrap();
+    assert!(res.is_err(), "Lifecycle execution must terminate with error on abort");
+
+    // Wait brief grace period for OS process cleanup
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Verify the grandchild process was cleanly terminated and not orphaned
+    assert!(
+        !process_guard::is_process_running(pid),
+        "Grandchild process {pid} must be terminated upon abort signal, no orphans allowed"
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_execution_aborts_and_halts_remaining_packages() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("workspace_abort_order.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let mut members = Vec::new();
+    let names = ["pkg-abort-1", "pkg-abort-2", "pkg-abort-3"];
+
+    for name in &names {
+        let pkg_dir = root.join("packages").join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.to_string());
+        manifest.version = Some("1.0.0".to_string());
+
+        let cmd = if *name == "pkg-abort-1" {
+            // First package logs its start and sleeps
+            format!(
+                "node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}\\n'); setTimeout(()=>{{}}, 60000)\""
+            )
+        } else {
+            format!("node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}\\n')\"")
+        };
+
+        manifest.scripts.insert("build".to_string(), cmd);
+
+        members.push(WorkspaceScriptMember {
+            name: name.to_string(),
+            path: pkg_dir,
+            manifest,
+        });
+    }
+
+    let topo_order = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+
+    let members_clone = members.clone();
+    let root_path = root.to_path_buf();
+    let run_task = tokio::spawn(async move {
+        execute_workspace_scripts_topological_with_abort(
+            &root_path,
+            &members_clone,
+            &topo_order,
+            &opts,
+            Some(abort_rx),
+        )
+        .await
+    });
+
+    // Wait until pkg-abort-1 starts running and writes marker
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if marker_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&marker_file) {
+                if content.contains("pkg-abort-1") {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Trigger abort
+    let _ = abort_tx.send(true);
+
+    let res = run_task.await.unwrap();
+    assert!(res.is_err(), "Workspace execution must abort on signal");
+
+    // Verify subsequent packages (pkg-abort-2, pkg-abort-3) NEVER ran
+    let content = std::fs::read_to_string(&marker_file).unwrap_or_default();
+    assert!(content.contains("pkg-abort-1"));
+    assert!(!content.contains("pkg-abort-2"), "pkg-abort-2 should not have run after abort");
+    assert!(!content.contains("pkg-abort-3"), "pkg-abort-3 should not have run after abort");
+}
+
+#[tokio::test]
+async fn test_monorepo_topological_sort_stress_large_dag() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("stress_dag_exec_order.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    // Construct a complex monorepo DAG with 65 packages across 4 disconnected components:
+    // Component 1: Infrastructure tier (20 packages with diamonds and deep chains)
+    // Component 2: Frontend tier (25 packages with wide fan-outs and multi-parents)
+    // Component 3: Data pipeline (15 packages with multi-stage aggregators)
+    // Component 4: Isolated packages (5 standalone packages)
+    let total_pkgs = 65;
+    let mut members = Vec::with_capacity(total_pkgs);
+    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+
+    // 1. Component 1: infra-00 to infra-19 (20 packages)
+    for i in 0..20 {
+        let name = format!("infra-{i:02}");
+        let mut deps = Vec::new();
+        if i == 1 || i == 2 || i == 3 {
+            deps.push("infra-00".to_string());
+        } else if i == 4 {
+            // Diamond: depends on 1 and 2
+            deps.push("infra-01".to_string());
+            deps.push("infra-02".to_string());
+        } else if i == 5 {
+            // Diamond: depends on 2 and 3
+            deps.push("infra-02".to_string());
+            deps.push("infra-03".to_string());
+        } else if (6..=15).contains(&i) {
+            // Deep chain
+            deps.push(format!("infra-{:02}", i - 1));
+        } else if i == 16 || i == 17 || i == 18 {
+            // Fan-out from 15
+            deps.push("infra-15".to_string());
+        } else if i == 19 {
+            // Fan-in from 16, 17, 18
+            deps.push("infra-16".to_string());
+            deps.push("infra-17".to_string());
+            deps.push("infra-18".to_string());
+        }
+        dependencies.insert(name.clone(), deps);
+    }
+
+    // 2. Component 2: ui-00 to ui-24 (25 packages, disconnected from infra)
+    for i in 0..25 {
+        let name = format!("ui-{i:02}");
+        let mut deps = Vec::new();
+        if (2..=7).contains(&i) {
+            // Wide fan-out from leaves ui-00, ui-01
+            deps.push("ui-00".to_string());
+            if i % 2 == 0 {
+                deps.push("ui-01".to_string());
+            }
+        } else if (8..=15).contains(&i) {
+            // Cross-component intermediate UI dependencies
+            deps.push(format!("ui-{:02}", i - 6));
+            deps.push(format!("ui-{:02}", i - 5));
+        } else if (16..=23).contains(&i) {
+            // Higher-level UI widgets
+            deps.push(format!("ui-{:02}", i - 8));
+        } else if i == 24 {
+            // Top-level application fanning in multiple widgets
+            deps.push("ui-20".to_string());
+            deps.push("ui-21".to_string());
+            deps.push("ui-22".to_string());
+            deps.push("ui-23".to_string());
+        }
+        dependencies.insert(name.clone(), deps);
+    }
+
+    // 3. Component 3: data-00 to data-14 (15 packages, disconnected from infra and ui)
+    for i in 0..15 {
+        let name = format!("data-{i:02}");
+        let mut deps = Vec::new();
+        if (1..=4).contains(&i) {
+            deps.push("data-00".to_string());
+        } else if (5..=9).contains(&i) {
+            deps.push(format!("data-{:02}", i - 4));
+            deps.push("data-00".to_string());
+        } else if (10..=13).contains(&i) {
+            deps.push(format!("data-{:02}", i - 5));
+        } else if i == 14 {
+            deps.push("data-10".to_string());
+            deps.push("data-11".to_string());
+            deps.push("data-12".to_string());
+            deps.push("data-13".to_string());
+        }
+        dependencies.insert(name.clone(), deps);
+    }
+
+    // 4. Component 4: standalone-00 to standalone-04 (5 isolated packages)
+    for i in 0..5 {
+        let name = format!("standalone-{i:02}");
+        dependencies.insert(name.clone(), Vec::new());
+    }
+
+    // Create manifest and directories for all 65 packages
+    let mut all_names = Vec::new();
+    for (name, _) in &dependencies {
+        all_names.push(name.clone());
+        let pkg_dir = root.join("packages").join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.clone());
+        manifest.version = Some("1.0.0".to_string());
+
+        // Script appends "name\n" to marker_file
+        manifest.scripts.insert(
+            "stress-build".to_string(),
+            format!("node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}\\n')\""),
+        );
+
+        members.push(WorkspaceScriptMember {
+            name: name.clone(),
+            path: pkg_dir,
+            manifest,
+        });
+    }
+
+    // Compute topological order across all 65 packages using Kahn's algorithm
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+
+    for name in &all_names {
+        in_degree.insert(name.clone(), 0);
+        adj.insert(name.clone(), Vec::new());
+    }
+
+    for (pkg, deps) in &dependencies {
+        for dep in deps {
+            adj.get_mut(dep).unwrap().push(pkg.clone());
+            *in_degree.get_mut(pkg).unwrap() += 1;
+        }
+    }
+
+    let mut ready = VecDeque::new();
+    let mut sorted_names = all_names.clone();
+    sorted_names.sort();
+
+    for name in &sorted_names {
+        if in_degree[name] == 0 {
+            ready.push_back(name.clone());
+        }
+    }
+
+    let mut topo_order = Vec::new();
+    while let Some(curr) = ready.pop_front() {
+        topo_order.push(curr.clone());
+        let mut dependents = adj[&curr].clone();
+        dependents.sort();
+        for dep in dependents {
+            let deg = in_degree.get_mut(&dep).unwrap();
+            *deg -= 1;
+            if *deg == 0 {
+                ready.push_back(dep);
+            }
+        }
+    }
+
+    assert_eq!(
+        topo_order.len(),
+        total_pkgs,
+        "All 65 packages must be included in computed topological order"
+    );
+
+    let opts = WorkspaceRunOptions {
+        script: "stress-build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let summary = execute_workspace_scripts_topological(root, &members, &topo_order, &opts)
+        .await
+        .expect("Workspace stress execution should succeed without errors");
+
+    assert_eq!(summary.executed_packages.len(), total_pkgs);
+
+    // Read recorded execution order from marker file
+    let content = std::fs::read_to_string(&marker_file).expect("Marker file should exist");
+    let executed_sequence: Vec<&str> = content.lines().collect();
+    assert_eq!(executed_sequence.len(), total_pkgs);
+
+    let mut executed_index_map: HashMap<&str, usize> = HashMap::new();
+    for (idx, &name) in executed_sequence.iter().enumerate() {
+        executed_index_map.insert(name, idx);
+    }
+
+    // Verify the topological invariant for ALL 65 packages:
+    // If package A depends on package B, B MUST appear before A in executed_sequence!
+    for (pkg, deps) in &dependencies {
+        let pkg_idx = *executed_index_map.get(pkg.as_str()).unwrap();
+        for dep in deps {
+            let dep_idx = *executed_index_map.get(dep.as_str()).unwrap();
+            assert!(
+                dep_idx < pkg_idx,
+                "Topological invariant violated! Dependency '{dep}' (index {dep_idx}) executed AFTER dependent '{pkg}' (index {pkg_idx})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_lifecycle_topological_stress_50_plus_packages() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // Test execute_topological with 60 LifecyclePackageNodes across multiple components
+    let count = 60;
+    let mut nodes = Vec::with_capacity(count);
+    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+
+    for i in 0..count {
+        let name = format!("pkg-dag-{i:02}");
+        let pkg_dir = root.join("node_modules").join(&name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.clone());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.scripts.insert("install".to_string(), "node -e \"process.exit(0)\"".to_string());
+
+        let mut deps = Vec::new();
+        if i >= 1 && i < 10 {
+            deps.push("pkg-dag-00".to_string());
+        } else if (10..30).contains(&i) {
+            deps.push(format!("pkg-dag-{:02}", i - 5));
+            deps.push(format!("pkg-dag-{:02}", i - 3));
+        } else if (30..50).contains(&i) {
+            deps.push(format!("pkg-dag-{:02}", i - 1));
+        }
+        // packages 50..60 are disconnected components / leaves
+
+        dependencies.insert(name.clone(), deps.clone());
+
+        nodes.push(LifecyclePackageNode {
+            package_path: format!("node_modules/{name}"),
+            disk_path: pkg_dir,
+            manifest,
+            source: PackageSource::Registry,
+            dependencies: deps,
+            optional: false,
+        });
+    }
+
+    let root_manifest = Manifest::default();
+    let opts = LifecycleOptions {
+        root_dir: root.clone(),
+        init_cwd: root.clone(),
+        ignore_scripts: false,
+        capture_output: true,
+    };
+
+    let res = execute_topological(&nodes, &root_manifest, &opts).await;
+    assert!(res.is_ok(), "Large 60-package topological lifecycle execution should succeed");
 }

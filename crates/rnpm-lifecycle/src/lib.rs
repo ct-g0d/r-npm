@@ -127,6 +127,26 @@ pub mod process_guard {
             }
         }
     }
+
+    pub fn is_process_running(pid: u32) -> bool {
+        unsafe {
+            extern "system" {
+                fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+                fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            }
+            const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+            const STILL_ACTIVE: u32 = 259;
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code = 0;
+            let res = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            res != 0 && exit_code == STILL_ACTIVE
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -173,6 +193,18 @@ pub mod process_guard {
     impl Drop for ProcessTreeGuard {
         fn drop(&mut self) {
             let _ = self.terminate(1);
+        }
+    }
+
+    pub fn is_process_running(pid: u32) -> bool {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, 0) == 0
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            false
         }
     }
 }
@@ -562,8 +594,15 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
 }
 
 /// Spawns and executes a lifecycle script asynchronously, enforcing process-tree signal cleanup.
-/// If cancelled or aborted by SIGINT/SIGTERM, runaway child processes are cleanly terminated immediately.
-pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<ExitStatus> {
+/// If an abort future resolves, or if cancelled by SIGINT/SIGTERM, or if the future is dropped,
+/// runaway child and grandchild processes are cleanly terminated immediately.
+pub async fn execute_lifecycle_script_with_abort<F>(
+    ctx: &LifecycleContext,
+    abort_fut: F,
+) -> Result<ExitStatus>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     info!(
         "Running async lifecycle script '{}' for package {} in {}",
         ctx.event,
@@ -678,6 +717,14 @@ pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<Ex
             cancel_guard.completed = true;
             return Err(anyhow::anyhow!("Lifecycle execution for {pkg_name} terminated by {sig}"));
         }
+        _ = abort_fut => {
+            warn!("Abort signal triggered; terminating lifecycle process tree for {pkg_name}");
+            if let Some(ref g) = *guard_clone {
+                g.terminate(143);
+            }
+            cancel_guard.completed = true;
+            return Err(anyhow::anyhow!("Lifecycle execution for {pkg_name} aborted by signal"));
+        }
     };
 
     // Guarantee cleanup of any remaining grandchild processes on exit
@@ -698,14 +745,29 @@ pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<Ex
     Ok(status)
 }
 
-/// Executes dependency lifecycle scripts bottom-up (topologically), followed by root hooks.
-pub async fn execute_topological(
+/// Spawns and executes a lifecycle script asynchronously, enforcing process-tree signal cleanup.
+/// If cancelled or aborted by SIGINT/SIGTERM, runaway child processes are cleanly terminated immediately.
+pub async fn execute_lifecycle_script_async(ctx: &LifecycleContext) -> Result<ExitStatus> {
+    execute_lifecycle_script_with_abort(ctx, std::future::pending()).await
+}
+
+/// Executes dependency lifecycle scripts bottom-up (topologically), followed by root hooks,
+/// with optional abort signal monitoring.
+pub async fn execute_topological_with_abort(
     nodes: &[LifecyclePackageNode],
     root_manifest: &Manifest,
     opts: &LifecycleOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     if opts.ignore_scripts {
         return Ok(());
+    }
+
+    // Check if already aborted
+    if let Some(ref rx) = abort_rx {
+        if *rx.borrow() {
+            return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+        }
     }
 
     // Topological sorting: leaf nodes first (bottom-up)
@@ -761,6 +823,12 @@ pub async fn execute_topological(
 
         for &hook in hooks {
             if let Some(script_cmd) = node.manifest.scripts.get(hook) {
+                if let Some(ref rx) = abort_rx {
+                    if *rx.borrow() {
+                        return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+                    }
+                }
+
                 let mut ctx = LifecycleContext::new(
                     &opts.root_dir,
                     &node.disk_path,
@@ -770,7 +838,18 @@ pub async fn execute_topological(
                 );
                 ctx.package_version = node.manifest.version.clone();
 
-                match execute_lifecycle_script_async(&ctx).await {
+                let abort_fut = {
+                    let mut rx_opt = abort_rx.clone();
+                    async move {
+                        if let Some(ref mut rx) = rx_opt {
+                            let _ = rx.wait_for(|&val| val).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                };
+
+                match execute_lifecycle_script_with_abort(&ctx, abort_fut).await {
                     Ok(status) if status.success() => {},
                     Ok(status) => {
                         if node.optional {
@@ -826,6 +905,12 @@ pub async fn execute_topological(
     let root_hooks = ["preinstall", "install", "postinstall", "prepare"];
     for hook in root_hooks {
         if let Some(script_cmd) = root_manifest.scripts.get(hook) {
+            if let Some(ref rx) = abort_rx {
+                if *rx.borrow() {
+                    return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+                }
+            }
+
             let mut ctx = LifecycleContext::new(
                 &opts.root_dir,
                 &opts.root_dir,
@@ -834,7 +919,19 @@ pub async fn execute_topological(
                 script_cmd,
             );
             ctx.package_version = root_manifest.version.clone();
-            let status = execute_lifecycle_script_async(&ctx).await?;
+
+            let abort_fut = {
+                let mut rx_opt = abort_rx.clone();
+                async move {
+                    if let Some(ref mut rx) = rx_opt {
+                        let _ = rx.wait_for(|&val| val).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+
+            let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
                 return Err(anyhow::anyhow!(
                     "Root lifecycle script '{}' failed with exit code: {:?}",
@@ -845,6 +942,15 @@ pub async fn execute_topological(
     }
 
     Ok(())
+}
+
+/// Executes dependency lifecycle scripts bottom-up (topologically), followed by root hooks.
+pub async fn execute_topological(
+    nodes: &[LifecyclePackageNode],
+    root_manifest: &Manifest,
+    opts: &LifecycleOptions,
+) -> Result<()> {
+    execute_topological_with_abort(nodes, root_manifest, opts, None).await
 }
 
 /// Represents a workspace package member participating in script execution.
@@ -870,15 +976,23 @@ pub struct WorkspaceRunSummary {
     pub skipped_packages: Vec<String>,
 }
 
-/// Executes an arbitrary script across workspace members in topological dependency order (leaf packages first).
-pub async fn execute_workspace_scripts_topological(
+/// Executes an arbitrary script across workspace members in topological dependency order (leaf packages first),
+/// with optional abort signal support.
+pub async fn execute_workspace_scripts_topological_with_abort(
     root_dir: &Path,
     members: &[WorkspaceScriptMember],
     topological_order: &[String],
     opts: &WorkspaceRunOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<WorkspaceRunSummary> {
     if opts.ignore_scripts {
         return Ok(WorkspaceRunSummary::default());
+    }
+
+    if let Some(ref rx) = abort_rx {
+        if *rx.borrow() {
+            return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
+        }
     }
 
     let mut name_to_member: HashMap<&str, &WorkspaceScriptMember> = HashMap::new();
@@ -891,6 +1005,12 @@ pub async fn execute_workspace_scripts_topological(
 
     // 1. Run members in explicit topological order
     for pkg_name in topological_order {
+        if let Some(ref rx) = abort_rx {
+            if *rx.borrow() {
+                return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
+            }
+        }
+
         if let Some(ref filter) = opts.filter_members {
             if !filter.iter().any(|f| f == pkg_name) {
                 continue;
@@ -924,7 +1044,18 @@ pub async fn execute_workspace_scripts_topological(
                 );
                 ctx.package_version = member.manifest.version.clone();
 
-                let status = execute_lifecycle_script_async(&ctx).await?;
+                let abort_fut = {
+                    let mut rx_opt = abort_rx.clone();
+                    async move {
+                        if let Some(ref mut rx) = rx_opt {
+                            let _ = rx.wait_for(|&val| val).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                };
+
+                let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
                 if !status.success() {
                     let code = status.code().unwrap_or(1);
                     return Err(anyhow::anyhow!(
@@ -955,6 +1086,12 @@ pub async fn execute_workspace_scripts_topological(
 
     // 2. Run any members not covered in topological_order
     for member in members {
+        if let Some(ref rx) = abort_rx {
+            if *rx.borrow() {
+                return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
+            }
+        }
+
         if executed_or_skipped.contains(&member.name) {
             continue;
         }
@@ -989,7 +1126,18 @@ pub async fn execute_workspace_scripts_topological(
             );
             ctx.package_version = member.manifest.version.clone();
 
-            let status = execute_lifecycle_script_async(&ctx).await?;
+            let abort_fut = {
+                let mut rx_opt = abort_rx.clone();
+                async move {
+                    if let Some(ref mut rx) = rx_opt {
+                        let _ = rx.wait_for(|&val| val).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+
+            let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
                 let code = status.code().unwrap_or(1);
                 return Err(anyhow::anyhow!(
@@ -1016,4 +1164,14 @@ pub async fn execute_workspace_scripts_topological(
     }
 
     Ok(summary)
+}
+
+/// Executes an arbitrary script across workspace members in topological dependency order (leaf packages first).
+pub async fn execute_workspace_scripts_topological(
+    root_dir: &Path,
+    members: &[WorkspaceScriptMember],
+    topological_order: &[String],
+    opts: &WorkspaceRunOptions,
+) -> Result<WorkspaceRunSummary> {
+    execute_workspace_scripts_topological_with_abort(root_dir, members, topological_order, opts, None).await
 }

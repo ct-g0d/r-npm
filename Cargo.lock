@@ -1155,6 +1155,7 @@ dependencies = [
  "anyhow",
  "rnpm-core",
  "rnpm-fs",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
