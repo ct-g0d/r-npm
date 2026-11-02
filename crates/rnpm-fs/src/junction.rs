@@ -51,7 +51,7 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
-                    if attempts >= 10 || !crate::atomic::is_retryable_error(&err) {
+                    if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::JunctionError {
                             path: path.to_path_buf(),
                             detail: format!("Failed to remove junction after {attempts} attempts: {err}"),
@@ -127,7 +127,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
-                    if attempts >= 10 || !crate::atomic::is_retryable_error(&err) {
+                    if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::Io(err));
                     }
                     let jitter_ms = (attempts as u64 * 3) % 7;
@@ -155,7 +155,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
-                    if attempts >= 10 || !crate::atomic::is_retryable_error(&err) {
+                    if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::Io(err));
                     }
                     let jitter_ms = (attempts as u64 * 3) % 7;

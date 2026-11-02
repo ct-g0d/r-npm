@@ -295,4 +295,245 @@ mod tests {
         assert!(!blob_path.exists());
         assert!(!index_path.exists());
     }
+
+    fn run_cache_multiprocess_worker(worker_id: &str, cache_dir: &str) {
+        let cache = Cache::new(cache_dir).expect("Worker failed to init cache");
+
+        // 1. Write unique keys
+        for item in 0..15 {
+            let key = format!("https://registry.npmjs.org/{worker_id}-pkg-{item}/-/{worker_id}-pkg-{item}-1.0.0.tgz");
+            let data = format!("{worker_id} payload data {item}").into_bytes();
+            cache.put(&key, &data, None).expect("Worker failed to put unique key");
+
+            let (_, read_back) = cache.get(&key).expect("Worker failed get").expect("Must hit cache");
+            assert_eq!(read_back, data);
+        }
+
+        // 2. Contend on shared keys across all workers
+        let shared_key = "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
+        for i in 0..5 {
+            let shared_data = format!("shared multiprocess payload from {worker_id} iter {i}").into_bytes();
+            let _ = cache.put(shared_key, &shared_data, None);
+            let _ = cache.get(shared_key);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_multiprocess_cache_reads_writes() {
+        // If launched as a child worker process:
+        if let Ok(worker_id) = std::env::var("RNPM_CACHE_WORKER_ID") {
+            let cache_dir = std::env::var("RNPM_CACHE_DIR").expect("RNPM_CACHE_DIR must be set");
+            run_cache_multiprocess_worker(&worker_id, &cache_dir);
+            return;
+        }
+
+        // Main test coordinator:
+        let dir = tempdir().unwrap();
+        let cache_dir_str = dir.path().to_str().unwrap().to_string();
+        let current_exe = std::env::current_exe().unwrap();
+
+        // Spawn 4 child processes concurrently
+        let mut children = Vec::new();
+        for i in 0..4 {
+            let child = std::process::Command::new(&current_exe)
+                .args(["--nocapture", "tests::test_concurrent_multiprocess_cache_reads_writes"])
+                .env("RNPM_CACHE_WORKER_ID", format!("worker-{i}"))
+                .env("RNPM_CACHE_DIR", &cache_dir_str)
+                .spawn()
+                .expect("Failed to spawn cache worker process");
+            children.push(child);
+        }
+
+        // Coordinator also performs concurrent cache operations in parallel with the 4 child processes
+        let cache = Cache::new(dir.path()).unwrap();
+        for i in 0..20 {
+            let key = format!("https://registry.npmjs.org/coord-pkg-{i}/-/coord-pkg-{i}-1.0.0.tgz");
+            let data = format!("coordinator payload {i}").into_bytes();
+            cache.put(&key, &data, None).unwrap();
+            let (_, retrieved) = cache.get(&key).unwrap().expect("Coordinator read miss");
+            assert_eq!(retrieved, data);
+        }
+
+        // Wait for all child processes and assert they exited successfully
+        for mut child in children {
+            let status = child.wait().expect("Failed to wait on child process");
+            assert!(status.success(), "Child worker process exited with failure: {:?}", status);
+        }
+
+        // Verify all keys written by workers are present and uncorrupted
+        for w in 0..4 {
+            for item in 0..15 {
+                let key = format!("https://registry.npmjs.org/worker-{w}-pkg-{item}/-/worker-{w}-pkg-{item}-1.0.0.tgz");
+                let expected_data = format!("worker-{w} payload data {item}").into_bytes();
+                let (_, retrieved) = cache.get(&key).unwrap().expect("Worker key should be in cache");
+                assert_eq!(retrieved, expected_data, "Data mismatch for key {key}");
+            }
+        }
+
+        // Verify shared key written by all workers concurrently
+        let shared_key = "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
+        let (_, shared_data) = cache.get(shared_key).unwrap().expect("Shared key must exist");
+        assert!(shared_data.starts_with(b"shared multiprocess payload"));
+
+        // Verify no temporary files remain in tmp directory
+        let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(tmp_entries.len(), 0, "No orphaned temp files after multiprocess stress");
+    }
+
+    #[test]
+    fn test_simulated_stale_lock_recovery() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap()
+            .with_lock_timeout(Duration::from_millis(150))
+            .with_stale_threshold(Duration::from_millis(40));
+
+        let lock_path = cache.lock_path("idx_simulated_stale");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create an abandoned lock file simulating a dead process
+        std::fs::write(&lock_path, b"pid=9999999 time=1000\n").unwrap();
+        assert!(lock_path.exists());
+
+        // Wait so the lock file age exceeds the 40ms stale threshold
+        sleep(Duration::from_millis(60));
+
+        // Attempt to acquire lock on the stale path
+        let acquired = CacheLock::acquire_exclusive_with_options(
+            &lock_path,
+            Duration::from_millis(100),
+            Duration::from_millis(40),
+        );
+
+        assert!(
+            acquired.is_ok(),
+            "Must successfully auto-recover abandoned stale lock: {:?}",
+            acquired.err()
+        );
+
+        let lock = acquired.unwrap();
+        assert!(lock.path().exists());
+
+        // Drop the lock guard to release the exclusive lock before reading file content on Windows
+        drop(lock);
+
+        // Content of lock should have been overwritten with current pid
+        let content = std::fs::read_to_string(&lock_path).unwrap();
+        let current_pid = std::process::id();
+        assert!(
+            content.contains(&format!("pid={current_pid}")),
+            "Lock file must be refreshed with current PID, got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_rapid_lock_timeouts_and_contention() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(
+            Cache::new(dir.path()).unwrap()
+                .with_lock_timeout(Duration::from_millis(20))
+                .with_stale_threshold(Duration::from_secs(60))
+        );
+
+        let lock_path = cache.lock_path("rapid_contention_lock");
+
+        // Primary lock holder acquires exclusive lock
+        let primary_lock = CacheLock::acquire_exclusive(&lock_path).unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let timeout_count = Arc::new(AtomicUsize::new(0));
+
+        let mut workers = Vec::new();
+        // Spawn 8 worker threads that rapidly attempt to acquire the held lock with 15ms timeout
+        for _ in 0..8 {
+            let lp = lock_path.clone();
+            let r = Arc::clone(&running);
+            let tc = Arc::clone(&timeout_count);
+            let h = thread::spawn(move || {
+                while r.load(Ordering::Relaxed) {
+                    let res = CacheLock::acquire_exclusive_timeout(&lp, Duration::from_millis(15));
+                    if let Err(e) = res {
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            tc.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            workers.push(h);
+        }
+
+        // Let workers hammer the lock and experience rapid timeouts
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            timeout_count.load(Ordering::Relaxed) > 10,
+            "Expected multiple rapid timeouts under contention, got {}",
+            timeout_count.load(Ordering::Relaxed)
+        );
+
+        // Signal workers to stop
+        running.store(false, Ordering::Relaxed);
+        for h in workers {
+            h.join().unwrap();
+        }
+
+        // Release the primary lock
+        drop(primary_lock);
+
+        // Now rapid acquisition must immediately succeed
+        let fresh_lock = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(200));
+        assert!(fresh_lock.is_ok(), "Lock must be immediately acquirable after release");
+    }
+
+    #[test]
+    fn test_concurrent_high_parallel_cache_hammering() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path()).unwrap());
+
+        let mut handles = Vec::new();
+        // 16 parallel threads performing concurrent cache operations
+        for thread_idx in 0..16 {
+            let c = Arc::clone(&cache);
+            let h = thread::spawn(move || {
+                for iter in 0..10 {
+                    // Contended shared key
+                    let shared_key = format!("https://registry.npmjs.org/contended-{}/-/contended.tgz", iter % 3);
+                    let payload = format!("contended-payload-{thread_idx}-{iter}").into_bytes();
+                    let _ = c.put(&shared_key, &payload, None);
+                    let _ = c.get(&shared_key);
+
+                    // Thread-local unique key
+                    let unique_key = format!("https://registry.npmjs.org/unique-{thread_idx}-{iter}/-/unique.tgz");
+                    let unique_data = format!("unique-data-{thread_idx}-{iter}").into_bytes();
+                    c.put(&unique_key, &unique_data, None).unwrap();
+                    let (_, retrieved) = c.get(&unique_key).unwrap().expect("Must hit cache");
+                    assert_eq!(retrieved, unique_data);
+                }
+            });
+            handles.push(h);
+        }
+
+        for h in handles {
+            h.join().expect("Worker thread panicked under cache hammering");
+        }
+
+        // Clean temp sweep
+        let remaining_tmp = cache.clean_stale_temp_files(std::time::Duration::from_secs(0)).unwrap();
+        assert_eq!(remaining_tmp, 0, "No temporary files should be orphaned");
+    }
 }

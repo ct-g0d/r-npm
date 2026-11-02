@@ -17,13 +17,22 @@ impl CacheLock {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
     pub const DEFAULT_STALE_THRESHOLD: Duration = Duration::from_secs(60);
 
-    /// Acquire an exclusive cross-process lock on the specified file path, with retry backoff and timeout.
+    /// Acquire an exclusive cross-process lock on the specified file path, with retry backoff and default timeout.
     pub fn acquire_exclusive(path: &Path) -> Result<Self, std::io::Error> {
-        Self::acquire_exclusive_timeout(path, Self::DEFAULT_TIMEOUT)
+        Self::acquire_exclusive_with_options(path, Self::DEFAULT_TIMEOUT, Self::DEFAULT_STALE_THRESHOLD)
     }
 
     /// Acquire an exclusive cross-process lock with a specific timeout duration.
     pub fn acquire_exclusive_timeout(path: &Path, timeout: Duration) -> Result<Self, std::io::Error> {
+        Self::acquire_exclusive_with_options(path, timeout, Self::DEFAULT_STALE_THRESHOLD)
+    }
+
+    /// Acquire an exclusive cross-process lock with specific timeout duration and stale threshold.
+    pub fn acquire_exclusive_with_options(
+        path: &Path,
+        timeout: Duration,
+        stale_threshold: Duration,
+    ) -> Result<Self, std::io::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -40,11 +49,11 @@ impl CacheLock {
                     let elapsed = start.elapsed();
                     if elapsed >= timeout {
                         // Check if lock file can be recovered (e.g. stale lock recovery)
-                        if Self::is_lock_stale(path, Self::DEFAULT_STALE_THRESHOLD) {
+                        if Self::is_lock_stale(path, stale_threshold) {
                             warn!(
                                 "Lock on {} appears stale (older than {:?}). Attempting recovery...",
                                 path.display(),
-                                Self::DEFAULT_STALE_THRESHOLD
+                                stale_threshold
                             );
                             if let Ok(Some(recovered)) = Self::force_recover_stale_lock(path) {
                                 return Ok(recovered);
