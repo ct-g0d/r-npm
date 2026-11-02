@@ -9,7 +9,11 @@ mod tests;
 /// Escapes a relative path string for use inside double quotes in POSIX shell script.
 pub fn escape_posix_path(path: &str) -> String {
     let forward = path.replace('\\', "/");
-    forward
+    let sanitized = forward
+        .replace('\0', "")
+        .replace('\r', "")
+        .replace('\n', "");
+    sanitized
         .replace('\\', "\\\\")
         .replace('\"', "\\\"")
         .replace('$', "\\$")
@@ -18,41 +22,53 @@ pub fn escape_posix_path(path: &str) -> String {
 
 /// Escapes a command-line argument for POSIX shell.
 pub fn escape_posix_arg(arg: &str) -> String {
-    if arg.is_empty() {
+    let sanitized = arg.replace('\0', "");
+    if sanitized.is_empty() {
         return "''".to_string();
     }
-    if arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
-        arg.to_string()
+    if sanitized.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+        sanitized
     } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
+        format!("'{}'", sanitized.replace('\'', r"'\''"))
     }
 }
 
 /// Escapes a relative path string for use inside double quotes in Windows Command Prompt (.cmd).
+/// Metacharacters such as % are escaped to %% to prevent unintended batch variable expansion,
+/// and quotes/newlines/null bytes are stripped.
 pub fn escape_cmd_path(path: &str) -> String {
     let win = path.replace('/', "\\");
-    win.replace('\"', "")
+    let sanitized = win
+        .replace('\0', "")
+        .replace('\r', "")
+        .replace('\n', "")
+        .replace('\"', "");
+    sanitized.replace('%', "%%")
 }
 
-/// Escapes an argument for Windows command line according to Win32 CommandLineToArgvW rules.
+/// Escapes an argument for Windows command line according to Win32 CommandLineToArgvW rules
+/// and protects against cmd shell metacharacters and injection vectors.
 pub fn escape_cmd_arg(arg: &str) -> String {
-    if arg.is_empty() {
+    let sanitized = arg.replace('\0', "");
+    if sanitized.is_empty() {
         return "\"\"".to_string();
     }
 
-    let needs_quotes = arg.chars().any(|c| {
-        c == ' ' || c == '\t' || c == '\n' || c == '\x0B' || c == '\"'
+    let needs_quotes = sanitized.chars().any(|c| {
+        c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0B' || c == '\"'
             || c == '&' || c == '|' || c == '<' || c == '>' || c == '^'
+            || c == '(' || c == ')' || c == '%' || c == '!'
+            || c == ',' || c == ';' || c == '='
     });
     if !needs_quotes {
-        return arg.to_string();
+        return sanitized;
     }
 
-    let mut result = String::with_capacity(arg.len() + 2);
+    let mut result = String::with_capacity(sanitized.len() + 2);
     result.push('\"');
 
     let mut backslashes = 0;
-    for c in arg.chars() {
+    for c in sanitized.chars() {
         if c == '\\' {
             backslashes += 1;
         } else if c == '\"' {
@@ -78,23 +94,29 @@ pub fn escape_cmd_arg(arg: &str) -> String {
 }
 
 /// Escapes a path for PowerShell double quotes.
+/// Strips null bytes and escapes backticks, double quotes, dollar signs, and newlines.
 pub fn escape_ps1_path(path: &str) -> String {
     let forward = path.replace('\\', "/");
-    forward
+    let sanitized = forward.replace('\0', "");
+    sanitized
         .replace('`', "``")
         .replace('\"', "`\"")
         .replace('$', "`$")
+        .replace('\r', "`r")
+        .replace('\n', "`n")
 }
 
 /// Escapes an argument for PowerShell.
+/// Wraps non-trivial arguments in single quotes with escaped internal single quotes.
 pub fn escape_ps1_arg(arg: &str) -> String {
-    if arg.is_empty() {
+    let sanitized = arg.replace('\0', "");
+    if sanitized.is_empty() {
         return "''".to_string();
     }
-    if arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
-        arg.to_string()
+    if sanitized.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+        sanitized
     } else {
-        format!("'{}'", arg.replace('\'', "''"))
+        format!("'{}'", sanitized.replace('\'', "''"))
     }
 }
 
@@ -185,21 +207,43 @@ pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
     )
 }
 
-/// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix.
+/// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix and Git Bash.
+/// Also supports files with UTF-8 BOM and clears Windows read-only flags if necessary.
 pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
     if !file_path.exists() {
         return Ok(());
     }
     let content = fs::read(file_path)?;
-    if content.starts_with(b"#!") {
-        if let Some(pos) = content.iter().position(|&b| b == b'\n') {
-            if pos > 0 && content[pos - 1] == b'\r' {
-                let mut new_content = Vec::with_capacity(content.len());
-                new_content.extend_from_slice(&content[..pos - 1]);
-                new_content.push(b'\n');
-                new_content.extend_from_slice(&content[pos + 1..]);
-                fs::write(file_path, new_content)?;
+    let (offset, is_shebang) = if content.starts_with(b"\xEF\xBB\xBF#!") {
+        (3, true)
+    } else if content.starts_with(b"#!") {
+        (0, true)
+    } else {
+        (0, false)
+    };
+
+    if !is_shebang {
+        return Ok(());
+    }
+
+    if let Some(newline_pos) = content[offset..].iter().position(|&b| b == b'\n') {
+        let abs_pos = offset + newline_pos;
+        if abs_pos > offset && content[abs_pos - 1] == b'\r' {
+            let mut new_content = Vec::with_capacity(content.len());
+            new_content.extend_from_slice(&content[..abs_pos - 1]);
+            new_content.push(b'\n');
+            new_content.extend_from_slice(&content[abs_pos + 1..]);
+
+            // Clear read-only attribute if set (common on Windows)
+            if let Ok(metadata) = fs::metadata(file_path) {
+                let mut perms = metadata.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(file_path, perms);
+                }
             }
+
+            fs::write(file_path, new_content)?;
         }
     }
     Ok(())

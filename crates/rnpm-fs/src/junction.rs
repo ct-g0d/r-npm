@@ -78,10 +78,22 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     // Target must exist for a junction
     let target_canonical = target.canonicalize().map_err(FsError::Io)?;
     let target_str = target_canonical.to_string_lossy().replace('/', "\\");
-    let clean_target = target_str.strip_prefix(r"\\?\").unwrap_or(&target_str);
+    let clean_target = if let Some(stripped) = target_str.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", stripped)
+    } else if let Some(stripped) = target_str.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        target_str.to_string()
+    };
 
     let link_str = link.to_string_lossy().replace('/', "\\");
-    let clean_link = link_str.strip_prefix(r"\\?\").unwrap_or(&link_str);
+    let clean_link = if let Some(stripped) = link_str.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", stripped)
+    } else if let Some(stripped) = link_str.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        link_str.to_string()
+    };
 
     // cmd.exe /C mklink /J "<link>" "<target>"
     // mklink /J creates directory junctions without administrator privileges.
@@ -90,8 +102,8 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
             "/C",
             "mklink",
             "/J",
-            clean_link,
-            clean_target,
+            &clean_link,
+            &clean_target,
         ])
         .output()
         .map_err(|err| FsError::JunctionError {

@@ -1153,6 +1153,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rnpm-core",
+ "rnpm-fs",
  "tempfile",
  "thiserror",
 ]
