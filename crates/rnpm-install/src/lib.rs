@@ -1154,6 +1154,23 @@ impl Installer {
                             let _ = normalize_shebang(&script_path);
                             let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
                         }
+
+                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall");
+                        if has_scripts {
+                            let deps = pkg_info.dependencies.as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect());
+                            lifecycle_nodes.push(LifecyclePackageNode {
+                                package_path: pkg_key.clone(),
+                                disk_path: target_path.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Registry,
+                                dependencies: deps,
+                                optional: is_optional,
+                            });
+                        }
                     }
                 }
                 packages_installed += 1;
@@ -1295,55 +1312,40 @@ impl Installer {
                         let _ = create_shims(&bin_dir, &bin_name, &target_rel);
                     }
 
-                    if !self.options.ignore_scripts {
-                        let mut script_failed = false;
-                        for event in &["preinstall", "install", "postinstall"] {
-                            if let Some(cmd) = pkg_manifest.scripts.get(*event) {
-                                let mut ctx = LifecycleContext::new(
-                                    &self.options.project_dir,
-                                    &target_path,
-                                    pkg_key,
-                                    *event,
-                                    cmd,
-                                );
-                                ctx.package_version = pkg_manifest.version.clone();
-                                match execute_lifecycle_script(&ctx) {
-                                    Ok(status) if status.success() => {},
-                                    Ok(status) => {
-                                        if is_optional {
-                                            warn!(
-                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {} failed at {} script with exit code: {:?}",
-                                                pkg_key, event, status.code()
-                                            );
-                                            script_failed = true;
-                                            break;
-                                        } else {
-                                            return Err(anyhow!(
-                                                "Lifecycle script '{}' failed for package {} with exit code: {:?}",
-                                                event, pkg_key, status.code()
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if is_optional {
-                                            warn!(
-                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Optional dependency lifecycle script error: {e}"
-                                            );
-                                            script_failed = true;
-                                            break;
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if script_failed {
-                            let _ = std::fs::remove_dir_all(&target_path);
-                        }
+                    let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                        || pkg_manifest.scripts.contains_key("install")
+                        || pkg_manifest.scripts.contains_key("postinstall");
+
+                    if has_scripts {
+                        let deps = if let Some(pkg_info) = lockfile.packages.get(pkg_key) {
+                            pkg_info.dependencies.as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect())
+                        } else {
+                            pkg_manifest.dependencies.keys().cloned().collect()
+                        };
+                        lifecycle_nodes.push(LifecyclePackageNode {
+                            package_path: pkg_key.clone(),
+                            disk_path: target_path.clone(),
+                            manifest: pkg_manifest,
+                            source: PackageSource::Registry,
+                            dependencies: deps,
+                            optional: is_optional,
+                        });
                     }
                 }
             }
+        }
+
+        // Execute lifecycle scripts bottom-up followed by root hooks
+        if !self.options.ignore_scripts {
+            let lifecycle_opts = LifecycleOptions {
+                root_dir: self.options.project_dir.clone(),
+                init_cwd: self.options.project_dir.clone(),
+                ignore_scripts: false,
+                capture_output: false,
+            };
+            execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
         Ok(InstallSummary {

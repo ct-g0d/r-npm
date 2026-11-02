@@ -1333,6 +1333,9 @@ pub async fn execute_topological_with_abort(
     for node in nodes {
         let name = node.manifest.name.clone().unwrap_or_else(|| node.package_path.clone());
         name_to_node.insert(name, node);
+        if let Some(stripped) = node.package_path.strip_prefix("node_modules/") {
+            name_to_node.insert(stripped.to_string(), node);
+        }
     }
 
     let mut ordered: Vec<&LifecyclePackageNode> = Vec::new();
