@@ -292,6 +292,115 @@ function computeStats(values) {
     };
 }
 
+/**
+ * Validates a checkpoint artifact against Gate F checkpoint.v1 schema specifications.
+ */
+function validateCheckpoint(checkpointPath) {
+    const errors = [];
+    if (!fs.existsSync(checkpointPath)) {
+        return { valid: false, errors: [`File does not exist: ${checkpointPath}`] };
+    }
+
+    let doc;
+    try {
+        doc = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
+    } catch (err) {
+        return { valid: false, errors: [`Invalid JSON in ${checkpointPath}: ${err.message}`] };
+    }
+
+    if (doc.version !== 'checkpoint.v1') {
+        errors.push(`Expected version to be 'checkpoint.v1', got '${doc.version}'`);
+    }
+
+    // Metadata validation
+    const meta = doc.metadata;
+    if (!meta || typeof meta !== 'object') {
+        errors.push('Missing or invalid metadata block');
+    } else {
+        const reqMeta = ['timestamp', 'git', 'tool', 'node_version', 'os', 'cpu', 'ram_bytes', 'antivirus_state', 'os_cache_purged'];
+        for (const f of reqMeta) {
+            if (meta[f] === undefined) errors.push(`metadata missing required field: ${f}`);
+        }
+        if (meta.git && (meta.git.revision === undefined || meta.git.dirty === undefined)) {
+            errors.push('metadata.git must contain revision and dirty fields');
+        }
+        if (meta.tool && (!meta.tool.name || !['npm', 'rnpm'].includes(meta.tool.name) || meta.tool.version === undefined)) {
+            errors.push('metadata.tool must have valid name (npm|rnpm) and version');
+        }
+    }
+
+    // Scenario validation
+    const sc = doc.scenario;
+    if (!sc || typeof sc !== 'object') {
+        errors.push('Missing or invalid scenario block');
+    } else {
+        if (!sc.fixture) errors.push('scenario missing fixture');
+        if (!['tier1', 'tier2', 'tier3'].includes(sc.tier)) errors.push(`Invalid scenario tier: ${sc.tier}`);
+        if (!['pristine-cold', 'cold-ci', 'lockfile-only-ci', 'warm-install', 'hot-noop'].includes(sc.cache_state)) {
+            errors.push(`Invalid scenario cache_state: ${sc.cache_state}`);
+        }
+        if (!['install', 'ci'].includes(sc.command)) errors.push(`Invalid scenario command: ${sc.command}`);
+        if (!['mock-loopback', 'public'].includes(sc.registry_kind)) errors.push(`Invalid scenario registry_kind: ${sc.registry_kind}`);
+    }
+
+    // Correctness validation
+    const corr = doc.correctness;
+    if (!corr || typeof corr !== 'object') {
+        errors.push('Missing or invalid correctness block');
+    } else {
+        const reqCorr = ['exit_code', 'normalized_tree_match', 'lockfile_match', 'digest_mismatches', 'installed_package_tree_digest', 'lockfile_digest'];
+        for (const f of reqCorr) {
+            if (corr[f] === undefined) errors.push(`correctness missing required field: ${f}`);
+        }
+        if (!Array.isArray(corr.digest_mismatches)) {
+            errors.push('correctness.digest_mismatches must be an array');
+        }
+    }
+
+    // Metrics validation
+    const m = doc.metrics;
+    if (!m || typeof m !== 'object') {
+        errors.push('Missing or invalid metrics block');
+    } else {
+        if (!Array.isArray(m.trials_raw) || m.trials_raw.length === 0) {
+            errors.push('metrics.trials_raw must be a non-empty array');
+        } else {
+            const reqTrialFields = [
+                'trial_index', 'wall_time_ms', 'user_cpu_ms', 'system_cpu_ms',
+                'peak_working_set_bytes', 'peak_commit_charge_bytes', 'disk_read_bytes',
+                'disk_write_bytes', 'disk_read_ops', 'disk_write_ops',
+                'network_bytes_read', 'network_bytes_written', 'network_requests', 'exit_code'
+            ];
+            for (let idx = 0; idx < m.trials_raw.length; idx++) {
+                const tr = m.trials_raw[idx];
+                for (const tf of reqTrialFields) {
+                    if (tr[tf] === undefined) {
+                        errors.push(`trial[${idx}] missing field: ${tf}`);
+                    }
+                }
+            }
+        }
+
+        const sum = m.summary;
+        if (!sum || typeof sum !== 'object') {
+            errors.push('metrics.summary must be an object');
+        } else {
+            const reqSumObj = ['wall_time', 'user_cpu', 'system_cpu', 'peak_working_set', 'peak_commit_charge', 'disk_write_bytes', 'disk_read_bytes', 'write_amplification'];
+            for (const sf of reqSumObj) {
+                if (!sum[sf] || typeof sum[sf] !== 'object') errors.push(`metrics.summary missing sub-object: ${sf}`);
+            }
+            if (sum.uncompressed_package_bytes === undefined) errors.push('metrics.summary missing uncompressed_package_bytes');
+            if (sum.outliers_replaced === undefined) errors.push('metrics.summary missing outliers_replaced');
+        }
+    }
+
+    return {
+        valid: errors.length === 0,
+        errors,
+        file: path.basename(checkpointPath)
+    };
+}
+
 // CLI handler if invoked directly
 if (require.main === module) {
     const command = process.argv[2];
@@ -316,8 +425,12 @@ if (require.main === module) {
     } else if (command === 'stats') {
         const nums = args.map(Number);
         console.log(JSON.stringify(computeStats(nums), null, 2));
+    } else if (command === 'validate-checkpoint') {
+        const res = validateCheckpoint(path.resolve(args[0]));
+        console.log(JSON.stringify(res, null, 2));
+        if (!res.valid) process.exit(1);
     } else {
-        console.error('Unknown command. Available: digest-tree, digest-lockfile, compare-trees, compare-lockfiles, stats');
+        console.error('Unknown command. Available: digest-tree, digest-lockfile, compare-trees, compare-lockfiles, stats, validate-checkpoint');
         process.exit(1);
     }
 }
@@ -328,6 +441,7 @@ module.exports = {
     compareTrees,
     compareLockfiles,
     computeStats,
+    validateCheckpoint,
     sha256,
     normalizeNewlines,
     sortObjectKeys

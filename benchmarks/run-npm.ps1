@@ -678,6 +678,18 @@ function Run-Scenario {
     [System.IO.File]::WriteAllText($DestFile, $jsonStr)
     Write-Host "[harness] Saved checkpoint artifact: $DestFile" -ForegroundColor Cyan
 
+    # Validate against Gate F schema
+    try {
+        $schemaValidation = (node $statsUtil validate-checkpoint $DestFile) | ConvertFrom-Json
+        if (-not $schemaValidation.valid) {
+            Write-Warning "[harness] Gate F schema validation failed for $DestFile`: $($schemaValidation.errors -join '; ')"
+        } else {
+            Write-Host "[harness] Gate F checkpoint schema validated successfully: $DestFile" -ForegroundColor Green
+        }
+    } catch {
+        Write-Warning "[harness] Failed to invoke schema validator: $_"
+    }
+
     # Cleanup temporary directories
     try {
         Remove-Item -Path $BaseTempDir -Recurse -Force -ErrorAction SilentlyContinue
