@@ -57,3 +57,53 @@ fn test_execute_lifecycle_script_runs() {
     let status = execute_lifecycle_script(&ctx).unwrap();
     assert!(status.success());
 }
+
+#[tokio::test]
+async fn test_optional_lifecycle_script_failure_isolation() {
+    let temp = tempfile::tempdir().unwrap();
+    let pkg_dir = temp.path().join("node_modules").join("failing-opt-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+
+    let mut failing_manifest = Manifest::default();
+    failing_manifest.name = Some("failing-opt-pkg".to_string());
+    failing_manifest.version = Some("1.0.0".to_string());
+    failing_manifest.scripts.insert("install".to_string(), "node -e \"process.exit(1)\"".to_string());
+
+    let node = LifecyclePackageNode {
+        package_path: "node_modules/failing-opt-pkg".to_string(),
+        disk_path: pkg_dir.clone(),
+        manifest: failing_manifest.clone(),
+        source: PackageSource::Registry,
+        dependencies: vec![],
+        optional: true,
+    };
+
+    let root_manifest = Manifest::default();
+    let opts = LifecycleOptions {
+        root_dir: temp.path().to_path_buf(),
+        init_cwd: temp.path().to_path_buf(),
+        ignore_scripts: false,
+        capture_output: true,
+    };
+
+    // When optional is true, script failure is isolated and does NOT fail execution
+    let res = execute_topological(&[node], &root_manifest, &opts).await;
+    assert!(res.is_ok(), "Optional script failure should not fail execute_topological");
+
+    // Contrast with optional = false: MUST fail!
+    let non_opt_pkg_dir = temp.path().join("node_modules").join("failing-req-pkg");
+    std::fs::create_dir_all(&non_opt_pkg_dir).unwrap();
+
+    let req_node = LifecyclePackageNode {
+        package_path: "node_modules/failing-req-pkg".to_string(),
+        disk_path: non_opt_pkg_dir,
+        manifest: failing_manifest,
+        source: PackageSource::Registry,
+        dependencies: vec![],
+        optional: false,
+    };
+
+    let req_res = execute_topological(&[req_node], &root_manifest, &opts).await;
+    assert!(req_res.is_err(), "Required script failure MUST fail execute_topological");
+}
+

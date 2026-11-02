@@ -172,10 +172,22 @@ impl Cache {
         // Acquire lock and rename atomically
         let _blob_lock = self.lock_blob(&sha512_hex)?;
         if target_path.exists() {
+            if let Ok(existing_bytes) = fs::read(&target_path) {
+                let mut h = Sha512::new();
+                h.update(&existing_bytes);
+                if HEXLOWER.encode(&h.finalize()) == sha512_hex {
+                    // Another worker already populated target_path; clean up temp and succeed
+                    let _ = fs::remove_file(&temp_path);
+                    return Ok(sha512_hex);
+                }
+            }
             let _ = fs::remove_file(&target_path);
         }
 
-        fs::rename(&temp_path, &target_path)?;
+        if let Err(err) = fs::rename(&temp_path, &target_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(CacheError::Io(err));
+        }
         debug!("Atomically stored blob {}", target_path.display());
 
         Ok(sha512_hex)
@@ -285,7 +297,10 @@ impl Cache {
         if index_path.exists() {
             let _ = fs::remove_file(&index_path);
         }
-        fs::rename(&temp_path, &index_path)?;
+        if let Err(err) = fs::rename(&temp_path, &index_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(CacheError::Io(err));
+        }
 
         Ok(entry)
     }

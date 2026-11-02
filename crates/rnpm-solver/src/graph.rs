@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,7 @@ pub struct NodeFlags {
     pub peer: bool,
     pub bundled: bool,
     pub has_install_script: bool,
+    pub skipped: bool,
 }
 
 /// A directed edge in the dependency graph.
@@ -62,6 +63,8 @@ pub struct Node {
     pub os: Option<Vec<String>>,
     /// Platform CPU architecture constraints.
     pub cpu: Option<Vec<String>>,
+    /// Platform libc constraints.
+    pub libc: Option<Vec<String>>,
     /// Executable binaries.
     pub bin: Option<PackageBin>,
 }
@@ -72,6 +75,7 @@ pub struct DependencyGraph {
     pub root_location: String,
     pub nodes: BTreeMap<String, Node>,
     pub edges: Vec<DependencyEdge>,
+    pub skipped: HashSet<String>,
 }
 
 impl DependencyGraph {
@@ -80,7 +84,13 @@ impl DependencyGraph {
             root_location: String::new(),
             nodes: BTreeMap::new(),
             edges: Vec::new(),
+            skipped: HashSet::new(),
         }
+    }
+
+    pub fn is_skipped(&self, name: &str) -> bool {
+        self.skipped.contains(name)
+            || self.nodes.values().any(|n| n.name == name && n.flags.skipped)
     }
 
     pub fn get_node(&self, location: &str) -> Option<&Node> {
@@ -156,6 +166,7 @@ impl DependencyGraph {
                     },
                     os: node.os.clone(),
                     cpu: node.cpu.clone(),
+                    libc: node.libc.clone(),
                     bin: node.bin.clone(),
                     ..Default::default()
                 };

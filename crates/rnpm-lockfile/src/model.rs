@@ -70,6 +70,9 @@ pub struct LockfilePackage {
     pub cpu: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub libc: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub dependencies: Option<BTreeMap<String, String>>,
 
     #[serde(rename = "devDependencies", skip_serializing_if = "Option::is_none", default)]

@@ -26,11 +26,47 @@ pub struct PackageVersionMetadata {
     #[serde(default)]
     pub cpu: Option<Vec<String>>,
     #[serde(default)]
+    pub libc: Option<Vec<String>>,
+    #[serde(default)]
     pub bin: Option<PackageBin>,
     #[serde(default)]
     pub has_install_script: bool,
     #[serde(default)]
     pub deprecated: Option<String>,
+}
+
+impl PackageVersionMetadata {
+    /// Parse PackageVersionMetadata from a package manifest (package.json).
+    pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Self {
+        Self {
+            name: manifest.name.clone().unwrap_or_default(),
+            version: manifest.version.clone().unwrap_or_default(),
+            dist_tarball: None,
+            dist_integrity: None,
+            dependencies: manifest.dependencies.clone(),
+            dev_dependencies: manifest.dev_dependencies.clone(),
+            peer_dependencies: manifest.peer_dependencies.clone(),
+            peer_dependencies_meta: manifest.peer_dependencies_meta.clone(),
+            optional_dependencies: manifest.optional_dependencies.clone(),
+            os: manifest.os.clone(),
+            cpu: manifest.cpu.clone(),
+            libc: manifest.libc.clone(),
+            bin: manifest.bin.clone().map(|b| match b {
+                rnpm_core::manifest::PackageBin::Single(s) => PackageBin::Single(s),
+                rnpm_core::manifest::PackageBin::Map(m) => PackageBin::Map(m),
+            }),
+            has_install_script: manifest.scripts.contains_key("preinstall")
+                || manifest.scripts.contains_key("install")
+                || manifest.scripts.contains_key("postinstall"),
+            deprecated: None,
+        }
+    }
+
+    /// Parse PackageVersionMetadata from raw package.json manifest bytes.
+    pub fn from_manifest_slice(bytes: &[u8]) -> Result<Self, rnpm_core::error::ManifestError> {
+        let manifest = rnpm_core::manifest::Manifest::from_slice(bytes)?;
+        Ok(Self::from_manifest(&manifest))
+    }
 }
 
 /// Metadata document containing dist-tags and all known versions of a package.

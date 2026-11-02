@@ -216,6 +216,13 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
             Component::Normal(os_str) => {
                 let name = os_str.to_string_lossy();
 
+                // Reject null bytes or colons (Windows Alternate Data Streams or drive colons)
+                if name.contains('\0') || name.contains(':') {
+                    return Err(FsError::PathTraversal {
+                        path: path.to_path_buf(),
+                    });
+                }
+
                 // Reject trailing dot or trailing space in component
                 if name.ends_with('.') || name.ends_with(' ') {
                     return Err(FsError::TrailingDotOrSpace {
@@ -224,7 +231,7 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
                     });
                 }
 
-                // Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9
+                // Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-9, LPT1-9, CONIN$, CONOUT$
                 if is_windows_reserved_name(&name) {
                     return Err(FsError::WindowsReservedDeviceName {
                         name: name.to_string(),
@@ -244,22 +251,30 @@ fn is_windows_reserved_name(name: &str) -> bool {
     let upper = base.to_ascii_uppercase();
 
     match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
         "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => true,
         "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => true,
         _ => false,
     }
 }
 
-fn validate_link_target(
+pub fn validate_link_target(
     link_path: &Path,
     target: &Path,
     _destination: &Path,
 ) -> Result<(), FsError> {
-    if target.is_absolute() {
+    if target.is_absolute() || target.has_root() {
         return Err(FsError::AbsolutePath {
             path: target.to_path_buf(),
         });
+    }
+
+    for comp in target.components() {
+        if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+            return Err(FsError::AbsolutePath {
+                path: target.to_path_buf(),
+            });
+        }
     }
 
     // Resolve target relative to link parent
@@ -267,8 +282,8 @@ fn validate_link_target(
     let combined = link_dir.join(target);
     let cleaned = clean(&combined);
 
-    // If cleaned path starts with '..' it escapes destination
-    if cleaned.starts_with("..") {
+    // If cleaned path starts with '..' or is root/absolute, it escapes destination
+    if cleaned.starts_with("..") || cleaned.is_absolute() || cleaned.has_root() {
         return Err(FsError::EscapingSymlink {
             link: link_path.to_path_buf(),
             target: target.to_path_buf(),

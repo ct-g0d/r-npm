@@ -1,5 +1,69 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::{self, Deserializer, SeqAccess, Visitor}, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+pub fn deserialize_vec_or_string<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct VecOrStringVisitor;
+
+    impl<'de> Visitor<'de> for VecOrStringVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                list.push(item);
+            }
+            Ok(list)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(VecOrStringVisitor)
+}
+
 
 /// Represents either a single string binary path or a map of command names to paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,10 +124,12 @@ pub struct AbbreviatedVersion {
     pub bin: Option<PackageBin>,
     #[serde(default)]
     pub engines: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub os: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub cpu: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub libc: Vec<String>,
     #[serde(rename = "hasInstallScript", default)]
     pub has_install_script: bool,
     #[serde(default)]
