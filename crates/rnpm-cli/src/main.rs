@@ -1,4 +1,5 @@
 mod audit;
+pub mod diagnostics;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
@@ -17,7 +18,7 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
     /// Install project dependencies or packages
-    #[command(alias = "i")]
+    #[command(alias = "i", alias = "add", alias = "isntall")]
     Install {
         /// Packages to install
         packages: Vec<String>,
@@ -40,6 +41,7 @@ pub(crate) enum Commands {
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
+    #[command(alias = "clean-install", alias = "ic")]
     Ci {
         /// Custom npm registry URL
         #[arg(long)]
@@ -48,6 +50,10 @@ pub(crate) enum Commands {
         /// Cache directory path
         #[arg(long)]
         cache: Option<PathBuf>,
+
+        /// Offline mode (only use cache)
+        #[arg(long)]
+        offline: bool,
 
         /// Skip lifecycle scripts
         #[arg(long)]
@@ -202,6 +208,36 @@ pub(crate) enum Commands {
         #[arg(long)]
         cache: Option<PathBuf>,
     },
+
+    /// List installed packages (deferred command)
+    #[command(alias = "ls", alias = "la", alias = "ll")]
+    List {
+        /// Additional arguments passed to list
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Check for outdated packages (deferred command)
+    Outdated {
+        /// Additional arguments passed to outdated
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// View package information from registry (deferred command)
+    #[command(alias = "info", alias = "v", alias = "show")]
+    View {
+        /// Additional arguments passed to view
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Publish a package to the registry (deferred command)
+    Publish {
+        /// Additional arguments passed to publish
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -245,8 +281,9 @@ where
         "publish", "login", "adduser", "logout", "token", "team",
         "fix", "outdated", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
-        "view", "info", "search", "stars", "star", "unstar",
+        "view", "info", "v", "show", "search", "stars", "star", "unstar",
         "ping", "whoami", "version", "init", "create",
+        "list", "ls", "la", "ll",
     ];
 
     if unsupported_commands.contains(&first.as_str()) {
@@ -261,6 +298,54 @@ where
         ));
     }
 
+    // Determine the slice of arguments to check for unsupported flags.
+    // 1. Any arguments after "--" are forwarded payloads and never scanned.
+    let pre_dash_dash = if let Some(dash_dash_idx) = args.iter().position(|a| a == "--") {
+        &args[1..dash_dash_idx]
+    } else {
+        &args[1..]
+    };
+
+    // 2. For `run` / `run-script` and `exec` / `x` / `npx`, stop scanning once the script/binary positional target is reached.
+    let mut args_to_scan = Vec::new();
+    if first == "run" || first == "run-script" {
+        let mut idx = 1;
+        while idx < pre_dash_dash.len() {
+            let arg = &pre_dash_dash[idx];
+            if arg.starts_with('-') {
+                args_to_scan.push(arg.clone());
+                if (arg == "--workspace" || arg == "--filter" || arg == "--scope")
+                    && idx + 1 < pre_dash_dash.len()
+                    && !pre_dash_dash[idx + 1].starts_with('-')
+                {
+                    idx += 1;
+                }
+            } else {
+                break;
+            }
+            idx += 1;
+        }
+    } else if first == "exec" || first == "x" || first == "npx" {
+        let mut idx = 1;
+        while idx < pre_dash_dash.len() {
+            let arg = &pre_dash_dash[idx];
+            if arg.starts_with('-') {
+                args_to_scan.push(arg.clone());
+                if (arg == "--registry" || arg == "--cache")
+                    && idx + 1 < pre_dash_dash.len()
+                    && !pre_dash_dash[idx + 1].starts_with('-')
+                {
+                    idx += 1;
+                }
+            } else {
+                break;
+            }
+            idx += 1;
+        }
+    } else {
+        args_to_scan.extend_from_slice(pre_dash_dash);
+    }
+
     let unsupported_flags = [
         "--legacy-peer-deps",
         "--global",
@@ -268,12 +353,18 @@ where
         "--package-lock-only",
         "--save-bundle",
         "--save-exact",
+        "-E",
+        "--no-save",
+        "--save-peer",
+        "--production",
         "--omit=dev",
         "--omit=optional",
         "--omit=peer",
     ];
 
-    for arg in &args[1..] {
+    let mut i = 0;
+    while i < args_to_scan.len() {
+        let arg = &args_to_scan[i];
         if unsupported_flags.contains(&arg.as_str()) {
             return Some((
                 "ERR_UNSUPPORTED_FLAG".to_string(),
@@ -285,22 +376,32 @@ where
                 ),
             ));
         }
+
+        if arg == "--omit" {
+            let flag_str = if i + 1 < args_to_scan.len() && !args_to_scan[i + 1].starts_with('-') {
+                format!("--omit {}", args_to_scan[i + 1])
+            } else {
+                "--omit".to_string()
+            };
+            return Some((
+                "ERR_UNSUPPORTED_FLAG".to_string(),
+                format!(
+                    "npm error code ERR_UNSUPPORTED_FLAG\n\
+                     npm error The flag '{}' is not supported by rnpm.\n\
+                     npm error See docs/compatibility-contract.md for supported options.",
+                    flag_str
+                ),
+            ));
+        }
+        i += 1;
     }
 
     None
 }
 
 pub(crate) fn print_structured_error(err: &anyhow::Error) {
-    let err_str = format!("{:#}", err);
-    if err_str.contains("Unsupported URL Type") || err_str.contains("Unsupported protocol") {
-        eprintln!("npm error code EUNSUPPORTEDPROTOCOL");
-        eprintln!("npm error {err_str}");
-        eprintln!("npm error Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
-    } else if err_str.contains("ERR_UNSUPPORTED_COMMAND") || err_str.contains("ERR_UNSUPPORTED_FLAG") {
-        eprintln!("{err_str}");
-    } else {
-        eprintln!("rnpm ERR! {err_str}");
-    }
+    let diag = diagnostics::classify_error(err);
+    eprintln!("{}", diag.format_npm());
 }
 
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
@@ -327,12 +428,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 summary.packages_installed, summary.cache_hits, summary.cache_misses
             );
         }
-        Commands::Ci { registry, cache, ignore_scripts } => {
+        Commands::Ci { registry, cache, offline, ignore_scripts } => {
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
                 cache_dir: cache,
-                offline: false,
+                offline,
                 ignore_scripts,
             };
 
@@ -587,11 +688,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             let manifest_path = package_dir.join("package.json");
             if !manifest_path.exists() {
-                eprintln!(
-                    "rnpm ERR! code ENOENT: package.json not found in {}",
+                return Err(anyhow::anyhow!(
+                    "code ENOENT: package.json not found in {}",
                     package_dir.display()
-                );
-                std::process::exit(1);
+                ));
             }
 
             let (summary, tarball_bytes) = match rnpm_fs::pack_directory(
@@ -600,8 +700,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ) {
                 Ok(res) => res,
                 Err(e) => {
-                    eprintln!("rnpm ERR! pack failed: {e}");
-                    std::process::exit(1);
+                    return Err(anyhow::anyhow!("pack failed: {e}"));
                 }
             };
 
@@ -610,11 +709,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             if !dry_run {
                 if let Err(e) = std::fs::write(&final_tarball_path, &tarball_bytes) {
-                    eprintln!(
-                        "rnpm ERR! failed to write {}: {e}",
+                    return Err(anyhow::anyhow!(
+                        "failed to write {}: {e}",
                         final_tarball_path.display()
-                    );
-                    std::process::exit(1);
+                    ));
                 }
             }
 
@@ -758,6 +856,34 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
+        Commands::List { .. } => {
+            return Err(anyhow::anyhow!(
+                "npm error code ERR_UNSUPPORTED_COMMAND\n\
+                 npm error The command 'list' is not currently implemented in rnpm.\n\
+                 npm error See docs/compatibility-contract.md for the active compatibility surface."
+            ));
+        }
+        Commands::Outdated { .. } => {
+            return Err(anyhow::anyhow!(
+                "npm error code ERR_UNSUPPORTED_COMMAND\n\
+                 npm error The command 'outdated' is not currently implemented in rnpm.\n\
+                 npm error See docs/compatibility-contract.md for the active compatibility surface."
+            ));
+        }
+        Commands::View { .. } => {
+            return Err(anyhow::anyhow!(
+                "npm error code ERR_UNSUPPORTED_COMMAND\n\
+                 npm error The command 'view' is not currently implemented in rnpm.\n\
+                 npm error See docs/compatibility-contract.md for the active compatibility surface."
+            ));
+        }
+        Commands::Publish { .. } => {
+            return Err(anyhow::anyhow!(
+                "npm error code ERR_UNSUPPORTED_COMMAND\n\
+                 npm error The command 'publish' is not currently implemented in rnpm.\n\
+                 npm error See docs/compatibility-contract.md for the active compatibility surface."
+            ));
+        }
     }
 
     Ok(())
@@ -845,6 +971,9 @@ async fn main() {
     if let Err(err) = run_cli(cli, None).await {
         if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
             std::process::exit(exit_err.exit_code);
+        }
+        if err.is::<audit::AuditThresholdError>() {
+            std::process::exit(1);
         }
         print_structured_error(&err);
         std::process::exit(1);

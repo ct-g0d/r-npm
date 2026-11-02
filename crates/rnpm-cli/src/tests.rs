@@ -715,6 +715,7 @@ use tokio::net::TcpListener;
 
         let lock_json = lockfile.to_json_string().unwrap();
         std::fs::write(&lock_path, lock_json).unwrap();
+        std::fs::write(temp.path().join("advisories.json"), "{}").unwrap();
 
         let cli = Cli {
             command: Commands::Audit {
@@ -753,6 +754,10 @@ use tokio::net::TcpListener;
             "--package-lock-only",
             "--save-bundle",
             "--save-exact",
+            "-E",
+            "--no-save",
+            "--save-peer",
+            "--production",
             "--omit=dev",
             "--omit=optional",
             "--omit=peer",
@@ -770,6 +775,20 @@ use tokio::net::TcpListener;
             assert!(msg.contains(flag));
             assert!(msg.contains("docs/compatibility-contract.md"));
         }
+
+        // Space-separated --omit
+        for omit_val in ["dev", "optional", "peer"] {
+            let check = check_unsupported_cli_invocation(vec!["rnpm", "install", "--omit", omit_val]);
+            assert!(check.is_some());
+            let (code, msg) = check.unwrap();
+            assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
+            assert!(msg.contains(&format!("--omit {omit_val}")));
+        }
+
+        // Pass-through for run and exec
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "run", "build", "--", "-g"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "run", "build", "-g"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "exec", "eslint", "-g"]).is_none());
     }
 
     #[tokio::test]
@@ -842,5 +861,139 @@ use tokio::net::TcpListener;
             err_str.contains("Unsupported URL Type \"ftp:\""),
             "Error message must specify Unsupported URL Type 'ftp:', got: {err_str}"
         );
+    }
+
+    #[test]
+    fn test_centralized_diagnostics_classification_codes() {
+        use crate::diagnostics::classify_error;
+
+        // ERESOLVE
+        let eresolve_err = anyhow::anyhow!("ERESOLVE: Conflicting peer dependency 'react@17' required by 'react-dom@17'");
+        let d = classify_error(&eresolve_err);
+        assert_eq!(d.code, "ERESOLVE");
+        assert!(d.format_npm().contains("npm error code ERESOLVE"));
+
+        // ETARGET
+        let etarget_err = anyhow::anyhow!("Version '2.99.0' for package 'lodash' not found");
+        let d = classify_error(&etarget_err);
+        assert_eq!(d.code, "ETARGET");
+        assert!(d.format_npm().contains("npm error code ETARGET"));
+
+        // E404
+        let e404_err = anyhow::anyhow!("Package 'non-existent-pkg-xyz' not found in registry (HTTP 404)");
+        let d = classify_error(&e404_err);
+        assert_eq!(d.code, "E404");
+        assert!(d.format_npm().contains("npm error code E404"));
+
+        // E401
+        let e401_err = anyhow::anyhow!("Authentication failed for https://registry.npmjs.org (HTTP 401): bad token");
+        let d = classify_error(&e401_err);
+        assert_eq!(d.code, "E401");
+        assert!(d.format_npm().contains("npm error code E401"));
+
+        // E403
+        let e403_err = anyhow::anyhow!("Access forbidden for https://registry.npmjs.org (HTTP 403): private package");
+        let d = classify_error(&e403_err);
+        assert_eq!(d.code, "E403");
+        assert!(d.format_npm().contains("npm error code E403"));
+
+        // E429
+        let e429_err = anyhow::anyhow!("Registry rate limit exceeded (HTTP 429)");
+        let d = classify_error(&e429_err);
+        assert_eq!(d.code, "E429");
+        assert!(d.format_npm().contains("npm error code E429"));
+
+        // EINTEGRITY
+        let eintegrity_err = anyhow::anyhow!("Integrity verification failed for sha512: expected abc, actual def");
+        let d = classify_error(&eintegrity_err);
+        assert_eq!(d.code, "EINTEGRITY");
+        assert!(d.format_npm().contains("npm error code EINTEGRITY"));
+
+        // ELOCKFILE_DRIFT
+        let drift_err = anyhow::anyhow!("package.json dependency express@^4.0.0 missing from package-lock.json");
+        let d = classify_error(&drift_err);
+        assert_eq!(d.code, "ELOCKFILE_DRIFT");
+        assert!(d.format_npm().contains("npm error code ELOCKFILE_DRIFT"));
+
+        // EUNSUPPORTEDPROTOCOL
+        let proto_err = anyhow::anyhow!("Unsupported URL Type \"ftp:\": ftp://example.com/pkg.tgz");
+        let d = classify_error(&proto_err);
+        assert_eq!(d.code, "EUNSUPPORTEDPROTOCOL");
+        assert!(d.format_npm().contains("npm error code EUNSUPPORTEDPROTOCOL"));
+        assert!(d.format_npm().contains("Supported protocols are npm registry packages"));
+
+        // ETARBOMB
+        let tarbomb_err = anyhow::anyhow!("Tar bomb resource limit exceeded (max_size): 600MB > 512MB");
+        let d = classify_error(&tarbomb_err);
+        assert_eq!(d.code, "ETARBOMB");
+        assert!(d.format_npm().contains("npm error code ETARBOMB"));
+
+        // ESECURITY
+        let sec_err = anyhow::anyhow!("Path traversal detected in tarball entry: '../../etc/passwd'");
+        let d = classify_error(&sec_err);
+        assert_eq!(d.code, "ESECURITY");
+        assert!(d.format_npm().contains("npm error code ESECURITY"));
+
+        // EJSONPARSE
+        let json_err = anyhow::anyhow!("Malformed JSON in manifest: invalid token at line 3, column 5");
+        let d = classify_error(&json_err);
+        assert_eq!(d.code, "EJSONPARSE");
+        assert!(d.format_npm().contains("npm error code EJSONPARSE"));
+
+        // ENOLOCK
+        let lock_err = anyhow::anyhow!("This command requires an existing lockfile. Try creating one with `rnpm install`.");
+        let d = classify_error(&lock_err);
+        assert_eq!(d.code, "ENOLOCK");
+        assert!(d.format_npm().contains("npm error code ENOLOCK"));
+    }
+
+    #[test]
+    fn test_audit_level_parsing_and_none() {
+        use crate::audit::{parse_audit_level, Severity};
+
+        assert_eq!(parse_audit_level("none").unwrap(), None);
+        assert_eq!(parse_audit_level("None").unwrap(), None);
+        assert_eq!(parse_audit_level("info").unwrap(), Some(Severity::Info));
+        assert_eq!(parse_audit_level("low").unwrap(), Some(Severity::Low));
+        assert_eq!(parse_audit_level("moderate").unwrap(), Some(Severity::Moderate));
+        assert_eq!(parse_audit_level("medium").unwrap(), Some(Severity::Moderate));
+        assert_eq!(parse_audit_level("high").unwrap(), Some(Severity::High));
+        assert_eq!(parse_audit_level("critical").unwrap(), Some(Severity::Critical));
+        assert_eq!(parse_audit_level("crit").unwrap(), Some(Severity::Critical));
+        assert!(parse_audit_level("invalid_typo").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_deferred_commands_matrix_diagnostics() {
+        let tmp = tempdir().unwrap();
+        let dir = Some(tmp.path().to_path_buf());
+
+        let list_cli = Cli {
+            command: Commands::List { args: vec![] },
+        };
+        let res = run_cli(list_cli, dir.clone()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
+
+        let outdated_cli = Cli {
+            command: Commands::Outdated { args: vec![] },
+        };
+        let res = run_cli(outdated_cli, dir.clone()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
+
+        let view_cli = Cli {
+            command: Commands::View { args: vec![] },
+        };
+        let res = run_cli(view_cli, dir.clone()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
+
+        let publish_cli = Cli {
+            command: Commands::Publish { args: vec![] },
+        };
+        let res = run_cli(publish_cli, dir).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
     }
 

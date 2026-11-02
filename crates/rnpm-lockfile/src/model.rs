@@ -47,6 +47,12 @@ pub struct LockfilePackage {
     #[serde(rename = "devOptional", skip_serializing_if = "is_false_or_none", default)]
     pub dev_optional: Option<bool>,
 
+    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    pub peer: Option<bool>,
+
+    #[serde(rename = "peerOptional", skip_serializing_if = "is_false_or_none", default)]
+    pub peer_optional: Option<bool>,
+
     #[serde(rename = "inBundle", skip_serializing_if = "is_false_or_none", default)]
     pub in_bundle: Option<bool>,
 

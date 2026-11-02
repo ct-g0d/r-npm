@@ -12,15 +12,15 @@
 
 ## 2. Command Surface & Scope Boundaries
 
-### Initial Target Commands
-- `install`: Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3.
-- `ci`: Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination and zero network/filesystem side effects.
-- `run`: Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, and process tree lifecycle controls.
-- `uninstall`: Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile.
-- `update`: Fetch latest versions matching declared semver ranges for registry dependencies.
-- `pack`: Package project files into a canonical npm-compatible `.tgz` archive.
-- `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints, generating structured JSON / human-readable reports, and enforcing `--audit-level` exit thresholds.
-- `exec` / `npx`: Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces.
+### Active Command Matrix & Aliases
+- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3.
+- `ci` / `clean-install` (aliases: `clean-install`, `ic`): Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination (`ELOCKFILE_DRIFT`) and zero network/filesystem side effects.
+- `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls. Supports `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
+- `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance.
+- `pack`: Package project files into a canonical npm-compatible `.tgz` archive. Supports `--dry-run`, `--json`, and `--pack-destination`.
+- `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile. Supports `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`).
+- `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies and update package.json/lockfile.
+- `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
 
 ### Supported Protocol Surface
@@ -48,8 +48,13 @@ npm error See docs/compatibility-contract.md for supported options.
 ```
 
 ### Unsupported & Deferred Commands
-- `publish`, `adduser`, `login`, `logout`, `token`, `team`: Account and package publishing.
+- `publish`: Package publishing (deferred).
+- `list` / `ls` / `la` / `ll`: Dependency tree inspection (deferred).
+- `outdated`: Dependency update checking (deferred).
+- `view` / `info` / `v`: Registry metadata inspection (deferred).
+- `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
 - `fix`: Vulnerability automated remediation.
+- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
 - Writing legacy lockfile formats (v1 or v2).
 
 ### Unsupported Command Handling (DEC-004)
@@ -202,4 +207,9 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 | `ESECURITY` | 1 | Tarball contained traversal (`..`), absolute paths, or escaping symlinks |
 | `EJSONPARSE` | 1 | Malformed `package.json` or `package-lock.json` |
 | `ERR_UNSUPPORTED_COMMAND` | 1 | Attempted invocation of an out-of-scope or deferred npm command |
+| `ERR_UNSUPPORTED_FLAG` | 1 | Attempted invocation of an unsupported flag |
+| `ENOLOCK` | 1 | Command requires an existing package-lock.json |
+| `ENOENT` | 1 | File or package.json not found |
+| `ENOWORKSPACES` | 1 | No workspace packages discovered |
+| `EUNKNOWN` | 1 | Unclassified runtime error |
 | `SIGINT` | 130 | Process terminated via Ctrl+C / interrupt signal |

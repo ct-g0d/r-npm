@@ -391,4 +391,38 @@ mod tests {
     fn v4_4_json(ver: u32) -> String {
         format!(r#"{{ "name": "future-app", "lockfileVersion": {ver} }}"#)
     }
+
+    #[test]
+    fn test_peer_and_peer_optional_classification_roundtrip() {
+        let mut lockfile = LockfileV3::new("peer-test-app", Some("1.0.0".to_string()));
+
+        let peer_pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            peer: Some(true),
+            peer_optional: Some(false), // omitted
+            ..Default::default()
+        };
+        let peer_opt_pkg = LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            peer: Some(true),
+            peer_optional: Some(true),
+            ..Default::default()
+        };
+
+        lockfile.insert_package("node_modules/peer-pkg", peer_pkg);
+        lockfile.insert_package("node_modules/peer-opt-pkg", peer_opt_pkg);
+
+        let json = lockfile.to_json_string().unwrap();
+        assert!(json.contains(r#""peer": true"#));
+        assert!(json.contains(r#""peerOptional": true"#));
+
+        let parsed: LockfileV3 = serde_json::from_str(&json).unwrap();
+        let p1 = parsed.packages.get("node_modules/peer-pkg").unwrap();
+        assert_eq!(p1.peer, Some(true));
+        assert_eq!(p1.peer_optional, None);
+
+        let p2 = parsed.packages.get("node_modules/peer-opt-pkg").unwrap();
+        assert_eq!(p2.peer, Some(true));
+        assert_eq!(p2.peer_optional, Some(true));
+    }
 }
