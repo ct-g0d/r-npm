@@ -1,6 +1,6 @@
 # Differential Comparison Report: npm vs rnpm
 
-- **Date:** 2026-11-02 04:35:29 UTC
+- **Date:** 2026-11-02 05:20:59 UTC
 - **Fixture:** tier1-diamond (tier1)
 - **Cache State:** warm-install (install)
 - **Machine:** Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz | RAM: 31.9 GB

@@ -203,6 +203,8 @@ pub struct RegistryClientConfig {
     pub initial_retry_backoff: Duration,
     pub max_retry_backoff: Duration,
     pub retry_on_status: HashSet<u16>,
+    pub scoped_registries: std::collections::BTreeMap<String, Url>,
+    pub auth_tokens: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for RegistryClientConfig {
@@ -234,6 +236,8 @@ impl Default for RegistryClientConfig {
             initial_retry_backoff: Duration::from_millis(DEFAULT_INITIAL_RETRY_BACKOFF_MS),
             max_retry_backoff: Duration::from_secs(DEFAULT_MAX_RETRY_BACKOFF_SECS),
             retry_on_status,
+            scoped_registries: std::collections::BTreeMap::new(),
+            auth_tokens: std::collections::BTreeMap::new(),
         }
     }
 }

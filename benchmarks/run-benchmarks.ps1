@@ -12,6 +12,8 @@
 
 [CmdletBinding()]
 param(
+    [string]$Fixture = "tier1-single-dep",
+    [string]$CacheState = "",
     [string]$RegistryUrl = "http://127.0.0.1:4873",
     [string]$RnpmPath = "",
     [string]$NpmPath = "npm.cmd",
@@ -75,8 +77,8 @@ if (-not $SkipBenchmarks) {
     Write-Host "[Step 3/3] Running Gate F Benchmarks (Cold, Warm, Hot)..." -ForegroundColor Yellow
     Write-Host "--------------------------------------------------------" -ForegroundColor Yellow
 
-    $scenarios = @("pristine-cold", "warm-install", "hot-noop")
-    $fixture = "tier1-single-dep"
+    $scenarios = if ($CacheState) { @($CacheState) } else { @("pristine-cold", "warm-install", "hot-noop") }
+    $fixture = $Fixture
     $resultsDir = Join-Path $ScriptDir "results\baseline"
 
     foreach ($sc in $scenarios) {

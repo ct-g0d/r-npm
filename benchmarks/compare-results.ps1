@@ -22,6 +22,10 @@
     Noise threshold in milliseconds for wall-clock time comparisons. Default: 25.0ms.
 .PARAMETER ThresholdCommitPct
     Maximum allowable peak commit charge regression percentage. Default: 10.0%.
+.PARAMETER Fixture
+    Optional fixture name (e.g. tier1-single-dep, tier1-diamond). If provided, auto-resolves checkpoint paths in results\baseline.
+.PARAMETER CacheState
+    Optional benchmark cache state (e.g. pristine-cold, warm-install, hot-noop). Defaults to warm-install if Fixture is specified.
 .PARAMETER ReportFile
     Optional path to write markdown summary report.
 .PARAMETER FailOnRegression
@@ -30,6 +34,9 @@
 
 [CmdletBinding()]
 param(
+    [string]$Fixture = "",
+    [ValidateSet("", "pristine-cold", "cold-ci", "lockfile-only-ci", "warm-install", "hot-noop")]
+    [string]$CacheState = "",
     [string]$NpmCheckpoint = "",
     [string]$RnpmCheckpoint = "",
     [string]$NpmDir = "",
@@ -53,9 +60,26 @@ if (-not $ScriptDir) {
 }
 $StatsUtil = Join-Path $ScriptDir "harness-utils.js"
 
+# Auto-resolve checkpoint files if Fixture is provided
+if ($Fixture) {
+    if (-not $CacheState) { $CacheState = "warm-install" }
+    $baselineDir = Join-Path $ScriptDir "results\baseline"
+    if (-not $NpmCheckpoint) {
+        $candidate = Join-Path $baselineDir "checkpoint-npm-$Fixture-$CacheState.json"
+        if (Test-Path $candidate) { $NpmCheckpoint = $candidate }
+    }
+    if (-not $RnpmCheckpoint) {
+        $candidate = Join-Path $baselineDir "checkpoint-rnpm-$Fixture-$CacheState.json"
+        if (Test-Path $candidate) { $RnpmCheckpoint = $candidate }
+    }
+    if (-not $ReportFile) {
+        $ReportFile = Join-Path $baselineDir "report-$Fixture-$CacheState.md"
+    }
+}
+
 # Validate inputs
 if (-not $NpmCheckpoint -and -not $NpmDir) {
-    throw "Either -NpmCheckpoint or -NpmDir must be provided."
+    throw "Either -Fixture, -NpmCheckpoint, or -NpmDir must be provided."
 }
 if (-not $RnpmCheckpoint -and -not $RnpmDir) {
     throw "Either -RnpmCheckpoint or -RnpmDir must be provided."
@@ -65,9 +89,21 @@ $npmData = $null
 $rnpmData = $null
 
 if ($NpmCheckpoint -and (Test-Path $NpmCheckpoint)) {
+    try {
+        $schemaNpm = (node $StatsUtil validate-checkpoint $NpmCheckpoint) | ConvertFrom-Json
+        if (-not $schemaNpm.valid) {
+            Write-Warning "npm checkpoint failed Gate F schema validation: $($schemaNpm.errors -join '; ')"
+        }
+    } catch { }
     $npmData = Get-Content $NpmCheckpoint -Raw | ConvertFrom-Json
 }
 if ($RnpmCheckpoint -and (Test-Path $RnpmCheckpoint)) {
+    try {
+        $schemaRnpm = (node $StatsUtil validate-checkpoint $RnpmCheckpoint) | ConvertFrom-Json
+        if (-not $schemaRnpm.valid) {
+            Write-Warning "rnpm checkpoint failed Gate F schema validation: $($schemaRnpm.errors -join '; ')"
+        }
+    } catch { }
     $rnpmData = Get-Content $RnpmCheckpoint -Raw | ConvertFrom-Json
 }
 

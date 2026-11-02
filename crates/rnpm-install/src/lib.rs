@@ -140,7 +140,21 @@ impl Installer {
         }
 
         let mut client_config = RegistryClientConfig::default();
-        client_config.default_registry = registry_url;
+        client_config.default_registry = registry_url.clone();
+        client_config.auth_tokens = config.npmrc.auth_tokens.clone();
+        client_config.scoped_registries = config.npmrc.scoped_registries.clone();
+        if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+            client_config.auth_token = Some(token.to_string());
+        }
+
+        for (_, scoped_reg) in &config.npmrc.scoped_registries {
+            if let Some(h) = scoped_reg.host_str() {
+                trusted_hosts.insert(h.to_ascii_lowercase());
+                if let Some(p) = scoped_reg.port_or_known_default() {
+                    trusted_hosts.insert(format!("{}:{}", h.to_ascii_lowercase(), p));
+                }
+            }
+        }
         client_config.trusted_hosts = trusted_hosts;
 
         let concurrency = config
