@@ -7,13 +7,13 @@ use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
 
 #[derive(Parser, Debug)]
 #[command(name = "rnpm", version, about = "High performance Rust implementation of npm workflows")]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    pub(crate) command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands {
+pub(crate) enum Commands {
     /// Install project dependencies or packages
     #[command(alias = "i")]
     Install {
@@ -106,19 +106,34 @@ enum Commands {
     },
 
     /// Update packages
+    #[command(alias = "up")]
     Update {
-        package: Option<String>,
+        /// Specific package names to update
+        packages: Vec<String>,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Offline mode (only use cache)
+        #[arg(long)]
+        offline: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    let cli = Cli::parse();
-    let current_dir = std::env::current_dir()?;
+pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let current_dir = match dir {
+        Some(d) => d,
+        None => std::env::current_dir()?,
+    };
 
     match cli.command {
         Commands::Install { registry, cache, offline, ignore_scripts, .. } => {
@@ -292,9 +307,37 @@ async fn main() -> anyhow::Result<()> {
                 summary.pruned_dependencies.len()
             );
         }
-        Commands::Update { .. } => {
-            eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: update workflow is scheduled for Phase 5.");
-            std::process::exit(1);
+        Commands::Update {
+            packages,
+            registry,
+            cache,
+            offline,
+            ignore_scripts,
+        } => {
+            let options = InstallOptions {
+                project_dir: current_dir,
+                registry_url: registry,
+                cache_dir: cache,
+                offline,
+                ignore_scripts,
+            };
+
+            let mut installer = Installer::new(options)?;
+            let summary = installer.update(&packages).await?;
+
+            if summary.packages_updated == 0 {
+                println!("rnpm: up to date");
+            } else {
+                for pkg in &summary.updated_packages {
+                    let old_v = summary.old_versions.get(pkg).map(|s| s.as_str()).unwrap_or("none");
+                    let new_v = summary.new_versions.get(pkg).map(|s| s.as_str()).unwrap_or("unknown");
+                    println!("rnpm: updated {pkg} {old_v} -> {new_v}");
+                }
+                println!(
+                    "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
+                    summary.packages_updated, summary.cache_hits, summary.cache_misses
+                );
+            }
         }
     }
 
@@ -349,3 +392,15 @@ fn format_bytes(bytes: u64, space: bool) -> String {
     }
 }
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+    run_cli(cli, None).await
+}
+
+#[cfg(test)]
+mod tests;
