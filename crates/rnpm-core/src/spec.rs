@@ -43,6 +43,26 @@ impl PackageTarget {
             return Self::parse_alias(alias_str);
         }
 
+        // Unsupported protocols (e.g. git+ssh://, git://, github:, bitbucket:, gitlab:, http://, https://)
+        let unsupported_protocols = [
+            "git+ssh://", "git+https://", "git://", "github:",
+            "bitbucket:", "gitlab:",
+        ];
+        for proto in unsupported_protocols {
+            if s.starts_with(proto) {
+                return Err(SpecError::UnsupportedProtocol {
+                    protocol: proto.trim_end_matches('/').to_string(),
+                    spec: s.to_string(),
+                });
+            }
+        }
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return Err(SpecError::UnsupportedProtocol {
+                protocol: if s.starts_with("https://") { "https:".to_string() } else { "http:".to_string() },
+                spec: s.to_string(),
+            });
+        }
+
         // Try exact version
         if let Ok(ver) = Version::parse(s) {
             return Ok(PackageTarget::Version(ver));

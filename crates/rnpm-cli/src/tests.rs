@@ -142,3 +142,113 @@ use tokio::net::TcpListener;
 
         let _ = tx.send(());
     }
+
+    #[test]
+    fn test_unsupported_commands_gate_e_diagnostics() {
+        let commands = ["publish", "login", "audit", "token", "exec"];
+        for cmd in commands {
+            let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
+            assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
+            let (code, msg) = res.unwrap();
+            assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
+            assert!(msg.contains("npm error code ERR_UNSUPPORTED_COMMAND"));
+            assert!(msg.contains(&format!("The command '{cmd}' is not currently implemented in rnpm.")));
+            assert!(msg.contains("docs/compatibility-contract.md"));
+        }
+    }
+
+    #[test]
+    fn test_unsupported_flags_gate_e_diagnostics() {
+        let flags = ["--legacy-peer-deps", "--global", "-g"];
+        for flag in flags {
+            let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+            assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
+            let (code, msg) = res.unwrap();
+            assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
+            assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
+            assert!(msg.contains(&format!("The flag '{flag}' is not supported by rnpm.")));
+        }
+    }
+
+    #[test]
+    fn test_unsupported_protocol_spec_gate_e_diagnostics() {
+        use rnpm_core::spec::PackageTarget;
+        let unsupported_specs = [
+            "git+ssh://git@github.com:foo/bar.git",
+            "git://github.com/foo/bar.git",
+            "github:user/repo",
+            "bitbucket:user/repo",
+            "gitlab:user/repo",
+        ];
+
+        for spec in unsupported_specs {
+            let res = PackageTarget::parse(spec);
+            assert!(res.is_err(), "Expected parse error for: {spec}");
+            let err = res.unwrap_err();
+            let err_str = err.to_string();
+            assert!(
+                err_str.contains("Unsupported protocol"),
+                "Expected UnsupportedProtocol error, got: {err_str}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_run_workspaces_topological_order() {
+        let root_dir = tempdir().unwrap();
+
+        // Monorepo root package.json
+        let root_pkg_json = root_dir.path().join("package.json");
+        std::fs::write(&root_pkg_json, r#"{
+            "name": "my-monorepo",
+            "workspaces": ["packages/*"]
+        }"#).unwrap();
+
+        let marker_file = root_dir.path().join("execution_log.txt");
+        let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+        // Member B: @mono/pkg-b (leaf dependency)
+        let b_dir = root_dir.path().join("packages").join("pkg-b");
+        std::fs::create_dir_all(&b_dir).unwrap();
+        std::fs::write(b_dir.join("package.json"), format!(r#"{{
+            "name": "@mono/pkg-b",
+            "version": "1.0.0",
+            "scripts": {{
+                "build": "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b\\n')\""
+            }}
+        }}"#)).unwrap();
+
+        // Member A: @mono/pkg-a (depends on @mono/pkg-b via workspace:*)
+        let a_dir = root_dir.path().join("packages").join("pkg-a");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::write(a_dir.join("package.json"), format!(r#"{{
+            "name": "@mono/pkg-a",
+            "version": "1.0.0",
+            "dependencies": {{
+                "@mono/pkg-b": "workspace:*"
+            }},
+            "scripts": {{
+                "build": "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a\\n')\""
+            }}
+        }}"#)).unwrap();
+
+        // Run `rnpm run build --workspaces`
+        let cli = Cli {
+            command: Commands::Run {
+                script: "build".to_string(),
+                args: vec![],
+                workspaces: true,
+                workspace: vec![],
+                if_present: false,
+                ignore_scripts: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(root_dir.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Expected run_cli to succeed across workspaces: {:?}", res.err());
+
+        // Verify topological execution: pkg-b (leaf) executed BEFORE pkg-a (dependent)
+        let log_content = std::fs::read_to_string(&marker_file).unwrap();
+        let executed_lines: Vec<&str> = log_content.lines().collect();
+        assert_eq!(executed_lines, vec!["pkg-b", "pkg-a"]);
+    }

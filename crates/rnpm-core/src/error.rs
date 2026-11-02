@@ -47,6 +47,12 @@ pub enum SpecError {
     #[error("Invalid specifier format: '{0}'")]
     InvalidFormat(String),
 
+    #[error("Unsupported protocol '{protocol}' in specifier '{spec}'")]
+    UnsupportedProtocol {
+        protocol: String,
+        spec: String,
+    },
+
     #[error("Invalid semver in specifier: {0}")]
     Semver(String),
 }

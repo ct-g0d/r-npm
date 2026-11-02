@@ -6,12 +6,104 @@ use rnpm_core::manifest::Manifest;
 #[cfg(test)]
 mod tests;
 
+/// Escapes a relative path string for use inside double quotes in POSIX shell script.
+pub fn escape_posix_path(path: &str) -> String {
+    let forward = path.replace('\\', "/");
+    forward
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
+/// Escapes a command-line argument for POSIX shell.
+pub fn escape_posix_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+/// Escapes a relative path string for use inside double quotes in Windows Command Prompt (.cmd).
+pub fn escape_cmd_path(path: &str) -> String {
+    let win = path.replace('/', "\\");
+    win.replace('\"', "")
+}
+
+/// Escapes an argument for Windows command line according to Win32 CommandLineToArgvW rules.
+pub fn escape_cmd_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let needs_quotes = arg.chars().any(|c| {
+        c == ' ' || c == '\t' || c == '\n' || c == '\x0B' || c == '\"'
+            || c == '&' || c == '|' || c == '<' || c == '>' || c == '^'
+    });
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut result = String::with_capacity(arg.len() + 2);
+    result.push('\"');
+
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '\"' {
+            for _ in 0..backslashes * 2 {
+                result.push('\\');
+            }
+            result.push('\\');
+            result.push('\"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                result.push('\\');
+            }
+            backslashes = 0;
+            result.push(c);
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        result.push('\\');
+    }
+    result.push('\"');
+    result
+}
+
+/// Escapes a path for PowerShell double quotes.
+pub fn escape_ps1_path(path: &str) -> String {
+    let forward = path.replace('\\', "/");
+    forward
+        .replace('`', "``")
+        .replace('\"', "`\"")
+        .replace('$', "`$")
+}
+
+/// Escapes an argument for PowerShell.
+pub fn escape_ps1_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "''"))
+    }
+}
+
 /// Generates POSIX shell script shim matching docs/platform-fs-contract.md.
 pub fn generate_posix_shim(target_rel_from_node_modules: &str) -> String {
-    let target = target_rel_from_node_modules.replace('\\', "/");
+    let target = escape_posix_path(target_rel_from_node_modules);
     format!(
         "#!/bin/sh\n\
-        basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\n\
+        basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\\\\\,/,g')\")\n\n\
         case `uname` in\n    \
             *CYGWIN*|*MINGW*|*MSYS*)\n        \
                 if command -v cygpath > /dev/null 2>&1; then\n            \
@@ -29,7 +121,7 @@ pub fn generate_posix_shim(target_rel_from_node_modules: &str) -> String {
 
 /// Generates Windows Batch (.cmd) wrapper matching docs/platform-fs-contract.md.
 pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
-    let target_win = target_rel_from_node_modules.replace('/', "\\");
+    let target_win = escape_cmd_path(target_rel_from_node_modules);
     format!(
         "@ECHO off\r\n\
         GOTO start\r\n\
@@ -51,7 +143,7 @@ pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
 
 /// Generates PowerShell (.ps1) wrapper matching docs/platform-fs-contract.md.
 pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
-    let target = target_rel_from_node_modules.replace('\\', "/");
+    let target = escape_ps1_path(target_rel_from_node_modules);
     format!(
         "#!/usr/bin/env pwsh\r\n\
         $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\r\n\
@@ -73,10 +165,20 @@ pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
         }}\r\n\r\n\
         $ret = 0\r\n\
         if (Test-Path \"$basedir/../{target}\") {{\r\n  \
-          & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          # Support pipeline input\r\n  \
+          if ($MyInvocation.ExpectingInput) {{\r\n    \
+            $input | & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          }} else {{\r\n    \
+            & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          }}\r\n  \
           $ret = $LASTEXITCODE\r\n\
         }} else {{\r\n  \
-          & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          # Support pipeline input\r\n  \
+          if ($MyInvocation.ExpectingInput) {{\r\n    \
+            $input | & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          }} else {{\r\n    \
+            & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
+          }}\r\n  \
           $ret = $LASTEXITCODE\r\n\
         }}\r\n\
         exit $ret\r\n"
