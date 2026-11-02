@@ -590,4 +590,81 @@ fn test_pack_edge_cases_and_error_handling() {
     assert!(!extract_dir.join(".gitignore").exists());
 }
 
+#[test]
+fn test_remove_junction_refuses_regular_dir() {
+    let dir = tempdir().unwrap();
+    let regular_dir = dir.path().join("regular_dir");
+    fs::create_dir_all(&regular_dir).unwrap();
+    fs::write(regular_dir.join("file.txt"), "keep me").unwrap();
+
+    let res = remove_junction(&regular_dir);
+    assert!(res.is_err(), "remove_junction must refuse to remove a regular directory");
+    assert!(regular_dir.exists(), "Regular directory must still exist");
+    assert!(regular_dir.join("file.txt").exists());
+}
+
+#[test]
+fn test_safe_remove_dir_all_with_nested_junctions() {
+    let dir = tempdir().unwrap();
+    let external_target = dir.path().join("external_workspace_pkg");
+    fs::create_dir_all(&external_target).unwrap();
+    let external_file = external_target.join("important_src.ts");
+    fs::write(&external_file, "console.log('precious');").unwrap();
+
+    let parent = dir.path().join("node_modules");
+    let nested = parent.join("@scope");
+    fs::create_dir_all(&nested).unwrap();
+
+    let link_path = nested.join("pkg");
+    create_junction(&link_path, &external_target).unwrap();
+    assert!(is_junction(&link_path).unwrap());
+    assert!(link_path.join("important_src.ts").exists());
+
+    // Also create regular files and directories inside parent
+    let regular_sub = parent.join("regular-pkg");
+    fs::create_dir_all(&regular_sub).unwrap();
+    fs::write(regular_sub.join("index.js"), "regular").unwrap();
+
+    // Now call remove_dir_all_safe on parent
+    crate::junction::remove_dir_all_safe(&parent).unwrap();
+
+    // Verify parent and all nested node_modules are deleted
+    assert!(!parent.exists(), "Parent node_modules must be deleted");
+    assert!(!link_path.exists(), "Junction link must be deleted");
+
+    // CRUCIAL: External target directory and its files must be completely preserved!
+    assert!(external_target.exists(), "External target directory must NOT be deleted");
+    assert!(external_file.exists(), "External target file must NOT be deleted");
+    assert_eq!(fs::read_to_string(&external_file).unwrap(), "console.log('precious');");
+}
+
+#[test]
+fn test_replace_dir_with_retries_replaces_junction() {
+    let dir = tempdir().unwrap();
+    let external_target = dir.path().join("ext_target");
+    fs::create_dir_all(&external_target).unwrap();
+    fs::write(external_target.join("ext.txt"), "external data").unwrap();
+
+    let dest = dir.path().join("destination_junction");
+    create_junction(&dest, &external_target).unwrap();
+    assert!(is_junction(&dest).unwrap());
+
+    // Create staging directory with regular content
+    let staging = dir.path().join("staging_dir");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("new.txt"), "new data").unwrap();
+
+    // Atomically replace destination junction with staging directory
+    crate::atomic::replace_dir_with_retries(&staging, &dest, 5).unwrap();
+
+    // Verify destination is now a regular directory containing new.txt
+    assert!(dest.exists());
+    assert!(!is_junction(&dest).unwrap());
+    assert!(dest.join("new.txt").exists());
+
+    // Verify external target was NOT destroyed during atomic replacement!
+    assert!(external_target.exists());
+    assert!(external_target.join("ext.txt").exists());
+}
+
 

@@ -68,7 +68,8 @@ pub fn replace_dir_with_retries(
         .unwrap_or_else(|| Path::new("."));
 
     let mut attempt = 0;
-    let mut delay = Duration::from_millis(5);
+    let mut delay = Duration::from_millis(10);
+    let effective_retries = max_retries.max(1);
 
     loop {
         attempt += 1;
@@ -77,30 +78,43 @@ pub fn replace_dir_with_retries(
         match result {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if attempt >= max_retries || !is_retryable_error(&err) {
+                if attempt >= effective_retries || !is_retryable_error(&err) {
                     return Err(FsError::AtomicReplacementFailed {
                         path: destination.to_path_buf(),
                         retries: attempt,
                         source: err,
                     });
                 }
-                let jitter_ms = (attempt as u64 * 3) % 7;
+                let jitter_ms = (attempt as u64 * 13 + 7) % 29;
                 sleep(delay + Duration::from_millis(jitter_ms));
-                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(500));
             }
         }
     }
 }
 
 fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io::Result<()> {
-    if !destination.exists() {
+    let dest_is_reparse = crate::junction::is_junction(destination).unwrap_or(false);
+    if !destination.exists() && !dest_is_reparse {
         // Fast-path: Direct atomic rename when destination does not exist
         return fs::rename(staging, destination);
     }
 
+    // Opportunistically cleanup any abandoned .rnpm-trash directories in parent
+    cleanup_stale_trash(parent);
+
     // If destination already exists:
     // Move existing destination to a unique trash path (that does NOT yet exist) on the same filesystem
     let trash_path = generate_unique_path(parent, ".rnpm-trash");
+
+    #[cfg(windows)]
+    if let Ok(meta) = fs::symlink_metadata(destination) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(destination, perms);
+        }
+    }
 
     // Rename destination -> trash_path
     fs::rename(destination, &trash_path)?;
@@ -112,12 +126,25 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         return Err(rename_err);
     }
 
-    // Successfully replaced; cleanup trash (ignore error if delayed by OS file lock)
-    let _ = fs::remove_dir_all(&trash_path);
+    // Successfully replaced; safely cleanup trash using non-recursive junction pruning
+    let _ = crate::junction::remove_dir_all_safe(&trash_path);
     Ok(())
 }
 
-fn is_retryable_error(err: &std::io::Error) -> bool {
+/// Opportunistic cleanup of any leftover .rnpm-trash-* directories in parent.
+fn cleanup_stale_trash(parent: &Path) {
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with(".rnpm-trash-") {
+                let _ = crate::junction::remove_dir_all_safe(&entry.path());
+            }
+        }
+    }
+}
+
+pub(crate) fn is_retryable_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     match err.kind() {
         ErrorKind::PermissionDenied
@@ -127,10 +154,24 @@ fn is_retryable_error(err: &std::io::Error) -> bool {
         _ => {
             // Check raw OS error codes for Windows:
             // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+            // ERROR_DIR_NOT_EMPTY (145), ERROR_FILE_CHECKED_OUT (149),
             // ERROR_BUSY (170), ERROR_USER_MAPPED_FILE (1224)
             #[cfg(windows)]
             if let Some(code) = err.raw_os_error() {
-                return code == 5 || code == 32 || code == 33 || code == 170 || code == 1224;
+                return code == 5
+                    || code == 32
+                    || code == 33
+                    || code == 145
+                    || code == 149
+                    || code == 170
+                    || code == 1224;
+            }
+            #[cfg(windows)]
+            {
+                let kind_debug = format!("{:?}", err.kind());
+                if kind_debug == "DirectoryNotEmpty" {
+                    return true;
+                }
             }
             false
         }
