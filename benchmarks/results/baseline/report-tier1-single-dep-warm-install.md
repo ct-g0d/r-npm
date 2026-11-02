@@ -1,6 +1,6 @@
 # Differential Comparison Report: npm vs rnpm
 
-- **Date:** 2026-11-02 05:22:19 UTC
+- **Date:** 2026-11-02 09:55:55 UTC
 - **Fixture:** tier1-single-dep (tier1)
 - **Cache State:** warm-install (install)
 - **Machine:** Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz | RAM: 31.9 GB
@@ -20,13 +20,13 @@
 
 | Metric | npm (Baseline) | rnpm (Target) | Delta (Abs) | Delta (%) | Gate Threshold | Status |
 |---|---|---|---|---|---|---|
-| **Wall-clock Time (Median)** | 681.7 ms | 39.51 ms | -642.19 ms | -94.20% | <= +5% and > 25 ms | 鈿?FASTER |
-| **User CPU Time** | 468.75 ms | 15.62 ms | -453.13 ms | -96.67% | Informational | 鈩癸笍 INFO |
-| **System CPU Time** | 250 ms | 31.25 ms | -218.75 ms | -87.50% | Informational | 鈩癸笍 INFO |
-| **Peak Working Set** | 89.45 MB | 7.62 MB | -81.83 MB | -91.48% | Informational | 鈩癸笍 INFO |
-| **Peak Commit Charge** | 97.27 MB | 3.14 MB | -94.13 MB | -96.77% | <= +10% | 鈿?FASTER |
-| **Disk Write Bytes** | 2.73 KB | 0.81 KB | -1.92 KB | -70.33% | Informational | 鈩癸笍 INFO |
-| **Write Amplification** | 11.99 x | 3.56 x | -8.43 x | -70.33% | Informational | 鈩癸笍 INFO |
+| **Wall-clock Time (Median)** | 925 ms | 45.03 ms | -879.97 ms | -95.13% | <= +5% and > 25 ms | 鈿?FASTER |
+| **User CPU Time** | 562.5 ms | 31.25 ms | -531.25 ms | -94.44% | Informational | 鈩癸笍 INFO |
+| **System CPU Time** | 359.38 ms | 15.62 ms | -343.76 ms | -95.65% | Informational | 鈩癸笍 INFO |
+| **Peak Working Set** | 89.5 MB | 7.31 MB | -82.20 MB | -91.83% | Informational | 鈩癸笍 INFO |
+| **Peak Commit Charge** | 97.26 MB | 3.3 MB | -93.96 MB | -96.61% | <= +10% | 鈿?FASTER |
+| **Disk Write Bytes** | 2.7 KB | 1.32 KB | -1.37 KB | -50.89% | Informational | 鈩癸笍 INFO |
+| **Write Amplification** | 11.85 x | 5.82 x | -6.03 x | -50.89% | Informational | 鈩癸笍 INFO |
 
 ## Gate Decision
 
