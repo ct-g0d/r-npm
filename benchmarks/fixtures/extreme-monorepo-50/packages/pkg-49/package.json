@@ -1,0 +1,20 @@
+{
+  "name": "pkg-49",
+  "version": "1.0.0",
+  "description": "pkg-49 (Tier 4) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-01": "^1.0.0",
+    "pkg-15": "^1.0.0",
+    "pkg-41": "^1.0.0",
+    "commander": "^11.1.0",
+    "chalk": "^4.1.2"
+  },
+  "scripts": {
+    "postinstall": "node build.js",
+    "prepare": "node build.js"
+  },
+  "bin": {
+    "pkg-49-cli": "./bin/cli.js"
+  }
+}

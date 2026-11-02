@@ -1,0 +1,16 @@
+{
+  "name": "pkg-51",
+  "version": "1.0.0",
+  "description": "pkg-51 (Tier 4) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-44": "~1.0.0",
+    "pkg-45": "^1.0.0",
+    "pkg-30": "^1.0.0",
+    "commander": "^11.1.0"
+  },
+  "scripts": {},
+  "bin": {
+    "pkg-51-cli": "./bin/cli.js"
+  }
+}

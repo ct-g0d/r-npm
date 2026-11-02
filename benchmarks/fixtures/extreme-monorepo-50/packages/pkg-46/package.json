@@ -1,0 +1,11 @@
+{
+  "name": "pkg-46",
+  "version": "1.0.0",
+  "description": "pkg-46 (Tier 3) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-16": "~1.0.0",
+    "pkg-31": "*"
+  },
+  "scripts": {}
+}

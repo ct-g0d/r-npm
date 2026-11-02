@@ -15,8 +15,7 @@ use std::sync::Arc;
 use rnpm_fs::atomic::extract_and_replace;
 use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_lifecycle::{
-    execute_lifecycle_script, execute_topological, LifecycleContext, LifecycleOptions,
-    LifecyclePackageNode, PackageSource,
+    execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource,
 };
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
@@ -471,15 +470,40 @@ impl Installer {
             // Collect lifecycle scripts for workspace member
             let has_scripts = member.manifest.scripts.contains_key("preinstall")
                 || member.manifest.scripts.contains_key("install")
-                || member.manifest.scripts.contains_key("postinstall");
+                || member.manifest.scripts.contains_key("postinstall")
+                || member.manifest.scripts.contains_key("prepare");
 
             if has_scripts {
+                let mut member_deps: Vec<String> = member.manifest.dependencies.keys().cloned().collect();
+                for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
+                    let is_sibling = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                        || dep_spec.starts_with("workspace:")
+                        || workspace_members.iter().any(|m| &m.name == dep_name);
+                    if is_sibling && !member_deps.contains(dep_name) {
+                        member_deps.push(dep_name.clone());
+                    }
+                }
+                if let Some(ref ws_graph) = ws_graph_opt {
+                    if let Some(sibling_map) = ws_graph.dependencies.get(&member.name) {
+                        for sibling_name in sibling_map.keys() {
+                            if !member_deps.contains(sibling_name) {
+                                member_deps.push(sibling_name.clone());
+                            }
+                        }
+                    }
+                }
+
+                let mut member_manifest = member.manifest.clone();
+                if member_manifest.name.is_none() {
+                    member_manifest.name = Some(member.name.clone());
+                }
+
                 lifecycle_nodes.push(LifecyclePackageNode {
                     package_path: format!("node_modules/{}", member.name),
                     disk_path: member.path.clone(),
-                    manifest: member.manifest.clone(),
+                    manifest: member_manifest,
                     source: PackageSource::Local,
-                    dependencies: member.manifest.dependencies.keys().cloned().collect(),
+                    dependencies: member_deps,
                     optional: false,
                 });
             }
@@ -891,6 +915,18 @@ impl Installer {
         let lockfile = LockfileV3::from_json_str(&lockfile_str)
             .context("Failed to parse package-lock.json")?;
 
+        // 0. Discover workspace members (if any)
+        let workspace_members = discover_workspaces_from_manifest(
+            &self.options.project_dir,
+            &manifest,
+        ).unwrap_or_default();
+
+        let ws_graph_opt = if !workspace_members.is_empty() {
+            WorkspaceDependencyGraph::construct(&workspace_members).ok()
+        } else {
+            None
+        };
+
         // Strict drift check between manifest and lockfile
         if let Some(root_pkg) = lockfile.packages.get("") {
             if let Some(lock_deps) = &root_pkg.dependencies {
@@ -929,6 +965,51 @@ impl Installer {
         let mut cache_misses = 0;
         let mut packages_installed = 0;
 
+        let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
+
+        // Collect lifecycle scripts for workspace members
+        for member in &workspace_members {
+            let has_scripts = member.manifest.scripts.contains_key("preinstall")
+                || member.manifest.scripts.contains_key("install")
+                || member.manifest.scripts.contains_key("postinstall")
+                || member.manifest.scripts.contains_key("prepare");
+
+            if has_scripts {
+                let mut member_deps: Vec<String> = member.manifest.dependencies.keys().cloned().collect();
+                for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
+                    let is_sibling = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                        || dep_spec.starts_with("workspace:")
+                        || workspace_members.iter().any(|m| &m.name == dep_name);
+                    if is_sibling && !member_deps.contains(dep_name) {
+                        member_deps.push(dep_name.clone());
+                    }
+                }
+                if let Some(ref ws_graph) = ws_graph_opt {
+                    if let Some(sibling_map) = ws_graph.dependencies.get(&member.name) {
+                        for sibling_name in sibling_map.keys() {
+                            if !member_deps.contains(sibling_name) {
+                                member_deps.push(sibling_name.clone());
+                            }
+                        }
+                    }
+                }
+
+                let mut member_manifest = member.manifest.clone();
+                if member_manifest.name.is_none() {
+                    member_manifest.name = Some(member.name.clone());
+                }
+
+                lifecycle_nodes.push(LifecyclePackageNode {
+                    package_path: format!("node_modules/{}", member.name),
+                    disk_path: member.path.clone(),
+                    manifest: member_manifest,
+                    source: PackageSource::Local,
+                    dependencies: member_deps,
+                    optional: false,
+                });
+            }
+        }
+
         let mut packages_to_download: Vec<(&String, &String, &String, bool)> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
@@ -966,6 +1047,39 @@ impl Installer {
                             let script_path = target_dir.join(&script_rel);
                             let _ = normalize_shebang(&script_path);
                             let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        }
+
+                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                        if !workspace_members.iter().any(|m| m.name == clean_pkg_name) {
+                            let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                                || pkg_manifest.scripts.contains_key("install")
+                                || pkg_manifest.scripts.contains_key("postinstall")
+                                || pkg_manifest.scripts.contains_key("prepare");
+
+                            if has_scripts {
+                                let mut member_deps: Vec<String> = pkg_manifest.dependencies.keys().cloned().collect();
+                                for (dep_name, dep_spec) in &pkg_manifest.dev_dependencies {
+                                    let is_sibling = dep_spec.starts_with("workspace:")
+                                        || lockfile.packages.contains_key(&format!("node_modules/{dep_name}"));
+                                    if is_sibling && !member_deps.contains(dep_name) {
+                                        member_deps.push(dep_name.clone());
+                                    }
+                                }
+
+                                let mut m = pkg_manifest.clone();
+                                if m.name.is_none() {
+                                    m.name = Some(clean_pkg_name.to_string());
+                                }
+
+                                lifecycle_nodes.push(LifecyclePackageNode {
+                                    package_path: pkg_key.clone(),
+                                    disk_path: target_dir.clone(),
+                                    manifest: m,
+                                    source: PackageSource::Local,
+                                    dependencies: member_deps,
+                                    optional: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -1039,6 +1153,23 @@ impl Installer {
                             let script_path = target_path.join(&script_rel);
                             let _ = normalize_shebang(&script_path);
                             let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        }
+
+                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall");
+                        if has_scripts {
+                            let deps = pkg_info.dependencies.as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect());
+                            lifecycle_nodes.push(LifecyclePackageNode {
+                                package_path: pkg_key.clone(),
+                                disk_path: target_path.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Registry,
+                                dependencies: deps,
+                                optional: is_optional,
+                            });
                         }
                     }
                 }
@@ -1181,55 +1312,40 @@ impl Installer {
                         let _ = create_shims(&bin_dir, &bin_name, &target_rel);
                     }
 
-                    if !self.options.ignore_scripts {
-                        let mut script_failed = false;
-                        for event in &["preinstall", "install", "postinstall"] {
-                            if let Some(cmd) = pkg_manifest.scripts.get(*event) {
-                                let mut ctx = LifecycleContext::new(
-                                    &self.options.project_dir,
-                                    &target_path,
-                                    pkg_key,
-                                    *event,
-                                    cmd,
-                                );
-                                ctx.package_version = pkg_manifest.version.clone();
-                                match execute_lifecycle_script(&ctx) {
-                                    Ok(status) if status.success() => {},
-                                    Ok(status) => {
-                                        if is_optional {
-                                            warn!(
-                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {} failed at {} script with exit code: {:?}",
-                                                pkg_key, event, status.code()
-                                            );
-                                            script_failed = true;
-                                            break;
-                                        } else {
-                                            return Err(anyhow!(
-                                                "Lifecycle script '{}' failed for package {} with exit code: {:?}",
-                                                event, pkg_key, status.code()
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if is_optional {
-                                            warn!(
-                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Optional dependency lifecycle script error: {e}"
-                                            );
-                                            script_failed = true;
-                                            break;
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if script_failed {
-                            let _ = std::fs::remove_dir_all(&target_path);
-                        }
+                    let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                        || pkg_manifest.scripts.contains_key("install")
+                        || pkg_manifest.scripts.contains_key("postinstall");
+
+                    if has_scripts {
+                        let deps = if let Some(pkg_info) = lockfile.packages.get(pkg_key) {
+                            pkg_info.dependencies.as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect())
+                        } else {
+                            pkg_manifest.dependencies.keys().cloned().collect()
+                        };
+                        lifecycle_nodes.push(LifecyclePackageNode {
+                            package_path: pkg_key.clone(),
+                            disk_path: target_path.clone(),
+                            manifest: pkg_manifest,
+                            source: PackageSource::Registry,
+                            dependencies: deps,
+                            optional: is_optional,
+                        });
                     }
                 }
             }
+        }
+
+        // Execute lifecycle scripts bottom-up followed by root hooks
+        if !self.options.ignore_scripts {
+            let lifecycle_opts = LifecycleOptions {
+                root_dir: self.options.project_dir.clone(),
+                init_cwd: self.options.project_dir.clone(),
+                ignore_scripts: false,
+                capture_output: false,
+            };
+            execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
         Ok(InstallSummary {

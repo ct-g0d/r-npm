@@ -1,0 +1,10 @@
+{
+  "name": "pkg-05",
+  "version": "1.0.0",
+  "description": "pkg-05 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "raw-body": "^2.5.2"
+  },
+  "scripts": {}
+}

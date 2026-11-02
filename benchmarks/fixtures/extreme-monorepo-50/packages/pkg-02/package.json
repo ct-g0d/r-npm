@@ -1,0 +1,10 @@
+{
+  "name": "pkg-02",
+  "version": "1.0.0",
+  "description": "pkg-02 (Tier 0) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "chalk": "^4.1.2"
+  },
+  "scripts": {}
+}

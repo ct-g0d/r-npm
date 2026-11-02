@@ -1,0 +1,12 @@
+{
+  "name": "pkg-28",
+  "version": "1.0.0",
+  "description": "pkg-28 (Tier 2) workspace package",
+  "main": "index.js",
+  "dependencies": {
+    "pkg-13": "~1.0.0",
+    "pkg-14": "*",
+    "pkg-03": "^1.0.0"
+  },
+  "scripts": {}
+}

@@ -1,0 +1,9 @@
+{
+  "name": "extreme-circular-monorepo",
+  "version": "1.0.0",
+  "description": "Circular workspace dependency fixture with mutual workspace:* links",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}
