@@ -85,6 +85,7 @@ async fn test_optional_lifecycle_script_failure_isolation() {
         init_cwd: temp.path().to_path_buf(),
         ignore_scripts: false,
         capture_output: true,
+        timeout: None,
     };
 
     // When optional is true, script failure is isolated and does NOT fail execution
@@ -275,6 +276,7 @@ async fn test_topological_dependency_cycle_prevention() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        timeout: None,
     };
 
     // Cyclic dependency should NOT overflow the stack and should successfully execute
@@ -314,6 +316,7 @@ async fn test_optional_dependency_disk_removal_on_failure() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        timeout: None,
     };
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
@@ -788,6 +791,7 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        timeout: None,
     };
 
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
@@ -949,5 +953,367 @@ async fn test_execute_workspace_scripts_with_filter_and_scope() {
     assert!(err_res.is_err());
     let err_msg = err_res.unwrap_err().to_string();
     assert!(err_msg.contains("No workspace packages matched the filter/scope criteria"));
+}
+
+#[test]
+fn test_is_sensitive_credential_key_expanded() {
+    // AWS credentials
+    assert!(is_sensitive_credential_key("aws_access_key_id"));
+    assert!(is_sensitive_credential_key("AWS_ACCESS_KEY_ID"));
+    assert!(is_sensitive_credential_key("aws_secret_access_key"));
+    assert!(is_sensitive_credential_key("AWS_SECRET_ACCESS_KEY"));
+    assert!(is_sensitive_credential_key("aws_session_token"));
+
+    // SSH agent socket
+    assert!(is_sensitive_credential_key("ssh_auth_sock"));
+    assert!(is_sensitive_credential_key("SSH_AUTH_SOCK"));
+
+    // JWT
+    assert!(is_sensitive_credential_key("jwt"));
+    assert!(is_sensitive_credential_key("JWT"));
+    assert!(is_sensitive_credential_key("JWT_SECRET"));
+    assert!(is_sensitive_credential_key("user_jwt_token"));
+
+    // Deploy, signing, encryption, secret keys
+    assert!(is_sensitive_credential_key("deploy_key"));
+    assert!(is_sensitive_credential_key("DEPLOY_KEY"));
+    assert!(is_sensitive_credential_key("deploykey"));
+    assert!(is_sensitive_credential_key("signing_key"));
+    assert!(is_sensitive_credential_key("SIGNING_KEY"));
+    assert!(is_sensitive_credential_key("signingkey"));
+    assert!(is_sensitive_credential_key("encryption_key"));
+    assert!(is_sensitive_credential_key("ENCRYPTION_KEY"));
+    assert!(is_sensitive_credential_key("encryptionkey"));
+    assert!(is_sensitive_credential_key("secret_key"));
+    assert!(is_sensitive_credential_key("SECRET_KEY"));
+    assert!(is_sensitive_credential_key("secretkey"));
+
+    // Token prefixes
+    assert!(is_sensitive_credential_key("ghp_1234567890abcdef1234567890abcdef"));
+    assert!(is_sensitive_credential_key("GHP_TOKEN"));
+    assert!(is_sensitive_credential_key("github_pat_11AAAAAAA_BBBBBBB"));
+    assert!(is_sensitive_credential_key("GITHUB_PAT_TOKEN"));
+
+    // Non-sensitive keys
+    assert!(!is_sensitive_credential_key("PATH"));
+    assert!(!is_sensitive_credential_key("NODE_ENV"));
+    assert!(!is_sensitive_credential_key("AUTHOR"));
+    assert!(!is_sensitive_credential_key("npm_package_author"));
+    assert!(!is_sensitive_credential_key("AWS_REGION"));
+    assert!(!is_sensitive_credential_key("SSH_HOST"));
+}
+
+#[test]
+fn test_process_environment_credential_scrubbing_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let env_dump_file = root.join("env_dump.json");
+    let escaped_dump = env_dump_file.to_string_lossy().replace('\\', "/");
+
+    let script = format!(
+        "node -e \"require('fs').writeFileSync('{escaped_dump}', JSON.stringify(process.env));\""
+    );
+
+    let mut ctx = LifecycleContext::new(
+        root,
+        root,
+        "env-scrub-pkg",
+        "preinstall",
+        &script,
+    );
+
+    // Inject all required sensitive keys into extra_env
+    ctx.extra_env.insert("AWS_ACCESS_KEY_ID".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string());
+    ctx.extra_env.insert("SSH_AUTH_SOCK".to_string(), "/tmp/ssh-agent.sock".to_string());
+    ctx.extra_env.insert("JWT".to_string(), "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy".to_string());
+    ctx.extra_env.insert("DEPLOY_KEY".to_string(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...".to_string());
+    ctx.extra_env.insert("SIGNING_KEY".to_string(), "secsign123".to_string());
+    ctx.extra_env.insert("ENCRYPTION_KEY".to_string(), "secenc456".to_string());
+    ctx.extra_env.insert("SECRET_KEY".to_string(), "secval789".to_string());
+    ctx.extra_env.insert("ghp_user_token".to_string(), "ghp_1234567890abcdef".to_string());
+    ctx.extra_env.insert("github_pat_key".to_string(), "github_pat_11ABCD_12345".to_string());
+    ctx.extra_env.insert("SAFE_BUILD_VAR".to_string(), "safe_value_xyz".to_string());
+
+    let status = execute_lifecycle_script(&ctx).expect("Execution should succeed");
+    assert!(status.success());
+    assert!(env_dump_file.exists());
+
+    let dump_content = std::fs::read_to_string(&env_dump_file).unwrap();
+    let env_map: HashMap<String, String> = serde_json::from_str(&dump_content).unwrap();
+
+    // Safe variable must be passed
+    assert_eq!(env_map.get("SAFE_BUILD_VAR").unwrap(), "safe_value_xyz");
+
+    // All sensitive keys must be scrubbed from process environment
+    assert!(!env_map.contains_key("AWS_ACCESS_KEY_ID"));
+    assert!(!env_map.contains_key("SSH_AUTH_SOCK"));
+    assert!(!env_map.contains_key("JWT"));
+    assert!(!env_map.contains_key("DEPLOY_KEY"));
+    assert!(!env_map.contains_key("SIGNING_KEY"));
+    assert!(!env_map.contains_key("ENCRYPTION_KEY"));
+    assert!(!env_map.contains_key("SECRET_KEY"));
+    assert!(!env_map.contains_key("ghp_user_token"));
+    assert!(!env_map.contains_key("github_pat_key"));
+}
+
+#[test]
+fn test_log_output_scrub_tokens_and_key_values() {
+    let log_sample = "\
+[info] AWS Key: aws_access_key_id=AKIAIOSFODNN7EXAMPLE; \
+SSH Agent: ssh_auth_sock=/tmp/ssh-agent.sock; \
+Auth: jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy; \
+Key: deploy_key=ssh-rsa AAAAB3NzaC1yc2E...; \
+Signing: signing_key=sign_secret_abc; \
+Encryption: encryption_key=enc_secret_xyz; \
+Secret: secret_key=super_secret_value; \
+Token1: ghp_1234567890abcdef1234567890abcdef; \
+Token2: github_pat_11AAAAAAA_BBBBBBBB2222222; \
+Header: Bearer token_secret_999";
+
+    let scrubbed = scrub_text(log_sample);
+
+    // Verify all sensitive contents are redacted
+    assert!(!scrubbed.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!scrubbed.contains("/tmp/ssh-agent.sock"));
+    assert!(!scrubbed.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy"));
+    assert!(!scrubbed.contains("ssh-rsa AAAAB3NzaC1yc2E..."));
+    assert!(!scrubbed.contains("sign_secret_abc"));
+    assert!(!scrubbed.contains("enc_secret_xyz"));
+    assert!(!scrubbed.contains("super_secret_value"));
+    assert!(!scrubbed.contains("ghp_1234567890abcdef1234567890abcdef"));
+    assert!(!scrubbed.contains("github_pat_11AAAAAAA_BBBBBBBB2222222"));
+    assert!(!scrubbed.contains("token_secret_999"));
+
+    // Verify replacements
+    assert!(scrubbed.contains("aws_access_key_id=[REDACTED]"));
+    assert!(scrubbed.contains("ssh_auth_sock=[REDACTED]"));
+    assert!(scrubbed.contains("jwt=[REDACTED]"));
+    assert!(scrubbed.contains("deploy_key=[REDACTED]"));
+    assert!(scrubbed.contains("signing_key=[REDACTED]"));
+    assert!(scrubbed.contains("encryption_key=[REDACTED]"));
+    assert!(scrubbed.contains("secret_key=[REDACTED]"));
+    assert!(scrubbed.contains("ghp_[REDACTED]"));
+    assert!(scrubbed.contains("github_pat_[REDACTED]"));
+    assert!(scrubbed.contains("Bearer [REDACTED]"));
+}
+
+#[tokio::test]
+async fn test_lifecycle_timeout_sync_and_async_exit_code_124() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // 1. Synchronous execution with timeout
+    let ctx_sync = LifecycleContext::new(
+        root,
+        root,
+        "timeout-sync-pkg",
+        "preinstall",
+        "node -e \"setTimeout(() => {}, 60000)\"",
+    ).with_timeout(std::time::Duration::from_millis(200));
+
+    let start = std::time::Instant::now();
+    let sync_res = execute_lifecycle_script(&ctx_sync);
+    let elapsed = start.elapsed();
+
+    assert!(sync_res.is_err(), "Sync script execution must fail upon timeout");
+    let err = sync_res.unwrap_err();
+    let code = extract_error_exit_code(&err);
+    assert_eq!(code, 124, "Timeout must exit with code 124");
+    assert!(elapsed < std::time::Duration::from_secs(5));
+
+    // 2. Asynchronous execution with timeout
+    let ctx_async = LifecycleContext::new(
+        root,
+        root,
+        "timeout-async-pkg",
+        "preinstall",
+        "node -e \"setTimeout(() => {}, 60000)\"",
+    ).with_timeout(std::time::Duration::from_millis(200));
+
+    let start_async = std::time::Instant::now();
+    let async_res = execute_lifecycle_script_async(&ctx_async).await;
+    let elapsed_async = start_async.elapsed();
+
+    assert!(async_res.is_err(), "Async script execution must fail upon timeout");
+    let err_async = async_res.unwrap_err();
+    let code_async = extract_error_exit_code(&err_async);
+    assert_eq!(code_async, 124, "Async timeout must exit with code 124");
+    assert!(elapsed_async < std::time::Duration::from_secs(5));
+
+    // 3. Topological execution with timeout
+    let mut manifest = Manifest::default();
+    manifest.name = Some("topo-timeout-pkg".to_string());
+    manifest.scripts.insert("install".to_string(), "node -e \"setTimeout(() => {}, 60000)\"".to_string());
+
+    let node = LifecyclePackageNode {
+        package_path: "node_modules/topo-timeout-pkg".to_string(),
+        disk_path: root.join("node_modules").join("topo-timeout-pkg"),
+        manifest,
+        source: PackageSource::Registry,
+        dependencies: vec![],
+        optional: false,
+    };
+    std::fs::create_dir_all(&node.disk_path).unwrap();
+
+    let root_manifest = Manifest::default();
+    let opts = LifecycleOptions::new(root)
+        .with_timeout(std::time::Duration::from_millis(250));
+
+    let topo_res = execute_topological(&[node], &root_manifest, &opts).await;
+    assert!(topo_res.is_err(), "Topological execution must fail on timeout");
+    let topo_err = topo_res.unwrap_err();
+    let topo_code = extract_error_exit_code(&topo_err);
+    assert_eq!(topo_code, 124, "Topological timeout must report exit code 124");
+}
+
+#[tokio::test]
+async fn test_lifecycle_timeout_terminates_grandchild_process_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let grandchild_pid_file = root.join("grandchild_timeout.pid");
+    let escaped_pid_file = grandchild_pid_file.to_string_lossy().replace('\\', "/");
+
+    let script_file = root.join("spawn_timeout_tree.js");
+    let script_js = format!(
+        "const {{ spawn }} = require('child_process');\n\
+        const g = spawn(process.execPath, [\n\
+            '-e',\n\
+            `require('fs').writeFileSync('{escaped_pid_file}', String(process.pid)); setInterval(() => {{}}, 1000);`\n\
+        ], {{ stdio: 'ignore' }});\n\
+        setInterval(() => {{}}, 1000);\n"
+    );
+    std::fs::write(&script_file, script_js).unwrap();
+
+    let escaped_script = script_file.to_string_lossy().replace('\\', "/");
+    let script_cmd = format!("node \"{escaped_script}\"");
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "grandchild-timeout-pkg",
+        "preinstall",
+        &script_cmd,
+    ).with_timeout(std::time::Duration::from_millis(1500));
+
+    let exec_task = tokio::spawn(async move {
+        execute_lifecycle_script_async(&ctx).await
+    });
+
+    // Wait until the grandchild has started and written its PID
+    let mut grandchild_pid: Option<u32> = None;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if grandchild_pid_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&grandchild_pid_file) {
+                let trimmed = content.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+        }
+    }
+
+    let pid = grandchild_pid.expect("Grandchild process should have launched and recorded its PID");
+    assert!(
+        process_guard::is_process_running(pid),
+        "Grandchild process {pid} must be running before timeout"
+    );
+
+    let res = exec_task.await.unwrap();
+    assert!(res.is_err(), "Execution must fail with timeout error");
+    let err = res.unwrap_err();
+    assert_eq!(extract_error_exit_code(&err), 124, "Timeout must return exit code 124");
+
+    // Wait brief grace period for OS process cleanup
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify grandchild process is no longer running (contained by Job Object / ProcessTreeGuard)
+    assert!(
+        !process_guard::is_process_running(pid),
+        "Grandchild process {pid} must be terminated when timeout occurs, no orphaned processes"
+    );
+}
+
+#[tokio::test]
+async fn test_sigint_and_sigterm_exit_code_fidelity() {
+    // 1. ScriptExitError exit code propagation
+    let err_sigint = anyhow::Error::from(ScriptExitError {
+        exit_code: 130,
+        message: "Interrupted by SIGINT".to_string(),
+    });
+    assert_eq!(extract_error_exit_code(&err_sigint), 130);
+
+    let err_sigterm = anyhow::Error::from(ScriptExitError {
+        exit_code: 143,
+        message: "Interrupted by SIGTERM".to_string(),
+    });
+    assert_eq!(extract_error_exit_code(&err_sigterm), 143);
+
+    let err_timeout = anyhow::Error::from(ScriptExitError {
+        exit_code: 124,
+        message: "Script timed out".to_string(),
+    });
+    assert_eq!(extract_error_exit_code(&err_timeout), 124);
+
+    // 2. Abort signal returns exit code 143
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "sigterm-abort-pkg",
+        "preinstall",
+        "node -e \"setTimeout(() => {}, 60000)\"",
+    );
+
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let abort_fut = async move {
+        let mut rx = abort_rx;
+        let _ = rx.wait_for(|&v| v).await;
+    };
+
+    let exec_task = tokio::spawn(async move {
+        execute_lifecycle_script_with_abort(&ctx, abort_fut).await
+    });
+
+    // Allow process to start
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let _ = abort_tx.send(true);
+
+    let res = exec_task.await.unwrap();
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(
+        extract_error_exit_code(&err),
+        143,
+        "Abort signal must faithfully propagate exit code 143 (SIGTERM)"
+    );
+
+    // 3. ProcessTreeGuard terminate fidelity on Windows
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        for target_code in [124u32, 130u32, 143u32] {
+            let guard = process_guard::ProcessTreeGuard::new().unwrap();
+            let mut cmd = std::process::Command::new("node");
+            cmd.arg("-e").arg("setTimeout(() => {}, 30000)");
+            let mut child = cmd.spawn().expect("Failed to spawn node process");
+            assert!(guard.assign_process(child.as_raw_handle()));
+
+            // Terminate with specific exit code
+            assert!(guard.terminate(target_code));
+
+            let status = child.wait().expect("Child should wait successfully");
+            assert_eq!(
+                extract_exit_status_code(&status),
+                target_code as i32,
+                "ProcessTreeGuard::terminate({target_code}) must terminate process with exact exit code"
+            );
+        }
+    }
 }
 

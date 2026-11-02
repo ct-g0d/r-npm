@@ -401,3 +401,220 @@ fn test_shim_exit_code_fidelity() {
         assert_eq!(status.code(), Some(42), "POSIX shim must faithfully propagate exit code 42");
     }
 }
+
+#[test]
+fn test_cmd_ps1_bash_shim_live_execution_all_shells() {
+    let dir = tempdir().unwrap();
+    let project_root = dir.path().join("All Shells Test");
+    let bin_dir = project_root.join("node_modules").join(".bin");
+    let tool_dir = project_root.join("node_modules").join("multi-tool");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&tool_dir).unwrap();
+
+    let output_file = project_root.join("shell_args.json");
+    let escaped_out = output_file.to_string_lossy().replace('\\', "/");
+
+    let script_file = tool_dir.join("cli.js");
+    let script_code = format!(
+        "const fs = require('fs');\n\
+        const args = process.argv.slice(2);\n\
+        fs.writeFileSync('{escaped_out}', JSON.stringify(args));\n"
+    );
+    fs::write(&script_file, script_code).unwrap();
+
+    create_shims(
+        &bin_dir,
+        "multi-tool",
+        "multi-tool/cli.js",
+    ).unwrap();
+
+    let cmd_shim = bin_dir.join("multi-tool.cmd");
+    let ps1_shim = bin_dir.join("multi-tool.ps1");
+    let posix_shim = bin_dir.join("multi-tool");
+
+    assert!(cmd_shim.exists());
+    assert!(ps1_shim.exists());
+    assert!(posix_shim.exists());
+
+    // 1. Windows CMD (.cmd) live invocation
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.current_dir(&bin_dir);
+        cmd.stdin(std::process::Stdio::null());
+        let status = cmd
+            .arg("/c")
+            .arg(".\\multi-tool.cmd")
+            .arg("alpha")
+            .arg("beta with spaces")
+            .arg("quote \"test\"")
+            .status()
+            .expect("Failed to execute cmd shim");
+        assert!(status.success());
+        assert!(output_file.exists());
+        let content = fs::read_to_string(&output_file).unwrap();
+        let args: Vec<String> = serde_json::from_str(&content).unwrap();
+        assert_eq!(args[0], "alpha");
+        assert_eq!(args[1], "beta with spaces");
+        assert!(args[2].contains("quote"));
+        fs::remove_file(&output_file).unwrap();
+    }
+
+    // 2. PowerShell (.ps1) live invocation
+    #[cfg(windows)]
+    {
+        let ps_res = std::process::Command::new("powershell.exe")
+            .current_dir(&bin_dir)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(".\\multi-tool.ps1")
+            .arg("ps_alpha")
+            .arg("ps with spaces")
+            .arg("literal $(subexpr)")
+            .stdin(std::process::Stdio::null())
+            .status();
+
+        if let Ok(st) = ps_res {
+            if st.success() && output_file.exists() {
+                let content = fs::read_to_string(&output_file).unwrap();
+                let args: Vec<String> = serde_json::from_str(&content).unwrap();
+                assert_eq!(args[0], "ps_alpha");
+                assert_eq!(args[1], "ps with spaces");
+                assert_eq!(args[2], "literal $(subexpr)");
+                fs::remove_file(&output_file).unwrap();
+            }
+        }
+    }
+
+    // 3. POSIX bash shim live invocation (works on Unix and Windows with Git Bash / MSYS)
+    let bash_paths = [
+        std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
+        std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\bash.exe"),
+        std::path::PathBuf::from("C:\\Program Files\\Git\\usr\\bin\\bash.exe"),
+        std::path::PathBuf::from("sh"),
+        std::path::PathBuf::from("bash"),
+    ];
+
+    let mut bash_exe = None;
+    for candidate in &bash_paths {
+        if candidate.exists() {
+            bash_exe = Some(candidate.clone());
+            break;
+        } else if let Ok(which) = which_tool(candidate.to_str().unwrap_or_default()) {
+            bash_exe = Some(which);
+            break;
+        }
+    }
+
+    if let Some(sh) = bash_exe {
+        let mut cmd = std::process::Command::new(sh);
+        cmd.current_dir(&bin_dir);
+        cmd.stdin(std::process::Stdio::null());
+        let status = cmd
+            .arg("./multi-tool")
+            .arg("bash_arg1")
+            .arg("bash arg with spaces")
+            .arg("it's a test")
+            .status();
+
+        if let Ok(st) = status {
+            if st.success() && output_file.exists() {
+                let content = fs::read_to_string(&output_file).unwrap();
+                let args: Vec<String> = serde_json::from_str(&content).unwrap();
+                assert_eq!(args[0], "bash_arg1");
+                assert_eq!(args[1], "bash arg with spaces");
+                assert_eq!(args[2], "it's a test");
+                fs::remove_file(&output_file).unwrap();
+            }
+        }
+    }
+}
+
+fn which_tool(name: &str) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    let out = std::process::Command::new("where.exe").arg(name).output()?;
+    #[cfg(not(windows))]
+    let out = std::process::Command::new("which").arg(name).output()?;
+
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(first_line) = stdout.lines().next() {
+            let p = std::path::PathBuf::from(first_line.trim());
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "tool not found"))
+}
+
+#[test]
+fn test_shim_exit_code_fidelity_all_codes() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let target_dir = dir.path().join("node_modules").join("exit-codes-pkg");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // Test exit codes 124 (timeout), 130 (SIGINT), 143 (SIGTERM), and 42
+    for &code in &[124, 130, 143, 42] {
+        let script_file = target_dir.join(format!("exit_{code}.js"));
+        fs::write(&script_file, format!("process.exit({code});\n")).unwrap();
+
+        let bin_name = format!("exit-{code}");
+        create_shims(&bin_dir, &bin_name, &format!("exit-codes-pkg/exit_{code}.js")).unwrap();
+
+        #[cfg(windows)]
+        {
+            // CMD shim exit code fidelity
+            let mut cmd = std::process::Command::new("cmd.exe");
+            cmd.current_dir(&bin_dir);
+            cmd.stdin(std::process::Stdio::null());
+            let status = cmd
+                .arg("/c")
+                .arg(format!(".\\{bin_name}.cmd"))
+                .status()
+                .expect("Failed to execute cmd shim");
+            assert_eq!(status.code(), Some(code), "CMD shim must faithfully exit with code {code}");
+
+            // PS1 shim exit code fidelity
+            let ps_status = std::process::Command::new("powershell.exe")
+                .current_dir(&bin_dir)
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(format!(".\\{bin_name}.ps1"))
+                .stdin(std::process::Stdio::null())
+                .status();
+
+            if let Ok(st) = ps_status {
+                assert_eq!(st.code(), Some(code), "PS1 shim must faithfully exit with code {code}");
+            }
+        }
+
+        // POSIX shim exit code fidelity if sh is available
+        let bash_paths = [
+            std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
+            std::path::PathBuf::from("sh"),
+        ];
+        for sh in &bash_paths {
+            if sh.exists() || which_tool(sh.to_str().unwrap_or_default()).is_ok() {
+                let mut cmd = std::process::Command::new(sh);
+                cmd.current_dir(&bin_dir);
+                cmd.stdin(std::process::Stdio::null());
+                let status = cmd
+                    .arg(format!("./{bin_name}"))
+                    .status();
+                if let Ok(st) = status {
+                    assert_eq!(st.code(), Some(code), "POSIX shim must faithfully exit with code {code}");
+                    break;
+                }
+            }
+        }
+    }
+}

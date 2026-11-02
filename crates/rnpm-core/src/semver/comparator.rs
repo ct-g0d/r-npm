@@ -72,7 +72,8 @@ impl Comparator {
             (Op::Eq, s)
         };
 
-        let version = Version::parse(ver_str.trim())?;
+        let version = Version::parse_loose(ver_str.trim())
+            .map_err(|_| SemverError::InvalidComparator(input.to_string()))?;
         Ok(Self { op, version })
     }
 }

@@ -856,6 +856,7 @@ impl Installer {
                 init_cwd: self.options.project_dir.clone(),
                 ignore_scripts: false,
                 capture_output: false,
+                timeout: None,
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
@@ -1863,6 +1864,7 @@ impl Installer {
                     init_cwd: self.options.project_dir.clone(),
                     ignore_scripts: false,
                     capture_output: false,
+                    timeout: None,
                 };
                 let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
             }

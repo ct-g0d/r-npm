@@ -67,6 +67,7 @@ pub mod process_guard {
 
     pub struct ProcessTreeGuard {
         job_handle: HANDLE,
+        terminated: std::sync::atomic::AtomicBool,
     }
 
     unsafe impl Send for ProcessTreeGuard {}
@@ -91,7 +92,10 @@ pub mod process_guard {
                     CloseHandle(job);
                     return None;
                 }
-                Some(Self { job_handle: job })
+                Some(Self {
+                    job_handle: job,
+                    terminated: std::sync::atomic::AtomicBool::new(false),
+                })
             }
         }
 
@@ -105,6 +109,7 @@ pub mod process_guard {
         }
 
         pub fn terminate(&self, exit_code: u32) -> bool {
+            self.terminated.store(true, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 if self.job_handle.is_null() {
                     return false;
@@ -119,8 +124,10 @@ pub mod process_guard {
             unsafe {
                 if !self.job_handle.is_null() {
                     // Forcefully terminate any lingering child or grandchild processes
-                    // running inside the job object before closing handle to guarantee cleanup.
-                    let _ = TerminateJobObject(self.job_handle, 1);
+                    // running inside the job object before closing handle if not already terminated.
+                    if !self.terminated.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = TerminateJobObject(self.job_handle, 1);
+                    }
                     CloseHandle(self.job_handle);
                     self.job_handle = std::ptr::null_mut();
                 }
@@ -151,16 +158,18 @@ pub mod process_guard {
 
 #[cfg(not(windows))]
 pub mod process_guard {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     pub struct ProcessTreeGuard {
         pgid: AtomicI32,
+        terminated: AtomicBool,
     }
 
     impl ProcessTreeGuard {
         pub fn new() -> Option<Self> {
             Some(Self {
                 pgid: AtomicI32::new(0),
+                terminated: AtomicBool::new(false),
             })
         }
 
@@ -169,14 +178,20 @@ pub mod process_guard {
             true
         }
 
-        pub fn terminate(&self, _exit_code: u32) -> bool {
+        pub fn terminate(&self, exit_code: u32) -> bool {
+            self.terminated.store(true, Ordering::SeqCst);
             let pid = self.pgid.load(Ordering::SeqCst);
             if pid > 0 {
-                // Send SIGTERM then SIGKILL to entire process group
+                // Send signal according to exit_code then SIGKILL to entire process group
                 unsafe {
                     #[cfg(unix)]
                     {
-                        libc::kill(-pid, libc::SIGTERM);
+                        let sig = match exit_code {
+                            130 => libc::SIGINT,
+                            143 => libc::SIGTERM,
+                            _ => libc::SIGTERM,
+                        };
+                        libc::kill(-pid, sig);
                         libc::kill(-pid, libc::SIGKILL) == 0
                     }
                     #[cfg(not(unix))]
@@ -192,7 +207,9 @@ pub mod process_guard {
 
     impl Drop for ProcessTreeGuard {
         fn drop(&mut self) {
-            let _ = self.terminate(1);
+            if !self.terminated.load(Ordering::SeqCst) {
+                let _ = self.terminate(1);
+            }
         }
     }
 
@@ -231,6 +248,37 @@ pub struct LifecycleOptions {
     pub init_cwd: PathBuf,
     pub ignore_scripts: bool,
     pub capture_output: bool,
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl Default for LifecycleOptions {
+    fn default() -> Self {
+        Self {
+            root_dir: PathBuf::new(),
+            init_cwd: PathBuf::new(),
+            ignore_scripts: false,
+            capture_output: true,
+            timeout: None,
+        }
+    }
+}
+
+impl LifecycleOptions {
+    pub fn new(root_dir: impl Into<PathBuf>) -> Self {
+        let root = root_dir.into();
+        Self {
+            init_cwd: root.clone(),
+            root_dir: root,
+            ignore_scripts: false,
+            capture_output: true,
+            timeout: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
 }
 
 /// Context for running a lifecycle script per docs/lifecycle-contract.md.
@@ -245,6 +293,7 @@ pub struct LifecycleContext {
     pub node_execpath: Option<PathBuf>,
     pub npm_execpath: Option<PathBuf>,
     pub extra_env: HashMap<String, String>,
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl LifecycleContext {
@@ -265,13 +314,46 @@ impl LifecycleContext {
             node_execpath: None,
             npm_execpath: None,
             extra_env: HashMap::new(),
+            timeout: None,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
 /// Scrub sensitive authentication tokens and credentials from environment map.
 pub fn is_sensitive_credential_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
+
+    // Specific credential keys requested for hardening
+    if lower.contains("aws_access_key_id")
+        || lower.contains("aws_secret_access_key")
+        || lower.contains("aws_session_token")
+        || lower.contains("ssh_auth_sock")
+        || lower.contains("jwt")
+        || lower.contains("deploy_key")
+        || lower.contains("deploykey")
+        || lower.contains("signing_key")
+        || lower.contains("signingkey")
+        || lower.contains("encryption_key")
+        || lower.contains("encryptionkey")
+        || lower.contains("secret_key")
+        || lower.contains("secretkey")
+    {
+        return true;
+    }
+
+    // Token prefixes
+    if lower.starts_with("ghp_")
+        || lower.contains("ghp_")
+        || lower.starts_with("github_pat_")
+        || lower.contains("github_pat_")
+    {
+        return true;
+    }
 
     if lower.contains("authtoken")
         || lower.contains("password")
@@ -325,8 +407,29 @@ pub fn scrub_text(text: &str) -> String {
     // 2. Redact npm tokens: npm_[A-Za-z0-9_-]{32,}
     result = replace_npm_tokens(&result);
 
-    // 3. Redact :_authToken=<val> and other key-value credentials
-    for key in &["_authtoken", "_authToken", "authtoken", "password", "secret", "token", "_auth"] {
+    // 3. Redact GitHub personal access tokens: ghp_ and github_pat_
+    result = replace_token_prefix(&result, "ghp_", 10);
+    result = replace_token_prefix(&result, "github_pat_", 10);
+
+    // 4. Redact :_authToken=<val> and other key-value credentials
+    for key in &[
+        "aws_secret_access_key",
+        "aws_access_key_id",
+        "ssh_auth_sock",
+        "encryption_key",
+        "signing_key",
+        "deploy_key",
+        "secret_key",
+        "_authtoken",
+        "_authToken",
+        "authtoken",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "_auth",
+        "jwt",
+    ] {
         result = replace_kv_pairs(&result, key);
     }
 
@@ -376,6 +479,30 @@ fn replace_npm_tokens(text: &str) -> String {
     out
 }
 
+fn replace_token_prefix(text: &str, prefix: &str, min_len: usize) -> String {
+    let mut out = String::new();
+    let lower = text.to_ascii_lowercase();
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut last_idx = 0;
+
+    for (idx, _) in lower.match_indices(&prefix_lower) {
+        if idx < last_idx {
+            continue;
+        }
+        let remainder = &text[idx + prefix.len()..];
+        let end_token = remainder
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .unwrap_or(remainder.len());
+        if end_token >= min_len {
+            out.push_str(&text[last_idx..idx]);
+            out.push_str(&format!("{prefix}[REDACTED]"));
+            last_idx = idx + prefix.len() + end_token;
+        }
+    }
+    out.push_str(&text[last_idx..]);
+    out
+}
+
 fn replace_kv_pairs(text: &str, key_name: &str) -> String {
     let mut out = String::new();
     let lower = text.to_ascii_lowercase();
@@ -386,11 +513,17 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
         if idx < last_idx {
             continue;
         }
+        if idx > 0 && !key_name.starts_with('_') && !key_name.starts_with(':') {
+            let prev = text[..idx].chars().next_back().unwrap();
+            if prev.is_ascii_alphanumeric() || prev == '_' {
+                continue;
+            }
+        }
         let key_len = pattern.len();
         out.push_str(&text[last_idx..idx + key_len]);
         let remainder = &text[idx + key_len..];
         let end_token = remainder
-            .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '"' || c == '\'' || c == '\n' || c == '\r')
+            .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ',')
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + key_len + end_token;
@@ -578,8 +711,40 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         g.assign_process(child.id());
     }
 
-    let status = child.wait()
-        .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?;
+    let status = if let Some(timeout) = ctx.timeout {
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_millis(10);
+        loop {
+            match child.try_wait().with_context(|| {
+                format!("Failed to poll lifecycle script for {}", ctx.package_name)
+            })? {
+                Some(status) => break status,
+                None => {
+                    if start.elapsed() >= timeout {
+                        warn!(
+                            "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
+                            ctx.event, timeout, ctx.package_name
+                        );
+                        if let Some(ref g) = guard {
+                            g.terminate(124);
+                        }
+                        let _ = child.kill();
+                        return Err(anyhow::Error::from(ScriptExitError {
+                            exit_code: 124,
+                            message: format!(
+                                "Lifecycle script '{}' timed out after {:?}",
+                                ctx.event, timeout
+                            ),
+                        }));
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+            }
+        }
+    } else {
+        child.wait()
+            .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?
+    };
 
     if !status.success() {
         warn!(
@@ -684,6 +849,15 @@ where
         (child, res)
     });
 
+    let timeout_fut = async {
+        if let Some(timeout) = ctx.timeout {
+            tokio::time::sleep(timeout).await;
+            true
+        } else {
+            std::future::pending::<bool>().await
+        }
+    };
+
     let signal_fut = async {
         #[cfg(unix)]
         {
@@ -714,6 +888,18 @@ where
                 .map_err(|e| anyhow::anyhow!("Lifecycle execution task for {pkg_name} interrupted: {e}"))?;
             wait_res
         }
+        _ = timeout_fut => {
+            warn!("Lifecycle script '{}' timed out after {:?}; terminating process tree for {pkg_name}", ctx.event, ctx.timeout.unwrap_or_default());
+            if let Some(ref g) = *guard_clone {
+                g.terminate(124);
+            }
+            cancel_guard.completed = true;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            return Err(anyhow::Error::from(ScriptExitError {
+                exit_code: 124,
+                message: format!("Lifecycle script '{}' timed out after {:?}", ctx.event, ctx.timeout.unwrap_or_default()),
+            }));
+        }
         sig = signal_fut => {
             warn!("Received {sig}; terminating lifecycle process tree for {pkg_name}");
             let exit_code = if sig == "SIGINT" { 130 } else { 143 };
@@ -721,7 +907,11 @@ where
                 g.terminate(exit_code);
             }
             cancel_guard.completed = true;
-            return Err(anyhow::anyhow!("Lifecycle execution for {pkg_name} terminated by {sig}"));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            return Err(anyhow::Error::from(ScriptExitError {
+                exit_code: exit_code as i32,
+                message: format!("Lifecycle execution for {pkg_name} terminated by {sig}"),
+            }));
         }
         _ = abort_fut => {
             warn!("Abort signal triggered; terminating lifecycle process tree for {pkg_name}");
@@ -729,7 +919,11 @@ where
                 g.terminate(143);
             }
             cancel_guard.completed = true;
-            return Err(anyhow::anyhow!("Lifecycle execution for {pkg_name} aborted by signal"));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            return Err(anyhow::Error::from(ScriptExitError {
+                exit_code: 143,
+                message: format!("Lifecycle execution for {pkg_name} aborted by signal"),
+            }));
         }
     };
 
@@ -789,6 +983,16 @@ pub fn extract_exit_status_code(status: &ExitStatus) -> i32 {
     #[cfg(not(unix))]
     {
         status.code().unwrap_or(1)
+    }
+}
+
+/// Extracts the exit code from an anyhow::Error if it originated from a ScriptExitError,
+/// defaulting to 1 otherwise.
+pub fn extract_error_exit_code(err: &anyhow::Error) -> i32 {
+    if let Some(script_err) = err.downcast_ref::<ScriptExitError>() {
+        script_err.exit_code
+    } else {
+        1
     }
 }
 
@@ -1269,7 +1473,11 @@ where
                 g.terminate(exit_code);
             }
             cancel_guard.completed = true;
-            return Err(anyhow::anyhow!("Process execution for {bin_display} terminated by {sig}"));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            return Err(anyhow::Error::from(ScriptExitError {
+                exit_code: exit_code as i32,
+                message: format!("Process execution for {bin_display} terminated by {sig}"),
+            }));
         }
         _ = abort_fut => {
             warn!("Abort signal triggered; terminating process tree for {bin_display}");
@@ -1277,7 +1485,11 @@ where
                 g.terminate(143);
             }
             cancel_guard.completed = true;
-            return Err(anyhow::anyhow!("Process execution for {bin_display} aborted by signal"));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            return Err(anyhow::Error::from(ScriptExitError {
+                exit_code: 143,
+                message: format!("Process execution for {bin_display} aborted by signal"),
+            }));
         }
     };
 
@@ -1395,6 +1607,7 @@ pub async fn execute_topological_with_abort(
                     script_cmd,
                 );
                 ctx.package_version = node.manifest.version.clone();
+                ctx.timeout = opts.timeout;
 
                 let abort_fut = {
                     let mut rx_opt = abort_rx.clone();
@@ -1477,6 +1690,7 @@ pub async fn execute_topological_with_abort(
                 script_cmd,
             );
             ctx.package_version = root_manifest.version.clone();
+            ctx.timeout = opts.timeout;
 
             let abort_fut = {
                 let mut rx_opt = abort_rx.clone();
