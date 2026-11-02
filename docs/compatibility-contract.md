@@ -20,12 +20,36 @@
 - `update`: Fetch latest versions matching declared semver ranges for registry dependencies.
 - `pack`: Package project files into a canonical npm-compatible `.tgz` archive.
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints, generating structured JSON / human-readable reports, and enforcing `--audit-level` exit thresholds.
+- `exec` / `npx`: Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces.
+- `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
+
+### Supported Protocol Surface
+- **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
+- **Local Directories (`file:../dir`):** Linked via unprivileged directory junctions (Windows) or symlinks (Unix).
+- **Local Archives (`file:./pkg.tgz`):** In-memory manifest extraction, streaming unpacking, and SSRI sha512 integrity generation.
+- **Workspaces (`workspace:*`, `workspace:^`, `workspace:~`):** Multi-tier workspace DAGs, cross-package linking, and topological script execution.
+- **Git Dependencies (`github:user/repo`, `gitlab:`, `bitbucket:`, `git+https://`, `git+ssh://`, `git://`, `git+file://`):** Remote repositories with optional commit-ish / tag specs.
+- **Direct HTTP/HTTPS Tarball URLs (`https://.../pkg-1.0.0.tgz`):** Direct remote tarball archives with cross-origin credential protection.
+
+### Unsupported Protocols (Gate E)
+Protocols outside the supported surface (e.g., `ftp://`, `svn://`, `sftp://`, `hg+https://`, `cvs://`, `telnet://`) are strictly rejected with exit code `1` and structured npm-compatible diagnostic:
+```text
+npm error code EUNSUPPORTEDPROTOCOL
+npm error Unsupported URL Type "<protocol>": <spec>
+```
+Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
+
+### Unsupported Flags Handling (Gate E)
+Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--package-lock-only`, `--save-bundle`, `--save-exact`, `--omit=dev`, `--omit=optional`, `--omit=peer`) terminate immediately with exit code `1` and a structured diagnostic:
+```text
+npm error code ERR_UNSUPPORTED_FLAG
+npm error The flag '<flag>' is not supported by rnpm.
+npm error See docs/compatibility-contract.md for supported options.
+```
 
 ### Unsupported & Deferred Commands
-- `publish`, `adduser`, `login`, `token`, `team`: Account and package publishing.
-- `exec`, `npx`: Dynamic ephemeral package downloads and execution.
+- `publish`, `adduser`, `login`, `logout`, `token`, `team`: Account and package publishing.
 - `fix`: Vulnerability automated remediation.
-- Git / Hosted Tarball protocols (`git+ssh://`, `github:user/repo`).
 - Writing legacy lockfile formats (v1 or v2).
 
 ### Unsupported Command Handling (DEC-004)

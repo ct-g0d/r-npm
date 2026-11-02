@@ -1,0 +1,9 @@
+{
+  "name": "gate-e-unsupported-protocol",
+  "version": "1.0.0",
+  "description": "Regression fixture verifying that unsupported protocols exit with structured EUNSUPPORTEDPROTOCOL error",
+  "private": true,
+  "dependencies": {
+    "unsupported-dep": "ftp://example.com/unsupported-pkg-1.0.0.tgz"
+  }
+}

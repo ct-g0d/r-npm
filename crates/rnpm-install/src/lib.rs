@@ -10,6 +10,7 @@ use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
+use rnpm_core::spec::PackageTarget;
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
 use std::sync::Arc;
 use rnpm_fs::atomic::extract_and_replace;
@@ -1428,6 +1429,7 @@ impl Installer {
         range_str: &str,
         is_optional: bool,
     ) -> Result<ResolvedNode> {
+        let _parsed_target = PackageTarget::parse(range_str)?;
         if let Some(file_spec) = range_str.strip_prefix("file:") {
             let file_spec_clean = file_spec.trim();
             let rel_path = PathBuf::from(file_spec_clean);
