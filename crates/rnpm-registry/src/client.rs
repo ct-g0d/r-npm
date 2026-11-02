@@ -2,7 +2,7 @@ use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Client, Method, Response, StatusCode};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -25,16 +25,78 @@ pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 /// Maximum number of HTTP redirects to follow before failing.
 pub const MAX_REDIRECTS: usize = 10;
 
+/// Helper to percent-encode a URI component (RFC 3986 unreserved characters).
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{:02x}", b);
+            }
+        }
+    }
+    out
+}
+
 /// Encodes a package name according to npm registry rules:
-/// Scoped packages `@scope/pkg` are encoded as `@scope%2fpkg`.
-/// Unscoped packages `pkg` remain unchanged.
+/// Scoped packages `@scope/pkg` are encoded as `@<encoded_scope>%2f<encoded_pkg>`.
+/// Unscoped packages `pkg` have special characters safely percent-encoded.
 pub fn encode_package_name(name: &str) -> String {
     if let Some(rest) = name.strip_prefix('@') {
         if let Some((scope, pkg)) = rest.split_once('/') {
-            return format!("@{scope}%2f{pkg}");
+            let enc_scope = percent_encode_component(scope);
+            let enc_pkg = if pkg.contains('/') {
+                pkg.split('/')
+                    .map(percent_encode_component)
+                    .collect::<Vec<_>>()
+                    .join("%2f")
+            } else {
+                percent_encode_component(pkg)
+            };
+            return format!("@{enc_scope}%2f{enc_pkg}");
         }
     }
-    name.to_string()
+    percent_encode_component(name)
+}
+
+/// Validates a package name against malicious patterns such as path traversal (`..`),
+/// backslashes, empty names, and illegal control characters.
+pub fn validate_package_name(name: &str) -> Result<(), RegistryError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(RegistryError::SecurityViolation(
+            "Package name cannot be empty".to_string(),
+        ));
+    }
+
+    if trimmed.contains('\0')
+        || trimmed.contains('\\')
+        || trimmed.contains('\r')
+        || trimmed.contains('\n')
+    {
+        return Err(RegistryError::SecurityViolation(format!(
+            "Package name contains illegal control or escape characters: '{trimmed}'"
+        )));
+    }
+
+    let unverified = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    for segment in unverified.split('/') {
+        if segment == "."
+            || segment == ".."
+            || segment.eq_ignore_ascii_case("%2e")
+            || segment.eq_ignore_ascii_case("%2e%2e")
+        {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Package name contains forbidden path traversal component: '{name}'"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Default maximum concurrent requests allowed across the client.
@@ -55,6 +117,8 @@ pub struct RegistryClientConfig {
     pub default_registry: Url,
     pub user_agent: String,
     pub auth_token: Option<String>,
+    pub auth_tokens: BTreeMap<String, String>,
+    pub scoped_registries: BTreeMap<String, Url>,
     pub trusted_hosts: HashSet<String>,
     pub timeout: Duration,
     pub max_concurrent_requests: usize,
@@ -75,6 +139,8 @@ impl Default for RegistryClientConfig {
             default_registry: registry_url,
             user_agent: default_user_agent(),
             auth_token: None,
+            auth_tokens: BTreeMap::new(),
+            scoped_registries: BTreeMap::new(),
             trusted_hosts,
             timeout: Duration::from_secs(30),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
@@ -150,9 +216,29 @@ impl RegistryClient {
         &self.semaphore
     }
 
-    /// Format the metadata URL for a package name.
+    /// Determine which registry to use for a package (scoped registry if configured, otherwise default).
+    pub fn registry_for_package(&self, package_name: &str) -> &Url {
+        let trimmed = package_name.trim();
+        if trimmed.starts_with('@') {
+            let scope_part = if let Some(slash_idx) = trimmed.find('/') {
+                &trimmed[..slash_idx]
+            } else if let Some(enc_idx) = trimmed.to_ascii_lowercase().find("%2f") {
+                &trimmed[..enc_idx]
+            } else {
+                trimmed
+            };
+            let scope_lower = scope_part.to_ascii_lowercase();
+            if let Some(url) = self.config.scoped_registries.get(&scope_lower) {
+                return url;
+            }
+        }
+        &self.config.default_registry
+    }
+
+    /// Format the metadata URL for a package name, respecting scoped package precedence.
     pub fn package_metadata_url(&self, package_name: &str) -> Result<Url, RegistryError> {
-        self.package_metadata_url_on(&self.config.default_registry, package_name)
+        let registry = self.registry_for_package(package_name);
+        self.package_metadata_url_on(registry, package_name)
     }
 
     /// Format the metadata URL for a package name on a specific registry.
@@ -161,14 +247,131 @@ impl RegistryClient {
         registry: &Url,
         package_name: &str,
     ) -> Result<Url, RegistryError> {
+        validate_package_name(package_name)?;
         let encoded = encode_package_name(package_name);
         let base_str = registry.as_str().trim_end_matches('/');
         let url_str = format!("{base_str}/{encoded}");
         Url::parse(&url_str).map_err(RegistryError::UrlParse)
     }
 
+    /// Retrieve the auth token applicable to the target URL.
+    pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
+        // 1. Check url-specific tokens in auth_tokens map (e.g. "//registry.npmjs.org/")
+        if !self.config.auth_tokens.is_empty() {
+            if let Some(host) = url.host_str() {
+                let host_lower = host.to_ascii_lowercase();
+                let port_part = if let Some(port) = url.port() {
+                    format!(":{port}")
+                } else {
+                    String::new()
+                };
+
+                let path = url.path();
+                let normalized_path = if path.ends_with('/') {
+                    path.to_string()
+                } else {
+                    format!("{path}/")
+                };
+
+                // Exact match "//host:port/path/"
+                let key1 = format!("//{host_lower}{port_part}{normalized_path}");
+                if let Some(tok) = self.config.auth_tokens.get(&key1) {
+                    return Some(tok.as_str());
+                }
+
+                // Root match "//host:port/"
+                let key2 = format!("//{host_lower}{port_part}/");
+                if let Some(tok) = self.config.auth_tokens.get(&key2) {
+                    return Some(tok.as_str());
+                }
+
+                // Root match without port "//host/"
+                if !port_part.is_empty() {
+                    let key3 = format!("//{host_lower}/");
+                    if let Some(tok) = self.config.auth_tokens.get(&key3) {
+                        return Some(tok.as_str());
+                    }
+                }
+            }
+        }
+
+        // 2. Fall back to config.auth_token
+        self.config.auth_token.as_deref()
+    }
+
     /// Check if target URL is trusted to receive authorization headers.
     pub fn is_trusted_target(&self, initial_url: &Url, current_url: &Url) -> bool {
+        // Disallow any non-HTTP(S) schemes
+        if current_url.scheme() != "https" && current_url.scheme() != "http" {
+            return false;
+        }
+
+        // Never allow scheme downgrade (HTTPS -> HTTP)
+        if initial_url.scheme() == "https" && current_url.scheme() == "http" {
+            return false;
+        }
+
+        let is_host_trusted = |url: &Url| -> bool {
+            // Check default_registry origin match
+            let matches_default = url.scheme() == self.config.default_registry.scheme()
+                && url.host_str().map(|s| s.to_ascii_lowercase())
+                    == self.config.default_registry.host_str().map(|s| s.to_ascii_lowercase())
+                && url.port_or_known_default() == self.config.default_registry.port_or_known_default();
+
+            if matches_default {
+                return true;
+            }
+
+            // Check configured scoped registries
+            for (_, scoped_url) in &self.config.scoped_registries {
+                let matches_scoped = url.scheme() == scoped_url.scheme()
+                    && url.host_str().map(|s| s.to_ascii_lowercase())
+                        == scoped_url.host_str().map(|s| s.to_ascii_lowercase())
+                    && url.port_or_known_default() == scoped_url.port_or_known_default();
+                if matches_scoped {
+                    return true;
+                }
+            }
+
+            // Check trusted_hosts list
+            if let Some(host) = url.host_str() {
+                let host_lower = host.to_ascii_lowercase();
+                if self.config.trusted_hosts.contains(&host_lower) {
+                    return true;
+                }
+                if let Some(port) = url.port_or_known_default() {
+                    if self.config.trusted_hosts.contains(&format!("{host_lower}:{port}")) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check auth_tokens map
+            if !self.config.auth_tokens.is_empty() {
+                if let Some(host) = url.host_str() {
+                    let host_lower = host.to_ascii_lowercase();
+                    let port_part = if let Some(port) = url.port() {
+                        format!(":{port}")
+                    } else {
+                        String::new()
+                    };
+                    if self.config.auth_tokens.contains_key(&format!("//{host_lower}{port_part}/"))
+                        || self.config.auth_tokens.contains_key(&format!("//{host_lower}/"))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
+
+        // If the initial URL itself is not from a trusted source, do not send credentials.
+        if !is_host_trusted(initial_url) {
+            return false;
+        }
+
+        // Same origin check between initial_url and current_url
         let same_origin = initial_url.scheme() == current_url.scheme()
             && initial_url.host_str().map(|s| s.to_ascii_lowercase())
                 == current_url.host_str().map(|s| s.to_ascii_lowercase())
@@ -178,26 +381,15 @@ impl RegistryClient {
             return true;
         }
 
-        if let Some(host) = current_url.host_str() {
-            let host_lower = host.to_ascii_lowercase();
-            if self.config.trusted_hosts.contains(&host_lower) {
-                return true;
-            }
-            if let Some(port) = current_url.port_or_known_default() {
-                if self.config.trusted_hosts.contains(&format!("{host_lower}:{port}")) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        // If cross-origin / cross-host redirect, current_url must ALSO be individually trusted.
+        is_host_trusted(current_url)
     }
 
     /// Execute a request following redirects manually and enforcing the security rule:
     /// Never forward auth headers across redirects to untrusted hostnames.
     pub async fn execute_with_security_policy(
         &self,
-        method: Method,
+        mut method: Method,
         initial_url: Url,
         accept_header: Option<&str>,
     ) -> Result<Response, RegistryError> {
@@ -208,6 +400,7 @@ impl RegistryClient {
             .map_err(|e| RegistryError::Other(e.to_string()))?;
 
         let mut current_url = initial_url.clone();
+        let mut credentials_stripped = false;
 
         for _redirect_count in 0..MAX_REDIRECTS {
             let mut req = self.client.request(method.clone(), current_url.clone());
@@ -217,13 +410,15 @@ impl RegistryClient {
             }
 
             // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts)
-            let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
+            let should_send_auth =
+                !credentials_stripped && self.is_trusted_target(&initial_url, &current_url);
 
             if should_send_auth {
-                if let Some(token) = &self.config.auth_token {
+                if let Some(token) = self.auth_token_for_url(&current_url) {
                     req = req.header(AUTHORIZATION, format!("Bearer {token}"));
                 }
             } else {
+                credentials_stripped = true;
                 debug!(
                     "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
                     initial_url, current_url
@@ -241,6 +436,21 @@ impl RegistryClient {
                         )
                     })?;
                     let next_url = current_url.join(loc_str)?;
+
+                    let next_scheme = next_url.scheme();
+                    if next_scheme != "http" && next_scheme != "https" {
+                        return Err(RegistryError::SecurityViolation(format!(
+                            "Disallowed redirect scheme '{next_scheme}' in Location header"
+                        )));
+                    }
+
+                    if status == StatusCode::SEE_OTHER
+                        || ((status == StatusCode::MOVED_PERMANENTLY || status == StatusCode::FOUND)
+                            && method == Method::POST)
+                    {
+                        method = Method::GET;
+                    }
+
                     debug!("Following redirect {} -> {}", current_url, next_url);
                     current_url = next_url;
                     continue;
@@ -518,6 +728,30 @@ mod tests {
         assert_eq!(encode_package_name("@scope/pkg"), "@scope%2fpkg");
         assert_eq!(encode_package_name("@npmcli/arborist"), "@npmcli%2farborist");
         assert_eq!(encode_package_name("my-package-123"), "my-package-123");
+        // Special characters and nested slashes
+        assert_eq!(encode_package_name("@scope/nested/pkg"), "@scope%2fnested%2fpkg");
+        assert_eq!(encode_package_name("@scope/foo bar"), "@scope%2ffoo%20bar");
+        assert_eq!(encode_package_name("foo?query=1"), "foo%3fquery%3d1");
+        assert_eq!(encode_package_name("foo#fragment"), "foo%23fragment");
+    }
+
+    #[test]
+    fn test_validate_package_name() {
+        // Valid names
+        assert!(validate_package_name("lodash").is_ok());
+        assert!(validate_package_name("@scope/pkg").is_ok());
+        assert!(validate_package_name("my-pkg-1.0").is_ok());
+
+        // Malicious path traversal
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("..").is_err());
+        assert!(validate_package_name("../foo").is_err());
+        assert!(validate_package_name("@scope/../../passwd").is_err());
+        assert!(validate_package_name("@../foo").is_err());
+        assert!(validate_package_name("foo/../bar").is_err());
+        assert!(validate_package_name("foo\\bar").is_err());
+        assert!(validate_package_name("foo\0bar").is_err());
+        assert!(validate_package_name("foo\nbar").is_err());
     }
 
     #[test]
@@ -531,5 +765,74 @@ mod tests {
             scoped_url.as_str(),
             "https://registry.npmjs.org/@scope%2fpkg"
         );
+
+        // Path traversal should be rejected
+        assert!(client.package_metadata_url("../evil").is_err());
+        assert!(client.package_metadata_url("@scope/../../passwd").is_err());
+    }
+
+    #[test]
+    fn test_scoped_registry_routing() {
+        let mut config = RegistryClientConfig::default();
+        config.scoped_registries.insert(
+            "@myorg".to_string(),
+            Url::parse("https://npm.pkg.github.com/").unwrap(),
+        );
+
+        let client = RegistryClient::with_config(config).unwrap();
+
+        // Scoped package routes to github pkg registry
+        let scoped_url = client.package_metadata_url("@myorg/widget").unwrap();
+        assert_eq!(
+            scoped_url.as_str(),
+            "https://npm.pkg.github.com/@myorg%2fwidget"
+        );
+
+        // Unscoped package routes to default registry
+        let unscoped_url = client.package_metadata_url("express").unwrap();
+        assert_eq!(
+            unscoped_url.as_str(),
+            "https://registry.npmjs.org/express"
+        );
+    }
+
+    #[test]
+    fn test_is_trusted_target_security_rules() {
+        let mut config = RegistryClientConfig::default();
+        config.trusted_hosts.insert("registry.npmjs.org".to_string());
+        config.trusted_hosts.insert("custom.corp.net".to_string());
+        let client = RegistryClient::with_config(config).unwrap();
+
+        let initial_https = Url::parse("https://registry.npmjs.org/is-odd").unwrap();
+        let same_origin = Url::parse("https://registry.npmjs.org/tarball.tgz").unwrap();
+        let diff_path = Url::parse("https://registry.npmjs.org/other").unwrap();
+
+        // Same origin: trusted
+        assert!(client.is_trusted_target(&initial_https, &same_origin));
+        assert!(client.is_trusted_target(&initial_https, &diff_path));
+
+        // Downgrade HTTPS -> HTTP on same host: MUST NOT BE TRUSTED
+        let downgrade_http = Url::parse("http://registry.npmjs.org/tarball.tgz").unwrap();
+        assert!(!client.is_trusted_target(&initial_https, &downgrade_http));
+
+        // Cross-host to another trusted host with HTTPS: trusted
+        let other_trusted = Url::parse("https://custom.corp.net/tarball.tgz").unwrap();
+        assert!(client.is_trusted_target(&initial_https, &other_trusted));
+
+        // Cross-host to another trusted host with HTTP (not loopback): NOT trusted
+        let other_trusted_http = Url::parse("http://custom.corp.net/tarball.tgz").unwrap();
+        assert!(!client.is_trusted_target(&initial_https, &other_trusted_http));
+
+        // Cross-host to untrusted CDN: MUST NOT BE TRUSTED
+        let untrusted_cdn = Url::parse("https://cdn.attacker.com/tarball.tgz").unwrap();
+        assert!(!client.is_trusted_target(&initial_https, &untrusted_cdn));
+
+        // Disallowed schemes: MUST NOT BE TRUSTED
+        let file_url = Url::parse("file:///etc/passwd").unwrap();
+        assert!(!client.is_trusted_target(&initial_https, &file_url));
+
+        // Initial untrusted URL: MUST NOT send credentials
+        let initial_untrusted = Url::parse("https://evil.com/tarball.tgz").unwrap();
+        assert!(!client.is_trusted_target(&initial_untrusted, &initial_untrusted));
     }
 }

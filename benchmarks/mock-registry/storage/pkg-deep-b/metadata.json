@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-deep-b",
+  "name": "pkg-deep-b",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-b",
+      "version": "1.0.0",
+      "description": "Deep chain intermediate level 1",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-deep-c": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "15dea00b011b4cc16e752215c8321b077c1a18f1",
+        "integrity": "sha512-Kf5zxQu0fxCNCYYxO33Y2QIyb2eSM8Zxun216a/ypqo3EyPtklibGKykBtfkNDaONnqjxU2aa7Lqgnwp8jXLVQ==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-b/-/pkg-deep-b-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

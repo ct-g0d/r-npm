@@ -1,0 +1,27 @@
+{
+  "_id": "pkg-deep-a",
+  "name": "pkg-deep-a",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-deep-a",
+      "version": "1.0.0",
+      "description": "Root of deep chain for differential uninstall testing",
+      "main": "index.js",
+      "dependencies": {
+        "pkg-deep-b": "^1.0.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "8029002fdef64219fd9933547ecb940eef09a4d7",
+        "integrity": "sha512-nVsrgGDVkKtcOHENecYDLTSEUdPyrzH6zsCScJG7bE/htHQs15PVuBPzg3NBUgoN1mYm5fsmzvl/ekGVhKoH+w==",
+        "tarball": "http://127.0.0.1:4873/pkg-deep-a/-/pkg-deep-a-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

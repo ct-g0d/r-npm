@@ -483,3 +483,168 @@ async fn test_concurrent_metadata_and_tarball_fetching() {
 
     server.stop();
 }
+
+#[tokio::test]
+async fn test_security_auth_header_stripped_on_multi_hop_redirect() {
+    // CDN server that receives request from registry and redirects back
+    let cdn_server = MockHttpServer::start(|_req| {
+        (200, vec![], b"downloaded from cdn".to_vec())
+    })
+    .await;
+    let cdn_url = cdn_server.url();
+
+    // Registry server issuing redirect
+    let registry_server = MockHttpServer::start(move |req| {
+        if req.contains("GET /initial-tarball") {
+            assert!(
+                req.contains("authorization: Bearer secret-multi-token")
+                    || req.contains("Authorization: Bearer secret-multi-token"),
+                "Initial request must have auth"
+            );
+            (302, vec![("Location", cdn_url.to_string())], vec![])
+        } else {
+            (404, vec![], vec![])
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: registry_server.url(),
+        user_agent: "test-multihop".into(),
+        auth_token: Some("secret-multi-token".into()),
+        trusted_hosts: HashSet::new(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let initial_url = format!("{}initial-tarball", registry_server.url());
+    let bytes = client.download_tarball_bytes(&initial_url).await.unwrap();
+    assert_eq!(bytes, b"downloaded from cdn");
+
+    let cdn_reqs = cdn_server.received_requests.lock().await;
+    for req in cdn_reqs.iter() {
+        assert!(
+            !req.to_lowercase().contains("authorization"),
+            "CDN must not receive authorization header! Got: {req}"
+        );
+    }
+
+    registry_server.stop();
+    cdn_server.stop();
+}
+
+#[tokio::test]
+async fn test_security_disallowed_redirect_scheme() {
+    let registry_server = MockHttpServer::start(|req| {
+        if req.contains("GET /bad-redirect") {
+            (302, vec![("Location", "file:///etc/passwd".into())], vec![])
+        } else {
+            (404, vec![], vec![])
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: registry_server.url(),
+        user_agent: "test-scheme".into(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let err = client
+        .download_tarball_bytes(&format!("{}bad-redirect", registry_server.url()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, rnpm_registry::RegistryError::SecurityViolation(_)));
+    assert!(err.to_string().contains("Disallowed redirect scheme"));
+
+    registry_server.stop();
+}
+
+#[tokio::test]
+async fn test_security_auth_not_sent_to_untrusted_initial_url() {
+    let untrusted_server = MockHttpServer::start(|_req| {
+        (200, vec![], b"untrusted content".to_vec())
+    })
+    .await;
+
+    // Config default registry is npmjs.org, but we request from untrusted_server
+    let config = RegistryClientConfig {
+        default_registry: Url::parse("https://registry.npmjs.org/").unwrap(),
+        user_agent: "test-untrusted".into(),
+        auth_token: Some("secret-user-token".into()),
+        trusted_hosts: HashSet::new(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let bytes = client
+        .download_tarball_bytes(&format!("{}tarball.tgz", untrusted_server.url()))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"untrusted content");
+
+    let reqs = untrusted_server.received_requests.lock().await;
+    for req in reqs.iter() {
+        assert!(
+            !req.to_lowercase().contains("authorization"),
+            "Untrusted third-party server must NOT receive auth header! Got: {req}"
+        );
+    }
+
+    untrusted_server.stop();
+}
+
+#[tokio::test]
+async fn test_scoped_registry_routing_and_auth() {
+    let scoped_json = r#"{
+        "name": "@myorg/scoped-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {}
+    }"#;
+
+    let scoped_server = MockHttpServer::start(move |req| {
+        if req.contains("GET /@myorg%2fscoped-pkg") {
+            assert!(
+                req.to_lowercase().contains("authorization: bearer github-secret-token"),
+                "Scoped registry must receive scoped auth token: {req}"
+            );
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                scoped_json.as_bytes().to_vec(),
+            )
+        } else {
+            (404, vec![], vec![])
+        }
+    })
+    .await;
+
+    let mut auth_tokens = std::collections::BTreeMap::new();
+    let scoped_host = scoped_server.addr.to_string();
+    auth_tokens.insert(format!("//{scoped_host}/"), "github-secret-token".to_string());
+
+    let mut scoped_registries = std::collections::BTreeMap::new();
+    scoped_registries.insert("@myorg".to_string(), scoped_server.url());
+
+    let config = RegistryClientConfig {
+        default_registry: Url::parse("https://registry.npmjs.org/").unwrap(),
+        user_agent: "test-scoped".into(),
+        auth_token: Some("default-npm-token".into()),
+        auth_tokens,
+        scoped_registries,
+        trusted_hosts: HashSet::new(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata("@myorg/scoped-pkg").await.unwrap();
+    assert_eq!(meta.name, "@myorg/scoped-pkg");
+
+    scoped_server.stop();
+}

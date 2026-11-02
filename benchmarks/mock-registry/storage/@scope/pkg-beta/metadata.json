@@ -1,0 +1,25 @@
+{
+  "_id": "@scope/pkg-beta",
+  "name": "@scope/pkg-beta",
+  "dist-tags": {
+    "latest": "1.0.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "@scope/pkg-beta",
+      "version": "1.0.0",
+      "description": "Scoped package beta for differential mutation testing",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "c17ed9855b0c54ce3704f5b7f19d7de6e80ea983",
+        "integrity": "sha512-ySy+KVsVzsXEiSjNKSkksEWaOY8u+se26BBK9giGOe1rjpC4P8rHyXUkXVyslSKXulI9U25eWp2qRk0CuaDAuw==",
+        "tarball": "http://127.0.0.1:4873/@scope/pkg-beta/-/pkg-beta-1.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

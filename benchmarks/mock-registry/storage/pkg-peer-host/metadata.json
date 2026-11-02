@@ -1,0 +1,40 @@
+{
+  "_id": "pkg-peer-host",
+  "name": "pkg-peer-host",
+  "dist-tags": {
+    "latest": "1.1.0"
+  },
+  "versions": {
+    "1.0.0": {
+      "name": "pkg-peer-host",
+      "version": "1.0.0",
+      "description": "Peer host package v1.0.0",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "5065bb78dc934ba605d1c6498ef77dd5dd11c431",
+        "integrity": "sha512-WWtw8dsy9VcvGVukGtnYZMSISWkcS3RD/kcGTKCa/tZK0dvVS919C+oTVoRozOsVTtc+pk4moMNbxqHOBPyj1g==",
+        "tarball": "http://127.0.0.1:4873/pkg-peer-host/-/pkg-peer-host-1.0.0.tgz"
+      }
+    },
+    "1.1.0": {
+      "name": "pkg-peer-host",
+      "version": "1.1.0",
+      "description": "Peer host package updated v1.1.0",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "c0bbbf0e704a4f68fb086697697773c4281c220e",
+        "integrity": "sha512-ARfNMDrNeqIM/oWa9L1jmtZzLgXQmw13oH8fiMsaSx0kc0AVxekjRyj/wo3ekXruBWBkgdcoqkNjRMQNCiFHig==",
+        "tarball": "http://127.0.0.1:4873/pkg-peer-host/-/pkg-peer-host-1.1.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}
