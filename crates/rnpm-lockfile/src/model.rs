@@ -89,6 +89,10 @@ pub struct LockfilePackage {
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspaces: Option<Vec<String>>,
+
+    /// Preserved hidden-tree metadata or arbitrary package properties.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// npm `package-lock.json` lockfile version 3 document.
@@ -161,11 +165,85 @@ impl LockfileV3 {
         self.packages.get_mut("")
     }
 
+    /// Standard relative path to the hidden lockfile inside `node_modules`.
+    pub const HIDDEN_LOCKFILE_PATH: &'static str = "node_modules/.package-lock.json";
+
+    /// Checks if this lockfile v3 matches the given package.json manifest.
+    /// Returns true if all direct dependencies in the manifest match the root package descriptor
+    /// and every required package exists in the lockfile `packages` map.
+    pub fn matches_manifest(&self, manifest: &rnpm_core::manifest::Manifest, include_dev: bool) -> bool {
+        let Some(root_pkg) = self.root_package() else {
+            return false;
+        };
+
+        // 1. Check dependencies
+        if !Self::map_matches(&manifest.dependencies, &root_pkg.dependencies) {
+            return false;
+        }
+
+        // 2. Check devDependencies
+        if include_dev {
+            if !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies) {
+                return false;
+            }
+        }
+
+        // 3. Check optionalDependencies
+        if !Self::map_matches(&manifest.optional_dependencies, &root_pkg.optional_dependencies) {
+            return false;
+        }
+
+        // 4. Check peerDependencies
+        if !Self::map_matches(&manifest.peer_dependencies, &root_pkg.peer_dependencies) {
+            return false;
+        }
+
+        // 5. Verify direct dependencies exist in packages map
+        for dep in manifest.dependencies.keys() {
+            let key = format!("node_modules/{dep}");
+            if !self.packages.contains_key(&key) {
+                return false;
+            }
+        }
+
+        if include_dev {
+            for dep in manifest.dev_dependencies.keys() {
+                let key = format!("node_modules/{dep}");
+                if !self.packages.contains_key(&key) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn map_matches(
+        manifest_map: &std::collections::BTreeMap<String, String>,
+        lock_map: &Option<std::collections::BTreeMap<String, String>>,
+    ) -> bool {
+        if manifest_map.is_empty() {
+            lock_map.as_ref().map(|m| m.is_empty()).unwrap_or(true)
+        } else {
+            lock_map.as_ref().map(|m| m == manifest_map).unwrap_or(false)
+        }
+    }
+
     /// Deterministic serialization to formatted JSON string (2-space indent, trailing newline).
+    /// Guarantees strict LF line endings and normalized POSIX forward-slash package keys.
     pub fn to_json_string(&self) -> Result<String, LockfileError> {
-        let mut json = serde_json::to_string_pretty(self)?;
-        json.push('\n');
-        Ok(json)
+        let mut normalized_packages = BTreeMap::new();
+        for (k, v) in &self.packages {
+            normalized_packages.insert(to_posix_path(k), v.clone());
+        }
+        let mut copy = self.clone();
+        copy.packages = normalized_packages;
+        let json = serde_json::to_string_pretty(&copy)?;
+        let mut lf_json = json.replace("\r\n", "\n");
+        if !lf_json.ends_with('\n') {
+            lf_json.push('\n');
+        }
+        Ok(lf_json)
     }
 
     /// Save the lockfile deterministically to disk.
@@ -178,9 +256,13 @@ impl LockfileV3 {
         Ok(())
     }
 
-    /// Load and parse a v3 lockfile from a string.
+    /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
-        let lockfile: Self = serde_json::from_str(s)?;
+        let mut lockfile: Self = serde_json::from_str(s)?;
+        let packages = std::mem::take(&mut lockfile.packages);
+        for (k, v) in packages {
+            lockfile.packages.insert(to_posix_path(&k), v);
+        }
         Ok(lockfile)
     }
 
@@ -188,5 +270,17 @@ impl LockfileV3 {
     pub fn load_from_file(path: &Path) -> Result<Self, LockfileError> {
         let content = fs::read_to_string(path)?;
         Self::from_json_str(&content)
+    }
+
+    /// Load the hidden lockfile from `<project_dir>/node_modules/.package-lock.json`.
+    pub fn load_hidden(project_dir: &Path) -> Result<Self, LockfileError> {
+        let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
+        Self::load_from_file(&hidden_path)
+    }
+
+    /// Save this lockfile as the hidden lockfile at `<project_dir>/node_modules/.package-lock.json`.
+    pub fn save_hidden(&self, project_dir: &Path) -> Result<(), LockfileError> {
+        let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
+        self.save_to_file(&hidden_path)
     }
 }

@@ -19,7 +19,10 @@ pub use error::SolverError;
 pub use graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
 pub use overrides::Overrides;
 pub use platform::Platform;
-pub use solver::{resolve_dependency_graph, ResolverOptions, Solver};
+pub use solver::{
+    resolve_dependency_graph, resolve_dependency_graph_with_lockfile, resolve_fast_path,
+    ResolverOptions, Solver,
+};
 pub use types::{
     InMemoryPackageProvider, PackageMetadata, PackageMetadataProvider, PackageVersionMetadata,
 };

@@ -1,4 +1,4 @@
-﻿use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use crate::platform::Platform;
 use crate::solver::{resolve_dependency_graph, ResolverOptions};
@@ -922,4 +922,157 @@ fn test_workspace_disconnected_components() {
     let pos_b = order.iter().position(|x| x == "comp1-b").unwrap();
     let pos_a = order.iter().position(|x| x == "comp1-a").unwrap();
     assert!(pos_b < pos_a);
+}
+
+#[test]
+fn test_fast_path_resolution_matching_lockfile() {
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+    use crate::solver::{resolve_dependency_graph_with_lockfile, resolve_fast_path};
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("fast-app".to_string());
+    manifest.dependencies.insert("chalk".to_string(), "^5.0.0".to_string());
+    manifest.dev_dependencies.insert("typescript".to_string(), "^5.0.0".to_string());
+
+    let mut lockfile = LockfileV3::new("fast-app", Some("1.0.0".to_string()));
+    let mut lock_deps = BTreeMap::new();
+    lock_deps.insert("chalk".to_string(), "^5.0.0".to_string());
+    let mut lock_dev_deps = BTreeMap::new();
+    lock_dev_deps.insert("typescript".to_string(), "^5.0.0".to_string());
+
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(lock_deps);
+        root.dev_dependencies = Some(lock_dev_deps);
+    }
+    lockfile.insert_package("node_modules/chalk", LockfilePackage {
+        version: Some("5.3.0".to_string()),
+        resolved: Some("https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz".to_string()),
+        integrity: Some("sha512-chalk123".to_string()),
+        ..Default::default()
+    });
+    lockfile.insert_package("node_modules/typescript", LockfilePackage {
+        version: Some("5.4.2".to_string()),
+        dev: Some(true),
+        ..Default::default()
+    });
+
+    let options = ResolverOptions::default();
+
+    // 1. Direct resolve_fast_path test
+    let fast_graph = resolve_fast_path(&manifest, &lockfile, &options).expect("Fast path should succeed");
+    assert!(fast_graph.nodes.contains_key("node_modules/chalk"));
+    assert!(fast_graph.nodes.contains_key("node_modules/typescript"));
+    assert_eq!(fast_graph.nodes.get("node_modules/chalk").unwrap().version, "5.3.0");
+
+    // 2. resolve_dependency_graph_with_lockfile using EMPTY provider (would fail if provider was queried!)
+    let empty_provider = InMemoryPackageProvider::new();
+    let graph = resolve_dependency_graph_with_lockfile(
+        &manifest,
+        &empty_provider,
+        &options,
+        Some(&lockfile),
+    ).expect("Resolution must succeed via fast-path without querying provider");
+
+    assert!(graph.nodes.contains_key("node_modules/chalk"));
+    assert!(graph.nodes.contains_key("node_modules/typescript"));
+
+    // 3. When manifest changes (spec drift), fast-path returns None and solver queries provider (fails on empty)
+    let mut drifted_manifest = manifest.clone();
+    drifted_manifest.dependencies.insert("chalk".to_string(), "^6.0.0".to_string());
+    assert!(resolve_fast_path(&drifted_manifest, &lockfile, &options).is_none());
+
+    let drifted_res = resolve_dependency_graph_with_lockfile(
+        &drifted_manifest,
+        &empty_provider,
+        &options,
+        Some(&lockfile),
+    );
+    assert!(drifted_res.is_err(), "Must fall back to provider and fail on missing metadata");
+}
+
+#[test]
+fn test_peer_dependency_conflict_diagnostic_error() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // React 18 is installed at root
+    provider.add_version("react", "18.2.0", |_| {});
+
+    // Plugin requires react peer ^16.0.0 || ^17.0.0
+    provider.add_version("legacy-plugin", "1.0.0", |v| {
+        v.peer_dependencies.insert("react".to_string(), "^17.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("peer-conflict-app".to_string());
+    manifest.dependencies.insert("react".to_string(), "18.2.0".to_string());
+    manifest.dependencies.insert("legacy-plugin".to_string(), "1.0.0".to_string());
+
+    // Scenario A: Strict mode (default) -> ERESOLVE peer conflict error
+    let options = ResolverOptions {
+        strict_peers: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+
+    let err_msg = err.to_string();
+    assert!(err_msg.contains("ERESOLVE: Conflicting peer dependency 'react' required by 'legacy-plugin'"));
+    assert!(err_msg.contains("peer react@\"^17.0.0\" from legacy-plugin"));
+    assert!(err_msg.contains("Found: react@18.2.0 at node_modules/react"));
+    assert!(err_msg.contains("Suggested resolutions:"));
+    assert!(err_msg.contains("Add an override in package.json: \"overrides\": { \"react\": \"...\" }"));
+    assert!(err_msg.contains("--legacy-peer-deps"));
+
+    let suggestions = err.suggested_resolutions();
+    assert_eq!(suggestions.len(), 3);
+    assert!(suggestions[0].contains("overrides"));
+    assert!(suggestions[1].contains("--legacy-peer-deps"));
+
+    // Scenario B: Non-strict mode / legacy_peer_deps -> succeeds with warning
+    let non_strict_options = ResolverOptions {
+        strict_peers: false,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &non_strict_options)
+        .expect("Non-strict mode should bypass peer conflict");
+    assert!(graph.nodes.contains_key("node_modules/react"));
+    assert!(graph.nodes.contains_key("node_modules/legacy-plugin"));
+
+    // Scenario C: legacy_peer_deps: true -> succeeds
+    let legacy_options = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
+    let legacy_graph = resolve_dependency_graph(&manifest, &provider, &legacy_options)
+        .expect("legacy_peer_deps should completely ignore peer dependencies");
+    assert!(legacy_graph.nodes.contains_key("node_modules/react"));
+    assert!(legacy_graph.nodes.contains_key("node_modules/legacy-plugin"));
+}
+
+#[test]
+fn test_hidden_tree_metadata_preservation_in_graph() {
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+    use crate::graph::DependencyGraph;
+
+    let mut lockfile = LockfileV3::new("meta-app", Some("1.0.0".to_string()));
+    let mut extra = BTreeMap::new();
+    extra.insert("funding".to_string(), serde_json::json!("https://example.com/fund"));
+    extra.insert("deprecated".to_string(), serde_json::json!("legacy package"));
+
+    lockfile.insert_package("node_modules/custom", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        extra: extra.clone(),
+        ..Default::default()
+    });
+
+    // from_lockfile_v3 preserves extra into Node
+    let graph = DependencyGraph::from_lockfile_v3(&lockfile);
+    let node = graph.nodes.get("node_modules/custom").expect("Node missing");
+    assert_eq!(node.extra.get("funding"), extra.get("funding"));
+    assert_eq!(node.extra.get("deprecated"), extra.get("deprecated"));
+
+    // to_lockfile_v3 writes it back into LockfilePackage
+    let generated_lock = graph.to_lockfile_v3("meta-app", Some("1.0.0"));
+    let gen_pkg = generated_lock.packages.get("node_modules/custom").expect("Package missing");
+    assert_eq!(gen_pkg.extra.get("funding"), extra.get("funding"));
+    assert_eq!(gen_pkg.extra.get("deprecated"), extra.get("deprecated"));
 }

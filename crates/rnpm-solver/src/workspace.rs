@@ -320,6 +320,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         .version
         .clone()
         .unwrap_or_else(|| "1.0.0".to_string());
+    let parsed_root_version = Version::parse(&root_version).ok();
 
     // 2. Insert root package node at ""
     let root_node = Node {
@@ -341,6 +342,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
             rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
         }),
+        parsed_version: parsed_root_version,
+        ..Default::default()
     };
     graph.nodes.insert(String::new(), root_node);
 
@@ -348,12 +351,15 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     for member in members {
         let member_loc = member.relative_path.clone();
         let link_loc = format!("node_modules/{}", member.name);
+        let mem_ver = member.version.clone().unwrap_or_else(|| "0.0.0".to_string());
+        let parsed_mem_ver = Version::parse(&mem_ver).ok();
 
         let member_node = Node {
             location: member_loc.clone(),
             install_name: member.name.clone(),
             name: member.name.clone(),
-            version: member.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+            version: mem_ver.clone(),
+            parsed_version: parsed_mem_ver.clone(),
             resolved: None,
             integrity: None,
             flags: NodeFlags::default(),
@@ -368,6 +374,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
+            ..Default::default()
         };
         graph.nodes.insert(member_loc.clone(), member_node);
 
@@ -376,7 +383,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             location: link_loc.clone(),
             install_name: member.name.clone(),
             name: member.name.clone(),
-            version: member.version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+            version: mem_ver,
+            parsed_version: parsed_mem_ver,
             resolved: Some(member_loc.clone()),
             integrity: None,
             flags: NodeFlags {
@@ -384,13 +392,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 ..Default::default()
             },
             dependencies: member.manifest.dependencies.clone(),
-            dev_dependencies: BTreeMap::new(),
-            peer_dependencies: BTreeMap::new(),
-            optional_dependencies: BTreeMap::new(),
-            os: None,
-            cpu: None,
-            libc: None,
-            bin: None,
+            ..Default::default()
         };
         graph.nodes.insert(link_loc.clone(), link_node);
 

@@ -24,6 +24,8 @@ pub struct ResolverOptions {
     pub legacy_peer_deps: bool,
     /// When true, unresolved or conflicting peer dependencies cause an ERESOLVE error.
     pub strict_peers: bool,
+    /// Optional lockfile v3 to enable fast-path resolution when matching package.json specs.
+    pub lockfile: Option<std::sync::Arc<rnpm_lockfile::LockfileV3>>,
 }
 
 impl Default for ResolverOptions {
@@ -33,6 +35,7 @@ impl Default for ResolverOptions {
             dev: true,
             legacy_peer_deps: false,
             strict_peers: true,
+            lockfile: None,
         }
     }
 }
@@ -45,7 +48,7 @@ struct ResolveTask {
     install_name: String,
     raw_spec: String,
     dep_type: DependencyType,
-    ancestors: Vec<String>,
+    ancestors: std::sync::Arc<Vec<String>>,
 }
 
 /// Main solver coordinator for building the dependency graph.
@@ -70,8 +73,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
     }
 
+    /// Attaches an existing LockfileV3 for fast-path resolution.
+    pub fn with_lockfile(mut self, lockfile: std::sync::Arc<rnpm_lockfile::LockfileV3>) -> Self {
+        self.options.lockfile = Some(lockfile);
+        self
+    }
+
     /// Resolves the dependency graph starting from a root manifest.
     pub fn resolve(mut self, root_manifest: &Manifest) -> Result<DependencyGraph, SolverError> {
+        // Fast-path: if lockfile v3 matches root_manifest specs, bypass expensive traversal
+        if let Some(ref lockfile) = self.options.lockfile {
+            if lockfile.matches_manifest(root_manifest, self.options.dev) {
+                debug!("Fast-path: lockfile v3 matches manifest specs; bypassing tree traversal");
+                if let Some(graph) = resolve_fast_path(root_manifest, lockfile, &self.options) {
+                    return Ok(graph);
+                }
+            }
+        }
+
         let root_name = root_manifest
             .name
             .clone()
@@ -103,6 +122,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
+            parsed_version: None,
+            extra: BTreeMap::new(),
         };
         self.graph.nodes.insert(String::new(), root_node);
 
@@ -126,6 +147,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             root_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
         }
 
+        let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
         for (install_name, (raw_spec, dep_type)) in root_deps {
             self.queue.push_back(ResolveTask {
                 parent_location: String::new(),
@@ -133,7 +155,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 install_name,
                 raw_spec,
                 dep_type,
-                ancestors: vec![root_name.clone()],
+                ancestors: root_ancestors.clone(),
             });
         }
 
@@ -146,13 +168,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn process_task(&mut self, task: ResolveTask) -> Result<(), SolverError> {
-        let ancestor_refs: Vec<&str> = task.ancestors.iter().map(|s| s.as_str()).collect();
-
-        // 1. Apply overrides
-        let effective_spec = if let Some(overridden) = self.overrides.resolve_override(
+        // 1. Apply overrides without allocations if no rules exist
+        let effective_spec = if self.overrides.rules.is_empty() {
+            task.raw_spec.clone()
+        } else if let Some(overridden) = self.overrides.resolve_override_strings(
             &task.install_name,
             &task.raw_spec,
-            &ancestor_refs,
+            &task.ancestors,
         ) {
             debug!(
                 "Overriding dependency '{}': '{}' -> '{}'",
@@ -166,7 +188,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // 2. Parse dependency spec (separating alias and real package name)
         let dep_spec = DependencySpec::parse(&task.install_name, &effective_spec)?;
 
-        // 3. Check for cyclic peer dependencies
+        // 3. Check for cyclic peer dependencies and existing peer instances
         let is_peer = task.dep_type == DependencyType::Peer
             || task.dep_type == DependencyType::PeerOptional;
         if is_peer {
@@ -196,6 +218,48 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     return Ok(());
                 }
             }
+
+            // Check if peer is already satisfied in ancestor/root scope
+            let root_candidate = format!("node_modules/{}", dep_spec.install_name);
+            if let Some(existing) = self.graph.nodes.get(&root_candidate) {
+                if existing.name == dep_spec.package_name {
+                    if crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
+                        debug!(
+                            "Peer dependency '{}@{}' satisfied by existing node at '{}'",
+                            dep_spec.package_name, effective_spec, root_candidate
+                        );
+                        self.graph.edges.push(DependencyEdge {
+                            from_location: task.parent_location,
+                            to_location: root_candidate,
+                            install_name: task.install_name,
+                            package_name: dep_spec.package_name,
+                            spec: effective_spec,
+                            dep_type: task.dep_type,
+                        });
+                        return Ok(());
+                    } else if task.dep_type == DependencyType::Peer {
+                        if self.options.strict_peers {
+                            return Err(SolverError::peer_conflict(
+                                &task.parent_package_name,
+                                &dep_spec.package_name,
+                                &effective_spec,
+                                Some(existing.version.clone()),
+                                Some(existing.location.clone()),
+                                (*task.ancestors).clone(),
+                                format!(
+                                    "Installed {}@{} at '{}' does not satisfy peer constraint '{}'",
+                                    dep_spec.package_name, existing.version, existing.location, effective_spec
+                                ),
+                            ));
+                        } else {
+                            warn!(
+                                "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
+                                task.parent_package_name, dep_spec.package_name, effective_spec, dep_spec.package_name, existing.version
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // 4. Resolve package metadata and choose matching version
@@ -213,6 +277,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     self.graph.skipped.insert(task.install_name.clone());
                 }
                 return Ok(());
+            }
+            if task.dep_type == DependencyType::Peer {
+                if !self.options.strict_peers {
+                    warn!(
+                        "Unresolved peer dependency '{}@{}' (non-strict mode), skipping",
+                        dep_spec.package_name, effective_spec
+                    );
+                    return Ok(());
+                }
+                return Err(SolverError::peer_conflict(
+                    task.parent_package_name,
+                    dep_spec.package_name,
+                    effective_spec.clone(),
+                    None,
+                    None,
+                    (*task.ancestors).clone(),
+                    format!("Peer package '{}' not found in registry", effective_spec),
+                ));
             }
             return Err(SolverError::UnresolvedDependency {
                 name: dep_spec.package_name,
@@ -244,12 +326,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     );
                     return Ok(());
                 }
-                return Err(SolverError::PeerConflict {
-                    parent: task.parent_package_name,
-                    peer: dep_spec.package_name,
-                    required_by: task.ancestors,
-                    message: format!("No version satisfying '{}'", effective_spec),
-                });
+                return Err(SolverError::peer_conflict(
+                    task.parent_package_name,
+                    dep_spec.package_name,
+                    effective_spec.clone(),
+                    None,
+                    None,
+                    (*task.ancestors).clone(),
+                    format!("No version satisfying '{}'", effective_spec),
+                ));
             }
             return Err(SolverError::UnresolvedDependency {
                 name: dep_spec.package_name,
@@ -319,11 +404,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     link: false,
                 };
 
+                let parsed_ver = Version::parse(&chosen_version.version).ok();
                 let node = Node {
                     location: target_loc.clone(),
                     install_name: task.install_name.clone(),
                     name: dep_spec.package_name.clone(),
                     version: chosen_version.version.clone(),
+                    parsed_version: parsed_ver,
                     resolved: chosen_version.dist_tarball.clone(),
                     integrity: chosen_version.dist_integrity.clone(),
                     flags,
@@ -335,6 +422,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     cpu: chosen_version.cpu.clone(),
                     libc: chosen_version.libc.clone(),
                     bin: chosen_version.bin.clone(),
+                    extra: BTreeMap::new(),
                 };
 
                 self.graph.nodes.insert(target_loc.clone(), node);
@@ -348,9 +436,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     dep_type: task.dep_type,
                 });
 
-                // Enqueue child dependencies
-                let mut child_ancestors = task.ancestors.clone();
+                // Enqueue child dependencies with Arc ancestors to avoid vector clones
+                let mut child_ancestors = (*task.ancestors).clone();
                 child_ancestors.push(dep_spec.package_name.clone());
+                let child_ancestors = std::sync::Arc::new(child_ancestors);
 
                 let mut child_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
 
@@ -395,7 +484,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         Ok(())
     }
 
-    /// Selects the highest version matching target constraint.
+    /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations).
     fn select_version(
         &self,
         meta: &PackageMetadata,
@@ -411,17 +500,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 meta.versions.get(tagged_version).cloned()
             }
             PackageTarget::Range(range) => {
-                let mut matching: Vec<(&PackageVersionMetadata, Version)> = Vec::new();
+                let mut best: Option<(&PackageVersionMetadata, Version)> = None;
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {
                         if range.satisfies(&parsed) {
-                            matching.push((v_meta, parsed));
+                            match &best {
+                                Some((_, best_v)) => {
+                                    if &parsed > best_v {
+                                        best = Some((v_meta, parsed));
+                                    }
+                                }
+                                None => {
+                                    best = Some((v_meta, parsed));
+                                }
+                            }
                         }
                     }
                 }
-                // Sort by semver precedence ascending, then pick the highest (last)
-                matching.sort_by(|a, b| a.1.cmp(&b.1));
-                matching.last().map(|(v_meta, _)| (*v_meta).clone())
+                best.map(|(v_meta, _)| (*v_meta).clone())
             }
             PackageTarget::Alias { target, .. } => self.select_version(meta, target),
             PackageTarget::File(_) => {
@@ -433,21 +529,59 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
                     meta.versions.values().last().cloned()
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    let mut matching: Vec<(&PackageVersionMetadata, Version)> = Vec::new();
+                    let mut best: Option<(&PackageVersionMetadata, Version)> = None;
                     for (ver_str, v_meta) in &meta.versions {
                         if let Ok(parsed) = Version::parse(ver_str) {
                             if range.satisfies(&parsed) {
-                                matching.push((v_meta, parsed));
+                                match &best {
+                                    Some((_, best_v)) => {
+                                        if &parsed > best_v {
+                                            best = Some((v_meta, parsed));
+                                        }
+                                    }
+                                    None => {
+                                        best = Some((v_meta, parsed));
+                                    }
+                                }
                             }
                         }
                     }
-                    matching.sort_by(|a, b| a.1.cmp(&b.1));
-                    matching.last().map(|(v_meta, _)| (*v_meta).clone())
+                    best.map(|(v_meta, _)| (*v_meta).clone())
                 } else {
                     meta.versions.values().last().cloned()
                 }
             }
         }
+    }
+}
+
+/// Attempts fast-path dependency graph construction from a lockfile v3 without tree traversal.
+/// Returns `Some(DependencyGraph)` if the lockfile matches the manifest, or `None` otherwise.
+pub fn resolve_fast_path(
+    manifest: &Manifest,
+    lockfile: &rnpm_lockfile::LockfileV3,
+    options: &ResolverOptions,
+) -> Option<DependencyGraph> {
+    if lockfile.matches_manifest(manifest, options.dev) {
+        let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
+        // Apply platform filters for optional dependencies
+        for node in graph.nodes.values_mut() {
+            if node.flags.optional {
+                let compatible = options.platform.matches_with_libc(
+                    node.os.as_deref(),
+                    node.cpu.as_deref(),
+                    node.libc.as_deref(),
+                );
+                if !compatible {
+                    node.flags.skipped = true;
+                    graph.skipped.insert(node.name.clone());
+                    graph.skipped.insert(node.install_name.clone());
+                }
+            }
+        }
+        Some(graph)
+    } else {
+        None
     }
 }
 
@@ -457,10 +591,24 @@ pub fn resolve_dependency_graph<P: PackageMetadataProvider>(
     provider: &P,
     options: &ResolverOptions,
 ) -> Result<DependencyGraph, SolverError> {
+    resolve_dependency_graph_with_lockfile(manifest, provider, options, None)
+}
+
+/// Resolves a dependency graph with optional lockfile fast-path bypass.
+pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
+    manifest: &Manifest,
+    provider: &P,
+    options: &ResolverOptions,
+    lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> Result<DependencyGraph, SolverError> {
+    let mut opts = options.clone();
+    if let Some(lf) = lockfile {
+        opts.lockfile = Some(std::sync::Arc::new(lf.clone()));
+    }
     let overrides = Overrides::from_json_value(
         manifest.extra.get("overrides"),
         manifest.dependencies.clone(),
     );
-    let solver = Solver::new(provider, options.clone(), overrides);
+    let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)
 }

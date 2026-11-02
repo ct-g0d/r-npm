@@ -14,8 +14,7 @@ impl PeerContext {
 
     /// Checks if a peer dependency edge forms a cycle with an already active resolution.
     pub fn is_cycle(&self, dependent: &str, peer: &str) -> bool {
-        self.active_edges.contains(&(peer.to_string(), dependent.to_string()))
-            || self.active_edges.contains(&(dependent.to_string(), peer.to_string()))
+        dependent == peer || self.active_edges.contains(&(peer.to_string(), dependent.to_string()))
     }
 
     /// Mark a peer edge as actively being resolved.

@@ -37,6 +37,34 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
     }
 }
 
+/// Fast check if a node satisfies target constraint, leveraging cached parsed_version.
+#[inline]
+pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) -> bool {
+    if let Some(parsed) = &node.parsed_version {
+        match target {
+            PackageTarget::Version(expected) => parsed == expected,
+            PackageTarget::Range(range) => range.satisfies(parsed),
+            PackageTarget::Tag(_) => true,
+            PackageTarget::Alias { target, .. } => node_satisfies_target(node, target),
+            PackageTarget::File(_) => true,
+            PackageTarget::Workspace(ws_spec) => {
+                let s = ws_spec.trim();
+                if s == "*" || s == "^" || s == "~" || s.is_empty() {
+                    true
+                } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
+                    range.satisfies(parsed)
+                } else if let Ok(expected) = Version::parse(s) {
+                    parsed == &expected
+                } else {
+                    true
+                }
+            }
+        }
+    } else {
+        version_satisfies_target(&node.version, target)
+    }
+}
+
 /// Determines the tree placement for a dependency according to npm/Arborist hoisting rules:
 /// 1. Top-Level Hoisting: Try to place at root `node_modules/<install_name>`.
 /// 2. Deduplication: If already occupied by a compatible version, reuse the existing node.
@@ -54,7 +82,7 @@ pub fn determine_placement(
     // If parent is root (""), location is directly under root
     if parent_location.is_empty() {
         if let Some(existing) = graph.nodes.get(&root_target) {
-            if existing.name == package_name && version_satisfies_target(&existing.version, target) {
+            if existing.name == package_name && node_satisfies_target(existing, target) {
                 return PlacementDecision::Reuse(root_target);
             }
         }
@@ -63,7 +91,7 @@ pub fn determine_placement(
 
     // Attempt 1: Check root node_modules
     if let Some(existing) = graph.nodes.get(&root_target) {
-        if existing.name == package_name && version_satisfies_target(&existing.version, target) {
+        if existing.name == package_name && node_satisfies_target(existing, target) {
             // Check if there is an intermediate shadowing conflict between parent and root
             if !is_shadowed_by_incompatible(graph, parent_location, install_name, target) {
                 return PlacementDecision::Reuse(root_target);
@@ -78,7 +106,7 @@ pub fn determine_placement(
     // Attempt 2: Conflict nesting under parent
     let nested_target = format!("{}/node_modules/{}", parent_location, install_name);
     if let Some(existing) = graph.nodes.get(&nested_target) {
-        if existing.name == package_name && version_satisfies_target(&existing.version, target) {
+        if existing.name == package_name && node_satisfies_target(existing, target) {
             return PlacementDecision::Reuse(nested_target);
         }
     }
@@ -95,10 +123,14 @@ fn is_shadowed_by_incompatible(
     target: &PackageTarget,
 ) -> bool {
     let mut current = parent_location;
+    let mut candidate_buf = String::with_capacity(parent_location.len() + 14 + install_name.len());
     while !current.is_empty() {
-        let candidate = format!("{}/node_modules/{}", current, install_name);
-        if let Some(node) = graph.nodes.get(&candidate) {
-            if !version_satisfies_target(&node.version, target) {
+        candidate_buf.clear();
+        candidate_buf.push_str(current);
+        candidate_buf.push_str("/node_modules/");
+        candidate_buf.push_str(install_name);
+        if let Some(node) = graph.nodes.get(&candidate_buf) {
+            if !node_satisfies_target(node, target) {
                 return true;
             }
         }
@@ -115,9 +147,8 @@ fn is_shadowed_by_incompatible(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Node, NodeFlags};
+    use crate::graph::Node;
     use rnpm_core::semver::Range;
-    use std::collections::BTreeMap;
 
     fn make_test_node(location: &str, name: &str, version: &str) -> Node {
         Node {
@@ -125,17 +156,8 @@ mod tests {
             install_name: name.to_string(),
             name: name.to_string(),
             version: version.to_string(),
-            resolved: None,
-            integrity: None,
-            flags: NodeFlags::default(),
-            dependencies: BTreeMap::new(),
-            dev_dependencies: BTreeMap::new(),
-            peer_dependencies: BTreeMap::new(),
-            optional_dependencies: BTreeMap::new(),
-            os: None,
-            cpu: None,
-            libc: None,
-            bin: None,
+            parsed_version: Version::parse(version).ok(),
+            ..Default::default()
         }
     }
 

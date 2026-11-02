@@ -201,6 +201,104 @@ mod tests {
         assert!(matches!(res_v0, Err(LockfileError::UnsupportedVersion(0))));
     }
 
+    #[test]
+    fn test_lockfile_matches_manifest() {
+        use rnpm_core::Manifest;
+
+        let mut lockfile = LockfileV3::new("test-pkg", Some("1.0.0".to_string()));
+        let mut deps = BTreeMap::new();
+        deps.insert("chalk".to_string(), "^5.0.0".to_string());
+        deps.insert("debug".to_string(), "^4.3.0".to_string());
+
+        let mut dev_deps = BTreeMap::new();
+        dev_deps.insert("typescript".to_string(), "^5.0.0".to_string());
+
+        if let Some(root) = lockfile.root_package_mut() {
+            root.dependencies = Some(deps.clone());
+            root.dev_dependencies = Some(dev_deps.clone());
+        }
+
+        // Insert packages in lockfile
+        lockfile.insert_package("node_modules/chalk", LockfilePackage {
+            version: Some("5.3.0".to_string()),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/debug", LockfilePackage {
+            version: Some("4.3.4".to_string()),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/typescript", LockfilePackage {
+            version: Some("5.4.2".to_string()),
+            ..Default::default()
+        });
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some("test-pkg".to_string());
+        manifest.dependencies = deps;
+        manifest.dev_dependencies = dev_deps;
+
+        // 1. Matches with dev dependencies
+        assert!(lockfile.matches_manifest(&manifest, true));
+
+        // 2. Spec mismatch in manifest
+        let mut modified_manifest = manifest.clone();
+        modified_manifest.dependencies.insert("chalk".to_string(), "^4.0.0".to_string());
+        assert!(!lockfile.matches_manifest(&modified_manifest, true));
+
+        // 3. Extra dependency in manifest
+        let mut added_dep_manifest = manifest.clone();
+        added_dep_manifest.dependencies.insert("semver".to_string(), "^7.0.0".to_string());
+        assert!(!lockfile.matches_manifest(&added_dep_manifest, true));
+
+        // 4. Missing package in packages map
+        let mut broken_lockfile = lockfile.clone();
+        broken_lockfile.packages.remove("node_modules/chalk");
+        assert!(!broken_lockfile.matches_manifest(&manifest, true));
+    }
+
+    #[test]
+    fn test_hidden_lockfile_roundtrip_and_extra_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path();
+
+        let mut lockfile = LockfileV3::new("hidden-test", Some("1.0.0".to_string()));
+        let mut extra = BTreeMap::new();
+        extra.insert("funding".to_string(), serde_json::json!({
+            "type": "opencollective",
+            "url": "https://opencollective.com/test"
+        }));
+
+        let pkg = LockfilePackage {
+            version: Some("1.2.3".to_string()),
+            extra,
+            ..Default::default()
+        };
+        // Backslash key to test POSIX conversion
+        lockfile.insert_package("node_modules\\custom-pkg", pkg);
+
+        // Save hidden lockfile to project_dir/node_modules/.package-lock.json
+        lockfile.save_hidden(project_dir).unwrap();
+
+        let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+        assert!(hidden_path.exists());
+
+        // Load hidden lockfile back
+        let loaded = LockfileV3::load_hidden(project_dir).unwrap();
+        assert_eq!(loaded.name, "hidden-test");
+        assert!(loaded.packages.contains_key("node_modules/custom-pkg"));
+
+        let loaded_pkg = loaded.packages.get("node_modules/custom-pkg").unwrap();
+        assert_eq!(loaded_pkg.version.as_deref(), Some("1.2.3"));
+        assert!(loaded_pkg.extra.contains_key("funding"));
+        assert_eq!(
+            loaded_pkg.extra.get("funding").unwrap(),
+            &serde_json::json!({
+                "type": "opencollective",
+                "url": "https://opencollective.com/test"
+            })
+        );
+    }
+
     fn v4_4_json(ver: u32) -> String {
         format!(r#"{{ "name": "future-app", "lockfileVersion": {ver} }}"#)
     }

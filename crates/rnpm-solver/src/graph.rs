@@ -36,7 +36,7 @@ pub struct DependencyEdge {
 }
 
 /// A node in the resolved dependency graph representing a package placed in `node_modules`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Node {
     /// Relative POSIX path in the tree (e.g. `""`, `"node_modules/foo"`, `"node_modules/bar/node_modules/foo"`).
     pub location: String,
@@ -68,6 +68,12 @@ pub struct Node {
     pub libc: Option<Vec<String>>,
     /// Executable binaries.
     pub bin: Option<PackageBin>,
+    /// Cached parsed semver for fast zero-allocation evaluation.
+    #[serde(skip, default)]
+    pub parsed_version: Option<rnpm_core::semver::Version>,
+    /// Preserved hidden-tree metadata or arbitrary package properties.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Complete resolved dependency graph and tree geometry.
@@ -134,18 +140,27 @@ impl DependencyGraph {
     /// that are no longer reachable.
     /// Returns the set of node locations that were pruned.
     pub fn prune_unreferenced(&mut self) -> std::collections::HashSet<String> {
-        use std::collections::{HashSet, VecDeque};
+        use std::collections::{HashMap, HashSet, VecDeque};
         let mut reachable = HashSet::new();
         reachable.insert(self.root_location.clone());
 
+        // Build adjacency index O(E) once to avoid O(V * E) lookups and allocations
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &self.edges {
+            adj.entry(edge.from_location.as_str())
+                .or_default()
+                .push(edge.to_location.as_str());
+        }
+
         let mut queue = VecDeque::new();
-        queue.push_back(self.root_location.clone());
+        queue.push_back(self.root_location.as_str());
 
         while let Some(curr) = queue.pop_front() {
-            for edge in self.get_outgoing_edges(&curr) {
-                if !reachable.contains(&edge.to_location) {
-                    reachable.insert(edge.to_location.clone());
-                    queue.push_back(edge.to_location.clone());
+            if let Some(targets) = adj.get(curr) {
+                for &target in targets {
+                    if reachable.insert(target.to_string()) {
+                        queue.push_back(target);
+                    }
                 }
             }
         }
@@ -186,8 +201,10 @@ impl DependencyGraph {
                     if let Some(bin) = &node.bin {
                         root_pkg.bin = Some(bin.clone());
                     }
+                    root_pkg.extra = node.extra.clone();
                 }
             } else {
+                let is_dev_and_opt = node.flags.dev && node.flags.optional;
                 let pkg = LockfilePackage {
                     name: if node.install_name != node.name {
                         Some(node.name.clone())
@@ -198,8 +215,10 @@ impl DependencyGraph {
                     resolved: node.resolved.clone(),
                     integrity: node.integrity.clone(),
                     link: if node.flags.link { Some(true) } else { None },
-                    dev: if node.flags.dev { Some(true) } else { None },
-                    optional: if node.flags.optional { Some(true) } else { None },
+                    dev: if node.flags.dev && !is_dev_and_opt { Some(true) } else { None },
+                    optional: if node.flags.optional && !is_dev_and_opt { Some(true) } else { None },
+                    dev_optional: if is_dev_and_opt { Some(true) } else { None },
+                    in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
                         Some(true)
                     } else {
@@ -224,6 +243,7 @@ impl DependencyGraph {
                     cpu: node.cpu.clone(),
                     libc: node.libc.clone(),
                     bin: node.bin.clone(),
+                    extra: node.extra.clone(),
                     ..Default::default()
                 };
                 lockfile.insert_package(loc, pkg);
@@ -251,17 +271,20 @@ impl DependencyGraph {
 
             let name = pkg.name.clone().unwrap_or_else(|| install_name.clone());
             let version = pkg.version.clone().unwrap_or_default();
+            let parsed_version = rnpm_core::semver::Version::parse(&version).ok();
 
+            let is_dev_opt = pkg.dev_optional.unwrap_or(false);
             let node = Node {
                 location: loc.clone(),
                 install_name: install_name.clone(),
                 name,
+                parsed_version,
                 version,
                 resolved: pkg.resolved.clone(),
                 integrity: pkg.integrity.clone(),
                 flags: NodeFlags {
-                    dev: pkg.dev.unwrap_or(false),
-                    optional: pkg.optional.unwrap_or(false),
+                    dev: pkg.dev.unwrap_or(false) || is_dev_opt,
+                    optional: pkg.optional.unwrap_or(false) || is_dev_opt,
                     peer: false,
                     bundled: pkg.in_bundle.unwrap_or(false),
                     has_install_script: pkg.has_install_script.unwrap_or(false),
@@ -276,6 +299,7 @@ impl DependencyGraph {
                 cpu: pkg.cpu.clone(),
                 libc: pkg.libc.clone(),
                 bin: pkg.bin.clone(),
+                extra: pkg.extra.clone(),
             };
             graph.nodes.insert(loc.clone(), node);
         }

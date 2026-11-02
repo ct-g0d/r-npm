@@ -9,10 +9,13 @@ pub enum SolverError {
         message: String,
     },
 
-    #[error("ERESOLVE: Conflicting peer dependency '{peer}' required by '{parent}': {message}")]
+    #[error("{}", format_peer_conflict(.parent, .peer, .required_spec, .found_version, .found_location, .required_by, .message))]
     PeerConflict {
         parent: String,
         peer: String,
+        required_spec: String,
+        found_version: Option<String>,
+        found_location: Option<String>,
         required_by: Vec<String>,
         message: String,
     },
@@ -40,4 +43,84 @@ pub enum SolverError {
 
     #[error("Package metadata error for '{0}': {1}")]
     PackageMetadata(String, String),
+}
+
+fn format_peer_conflict(
+    parent: &str,
+    peer: &str,
+    required_spec: &str,
+    found_version: &Option<String>,
+    found_location: &Option<String>,
+    required_by: &[String],
+    message: &str,
+) -> String {
+    let mut out = format!("ERESOLVE: Conflicting peer dependency '{peer}' required by '{parent}': {message}\n");
+    out.push_str(&format!("  Could not resolve dependency:\n    peer {peer}@\"{required_spec}\" from {parent}\n"));
+    if let (Some(ver), Some(loc)) = (found_version, found_location) {
+        out.push_str(&format!("  Found: {peer}@{ver} at {loc}\n"));
+    }
+    if !required_by.is_empty() {
+        out.push_str("  Dependency chain:\n    ");
+        out.push_str(&required_by.join(" -> "));
+        out.push_str(&format!(" -> {parent}\n"));
+    }
+    out.push_str("  Suggested resolutions:\n");
+    out.push_str(&format!("    1. Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}\n"));
+    out.push_str("    2. Run with --legacy-peer-deps to ignore peer dependency requirements\n");
+    if let Some(ver) = found_version {
+        out.push_str(&format!("    3. Update '{parent}' to a version compatible with '{peer}@{ver}'\n"));
+    } else {
+        out.push_str(&format!("    3. Install '{peer}' as an explicit dependency in package.json\n"));
+    }
+    out
+}
+
+impl SolverError {
+    /// Constructs a rich diagnostic peer conflict error.
+    pub fn peer_conflict(
+        parent: impl Into<String>,
+        peer: impl Into<String>,
+        required_spec: impl Into<String>,
+        found_version: Option<String>,
+        found_location: Option<String>,
+        required_by: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        SolverError::PeerConflict {
+            parent: parent.into(),
+            peer: peer.into(),
+            required_spec: required_spec.into(),
+            found_version,
+            found_location,
+            required_by,
+            message: message.into(),
+        }
+    }
+
+    /// Returns structured suggested resolutions for peer conflicts.
+    pub fn suggested_resolutions(&self) -> Vec<String> {
+        match self {
+            SolverError::PeerConflict {
+                parent,
+                peer,
+                found_version,
+                ..
+            } => {
+                let mut suggestions = Vec::new();
+                suggestions.push(format!(
+                    "Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}"
+                ));
+                suggestions.push("Run with --legacy-peer-deps to ignore peer dependency requirements".to_string());
+                if let Some(found) = found_version {
+                    suggestions.push(format!(
+                        "Update '{parent}' to a version compatible with '{peer}@{found}'"
+                    ));
+                } else {
+                    suggestions.push(format!("Install '{peer}' as an explicit dependency in package.json"));
+                }
+                suggestions
+            }
+            _ => Vec::new(),
+        }
+    }
 }

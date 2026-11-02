@@ -54,6 +54,25 @@ impl Overrides {
         requested_spec: &str,
         ancestors: &[&str],
     ) -> Option<String> {
+        self.resolve_override_generic(dep_name, requested_spec, ancestors)
+    }
+
+    /// Optimized overload accepting `&[String]` to bypass intermediate slice allocation.
+    pub fn resolve_override_strings(
+        &self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[String],
+    ) -> Option<String> {
+        self.resolve_override_generic(dep_name, requested_spec, ancestors)
+    }
+
+    fn resolve_override_generic<T: AsRef<str>>(
+        &self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+    ) -> Option<String> {
         if self.rules.is_empty() {
             return None;
         }
@@ -121,10 +140,10 @@ impl Overrides {
         None
     }
 
-    fn find_in_nested<'a>(
+    fn find_in_nested<'a, T: AsRef<str>>(
         &self,
         rules: &'a BTreeMap<String, OverrideValue>,
-        ancestors: &[&str],
+        ancestors: &[T],
         dep_name: &str,
         requested_spec: &str,
     ) -> Option<&'a OverrideValue> {
@@ -132,7 +151,7 @@ impl Overrides {
             return self.find_direct(rules, dep_name, requested_spec);
         }
 
-        let parent = ancestors[0];
+        let parent = ancestors[0].as_ref();
         for (k, v) in rules {
             let matches_parent = if let Some((k_name, _)) = parse_key_and_spec(k) {
                 k_name == parent
