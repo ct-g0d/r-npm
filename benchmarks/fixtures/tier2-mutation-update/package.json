@@ -1,0 +1,10 @@
+{
+  "name": "tier2-mutation-update",
+  "version": "1.0.0",
+  "description": "Tier 2 mutation fixture for testing semver range updates",
+  "private": true,
+  "dependencies": {
+    "commander": "^11.0.0",
+    "cors": "^2.8.4"
+  }
+}

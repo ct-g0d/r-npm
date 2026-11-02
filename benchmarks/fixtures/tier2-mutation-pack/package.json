@@ -1,0 +1,14 @@
+{
+  "name": "tier2-mutation-pack",
+  "version": "1.0.0",
+  "description": "Tier 2 mutation fixture for testing rnpm pack and npm pack parity",
+  "main": "lib/index.js",
+  "bin": {
+    "pack-tool": "bin/tool.js"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "README.md"
+  ]
+}
