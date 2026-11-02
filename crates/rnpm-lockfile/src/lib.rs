@@ -180,4 +180,28 @@ mod tests {
         assert!(parsed_raw.get("dependencies").is_none());
         assert!(parsed_raw.get("packages").is_some());
     }
+
+    #[test]
+    fn test_malformed_lockfiles_and_unsupported_versions() {
+        // 1. Invalid JSON syntax
+        let bad_json = "{ \"name\": \"broken\", \"lockfileVersion\": ";
+        let res_bad = parse_and_migrate(bad_json);
+        assert!(matches!(res_bad, Err(LockfileError::Json(_))));
+
+        // 2. Empty string
+        let res_empty = parse_and_migrate("");
+        assert!(matches!(res_empty, Err(LockfileError::Json(_))));
+
+        // 3. Unsupported version (e.g. 0, 4, 999)
+        let res_v4 = parse_and_migrate(&v4_4_json(4));
+        assert!(matches!(res_v4, Err(LockfileError::UnsupportedVersion(4))));
+
+        let v0_json = r#"{ "name": "zero-app", "lockfileVersion": 0 }"#;
+        let res_v0 = parse_and_migrate(v0_json);
+        assert!(matches!(res_v0, Err(LockfileError::UnsupportedVersion(0))));
+    }
+
+    fn v4_4_json(ver: u32) -> String {
+        format!(r#"{{ "name": "future-app", "lockfileVersion": {ver} }}"#)
+    }
 }

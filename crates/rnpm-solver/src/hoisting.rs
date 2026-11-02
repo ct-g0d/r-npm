@@ -122,6 +122,7 @@ mod tests {
             optional_dependencies: BTreeMap::new(),
             os: None,
             cpu: None,
+            libc: None,
             bin: None,
         }
     }

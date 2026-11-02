@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use crate::platform::Platform;
 use crate::solver::{resolve_dependency_graph, ResolverOptions};
-use crate::types::InMemoryPackageProvider;
+use crate::types::{InMemoryPackageProvider, PackageVersionMetadata};
 
 #[test]
 fn test_hoisting_and_deduplication() {
@@ -284,3 +284,188 @@ fn test_peer_dependencies_and_cycles() {
     // Optional peer canvas is not in registry/provider, so omitted without error!
     assert!(!graph.nodes.contains_key("node_modules/canvas"));
 }
+
+#[test]
+fn test_manifest_platform_parsing() {
+    // 1. Array representation
+    let json_array = r#"{
+        "name": "array-pkg",
+        "version": "1.0.0",
+        "os": ["darwin", "linux"],
+        "cpu": ["x64", "arm64"],
+        "libc": ["glibc"]
+    }"#;
+    let meta_arr = PackageVersionMetadata::from_manifest_slice(json_array.as_bytes()).unwrap();
+    assert_eq!(meta_arr.name, "array-pkg");
+    assert_eq!(meta_arr.version, "1.0.0");
+    assert_eq!(meta_arr.os.as_deref(), Some(&["darwin".to_string(), "linux".to_string()][..]));
+    assert_eq!(meta_arr.cpu.as_deref(), Some(&["x64".to_string(), "arm64".to_string()][..]));
+    assert_eq!(meta_arr.libc.as_deref(), Some(&["glibc".to_string()][..]));
+
+    // 2. Single string representation (e.g. "os": "darwin")
+    let json_str = r#"{
+        "name": "str-pkg",
+        "version": "2.0.0",
+        "os": "darwin",
+        "cpu": "arm64",
+        "libc": "musl"
+    }"#;
+    let meta_str = PackageVersionMetadata::from_manifest_slice(json_str.as_bytes()).unwrap();
+    assert_eq!(meta_str.os.as_deref(), Some(&["darwin".to_string()][..]));
+    assert_eq!(meta_str.cpu.as_deref(), Some(&["arm64".to_string()][..]));
+    assert_eq!(meta_str.libc.as_deref(), Some(&["musl".to_string()][..]));
+
+    // 3. Omitted platform fields
+    let json_none = r#"{"name": "any-pkg", "version": "3.0.0"}"#;
+    let meta_none = PackageVersionMetadata::from_manifest_slice(json_none.as_bytes()).unwrap();
+    assert!(meta_none.os.is_none());
+    assert!(meta_none.cpu.is_none());
+    assert!(meta_none.libc.is_none());
+}
+
+#[test]
+fn test_platform_libc_filtering_optional_dependencies() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Package for glibc only
+    provider.add_version("glibc-pkg", "1.0.0", |v| {
+        v.os = Some(vec!["linux".to_string()]);
+        v.libc = Some(vec!["glibc".to_string()]);
+    });
+
+    // Package for musl only
+    provider.add_version("musl-pkg", "1.0.0", |v| {
+        v.os = Some(vec!["linux".to_string()]);
+        v.libc = Some(vec!["musl".to_string()]);
+    });
+
+    // Package for non-musl (!musl)
+    provider.add_version("not-musl-pkg", "1.0.0", |v| {
+        v.libc = Some(vec!["!musl".to_string()]);
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("libc-test".to_string());
+    manifest.optional_dependencies.insert("glibc-pkg".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("musl-pkg".to_string(), "1.0.0".to_string());
+    manifest.optional_dependencies.insert("not-musl-pkg".to_string(), "1.0.0".to_string());
+
+    // Host 1: Linux with glibc
+    let glibc_opts = ResolverOptions {
+        platform: Platform::with_libc("linux", "x64", Some("glibc".to_string())),
+        ..Default::default()
+    };
+    let graph1 = resolve_dependency_graph(&manifest, &provider, &glibc_opts).unwrap();
+    assert!(graph1.nodes.contains_key("node_modules/glibc-pkg"));
+    assert!(graph1.nodes.contains_key("node_modules/not-musl-pkg"));
+    assert!(!graph1.nodes.contains_key("node_modules/musl-pkg"));
+    assert!(graph1.is_skipped("musl-pkg"));
+
+    // Host 2: Linux with musl (Alpine)
+    let musl_opts = ResolverOptions {
+        platform: Platform::with_libc("linux", "x64", Some("musl".to_string())),
+        ..Default::default()
+    };
+    let graph2 = resolve_dependency_graph(&manifest, &provider, &musl_opts).unwrap();
+    assert!(graph2.nodes.contains_key("node_modules/musl-pkg"));
+    assert!(!graph2.nodes.contains_key("node_modules/glibc-pkg"));
+    assert!(!graph2.nodes.contains_key("node_modules/not-musl-pkg"));
+    assert!(graph2.is_skipped("glibc-pkg"));
+    assert!(graph2.is_skipped("not-musl-pkg"));
+
+    // Host 3: Windows (no libc)
+    let win_opts = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let graph3 = resolve_dependency_graph(&manifest, &provider, &win_opts).unwrap();
+    assert!(!graph3.nodes.contains_key("node_modules/glibc-pkg"));
+    assert!(!graph3.nodes.contains_key("node_modules/musl-pkg"));
+    assert!(graph3.nodes.contains_key("node_modules/not-musl-pkg"));
+    assert!(graph3.is_skipped("glibc-pkg"));
+    assert!(graph3.is_skipped("musl-pkg"));
+}
+
+#[test]
+fn test_transitive_optional_dependency_platform_skipping() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Incompatible optional parent depends on child-pkg
+    provider.add_version("darwin-parent", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".to_string()]);
+        v.dependencies.insert("child-pkg".to_string(), "1.0.0".to_string());
+    });
+
+    provider.add_version("child-pkg", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("transitive-opt".to_string());
+    manifest.optional_dependencies.insert("darwin-parent".to_string(), "1.0.0".to_string());
+
+    let win_opts = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &win_opts).unwrap();
+
+    // Neither darwin-parent NOR its child-pkg should be placed in node_modules!
+    assert!(!graph.nodes.contains_key("node_modules/darwin-parent"));
+    assert!(!graph.nodes.contains_key("node_modules/child-pkg"));
+    assert!(graph.is_skipped("darwin-parent"));
+}
+
+#[test]
+fn test_circular_dependencies_termination() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Package A depends on Package B
+    provider.add_version("pkg-circ-a", "1.0.0", |v| {
+        v.dependencies.insert("pkg-circ-b".to_string(), "1.0.0".to_string());
+    });
+
+    // Package B depends on Package A (direct cycle)
+    provider.add_version("pkg-circ-b", "1.0.0", |v| {
+        v.dependencies.insert("pkg-circ-a".to_string(), "1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("circ-test".to_string());
+    manifest.dependencies.insert("pkg-circ-a".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    assert!(graph.nodes.contains_key("node_modules/pkg-circ-a"));
+    assert!(graph.nodes.contains_key("node_modules/pkg-circ-b"));
+}
+
+#[test]
+fn test_missing_optional_dependency_isolation() {
+    let provider = InMemoryPackageProvider::new();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("opt-missing".to_string());
+    // "nonexistent-pkg" does not exist in provider
+    manifest.optional_dependencies.insert("nonexistent-pkg".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    // Resolves successfully without failing!
+    assert!(!graph.nodes.contains_key("node_modules/nonexistent-pkg"));
+    assert!(graph.is_skipped("nonexistent-pkg"));
+}
+
+#[test]
+fn test_empty_manifest_resolution() {
+    let provider = InMemoryPackageProvider::new();
+    let manifest = Manifest::default();
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    // Root node exists at ""
+    assert!(graph.nodes.contains_key(""));
+    assert_eq!(graph.nodes.len(), 1);
+}
+

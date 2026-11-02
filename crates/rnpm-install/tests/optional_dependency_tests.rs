@@ -1,0 +1,767 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use sha2::{Digest, Sha512};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+
+use rnpm_install::{InstallOptions, Installer};
+use rnpm_lockfile::{LockfilePackage, LockfileV3};
+
+/// Constructs an npm-compatible .tgz archive with files rooted in `package/`.
+fn create_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        for &(rel_path, content) in files {
+            let full_path = format!("package/{}", rel_path);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, full_path, content)
+                .expect("Failed to append tar entry");
+        }
+        builder.finish().expect("Failed to finish tar archive");
+    }
+    gz.finish().expect("Failed to finish gzip compression")
+}
+
+/// Compute standard npm SSRI string (`sha512-...`)
+fn compute_ssri(bytes: &[u8]) -> String {
+    let mut hasher = Sha512::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    format!("sha512-{}", data_encoding::BASE64.encode(&hash))
+}
+
+/// In-memory mock registry server for tests.
+struct TestRegistryServer {
+    addr: SocketAddr,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+    pub requested_paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl TestRegistryServer {
+    async fn start<F>(handler: F) -> Self
+    where
+        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)> + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let requested_paths = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(handler);
+
+        let reqs = requested_paths.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => {
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        if let Ok((mut stream, _)) = accept_res {
+                            let handler_clone = handler.clone();
+                            let reqs_clone = reqs.clone();
+                            let base_url = format!("http://{}", addr);
+                            tokio::spawn(async move {
+                                let mut buf = vec![0u8; 4096];
+                                let n = stream.read(&mut buf).await.unwrap_or(0);
+                                if n > 0 {
+                                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                    let first_line = req_str.lines().next().unwrap_or("");
+                                    let path = first_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                                    reqs_clone.lock().await.push(path.clone());
+
+                                    let (status, headers, body) = match handler_clone(&path, &base_url) {
+                                        Some(resp) => resp,
+                                        None => (404, vec![("Content-Type", "text/plain".to_string())], b"Not Found".to_vec()),
+                                    };
+
+                                    let status_text = match status {
+                                        200 => "OK",
+                                        404 => "Not Found",
+                                        500 => "Internal Server Error",
+                                        _ => "Response",
+                                    };
+
+                                    let mut response = format!(
+                                        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                        body.len()
+                                    );
+                                    for (k, v) in headers {
+                                        response.push_str(&format!("{k}: {v}\r\n"));
+                                    }
+                                    response.push_str("\r\n");
+
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    let _ = stream.write_all(&body).await;
+                                    let _ = stream.flush().await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            addr,
+            _shutdown: tx,
+            requested_paths,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+#[tokio::test]
+async fn test_platform_skipping_incompatible_os_or_cpu() {
+    let normal_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"normal-pkg","version":"1.0.0"}"#),
+        ("index.js", b"module.exports = 'normal';"),
+    ]);
+    let normal_integrity = compute_ssri(&normal_tarball);
+
+    let darwin_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"darwin-pkg","version":"1.0.0","os":["darwin"],"cpu":["arm64"]}"#),
+        ("index.js", b"module.exports = 'darwin';"),
+    ]);
+    let darwin_integrity = compute_ssri(&darwin_tarball);
+
+    let normal_tarball_clone = normal_tarball.clone();
+    let darwin_tarball_clone = darwin_tarball.clone();
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        match path {
+            "/normal-pkg" => {
+                let json = serde_json::json!({
+                    "name": "normal-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "normal-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/normal-pkg/-/normal-pkg-1.0.0.tgz"),
+                                "integrity": normal_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            "/darwin-pkg" => {
+                let json = serde_json::json!({
+                    "name": "darwin-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "darwin-pkg",
+                            "version": "1.0.0",
+                            "os": ["darwin"],
+                            "cpu": ["arm64"],
+                            "dist": {
+                                "tarball": format!("{base_url}/darwin-pkg/-/darwin-pkg-1.0.0.tgz"),
+                                "integrity": darwin_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            p if p.ends_with("/normal-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
+            }
+            p if p.ends_with("/darwin-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], darwin_tarball_clone.clone()))
+            }
+            _ => None,
+        }
+    }).await;
+
+    let reg_url = server.url();
+
+    // Setup temporary project directory
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    let root_pkg_json = serde_json::json!({
+        "name": "test-platform-skipping",
+        "version": "1.0.0",
+        "dependencies": {
+            "normal-pkg": "^1.0.0"
+        },
+        "optionalDependencies": {
+            "darwin-pkg": "^1.0.0"
+        }
+    });
+
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    ).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    // Verify normal-pkg was installed
+    assert!(temp_proj.path().join("node_modules").join("normal-pkg").exists());
+    assert!(temp_proj.path().join("node_modules").join("normal-pkg").join("index.js").exists());
+
+    // Verify darwin-pkg was SKIPPED on non-darwin host (or if host is win32)
+    if cfg!(not(target_os = "macos")) {
+        assert!(
+            !temp_proj.path().join("node_modules").join("darwin-pkg").exists(),
+            "darwin-pkg must not be extracted on non-macos platform"
+        );
+
+        // Verify darwin-pkg tarball was NEVER requested from the registry!
+        let paths = server.requested_paths.lock().await;
+        let downloaded_darwin = paths.iter().any(|p| p.contains("darwin-pkg-1.0.0.tgz"));
+        assert!(!downloaded_darwin, "darwin-pkg tarball must NEVER be downloaded");
+    }
+}
+
+#[tokio::test]
+async fn test_optional_download_failure_isolation() {
+    let normal_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
+    ]);
+    let normal_integrity = compute_ssri(&normal_tarball);
+    let normal_tarball_clone = normal_tarball.clone();
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        match path {
+            "/good-pkg" => {
+                let json = serde_json::json!({
+                    "name": "good-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "good-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/good-pkg/-/good-pkg-1.0.0.tgz"),
+                                "integrity": normal_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            "/bad-dl-pkg" => {
+                let json = serde_json::json!({
+                    "name": "bad-dl-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "bad-dl-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/bad-dl-pkg/-/missing-404.tgz"),
+                                "integrity": "sha512-dummy"
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            p if p.ends_with("/good-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
+            }
+            // missing-404.tgz returns 404
+            p if p.ends_with("/missing-404.tgz") => {
+                Some((404, vec![("Content-Type", "text/plain".to_string())], b"Tarball Not Found".to_vec()))
+            }
+            _ => None,
+        }
+    }).await;
+
+    let reg_url = server.url();
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    // 1. Optional dependency download failure is isolated -> install SUCCEEDS
+    let root_pkg_json = serde_json::json!({
+        "name": "test-opt-dl-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "good-pkg": "^1.0.0"
+        },
+        "optionalDependencies": {
+            "bad-dl-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url.clone()),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run().await;
+    assert!(res.is_ok(), "Installation must succeed despite optional download failure");
+    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
+    assert!(!temp_proj.path().join("node_modules").join("bad-dl-pkg").exists());
+
+    // 2. Contrast: required dependency download failure MUST fail install!
+    let temp_proj_req = tempfile::tempdir().unwrap();
+    let root_req_json = serde_json::json!({
+        "name": "test-req-dl-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "bad-dl-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+
+    let mut req_installer = Installer::new(InstallOptions {
+        project_dir: temp_proj_req.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let req_res = req_installer.run().await;
+    assert!(req_res.is_err(), "Required dependency download failure MUST fail install");
+}
+
+#[tokio::test]
+async fn test_optional_ssri_failure_isolation() {
+    let normal_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"valid-pkg","version":"1.0.0"}"#),
+    ]);
+    let normal_integrity = compute_ssri(&normal_tarball);
+
+    let corrupt_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"corrupt-pkg","version":"1.0.0"}"#),
+    ]);
+    // Intentionally wrong integrity hash!
+    let fake_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
+    let normal_tarball_clone = normal_tarball.clone();
+    let corrupt_tarball_clone = corrupt_tarball.clone();
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        match path {
+            "/valid-pkg" => {
+                let json = serde_json::json!({
+                    "name": "valid-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "valid-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/valid-pkg/-/valid-pkg-1.0.0.tgz"),
+                                "integrity": normal_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            "/corrupt-pkg" => {
+                let json = serde_json::json!({
+                    "name": "corrupt-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "corrupt-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/corrupt-pkg/-/corrupt-pkg-1.0.0.tgz"),
+                                "integrity": fake_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            p if p.ends_with("/valid-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
+            }
+            p if p.ends_with("/corrupt-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], corrupt_tarball_clone.clone()))
+            }
+            _ => None,
+        }
+    }).await;
+
+    let reg_url = server.url();
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    // 1. Optional dependency SSRI verification failure is caught & isolated
+    let root_pkg_json = serde_json::json!({
+        "name": "test-opt-ssri-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "valid-pkg": "^1.0.0"
+        },
+        "optionalDependencies": {
+            "corrupt-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url.clone()),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run().await;
+    assert!(res.is_ok(), "Installation must succeed despite optional SSRI mismatch");
+    assert!(temp_proj.path().join("node_modules").join("valid-pkg").exists());
+    assert!(!temp_proj.path().join("node_modules").join("corrupt-pkg").exists());
+
+    // 2. Contrast: required dependency SSRI mismatch MUST fail install!
+    let temp_proj_req = tempfile::tempdir().unwrap();
+    let root_req_json = serde_json::json!({
+        "name": "test-req-ssri-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "corrupt-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+
+    let mut req_installer = Installer::new(InstallOptions {
+        project_dir: temp_proj_req.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let req_res = req_installer.run().await;
+    assert!(req_res.is_err(), "Required dependency SSRI mismatch MUST fail install");
+}
+
+#[tokio::test]
+async fn test_optional_lifecycle_failure_isolation() {
+    let normal_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"clean-pkg","version":"1.0.0"}"#),
+    ]);
+    let normal_integrity = compute_ssri(&normal_tarball);
+
+    let failing_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"failing-native-pkg","version":"1.0.0","scripts":{"install":"node -e \"process.exit(1)\""}}"#),
+    ]);
+    let failing_integrity = compute_ssri(&failing_tarball);
+
+    let normal_tarball_clone = normal_tarball.clone();
+    let failing_tarball_clone = failing_tarball.clone();
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        match path {
+            "/clean-pkg" => {
+                let json = serde_json::json!({
+                    "name": "clean-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "clean-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/clean-pkg/-/clean-pkg-1.0.0.tgz"),
+                                "integrity": normal_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            "/failing-native-pkg" => {
+                let json = serde_json::json!({
+                    "name": "failing-native-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "failing-native-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/failing-native-pkg/-/failing-native-pkg-1.0.0.tgz"),
+                                "integrity": failing_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            p if p.ends_with("/clean-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
+            }
+            p if p.ends_with("/failing-native-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], failing_tarball_clone.clone()))
+            }
+            _ => None,
+        }
+    }).await;
+
+    let reg_url = server.url();
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    // 1. Optional dependency native build lifecycle failure is caught & isolated
+    let root_pkg_json = serde_json::json!({
+        "name": "test-opt-lifecycle-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "clean-pkg": "^1.0.0"
+        },
+        "optionalDependencies": {
+            "failing-native-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url.clone()),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run().await;
+    assert!(res.is_ok(), "Installation must succeed despite optional lifecycle build script failure");
+    assert!(temp_proj.path().join("node_modules").join("clean-pkg").exists());
+
+    // 2. Contrast: required dependency build script failure MUST fail install!
+    let temp_proj_req = tempfile::tempdir().unwrap();
+    let root_req_json = serde_json::json!({
+        "name": "test-req-lifecycle-failure",
+        "version": "1.0.0",
+        "dependencies": {
+            "failing-native-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+
+    let mut req_installer = Installer::new(InstallOptions {
+        project_dir: temp_proj_req.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let req_res = req_installer.run().await;
+    assert!(req_res.is_err(), "Required dependency lifecycle script failure MUST fail install");
+}
+
+#[tokio::test]
+async fn test_ci_optional_platform_skipping_and_isolation() {
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    // Setup package.json
+    let root_pkg_json = serde_json::json!({
+        "name": "test-ci-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "good-pkg": "1.0.0"
+        },
+        "optionalDependencies": {
+            "other-os-pkg": "1.0.0"
+        }
+    });
+    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+
+    let normal_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
+    ]);
+    let normal_integrity = compute_ssri(&normal_tarball);
+
+    let server = TestRegistryServer::start(move |path, _base_url| {
+        if path.ends_with("/good-pkg-1.0.0.tgz") {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball.clone()))
+        } else {
+            None
+        }
+    }).await;
+
+    let reg_url = server.url();
+
+    // Create package-lock.json with an optional dependency targeting another OS
+    let mut lockfile = LockfileV3::new("test-ci-project", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lockfile.root_package_mut() {
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert("good-pkg".to_string(), "1.0.0".to_string());
+        root_pkg.dependencies = Some(deps);
+
+        let mut opt_deps = std::collections::BTreeMap::new();
+        opt_deps.insert("other-os-pkg".to_string(), "1.0.0".to_string());
+        root_pkg.optional_dependencies = Some(opt_deps);
+    }
+
+    lockfile.insert_package("node_modules/good-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{}/good-pkg-1.0.0.tgz", reg_url)),
+        integrity: Some(normal_integrity),
+        ..Default::default()
+    });
+
+    // Incompatible platform optional package in lockfile
+    lockfile.insert_package("node_modules/other-os-pkg", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("http://invalid-url-should-never-be-called.local/other.tgz".to_string()),
+        integrity: Some("sha512-dummy".to_string()),
+        optional: Some(true),
+        os: Some(vec!["non_existent_os_xyz".to_string()]),
+        cpu: Some(vec!["non_existent_cpu_xyz".to_string()]),
+        ..Default::default()
+    });
+
+    lockfile.save_to_file(&temp_proj.path().join("package-lock.json")).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_ok(), "CI install must succeed and skip incompatible optional dependency");
+    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
+    assert!(!temp_proj.path().join("node_modules").join("other-os-pkg").exists());
+}
+
+#[tokio::test]
+async fn test_optional_corrupted_tarball_bytes_isolation() {
+    let good_tarball = create_test_tarball(&[
+        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
+    ]);
+    let good_integrity = compute_ssri(&good_tarball);
+
+    // Corrupted binary payload (not valid gzip)
+    let corrupt_bytes = vec![0x1F, 0x8B, 0x08, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+    let corrupt_integrity = compute_ssri(&corrupt_bytes);
+
+    let good_clone = good_tarball.clone();
+    let corrupt_clone = corrupt_bytes.clone();
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        match path {
+            "/good-pkg" => {
+                let json = serde_json::json!({
+                    "name": "good-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "good-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/good-pkg/-/good-pkg-1.0.0.tgz"),
+                                "integrity": good_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            "/corrupt-tarball-pkg" => {
+                let json = serde_json::json!({
+                    "name": "corrupt-tarball-pkg",
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": "corrupt-tarball-pkg",
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": format!("{base_url}/corrupt-tarball-pkg/-/corrupt-tarball-pkg-1.0.0.tgz"),
+                                "integrity": corrupt_integrity
+                            }
+                        }
+                    }
+                });
+                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+            }
+            p if p.ends_with("/good-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], good_clone.clone()))
+            }
+            p if p.ends_with("/corrupt-tarball-pkg-1.0.0.tgz") => {
+                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], corrupt_clone.clone()))
+            }
+            _ => None,
+        }
+    }).await;
+
+    let reg_url = server.url();
+
+    // 1. When optional: extraction error is isolated, install succeeds
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    let root_pkg_json = serde_json::json!({
+        "name": "test-opt-corrupt-tarball",
+        "version": "1.0.0",
+        "dependencies": {
+            "good-pkg": "^1.0.0"
+        },
+        "optionalDependencies": {
+            "corrupt-tarball-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url.clone()),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res = installer.run().await;
+    assert!(res.is_ok(), "Installation must succeed despite optional corrupted tarball");
+    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
+    assert!(!temp_proj.path().join("node_modules").join("corrupt-tarball-pkg").exists());
+
+    // 2. When required: extraction error must fail install
+    let temp_proj_req = tempfile::tempdir().unwrap();
+    let root_req_json = serde_json::json!({
+        "name": "test-req-corrupt-tarball",
+        "version": "1.0.0",
+        "dependencies": {
+            "corrupt-tarball-pkg": "^1.0.0"
+        }
+    });
+    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+
+    let mut installer_req = Installer::new(InstallOptions {
+        project_dir: temp_proj_req.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+    }).unwrap();
+
+    let res_req = installer_req.run().await;
+    assert!(res_req.is_err(), "Required dependency corrupted tarball extraction must fail installation");
+}

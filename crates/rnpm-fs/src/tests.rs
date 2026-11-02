@@ -217,3 +217,98 @@ fn test_junction_creation_and_safe_deletion() {
     assert!(file_path.exists(), "Target contents must not be deleted when junction is removed");
     assert_eq!(fs::read_to_string(&file_path).unwrap(), "important data");
 }
+
+#[test]
+fn test_security_rejection_escaping_symlink() {
+    use crate::tarball::validate_link_target;
+    use std::path::Path;
+
+    let dest = Path::new("C:/test/dest");
+    let link_path = Path::new("sub/my_link");
+
+    // Traversal escaping root: link in sub/ pointing to ../../secret
+    let res1 = validate_link_target(link_path, Path::new("../../secret"), dest);
+    assert!(matches!(res1, Err(FsError::EscapingSymlink { .. })));
+
+    // Absolute Unix path
+    let res2 = validate_link_target(link_path, Path::new("/etc/passwd"), dest);
+    assert!(matches!(res2, Err(FsError::AbsolutePath { .. })));
+
+    // Drive-relative root path on Windows
+    let res3 = validate_link_target(link_path, Path::new(r"\Windows\System32"), dest);
+    assert!(matches!(res3, Err(FsError::AbsolutePath { .. })));
+
+    // Windows drive-prefixed path
+    let res4 = validate_link_target(link_path, Path::new(r"C:\Windows\System32"), dest);
+    assert!(matches!(res4, Err(FsError::AbsolutePath { .. })));
+
+    // Safe relative target within extraction directory
+    let res_ok = validate_link_target(link_path, Path::new("../other_file.js"), dest);
+    assert!(res_ok.is_ok());
+}
+
+#[test]
+fn test_security_rejection_colon_and_null_bytes() {
+    use crate::tarball::validate_entry_path;
+    use std::path::Path;
+
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // Alternate Data Stream syntax
+    let tar_colon = create_test_tarball(&[("package/file.txt:stream", b"ads content", 0o644)]);
+    let res_colon = extract_tar_gz(Cursor::new(&tar_colon), &dest, None);
+    assert!(matches!(res_colon, Err(FsError::PathTraversal { .. })));
+
+    // Direct path validation with null byte and colon
+    assert!(matches!(
+        validate_entry_path(Path::new("file\0hidden.txt")),
+        Err(FsError::PathTraversal { .. })
+    ));
+    assert!(matches!(
+        validate_entry_path(Path::new("file.txt:stream")),
+        Err(FsError::PathTraversal { .. })
+    ));
+}
+
+#[test]
+fn test_security_rejection_conin_conout() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    for bad_name in ["package/conin$.txt", "package/CONOUT$", "package/aux.d"] {
+        let tar_bytes = create_test_tarball(&[(bad_name, b"dummy", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(matches!(res, Err(FsError::WindowsReservedDeviceName { .. })));
+    }
+}
+
+#[test]
+fn test_corrupted_tarball_handling() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // 1. Truncated gzip stream (unexpected EOF during gzip decompression)
+    let valid_tar = create_test_tarball(&[("package/index.js", b"console.log(1);", 0o644)]);
+    let truncated_tar = &valid_tar[..valid_tar.len() / 2];
+    let res_trunc = extract_tar_gz(Cursor::new(truncated_tar), &dest, None);
+    assert!(res_trunc.is_err(), "Truncated gzip must return error");
+
+    // 2. Completely corrupt/random bytes
+    let random_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
+    let res_random = extract_tar_gz(Cursor::new(&random_bytes), &dest, None);
+    assert!(res_random.is_err(), "Corrupted bytes must return error");
+
+    // 3. Zero-byte input
+    let res_empty = extract_tar_gz(Cursor::new(&[]), &dest, None);
+    assert!(res_empty.is_err(), "Empty stream must return error");
+}
+
+#[test]
+fn test_junction_nonexistent_path_safety() {
+    let dir = tempdir().unwrap();
+    let non_existent = dir.path().join("does_not_exist");
+
+    // Removing nonexistent path must be idempotent and succeed
+    assert!(remove_junction(&non_existent).is_ok());
+}

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use rnpm_cache::Cache;
@@ -19,6 +19,7 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
+use rnpm_solver::Platform;
 
 /// Options for running rnpm install.
 #[derive(Debug, Clone)]
@@ -59,6 +60,12 @@ pub struct ResolvedNode {
     pub resolved_url: String,
     pub integrity: String,
     pub dependencies: BTreeMap<String, String>,
+    pub optional_dependencies: BTreeMap<String, String>,
+    pub optional: bool,
+    pub skipped: bool,
+    pub os: Vec<String>,
+    pub cpu: Vec<String>,
+    pub libc: Vec<String>,
 }
 
 pub struct Installer {
@@ -126,23 +133,64 @@ impl Installer {
 
         // 1. Resolve dependency graph
         let mut resolved_tree: BTreeMap<String, ResolvedNode> = BTreeMap::new();
-        let mut queue: VecDeque<(String, String)> = VecDeque::new();
+        let mut queue: VecDeque<(String, String, bool)> = VecDeque::new();
 
         for (dep_name, dep_range) in &manifest.dependencies {
-            queue.push_back((dep_name.clone(), dep_range.clone()));
+            let is_opt = manifest.optional_dependencies.contains_key(dep_name);
+            queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
         }
 
-        while let Some((dep_name, dep_range)) = queue.pop_front() {
-            if resolved_tree.contains_key(&dep_name) {
+        for (opt_name, opt_range) in &manifest.optional_dependencies {
+            if !manifest.dependencies.contains_key(opt_name) {
+                queue.push_back((opt_name.clone(), opt_range.clone(), true));
+            }
+        }
+
+        while let Some((dep_name, dep_range, is_optional)) = queue.pop_front() {
+            if let Some(existing) = resolved_tree.get_mut(&dep_name) {
+                if !is_optional && existing.optional {
+                    existing.optional = false;
+                }
                 continue;
             }
 
-            let node = self.resolve_package(&dep_name, &dep_range).await?;
+            let node = match self.resolve_package(&dep_name, &dep_range, is_optional).await {
+                Ok(n) => n,
+                Err(err) => {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to resolve {}@{}: {:#}",
+                            dep_name, dep_range, err
+                        );
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+
+            if node.skipped {
+                debug!(
+                    "Skipping optional dependency {} due to platform filter",
+                    dep_name
+                );
+                resolved_tree.insert(dep_name, node);
+                continue;
+            }
+
             for (sub_name, sub_range) in &node.dependencies {
+                let sub_is_opt = node.optional_dependencies.contains_key(sub_name) || node.optional;
                 if !resolved_tree.contains_key(sub_name) {
-                    queue.push_back((sub_name.clone(), sub_range.clone()));
+                    queue.push_back((sub_name.clone(), sub_range.clone(), sub_is_opt));
                 }
             }
+
+            for (opt_name, opt_range) in &node.optional_dependencies {
+                if !node.dependencies.contains_key(opt_name) && !resolved_tree.contains_key(opt_name) {
+                    queue.push_back((opt_name.clone(), opt_range.clone(), true));
+                }
+            }
+
             resolved_tree.insert(dep_name, node);
         }
 
@@ -163,12 +211,48 @@ impl Installer {
             if !manifest.dev_dependencies.is_empty() {
                 root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
             }
+            if !manifest.optional_dependencies.is_empty() {
+                root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+            }
         }
 
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
 
         for (pkg_name, node) in &resolved_tree {
-            let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
+            if node.skipped {
+                // NEVER download or extract skipped packages!
+                debug!("Package {} is marked skipped, bypassing download and extraction", pkg_name);
+                let lockfile_key = format!("node_modules/{pkg_name}");
+                let mut lock_entry = LockfilePackage {
+                    version: Some(node.version.clone()),
+                    resolved: Some(node.resolved_url.clone()),
+                    integrity: if !node.integrity.is_empty() { Some(node.integrity.clone()) } else { None },
+                    optional: Some(true),
+                    ..Default::default()
+                };
+                if !node.os.is_empty() { lock_entry.os = Some(node.os.clone()); }
+                if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
+                if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
+                lockfile.insert_package(&lockfile_key, lock_entry);
+                continue;
+            }
+
+            let fetch_res = self.fetch_tarball(&node.resolved_url).await;
+            let (bytes, was_hit) = match fetch_res {
+                Ok(res) => res,
+                Err(err) => {
+                    if node.optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                            pkg_name, err
+                        );
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+
             if was_hit {
                 cache_hits += 1;
             } else {
@@ -176,20 +260,64 @@ impl Installer {
             }
 
             // Verify integrity
-            let expected_integrity: Integrity = node.integrity.parse()
-                .map_err(|e| anyhow!("Invalid integrity string: {e}"))?;
-            expected_integrity.verify(&bytes)
-                .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", pkg_name))?;
+            let expected_integrity: Result<Integrity, _> = node.integrity.parse()
+                .map_err(|e| anyhow!("Invalid integrity string: {e}"));
+            let expected_integrity = match expected_integrity {
+                Ok(i) => i,
+                Err(e) => {
+                    if node.optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                            pkg_name, e
+                        );
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+
+            if let Err(e) = expected_integrity.verify(&bytes) {
+                if node.optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                        pkg_name, e
+                    );
+                    continue;
+                } else {
+                    return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
+                }
+            }
 
             // Extract to node_modules/<pkg_name>
             let dest_dir = node_modules_dir.join(pkg_name);
             if dest_dir.exists() {
                 let _ = std::fs::remove_dir_all(&dest_dir);
             }
-            std::fs::create_dir_all(&dest_dir)?;
+            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                if node.optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create dir for {}: {}",
+                        pkg_name, e
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
 
-            extract_tar_gz(Cursor::new(&bytes), &dest_dir, None)
-                .map_err(|e| anyhow!("Failed to extract package {}: {e}", pkg_name))?;
+            if let Err(e) = extract_tar_gz(Cursor::new(&bytes), &dest_dir, None) {
+                if node.optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
+                        pkg_name, e
+                    );
+                    let _ = std::fs::remove_dir_all(&dest_dir);
+                    continue;
+                } else {
+                    return Err(anyhow!("Failed to extract package {}: {e}", pkg_name));
+                }
+            }
 
             packages_installed += 1;
 
@@ -217,7 +345,7 @@ impl Installer {
                         manifest: pkg_manifest,
                         source: PackageSource::Registry,
                         dependencies: node.dependencies.keys().cloned().collect(),
-                        optional: false,
+                        optional: node.optional,
                     });
                 }
             }
@@ -228,8 +356,13 @@ impl Installer {
                 version: Some(node.version.clone()),
                 resolved: Some(node.resolved_url.clone()),
                 integrity: Some(node.integrity.clone()),
+                optional: if node.optional { Some(true) } else { None },
                 ..Default::default()
             };
+
+            if !node.os.is_empty() { lock_entry.os = Some(node.os.clone()); }
+            if !node.cpu.is_empty() { lock_entry.cpu = Some(node.cpu.clone()); }
+            if !node.libc.is_empty() { lock_entry.libc = Some(node.libc.clone()); }
 
             if has_install_script {
                 lock_entry.has_install_script = Some(true);
@@ -250,7 +383,7 @@ impl Installer {
                 ignore_scripts: false,
                 capture_output: false,
             };
-            let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
+            execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
         // 4. Write deterministic package-lock.json
@@ -325,28 +458,125 @@ impl Installer {
                 continue;
             }
 
-            let resolved_url = pkg_info.resolved.as_ref()
-                .ok_or_else(|| anyhow!("Package {} missing resolved URL in lockfile", pkg_key))?;
-            let integrity_str = pkg_info.integrity.as_ref()
-                .ok_or_else(|| anyhow!("Package {} missing integrity in lockfile", pkg_key))?;
+            let is_optional = pkg_info.optional.unwrap_or(false);
 
-            let (bytes, was_hit) = self.fetch_tarball(resolved_url).await?;
+            // Filter optional dependencies by platform: os, cpu, libc
+            if is_optional {
+                let host_platform = Platform::current();
+                let os_match = host_platform.matches_with_libc(
+                    pkg_info.os.as_deref(),
+                    pkg_info.cpu.as_deref(),
+                    pkg_info.libc.as_deref(),
+                );
+                if !os_match {
+                    debug!("Skipping optional dependency {pkg_key} due to platform constraint");
+                    continue;
+                }
+            }
+
+            let resolved_url = match pkg_info.resolved.as_ref() {
+                Some(url) => url,
+                None => {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} missing resolved URL in lockfile",
+                            pkg_key
+                        );
+                        continue;
+                    } else {
+                        return Err(anyhow!("Package {} missing resolved URL in lockfile", pkg_key));
+                    }
+                }
+            };
+
+            let integrity_str = match pkg_info.integrity.as_ref() {
+                Some(i) => i,
+                None => {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} missing integrity in lockfile",
+                            pkg_key
+                        );
+                        continue;
+                    } else {
+                        return Err(anyhow!("Package {} missing integrity in lockfile", pkg_key));
+                    }
+                }
+            };
+
+            let fetch_res = self.fetch_tarball(resolved_url).await;
+            let (bytes, was_hit) = match fetch_res {
+                Ok(res) => res,
+                Err(err) => {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                            pkg_key, err
+                        );
+                        continue;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
+
             if was_hit {
                 cache_hits += 1;
             } else {
                 cache_misses += 1;
             }
 
-            let expected_integrity: Integrity = integrity_str.parse()
-                .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
-            expected_integrity.verify(&bytes)
-                .map_err(|e| anyhow!("Integrity verification failed for {pkg_key}: {e}"))?;
+            let expected_integrity: Result<Integrity, _> = integrity_str.parse()
+                .map_err(|e| anyhow!("Invalid integrity hash: {e}"));
+            let expected_integrity = match expected_integrity {
+                Ok(i) => i,
+                Err(e) => {
+                    if is_optional {
+                        warn!(
+                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                            pkg_key, e
+                        );
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+
+            if let Err(e) = expected_integrity.verify(&bytes) {
+                if is_optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
+                    );
+                    continue;
+                } else {
+                    return Err(anyhow!("Integrity verification failed for {pkg_key}: {e}"));
+                }
+            }
 
             let target_path = self.options.project_dir.join(pkg_key);
-            std::fs::create_dir_all(&target_path)?;
+            if let Err(e) = std::fs::create_dir_all(&target_path) {
+                if is_optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create target dir for {pkg_key}: {e}"
+                    );
+                    continue;
+                } else {
+                    return Err(e.into());
+                }
+            }
 
-            extract_tar_gz(Cursor::new(&bytes), &target_path, None)
-                .map_err(|e| anyhow!("Failed to extract {pkg_key}: {e}"))?;
+            if let Err(e) = extract_tar_gz(Cursor::new(&bytes), &target_path, None) {
+                if is_optional {
+                    warn!(
+                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract {pkg_key}: {e}"
+                    );
+                    let _ = std::fs::remove_dir_all(&target_path);
+                    continue;
+                } else {
+                    return Err(anyhow!("Failed to extract {pkg_key}: {e}"));
+                }
+            }
 
             packages_installed += 1;
 
@@ -362,6 +592,7 @@ impl Installer {
                     }
 
                     if !self.options.ignore_scripts {
+                        let mut script_failed = false;
                         for event in &["preinstall", "install", "postinstall"] {
                             if let Some(cmd) = pkg_manifest.scripts.get(*event) {
                                 let mut ctx = LifecycleContext::new(
@@ -372,8 +603,39 @@ impl Installer {
                                     cmd,
                                 );
                                 ctx.package_version = pkg_manifest.version.clone();
-                                let _ = execute_lifecycle_script(&ctx);
+                                match execute_lifecycle_script(&ctx) {
+                                    Ok(status) if status.success() => {},
+                                    Ok(status) => {
+                                        if is_optional {
+                                            warn!(
+                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {} failed at {} script with exit code: {:?}",
+                                                pkg_key, event, status.code()
+                                            );
+                                            script_failed = true;
+                                            break;
+                                        } else {
+                                            return Err(anyhow!(
+                                                "Lifecycle script '{}' failed for package {} with exit code: {:?}",
+                                                event, pkg_key, status.code()
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if is_optional {
+                                            warn!(
+                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Optional dependency lifecycle script error: {e}"
+                                            );
+                                            script_failed = true;
+                                            break;
+                                        } else {
+                                            return Err(e);
+                                        }
+                                    }
+                                }
                             }
+                        }
+                        if script_failed {
+                            let _ = std::fs::remove_dir_all(&target_path);
                         }
                     }
                 }
@@ -388,7 +650,12 @@ impl Installer {
         })
     }
 
-    async fn resolve_package(&mut self, name: &str, range_str: &str) -> Result<ResolvedNode> {
+    async fn resolve_package(
+        &mut self,
+        name: &str,
+        range_str: &str,
+        is_optional: bool,
+    ) -> Result<ResolvedNode> {
         let metadata = if let Some(cached) = self.metadata_cache.get(name) {
             cached.clone()
         } else {
@@ -420,12 +687,25 @@ impl Installer {
             .ok_or_else(|| anyhow!("Version info missing for {}", best_ver_str))?;
 
         let integrity = ver_info.dist.integrity.clone()
-            .ok_or_else(|| anyhow!("Integrity hash missing for {}@{}", name, best_ver_str))?;
+            .unwrap_or_default();
 
         let mut deps = BTreeMap::new();
         for (d_name, d_range) in &ver_info.dependencies {
             deps.insert(d_name.clone(), d_range.clone());
         }
+
+        let mut opt_deps = BTreeMap::new();
+        for (d_name, d_range) in &ver_info.optional_dependencies {
+            opt_deps.insert(d_name.clone(), d_range.clone());
+        }
+
+        let os_list = if ver_info.os.is_empty() { None } else { Some(ver_info.os.as_slice()) };
+        let cpu_list = if ver_info.cpu.is_empty() { None } else { Some(ver_info.cpu.as_slice()) };
+        let libc_list = if ver_info.libc.is_empty() { None } else { Some(ver_info.libc.as_slice()) };
+
+        let host_platform = Platform::current();
+        let compatible = host_platform.matches_with_libc(os_list, cpu_list, libc_list);
+        let skipped = is_optional && !compatible;
 
         Ok(ResolvedNode {
             name: name.to_string(),
@@ -433,6 +713,12 @@ impl Installer {
             resolved_url: ver_info.dist.tarball.clone(),
             integrity,
             dependencies: deps,
+            optional_dependencies: opt_deps,
+            optional: is_optional,
+            skipped,
+            os: ver_info.os.clone(),
+            cpu: ver_info.cpu.clone(),
+            libc: ver_info.libc.clone(),
         })
     }
 

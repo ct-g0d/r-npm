@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct Platform {
     pub os: String,
     pub cpu: String,
+    pub libc: Option<String>,
 }
 
 impl Platform {
@@ -12,6 +13,19 @@ impl Platform {
         Self {
             os: os.into(),
             cpu: cpu.into(),
+            libc: None,
+        }
+    }
+
+    pub fn with_libc(
+        os: impl Into<String>,
+        cpu: impl Into<String>,
+        libc: Option<String>,
+    ) -> Self {
+        Self {
+            os: os.into(),
+            cpu: cpu.into(),
+            libc,
         }
     }
 
@@ -53,21 +67,44 @@ impl Platform {
             std::env::consts::ARCH
         };
 
+        let libc = if cfg!(target_os = "linux") {
+            if cfg!(target_env = "musl") {
+                Some("musl".to_string())
+            } else {
+                Some("glibc".to_string())
+            }
+        } else {
+            None
+        };
+
         Self {
             os: os.to_string(),
             cpu: cpu.to_string(),
+            libc,
         }
     }
 
     /// Evaluates if this platform matches both `os` and `cpu` constraints.
+    pub fn matches(&self, os_list: Option<&[String]>, cpu_list: Option<&[String]>) -> bool {
+        self.matches_with_libc(os_list, cpu_list, None)
+    }
+
+    /// Evaluates if this platform matches `os`, `cpu`, and optional `libc` constraints.
     ///
     /// Rules according to npm / package.json:
     /// - If list is None or empty: matches all.
     /// - If any negated item (starts with `!`) matches current: rejected.
     /// - If positive items exist, current MUST match at least one positive item.
     /// - If only negated items exist, passes as long as no negation matched.
-    pub fn matches(&self, os_list: Option<&[String]>, cpu_list: Option<&[String]>) -> bool {
-        self.matches_list(&self.os, os_list) && self.matches_list(&self.cpu, cpu_list)
+    pub fn matches_with_libc(
+        &self,
+        os_list: Option<&[String]>,
+        cpu_list: Option<&[String]>,
+        libc_list: Option<&[String]>,
+    ) -> bool {
+        self.matches_list(&self.os, os_list)
+            && self.matches_list(&self.cpu, cpu_list)
+            && self.matches_libc_list(libc_list)
     }
 
     fn matches_list(&self, current: &str, list_opt: Option<&[String]>) -> bool {
@@ -91,6 +128,42 @@ impl Platform {
                 has_positive = true;
                 if current.eq_ignore_ascii_case(item) {
                     matched_positive = true;
+                }
+            }
+        }
+
+        if has_positive {
+            matched_positive
+        } else {
+            true
+        }
+    }
+
+    fn matches_libc_list(&self, list_opt: Option<&[String]>) -> bool {
+        let Some(list) = list_opt else {
+            return true;
+        };
+        if list.is_empty() {
+            return true;
+        }
+
+        let mut has_positive = false;
+        let mut matched_positive = false;
+
+        for item in list {
+            let item = item.trim();
+            if let Some(negated) = item.strip_prefix('!') {
+                if let Some(ref current_libc) = self.libc {
+                    if current_libc.eq_ignore_ascii_case(negated.trim()) {
+                        return false;
+                    }
+                }
+            } else {
+                has_positive = true;
+                if let Some(ref current_libc) = self.libc {
+                    if current_libc.eq_ignore_ascii_case(item) {
+                        matched_positive = true;
+                    }
                 }
             }
         }
@@ -145,5 +218,31 @@ mod tests {
         // Empty / None
         assert!(win.matches(None, None));
         assert!(win.matches(Some(&[]), Some(&[])));
+    }
+
+    #[test]
+    fn test_platform_libc_matching() {
+        let linux_glibc = Platform::with_libc("linux", "x64", Some("glibc".to_string()));
+        let linux_musl = Platform::with_libc("linux", "x64", Some("musl".to_string()));
+        let win = Platform::new("win32", "x64");
+
+        let glibc_only = vec!["glibc".to_string()];
+        let musl_only = vec!["musl".to_string()];
+        let not_musl = vec!["!musl".to_string()];
+
+        // Glibc only
+        assert!(linux_glibc.matches_with_libc(None, None, Some(&glibc_only)));
+        assert!(!linux_musl.matches_with_libc(None, None, Some(&glibc_only)));
+        assert!(!win.matches_with_libc(None, None, Some(&glibc_only)));
+
+        // Musl only
+        assert!(!linux_glibc.matches_with_libc(None, None, Some(&musl_only)));
+        assert!(linux_musl.matches_with_libc(None, None, Some(&musl_only)));
+        assert!(!win.matches_with_libc(None, None, Some(&musl_only)));
+
+        // Negated musl (!musl)
+        assert!(linux_glibc.matches_with_libc(None, None, Some(&not_musl)));
+        assert!(!linux_musl.matches_with_libc(None, None, Some(&not_musl)));
+        assert!(win.matches_with_libc(None, None, Some(&not_musl)));
     }
 }

@@ -136,4 +136,73 @@ mod tests {
         let err = cache.put_blob(data, Some(&fake_integrity)).unwrap_err();
         assert!(matches!(err, CacheError::IntegrityMismatch { .. }));
     }
+
+    #[test]
+    fn test_concurrent_puts_and_locks() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path()).unwrap());
+
+        let mut handles = Vec::new();
+        // Spawn 8 concurrent threads putting both same and different keys
+        for i in 0..8 {
+            let cache_clone = Arc::clone(&cache);
+            let handle = thread::spawn(move || {
+                // Shared key contended by all threads
+                let shared_key = "https://registry.npmjs.org/shared/-/shared-1.0.0.tgz";
+                let shared_data = b"shared content written concurrently";
+                let entry1 = cache_clone.put(shared_key, shared_data, None).unwrap();
+                assert_eq!(entry1.size, shared_data.len() as u64);
+
+                // Unique key per thread
+                let unique_key = format!("https://registry.npmjs.org/pkg-{i}/-/pkg-{i}-1.0.0.tgz");
+                let unique_data = format!("unique content for thread {i}").into_bytes();
+                let entry2 = cache_clone.put(&unique_key, &unique_data, None).unwrap();
+                assert_eq!(entry2.size, unique_data.len() as u64);
+
+                // Verify immediate retrieval
+                let (_, retrieved) = cache_clone.get(&unique_key).unwrap().expect("Cache hit expected");
+                assert_eq!(retrieved, unique_data);
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("Worker thread panicked");
+        }
+
+        // Verify shared key is consistent and valid
+        let (_, retrieved_shared) = cache.get("https://registry.npmjs.org/shared/-/shared-1.0.0.tgz").unwrap().expect("Shared cache hit");
+        assert_eq!(retrieved_shared, b"shared content written concurrently");
+
+        // Verify no leftover .tmp files
+        let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(tmp_entries.len(), 0, "No orphaned temporary files in cache tmp directory");
+    }
+
+    #[test]
+    fn test_corrupt_index_auto_recovery() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let key = "https://registry.npmjs.org/bad-index/-/bad-index-1.0.0.tgz";
+        let data = b"some payload";
+        let _ = cache.put(key, data, None).unwrap();
+
+        let index_path = IndexEntry::path_for_key(cache.root(), key);
+        assert!(index_path.exists());
+
+        // Corrupt the index JSON with invalid syntax
+        std::fs::write(&index_path, b"{ not valid json syntax ...").unwrap();
+
+        // get() should handle corrupt JSON, purge the file, and return None (miss)
+        let res = cache.get(key).unwrap();
+        assert!(res.is_none(), "Corrupted index must return cache miss");
+        assert!(!index_path.exists(), "Corrupted index must be purged");
+    }
 }

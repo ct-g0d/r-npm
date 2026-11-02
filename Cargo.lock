@@ -1078,6 +1078,8 @@ name = "rnpm-install"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "data-encoding",
+ "flate2",
  "rnpm-cache",
  "rnpm-config",
  "rnpm-core",
@@ -1089,6 +1091,8 @@ dependencies = [
  "rnpm-solver",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1148,9 +1152,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rnpm-core",
+ "rnpm-lockfile",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
