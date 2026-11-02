@@ -43,6 +43,9 @@ pub struct Manifest {
     pub bin: Option<PackageBin>,
 
     #[serde(default)]
+    pub files: Option<Vec<String>>,
+
+    #[serde(default)]
     pub scripts: BTreeMap<String, String>,
 
     #[serde(default)]

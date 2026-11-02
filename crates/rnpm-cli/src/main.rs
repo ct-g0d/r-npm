@@ -67,7 +67,23 @@ enum Commands {
     },
 
     /// Pack project into a tarball archive
-    Pack,
+    Pack {
+        /// Target package directory or spec (defaults to current directory)
+        #[arg(default_value = ".")]
+        target: PathBuf,
+
+        /// Dry-run mode: do not write the tarball archive to disk
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output JSON summary instead of standard text notices
+        #[arg(long)]
+        json: bool,
+
+        /// Directory where the tarball should be created
+        #[arg(long)]
+        pack_destination: Option<PathBuf>,
+    },
 
     /// Remove a package from project dependencies
     Uninstall {
@@ -166,9 +182,76 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Pack => {
-            eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: 'pack' command workflow is scheduled for Phase 5.");
-            std::process::exit(1);
+        Commands::Pack {
+            target,
+            dry_run,
+            json,
+            pack_destination,
+        } => {
+            let package_dir = if target.is_absolute() {
+                target
+            } else {
+                current_dir.join(target)
+            };
+
+            let manifest_path = package_dir.join("package.json");
+            if !manifest_path.exists() {
+                eprintln!(
+                    "rnpm ERR! code ENOENT: package.json not found in {}",
+                    package_dir.display()
+                );
+                std::process::exit(1);
+            }
+
+            let (summary, tarball_bytes) = match rnpm_fs::pack_directory(
+                &package_dir,
+                None,
+            ) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("rnpm ERR! pack failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let dest_dir = pack_destination.unwrap_or_else(|| current_dir.clone());
+            let final_tarball_path = dest_dir.join(&summary.filename);
+
+            if !dry_run {
+                if let Err(e) = std::fs::write(&final_tarball_path, &tarball_bytes) {
+                    eprintln!(
+                        "rnpm ERR! failed to write {}: {e}",
+                        final_tarball_path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            if json {
+                let json_output = serde_json::json!([
+                    {
+                        "id": format!("{}@{}", summary.name, summary.version),
+                        "name": summary.name,
+                        "version": summary.version,
+                        "size": summary.package_size,
+                        "unpackedSize": summary.unpacked_size,
+                        "shasum": summary.shasum,
+                        "integrity": summary.integrity,
+                        "filename": summary.filename,
+                        "files": summary.files.iter().map(|f| serde_json::json!({
+                            "path": f.path,
+                            "size": f.size,
+                            "mode": f.mode,
+                        })).collect::<Vec<_>>(),
+                        "entryCount": summary.entry_count,
+                        "bundled": summary.bundled,
+                    }
+                ]);
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else {
+                print_pack_notices(&summary);
+                println!("{}", summary.filename);
+            }
         }
         Commands::Uninstall { .. } | Commands::Update { .. } => {
             eprintln!("rnpm ERR! code ERR_UNSUPPORTED_COMMAND: mutation workflow is scheduled for Phase 5.");
@@ -178,3 +261,52 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
+    eprintln!("npm notice");
+    eprintln!("npm notice package: {}@{}", summary.name, summary.version);
+    eprintln!("npm notice Tarball Contents");
+    for file in &summary.files {
+        eprintln!("npm notice {} {}", format_bytes(file.size, false), file.path);
+    }
+    if !summary.bundled.is_empty() {
+        eprintln!("npm notice Bundled Dependencies");
+        for b in &summary.bundled {
+            eprintln!("npm notice {b}");
+        }
+    }
+    eprintln!("npm notice Tarball Details");
+    eprintln!("npm notice name: {}", summary.name);
+    eprintln!("npm notice version: {}", summary.version);
+    eprintln!("npm notice filename: {}", summary.filename);
+    eprintln!("npm notice package size: {}", format_bytes(summary.package_size, true));
+    eprintln!("npm notice unpacked size: {}", format_bytes(summary.unpacked_size, true));
+    eprintln!("npm notice shasum: {}", summary.shasum);
+    let integrity_short = if summary.integrity.len() >= 80 {
+        format!("{}[...]{}", &summary.integrity[..20], &summary.integrity[summary.integrity.len().saturating_sub(14)..])
+    } else {
+        summary.integrity.clone()
+    };
+    eprintln!("npm notice integrity: {}", integrity_short);
+    if !summary.bundled.is_empty() {
+        eprintln!("npm notice bundled deps: {}", summary.bundled.len());
+        eprintln!("npm notice bundled files: {}", summary.entry_count.saturating_sub(summary.files.len()));
+        eprintln!("npm notice own files: {}", summary.files.len());
+    }
+    eprintln!("npm notice total files: {}", summary.entry_count);
+    eprintln!("npm notice");
+}
+
+fn format_bytes(bytes: u64, space: bool) -> String {
+    let spacer = if space { " " } else { "" };
+    if bytes < 1000 {
+        format!("{bytes}{spacer}B")
+    } else if bytes < 999_950 {
+        format!("{:.1}{spacer}kB", bytes as f64 / 1000.0)
+    } else if bytes < 999_950_000 {
+        format!("{:.1}{spacer}MB", bytes as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}{spacer}GB", bytes as f64 / 1_000_000_000.0)
+    }
+}
+
