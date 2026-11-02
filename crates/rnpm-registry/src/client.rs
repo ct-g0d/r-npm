@@ -2,8 +2,8 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, ETAG, IF_NONE_MATCH, LOCATION,
-    RETRY_AFTER, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, ETAG, IF_NONE_MATCH,
+    LOCATION, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode};
 use std::collections::HashSet;
@@ -53,6 +53,15 @@ pub const DEFAULT_INITIAL_RETRY_BACKOFF_MS: u64 = 100;
 
 /// Default maximum retry backoff duration in seconds.
 pub const DEFAULT_MAX_RETRY_BACKOFF_SECS: u64 = 5;
+
+/// Default maximum package size allowed for tarball downloads (512 MB).
+pub const DEFAULT_MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Default maximum metadata size allowed for packument JSON (16 MB).
+pub const DEFAULT_MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
+
+/// Default chunk idle timeout for streaming sockets (10 seconds).
+pub const DEFAULT_CHUNK_IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// Encodes a package name according to npm registry rules:
 /// Scoped packages `@scope/pkg` are encoded as `@scope%2fpkg`.
@@ -156,13 +165,63 @@ impl BytesFetchResult {
     }
 }
 
+/// Tarball download stream holding an owned concurrency semaphore permit.
+///
+/// Holding the permit tied to the stream guarantees that active streaming sockets
+/// do not leak concurrency permits or bypass maximum concurrency limits.
+#[derive(Debug)]
+pub struct TarballStream {
+    pub response: Response,
+    pub permit: OwnedSemaphorePermit,
+}
+
+impl TarballStream {
+    pub fn new(response: Response, permit: OwnedSemaphorePermit) -> Self {
+        Self { response, permit }
+    }
+
+    pub fn response(&self) -> &Response {
+        &self.response
+    }
+
+    pub fn response_mut(&mut self) -> &mut Response {
+        &mut self.response
+    }
+
+    pub fn into_parts(self) -> (Response, OwnedSemaphorePermit) {
+        (self.response, self.permit)
+    }
+
+    pub fn into_response(self) -> Response {
+        self.response
+    }
+
+    pub async fn chunk(&mut self) -> Result<Option<bytes::Bytes>, reqwest::Error> {
+        self.response.chunk().await
+    }
+}
+
+impl std::ops::Deref for TarballStream {
+    type Target = Response;
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+impl std::ops::DerefMut for TarballStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.response
+    }
+}
+
 /// Result of a conditional tarball response fetch.
 #[derive(Debug)]
 pub enum TarballFetchResult {
-    /// Server returned fresh tarball response (HTTP 200 OK) with optional ETag.
+    /// Server returned fresh tarball response (HTTP 200 OK) with optional ETag and held permit.
     Modified {
         response: Response,
         etag: Option<String>,
+        permit: OwnedSemaphorePermit,
     },
     /// Server returned HTTP 304 Not Modified.
     NotModified {
@@ -177,6 +236,13 @@ impl TarballFetchResult {
 
     pub fn is_not_modified(&self) -> bool {
         matches!(self, Self::NotModified { .. })
+    }
+
+    pub fn response(&self) -> Option<&Response> {
+        match self {
+            Self::Modified { response, .. } => Some(response),
+            Self::NotModified { .. } => None,
+        }
     }
 
     pub fn etag(&self) -> Option<&str> {
@@ -209,6 +275,9 @@ pub struct RegistryClientConfig {
     pub circuit_breaker_enabled: bool,
     pub circuit_breaker_failure_threshold: usize,
     pub circuit_breaker_reset_timeout: Duration,
+    pub max_package_size: u64,
+    pub max_metadata_size: usize,
+    pub chunk_idle_timeout: Duration,
 }
 
 impl Default for RegistryClientConfig {
@@ -245,6 +314,9 @@ impl Default for RegistryClientConfig {
             circuit_breaker_enabled: false,
             circuit_breaker_failure_threshold: 5,
             circuit_breaker_reset_timeout: Duration::from_secs(30),
+            max_package_size: DEFAULT_MAX_PACKAGE_SIZE,
+            max_metadata_size: DEFAULT_MAX_METADATA_SIZE,
+            chunk_idle_timeout: Duration::from_secs(DEFAULT_CHUNK_IDLE_TIMEOUT_SECS),
         }
     }
 }
@@ -570,7 +642,47 @@ impl RegistryClient {
         &self.config.default_registry
     }
 
+    /// Check whether a host is trusted to receive registry authorization headers.
+    /// A host is trusted if it matches the default registry, is listed in `trusted_hosts`,
+    /// or matches one of the `scoped_registries`.
+    pub fn is_trusted_host(&self, url: &Url) -> bool {
+        let host = match url.host_str() {
+            Some(h) => h.to_ascii_lowercase(),
+            None => return false,
+        };
+
+        if let Some(reg_host) = self.config.default_registry.host_str() {
+            if reg_host.eq_ignore_ascii_case(&host)
+                && self.config.default_registry.port_or_known_default() == url.port_or_known_default()
+            {
+                return true;
+            }
+        }
+
+        if let Some(port) = url.port_or_known_default() {
+            if self.config.trusted_hosts.contains(&format!("{host}:{port}")) {
+                return true;
+            }
+        }
+        if self.config.trusted_hosts.contains(&host) {
+            return true;
+        }
+
+        for scoped_reg in self.config.scoped_registries.values() {
+            if let Some(shost) = scoped_reg.host_str() {
+                if shost.eq_ignore_ascii_case(&host)
+                    && scoped_reg.port_or_known_default() == url.port_or_known_default()
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Retrieve the auth token for a target URL if configured in `auth_tokens` or fallback to `auth_token`.
+    /// Never returns the fallback registry auth token to untrusted hosts.
     pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
         let host = url.host_str()?;
         let host_lower = host.to_ascii_lowercase();
@@ -604,7 +716,13 @@ impl RegistryClient {
                 return Some(token.as_str());
             }
         }
-        self.config.auth_token.as_deref()
+
+        // Hardening: Fallback to self.config.auth_token ONLY if the host is trusted
+        if self.is_trusted_host(url) {
+            self.config.auth_token.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Acquire an owned permit from the bounded concurrency semaphore.
@@ -637,7 +755,42 @@ impl RegistryClient {
     }
 
     /// Check if target URL is trusted to receive authorization headers.
+    /// When following redirects or downloading tarballs, never forward registry auth token
+    /// to untrusted cross-origin hosts.
     pub fn is_trusted_target(&self, initial_url: &Url, current_url: &Url) -> bool {
+        let host = match current_url.host_str() {
+            Some(h) => h.to_ascii_lowercase(),
+            None => return false,
+        };
+
+        // If explicitly defined in auth_tokens map for this URL, that specific host token is allowed
+        let has_explicit_token = {
+            let port_part = if let Some(port) = current_url.port() {
+                format!(":{port}")
+            } else {
+                String::new()
+            };
+            let path = current_url.path();
+            let normalized_path = if path.ends_with('/') {
+                path.to_string()
+            } else {
+                format!("{path}/")
+            };
+            self.config.auth_tokens.contains_key(&format!("//{host}{port_part}{normalized_path}"))
+                || self.config.auth_tokens.contains_key(&format!("//{host}{port_part}{path}"))
+                || self.config.auth_tokens.contains_key(&format!("//{host}{port_part}/"))
+                || (!port_part.is_empty() && self.config.auth_tokens.contains_key(&format!("//{host}/")))
+        };
+
+        if has_explicit_token {
+            return true;
+        }
+
+        // To receive the registry auth token, BOTH initial_url and current_url MUST be trusted hosts!
+        if !self.is_trusted_host(initial_url) || !self.is_trusted_host(current_url) {
+            return false;
+        }
+
         let same_origin = initial_url.scheme() == current_url.scheme()
             && initial_url.host_str().map(|s| s.to_ascii_lowercase())
                 == current_url.host_str().map(|s| s.to_ascii_lowercase())
@@ -647,26 +800,7 @@ impl RegistryClient {
             return true;
         }
 
-        if let Some(host) = current_url.host_str() {
-            let host_lower = host.to_ascii_lowercase();
-            if self.config.trusted_hosts.contains(&host_lower) {
-                return true;
-            }
-            if let Some(port) = current_url.port_or_known_default() {
-                if self.config.trusted_hosts.contains(&format!("{host_lower}:{port}")) {
-                    return true;
-                }
-            }
-            for scoped_reg in self.config.scoped_registries.values() {
-                if let Some(shost) = scoped_reg.host_str() {
-                    if shost.eq_ignore_ascii_case(host) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+        self.is_trusted_host(current_url)
     }
 
     /// Execute a request under semaphore permit with redirect security and retry backoff.
@@ -947,7 +1081,7 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
-        let (resp, _permit) = self
+        let (mut resp, _permit) = self
             .execute_with_permit(
                 Method::GET,
                 url.clone(),
@@ -1011,7 +1145,64 @@ impl RegistryClient {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        let metadata: AbbreviatedPackageMetadata = resp.json().await?;
+        let expected_content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| resp.content_length());
+
+        if let Some(content_length) = expected_content_length {
+            if content_length > self.config.max_metadata_size as u64 {
+                return Err(RegistryError::SizeLimitExceeded {
+                    limit: self.config.max_metadata_size as u64,
+                    actual: content_length,
+                    message: format!("Metadata Content-Length for package '{package_name}' exceeds maximum metadata size"),
+                });
+            }
+        }
+
+        let mut bytes = Vec::new();
+        loop {
+            let chunk_res = tokio::time::timeout(
+                self.config.chunk_idle_timeout,
+                resp.chunk(),
+            ).await;
+
+            let chunk_opt = match chunk_res {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(e)) => return Err(RegistryError::Http(e)),
+                Err(_) => {
+                    return Err(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                }
+            };
+
+            match chunk_opt {
+                Some(chunk) => {
+                    if bytes.len() + chunk.len() > self.config.max_metadata_size {
+                        return Err(RegistryError::SizeLimitExceeded {
+                            limit: self.config.max_metadata_size as u64,
+                            actual: (bytes.len() + chunk.len()) as u64,
+                            message: format!("Metadata payload for package '{package_name}' exceeds maximum metadata size"),
+                        });
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                None => break,
+            }
+        }
+
+        if let Some(content_length) = expected_content_length {
+            if bytes.len() as u64 != content_length {
+                return Err(RegistryError::ContentLengthMismatch {
+                    expected: content_length,
+                    actual: bytes.len() as u64,
+                });
+            }
+        }
+
+        let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
+        metadata.validate()?;
         Ok(MetadataFetchResult::Fresh { metadata, etag })
     }
 
@@ -1046,17 +1237,23 @@ impl RegistryClient {
     }
 
     /// Download a tarball stream from URL, safely following redirects.
-    pub async fn download_tarball(&self, tarball_url: &str) -> Result<Response, RegistryError> {
-        let (resp, _permit) = self.download_tarball_stream(tarball_url).await?;
-        Ok(resp)
+    pub async fn download_tarball(&self, tarball_url: &str) -> Result<TarballStream, RegistryError> {
+        self.download_tarball_stream(tarball_url).await
     }
 
     /// Download a tarball stream while maintaining an owned concurrency permit.
     pub async fn download_tarball_stream(
         &self,
         tarball_url: &str,
-    ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
+    ) -> Result<TarballStream, RegistryError> {
         let url = Url::parse(tarball_url)?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+            )));
+        }
+
         let (resp, permit) = self
             .execute_with_permit(Method::GET, url.clone(), None, None)
             .await?;
@@ -1100,7 +1297,7 @@ impl RegistryClient {
             });
         }
 
-        Ok((resp, permit))
+        Ok(TarballStream { response: resp, permit })
     }
 
     /// Download a tarball response conditionally using ETag (`If-None-Match`).
@@ -1110,7 +1307,14 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<TarballFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let (resp, _permit) = self
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+            )));
+        }
+
+        let (resp, permit) = self
             .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
             .await?;
 
@@ -1172,6 +1376,7 @@ impl RegistryClient {
         Ok(TarballFetchResult::Modified {
             response: resp,
             etag,
+            permit,
         })
     }
 
@@ -1195,6 +1400,13 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<BytesFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+            )));
+        }
+
         let host_key = if let Some(port) = url.port() {
             format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
@@ -1203,7 +1415,7 @@ impl RegistryClient {
 
         let mut stream_attempt = 0;
         loop {
-            let (resp, _permit) = self
+            let (mut resp, _permit) = self
                 .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
                 .await?;
 
@@ -1262,32 +1474,94 @@ impl RegistryClient {
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
 
-            match resp.bytes().await {
-                Ok(bytes) => {
-                    return Ok(BytesFetchResult::Fresh {
-                        bytes: bytes.to_vec(),
-                        etag,
+            let expected_content_length = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| resp.content_length());
+
+            if let Some(content_length) = expected_content_length {
+                if content_length > self.config.max_package_size {
+                    return Err(RegistryError::SizeLimitExceeded {
+                        limit: self.config.max_package_size,
+                        actual: content_length,
+                        message: format!("Tarball Content-Length for '{tarball_url}' exceeds maximum package size"),
                     });
                 }
-                Err(err) => {
-                    if stream_attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                            .min(self.config.max_retry_backoff);
-                        debug!(
-                            "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
-                            err, url, delay, stream_attempt + 1, self.config.max_retries
-                        );
-                        tokio::time::sleep(delay).await;
-                        stream_attempt += 1;
-                        continue;
-                    } else {
-                        if self.config.circuit_breaker_enabled {
-                            self.circuit_breaker.record_failure(&host_key).await;
-                        }
-                        return Err(RegistryError::Http(err));
+            }
+
+            let mut bytes = Vec::new();
+            let mut stream_err = None;
+
+            loop {
+                let chunk_res = tokio::time::timeout(
+                    self.config.chunk_idle_timeout,
+                    resp.chunk(),
+                ).await;
+
+                let chunk_opt = match chunk_res {
+                    Ok(Ok(opt)) => opt,
+                    Ok(Err(err)) => {
+                        stream_err = Some(RegistryError::Http(err));
+                        break;
                     }
+                    Err(_) => {
+                        stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                        break;
+                    }
+                };
+
+                match chunk_opt {
+                    Some(chunk) => {
+                        if (bytes.len() as u64) + (chunk.len() as u64) > self.config.max_package_size {
+                            stream_err = Some(RegistryError::SizeLimitExceeded {
+                                limit: self.config.max_package_size,
+                                actual: (bytes.len() as u64) + (chunk.len() as u64),
+                                message: format!("Tarball payload for '{tarball_url}' exceeds maximum package size"),
+                            });
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    None => break,
                 }
             }
+
+            if let Some(err) = stream_err {
+                match err {
+                    RegistryError::Http(err) => {
+                        if stream_attempt < self.config.max_retries {
+                            let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                                .min(self.config.max_retry_backoff);
+                            debug!(
+                                "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                                err, url, delay, stream_attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            stream_attempt += 1;
+                            continue;
+                        } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
+                            return Err(RegistryError::Http(err));
+                        }
+                    }
+                    non_retryable => return Err(non_retryable),
+                }
+            }
+
+            if let Some(content_length) = expected_content_length {
+                if bytes.len() as u64 != content_length {
+                    return Err(RegistryError::ContentLengthMismatch {
+                        expected: content_length,
+                        actual: bytes.len() as u64,
+                    });
+                }
+            }
+
+            return Ok(BytesFetchResult::Fresh { bytes, etag });
         }
     }
 
@@ -1328,17 +1602,31 @@ impl RegistryClient {
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
         let url = Url::parse(tarball_url)?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+            )));
+        }
+
         let host_key = if let Some(port) = url.port() {
             format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
             url.host_str().unwrap_or_default().to_ascii_lowercase()
         };
 
-        if let Some(parent) = dest_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
-            })?;
-        }
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
+        })?;
+
+        let temp_path = {
+            let file_name = dest_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("download");
+            parent.join(format!("{file_name}.part"))
+        };
 
         let mut stream_attempt = 0;
         loop {
@@ -1385,56 +1673,120 @@ impl RegistryClient {
                 });
             }
 
-            let mut file = tokio::fs::File::create(dest_path).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to create {}: {e}", dest_path.display()))
+            let expected_content_length = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| resp.content_length());
+
+            if let Some(content_length) = expected_content_length {
+                if content_length > self.config.max_package_size {
+                    return Err(RegistryError::SizeLimitExceeded {
+                        limit: self.config.max_package_size,
+                        actual: content_length,
+                        message: format!("Tarball Content-Length for '{tarball_url}' exceeds maximum package size"),
+                    });
+                }
+            }
+
+            let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+                RegistryError::Other(format!("Failed to create {}: {e}", temp_path.display()))
             })?;
 
             let mut written: u64 = 0;
             let mut stream_err = None;
 
             loop {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => {
+                let chunk_res = tokio::time::timeout(
+                    self.config.chunk_idle_timeout,
+                    resp.chunk(),
+                ).await;
+
+                let chunk_opt = match chunk_res {
+                    Ok(Ok(opt)) => opt,
+                    Ok(Err(err)) => {
+                        stream_err = Some(RegistryError::Http(err));
+                        break;
+                    }
+                    Err(_) => {
+                        stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                        break;
+                    }
+                };
+
+                match chunk_opt {
+                    Some(chunk) => {
+                        if written + (chunk.len() as u64) > self.config.max_package_size {
+                            stream_err = Some(RegistryError::SizeLimitExceeded {
+                                limit: self.config.max_package_size,
+                                actual: written + (chunk.len() as u64),
+                                message: format!("Tarball payload for '{tarball_url}' exceeds maximum package size"),
+                            });
+                            break;
+                        }
                         if let Err(e) = file.write_all(&chunk).await {
-                            return Err(RegistryError::Other(format!(
+                            stream_err = Some(RegistryError::Other(format!(
                                 "Failed to write chunk to {}: {e}",
-                                dest_path.display()
+                                temp_path.display()
                             )));
+                            break;
                         }
                         written += chunk.len() as u64;
                     }
-                    Ok(None) => break,
-                    Err(err) => {
-                        stream_err = Some(err);
-                        break;
-                    }
+                    None => break,
                 }
             }
 
             if let Some(err) = stream_err {
                 drop(file);
-                let _ = tokio::fs::remove_file(dest_path).await;
+                let _ = tokio::fs::remove_file(&temp_path).await;
 
-                if stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                        .min(self.config.max_retry_backoff);
-                    debug!(
-                        "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
-                        err, url, delay, stream_attempt + 1, self.config.max_retries
-                    );
-                    tokio::time::sleep(delay).await;
-                    stream_attempt += 1;
-                    continue;
-                } else {
-                    if self.config.circuit_breaker_enabled {
-                        self.circuit_breaker.record_failure(&host_key).await;
+                match err {
+                    RegistryError::Http(err) => {
+                        if stream_attempt < self.config.max_retries {
+                            let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                                .min(self.config.max_retry_backoff);
+                            debug!(
+                                "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                                err, url, delay, stream_attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            stream_attempt += 1;
+                            continue;
+                        } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
+                            return Err(RegistryError::Http(err));
+                        }
                     }
-                    return Err(RegistryError::Http(err));
+                    non_retryable => return Err(non_retryable),
+                }
+            }
+
+            if let Some(content_length) = expected_content_length {
+                if written != content_length {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(RegistryError::ContentLengthMismatch {
+                        expected: content_length,
+                        actual: written,
+                    });
                 }
             }
 
             file.flush().await.map_err(|e| {
-                RegistryError::Other(format!("Failed to flush {}: {e}", dest_path.display()))
+                RegistryError::Other(format!("Failed to flush {}: {e}", temp_path.display()))
+            })?;
+            drop(file);
+
+            tokio::fs::rename(&temp_path, dest_path).await.map_err(|e| {
+                RegistryError::Other(format!(
+                    "Failed to rename {} to {}: {e}",
+                    temp_path.display(),
+                    dest_path.display()
+                ))
             })?;
 
             return Ok(written);

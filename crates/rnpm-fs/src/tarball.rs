@@ -27,6 +27,8 @@ pub struct TarLimits {
     pub max_compression_ratio: f64,
     pub max_single_entry_size: u64,
     pub max_symlinks: usize,
+    pub max_path_depth: usize,
+    pub max_directories: usize,
 }
 
 impl Default for TarLimits {
@@ -37,6 +39,8 @@ impl Default for TarLimits {
             max_compression_ratio: 100.0,
             max_single_entry_size: 256 * 1024 * 1024, // 256 MB
             max_symlinks: 5_000,
+            max_path_depth: 32,
+            max_directories: 10_000,
         }
     }
 }
@@ -100,14 +104,27 @@ pub fn extract_tar_gz<R: Read>(
     let mut archive = Archive::new(gz);
 
     let mut entry_count = 0;
+    let mut directory_count = 0usize;
     let mut symlink_count = 0;
     let mut total_uncompressed = 0u64;
     let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
+    let mut extracted_regular_files: HashSet<PathBuf> = HashSet::new();
+    let mut seen_paths_lower: HashSet<String> = HashSet::new();
+    let mut seen_dirs_lower: HashSet<String> = HashSet::new();
+    let mut seen_files_lower: HashSet<String> = HashSet::new();
+    let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
     for entry_res in entries {
         let mut entry = entry_res.map_err(FsError::Io)?;
+
+        let entry_type = entry.header().entry_type();
+
+        // Skip EntryType::XGlobalHeader without failing validation
+        if entry_type == tar::EntryType::XGlobalHeader || entry_type.as_byte() == b'g' {
+            continue;
+        }
 
         entry_count += 1;
         if entry_count > limits.max_entries {
@@ -126,8 +143,40 @@ pub fn extract_tar_gz<R: Read>(
             });
         }
 
+        // Check non-UTF-8 path bytes before entry.path()
+        let path_bytes = entry.path_bytes();
+        if std::str::from_utf8(&path_bytes).is_err() {
+            return Err(FsError::InvalidUtf8Path {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            });
+        }
+
         // Get raw entry path
-        let raw_path = entry.path().map_err(FsError::Io)?.to_path_buf();
+        let raw_path = match entry.path() {
+            Ok(p) => p.to_path_buf(),
+            Err(_) if std::str::from_utf8(&path_bytes).is_err() => {
+                return Err(FsError::InvalidUtf8Path {
+                    path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+                });
+            }
+            Err(e) => return Err(FsError::Io(e)),
+        };
+
+        // Reject sparse entries: entry_type.as_byte() == b'S' or PAX sparse attributes
+        let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
+        let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
+            extensions.filter_map(|e| e.ok()).any(|ext| {
+                ext.key().map(|k| k.starts_with("GNU.sparse.")).unwrap_or(false)
+                    || ext.key_bytes().starts_with(b"GNU.sparse.")
+            })
+        } else {
+            false
+        };
+        if is_sparse || has_pax_sparse {
+            return Err(FsError::ForbiddenSparseFile {
+                path: raw_path,
+            });
+        }
 
         // Security check raw path before stripping prefix
         validate_entry_path(&raw_path)?;
@@ -144,19 +193,110 @@ pub fn extract_tar_gz<R: Read>(
         // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
         validate_entry_path(&relative_path)?;
 
-        let target_path = destination.join(&relative_path);
+        // Check path depth: count components; if deeper than limits.max_path_depth
+        let path_depth = relative_path.components().filter(|c| matches!(c, Component::Normal(_))).count();
+        if path_depth > limits.max_path_depth {
+            return Err(FsError::TarBombLimitExceeded {
+                limit_type: "path depth".to_string(),
+                detail: format!(
+                    "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
+                    path_depth, limits.max_path_depth, relative_path.display()
+                ),
+            });
+        }
 
-        // Security check against Symlink Slip:
-        // Ensure no ancestor directory between destination and target_path is a symlink or junction
-        ensure_no_symlink_ancestors(&target_path, destination)?;
+        // Track directory count: if directories exceed limits.max_directories
+        if entry_type.is_dir() {
+            directory_count += 1;
+            if directory_count > limits.max_directories {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "directory count".to_string(),
+                    detail: format!(
+                        "Tarball exceeded maximum allowed directories: {}",
+                        limits.max_directories
+                    ),
+                });
+            }
+        }
 
         // Check special entry types: FIFOs, block/character devices
-        let entry_type = entry.header().entry_type();
         if entry_type.is_block_special() || entry_type.is_character_special() || entry_type.is_fifo() {
             return Err(FsError::ForbiddenSpecialEntry {
                 path: raw_path,
             });
         }
+
+        // Track lowercase paths: maintain seen_paths_lower: HashSet<String>.
+        // Before extracting a file, symlink, or directory, check if relative_path.to_string_lossy().to_ascii_lowercase()
+        // is already present. If so, return FsError::CaseCollision.
+        let norm_lower = relative_path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let raw_lower = relative_path.to_string_lossy().to_ascii_lowercase();
+
+        if seen_paths_lower.contains(&norm_lower) || seen_paths_lower.contains(&raw_lower) {
+            return Err(FsError::CaseCollision {
+                path: relative_path.clone(),
+            });
+        }
+
+        // Case collision check between files and directory ancestors
+        let path_segments: Vec<&str> = norm_lower.split('/').collect();
+        if entry_type.is_dir() {
+            if seen_files_lower.contains(&norm_lower) {
+                return Err(FsError::CaseCollision {
+                    path: relative_path.clone(),
+                });
+            }
+            seen_dirs_lower.insert(norm_lower.clone());
+            let mut prefix = String::new();
+            for seg in &path_segments {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(seg);
+                if seen_files_lower.contains(&prefix) {
+                    return Err(FsError::CaseCollision {
+                        path: relative_path.clone(),
+                    });
+                }
+                seen_dirs_lower.insert(prefix.clone());
+            }
+        } else {
+            if seen_dirs_lower.contains(&norm_lower) {
+                return Err(FsError::CaseCollision {
+                    path: relative_path.clone(),
+                });
+            }
+            seen_files_lower.insert(norm_lower.clone());
+            let mut prefix = String::new();
+            for seg in &path_segments[..path_segments.len().saturating_sub(1)] {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(seg);
+                if seen_files_lower.contains(&prefix) {
+                    return Err(FsError::CaseCollision {
+                        path: relative_path.clone(),
+                    });
+                }
+                seen_dirs_lower.insert(prefix.clone());
+            }
+        }
+
+        seen_paths_lower.insert(norm_lower);
+        seen_paths_lower.insert(raw_lower);
+
+        let target_path = destination.join(&relative_path);
+
+        // Security check against Symlink Slip:
+        // Ensure no ancestor directory between destination and target_path is a symlink or junction
+        ensure_no_symlink_ancestors(&target_path, destination)?;
 
         // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -171,20 +311,29 @@ pub fn extract_tar_gz<R: Read>(
                 });
             }
 
+            if let Some(link_bytes) = entry.link_name_bytes() {
+                if std::str::from_utf8(&link_bytes).is_err() {
+                    return Err(FsError::InvalidUtf8Path {
+                        path: PathBuf::from(String::from_utf8_lossy(&link_bytes).into_owned()),
+                    });
+                }
+            }
+
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
                 // For hardlinks, the target is often archived as package/...
                 let normalized_target = strip_package_prefix(&link_target)
                     .unwrap_or_else(|| link_target.to_path_buf());
-                let cleaned_rel = validate_link_target(&relative_path, &normalized_target, destination)?;
-
-                if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-
-                // If target_path exists, safely unlink it (handling Windows junctions) before creating link
-                unlink_target_path(&target_path);
 
                 if entry_type.is_symlink() {
+                    let cleaned_rel = validate_link_target(&relative_path, &normalized_target, destination)?;
+
+                    if let Some(parent) = target_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    // If target_path exists, safely unlink it (handling Windows junctions) before creating link
+                    unlink_target_path(&target_path);
+
                     symlink_paths.insert(relative_path.clone());
                     #[cfg(unix)]
                     {
@@ -200,27 +349,90 @@ pub fn extract_tar_gz<R: Read>(
                         }
                     }
                 } else if entry_type.is_hard_link() {
-                    let source_full = destination.join(&cleaned_rel);
-                    #[cfg(windows)]
-                    let is_symlink_or_junction = source_full.is_symlink()
-                        || crate::junction::is_junction(&source_full).unwrap_or(false);
-                    #[cfg(not(windows))]
-                    let is_symlink_or_junction = source_full.is_symlink();
+                    // Hardlinks in tar are relative to archive root (destination), NOT relative to link_dir!
+                    if normalized_target.is_absolute() || normalized_target.has_root() {
+                        return Err(FsError::AbsolutePath {
+                            path: normalized_target,
+                        });
+                    }
 
-                    if symlink_paths.contains(&cleaned_rel) || is_symlink_or_junction {
+                    for comp in normalized_target.components() {
+                        if matches!(comp, Component::Prefix(_) | Component::RootDir) {
+                            return Err(FsError::AbsolutePath {
+                                path: normalized_target,
+                            });
+                        }
+                    }
+
+                    let cleaned_target = clean(&normalized_target);
+
+                    // If cleaned target starts with '..' or is root/absolute, it escapes destination
+                    if cleaned_target.starts_with("..") || cleaned_target.is_absolute() || cleaned_target.has_root() {
                         return Err(FsError::EscapingSymlink {
                             link: relative_path.clone(),
                             target: normalized_target,
                         });
                     }
 
-                    if source_full.exists() {
-                        if fs::hard_link(&source_full, &target_path).is_err() {
-                            if source_full.is_file() {
-                                let _ = fs::copy(&source_full, &target_path);
-                            }
+                    validate_entry_path(&cleaned_target)?;
+
+                    let source_full = destination.join(&cleaned_target);
+
+                    #[cfg(windows)]
+                    let is_symlink_or_junction = source_full.is_symlink()
+                        || crate::junction::is_junction(&source_full).unwrap_or(false);
+                    #[cfg(not(windows))]
+                    let is_symlink_or_junction = source_full.is_symlink();
+
+                    if symlink_paths.contains(&cleaned_target) || is_symlink_or_junction {
+                        return Err(FsError::EscapingSymlink {
+                            link: relative_path.clone(),
+                            target: normalized_target,
+                        });
+                    }
+
+                    // Check for circular hardlink
+                    if cleaned_target == relative_path {
+                        return Err(FsError::CircularHardlink {
+                            link: relative_path.clone(),
+                            target: normalized_target,
+                        });
+                    }
+                    let mut curr = cleaned_target.clone();
+                    let mut visited = HashSet::new();
+                    visited.insert(relative_path.clone());
+                    while let Some(next) = hardlink_targets.get(&curr) {
+                        if !visited.insert(curr.clone()) || curr == relative_path {
+                            return Err(FsError::CircularHardlink {
+                                link: relative_path.clone(),
+                                target: normalized_target,
+                            });
+                        }
+                        curr = next.clone();
+                    }
+
+                    // Reject dangling hardlinks: hardlinks can only point to previously extracted regular files
+                    if !extracted_regular_files.contains(&cleaned_target) || !source_full.exists() {
+                        return Err(FsError::DanglingHardlink {
+                            link: relative_path.clone(),
+                            target: normalized_target,
+                        });
+                    }
+
+                    if let Some(parent) = target_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    unlink_target_path(&target_path);
+
+                    if fs::hard_link(&source_full, &target_path).is_err() {
+                        if source_full.is_file() {
+                            let _ = fs::copy(&source_full, &target_path);
                         }
                     }
+
+                    hardlink_targets.insert(relative_path.clone(), cleaned_target);
+                    extracted_regular_files.insert(relative_path.clone());
                 }
             }
             continue;
@@ -362,6 +574,7 @@ pub fn extract_tar_gz<R: Read>(
                     }
                 }
             }
+            extracted_regular_files.insert(relative_path.clone());
         }
     }
 
@@ -460,8 +673,14 @@ pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
-/// Validates that path contains no traversal, absolute prefixes, Windows device names, or trailing dots/spaces.
+/// Validates that path contains no traversal, absolute prefixes, Windows device names, trailing dots/spaces, or non-UTF-8 components.
 pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
+    if path.to_str().is_none() {
+        return Err(FsError::InvalidUtf8Path {
+            path: path.to_path_buf(),
+        });
+    }
+
     if path.is_absolute() {
         return Err(FsError::AbsolutePath {
             path: path.to_path_buf(),
@@ -482,7 +701,14 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
             }
             Component::CurDir => continue,
             Component::Normal(os_str) => {
-                let name = os_str.to_string_lossy();
+                let name = match os_str.to_str() {
+                    Some(s) => s,
+                    None => {
+                        return Err(FsError::InvalidUtf8Path {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                };
 
                 // Reject null bytes, colons, or backslashes (Windows Alternate Data Streams, drive colons, or traversal)
                 if name.contains('\0') || name.contains(':') || name.contains('\\') {

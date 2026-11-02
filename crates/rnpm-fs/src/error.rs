@@ -12,6 +12,21 @@ pub enum FsError {
     #[error("Symlink target '{target}' escapes destination for link '{link}'")]
     EscapingSymlink { link: PathBuf, target: PathBuf },
 
+    #[error("Case collision detected for path: '{path}'")]
+    CaseCollision { path: PathBuf },
+
+    #[error("Non-UTF-8 path detected in tarball entry: '{path}'")]
+    InvalidUtf8Path { path: PathBuf },
+
+    #[error("Forbidden sparse file in tarball entry: '{path}'")]
+    ForbiddenSparseFile { path: PathBuf },
+
+    #[error("Dangling hardlink '{link}' targets non-existent entry '{target}'")]
+    DanglingHardlink { link: PathBuf, target: PathBuf },
+
+    #[error("Circular hardlink detected: link '{link}' to target '{target}'")]
+    CircularHardlink { link: PathBuf, target: PathBuf },
+
     #[error("Windows reserved device name rejected: '{name}' in path '{path}'")]
     WindowsReservedDeviceName { name: String, path: PathBuf },
 
