@@ -1,0 +1,50 @@
+{
+  "lodash": [
+    {
+      "id": 1065,
+      "name": "lodash",
+      "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw",
+      "title": "Prototype Pollution in lodash",
+      "severity": "high",
+      "vulnerable_versions": "<4.17.21",
+      "cwe": ["CWE-1321"],
+      "cvss": { "score": 7.4 }
+    }
+  ],
+  "minimist": [
+    {
+      "id": 1003,
+      "name": "minimist",
+      "url": "https://github.com/advisories/GHSA-vh95-rmgr-6w4m",
+      "title": "Prototype Pollution in minimist",
+      "severity": "critical",
+      "vulnerable_versions": "<1.2.6",
+      "cwe": ["CWE-1321"],
+      "cvss": { "score": 9.8 }
+    }
+  ],
+  "marked": [
+    {
+      "id": 1002,
+      "name": "marked",
+      "url": "https://github.com/advisories/GHSA-rrrm-qjm4-4p7v",
+      "title": "Regular Expression Denial of Service in marked",
+      "severity": "moderate",
+      "vulnerable_versions": "<4.0.10",
+      "cwe": ["CWE-1333"],
+      "cvss": { "score": 5.3 }
+    }
+  ],
+  "debug": [
+    {
+      "id": 1004,
+      "name": "debug",
+      "url": "https://github.com/advisories/GHSA-g7hh-rhg4-9x7w",
+      "title": "Regular Expression Denial of Service in debug",
+      "severity": "low",
+      "vulnerable_versions": "<2.6.9",
+      "cwe": ["CWE-1333"],
+      "cvss": { "score": 3.7 }
+    }
+  ]
+}

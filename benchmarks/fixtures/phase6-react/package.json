@@ -1,0 +1,14 @@
+{
+  "name": "phase6-react",
+  "version": "1.0.0",
+  "description": "Phase 6 Real-Project Compatibility Corpus: react fixture",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}

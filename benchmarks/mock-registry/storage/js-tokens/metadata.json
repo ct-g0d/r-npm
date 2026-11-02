@@ -1,0 +1,25 @@
+{
+  "_id": "js-tokens",
+  "name": "js-tokens",
+  "dist-tags": {
+    "latest": "4.0.0"
+  },
+  "versions": {
+    "4.0.0": {
+      "name": "js-tokens",
+      "version": "4.0.0",
+      "description": "The tiny regex-powered JavaScript lexer mock",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "c503425edc308bf33f6ce4aea32e93195abff129",
+        "integrity": "sha512-ZKJKr53kziqKgMR8KQstwxDMSgvn8bxFrIIMPi/uQui9eVev5omrRnfCrJyiJsz78MXbg7swIPmIFSSobIBRHA==",
+        "tarball": "http://127.0.0.1:4873/js-tokens/-/js-tokens-4.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

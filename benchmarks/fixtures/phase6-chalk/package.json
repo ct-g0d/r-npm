@@ -1,0 +1,13 @@
+{
+  "name": "phase6-chalk",
+  "version": "1.0.0",
+  "description": "Phase 6 Real-Project Compatibility Corpus: chalk fixture",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2"
+  }
+}

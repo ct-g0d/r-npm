@@ -1,0 +1,10 @@
+{
+  "name": "phase6-audit-vuln",
+  "version": "1.0.0",
+  "description": "Phase 6 fixture with vulnerable dependencies for rnpm audit verification",
+  "private": true,
+  "dependencies": {
+    "lodash": "4.17.20",
+    "minimist": "1.2.5"
+  }
+}

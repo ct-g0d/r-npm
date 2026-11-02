@@ -1,0 +1,14 @@
+{
+  "name": "phase6-prettier",
+  "version": "1.0.0",
+  "description": "Phase 6 Real-Project Compatibility Corpus: prettier fixture",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "prettier-version": "prettier --version"
+  },
+  "dependencies": {
+    "prettier": "^3.2.5"
+  }
+}

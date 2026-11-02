@@ -1,0 +1,27 @@
+{
+  "_id": "ansi-styles",
+  "name": "ansi-styles",
+  "dist-tags": {
+    "latest": "4.3.0"
+  },
+  "versions": {
+    "4.3.0": {
+      "name": "ansi-styles",
+      "version": "4.3.0",
+      "description": "ANSI escape codes for styling strings in the terminal mock",
+      "main": "index.js",
+      "dependencies": {
+        "color-convert": "^2.0.1"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "25119503fd04e2c6897ebb4388dcd6fdd908f5c8",
+        "integrity": "sha512-3V96bYsoF2aOe3IjYrYjdT5pRSAie3tvssanXGdmGJ6d7Uo5iPm00Jsyi0SKxFSM4ED+BNYMdYt8psOdDaoh5w==",
+        "tarball": "http://127.0.0.1:4873/ansi-styles/-/ansi-styles-4.3.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

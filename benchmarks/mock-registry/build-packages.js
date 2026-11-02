@@ -703,6 +703,202 @@ for (let i = 1; i <= 110; i++) {
     });
 }
 
+// ==========================================
+// Phase 6: Real-Project Compatibility Corpus Packages
+// lodash, chalk, react, prettier + dependencies & advisory fixtures
+// ==========================================
+PACKAGES.push({
+    name: 'lodash',
+    version: '4.17.20',
+    description: 'Lodash modular utilities mock v4.17.20 (vulnerable)',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = { isArray: Array.isArray, isObject: (v) => typeof v === "object", version: "4.17.20" };\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'lodash',
+    version: '4.17.21',
+    description: 'Lodash modular utilities mock v4.17.21 (patched)',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = { isArray: Array.isArray, isObject: (v) => typeof v === "object", version: "4.17.21" };\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'has-flag',
+    version: '4.0.0',
+    description: 'Check if argv has a specific flag mock',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = () => false;\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'supports-color',
+    version: '7.2.0',
+    description: 'Detect whether a terminal supports color mock',
+    main: 'index.js',
+    dependencies: {
+        'has-flag': '^4.0.0'
+    },
+    files: {
+        'package/index.js': 'module.exports = { stdout: { level: 2, hasBasic: true } };\n'
+    }
+});
+PACKAGES.push({
+    name: 'color-name',
+    version: '1.1.4',
+    description: 'A list of color names and their values mock',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = { red: [255, 0, 0], green: [0, 255, 0] };\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'color-convert',
+    version: '2.0.1',
+    description: 'Plain color conversion functions mock',
+    main: 'index.js',
+    dependencies: {
+        'color-name': '~1.1.4'
+    },
+    files: {
+        'package/index.js': 'module.exports = { rgb: { ansi256: () => 1 } };\n'
+    }
+});
+PACKAGES.push({
+    name: 'ansi-styles',
+    version: '4.3.0',
+    description: 'ANSI escape codes for styling strings in the terminal mock',
+    main: 'index.js',
+    dependencies: {
+        'color-convert': '^2.0.1'
+    },
+    files: {
+        'package/index.js': 'module.exports = { red: { open: "\\u001b[31m", close: "\\u001b[39m" } };\n'
+    }
+});
+PACKAGES.push({
+    name: 'chalk',
+    version: '4.1.2',
+    description: 'Terminal string styling done right mock',
+    main: 'index.js',
+    dependencies: {
+        'ansi-styles': '^4.1.0',
+        'supports-color': '^7.1.0'
+    },
+    files: {
+        'package/index.js': 'module.exports = { red: (s) => `\\u001b[31m${s}\\u001b[39m`, green: (s) => s };\n'
+    }
+});
+PACKAGES.push({
+    name: 'js-tokens',
+    version: '4.0.0',
+    description: 'The tiny regex-powered JavaScript lexer mock',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = /token/;\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'loose-envify',
+    version: '1.4.0',
+    description: 'Fast replacement of process.env.NODE_ENV mock',
+    main: 'index.js',
+    dependencies: {
+        'js-tokens': '^4.0.0'
+    },
+    files: {
+        'package/index.js': 'module.exports = (s) => s;\n'
+    }
+});
+PACKAGES.push({
+    name: 'react',
+    version: '18.2.0',
+    description: 'React is a JavaScript library for building user interfaces mock',
+    main: 'index.js',
+    dependencies: {
+        'loose-envify': '^1.1.0'
+    },
+    files: {
+        'package/index.js': 'module.exports = { createElement: () => ({}), version: "18.2.0" };\n'
+    }
+});
+PACKAGES.push({
+    name: 'react-dom',
+    version: '18.2.0',
+    description: 'React package for working with the DOM mock',
+    main: 'index.js',
+    peerDependencies: {
+        'react': '^18.2.0'
+    },
+    dependencies: {
+        'loose-envify': '^1.1.0'
+    },
+    files: {
+        'package/index.js': 'const React = require("react"); module.exports = { render: () => {}, version: "18.2.0" };\n'
+    }
+});
+PACKAGES.push({
+    name: 'prettier',
+    version: '3.2.5',
+    description: 'Prettier code formatter mock with CLI bin',
+    main: 'index.js',
+    bin: {
+        'prettier': 'bin/prettier.cjs'
+    },
+    files: {
+        'package/index.js': 'module.exports = { format: (s) => s, version: "3.2.5" };\n',
+        'package/bin/prettier.cjs': [
+            '#!/usr/bin/env node',
+            'const args = process.argv.slice(2);',
+            'if (args.includes("--version") || args.includes("-v")) {',
+            '    console.log("3.2.5");',
+            '} else {',
+            '    console.log("prettier formatted 0 files");',
+            '}',
+            ''
+        ].join('\n')
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'minimist',
+    version: '1.2.5',
+    description: 'parse argument options mock (vulnerable)',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = (args) => ({ _: args });\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'minimist',
+    version: '1.2.8',
+    description: 'parse argument options mock (patched)',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = (args) => ({ _: args });\n'
+    },
+    dependencies: {}
+});
+PACKAGES.push({
+    name: 'marked',
+    version: '4.0.0',
+    description: 'Markdown parser mock (vulnerable)',
+    main: 'index.js',
+    files: {
+        'package/index.js': 'module.exports = { parse: (s) => `<p>${s}</p>` };\n'
+    },
+    dependencies: {}
+});
+
 const STORAGE_DIR = path.resolve(__dirname, 'storage');
 
 function build() {

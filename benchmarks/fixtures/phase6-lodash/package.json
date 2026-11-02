@@ -1,0 +1,13 @@
+{
+  "name": "phase6-lodash",
+  "version": "1.0.0",
+  "description": "Phase 6 Real-Project Compatibility Corpus: lodash fixture",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "lodash": "4.17.20"
+  }
+}

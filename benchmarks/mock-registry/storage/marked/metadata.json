@@ -1,0 +1,25 @@
+{
+  "_id": "marked",
+  "name": "marked",
+  "dist-tags": {
+    "latest": "4.0.0"
+  },
+  "versions": {
+    "4.0.0": {
+      "name": "marked",
+      "version": "4.0.0",
+      "description": "Markdown parser mock (vulnerable)",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "609d258c122aef44cd6c6dc4b912d88316504470",
+        "integrity": "sha512-vr+Cn60FYmZqdlR1bDgSOugrC3/LRFrH7ok7gJJF4rD4gqR2TokY23aizr+HFFcVyk8RuwNueHujwiPiRU+oZQ==",
+        "tarball": "http://127.0.0.1:4873/marked/-/marked-4.0.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

@@ -1,0 +1,27 @@
+{
+  "_id": "react",
+  "name": "react",
+  "dist-tags": {
+    "latest": "18.2.0"
+  },
+  "versions": {
+    "18.2.0": {
+      "name": "react",
+      "version": "18.2.0",
+      "description": "React is a JavaScript library for building user interfaces mock",
+      "main": "index.js",
+      "dependencies": {
+        "loose-envify": "^1.1.0"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "7648aacec3028e92daa14a9f0cef8e60a77d5db4",
+        "integrity": "sha512-M0w6KyPC44fLycl6DOEQuRVQGhXNl7pcbi18AZFBO26kOKpOewmAdFFUO/nD07u6yr6GjdSGKz99vfwChmdI2A==",
+        "tarball": "http://127.0.0.1:4873/react/-/react-18.2.0.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

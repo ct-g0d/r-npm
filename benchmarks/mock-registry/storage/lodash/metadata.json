@@ -1,0 +1,40 @@
+{
+  "_id": "lodash",
+  "name": "lodash",
+  "dist-tags": {
+    "latest": "4.17.21"
+  },
+  "versions": {
+    "4.17.20": {
+      "name": "lodash",
+      "version": "4.17.20",
+      "description": "Lodash modular utilities mock v4.17.20 (vulnerable)",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "d44b72ec5ec01c833b0511c4bed37ea1241181d7",
+        "integrity": "sha512-5ETvHL3R6LlAUODyXKHNeoOyQdFNybX8lvGcYc8pWTzQKM8thXgaXmATTfbLeFkfXFjq5yqsuDgy+wSNp0+V1g==",
+        "tarball": "http://127.0.0.1:4873/lodash/-/lodash-4.17.20.tgz"
+      }
+    },
+    "4.17.21": {
+      "name": "lodash",
+      "version": "4.17.21",
+      "description": "Lodash modular utilities mock v4.17.21 (patched)",
+      "main": "index.js",
+      "dependencies": {},
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "c1e9d56d0095113f556ac99ef7add156585d35f4",
+        "integrity": "sha512-mK278KMPSwLA7XwO6mbKbry0q5+JjaHIOsiZrsoU/HSFKvHIz2WV5TPU9Z5qPzy/PcoGsZEPN9w1w1kM1xHGCQ==",
+        "tarball": "http://127.0.0.1:4873/lodash/-/lodash-4.17.21.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

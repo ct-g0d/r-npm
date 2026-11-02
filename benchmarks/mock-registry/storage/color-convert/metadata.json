@@ -1,0 +1,27 @@
+{
+  "_id": "color-convert",
+  "name": "color-convert",
+  "dist-tags": {
+    "latest": "2.0.1"
+  },
+  "versions": {
+    "2.0.1": {
+      "name": "color-convert",
+      "version": "2.0.1",
+      "description": "Plain color conversion functions mock",
+      "main": "index.js",
+      "dependencies": {
+        "color-name": "~1.1.4"
+      },
+      "devDependencies": {},
+      "peerDependencies": {},
+      "hasInstallScript": false,
+      "dist": {
+        "shasum": "a48917281aac8102de4f263acc0d674a82f4af27",
+        "integrity": "sha512-tr2Vpr7eka6SZ924iLuvhkfgndNrtR8DRcgK6cxURJruwjZLUpv0qQBTvASFrzfX3VOBg/AfdPazq6CUlV3ziw==",
+        "tarball": "http://127.0.0.1:4873/color-convert/-/color-convert-2.0.1.tgz"
+      }
+    }
+  },
+  "modified": "2026-11-01T00:00:00.000Z"
+}

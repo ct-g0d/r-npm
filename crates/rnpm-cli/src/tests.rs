@@ -145,7 +145,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_commands_gate_e_diagnostics() {
-        let commands = ["publish", "login", "audit", "token", "exec"];
+        let commands = ["publish", "login", "fix", "token", "exec"];
         for cmd in commands {
             let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
             assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
@@ -394,4 +394,44 @@ use tokio::net::TcpListener;
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_cli_audit_clean_lockfile_zero_vulnerabilities() {
+        let temp = tempdir().unwrap();
+        let lock_path = temp.path().join("package-lock.json");
+
+        let mut lockfile = LockfileV3::new("clean-app", Some("1.0.0".to_string()));
+        let mut clean_pkg = LockfilePackage::default();
+        clean_pkg.version = Some("4.17.21".to_string());
+        clean_pkg.resolved = Some("http://127.0.0.1:4873/lodash/-/lodash-4.17.21.tgz".to_string());
+        lockfile.insert_package("node_modules/lodash", clean_pkg);
+
+        let lock_json = lockfile.to_json_string().unwrap();
+        std::fs::write(&lock_path, lock_json).unwrap();
+
+        let cli = Cli {
+            command: Commands::Audit {
+                registry: Some("http://127.0.0.1:4873".to_string()),
+                json: true,
+                audit_level: "low".to_string(),
+                dry_run: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(temp.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Expected audit to succeed on clean project: {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_cli_audit_unsupported_command_filtering() {
+        // "audit" should now be supported and not trigger ERR_UNSUPPORTED_COMMAND
+        let check = check_unsupported_cli_invocation(vec!["rnpm", "audit"]);
+        assert!(check.is_none(), "rnpm audit must be a supported command");
+
+        // Commands still deferred should still trigger ERR_UNSUPPORTED_COMMAND
+        let check_fix = check_unsupported_cli_invocation(vec!["rnpm", "fix"]);
+        assert!(check_fix.is_some());
+        let (code, _) = check_fix.unwrap();
+        assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
     }
