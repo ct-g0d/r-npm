@@ -152,3 +152,168 @@ fn test_config_merging_precedence() {
     assert_eq!(loaded.npmrc.registry.as_str(), "https://project.registry.com/");
     assert_eq!(loaded.npmrc.settings.get("save-exact").unwrap(), "true");
 }
+
+#[test]
+fn test_env_interpolation_escaping_and_defaults() {
+    let mut env_map = HashMap::new();
+    env_map.insert("EMPTY_VAR".to_string(), "".to_string());
+    env_map.insert("SET_VAR".to_string(), "val".to_string());
+    let lookup = |var: &str| env_map.get(var).cloned();
+
+    // 1. Escaping ${VAR} and $VAR
+    assert_eq!(
+        interpolate_env(r"\${SET_VAR}", &lookup),
+        "${SET_VAR}"
+    );
+    assert_eq!(
+        interpolate_env(r"\$SET_VAR", &lookup),
+        "$SET_VAR"
+    );
+    assert_eq!(
+        interpolate_env("Cost is $$100", &lookup),
+        "Cost is $100"
+    );
+
+    // 2. ${VAR:-default} uses default when unset OR empty
+    assert_eq!(
+        interpolate_env("${UNSET_VAR:-fallback}", &lookup),
+        "fallback"
+    );
+    assert_eq!(
+        interpolate_env("${EMPTY_VAR:-fallback}", &lookup),
+        "fallback"
+    );
+    assert_eq!(
+        interpolate_env("${SET_VAR:-fallback}", &lookup),
+        "val"
+    );
+
+    // 3. ${VAR-default} uses default ONLY when unset (keeps empty if set to empty)
+    assert_eq!(
+        interpolate_env("${UNSET_VAR-fallback}", &lookup),
+        "fallback"
+    );
+    assert_eq!(
+        interpolate_env("${EMPTY_VAR-fallback}", &lookup),
+        ""
+    );
+    assert_eq!(
+        interpolate_env("${SET_VAR-fallback}", &lookup),
+        "val"
+    );
+
+    // 4. Multi-byte Unicode in input works safely without slice boundary issues
+    let unicode_input = "prefix 🦀 ${SET_VAR} 🚀 suffix";
+    assert_eq!(
+        interpolate_env(unicode_input, &lookup),
+        "prefix 🦀 val 🚀 suffix"
+    );
+
+    // 5. Invalid identifiers preserved as literal
+    assert_eq!(
+        interpolate_env("${VAR; injection}", &lookup),
+        "${VAR; injection}"
+    );
+}
+
+#[test]
+fn test_scoped_precedence_and_alternate_syntaxes() {
+    let content = r#"
+    registry = https://registry.npmjs.org/
+    @myorg:registry = https://custom1.org/
+    @altorg/registry = https://custom2.org/
+    thirdorg:registry = https://custom3.org/
+    "#;
+
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // Standard @myorg:registry
+    assert_eq!(
+        npmrc.registry_for_package("@myorg/widget").as_str(),
+        "https://custom1.org/"
+    );
+
+    // Alternate @altorg/registry syntax
+    assert_eq!(
+        npmrc.registry_for_package("@altorg/pkg").as_str(),
+        "https://custom2.org/"
+    );
+
+    // Bare thirdorg:registry syntax
+    assert_eq!(
+        npmrc.registry_for_package("@thirdorg/lib").as_str(),
+        "https://custom3.org/"
+    );
+
+    // Case insensitivity
+    assert_eq!(
+        npmrc.registry_for_package("@MYORG/WIDGET").as_str(),
+        "https://custom1.org/"
+    );
+
+    // Encoded scoped package name
+    assert_eq!(
+        npmrc.registry_for_package("@myorg%2fwidget").as_str(),
+        "https://custom1.org/"
+    );
+
+    // Unscoped package falls back to default registry
+    assert_eq!(
+        npmrc.registry_for_package("react").as_str(),
+        "https://registry.npmjs.org/"
+    );
+
+    // Unmatched scope falls back to default registry
+    assert_eq!(
+        npmrc.registry_for_package("@unknown/pkg").as_str(),
+        "https://registry.npmjs.org/"
+    );
+}
+
+#[test]
+fn test_auth_token_for_package_and_crlf_rejection() {
+    let content = r#"
+    registry = https://registry.npmjs.org/
+    @corp:registry = https://npm.corp.internal/
+    //registry.npmjs.org/:_authToken = public_token
+    //npm.corp.internal/:_authToken = internal_token
+    "#;
+
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // Auth token for scoped package
+    assert_eq!(
+        npmrc.get_auth_token_for_package("@corp/secret-lib"),
+        Some("internal_token")
+    );
+
+    // Auth token for unscoped package
+    assert_eq!(
+        npmrc.get_auth_token_for_package("lodash"),
+        Some("public_token")
+    );
+
+    // Rejection of CRLF / newline injection in auth token
+    let mut bad_npmrc = Npmrc::new();
+    assert!(bad_npmrc.set("//registry.org/:_authToken", "token\r\nevil=1").is_err());
+    assert!(bad_npmrc.set("key\ninvalid", "val").is_err());
+}
+
+#[test]
+fn test_package_metadata_url_and_validation() {
+    let mut npmrc = Npmrc::new();
+    npmrc.set("@myorg:registry", "https://custom.registry.com/").unwrap();
+
+    // Scoped package URL formatting
+    let url = npmrc.package_metadata_url("@myorg/pkg").unwrap();
+    assert_eq!(url.as_str(), "https://custom.registry.com/@myorg%2fpkg");
+
+    // Unscoped package URL formatting
+    let unscoped_url = npmrc.package_metadata_url("lodash").unwrap();
+    assert_eq!(unscoped_url.as_str(), "https://registry.npmjs.org/lodash");
+
+    // Path traversal in package name is rejected
+    assert!(npmrc.package_metadata_url("../foo").is_err());
+    assert!(npmrc.package_metadata_url("@myorg/../../etc/passwd").is_err());
+    assert!(npmrc.package_metadata_url("").is_err());
+}

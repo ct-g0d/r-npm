@@ -522,7 +522,10 @@ async fn test_security_auth_header_stripped_on_multi_hop_redirect() {
     let bytes = client.download_tarball_bytes(&initial_url).await.unwrap();
     assert_eq!(bytes, b"downloaded from cdn");
 
-    let cdn_reqs = cdn_server.received_requests.lock().await;
+    let cdn_reqs = {
+        let guard = cdn_server.received_requests.lock().await;
+        guard.clone()
+    };
     for req in cdn_reqs.iter() {
         assert!(
             !req.to_lowercase().contains("authorization"),
@@ -588,7 +591,10 @@ async fn test_security_auth_not_sent_to_untrusted_initial_url() {
         .unwrap();
     assert_eq!(bytes, b"untrusted content");
 
-    let reqs = untrusted_server.received_requests.lock().await;
+    let reqs = {
+        let guard = untrusted_server.received_requests.lock().await;
+        guard.clone()
+    };
     for req in reqs.iter() {
         assert!(
             !req.to_lowercase().contains("authorization"),
