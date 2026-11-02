@@ -145,11 +145,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_commands_gate_e_diagnostics() {
-<<<<<<< HEAD
-        let commands = ["publish", "login", "audit", "token", "deprecate"];
-=======
-        let commands = ["publish", "login", "fix", "token", "exec"];
->>>>>>> t3/feat-agy5-audit-real-corpus
+        let commands = ["publish", "login", "fix", "token", "deprecate"];
         for cmd in commands {
             let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
             assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
@@ -744,4 +740,4 @@ use tokio::net::TcpListener;
         let (code, _) = check_fix.unwrap();
         assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
     }
-}
+
