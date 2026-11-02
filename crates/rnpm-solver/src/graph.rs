@@ -21,6 +21,7 @@ pub struct NodeFlags {
     pub bundled: bool,
     pub has_install_script: bool,
     pub skipped: bool,
+    pub link: bool,
 }
 
 /// A directed edge in the dependency graph.
@@ -196,6 +197,7 @@ impl DependencyGraph {
                     version: Some(node.version.clone()),
                     resolved: node.resolved.clone(),
                     integrity: node.integrity.clone(),
+                    link: if node.flags.link { Some(true) } else { None },
                     dev: if node.flags.dev { Some(true) } else { None },
                     optional: if node.flags.optional { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
@@ -264,6 +266,7 @@ impl DependencyGraph {
                     bundled: pkg.in_bundle.unwrap_or(false),
                     has_install_script: pkg.has_install_script.unwrap_or(false),
                     skipped: false,
+                    link: pkg.link.unwrap_or(false),
                 },
                 dependencies: pkg.dependencies.clone().unwrap_or_default(),
                 dev_dependencies: pkg.dev_dependencies.clone().unwrap_or_default(),

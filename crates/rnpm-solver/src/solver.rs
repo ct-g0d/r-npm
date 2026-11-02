@@ -316,6 +316,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     bundled: false,
                     has_install_script: chosen_version.has_install_script,
                     skipped: false,
+                    link: false,
                 };
 
                 let node = Node {
@@ -426,6 +427,25 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             PackageTarget::File(_) => {
                 // If versions exist, return highest/latest, else None
                 meta.versions.values().last().cloned()
+            }
+            PackageTarget::Workspace(ws_spec) => {
+                let s = ws_spec.trim();
+                if s == "*" || s == "^" || s == "~" || s.is_empty() {
+                    meta.versions.values().last().cloned()
+                } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
+                    let mut matching: Vec<(&PackageVersionMetadata, Version)> = Vec::new();
+                    for (ver_str, v_meta) in &meta.versions {
+                        if let Ok(parsed) = Version::parse(ver_str) {
+                            if range.satisfies(&parsed) {
+                                matching.push((v_meta, parsed));
+                            }
+                        }
+                    }
+                    matching.sort_by(|a, b| a.1.cmp(&b.1));
+                    matching.last().map(|(v_meta, _)| (*v_meta).clone())
+                } else {
+                    meta.versions.values().last().cloned()
+                }
             }
         }
     }

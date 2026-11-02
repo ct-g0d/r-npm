@@ -22,6 +22,18 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
         PackageTarget::Tag(_) => true,
         PackageTarget::Alias { target, .. } => version_satisfies_target(version_str, target),
         PackageTarget::File(_) => true,
+        PackageTarget::Workspace(ws_spec) => {
+            let s = ws_spec.trim();
+            if s == "*" || s == "^" || s == "~" || s.is_empty() {
+                true
+            } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
+                range.satisfies(&v)
+            } else if let Ok(expected) = Version::parse(s) {
+                &v == &expected
+            } else {
+                true
+            }
+        }
     }
 }
 

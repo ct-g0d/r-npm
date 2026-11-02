@@ -77,10 +77,10 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
 
     // Target must exist for a junction
     let target_canonical = target.canonicalize().map_err(FsError::Io)?;
-    let target_str = target_canonical.to_string_lossy();
+    let target_str = target_canonical.to_string_lossy().replace('/', "\\");
     let clean_target = target_str.strip_prefix(r"\\?\").unwrap_or(&target_str);
 
-    let link_str = link.to_string_lossy();
+    let link_str = link.to_string_lossy().replace('/', "\\");
     let clean_link = link_str.strip_prefix(r"\\?\").unwrap_or(&link_str);
 
     // cmd.exe /C mklink /J "<link>" "<target>"

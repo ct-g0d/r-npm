@@ -16,6 +16,7 @@ pub enum PackageTarget {
         target: Box<PackageTarget>,
     },
     File(PathBuf),
+    Workspace(String),
 }
 
 impl PackageTarget {
@@ -25,6 +26,11 @@ impl PackageTarget {
             return Ok(PackageTarget::Range(
                 Range::parse("*").map_err(|e| SpecError::Semver(e.to_string()))?,
             ));
+        }
+
+        // workspace: protocol specifier (e.g. workspace:*, workspace:^, workspace:~, workspace:^1.0.0)
+        if let Some(ws_spec) = s.strip_prefix("workspace:") {
+            return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
         }
 
         // file: specifier
@@ -97,6 +103,7 @@ impl fmt::Display for PackageTarget {
             PackageTarget::Tag(t) => write!(f, "{t}"),
             PackageTarget::Alias { name, target } => write!(f, "npm:{name}@{target}"),
             PackageTarget::File(p) => write!(f, "file:{}", p.display()),
+            PackageTarget::Workspace(w) => write!(f, "workspace:{w}"),
         }
     }
 }
@@ -116,11 +123,19 @@ impl PackageSpec {
     }
 
     /// Parse a package specifier as provided in CLI arguments or manifests:
-    /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar"
+    /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar", "foo@workspace:*"
     pub fn parse(input: &str) -> Result<Self, SpecError> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(SpecError::Empty);
+        }
+
+        // Direct "workspace:" specifier without name (e.g. "workspace:*")
+        if let Some(ws_str) = trimmed.strip_prefix("workspace:") {
+            return Ok(Self {
+                name: "workspace".to_string(),
+                target: PackageTarget::Workspace(ws_str.trim().to_string()),
+            });
         }
 
         // Direct "file:" specifier without name (e.g. "file:../foo")

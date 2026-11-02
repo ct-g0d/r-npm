@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info, warn};
 use url::Url;
@@ -10,6 +10,7 @@ use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
+use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
 use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::tarball::extract_tar_gz;
 use rnpm_lifecycle::{
@@ -20,8 +21,28 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
-use rnpm_solver::Platform;
 use rnpm_solver::graph::DependencyGraph;
+use rnpm_solver::{Platform, WorkspaceDependencyGraph};
+
+/// Helper to link a workspace member into node_modules/<pkg-name> using directory junctions (Windows) or symlinks (Unix).
+pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) -> Result<()> {
+    let link_path = node_modules_dir.join(&member.name);
+    if let Some(parent) = link_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+        let _ = rnpm_fs::remove_junction(&link_path);
+        if link_path.exists() {
+            let _ = std::fs::remove_dir_all(&link_path);
+        }
+    }
+
+    rnpm_fs::create_junction(&link_path, &member.path)
+        .map_err(|e| anyhow!("Failed to link workspace package '{}' at '{}' -> '{}': {e}", member.name, link_path.display(), member.path.display()))?;
+
+    Ok(())
+}
 
 /// Options for running rnpm install.
 #[derive(Debug, Clone)]
@@ -145,17 +166,72 @@ impl Installer {
         let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
         let project_version = manifest.version.clone();
 
-        // 1. Resolve dependency graph
+        // 0. Discover workspace members (if any)
+        let workspace_members = discover_workspaces_from_manifest(
+            &self.options.project_dir,
+            &manifest,
+        ).map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
+
+        let ws_graph_opt = if !workspace_members.is_empty() {
+            Some(WorkspaceDependencyGraph::construct(&workspace_members)
+                .map_err(|e| anyhow!("Workspace dependency error: {e}"))?)
+        } else {
+            None
+        };
+
+        // 1. Resolve external dependency graph
         let mut resolved_tree: BTreeMap<String, ResolvedNode> = BTreeMap::new();
         let mut queue: VecDeque<(String, String, bool)> = VecDeque::new();
 
+        // Enqueue root dependencies
         for (dep_name, dep_range) in &manifest.dependencies {
-            let is_opt = manifest.optional_dependencies.contains_key(dep_name);
-            queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
+            let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                || dep_range.starts_with("workspace:");
+            if !is_ws {
+                let is_opt = manifest.optional_dependencies.contains_key(dep_name);
+                queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
+            }
+        }
+        for (dep_name, dep_range) in &manifest.dev_dependencies {
+            let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                || dep_range.starts_with("workspace:");
+            if !is_ws {
+                let is_opt = manifest.optional_dependencies.contains_key(dep_name);
+                queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
+            }
+        }
+
+        // Enqueue external dependencies from all workspace members
+        for member in &workspace_members {
+            for (dep_name, dep_range) in &member.manifest.dependencies {
+                let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                    || dep_range.starts_with("workspace:");
+                if !is_ws && !resolved_tree.contains_key(dep_name) {
+                    let is_opt = member.manifest.optional_dependencies.contains_key(dep_name);
+                    queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
+                }
+            }
+            for (dep_name, dep_range) in &member.manifest.dev_dependencies {
+                let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                    || dep_range.starts_with("workspace:");
+                if !is_ws && !resolved_tree.contains_key(dep_name) {
+                    let is_opt = member.manifest.optional_dependencies.contains_key(dep_name);
+                    queue.push_back((dep_name.clone(), dep_range.clone(), is_opt));
+                }
+            }
+            for (opt_name, opt_range) in &member.manifest.optional_dependencies {
+                let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(opt_name)).unwrap_or(false)
+                    || opt_range.starts_with("workspace:");
+                if !is_ws && !resolved_tree.contains_key(opt_name) {
+                    queue.push_back((opt_name.clone(), opt_range.clone(), true));
+                }
+            }
         }
 
         for (opt_name, opt_range) in &manifest.optional_dependencies {
-            if !manifest.dependencies.contains_key(opt_name) {
+            let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(opt_name)).unwrap_or(false)
+                || opt_range.starts_with("workspace:");
+            if !is_ws && !manifest.dependencies.contains_key(opt_name) {
                 queue.push_back((opt_name.clone(), opt_range.clone(), true));
             }
         }
@@ -193,8 +269,10 @@ impl Installer {
             }
 
             for (sub_name, sub_range) in &node.dependencies {
-                let sub_is_opt = node.optional_dependencies.contains_key(sub_name) || node.optional;
-                if !resolved_tree.contains_key(sub_name) {
+                let is_ws = ws_graph_opt.as_ref().map(|g| g.is_member(sub_name)).unwrap_or(false)
+                    || sub_range.starts_with("workspace:");
+                if !is_ws && !resolved_tree.contains_key(sub_name) {
+                    let sub_is_opt = node.optional_dependencies.contains_key(sub_name) || node.optional;
                     queue.push_back((sub_name.clone(), sub_range.clone(), sub_is_opt));
                 }
             }
@@ -212,6 +290,7 @@ impl Installer {
         let node_modules_dir = self.options.project_dir.join("node_modules");
         let bin_dir = node_modules_dir.join(".bin");
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
+        std::fs::create_dir_all(&bin_dir).context("Failed to create node_modules/.bin")?;
 
         let mut cache_hits = 0;
         let mut cache_misses = 0;
@@ -219,6 +298,9 @@ impl Installer {
 
         let mut lockfile = LockfileV3::new(project_name, project_version);
         if let Some(root_pkg) = lockfile.root_package_mut() {
+            if !manifest.workspace_patterns().is_empty() {
+                root_pkg.workspaces = Some(manifest.workspace_patterns());
+            }
             if !manifest.dependencies.is_empty() {
                 root_pkg.dependencies = Some(manifest.dependencies.clone());
             }
@@ -232,6 +314,59 @@ impl Installer {
 
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
 
+        // Reify workspace packages: link into root node_modules/<member.name>
+        for member in &workspace_members {
+            link_workspace_member(&node_modules_dir, member)?;
+            packages_installed += 1;
+
+            // Companion shims for member binaries
+            for (bin_name, script_rel) in member.manifest.bin_entries() {
+                let target_rel = format!("{}/{}", member.name, script_rel);
+                let script_path = member.path.join(&script_rel);
+                let _ = normalize_shebang(&script_path);
+                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+            }
+
+            // Lockfile entry for member source package
+            let mut member_pkg = LockfilePackage {
+                version: member.version.clone(),
+                ..Default::default()
+            };
+            if !member.manifest.dependencies.is_empty() {
+                member_pkg.dependencies = Some(member.manifest.dependencies.clone());
+            }
+            if !member.manifest.dev_dependencies.is_empty() {
+                member_pkg.dev_dependencies = Some(member.manifest.dev_dependencies.clone());
+            }
+            lockfile.insert_package(&member.relative_path, member_pkg);
+
+            // Lockfile entry for node_modules link
+            let link_key = format!("node_modules/{}", member.name);
+            let link_pkg = LockfilePackage {
+                resolved: Some(member.relative_path.clone()),
+                link: Some(true),
+                ..Default::default()
+            };
+            lockfile.insert_package(&link_key, link_pkg);
+
+            // Collect lifecycle scripts for workspace member
+            let has_scripts = member.manifest.scripts.contains_key("preinstall")
+                || member.manifest.scripts.contains_key("install")
+                || member.manifest.scripts.contains_key("postinstall");
+
+            if has_scripts {
+                lifecycle_nodes.push(LifecyclePackageNode {
+                    package_path: format!("node_modules/{}", member.name),
+                    disk_path: member.path.clone(),
+                    manifest: member.manifest.clone(),
+                    source: PackageSource::Local,
+                    dependencies: member.manifest.dependencies.keys().cloned().collect(),
+                    optional: false,
+                });
+            }
+        }
+
+        // Reify external packages
         for (pkg_name, node) in &resolved_tree {
             if node.skipped {
                 // NEVER download or extract skipped packages!
@@ -462,6 +597,7 @@ impl Installer {
             std::fs::remove_dir_all(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
+        std::fs::create_dir_all(&bin_dir)?;
 
         let mut cache_hits = 0;
         let mut cache_misses = 0;
@@ -469,6 +605,47 @@ impl Installer {
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
+                continue;
+            }
+
+            // Handle workspace links
+            if pkg_info.link == Some(true) {
+                let target_rel = pkg_info.resolved.as_ref().ok_or_else(|| {
+                    anyhow!("Workspace link {pkg_key} missing resolved target in lockfile")
+                })?;
+                let target_dir = self.options.project_dir.join(target_rel);
+                let link_path = self.options.project_dir.join(pkg_key);
+                if let Some(parent) = link_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&link_path);
+                    if link_path.exists() {
+                        let _ = std::fs::remove_dir_all(&link_path);
+                    }
+                }
+                rnpm_fs::create_junction(&link_path, &target_dir)
+                    .map_err(|e| anyhow!("Failed to link workspace package at '{}': {e}", link_path.display()))?;
+
+                packages_installed += 1;
+
+                let pkg_manifest_path = target_dir.join("package.json");
+                if pkg_manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                            let target_rel_bin = format!("{clean_pkg_name}/{script_rel}");
+                            let script_path = target_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Skip workspace member physical directories
+            if !pkg_key.starts_with("node_modules/") {
                 continue;
             }
 
