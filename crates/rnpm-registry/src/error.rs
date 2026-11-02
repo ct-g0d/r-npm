@@ -43,6 +43,9 @@ pub enum RegistryError {
     #[error("Server error (HTTP {status}): {body}")]
     ServerError { status: u16, body: String },
 
+    #[error("Circuit breaker is OPEN for host '{host}'; registry is temporarily failing fast")]
+    CircuitBreakerOpen { host: String },
+
     #[error("Unexpected error: {0}")]
     Other(String),
 }
@@ -91,6 +94,35 @@ impl RegistryError {
         match self {
             Self::RateLimited { retry_after } => *retry_after,
             _ => None,
+        }
+    }
+
+    /// Returns true if this error is caused by an open circuit breaker.
+    pub fn is_circuit_breaker_open(&self) -> bool {
+        matches!(self, Self::CircuitBreakerOpen { .. })
+    }
+
+    /// Returns true if this error was caused by a connection or request timeout.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Http(e) => e.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error was caused by a connection or DNS resolution failure.
+    pub fn is_connect(&self) -> bool {
+        match self {
+            Self::Http(e) => e.is_connect(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error was caused by a body/stream decoding or chunk corruption error.
+    pub fn is_decode(&self) -> bool {
+        match self {
+            Self::Http(e) => e.is_decode() || e.is_body(),
+            _ => false,
         }
     }
 }

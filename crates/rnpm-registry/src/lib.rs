@@ -5,10 +5,12 @@
 //! URL encoding, streaming tarball downloads, and redirect security policies
 //! (preventing auth header leakage across redirects to untrusted hostnames).
 
+pub mod circuit_breaker;
 pub mod client;
 pub mod error;
 pub mod metadata;
 
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 pub use client::{
     default_user_agent, encode_package_name, BytesFetchResult, MetadataFetchResult,
     RegistryClient, RegistryClientConfig, TarballFetchResult, NPM_INSTALL_V1_JSON,

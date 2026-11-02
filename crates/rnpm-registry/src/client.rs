@@ -1,3 +1,4 @@
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
 use reqwest::header::{
@@ -205,6 +206,9 @@ pub struct RegistryClientConfig {
     pub retry_on_status: HashSet<u16>,
     pub scoped_registries: std::collections::BTreeMap<String, Url>,
     pub auth_tokens: std::collections::BTreeMap<String, String>,
+    pub circuit_breaker_enabled: bool,
+    pub circuit_breaker_failure_threshold: usize,
+    pub circuit_breaker_reset_timeout: Duration,
 }
 
 impl Default for RegistryClientConfig {
@@ -238,6 +242,9 @@ impl Default for RegistryClientConfig {
             retry_on_status,
             scoped_registries: std::collections::BTreeMap::new(),
             auth_tokens: std::collections::BTreeMap::new(),
+            circuit_breaker_enabled: false,
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_reset_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -248,6 +255,7 @@ pub struct RegistryClient {
     client: Client,
     config: RegistryClientConfig,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl RegistryClient {
@@ -295,10 +303,18 @@ impl RegistryClient {
         };
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
 
+        let failure_threshold = if config.circuit_breaker_enabled {
+            config.circuit_breaker_failure_threshold
+        } else {
+            0
+        };
+        let circuit_breaker = CircuitBreaker::new(failure_threshold, config.circuit_breaker_reset_timeout);
+
         Ok(Self {
             client,
             config,
             semaphore,
+            circuit_breaker,
         })
     }
 
@@ -312,6 +328,79 @@ impl RegistryClient {
         &self.semaphore
     }
 
+    /// Check the current circuit breaker state for a host.
+    pub async fn circuit_state(&self, host: &str) -> CircuitBreakerState {
+        self.circuit_breaker.check_state(host).await
+    }
+
+    /// Explicitly reset the circuit breaker for a host.
+    pub async fn reset_circuit(&self, host: &str) {
+        self.circuit_breaker.reset(host).await;
+    }
+
+    /// Explicitly trip the circuit breaker for a host to Open state.
+    pub async fn trip_circuit(&self, host: &str) {
+        self.circuit_breaker.trip(host).await;
+    }
+
+    /// Determine the registry URL to use for a given package name.
+    /// Scoped package definitions in `config.scoped_registries` take strict precedence over the default registry.
+    pub fn registry_for_package(&self, package_name: &str) -> &Url {
+        let pkg_trimmed = package_name.trim();
+        if pkg_trimmed.starts_with('@') {
+            let scope_part = if let Some(slash_idx) = pkg_trimmed.find('/') {
+                &pkg_trimmed[..slash_idx]
+            } else if let Some(enc_idx) = pkg_trimmed.to_ascii_lowercase().find("%2f") {
+                &pkg_trimmed[..enc_idx]
+            } else {
+                pkg_trimmed
+            };
+
+            let scope_lower = scope_part.to_ascii_lowercase();
+            if let Some(scoped_url) = self.config.scoped_registries.get(&scope_lower) {
+                return scoped_url;
+            }
+        }
+        &self.config.default_registry
+    }
+
+    /// Retrieve the auth token for a target URL if configured in `auth_tokens` or fallback to `auth_token`.
+    pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
+        let host = url.host_str()?;
+        let host_lower = host.to_ascii_lowercase();
+        let port_part = if let Some(port) = url.port() {
+            format!(":{port}")
+        } else {
+            String::new()
+        };
+        let path = url.path();
+        let normalized_path = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+
+        let candidate1 = format!("//{host_lower}{port_part}{normalized_path}");
+        if let Some(token) = self.config.auth_tokens.get(&candidate1) {
+            return Some(token.as_str());
+        }
+        let candidate2 = format!("//{host_lower}{port_part}{path}");
+        if let Some(token) = self.config.auth_tokens.get(&candidate2) {
+            return Some(token.as_str());
+        }
+        let candidate3 = format!("//{host_lower}{port_part}/");
+        if let Some(token) = self.config.auth_tokens.get(&candidate3) {
+            return Some(token.as_str());
+        }
+        if !port_part.is_empty() {
+            let candidate4 = format!("//{host_lower}/");
+            if let Some(token) = self.config.auth_tokens.get(&candidate4) {
+                return Some(token.as_str());
+            }
+        }
+        self.config.auth_token.as_deref()
+    }
+
     /// Acquire an owned permit from the bounded concurrency semaphore.
     /// Holding this permit ensures that total concurrent in-flight network requests
     /// and active socket streams remain strictly bounded by `max_concurrent_requests`.
@@ -323,9 +412,10 @@ impl RegistryClient {
             .map_err(|e| RegistryError::Other(e.to_string()))
     }
 
-    /// Format the metadata URL for a package name.
+    /// Format the metadata URL for a package name using scoped registry routing.
     pub fn package_metadata_url(&self, package_name: &str) -> Result<Url, RegistryError> {
-        self.package_metadata_url_on(&self.config.default_registry, package_name)
+        let registry = self.registry_for_package(package_name);
+        self.package_metadata_url_on(registry, package_name)
     }
 
     /// Format the metadata URL for a package name on a specific registry.
@@ -361,6 +451,13 @@ impl RegistryClient {
                     return true;
                 }
             }
+            for scoped_reg in self.config.scoped_registries.values() {
+                if let Some(shost) = scoped_reg.host_str() {
+                    if shost.eq_ignore_ascii_case(host) {
+                        return true;
+                    }
+                }
+            }
         }
 
         false
@@ -381,7 +478,7 @@ impl RegistryClient {
         Ok((resp, permit))
     }
 
-    /// Internal request dispatch loop with redirect security policy and retry backoff on 429/503.
+    /// Internal request dispatch loop with redirect security policy, circuit breaking, and retry backoff.
     async fn execute_request_loop(
         &self,
         method: Method,
@@ -389,6 +486,21 @@ impl RegistryClient {
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<Response, RegistryError> {
+        let host_key = if let Some(port) = initial_url.port() {
+            format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        } else {
+            initial_url.host_str().unwrap_or_default().to_ascii_lowercase()
+        };
+
+        if self.config.circuit_breaker_enabled {
+            let state = self.circuit_breaker.check_state(&host_key).await;
+            if state == CircuitBreakerState::Open {
+                return Err(RegistryError::CircuitBreakerOpen {
+                    host: host_key,
+                });
+            }
+        }
+
         let mut attempt = 0;
 
         loop {
@@ -410,7 +522,7 @@ impl RegistryClient {
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
 
                 if should_send_auth {
-                    if let Some(token) = &self.config.auth_token {
+                    if let Some(token) = self.auth_token_for_url(&current_url) {
                         req = req.header(AUTHORIZATION, format!("Bearer {token}"));
                     }
                 } else {
@@ -499,30 +611,49 @@ impl RegistryClient {
                             attempt += 1;
                             continue;
                         } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
                             return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
                         }
-                    } else if is_retryable_server_error && attempt < self.config.max_retries {
+                    } else if is_retryable_server_error {
                         let retry_after_secs = resp
                             .headers()
                             .get(RETRY_AFTER)
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok());
 
-                        let delay = if let Some(secs) = retry_after_secs {
-                            Duration::from_secs(secs).min(self.config.max_retry_backoff)
+                        let within_backoff_budget = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs) <= self.config.max_retry_backoff
                         } else {
-                            (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                                .min(self.config.max_retry_backoff)
+                            true
                         };
-                        debug!(
-                            "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
-                            status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
+
+                        if within_backoff_budget && attempt < self.config.max_retries {
+                            let delay = if let Some(secs) = retry_after_secs {
+                                Duration::from_secs(secs)
+                            } else {
+                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                                    .min(self.config.max_retry_backoff)
+                            };
+                            debug!(
+                                "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
+                                status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
+                            return Ok(resp);
+                        }
                     }
 
+                    if self.config.circuit_breaker_enabled {
+                        self.circuit_breaker.record_success(&host_key).await;
+                    }
                     return Ok(resp);
                 }
                 Err(err) => {
@@ -538,6 +669,9 @@ impl RegistryClient {
                         attempt += 1;
                         continue;
                     } else {
+                        if self.config.circuit_breaker_enabled {
+                            self.circuit_breaker.record_failure(&host_key).await;
+                        }
                         return Err(err);
                     }
                 }

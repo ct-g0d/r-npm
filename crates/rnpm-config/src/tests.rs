@@ -317,3 +317,139 @@ fn test_package_metadata_url_and_validation() {
     assert!(npmrc.package_metadata_url("@myorg/../../etc/passwd").is_err());
     assert!(npmrc.package_metadata_url("").is_err());
 }
+
+#[test]
+fn test_malicious_scopes_unicode_spoofing_and_rejection() {
+    use crate::npmrc::validate_package_name;
+
+    let content = r#"
+    registry = https://registry.npmjs.org/
+    @company:registry = https://npm.company.internal/
+    "#;
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // 1. Cyrillic homoglyph spoofing: '@соmраny/secret' where 'о', 'а' are Cyrillic U+043E, U+0430
+    let cyrillic_spoofed = "@\u{0441}\u{043E}m\u{0440}\u{0430}ny/secret";
+    // Must fail package validation
+    assert!(validate_package_name(cyrillic_spoofed).is_err());
+    // In registry_for_package fallback: must NEVER match the private @company registry
+    let routed = npmrc.registry_for_package(cyrillic_spoofed);
+    assert_eq!(
+        routed.as_str(),
+        "https://registry.npmjs.org/",
+        "Unicode spoofed package must never route to private company registry"
+    );
+
+    // 2. Zero-width space spoofing: '@company\u{200B}/secret'
+    let zwsp_spoofed = "@company\u{200B}/secret";
+    assert!(validate_package_name(zwsp_spoofed).is_err());
+    assert_eq!(
+        npmrc.registry_for_package(zwsp_spoofed).as_str(),
+        "https://registry.npmjs.org/"
+    );
+
+    // 3. Fullwidth @ spoofing: '＠company/secret' (U+FF20)
+    let fullwidth_at = "\u{FF20}company/secret";
+    assert!(validate_package_name(fullwidth_at).is_err());
+    assert_eq!(
+        npmrc.registry_for_package(fullwidth_at).as_str(),
+        "https://registry.npmjs.org/"
+    );
+
+    // 4. Right-to-Left (RTL) override spoofing: '@company\u{202E}evil/secret'
+    let rtl_spoofed = "@company\u{202E}evil/secret";
+    assert!(validate_package_name(rtl_spoofed).is_err());
+    assert_eq!(
+        npmrc.registry_for_package(rtl_spoofed).as_str(),
+        "https://registry.npmjs.org/"
+    );
+}
+
+#[test]
+fn test_malicious_scopes_directory_traversal_attempts() {
+    use crate::npmrc::validate_package_name;
+
+    let malicious_names = [
+        "@../pkg",
+        "@../../etc/passwd",
+        "@%2e%2e/pkg",
+        "@scope/../../escaped",
+        "@scope%2f..%2f..%2fescaped",
+        "@..%2f..%2f/pkg",
+        "../foo",
+        "../../foo",
+        "..%2f..",
+        "foo/",
+        "/foo",
+        "@/foo",
+        "@scope//pkg",
+        "@scope",
+        "@scope/",
+        "foo/bar/baz",
+        "%2e%2e",
+        "foo\\bar",
+        "foo\0bar",
+    ];
+
+    for name in malicious_names {
+        assert!(
+            validate_package_name(name).is_err(),
+            "Expected '{name}' to fail validation as malicious / directory traversal"
+        );
+    }
+}
+
+#[test]
+fn test_mixed_case_scopes_and_alternate_syntaxes() {
+    let content = r#"
+    registry = https://registry.npmjs.org/
+    @MyOrg:registry = https://npm.myorg.internal/
+    @MixedCase/registry = https://npm.mixed.internal/
+    UpperOrg:registry = https://npm.upper.internal/
+    "#;
+
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // Verify all casing variations route to the expected registry
+    let variants_myorg = [
+        "@myorg/pkg",
+        "@MYORG/pkg",
+        "@MyOrg/Pkg",
+        "@mYoRg/pkg",
+        "@MyOrg%2fpkg",
+    ];
+    for var in variants_myorg {
+        assert_eq!(
+            npmrc.registry_for_package(var).as_str(),
+            "https://npm.myorg.internal/",
+            "Variant '{var}' must route to @myorg registry"
+        );
+    }
+
+    // Verify @MixedCase/registry
+    assert_eq!(
+        npmrc.registry_for_package("@mixedcase/lib").as_str(),
+        "https://npm.mixed.internal/"
+    );
+    assert_eq!(
+        npmrc.registry_for_package("@MIXEDCASE/lib").as_str(),
+        "https://npm.mixed.internal/"
+    );
+
+    // Verify UpperOrg:registry
+    assert_eq!(
+        npmrc.registry_for_package("@upperorg/core").as_str(),
+        "https://npm.upper.internal/"
+    );
+    assert_eq!(
+        npmrc.registry_for_package("@UPPERORG/core").as_str(),
+        "https://npm.upper.internal/"
+    );
+
+    // Metadata URL generation handles mixed-case correctly
+    let meta_url = npmrc.package_metadata_url("@MyOrg/Package-A").unwrap();
+    assert_eq!(
+        meta_url.as_str(),
+        "https://npm.myorg.internal/@MyOrg%2fPackage-A"
+    );
+}
