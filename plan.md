@@ -68,6 +68,7 @@ Do not mark a phase complete because the prose is complete. Mark it complete onl
 | DEC-002 | 2026-10-31 | Performance registry | `[x]` Accepted | Performance checkpoints use a pinned loopback registry; public registry runs are smoke tests only. |
 | DEC-003 | 2026-10-31 | Windows process accounting | `[x]` Accepted | Use Job Object process-tree accounting plus sampled working set. |
 | DEC-004 | 2026-10-31 | Full npm surface | `[!]` Open | Decide when unsupported commands move into the compatibility target based on fixture evidence. |
+| DEC-005 | 2026-11-02 | Core code isolation & Worktrees | `[x]` Accepted | Mandatory rule: Any modifications to core crates (`crates/rnpm-*`) must be performed within dedicated git worktrees. This directive applies to all successor threads in the lineage. |
 
 ## Scope definition
 
