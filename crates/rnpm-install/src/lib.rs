@@ -264,89 +264,6 @@ fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path) -> PathBuf {
     root_bin_dir.to_path_buf()
 }
 
-pub fn apply_npmrc_to_client_config(
-    client_config: &mut RegistryClientConfig,
-    npmrc: &rnpm_config::Npmrc,
-) {
-    if let Some(strict_val) = npmrc
-        .settings
-        .get("strict-ssl")
-        .or_else(|| npmrc.settings.get("strict_ssl"))
-    {
-        let trimmed = strict_val.trim().to_ascii_lowercase();
-        client_config.strict_ssl = !matches!(trimmed.as_str(), "false" | "0" | "no" | "off");
-    }
-
-    if let Some(proxy_val) = npmrc.settings.get("proxy") {
-        client_config.proxy = Some(proxy_val.clone());
-    }
-
-    if let Some(https_val) = npmrc
-        .settings
-        .get("https-proxy")
-        .or_else(|| npmrc.settings.get("https_proxy"))
-    {
-        client_config.https_proxy = Some(https_val.clone());
-    }
-
-    if let Some(http_val) = npmrc
-        .settings
-        .get("http-proxy")
-        .or_else(|| npmrc.settings.get("http_proxy"))
-    {
-        client_config.http_proxy = Some(http_val.clone());
-    }
-
-    if let Some(no_proxy_val) = npmrc
-        .settings
-        .get("no-proxy")
-        .or_else(|| npmrc.settings.get("no_proxy"))
-    {
-        client_config.no_proxy = Some(no_proxy_val.clone());
-    }
-
-    if let Some(ca_val) = npmrc.settings.get("ca") {
-        client_config.ca = Some(ca_val.clone());
-    }
-
-    if let Some(cafile_val) = npmrc
-        .settings
-        .get("cafile")
-        .or_else(|| npmrc.settings.get("ca_file"))
-    {
-        client_config.cafile = Some(PathBuf::from(cafile_val));
-    }
-
-    if let Some(cert_val) = npmrc.settings.get("cert") {
-        client_config.cert = Some(cert_val.clone());
-    }
-
-    if let Some(key_val) = npmrc.settings.get("key") {
-        client_config.key = Some(key_val.clone());
-    }
-
-    let timeout_ms = npmrc
-        .settings
-        .get("fetch-timeout")
-        .or_else(|| npmrc.settings.get("fetch_timeout"))
-        .or_else(|| npmrc.settings.get("timeout"))
-        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
-    if let Some(ms) = timeout_ms {
-        client_config.timeout = std::time::Duration::from_millis(ms);
-    }
-
-    let connect_timeout_ms = npmrc
-        .settings
-        .get("connect-timeout")
-        .or_else(|| npmrc.settings.get("connect_timeout"))
-        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
-    if let Some(ms) = connect_timeout_ms {
-        client_config.connect_timeout = std::time::Duration::from_millis(ms);
-    }
-}
-
-/// Options for running rnpm install.
-#[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub project_dir: PathBuf,
     pub registry_url: Option<String>,
@@ -608,16 +525,6 @@ impl Installer {
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
         self.install_internal().await
-    }
-
-    /// Alias for run().
-    pub async fn install(&mut self) -> Result<InstallSummary> {
-        self.run().await
-    }
-
-    /// Alias for run_ci().
-    pub async fn ci(&mut self) -> Result<InstallSummary> {
-        self.run_ci().await
     }
 
     async fn install_internal(&mut self) -> Result<InstallSummary> {
