@@ -243,6 +243,7 @@ async fn test_nested_conflict_diamond_reification_and_lockfile() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let summary = installer.run().await.unwrap();
@@ -326,6 +327,7 @@ async fn test_npm_alias_installation_and_lockfile() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let summary = installer.run().await.unwrap();
@@ -419,6 +421,7 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let summary = installer.run().await.unwrap();
@@ -486,6 +489,7 @@ async fn test_required_platform_incompatibility_fails_ebadplatform() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run().await;

@@ -214,6 +214,7 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let summary = installer.run().await.unwrap();
@@ -315,6 +316,7 @@ async fn test_optional_download_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run().await;
@@ -339,6 +341,7 @@ async fn test_optional_download_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let req_res = req_installer.run().await;
@@ -430,6 +433,7 @@ async fn test_optional_ssri_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run().await;
@@ -454,6 +458,7 @@ async fn test_optional_ssri_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let req_res = req_installer.run().await;
@@ -544,6 +549,7 @@ async fn test_optional_lifecycle_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run().await;
@@ -567,6 +573,7 @@ async fn test_optional_lifecycle_failure_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let req_res = req_installer.run().await;
@@ -644,6 +651,7 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run_ci().await;
@@ -736,6 +744,7 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res = installer.run().await;
@@ -760,6 +769,7 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ignore_scripts: false,
+        ..Default::default()
     }).unwrap();
 
     let res_req = installer_req.run().await;

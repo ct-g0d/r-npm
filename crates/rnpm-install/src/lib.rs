@@ -10,7 +10,7 @@ use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
-use rnpm_core::spec::PackageTarget;
+use rnpm_core::spec::{PackageSpec, PackageTarget};
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
 use std::sync::Arc;
 use rnpm_fs::atomic::extract_and_replace;
@@ -170,6 +170,87 @@ fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path) -> PathBuf {
     root_bin_dir.to_path_buf()
 }
 
+pub fn apply_npmrc_to_client_config(
+    client_config: &mut RegistryClientConfig,
+    npmrc: &rnpm_config::Npmrc,
+) {
+    if let Some(strict_val) = npmrc
+        .settings
+        .get("strict-ssl")
+        .or_else(|| npmrc.settings.get("strict_ssl"))
+    {
+        let trimmed = strict_val.trim().to_ascii_lowercase();
+        client_config.strict_ssl = !matches!(trimmed.as_str(), "false" | "0" | "no" | "off");
+    }
+
+    if let Some(proxy_val) = npmrc.settings.get("proxy") {
+        client_config.proxy = Some(proxy_val.clone());
+    }
+
+    if let Some(https_val) = npmrc
+        .settings
+        .get("https-proxy")
+        .or_else(|| npmrc.settings.get("https_proxy"))
+    {
+        client_config.https_proxy = Some(https_val.clone());
+    }
+
+    if let Some(http_val) = npmrc
+        .settings
+        .get("http-proxy")
+        .or_else(|| npmrc.settings.get("http_proxy"))
+    {
+        client_config.http_proxy = Some(http_val.clone());
+    }
+
+    if let Some(no_proxy_val) = npmrc
+        .settings
+        .get("no-proxy")
+        .or_else(|| npmrc.settings.get("no_proxy"))
+    {
+        client_config.no_proxy = Some(no_proxy_val.clone());
+    }
+
+    if let Some(ca_val) = npmrc.settings.get("ca") {
+        client_config.ca = Some(ca_val.clone());
+    }
+
+    if let Some(cafile_val) = npmrc
+        .settings
+        .get("cafile")
+        .or_else(|| npmrc.settings.get("ca_file"))
+    {
+        client_config.cafile = Some(PathBuf::from(cafile_val));
+    }
+
+    if let Some(cert_val) = npmrc.settings.get("cert") {
+        client_config.cert = Some(cert_val.clone());
+    }
+
+    if let Some(key_val) = npmrc.settings.get("key") {
+        client_config.key = Some(key_val.clone());
+    }
+
+    let timeout_ms = npmrc
+        .settings
+        .get("fetch-timeout")
+        .or_else(|| npmrc.settings.get("fetch_timeout"))
+        .or_else(|| npmrc.settings.get("timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = timeout_ms {
+        client_config.timeout = std::time::Duration::from_millis(ms);
+    }
+
+    let connect_timeout_ms = npmrc
+        .settings
+        .get("connect-timeout")
+        .or_else(|| npmrc.settings.get("connect_timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = connect_timeout_ms {
+        client_config.connect_timeout = std::time::Duration::from_millis(ms);
+    }
+}
+
 /// Options for running rnpm install.
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -178,6 +259,14 @@ pub struct InstallOptions {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub ignore_scripts: bool,
+    pub save_dev: bool,
+    pub save_exact: bool,
+    pub save_prod: bool,
+    pub save_optional: bool,
+    pub save_peer: bool,
+    pub no_save: bool,
+    pub package_lock_only: bool,
+    pub packages: Vec<String>,
 }
 
 impl Default for InstallOptions {
@@ -188,6 +277,14 @@ impl Default for InstallOptions {
             cache_dir: None,
             offline: false,
             ignore_scripts: false,
+            save_dev: false,
+            save_exact: false,
+            save_prod: false,
+            save_optional: false,
+            save_peer: false,
+            no_save: false,
+            package_lock_only: false,
+            packages: Vec::new(),
         }
     }
 }
@@ -390,6 +487,22 @@ impl Installer {
         &self.registry_client
     }
 
+    /// Alias for `run()`.
+    pub async fn install(&mut self) -> Result<InstallSummary> {
+        self.run().await
+    }
+
+    /// Alias for `run_ci()`.
+    pub async fn ci(&mut self) -> Result<InstallSummary> {
+        self.run_ci().await
+    }
+
+    /// Install specific packages.
+    pub async fn install_packages(&mut self, packages: &[String]) -> Result<InstallSummary> {
+        self.options.packages = packages.to_vec();
+        self.run().await
+    }
+
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
@@ -397,8 +510,101 @@ impl Installer {
             return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
         }
 
-        let manifest = Manifest::from_file(&manifest_path)
+        let mut manifest = Manifest::from_file(&manifest_path)
             .context("Failed to parse project package.json")?;
+
+        // Track added packages and their original requested specifiers
+        struct AddedPkgInfo {
+            name: String,
+            user_spec: Option<String>,
+            target: PackageTarget,
+        }
+        let mut added_pkgs: Vec<AddedPkgInfo> = Vec::new();
+
+        for raw_pkg in &self.options.packages {
+            let trimmed = raw_pkg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if trimmed.contains('\0') {
+                return Err(anyhow!("Package argument contains null character"));
+            }
+
+            let formatted_input = if (trimmed.starts_with("./")
+                || trimmed.starts_with("../")
+                || trimmed.starts_with(".\\")
+                || trimmed.starts_with("..\\"))
+                && !trimmed.starts_with("file:")
+            {
+                format!("file:{}", trimmed)
+            } else {
+                trimmed.to_string()
+            };
+
+            let spec = PackageSpec::parse(&formatted_input)
+                .map_err(|e| anyhow!("Failed to parse package specifier '{trimmed}': {e}"))?;
+
+            if spec.name.contains("..") || spec.name.contains(':') || spec.name.contains('\\') || spec.name.contains('\0') {
+                return Err(anyhow!("Package name '{}' contains illegal path characters", spec.name));
+            }
+            rnpm_fs::validate_entry_path(Path::new(&spec.name))
+                .map_err(|e| anyhow!("Invalid package name '{}': {e}", spec.name))?;
+
+            let user_spec = if let Some(at_idx) = trimmed.rfind('@') {
+                let slash_idx = trimmed.find('/').unwrap_or(0);
+                if at_idx > slash_idx {
+                    Some(trimmed[at_idx + 1..].trim().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let solver_spec = match &spec.target {
+                PackageTarget::Tag(t) => t.clone(),
+                PackageTarget::Range(r) => user_spec.clone().unwrap_or_else(|| r.to_string()),
+                PackageTarget::Version(v) => v.to_string(),
+                PackageTarget::File(p) => format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy())),
+                PackageTarget::Git { url, committish } => {
+                    format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                }
+                PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
+                PackageTarget::Alias { name: real_name, target } => {
+                    format!("npm:{}@{}", real_name, target)
+                }
+                PackageTarget::Url(u) => u.to_string(),
+            };
+
+            if self.options.save_dev {
+                manifest.dev_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest.dependencies.remove(&spec.name);
+                manifest.optional_dependencies.remove(&spec.name);
+                manifest.peer_dependencies.remove(&spec.name);
+            } else if self.options.save_optional {
+                manifest.optional_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest.dependencies.remove(&spec.name);
+                manifest.dev_dependencies.remove(&spec.name);
+                manifest.peer_dependencies.remove(&spec.name);
+            } else if self.options.save_peer {
+                manifest.peer_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest.dependencies.remove(&spec.name);
+                manifest.dev_dependencies.remove(&spec.name);
+                manifest.optional_dependencies.remove(&spec.name);
+            } else {
+                manifest.dependencies.insert(spec.name.clone(), solver_spec);
+                manifest.dev_dependencies.remove(&spec.name);
+                manifest.optional_dependencies.remove(&spec.name);
+                manifest.peer_dependencies.remove(&spec.name);
+            }
+
+            added_pkgs.push(AddedPkgInfo {
+                name: spec.name,
+                user_spec,
+                target: spec.target,
+            });
+        }
 
         let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
         let project_version = manifest.version.clone();
@@ -484,6 +690,148 @@ impl Installer {
             }).await.map_err(|e| anyhow!("Solver task panicked: {e}"))??
         };
 
+        // 2. Post-solve: finalize versions for added packages in manifest
+        if !added_pkgs.is_empty() {
+            for added in &added_pkgs {
+                let resolved_version_opt = graph.nodes.get(&format!("node_modules/{}", added.name))
+                    .or_else(|| graph.nodes.values().find(|n| n.name == added.name))
+                    .map(|n| n.version.clone());
+
+                let resolved_ver = resolved_version_opt.unwrap_or_else(|| "1.0.0".to_string());
+
+                let final_spec = if self.options.save_exact {
+                    match &added.target {
+                        PackageTarget::Alias { name: real_name, .. } => {
+                            format!("npm:{}@{}", real_name, resolved_ver)
+                        }
+                        PackageTarget::File(p) => {
+                            format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
+                        }
+                        PackageTarget::Git { url, committish } => {
+                            format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                        }
+                        PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
+                        _ => resolved_ver,
+                    }
+                } else {
+                    match &added.target {
+                        PackageTarget::Range(_) => {
+                            if let Some(ref u_spec) = added.user_spec {
+                                if u_spec == "*" {
+                                    format!("^{}", resolved_ver)
+                                } else {
+                                    u_spec.clone()
+                                }
+                            } else {
+                                format!("^{}", resolved_ver)
+                            }
+                        }
+                        PackageTarget::Tag(_) | PackageTarget::Version(_) => {
+                            format!("^{}", resolved_ver)
+                        }
+                        PackageTarget::Alias { name: real_name, .. } => {
+                            if let Some(ref u_spec) = added.user_spec {
+                                u_spec.clone()
+                            } else {
+                                format!("npm:{}@^{}", real_name, resolved_ver)
+                            }
+                        }
+                        PackageTarget::File(p) => {
+                            format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
+                        }
+                        PackageTarget::Git { url, committish } => {
+                            format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                        }
+                        PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
+                        PackageTarget::Url(u) => u.to_string(),
+                    }
+                };
+
+                if self.options.save_dev {
+                    manifest.dev_dependencies.insert(added.name.clone(), final_spec);
+                } else if self.options.save_optional {
+                    manifest.optional_dependencies.insert(added.name.clone(), final_spec);
+                } else if self.options.save_peer {
+                    manifest.peer_dependencies.insert(added.name.clone(), final_spec);
+                } else {
+                    manifest.dependencies.insert(added.name.clone(), final_spec);
+                }
+            }
+
+            // Save package.json unless --no-save was passed
+            if !self.options.no_save {
+                manifest.save_to_file(&manifest_path)
+                    .context("Failed to save updated package.json")?;
+            }
+        }
+
+        let mut lockfile = graph.to_lockfile_v3(&project_name, project_version.as_deref());
+        if let Some(root_pkg) = lockfile.root_package_mut() {
+            if manifest.dependencies.is_empty() {
+                root_pkg.dependencies = None;
+            } else {
+                root_pkg.dependencies = Some(manifest.dependencies.clone());
+            }
+            if manifest.dev_dependencies.is_empty() {
+                root_pkg.dev_dependencies = None;
+            } else {
+                root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+            }
+            if manifest.optional_dependencies.is_empty() {
+                root_pkg.optional_dependencies = None;
+            } else {
+                root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+            }
+            if manifest.peer_dependencies.is_empty() {
+                root_pkg.peer_dependencies = None;
+            } else {
+                root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
+            }
+            if !manifest.workspace_patterns().is_empty() {
+                root_pkg.workspaces = Some(manifest.workspace_patterns());
+            }
+        }
+
+        // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
+        if self.options.package_lock_only {
+            for (loc, node) in &graph.nodes {
+                if let Some(ref res) = node.resolved {
+                    if res.starts_with("file:") {
+                        let rel_file = res.strip_prefix("file:").unwrap();
+                        let abs_file = self.options.project_dir.join(rel_file);
+                        if abs_file.is_dir() {
+                            let link_entry = LockfilePackage {
+                                resolved: Some(rel_file.to_string()),
+                                link: Some(true),
+                                ..Default::default()
+                            };
+                            lockfile.insert_package(loc, link_entry);
+
+                            let mut target_entry = LockfilePackage {
+                                version: Some(node.version.clone()),
+                                ..Default::default()
+                            };
+                            if !node.dependencies.is_empty() {
+                                target_entry.dependencies = Some(node.dependencies.clone());
+                            }
+                            lockfile.insert_package(rel_file, target_entry);
+                        }
+                    }
+                }
+            }
+
+            let lockfile_path = self.options.project_dir.join("package-lock.json");
+            lockfile.save_to_file(&lockfile_path)
+                .context("Failed to save package-lock.json")?;
+
+            return Ok(InstallSummary {
+                packages_installed: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path,
+            });
+        }
+
         // 2. Build proper nested node_modules trees and lockfile v3 from solver graph
         let node_modules_dir = self.options.project_dir.join("node_modules");
         let root_bin_dir = node_modules_dir.join(".bin");
@@ -493,13 +841,6 @@ impl Installer {
         let mut cache_hits = 0;
         let mut cache_misses = 0;
         let mut packages_installed = 0;
-
-        let mut lockfile = graph.to_lockfile_v3(&project_name, project_version.as_deref());
-        if let Some(root_pkg) = lockfile.root_package_mut() {
-            if !manifest.workspace_patterns().is_empty() {
-                root_pkg.workspaces = Some(manifest.workspace_patterns());
-            }
-        }
 
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
         let mut packages_to_download = Vec::new();
