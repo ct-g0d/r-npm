@@ -42,6 +42,33 @@ pub(crate) enum Commands {
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
         omit: Vec<String>,
+        /// Save added dependencies to devDependencies
+        #[arg(short = 'D', long = "save-dev")]
+        save_dev: bool,
+
+        /// Save exact version string (no ^ or ~)
+        #[arg(short = 'E', long = "save-exact")]
+        save_exact: bool,
+
+        /// Save to dependencies
+        #[arg(short = 'P', short_alias = 'S', long = "save-prod", alias = "save")]
+        save_prod: bool,
+
+        /// Save to optionalDependencies
+        #[arg(short = 'O', long = "save-optional")]
+        save_optional: bool,
+
+        /// Save to peerDependencies
+        #[arg(long = "save-peer")]
+        save_peer: bool,
+
+        /// Do not write or mutate package.json
+        #[arg(long = "no-save")]
+        no_save: bool,
+
+        /// Resolve and write package-lock.json without extracting or modifying node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -389,12 +416,7 @@ where
         "--legacy-peer-deps",
         "--global",
         "-g",
-        "--package-lock-only",
         "--save-bundle",
-        "--save-exact",
-        "-E",
-        "--no-save",
-        "--save-peer",
         "--production",
     ];
 
@@ -638,7 +660,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
     };
 
     match cli.command {
-        Commands::Install { registry, cache, offline, ignore_scripts, omit, .. } => {
+        Commands::Install {
+
+            packages,
+            registry,
+            cache,
+            offline,
+            ignore_scripts,
+            save_dev,
+            save_exact,
+            save_prod,
+            save_optional,
+            save_peer,
+            no_save,
+            package_lock_only,
+                    omit,
+        } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
                 project_dir: current_dir,
@@ -649,6 +686,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_dev,
                 omit_optional,
                 omit_peer,
+                save_dev,
+                save_exact,
+                save_prod,
+                save_optional,
+                save_peer,
+                no_save,
+                package_lock_only,
+                packages,
             };
 
             let mut installer = Installer::new(options)?;
@@ -670,6 +715,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_dev,
                 omit_optional,
                 omit_peer,
+                ..Default::default()
             };
 
             let mut installer = Installer::new(options)?;

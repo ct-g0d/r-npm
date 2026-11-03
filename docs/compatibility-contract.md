@@ -13,7 +13,7 @@
 ## 2. Command Surface & Scope Boundaries
 
 ### Active Command Matrix & Aliases
-- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3.
+- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3. Supports `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`.
 - `ci` / `clean-install` (aliases: `clean-install`, `ic`): Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination (`ELOCKFILE_DRIFT`) and zero network/filesystem side effects.
 - `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls. Supports `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
 - `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance.
@@ -40,7 +40,7 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--package-lock-only`, `--save-bundle`, `--save-exact`) terminate immediately with exit code `1` and a structured diagnostic:
+Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--save-bundle`, `--production`) terminate immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_FLAG
 npm error The flag '<flag>' is not supported by rnpm.
@@ -140,7 +140,7 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 ### 4.7. Tar Extraction Security Boundary & Tar Bomb Defenses
 - **Path Traversal Defense:** Reject tar entries containing `..`, absolute paths (leading `/` or `C:\`), or drive letters.
 - **Symlink & Hardlink Escape:** Symlinks and hardlinks pointing outside the target package root directory are strictly rejected.
-- **Windows Forbidden Device Names:** Reject entries matching `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9` (including extensions like `NUL.txt`).
+- **Windows Forbidden Device Names:** Reject entries matching `CON`, `PRN`, `AUX`, `NUL`, `COM1`鈥揱COM9`, `LPT1`鈥揱LPT9` (including extensions like `NUL.txt`).
 - **Trailing Characters:** Strip or reject trailing dots (`.`) and spaces in filenames on Windows.
 - **Mode Bit Sanitization:** Strip SUID (04000) and SGID (02000) bits. Normalize file permissions to `0644` (regular file) or `0755` (executable / binary).
 - **Directory Prefix Stripping:** Strip exactly the standard top-level `package/` prefix from tar archives.

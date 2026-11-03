@@ -2224,3 +2224,146 @@ async fn test_offline_mode_cache_hit_success() {
     assert!(project_dir.join("node_modules").join("offline-pkg").join("package.json").exists());
 }
 
+#[tokio::test]
+async fn test_install_save_flags_and_package_lock_only_matrix() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create two local packages
+    let local_pkg_a = root.join("packages").join("pkg-a");
+    fs::create_dir_all(&local_pkg_a).unwrap();
+    fs::write(
+        local_pkg_a.join("package.json"),
+        r#"{"name": "pkg-a", "version": "1.2.3"}"#,
+    ).unwrap();
+
+    let local_pkg_b = root.join("packages").join("pkg-b");
+    fs::create_dir_all(&local_pkg_b).unwrap();
+    fs::write(
+        local_pkg_b.join("package.json"),
+        r#"{"name": "pkg-b", "version": "2.0.0"}"#,
+    ).unwrap();
+
+    let app_dir = root.join("app");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("package.json"),
+        r#"{"name": "app", "version": "1.0.0"}"#,
+    ).unwrap();
+
+    // Test A: --save-dev (-D)
+    {
+        let opts = InstallOptions {
+            project_dir: app_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-a@file:../packages/pkg-a".to_string()],
+            save_dev: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        installer.run().await.unwrap();
+
+        let manifest = Manifest::from_file(app_dir.join("package.json")).unwrap();
+        assert!(manifest.dev_dependencies.contains_key("pkg-a"));
+        assert!(!manifest.dependencies.contains_key("pkg-a"));
+    }
+
+    // Test B: --save-prod (-P) moves from dev_dependencies to dependencies
+    {
+        let opts = InstallOptions {
+            project_dir: app_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-a@file:../packages/pkg-a".to_string()],
+            save_prod: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        installer.run().await.unwrap();
+
+        let manifest = Manifest::from_file(app_dir.join("package.json")).unwrap();
+        assert!(manifest.dependencies.contains_key("pkg-a"));
+        assert!(!manifest.dev_dependencies.contains_key("pkg-a"));
+    }
+
+    // Test C: --save-optional (-O) moves to optional_dependencies
+    {
+        let opts = InstallOptions {
+            project_dir: app_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-a@file:../packages/pkg-a".to_string()],
+            save_optional: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        installer.run().await.unwrap();
+
+        let manifest = Manifest::from_file(app_dir.join("package.json")).unwrap();
+        assert!(manifest.optional_dependencies.contains_key("pkg-a"));
+        assert!(!manifest.dependencies.contains_key("pkg-a"));
+    }
+
+    // Test D: --save-peer moves to peer_dependencies
+    {
+        let opts = InstallOptions {
+            project_dir: app_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-a@file:../packages/pkg-a".to_string()],
+            save_peer: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        installer.run().await.unwrap();
+
+        let manifest = Manifest::from_file(app_dir.join("package.json")).unwrap();
+        assert!(manifest.peer_dependencies.contains_key("pkg-a"));
+        assert!(!manifest.optional_dependencies.contains_key("pkg-a"));
+    }
+
+    // Test E: --no-save does not mutate package.json or write package-lock.json
+    {
+        let app_no_save_dir = root.join("app-no-save");
+        fs::create_dir_all(&app_no_save_dir).unwrap();
+        let orig_content = r#"{"name": "app-no-save", "version": "1.0.0"}"#;
+        fs::write(app_no_save_dir.join("package.json"), orig_content).unwrap();
+
+        let opts = InstallOptions {
+            project_dir: app_no_save_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-b@file:../packages/pkg-b".to_string()],
+            no_save: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        installer.run().await.unwrap();
+
+        let content = fs::read_to_string(app_no_save_dir.join("package.json")).unwrap();
+        assert_eq!(content, orig_content);
+        assert!(!app_no_save_dir.join("package-lock.json").exists());
+        assert!(app_no_save_dir.join("node_modules").join("pkg-b").exists());
+    }
+
+    // Test F: --package-lock-only writes package-lock.json without creating node_modules
+    {
+        let app_lock_only_dir = root.join("app-lock-only");
+        fs::create_dir_all(&app_lock_only_dir).unwrap();
+        fs::write(
+            app_lock_only_dir.join("package.json"),
+            r#"{"name": "app-lock-only", "version": "1.0.0"}"#,
+        ).unwrap();
+
+        let opts = InstallOptions {
+            project_dir: app_lock_only_dir.clone(),
+            offline: true,
+            packages: vec!["pkg-a@file:../packages/pkg-a".to_string()],
+            package_lock_only: true,
+            ..Default::default()
+        };
+        let mut installer = Installer::new(opts).unwrap();
+        let summary = installer.run().await.unwrap();
+
+        assert_eq!(summary.packages_installed, 0);
+        assert!(app_lock_only_dir.join("package-lock.json").exists());
+        assert!(!app_lock_only_dir.join("node_modules").exists());
+    }
+}
+

@@ -751,12 +751,7 @@ use tokio::net::TcpListener;
             "--legacy-peer-deps",
             "--global",
             "-g",
-            "--package-lock-only",
             "--save-bundle",
-            "--save-exact",
-            "-E",
-            "--no-save",
-            "--save-peer",
             "--production",
         ];
 
@@ -844,6 +839,13 @@ use tokio::net::TcpListener;
                 offline: true,
                 ignore_scripts: true,
                 omit: vec![],
+                save_dev: false,
+                save_exact: false,
+                save_prod: false,
+                save_optional: false,
+                save_peer: false,
+                no_save: false,
+                package_lock_only: false,
             },
         };
 
