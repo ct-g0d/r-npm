@@ -154,6 +154,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             dependencies: root_manifest.dependencies.clone(),
             dev_dependencies: root_manifest.dev_dependencies.clone(),
             peer_dependencies: root_manifest.peer_dependencies.clone(),
+            peer_dependencies_meta: root_manifest.peer_dependencies_meta.clone(),
             optional_dependencies: root_manifest.optional_dependencies.clone(),
             os: root_manifest.os.clone(),
             cpu: root_manifest.cpu.clone(),
@@ -499,13 +500,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
 
         // 5. Platform filtering for optional dependencies
-        if task.dep_type == DependencyType::Optional {
-            let compatible = self.options.platform.matches_with_libc(
-                chosen_version.os.as_deref(),
-                chosen_version.cpu.as_deref(),
-                chosen_version.libc.as_deref(),
-            );
-            if !compatible {
+        let compatible = self.options.platform.matches_with_libc(
+            chosen_version.os.as_deref(),
+            chosen_version.cpu.as_deref(),
+            chosen_version.libc.as_deref(),
+        );
+        if !compatible {
+            if task.dep_type == DependencyType::Optional {
                 debug!(
                     "Optional package '{}@{}' filtered out by platform ({:?})",
                     dep_spec.package_name, chosen_version.version, self.options.platform
@@ -513,6 +514,27 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 self.graph.skipped.insert(dep_spec.package_name.clone());
                 self.graph.skipped.insert(task.install_name.clone());
                 return Ok(());
+            } else {
+                let wanted = format!(
+                    "os: {:?}, cpu: {:?}, libc: {:?}",
+                    chosen_version.os.as_deref().unwrap_or(&[]),
+                    chosen_version.cpu.as_deref().unwrap_or(&[]),
+                    chosen_version.libc.as_deref().unwrap_or(&[])
+                );
+                let current = format!(
+                    "os: {}, cpu: {}, libc: {}",
+                    self.options.platform.os,
+                    self.options.platform.cpu,
+                    self.options.platform.libc.as_deref().unwrap_or("none")
+                );
+                return Err(SolverError::platform_incompatible(
+                    &dep_spec.package_name,
+                    &chosen_version.version,
+                    wanted,
+                    current,
+                    (*task.ancestors).clone(),
+                    format!("Package '{}@{}' is incompatible with the current platform", dep_spec.package_name, chosen_version.version),
+                ));
             }
         }
 
@@ -572,6 +594,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     dependencies: chosen_version.dependencies.clone(),
                     dev_dependencies: chosen_version.dev_dependencies.clone(),
                     peer_dependencies: chosen_version.peer_dependencies.clone(),
+                    peer_dependencies_meta: chosen_version.peer_dependencies_meta.clone(),
                     optional_dependencies: chosen_version.optional_dependencies.clone(),
                     os: chosen_version.os.clone(),
                     cpu: chosen_version.cpu.clone(),
@@ -777,6 +800,15 @@ pub fn resolve_fast_path(
                 node.flags.skipped = true;
                 graph.skipped.insert(node.name.clone());
                 graph.skipped.insert(node.install_name.clone());
+            }
+        } else if !node.location.is_empty() {
+            let compatible = options.platform.matches_with_libc(
+                node.os.as_deref(),
+                node.cpu.as_deref(),
+                node.libc.as_deref(),
+            );
+            if !compatible {
+                return None;
             }
         }
     }
