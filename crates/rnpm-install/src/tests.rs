@@ -787,6 +787,7 @@ fn test_uninstall_deterministic_serialization_preserves_formatting() {
             cache_dir: Some(cache_dir.path().to_path_buf()),
             offline: false,
             ignore_scripts: true,
+            ..Default::default()
         };
 
         let mut installer = Installer::new(options).unwrap();
@@ -941,6 +942,7 @@ fn test_uninstall_deterministic_serialization_preserves_formatting() {
             cache_dir: Some(cache_dir.path().to_path_buf()),
             offline: false,
             ignore_scripts: true,
+            ..Default::default()
         };
 
         let mut installer = Installer::new(options).unwrap();
@@ -1373,6 +1375,7 @@ async fn test_targeted_update_preserves_satisfying_and_unrelated_dependencies() 
         cache_dir: Some(cache_dir.path().to_path_buf()),
         offline: false,
         ignore_scripts: true,
+        ..Default::default()
     };
 
     let mut installer = Installer::new(options).unwrap();
@@ -1417,6 +1420,7 @@ async fn test_install_reification_path_containment_and_illegal_package_names() {
             cache_dir: Some(cache_dir.path().to_path_buf()),
             offline: true,
             ignore_scripts: true,
+            ..Default::default()
         };
 
         let mut installer = Installer::new(options).unwrap();
@@ -2084,6 +2088,7 @@ async fn test_offline_mode_metadata_cache_miss_enotcached() {
         cache_dir: Some(cache_dir),
         offline: true,
         ignore_scripts: true,
+        ..Default::default()
     };
 
     let mut installer = crate::Installer::new(options).unwrap();
@@ -2130,6 +2135,7 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
         cache_dir: Some(cache_dir),
         offline: true,
         ignore_scripts: true,
+        ..Default::default()
     };
 
     let mut installer = crate::Installer::new(options).unwrap();
@@ -2206,6 +2212,7 @@ async fn test_offline_mode_cache_hit_success() {
         cache_dir: Some(cache_dir),
         offline: true,
         ignore_scripts: true,
+        ..Default::default()
     };
 
     let mut installer = crate::Installer::new(options).unwrap();

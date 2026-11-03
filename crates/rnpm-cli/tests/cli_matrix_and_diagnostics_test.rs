@@ -313,14 +313,12 @@ fn test_additional_aliases_and_flag_routing() {
     assert!(stderr.contains("npm error code ERR_UNSUPPORTED_COMMAND"));
     assert!(stderr.contains("show"));
 
-    // Additional unsupported flags -E, --no-save, --save-peer, --production, space-separated --omit
+    // Additional unsupported flags -E, --no-save, --save-peer, --production
     for flag_args in [
         vec!["install", "-E"],
         vec!["install", "--no-save"],
         vec!["install", "--save-peer"],
         vec!["install", "--production"],
-        vec!["install", "--omit", "dev"],
-        vec!["install", "--omit", "optional"],
     ] {
         let output = Command::new(rnpm_bin)
             .args(&flag_args)

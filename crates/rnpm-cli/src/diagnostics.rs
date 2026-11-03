@@ -70,6 +70,7 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOLOCK" => "ENOLOCK",
                 "ENOENT" => "ENOENT",
                 "ENOWORKSPACES" => "ENOWORKSPACES",
+                "ENOTCACHED" => "ENOTCACHED",
                 _ => "EUNKNOWN",
             };
             let remaining: Vec<String> = lines
@@ -331,6 +332,8 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         Diagnostic::new("ENOLOCK", err_str)
     } else if err_str.contains("ENOWORKSPACES") {
         Diagnostic::new("ENOWORKSPACES", err_str)
+    } else if err_str.contains("ENOTCACHED") || err_str.contains("only-if-cached") {
+        Diagnostic::new("ENOTCACHED", err_str)
     } else if err_str.contains("ENOENT") || err_str.contains("package.json not found") {
         Diagnostic::new("ENOENT", err_str)
     } else {

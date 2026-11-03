@@ -40,7 +40,7 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--package-lock-only`, `--save-bundle`, `--save-exact`, `--omit=dev`, `--omit=optional`, `--omit=peer`) terminate immediately with exit code `1` and a structured diagnostic:
+Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--package-lock-only`, `--save-bundle`, `--save-exact`) terminate immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_FLAG
 npm error The flag '<flag>' is not supported by rnpm.
