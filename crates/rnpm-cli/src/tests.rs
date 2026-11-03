@@ -259,7 +259,7 @@ use tokio::net::TcpListener;
         // Run `rnpm run build --workspaces`
         let cli = Cli {
             command: Commands::Run {
-                script: "build".to_string(),
+                script: Some("build".to_string()),
                 args: vec![],
                 workspaces: true,
                 workspace: vec![],
@@ -383,7 +383,7 @@ use tokio::net::TcpListener;
         // Run `rnpm run build --workspaces`
         let cli = Cli {
             command: Commands::Run {
-                script: "build".to_string(),
+                script: Some("build".to_string()),
                 args: vec![],
                 workspaces: true,
                 workspace: vec![],
@@ -683,7 +683,7 @@ use tokio::net::TcpListener;
         // Run `rnpm run test-filter --filter @scope/*`
         let cli = Cli {
             command: Commands::Run {
-                script: "test-filter".to_string(),
+                script: Some("test-filter".to_string()),
                 args: vec![],
                 workspaces: true,
                 workspace: vec![],
