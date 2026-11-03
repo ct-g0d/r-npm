@@ -1054,5 +1054,53 @@ mod tests {
         let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir()).unwrap().collect();
         assert_eq!(tmp_entries.len(), 0, "No temp files must remain in tmp directory");
     }
+
+    #[test]
+    fn test_cacache_format_and_key_aliasing() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let data = b"console.log('hello cacache');";
+        let tarball_url = "https://registry.npmjs.org/my-pkg/-/my-pkg-1.0.0.tgz";
+        let cacache_key = format!("make-fetch-happen:request-cache:{tarball_url}");
+
+        // Store with npm make-fetch-happen key format
+        let entry = cache.put(&cacache_key, data, None).unwrap();
+        assert_eq!(entry.size, data.len() as u64);
+
+        // Lookup by raw tarball URL should resolve the entry via alias
+        let (found_entry, found_data) = cache.get(tarball_url).unwrap().expect("Must resolve via cacache alias");
+        assert_eq!(found_data, data);
+        assert_eq!(found_entry.key, cacache_key);
+
+        // Test pacote packument aliasing
+        let pkg_name = "my-library";
+        let pacote_key = format!("pacote:packument:{pkg_name}");
+        let meta_data = b"{\"name\":\"my-library\",\"dist-tags\":{\"latest\":\"1.0.0\"}}";
+        cache.put(&pacote_key, meta_data, None).unwrap();
+
+        let (_, found_meta) = cache.get(pkg_name).unwrap().expect("Must resolve pacote:packument alias");
+        assert_eq!(found_meta, meta_data);
+    }
+
+    #[test]
+    fn test_ssri_variants_sha1_and_sha256() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let data = b"legacy sha1 package payload";
+        let sha1_integrity = Integrity::from_bytes(data, Algorithm::Sha1);
+
+        // Write a blob into content-v2/sha1/...
+        let sha1_entry = sha1_integrity.entries.iter().find(|e| e.algorithm == Algorithm::Sha1).unwrap();
+        let hex = data_encoding::HEXLOWER.encode(&sha1_entry.digest);
+        let blob_path = cache.blob_path_for_algo(Algorithm::Sha1, &hex);
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::write(&blob_path, data).unwrap();
+
+        // Fetch by integrity should find it in content-v2/sha1/...
+        let found = cache.get_by_integrity(&sha1_integrity).unwrap().expect("Must resolve sha1 blob");
+        assert_eq!(found, data);
+    }
 }
 

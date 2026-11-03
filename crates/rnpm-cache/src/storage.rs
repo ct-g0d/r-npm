@@ -281,6 +281,19 @@ impl Cache {
             .join(&hex)
     }
 
+    /// Compute storage path for a digest hex string under a specific algorithm (cacache content-v2/<algo> layout).
+    pub fn blob_path_for_algo(&self, algo: Algorithm, hex_str: &str) -> PathBuf {
+        let hex = hex_str.to_ascii_lowercase();
+        let p1 = if hex.len() >= 2 { &hex[0..2] } else { "xx" };
+        let p2 = if hex.len() >= 4 { &hex[2..4] } else { "yy" };
+        self.root
+            .join("content-v2")
+            .join(algo.as_str())
+            .join(p1)
+            .join(p2)
+            .join(&hex)
+    }
+
     /// Compute lock file path for a given resource name.
     pub fn lock_path(&self, name: &str) -> PathBuf {
         let safe_name = name
@@ -483,6 +496,36 @@ impl Cache {
     /// If the index file is corrupted (invalid JSON, non-UTF-8, or mismatched key),
     /// it is automatically PURGED and `Ok(None)` is returned.
     pub fn get_index_entry(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
+        // First try exact key
+        if let Some(entry) = self.get_index_entry_internal(key)? {
+            return Ok(Some(entry));
+        }
+
+        // Try npm cacache / pacote key aliases
+        if key.starts_with("http://") || key.starts_with("https://") {
+            let alias = format!("make-fetch-happen:request-cache:{key}");
+            if let Some(entry) = self.get_index_entry_internal(&alias)? {
+                return Ok(Some(entry));
+            }
+        } else if let Some(stripped) = key.strip_prefix("make-fetch-happen:request-cache:") {
+            if let Some(entry) = self.get_index_entry_internal(stripped)? {
+                return Ok(Some(entry));
+            }
+        } else if !key.contains(':') {
+            let alias = format!("pacote:packument:{key}");
+            if let Some(entry) = self.get_index_entry_internal(&alias)? {
+                return Ok(Some(entry));
+            }
+        } else if let Some(stripped) = key.strip_prefix("pacote:packument:") {
+            if let Some(entry) = self.get_index_entry_internal(stripped)? {
+                return Ok(Some(entry));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn get_index_entry_internal(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
         let index_path = IndexEntry::path_for_key(&self.root, key);
         if !index_path.exists() {
             return Ok(None);
@@ -501,35 +544,87 @@ impl Cache {
             }
         };
 
-        match serde_json::from_str::<IndexEntry>(&content) {
-            Ok(entry) => {
-                // Verify index metadata consistency with requested key
-                if entry.key != key || entry.sha512_hex.is_empty() {
-                    warn!(
-                        "Index entry at {} has key mismatch (expected '{}', got '{}'). Purging corrupt index.",
-                        index_path.display(),
-                        key,
-                        entry.key
-                    );
-                    let _ = remove_file_with_retries(&index_path);
-                    return Ok(None);
-                }
-                if let Err(err) = Integrity::parse(&entry.integrity) {
-                    warn!(
-                        "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
-                        index_path.display(),
-                        entry.integrity
-                    );
-                    let _ = remove_file_with_retries(&index_path);
-                    return Ok(None);
-                }
-                Ok(Some(entry))
+        for line in content.lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            Err(err) => {
-                warn!(
-                    "Corrupt index entry at {}: {err}. Purging corrupt index.",
-                    index_path.display()
-                );
+
+            let json_str = if let Some(tab_pos) = trimmed.find('\t') {
+                &trimmed[tab_pos + 1..]
+            } else {
+                trimmed
+            };
+
+            match serde_json::from_str::<IndexEntry>(json_str) {
+                Ok(mut entry) => {
+                    if entry.key == key {
+                        if let Err(err) = Integrity::parse(&entry.integrity) {
+                            warn!(
+                                "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
+                                index_path.display(),
+                                entry.integrity
+                            );
+                            let _ = remove_file_with_retries(&index_path);
+                            return Ok(None);
+                        }
+
+                        if entry.sha512_hex.is_empty() {
+                            if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                                if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                    entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                                }
+                            }
+                        }
+
+                        return Ok(Some(entry));
+                    } else {
+                        warn!(
+                            "Index entry at {} has key mismatch (expected '{}', got '{}'). Purging corrupt index.",
+                            index_path.display(),
+                            key,
+                            entry.key
+                        );
+                        let _ = remove_file_with_retries(&index_path);
+                        return Ok(None);
+                    }
+                }
+                Err(err) => {
+                    warn!("Corrupt index entry at {}: {err}. Purging corrupt index.", index_path.display());
+                    let _ = remove_file_with_retries(&index_path);
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Fallback for multi-line pretty-printed single JSON
+        match serde_json::from_str::<IndexEntry>(&content) {
+            Ok(mut entry) => {
+                if entry.key == key {
+                    if let Err(err) = Integrity::parse(&entry.integrity) {
+                        warn!(
+                            "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
+                            index_path.display(),
+                            entry.integrity
+                        );
+                        let _ = remove_file_with_retries(&index_path);
+                        return Ok(None);
+                    }
+                    if entry.sha512_hex.is_empty() {
+                        if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                            if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                            }
+                        }
+                    }
+                    Ok(Some(entry))
+                } else {
+                    let _ = remove_file_with_retries(&index_path);
+                    Ok(None)
+                }
+            }
+            Err(_) => {
+                warn!("Corrupt index entry at {}. Purging corrupt index.", index_path.display());
                 let _ = remove_file_with_retries(&index_path);
                 Ok(None)
             }
@@ -598,12 +693,17 @@ impl Cache {
 
         let temp_path = self.create_temp_path("index");
         {
-            let json_bytes = serde_json::to_vec_pretty(&entry)?;
+            let json_str = serde_json::to_string(&entry)?;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(json_str.as_bytes());
+            let hash = HEXLOWER.encode(&hasher.finalize());
+            let line = format!("{hash}\t{json_str}\n");
+
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temp_path)?;
-            file.write_all(&json_bytes)?;
+            file.write_all(line.as_bytes())?;
             file.flush()?;
         }
 
@@ -648,12 +748,17 @@ impl Cache {
 
         let temp_path = self.create_temp_path("index");
         {
-            let json_bytes = serde_json::to_vec_pretty(&entry)?;
+            let json_str = serde_json::to_string(&entry)?;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(json_str.as_bytes());
+            let hash = HEXLOWER.encode(&hasher.finalize());
+            let line = format!("{hash}\t{json_str}\n");
+
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temp_path)?;
-            file.write_all(&json_bytes)?;
+            file.write_all(line.as_bytes())?;
             file.flush()?;
         }
 
@@ -676,69 +781,202 @@ impl Cache {
             None => return Ok(None),
         };
 
-        match self.get_by_sha512(&entry.sha512_hex)? {
-            Some(bytes) => {
-                // Verify against entry integrity as well
-                let expected_integrity = match Integrity::parse(&entry.integrity) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
+        if !entry.sha512_hex.is_empty() {
+            if let Some(bytes) = self.get_by_sha512(&entry.sha512_hex)? {
+                if let Ok(expected_integrity) = Integrity::parse(&entry.integrity) {
+                    if let Err(err) = expected_integrity.verify(&bytes) {
                         warn!(
-                            "Unparseable SSRI integrity in index for key '{key}': {err}. Auto-purging corrupt entry."
+                            "SSRI SHA-512 integrity mismatch for key '{key}': {err}. Auto-purging corrupt entry and treating as cache miss."
                         );
-                        let index_path = IndexEntry::path_for_key(&self.root, key);
+                        let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
                         let _ = remove_file_with_retries(&index_path);
                         let blob_path = self.blob_path(&entry.sha512_hex);
                         let _ = remove_file_with_retries(&blob_path);
                         return Ok(None);
                     }
-                };
-
-                if let Err(err) = expected_integrity.verify(&bytes) {
-                    warn!(
-                        "SSRI SHA-512 integrity mismatch for key '{key}': {err}. Auto-purging corrupt entry and treating as cache miss."
-                    );
-                    let index_path = IndexEntry::path_for_key(&self.root, key);
-                    let _ = remove_file_with_retries(&index_path);
-                    let blob_path = self.blob_path(&entry.sha512_hex);
-                    let _ = remove_file_with_retries(&blob_path);
-                    return Ok(None);
                 }
-                Ok(Some((entry, bytes)))
-            }
-            None => {
-                // Blob was corrupted or missing! Purge the stale index entry as well.
-                let index_path = IndexEntry::path_for_key(&self.root, key);
-                let _ = remove_file_with_retries(&index_path);
-                warn!(
-                    "Blob for index key '{key}' was corrupted or missing. Stale index purged."
-                );
-                Ok(None)
+                return Ok(Some((entry, bytes)));
             }
         }
+
+        if let Ok(parsed_integrity) = Integrity::parse(&entry.integrity) {
+            if let Some(bytes) = self.get_by_integrity(&parsed_integrity)? {
+                return Ok(Some((entry, bytes)));
+            }
+        }
+
+        let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
+        let _ = remove_file_with_retries(&index_path);
+        warn!(
+            "Blob for index key '{key}' was corrupted or missing. Stale index purged."
+        );
+        Ok(None)
+    }
+
+    /// Retrieve the local filesystem path to a cached blob without reading the contents into memory.
+    /// This enables zero-copy streaming extraction and inspection.
+    pub fn get_blob_path(&self, key: &str) -> Result<Option<(IndexEntry, PathBuf)>, CacheError> {
+        let entry = match self.get_index_entry(key)? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        if !entry.sha512_hex.is_empty() {
+            let blob_path = self.blob_path(&entry.sha512_hex);
+            if blob_path.exists() {
+                return Ok(Some((entry, blob_path)));
+            }
+        }
+
+        if let Ok(parsed_integrity) = Integrity::parse(&entry.integrity) {
+            let mut sorted_entries = parsed_integrity.entries.clone();
+            sorted_entries.sort_by(|a, b| b.algorithm.cmp(&a.algorithm));
+
+            for ssri in sorted_entries {
+                let hex = HEXLOWER.encode(&ssri.digest);
+                let blob_path = self.blob_path_for_algo(ssri.algorithm, &hex);
+                if blob_path.exists() {
+                    return Ok(Some((entry, blob_path)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Store a local file into content-addressable storage with key mapping and strict integrity verification.
+    /// Streams content from `source_path` in bounded chunks to avoid buffering the whole file in memory.
+    pub fn put_file_with_integrity(
+        &self,
+        key: &str,
+        source_path: &Path,
+        expected_integrity: Option<&Integrity>,
+        metadata: Option<&[u8]>,
+    ) -> Result<IndexEntry, CacheError> {
+        use std::io::Read;
+
+        let mut file = fs::File::open(source_path).map_err(CacheError::Io)?;
+        let mut hasher = Sha512::new();
+        let mut buffer = [0u8; 65536];
+        let mut total_size = 0u64;
+
+        loop {
+            let bytes_read = file.read(&mut buffer).map_err(CacheError::Io)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+            total_size += bytes_read as u64;
+        }
+
+        let sha512_bytes = hasher.finalize();
+        let sha512_hex = HEXLOWER.encode(&sha512_bytes);
+
+        if let Some(expected) = expected_integrity {
+            if let Some(sha512_entry) = expected.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                if sha512_entry.digest.as_slice() != sha512_bytes.as_slice() {
+                    return Err(CacheError::IntegrityMismatch {
+                        key: key.to_string(),
+                        expected: sha512_entry.to_string(),
+                        actual: format!("sha512-{}", data_encoding::BASE64.encode(&sha512_bytes)),
+                    });
+                }
+            }
+        }
+
+        let target_path = self.blob_path(&sha512_hex);
+        if !target_path.exists() {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let temp_path = self.create_temp_path("blob");
+            fs::copy(source_path, &temp_path)?;
+            let _ = rename_with_retries(&temp_path, &target_path);
+        }
+
+        let integrity = if let Some(expected) = expected_integrity {
+            expected.to_string()
+        } else {
+            format!("sha512-{}", data_encoding::BASE64.encode(&sha512_bytes))
+        };
+
+        let metadata_val = match metadata {
+            Some(m) => match serde_json::from_slice::<serde_json::Value>(m) {
+                Ok(val) => Some(val),
+                Err(_) => match std::str::from_utf8(m) {
+                    Ok(s) => Some(serde_json::Value::String(s.to_string())),
+                    Err(_) => Some(serde_json::Value::String(HEXLOWER.encode(m))),
+                },
+            },
+            None => None,
+        };
+
+        let entry = IndexEntry::new(
+            key.to_string(),
+            integrity,
+            sha512_hex,
+            total_size,
+            metadata_val,
+        );
+
+        let index_path = IndexEntry::path_for_key(&self.root, key);
+        if let Some(parent) = index_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = self.create_temp_path("index");
+        {
+            let json_str = serde_json::to_string(&entry)?;
+            let mut h = sha1::Sha1::new();
+            h.update(json_str.as_bytes());
+            let hash = HEXLOWER.encode(&h.finalize());
+            let line = format!("{hash}\t{json_str}\n");
+
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            f.write_all(line.as_bytes())?;
+            f.flush()?;
+        }
+
+        let _key_lock = self.lock_key(key)?;
+        if index_path.exists() {
+            let _ = remove_file_with_retries(&index_path);
+        }
+        if let Err(err) = rename_with_retries(&temp_path, &index_path) {
+            let _ = remove_file_with_retries(&temp_path);
+            return Err(CacheError::Io(err));
+        }
+
+        Ok(entry)
     }
 
     /// Retrieve a blob by its SSRI Integrity descriptor.
     /// If corrupted, auto-purges the corrupt blob, logs a diagnostic, and returns `Ok(None)` for clean re-fetching.
     pub fn get_by_integrity(&self, integrity: &Integrity) -> Result<Option<Vec<u8>>, CacheError> {
-        let sha512_entry = integrity.entries.iter().find(|e| e.algorithm == Algorithm::Sha512);
-        if let Some(entry) = sha512_entry {
+        let mut sorted_entries = integrity.entries.clone();
+        sorted_entries.sort_by(|a, b| b.algorithm.cmp(&a.algorithm));
+
+        for entry in sorted_entries {
             let hex = HEXLOWER.encode(&entry.digest);
-            match self.get_by_sha512(&hex)? {
-                Some(bytes) => {
-                    if let Err(err) = integrity.verify(&bytes) {
-                        warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
-                        let blob_path = self.blob_path(&hex);
-                        let _ = remove_file_with_retries(&blob_path);
-                        Ok(None)
-                    } else {
-                        Ok(Some(bytes))
+            let blob_path = self.blob_path_for_algo(entry.algorithm, &hex);
+            if blob_path.exists() {
+                match fs::read(&blob_path) {
+                    Ok(bytes) => {
+                        if let Err(err) = integrity.verify(&bytes) {
+                            warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
+                            let _ = remove_file_with_retries(&blob_path);
+                        } else {
+                            return Ok(Some(bytes));
+                        }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(CacheError::Io(e)),
                 }
-                None => Ok(None),
             }
-        } else {
-            Ok(None)
         }
+        Ok(None)
     }
 
     /// Purge a specific key and its blob from the cache.
@@ -915,26 +1153,59 @@ impl Cache {
                     }
                 };
 
-                let parsed_entry = if let Ok(entry) = serde_json::from_str::<IndexEntry>(&content) {
-                    Some(entry)
-                } else {
+                let parsed_entry = {
                     let mut last = None;
-                    let mut all_valid = false;
+                    let mut all_valid = true;
+                    let mut has_lines = false;
                     for line in content.lines() {
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Ok(entry) = serde_json::from_str::<IndexEntry>(trimmed) {
-                            last = Some(entry);
-                            all_valid = true;
+                        has_lines = true;
+                        let json_str = if let Some(tab_pos) = trimmed.find('\t') {
+                            &trimmed[tab_pos + 1..]
+                        } else {
+                            trimmed
+                        };
+                        if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(json_str) {
+                            if entry.sha512_hex.is_empty() {
+                                if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                                    if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                        entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                                    }
+                                }
+                            }
+                            if Integrity::parse(&entry.integrity).is_ok() {
+                                last = Some(entry);
+                            } else {
+                                all_valid = false;
+                                break;
+                            }
                         } else {
                             all_valid = false;
                             break;
                         }
                     }
-                    if all_valid {
+                    if all_valid && last.is_some() {
                         last
+                    } else if !has_lines {
+                        if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(&content) {
+                            if entry.sha512_hex.is_empty() {
+                                if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                                    if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                        entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                                    }
+                                }
+                            }
+                            if Integrity::parse(&entry.integrity).is_ok() {
+                                Some(entry)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }

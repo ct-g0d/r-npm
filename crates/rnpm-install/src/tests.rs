@@ -2031,3 +2031,189 @@ async fn test_ci_and_install_persists_hidden_lockfile() {
     assert!(loaded_ci_hidden.packages.contains_key("node_modules/local-dep"));
 }
 
+#[test]
+fn test_apply_npmrc_to_client_config() {
+    use crate::apply_npmrc_to_client_config;
+    use rnpm_config::Npmrc;
+    use rnpm_registry::client::RegistryClientConfig;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    let mut npmrc = Npmrc::new();
+    npmrc.set("strict-ssl", "false").unwrap();
+    npmrc.set("proxy", "http://proxy.local:8080").unwrap();
+    npmrc.set("https-proxy", "https://proxy.local:8443").unwrap();
+    npmrc.set("http-proxy", "http://proxy.local:8080").unwrap();
+    npmrc.set("no-proxy", "localhost,127.0.0.1").unwrap();
+    npmrc.set("ca", "dummy-ca-pem").unwrap();
+    npmrc.set("cafile", "test/cafile.pem").unwrap();
+    npmrc.set("cert", "test/client.crt").unwrap();
+    npmrc.set("key", "test/client.key").unwrap();
+    npmrc.set("fetch-timeout", "45000").unwrap();
+    npmrc.set("connect-timeout", "12000").unwrap();
+
+    let mut client_config = RegistryClientConfig::default();
+    apply_npmrc_to_client_config(&mut client_config, &npmrc);
+
+    assert!(!client_config.strict_ssl);
+    assert_eq!(client_config.proxy.as_deref(), Some("http://proxy.local:8080"));
+    assert_eq!(client_config.https_proxy.as_deref(), Some("https://proxy.local:8443"));
+    assert_eq!(client_config.http_proxy.as_deref(), Some("http://proxy.local:8080"));
+    assert_eq!(client_config.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+    assert_eq!(client_config.ca.as_deref(), Some("dummy-ca-pem"));
+    assert_eq!(client_config.cafile, Some(PathBuf::from("test/cafile.pem")));
+    assert_eq!(client_config.cert.as_deref(), Some("test/client.crt"));
+    assert_eq!(client_config.key.as_deref(), Some("test/client.key"));
+    assert_eq!(client_config.timeout, Duration::from_millis(45000));
+    assert_eq!(client_config.connect_timeout, Duration::from_millis(12000));
+}
+
+#[tokio::test]
+async fn test_offline_mode_metadata_cache_miss_enotcached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_json = r#"{"name": "test-app", "dependencies": {"uncached-pkg": "^1.0.0"}}"#;
+    std::fs::write(project_dir.join("package.json"), pkg_json).unwrap();
+
+    let options = crate::InstallOptions {
+        project_dir: project_dir.clone(),
+        registry_url: Some("https://registry.npmjs.org/".to_string()),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ignore_scripts: true,
+    };
+
+    let mut installer = crate::Installer::new(options).unwrap();
+    let err = installer.run().await.unwrap_err();
+    let err_str = err.to_string();
+    assert!(err_str.contains("ENOTCACHED"), "Must contain ENOTCACHED code: {err_str}");
+    assert!(
+        err_str.contains("only-if-cached") && err_str.contains("--offline"),
+        "Must contain offline cache mode explanation: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_offline_mode_tarball_cache_miss_enotcached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_json = r#"{"name": "test-app", "dependencies": {"my-cached-pkg": "1.0.0"}}"#;
+    std::fs::write(project_dir.join("package.json"), pkg_json).unwrap();
+
+    // Populate metadata into cache so metadata succeeds, but tarball is not cached
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    let metadata_json = r#"{
+        "name": "my-cached-pkg",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": "my-cached-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/my-cached-pkg/-/my-cached-pkg-1.0.0.tgz",
+                    "integrity": "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="
+                }
+            }
+        }
+    }"#;
+    cache.put("pacote:packument:my-cached-pkg", metadata_json.as_bytes(), None).unwrap();
+
+    let options = crate::InstallOptions {
+        project_dir: project_dir.clone(),
+        registry_url: Some("https://registry.npmjs.org/".to_string()),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ignore_scripts: true,
+    };
+
+    let mut installer = crate::Installer::new(options).unwrap();
+    let err = installer.run().await.unwrap_err();
+    let err_str = err.to_string();
+    assert!(err_str.contains("ENOTCACHED"), "Must contain ENOTCACHED code: {err_str}");
+    assert!(
+        err_str.contains("only-if-cached") && err_str.contains("--offline"),
+        "Must contain offline cache mode explanation: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_offline_mode_cache_hit_success() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use sha2::{Digest, Sha512};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Build test tarball
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        let content = br#"{"name":"offline-pkg","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, "package/package.json", &content[..]).unwrap();
+        builder.finish().unwrap();
+    }
+    let tarball_bytes = gz.finish().unwrap();
+
+    let mut hasher = Sha512::new();
+    hasher.update(&tarball_bytes);
+    let hash = hasher.finalize();
+    let integrity_str = format!("sha512-{}", data_encoding::BASE64.encode(&hash));
+    let integrity: rnpm_core::integrity::Integrity = integrity_str.parse().unwrap();
+
+    let tarball_url = "https://registry.npmjs.org/offline-pkg/-/offline-pkg-1.0.0.tgz";
+
+    // 2. Populate metadata and tarball into cache
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    let metadata_json = format!(
+        r#"{{
+            "name": "offline-pkg",
+            "dist-tags": {{"latest": "1.0.0"}},
+            "versions": {{
+                "1.0.0": {{
+                    "name": "offline-pkg",
+                    "version": "1.0.0",
+                    "dist": {{
+                        "tarball": "{tarball_url}",
+                        "integrity": "{integrity_str}"
+                    }}
+                }}
+            }}
+        }}"#
+    );
+    cache.put("pacote:packument:offline-pkg", metadata_json.as_bytes(), None).unwrap();
+    cache.put_with_integrity(tarball_url, &tarball_bytes, Some(&integrity), None).unwrap();
+
+    // 3. Project package.json
+    let pkg_json = r#"{"name": "test-app", "dependencies": {"offline-pkg": "^1.0.0"}}"#;
+    std::fs::write(project_dir.join("package.json"), pkg_json).unwrap();
+
+    let options = crate::InstallOptions {
+        project_dir: project_dir.clone(),
+        registry_url: Some("https://registry.npmjs.org/".to_string()),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ignore_scripts: true,
+    };
+
+    let mut installer = crate::Installer::new(options).unwrap();
+    let summary = installer.run().await.unwrap();
+
+    assert_eq!(summary.packages_installed, 1);
+    assert_eq!(summary.cache_hits, 1);
+    assert_eq!(summary.cache_misses, 0);
+    assert!(project_dir.join("node_modules").join("offline-pkg").join("package.json").exists());
+}
+

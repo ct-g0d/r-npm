@@ -902,11 +902,65 @@ pub fn collect_pack_files(
         }
     }
 
+    // Include bundled dependency files from node_modules/<bundled_pkg>
+    for bundled_name in manifest.bundled_package_names() {
+        let bundled_dir = package_dir.join("node_modules").join(&bundled_name);
+        if bundled_dir.is_dir() {
+            walk_bundled_dependency_dir(&bundled_dir, package_dir, &mut files_to_pack, &mut existing_set)?;
+        }
+    }
+
     // Sort files according to npm order:
     // uppercase initial files first sorted alphabetically, then others sorted alphabetically
     files_to_pack.sort_by(|a, b| sort_pack_file_paths(&a.0, &b.0));
 
     Ok(files_to_pack)
+}
+
+fn walk_bundled_dependency_dir(
+    dir: &Path,
+    root_dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    existing: &mut HashSet<String>,
+) -> Result<(), FsError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let rel_path_buf = match path.strip_prefix(root_dir) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rel_path = rel_path_buf
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if filename == ".git" || filename == ".gitignore" || filename == ".DS_Store" {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if file_type.is_dir() {
+            walk_bundled_dependency_dir(&path, root_dir, out, existing)?;
+        } else if file_type.is_file() {
+            if !existing.contains(&rel_path) {
+                existing.insert(rel_path.clone());
+                out.push((rel_path, path));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_strictly_required_files(package_dir: &Path, manifest: &Manifest) -> Vec<String> {

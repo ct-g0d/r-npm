@@ -54,7 +54,7 @@ impl PackageTarget {
         // "git+ssh://git@github.com/org/repo.git", "git://github.com/org/repo.git",
         // "gitlab:user/repo", "bitbucket:user/repo", "git+file:///path/to/repo"
         let git_prefixes = [
-            "git+ssh://", "git+https://", "git+file://", "git://",
+            "git+ssh://", "git+https://", "git+http://", "git+git://", "git+file://", "git://",
             "github:", "gitlab:", "bitbucket:",
         ];
         for prefix in git_prefixes {
@@ -293,7 +293,7 @@ impl PackageSpec {
 
         // Direct Git specifier without name (e.g. "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0")
         let git_prefixes = [
-            "git+ssh://", "git+https://", "git+file://", "git://",
+            "git+ssh://", "git+https://", "git+http://", "git+git://", "git+file://", "git://",
             "github:", "gitlab:", "bitbucket:",
         ];
         for prefix in git_prefixes {

@@ -170,6 +170,9 @@ impl RegistryError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Http(e) => {
+                if e.is_redirect() || e.is_builder() {
+                    return false;
+                }
                 if e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body() {
                     return true;
                 }
@@ -197,10 +200,23 @@ impl RegistryError {
                 false
             }
             Self::RateLimited { .. } => true,
+            Self::SlowlorisTimeout(_) => true,
+            Self::ContentLengthMismatch { .. } => true,
             Self::ServerError { status, .. } => {
                 *status == 429 || *status == 502 || *status == 503 || *status == 504
             }
-            _ => false,
+            Self::SecurityViolation(_) => false,
+            Self::TooManyRedirects(_) => false,
+            Self::UrlParse(_) => false,
+            Self::Json(_) => false,
+            Self::MalformedMetadata(_) => false,
+            Self::SizeLimitExceeded { .. } => false,
+            Self::PackageNotFound { .. } => false,
+            Self::VersionNotFound { .. } => false,
+            Self::Unauthorized { .. } => false,
+            Self::Forbidden { .. } => false,
+            Self::CircuitBreakerOpen { .. } => false,
+            Self::Other(_) => false,
         }
     }
 }
@@ -296,6 +312,19 @@ mod tests {
 
         let other = RegistryError::Other("custom error".into());
         assert!(!other.is_transient());
+
+        let url_err = RegistryError::UrlParse(url::ParseError::EmptyHost);
+        assert!(!url_err.is_transient());
+
+        let malformed = RegistryError::MalformedMetadata("missing name".into());
+        assert!(!malformed.is_transient());
+
+        let size_err = RegistryError::SizeLimitExceeded {
+            limit: 100,
+            actual: 200,
+            message: "Too large".into(),
+        };
+        assert!(!size_err.is_transient());
     }
 }
 
