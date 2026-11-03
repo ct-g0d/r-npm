@@ -1,6 +1,7 @@
 pub mod error;
 pub mod integrity;
 pub mod manifest;
+pub mod pkg;
 pub mod semver;
 pub mod spec;
 pub mod workspace;
@@ -9,6 +10,10 @@ pub use error::{CoreError, IntegrityError, ManifestError, SemverError, SpecError
 pub use integrity::{Algorithm, Integrity, IntegrityEntry};
 pub use manifest::{
     BundledDependencies, Manifest, PackageBin, PackageWorkspaces, PeerDependencyMeta,
+};
+pub use pkg::{
+    get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_set, resolve_manifest_path,
+    PathSegment,
 };
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};
 pub use spec::{PackageSpec, PackageTarget};

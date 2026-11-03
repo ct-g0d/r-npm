@@ -1063,6 +1063,7 @@ dependencies = [
 name = "rnpm-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "data-encoding",
  "path-clean",
  "serde",
