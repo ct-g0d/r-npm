@@ -150,10 +150,8 @@ fn cleanup_stale_trash(parent: &Path) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let name_str = file_name.to_string_lossy();
-            if name_str.starts_with(".rnpm-trash-") {
-                let _ = crate::junction::remove_dir_all_safe(&entry.path());
-            } else if name_str.starts_with(".rnpm-staging-") {
-                // Only clean staging dirs older than 30 seconds to avoid deleting in-flight extractions
+            if name_str.starts_with(".rnpm-trash-") || name_str.starts_with(".rnpm-staging-") {
+                // Only clean staging or trash dirs older than 30 seconds to avoid deleting in-flight extractions or rollbacks
                 let should_clean = if let Ok(meta) = entry.metadata() {
                     if let Ok(mtime) = meta.modified() {
                         if let Ok(age) = now.duration_since(mtime) {

@@ -1163,6 +1163,7 @@ name = "rnpm-shim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "path-clean",
  "rnpm-core",
  "rnpm-fs",
  "serde_json",

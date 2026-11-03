@@ -28,7 +28,26 @@ fn prefixes_equal(a: &Prefix, b: &Prefix) -> bool {
         (Prefix::VerbatimDisk(d1), Prefix::Disk(d2)) => {
             d1.to_ascii_uppercase() == d2.to_ascii_uppercase()
         }
+        (Prefix::UNC(s1, p1), Prefix::UNC(s2, p2))
+        | (Prefix::VerbatimUNC(s1, p1), Prefix::VerbatimUNC(s2, p2))
+        | (Prefix::UNC(s1, p1), Prefix::VerbatimUNC(s2, p2))
+        | (Prefix::VerbatimUNC(s1, p1), Prefix::UNC(s2, p2)) => {
+            s1.to_string_lossy().to_lowercase() == s2.to_string_lossy().to_lowercase()
+                && p1.to_string_lossy().to_lowercase() == p2.to_string_lossy().to_lowercase()
+        }
         _ => a == b,
+    }
+}
+
+/// Compares two path component OsStrs, case-insensitively on Windows.
+fn components_equal(a: &OsStr, b: &OsStr) -> bool {
+    if a == b {
+        return true;
+    }
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        false
     }
 }
 
@@ -132,7 +151,7 @@ pub fn compute_relative_path(from: &Path, to: &Path) -> Result<String, ShimError
     let mut common = 0;
     while common < from_normal.len()
         && common < to_normal.len()
-        && from_normal[common] == to_normal[common]
+        && components_equal(from_normal[common], to_normal[common])
     {
         common += 1;
     }

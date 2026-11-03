@@ -9,8 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct IndexEntry {
     pub key: String,
     pub integrity: String,
+    #[serde(default)]
     pub sha512_hex: String,
+    #[serde(default)]
     pub size: u64,
+    #[serde(default)]
     pub time: u64,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,

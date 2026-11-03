@@ -382,6 +382,44 @@ fn test_pack_directory_tarball_generation_and_integrity() {
 }
 
 #[test]
+fn test_pack_directory_bundled_dependencies() {
+    let dir = tempdir().unwrap();
+    let pkg_dir = dir.path().join("bundled-pkg");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    let package_json = serde_json::json!({
+        "name": "my-bundled-app",
+        "version": "1.0.0",
+        "bundleDependencies": ["my-bundled-dep"]
+    });
+    fs::write(pkg_dir.join("package.json"), package_json.to_string()).unwrap();
+
+    // Create bundled dependency in node_modules/my-bundled-dep
+    let bundled_dir = pkg_dir.join("node_modules").join("my-bundled-dep");
+    fs::create_dir_all(&bundled_dir).unwrap();
+    fs::write(bundled_dir.join("package.json"), "{\"name\":\"my-bundled-dep\"}").unwrap();
+    fs::write(bundled_dir.join("index.js"), "module.exports = 'bundled';").unwrap();
+
+    // Create unbundled dependency in node_modules/unbundled-dep
+    let unbundled_dir = pkg_dir.join("node_modules").join("unbundled-dep");
+    fs::create_dir_all(&unbundled_dir).unwrap();
+    fs::write(unbundled_dir.join("index.js"), "should be ignored").unwrap();
+
+    let dest_tarball = dir.path().join("bundled.tgz");
+    let (_summary, compressed_bytes) = crate::tarball::pack_directory(&pkg_dir, Some(&dest_tarball)).unwrap();
+
+    let extract_dir = dir.path().join("extracted_bundled");
+    let _ = crate::tarball::extract_tar_gz(Cursor::new(&compressed_bytes), &extract_dir, None).unwrap();
+
+    // Bundled dependency files MUST exist
+    assert!(extract_dir.join("node_modules/my-bundled-dep/package.json").exists());
+    assert!(extract_dir.join("node_modules/my-bundled-dep/index.js").exists());
+
+    // Unbundled dependency files MUST NOT exist
+    assert!(!extract_dir.join("node_modules/unbundled-dep").exists());
+}
+
+#[test]
 fn test_tar_bomb_ratio_limit() {
     let dir = tempdir().unwrap();
     let dest = dir.path().join("dest");
@@ -1359,6 +1397,10 @@ fn test_verbatim_path_normalization_and_strip() {
         assert_eq!(v.to_string_lossy(), "/foo/bar/qux/file.txt");
         let s = strip_verbatim_prefix(&v);
         assert_eq!(s.to_string_lossy(), "/foo/bar/qux/file.txt");
+    }
+}
+
+#[test]
 fn test_security_rejection_special_device_entries() {
     let dir = tempdir().unwrap();
     let dest = dir.path().join("dest");
@@ -1450,6 +1492,7 @@ fn test_verbatim_path_extraction_and_junction_exceeding_max_path() {
     assert!(!deep_dest.exists());
 }
 
+#[test]
 fn test_security_rejection_windows_illegal_characters() {
     let dir = tempdir().unwrap();
     let dest = dir.path().join("dest");
@@ -1648,7 +1691,7 @@ fn test_windows_reserved_names_and_dot_space_comprehensive() {
 
     let reserved = [
         "package/aux.js",
-        "package/COM鹿",
+        "package/COM\u{00B9}",
         "package/com1.json",
         "package/LPT9.dat",
         "package/PRN",
@@ -1996,6 +2039,26 @@ fn test_skip_xglobal_header_without_validation_failure() {
     let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
     assert_eq!(summary.entries_extracted, 1);
     assert!(dest.join("index.js").exists());
+}
+
+#[test]
+fn test_junction_with_spaces_and_metacharacters() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target folder with spaces & ^ % ( ) !");
+    let link = dir.path().join("link folder with spaces & ^ % ( ) !");
+
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("data.txt"), "metacharacter payload").unwrap();
+
+    create_junction(&link, &target).expect("Must safely create junction with spaces and metacharacters");
+    assert!(is_junction(&link).unwrap());
+
+    let read = fs::read_to_string(link.join("data.txt")).unwrap();
+    assert_eq!(read, "metacharacter payload");
+
+    remove_junction(&link).expect("Must safely remove junction with spaces and metacharacters");
+    assert!(!link.exists());
+    assert!(target.join("data.txt").exists());
 }
 
 

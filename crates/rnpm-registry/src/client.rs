@@ -7,7 +7,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, Method, Response, StatusCode};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedSemaphorePermit;
@@ -278,6 +278,15 @@ pub struct RegistryClientConfig {
     pub max_package_size: u64,
     pub max_metadata_size: usize,
     pub chunk_idle_timeout: Duration,
+    pub proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub http_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub ca: Option<String>,
+    pub cafile: Option<PathBuf>,
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub strict_ssl: bool,
 }
 
 impl Default for RegistryClientConfig {
@@ -317,6 +326,15 @@ impl Default for RegistryClientConfig {
             max_package_size: DEFAULT_MAX_PACKAGE_SIZE,
             max_metadata_size: DEFAULT_MAX_METADATA_SIZE,
             chunk_idle_timeout: Duration::from_secs(DEFAULT_CHUNK_IDLE_TIMEOUT_SECS),
+            proxy: None,
+            https_proxy: None,
+            http_proxy: None,
+            no_proxy: None,
+            ca: None,
+            cafile: None,
+            cert: None,
+            key: None,
+            strict_ssl: true,
         }
     }
 }
@@ -563,7 +581,7 @@ impl RegistryClient {
 
         // We disable reqwest's automatic redirect following so that we can enforce
         // the strict security rule: NEVER forward auth headers across redirects to untrusted hostnames.
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(config.timeout)
@@ -571,8 +589,115 @@ impl RegistryClient {
             .tcp_nodelay(true)
             .tcp_keepalive(Some(config.tcp_keepalive))
             .pool_idle_timeout(Some(config.pool_idle_timeout))
-            .pool_max_idle_per_host(max_idle)
-            .build()?;
+            .pool_max_idle_per_host(max_idle);
+
+        if !config.strict_ssl {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+
+        if let Some(https_proxy) = &config.https_proxy {
+            let mut proxy = reqwest::Proxy::https(https_proxy)
+                .map_err(|err| RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}")))?;
+            if let Some(no_proxy) = &config.no_proxy {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+            }
+            builder = builder.proxy(proxy);
+        }
+
+        if let Some(http_proxy) = &config.http_proxy {
+            let mut proxy = reqwest::Proxy::http(http_proxy)
+                .map_err(|err| RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}")))?;
+            if let Some(no_proxy) = &config.no_proxy {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+            }
+            builder = builder.proxy(proxy);
+        }
+
+        if let Some(general_proxy) = &config.proxy {
+            if config.https_proxy.is_none() && config.http_proxy.is_none() {
+                let mut proxy = reqwest::Proxy::all(general_proxy)
+                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                if let Some(no_proxy) = &config.no_proxy {
+                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+                }
+                builder = builder.proxy(proxy);
+            } else if config.http_proxy.is_none() {
+                let mut proxy = reqwest::Proxy::http(general_proxy)
+                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                if let Some(no_proxy) = &config.no_proxy {
+                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+                }
+                builder = builder.proxy(proxy);
+            } else if config.https_proxy.is_none() {
+                let mut proxy = reqwest::Proxy::https(general_proxy)
+                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                if let Some(no_proxy) = &config.no_proxy {
+                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+                }
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        if let Some(cafile_path) = &config.cafile {
+            let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
+                RegistryError::Other(format!("Failed to read cafile at '{}': {err}", cafile_path.display()))
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+            if certs.is_empty() {
+                return Err(RegistryError::Other(format!(
+                    "No PEM certificates found in cafile '{}'",
+                    cafile_path.display()
+                )));
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        if let Some(ca_content_or_path) = &config.ca {
+            let pem_bytes = if Path::new(ca_content_or_path).exists() {
+                std::fs::read(ca_content_or_path).map_err(|err| {
+                    RegistryError::Other(format!("Failed to read CA path '{ca_content_or_path}': {err}"))
+                })?
+            } else {
+                ca_content_or_path.as_bytes().to_vec()
+            };
+            let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+            if certs.is_empty() {
+                return Err(RegistryError::Other(
+                    "No PEM certificates found in ca configuration".to_string(),
+                ));
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        if let (Some(cert_str), Some(key_str)) = (&config.cert, &config.key) {
+            let cert_content = if Path::new(cert_str).exists() {
+                std::fs::read_to_string(cert_str).map_err(|err| {
+                    RegistryError::Other(format!("Failed to read cert file '{cert_str}': {err}"))
+                })?
+            } else {
+                cert_str.clone()
+            };
+
+            let key_content = if Path::new(key_str).exists() {
+                std::fs::read_to_string(key_str).map_err(|err| {
+                    RegistryError::Other(format!("Failed to read key file '{key_str}': {err}"))
+                })?
+            } else {
+                key_str.clone()
+            };
+
+            let combined_pem = format!("{}\n{}", cert_content.trim(), key_content.trim());
+            let identity = reqwest::Identity::from_pem(combined_pem.as_bytes()).map_err(|err| {
+                RegistryError::Other(format!("Failed to parse client certificate and key into Identity: {err}"))
+            })?;
+            builder = builder.identity(identity);
+        }
+
+        let client = builder.build()?;
 
         let max_concurrency = if config.max_concurrent_requests == 0 {
             DEFAULT_MAX_CONCURRENT_REQUESTS
@@ -1006,7 +1131,7 @@ impl RegistryClient {
                 }
                 Err(err) => {
                     // Check if network error is transient and retryable
-                    if attempt < self.config.max_retries {
+                    if err.is_transient() && attempt < self.config.max_retries {
                         let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
                             .min(self.config.max_retry_backoff);
                         debug!(
@@ -1017,7 +1142,7 @@ impl RegistryClient {
                         attempt += 1;
                         continue;
                     } else {
-                        if self.config.circuit_breaker_enabled {
+                        if self.config.circuit_breaker_enabled && err.is_transient() {
                             self.circuit_breaker.record_failure(&host_key).await;
                         }
                         return Err(err);
@@ -1099,6 +1224,14 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
+        let host_key = if let Some(port) = url.port() {
+            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        } else {
+            url.host_str().unwrap_or_default().to_ascii_lowercase()
+        };
+
+        let mut stream_attempt = 0;
+        loop {
         let (mut resp, _permit) = self
             .execute_with_permit(
                 Method::GET,
@@ -1181,6 +1314,7 @@ impl RegistryClient {
         }
 
         let mut bytes = Vec::new();
+        let mut stream_err: Option<RegistryError> = None;
         loop {
             let chunk_res = tokio::time::timeout(
                 self.config.chunk_idle_timeout,
@@ -1189,9 +1323,13 @@ impl RegistryClient {
 
             let chunk_opt = match chunk_res {
                 Ok(Ok(chunk)) => chunk,
-                Ok(Err(e)) => return Err(RegistryError::Http(e)),
+                Ok(Err(e)) => {
+                    stream_err = Some(RegistryError::Http(e));
+                    break;
+                }
                 Err(_) => {
-                    return Err(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                    stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                    break;
                 }
             };
 
@@ -1210,18 +1348,47 @@ impl RegistryClient {
             }
         }
 
+        if let Some(err) = stream_err {
+            if err.is_transient() && stream_attempt < self.config.max_retries {
+                let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                    .min(self.config.max_retry_backoff);
+                debug!(
+                    "Stream metadata error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                    err, url, delay, stream_attempt + 1, self.config.max_retries
+                );
+                tokio::time::sleep(delay).await;
+                stream_attempt += 1;
+                continue;
+            } else {
+                if self.config.circuit_breaker_enabled && err.is_transient() {
+                    self.circuit_breaker.record_failure(&host_key).await;
+                }
+                return Err(err);
+            }
+        }
+
         if let Some(content_length) = expected_content_length {
             if bytes.len() as u64 != content_length {
-                return Err(RegistryError::ContentLengthMismatch {
+                let mismatch_err = RegistryError::ContentLengthMismatch {
                     expected: content_length,
                     actual: bytes.len() as u64,
-                });
+                };
+                if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                    tokio::time::sleep(delay).await;
+                    stream_attempt += 1;
+                    continue;
+                } else {
+                    return Err(mismatch_err);
+                }
             }
         }
 
         let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
         metadata.validate()?;
-        Ok(MetadataFetchResult::Fresh { metadata, etag })
+        return Ok(MetadataFetchResult::Fresh { metadata, etag });
+        }
     }
 
     /// Fetch abbreviated install metadata for multiple packages concurrently with bounded concurrency.
@@ -1547,26 +1714,21 @@ impl RegistryClient {
             }
 
             if let Some(err) = stream_err {
-                match err {
-                    RegistryError::Http(err) => {
-                        if stream_attempt < self.config.max_retries {
-                            let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                                .min(self.config.max_retry_backoff);
-                            debug!(
-                                "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
-                                err, url, delay, stream_attempt + 1, self.config.max_retries
-                            );
-                            tokio::time::sleep(delay).await;
-                            stream_attempt += 1;
-                            continue;
-                        } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
-                            }
-                            return Err(RegistryError::Http(err));
-                        }
+                if err.is_transient() && stream_attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                    debug!(
+                        "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                        err, url, delay, stream_attempt + 1, self.config.max_retries
+                    );
+                    tokio::time::sleep(delay).await;
+                    stream_attempt += 1;
+                    continue;
+                } else {
+                    if self.config.circuit_breaker_enabled && err.is_transient() {
+                        self.circuit_breaker.record_failure(&host_key).await;
                     }
-                    non_retryable => return Err(non_retryable),
+                    return Err(err);
                 }
             }
 
@@ -1760,26 +1922,21 @@ impl RegistryClient {
                 drop(file);
                 let _ = tokio::fs::remove_file(&temp_path).await;
 
-                match err {
-                    RegistryError::Http(err) => {
-                        if stream_attempt < self.config.max_retries {
-                            let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                                .min(self.config.max_retry_backoff);
-                            debug!(
-                                "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
-                                err, url, delay, stream_attempt + 1, self.config.max_retries
-                            );
-                            tokio::time::sleep(delay).await;
-                            stream_attempt += 1;
-                            continue;
-                        } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
-                            }
-                            return Err(RegistryError::Http(err));
-                        }
+                if err.is_transient() && stream_attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                    debug!(
+                        "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                        err, url, delay, stream_attempt + 1, self.config.max_retries
+                    );
+                    tokio::time::sleep(delay).await;
+                    stream_attempt += 1;
+                    continue;
+                } else {
+                    if self.config.circuit_breaker_enabled && err.is_transient() {
+                        self.circuit_breaker.record_failure(&host_key).await;
                     }
-                    non_retryable => return Err(non_retryable),
+                    return Err(err);
                 }
             }
 
@@ -1920,5 +2077,68 @@ mod tests {
             parsed_secs >= 28 && parsed_secs <= 31,
             "Expected ~30s, got {parsed_secs}"
         );
+    }
+
+    #[test]
+    fn test_client_config_strict_ssl() {
+        let config_insecure = RegistryClientConfig {
+            strict_ssl: false,
+            ..Default::default()
+        };
+        assert!(RegistryClient::with_config(config_insecure).is_ok());
+
+        let config_secure = RegistryClientConfig {
+            strict_ssl: true,
+            ..Default::default()
+        };
+        assert!(RegistryClient::with_config(config_secure).is_ok());
+    }
+
+    #[test]
+    fn test_client_config_proxy_and_no_proxy() {
+        let config_proxy = RegistryClientConfig {
+            proxy: Some("http://proxy.local:8080".into()),
+            no_proxy: Some("localhost,127.0.0.1".into()),
+            ..Default::default()
+        };
+        assert!(RegistryClient::with_config(config_proxy).is_ok());
+
+        let config_split_proxy = RegistryClientConfig {
+            https_proxy: Some("https://proxy.local:8443".into()),
+            http_proxy: Some("http://proxy.local:8080".into()),
+            no_proxy: Some(".corp.internal".into()),
+            ..Default::default()
+        };
+        assert!(RegistryClient::with_config(config_split_proxy).is_ok());
+    }
+
+    #[test]
+    fn test_client_config_invalid_proxy_rejected() {
+        let config_bad_proxy = RegistryClientConfig {
+            proxy: Some("invalid url with spaces".into()),
+            ..Default::default()
+        };
+        let result = RegistryClient::with_config(config_bad_proxy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_config_invalid_ca_rejected() {
+        let config_bad_ca = RegistryClientConfig {
+            ca: Some("not a valid pem certificate content".into()),
+            ..Default::default()
+        };
+        let result = RegistryClient::with_config(config_bad_ca);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_config_cafile_missing_rejected() {
+        let config_missing_ca = RegistryClientConfig {
+            cafile: Some(PathBuf::from("nonexistent_ca_path_12345.pem")),
+            ..Default::default()
+        };
+        let result = RegistryClient::with_config(config_missing_ca);
+        assert!(result.is_err());
     }
 }

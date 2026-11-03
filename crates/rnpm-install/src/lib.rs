@@ -25,6 +25,9 @@ use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
 use rnpm_solver::{Platform, WorkspaceDependencyGraph};
 
+pub mod git;
+pub use git::GitFetcher;
+
 /// Helper to link a workspace member into node_modules/<pkg-name> using directory junctions (Windows) or symlinks (Unix).
 pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) -> Result<()> {
     let link_path = node_modules_dir.join(&member.name);
@@ -42,6 +45,147 @@ pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) 
     rnpm_fs::create_junction(&link_path, &member.path)
         .map_err(|e| anyhow!("Failed to link workspace package '{}' at '{}' -> '{}': {e}", member.name, link_path.display(), member.path.display()))?;
 
+    Ok(())
+}
+
+pub fn apply_npmrc_to_client_config(
+    client_config: &mut RegistryClientConfig,
+    npmrc: &rnpm_config::Npmrc,
+) {
+    if let Some(strict_val) = npmrc
+        .settings
+        .get("strict-ssl")
+        .or_else(|| npmrc.settings.get("strict_ssl"))
+    {
+        let trimmed = strict_val.trim().to_ascii_lowercase();
+        client_config.strict_ssl = !matches!(trimmed.as_str(), "false" | "0" | "no" | "off");
+    }
+
+    if let Some(proxy_val) = npmrc.settings.get("proxy") {
+        client_config.proxy = Some(proxy_val.clone());
+    }
+
+    if let Some(https_val) = npmrc
+        .settings
+        .get("https-proxy")
+        .or_else(|| npmrc.settings.get("https_proxy"))
+    {
+        client_config.https_proxy = Some(https_val.clone());
+    }
+
+    if let Some(http_val) = npmrc
+        .settings
+        .get("http-proxy")
+        .or_else(|| npmrc.settings.get("http_proxy"))
+    {
+        client_config.http_proxy = Some(http_val.clone());
+    }
+
+    if let Some(no_proxy_val) = npmrc
+        .settings
+        .get("no-proxy")
+        .or_else(|| npmrc.settings.get("no_proxy"))
+    {
+        client_config.no_proxy = Some(no_proxy_val.clone());
+    }
+
+    if let Some(ca_val) = npmrc.settings.get("ca") {
+        client_config.ca = Some(ca_val.clone());
+    }
+
+    if let Some(cafile_val) = npmrc
+        .settings
+        .get("cafile")
+        .or_else(|| npmrc.settings.get("ca_file"))
+    {
+        client_config.cafile = Some(PathBuf::from(cafile_val));
+    }
+
+    if let Some(cert_val) = npmrc.settings.get("cert") {
+        client_config.cert = Some(cert_val.clone());
+    }
+
+    if let Some(key_val) = npmrc.settings.get("key") {
+        client_config.key = Some(key_val.clone());
+    }
+
+    let timeout_ms = npmrc
+        .settings
+        .get("fetch-timeout")
+        .or_else(|| npmrc.settings.get("fetch_timeout"))
+        .or_else(|| npmrc.settings.get("timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = timeout_ms {
+        client_config.timeout = std::time::Duration::from_millis(ms);
+    }
+
+    let connect_timeout_ms = npmrc
+        .settings
+        .get("connect-timeout")
+        .or_else(|| npmrc.settings.get("connect_timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = connect_timeout_ms {
+        client_config.connect_timeout = std::time::Duration::from_millis(ms);
+    }
+}
+
+/// Stream-verifies a file on disk against expected SSRI integrity without buffering the full file into memory.
+pub fn verify_cached_blob_integrity(path: &Path, expected: &Integrity) -> Result<()> {
+    use std::io::Read;
+    use sha2::{Digest, Sha256, Sha512};
+
+    let strongest = expected
+        .strongest_algorithm()
+        .ok_or_else(|| anyhow!("Integrity specification is empty"))?;
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open cached blob '{}'", path.display()))?;
+    let mut buffer = [0u8; 65536];
+
+    match strongest {
+        rnpm_core::integrity::Algorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            loop {
+                let n = file.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+            }
+            let actual = hasher.finalize();
+            let matches = expected
+                .entries
+                .iter()
+                .filter(|e| e.algorithm == rnpm_core::integrity::Algorithm::Sha512)
+                .any(|e| e.digest.as_slice() == actual.as_slice());
+            if !matches {
+                return Err(anyhow!("Integrity mismatch for cached blob"));
+            }
+        }
+        rnpm_core::integrity::Algorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            loop {
+                let n = file.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+            }
+            let actual = hasher.finalize();
+            let matches = expected
+                .entries
+                .iter()
+                .filter(|e| e.algorithm == rnpm_core::integrity::Algorithm::Sha256)
+                .any(|e| e.digest.as_slice() == actual.as_slice());
+            if !matches {
+                return Err(anyhow!("Integrity mismatch for cached blob"));
+            }
+        }
+        _ => {
+            let bytes = std::fs::read(path)?;
+            expected.verify(&bytes).map_err(|e| anyhow!("{e}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -104,6 +248,7 @@ pub struct ResolvedNode {
     pub libc: Vec<String>,
     pub is_file_dir: bool,
     pub is_file_archive: bool,
+    pub is_git: bool,
     pub local_path: Option<PathBuf>,
 }
 
@@ -174,6 +319,7 @@ pub struct Installer {
     cache: Cache,
     registry_client: RegistryClient,
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
+    pub git_fetcher: GitFetcher,
 }
 
 impl Installer {
@@ -198,6 +344,7 @@ impl Installer {
         });
 
         let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
+        let git_fetcher = GitFetcher::new(cache.root());
 
         let mut trusted_hosts = HashSet::new();
         if let Some(host) = registry_url.host_str() {
@@ -240,6 +387,8 @@ impl Installer {
             }
         }
 
+        apply_npmrc_to_client_config(&mut client_config, &config.npmrc);
+
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;
 
@@ -248,6 +397,7 @@ impl Installer {
             cache,
             registry_client,
             metadata_cache: HashMap::new(),
+            git_fetcher,
         })
     }
 
@@ -267,6 +417,11 @@ impl Installer {
 
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
+        self.install().await
+    }
+
+    /// Alias for install workflow from project package.json.
+    pub async fn install(&mut self) -> Result<InstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
             return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
@@ -350,7 +505,10 @@ impl Installer {
 
         let initial_names: Vec<&str> = queue
             .iter()
-            .filter(|(_, r, _)| !r.starts_with("file:"))
+            .filter(|(_, r, _)| {
+                !r.starts_with("file:")
+                    && !PackageTarget::parse(r).map(|t| t.is_git()).unwrap_or(false)
+            })
             .map(|(n, _, _)| n.as_str())
             .collect();
         let _ = self.prefetch_metadata(&initial_names).await;
@@ -659,6 +817,76 @@ impl Installer {
                     }
                 }
                 lockfile.insert_package(&format!("node_modules/{pkg_name}"), lock_entry);
+            } else if node.is_git {
+                let checkout_dir = node.local_path.as_ref().unwrap();
+                let dest_dir = node_modules_dir.join(&pkg_name);
+                if let Some(parent) = dest_dir.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&dest_dir);
+                    if dest_dir.exists() && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(&dest_dir);
+                    }
+                }
+                crate::git::copy_dir_all(checkout_dir, &dest_dir)
+                    .map_err(|e| anyhow!("Failed to extract git package '{pkg_name}' into '{}': {e}", dest_dir.display()))?;
+
+                packages_installed += 1;
+                cache_hits += 1;
+
+                let manifest_path = dest_dir.join("package.json");
+                let (manifest, lifecycle_node) = if manifest_path.exists() {
+                    if let Ok(m) = Manifest::from_file(&manifest_path) {
+                        for (bin_name, script_rel) in m.bin_entries() {
+                            let target_rel = format!("{pkg_name}/{script_rel}");
+                            let script_path = dest_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                        }
+                        let l_node = if m.scripts.contains_key("preinstall")
+                            || m.scripts.contains_key("install")
+                            || m.scripts.contains_key("postinstall")
+                            || m.scripts.contains_key("prepare")
+                        {
+                            Some(LifecyclePackageNode {
+                                package_path: format!("node_modules/{pkg_name}"),
+                                disk_path: dest_dir.clone(),
+                                manifest: m.clone(),
+                                source: PackageSource::Registry,
+                                dependencies: m.dependencies.keys().cloned().collect(),
+                                optional: node.optional,
+                            })
+                        } else {
+                            None
+                        };
+                        (Some(m), l_node)
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
+                if let Some(l) = lifecycle_node {
+                    lifecycle_nodes.push(l);
+                }
+
+                let mut lock_entry = LockfilePackage {
+                    version: Some(node.version.clone()),
+                    resolved: Some(node.resolved_url.clone()),
+                    integrity: None,
+                    ..Default::default()
+                };
+                if let Some(ref m) = manifest {
+                    if m.name.as_deref() != Some(pkg_name.as_str()) {
+                        lock_entry.name = m.name.clone();
+                    }
+                    if !m.dependencies.is_empty() {
+                        lock_entry.dependencies = Some(m.dependencies.clone());
+                    }
+                }
+                lockfile.insert_package(&format!("node_modules/{pkg_name}"), lock_entry);
             } else {
                 packages_to_download.push((pkg_name, node));
             }
@@ -677,6 +905,7 @@ impl Installer {
             let registry_client = self.registry_client.clone();
             let node_modules_dir = node_modules_dir.clone();
             let bin_dir = bin_dir.clone();
+            let offline = self.options.offline;
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -700,65 +929,64 @@ impl Installer {
                     None
                 };
 
-                let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&node.resolved_url) {
+                let mut cached_path: Option<PathBuf> = None;
+                if let Ok(Some((_entry, blob_path))) = cache.get_blob_path(&node.resolved_url) {
                     let is_valid = if let Some(ref exp) = expected_integrity {
-                        exp.verify(&data).is_ok()
+                        verify_cached_blob_integrity(&blob_path, exp).is_ok()
                     } else {
                         true
                     };
 
                     if is_valid {
                         debug!("Cache hit for {}", node.resolved_url);
-                        Ok((data, true))
+                        cached_path = Some(blob_path);
                     } else {
-                        debug!("Cached blob for {} failed integrity, purging and re-fetching", node.resolved_url);
+                        debug!("Cached blob for {} failed integrity, purging", node.resolved_url);
                         let _ = cache.purge_key(&node.resolved_url);
-                        match registry_client.download_tarball_bytes(&node.resolved_url).await {
-                            Ok(bytes) => {
-                                if let Some(ref exp) = expected_integrity {
-                                    if let Err(e) = exp.verify(&bytes) {
-                                        if node.optional {
-                                            warn!(
-                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                                pkg_name, e
-                                            );
-                                            return Ok(None);
-                                        } else {
-                                            return Err(anyhow!("Integrity verification failed for {pkg_name}: {e}"));
-                                        }
-                                    }
-                                }
-                                let _ = cache.put_with_integrity(&node.resolved_url, &bytes, expected_integrity.as_ref(), None);
-                                Ok((bytes, false))
-                            }
-                            Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
-                        }
                     }
+                }
+
+                let fetch_res = if let Some(path) = cached_path {
+                    Ok((path, true))
+                } else if offline {
+                    Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available.",
+                        node.resolved_url
+                    ))
                 } else {
                     info!("Downloading {}", node.resolved_url);
-                    match registry_client.download_tarball_bytes(&node.resolved_url).await {
-                        Ok(bytes) => {
-                            if let Some(ref exp) = expected_integrity {
-                                if let Err(e) = exp.verify(&bytes) {
-                                    if node.optional {
-                                        warn!(
-                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                            pkg_name, e
-                                        );
-                                        return Ok(None);
-                                    } else {
-                                        return Err(anyhow!("Integrity verification failed for {pkg_name}: {e}"));
-                                    }
+                    let temp_file = match tempfile::NamedTempFile::new_in(cache.tmp_dir()) {
+                        Ok(f) => f,
+                        Err(e) => return Err(anyhow!("Failed to create temp file: {e}")),
+                    };
+                    let temp_path = temp_file.path().to_path_buf();
+
+                    let download_res = registry_client
+                        .download_tarball_to_file(&node.resolved_url, &temp_path)
+                        .await;
+
+                    match download_res {
+                        Ok(_) => {
+                            let put_res = cache.put_file_with_integrity(
+                                &node.resolved_url,
+                                &temp_path,
+                                expected_integrity.as_ref(),
+                                None,
+                            );
+
+                            match put_res {
+                                Ok(entry) => {
+                                    let path = cache.blob_path(&entry.sha512_hex);
+                                    Ok((path, false))
                                 }
+                                Err(e) => Err(anyhow!("Integrity verification or cache write failed for {}: {e}", node.resolved_url)),
                             }
-                            let _ = cache.put_with_integrity(&node.resolved_url, &bytes, expected_integrity.as_ref(), None);
-                            Ok((bytes, false))
                         }
                         Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", node.resolved_url)),
                     }
                 };
 
-                let (bytes, was_hit) = match fetch_res {
+                let (blob_path, was_hit) = match fetch_res {
                     Ok(res) => res,
                     Err(err) => {
                         if node.optional {
@@ -773,24 +1001,10 @@ impl Installer {
                     }
                 };
 
-                // Verify integrity in memory (defense in depth)
-                if let Some(ref exp) = expected_integrity {
-                    if let Err(e) = exp.verify(&bytes) {
-                        if node.optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                pkg_name, e
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(anyhow!("Integrity verification failed for {}: {e}", pkg_name));
-                        }
-                    }
-                }
-
                 // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
-                const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
-                if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
+                const MAX_COMPRESSED_TARBALL_BYTES: u64 = 256 * 1024 * 1024;
+                let file_size = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+                if file_size > MAX_COMPRESSED_TARBALL_BYTES {
                     return Err(anyhow!(
                         "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
                         pkg_name, MAX_COMPRESSED_TARBALL_BYTES
@@ -808,10 +1022,12 @@ impl Installer {
                     return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes node_modules"));
                 }
 
-                // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
+                // Decompress directly from disk and extract with atomic replacement & backoff retries
                 let dest_dir_clone = dest_dir.clone();
+                let blob_path_clone = blob_path.clone();
                 let extract_res = tokio::task::spawn_blocking(move || {
-                    extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)
+                    let file = std::fs::File::open(&blob_path_clone)?;
+                    extract_and_replace(file, &dest_dir_clone, None)
                 }).await?;
 
                 if let Err(e) = extract_res {
@@ -935,6 +1151,11 @@ impl Installer {
 
     /// Run strict CI installation from committed package-lock.json.
     pub async fn run_ci(&mut self) -> Result<InstallSummary> {
+        self.ci().await
+    }
+
+    /// Alias for strict CI installation from committed package-lock.json.
+    pub async fn ci(&mut self) -> Result<InstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         let lockfile_path = self.options.project_dir.join("package-lock.json");
 
@@ -1258,6 +1479,76 @@ impl Installer {
                 }
             };
 
+            let is_git = if let Ok(t) = PackageTarget::parse(resolved_url) {
+                t.is_git()
+            } else {
+                resolved_url.starts_with("git+")
+                    || resolved_url.starts_with("git://")
+                    || resolved_url.starts_with("github:")
+                    || resolved_url.starts_with("gitlab:")
+                    || resolved_url.starts_with("bitbucket:")
+            };
+
+            if is_git {
+                let target = PackageTarget::parse(resolved_url)
+                    .map_err(|e| anyhow!("Invalid git target '{resolved_url}' in lockfile for '{pkg_key}': {e}"))?;
+                let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                let checkout_dir = self
+                    .git_fetcher
+                    .checkout_git_dependency(&target, self.options.offline)
+                    .await?;
+                let dest_dir = self.options.project_dir.join(pkg_key);
+                if let Some(parent) = dest_dir.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&dest_dir);
+                    if dest_dir.exists() && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(&dest_dir);
+                    }
+                }
+                crate::git::copy_dir_all(&checkout_dir, &dest_dir)
+                    .map_err(|e| anyhow!("Failed to extract git package '{clean_pkg_name}' into '{}': {e}", dest_dir.display()))?;
+
+                packages_installed += 1;
+                cache_hits += 1;
+
+                let manifest_path = dest_dir.join("package.json");
+                if manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&manifest_path) {
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let target_rel_bin = format!("{clean_pkg_name}/{script_rel}");
+                            let script_path = dest_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        }
+
+                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall")
+                            || pkg_manifest.scripts.contains_key("prepare");
+                        if has_scripts {
+                            let deps = pkg_info
+                                .dependencies
+                                .as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| {
+                                    pkg_manifest.dependencies.keys().cloned().collect()
+                                });
+                            lifecycle_nodes.push(LifecyclePackageNode {
+                                package_path: pkg_key.clone(),
+                                disk_path: dest_dir.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Registry,
+                                dependencies: deps,
+                                optional: is_optional,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Validate that lockfile packages have non-empty valid integrity hashes
             let integrity_str = match pkg_info.integrity.as_deref() {
                 Some(i) if !i.trim().is_empty() => {
@@ -1394,7 +1685,7 @@ impl Installer {
         let ci_download_results = self.fetch_tarballs_concurrent(&ci_urls).await;
 
         for ((pkg_key, _resolved_url, integrity_str, is_optional), fetch_res) in packages_to_download.into_iter().zip(ci_download_results) {
-            let (bytes, was_hit) = match fetch_res {
+            let (blob_path, was_hit) = match fetch_res {
                 Ok(res) => res,
                 Err(err) => {
                     if is_optional {
@@ -1408,12 +1699,6 @@ impl Installer {
                     }
                 }
             };
-
-            if was_hit {
-                cache_hits += 1;
-            } else {
-                cache_misses += 1;
-            }
 
             let expected_integrity: Result<Integrity, _> = integrity_str.parse()
                 .map_err(|e| anyhow!("Invalid integrity hash: {e}"));
@@ -1432,34 +1717,53 @@ impl Installer {
                 }
             };
 
-            let bytes = if let Err(e) = expected_integrity.verify(&bytes) {
+            let blob_path = if let Err(e) = verify_cached_blob_integrity(&blob_path, &expected_integrity) {
                 if was_hit {
                     debug!("Cached blob for {pkg_key} failed integrity ({e}), re-fetching from registry");
                     let _ = self.cache.purge_key(_resolved_url);
-                    match self.registry_client.download_tarball_bytes(_resolved_url).await {
-                        Ok(fresh_bytes) => {
-                            if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
-                                if is_optional {
-                                    warn!(
-                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
-                                    );
-                                    continue;
-                                } else {
-                                    return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
-                                }
-                            }
-                            let _ = self.cache.put_with_integrity(_resolved_url, &fresh_bytes, Some(&expected_integrity), None);
-                            fresh_bytes
+                    if self.options.offline {
+                        if is_optional {
+                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Cache miss in offline mode for {pkg_key}");
+                            continue;
+                        } else {
+                            return Err(anyhow!(
+                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{_resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            ));
                         }
-                        Err(fetch_err) => {
+                    }
+                    let temp_file = match tempfile::NamedTempFile::new_in(self.cache.tmp_dir()) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: {err}");
+                                continue;
+                            } else {
+                                return Err(err.into());
+                            }
+                        }
+                    };
+                    let temp_path = temp_file.path().to_path_buf();
+                    if let Err(fetch_err) = self.registry_client.download_tarball_to_file(_resolved_url, &temp_path).await {
+                        if is_optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
+                                pkg_key, fetch_err
+                            );
+                            continue;
+                        } else {
+                            return Err(fetch_err.into());
+                        }
+                    }
+                    match self.cache.put_file_with_integrity(_resolved_url, &temp_path, Some(&expected_integrity), None) {
+                        Ok(entry) => self.cache.blob_path(&entry.sha512_hex),
+                        Err(fresh_err) => {
                             if is_optional {
                                 warn!(
-                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
-                                    pkg_key, fetch_err
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
                                 );
                                 continue;
                             } else {
-                                return Err(fetch_err.into());
+                                return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
                             }
                         }
                     }
@@ -1474,14 +1778,24 @@ impl Installer {
                     }
                 }
             } else {
-                if !was_hit {
-                    let _ = self.cache.put_with_integrity(_resolved_url, &bytes, Some(&expected_integrity), None);
-                }
-                bytes
+                blob_path
             };
 
+            if was_hit {
+                cache_hits += 1;
+            } else {
+                cache_misses += 1;
+            }
+
             let target_path = self.options.project_dir.join(pkg_key);
-            if let Err(e) = extract_and_replace(Cursor::new(&bytes), &target_path, None) {
+            let blob_path_clone = blob_path.clone();
+            let target_path_clone = target_path.clone();
+            let extract_res = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&blob_path_clone)?;
+                extract_and_replace(file, &target_path_clone, None)
+            }).await?;
+
+            if let Err(e) = extract_res {
                 if is_optional {
                     warn!(
                         "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract {pkg_key}: {e}"
@@ -1621,6 +1935,7 @@ impl Installer {
                     libc: manifest.libc.unwrap_or_default(),
                     is_file_dir: false,
                     is_file_archive: true,
+                    is_git: false,
                     local_path: Some(abs_path),
                 });
             } else {
@@ -1655,18 +1970,79 @@ impl Installer {
                     libc: manifest.libc.unwrap_or_default(),
                     is_file_dir: true,
                     is_file_archive: false,
+                    is_git: false,
                     local_path: Some(abs_path),
                 });
             }
         }
 
+        if _parsed_target.is_git() {
+            let git_resolved = self
+                .git_fetcher
+                .resolve_git_dependency(&_parsed_target, self.options.offline)
+                .await?;
+            let manifest = git_resolved.manifest;
+            let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+
+            return Ok(ResolvedNode {
+                name: manifest.name.clone().unwrap_or_else(|| name.to_string()),
+                version,
+                resolved_url: git_resolved.resolved_url,
+                integrity: String::new(),
+                dependencies: manifest.dependencies,
+                optional_dependencies: manifest.optional_dependencies,
+                optional: is_optional,
+                skipped: false,
+                os: manifest.os.unwrap_or_default(),
+                cpu: manifest.cpu.unwrap_or_default(),
+                libc: manifest.libc.unwrap_or_default(),
+                is_file_dir: false,
+                is_file_archive: false,
+                is_git: true,
+                local_path: Some(git_resolved.checkout_dir),
+            });
+        }
+
         let metadata = if let Some(cached) = self.metadata_cache.get(name) {
             cached.clone()
         } else {
-            let meta = self.registry_client.get_package_metadata(name).await
-                .map_err(|e| anyhow!("Failed to fetch metadata for {name}: {e}"))?;
-            self.metadata_cache.insert(name.to_string(), meta.clone());
-            meta
+            let cached_disk = self
+                .cache
+                .get(&format!("pacote:packument:{name}"))
+                .ok()
+                .flatten()
+                .or_else(|| self.cache.get(name).ok().flatten());
+
+            if let Some((_entry, data)) = cached_disk {
+                if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                    self.metadata_cache.insert(name.to_string(), meta.clone());
+                    meta
+                } else if self.options.offline {
+                    return Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                    ));
+                } else {
+                    let meta = self.registry_client.get_package_metadata(name).await
+                        .map_err(|e| anyhow!("Failed to fetch metadata for {name}: {e}"))?;
+                    self.metadata_cache.insert(name.to_string(), meta.clone());
+                    if let Ok(meta_json) = serde_json::to_vec(&meta) {
+                        let _ = self.cache.put(&format!("pacote:packument:{name}"), &meta_json, None);
+                    }
+                    meta
+                }
+            } else if self.options.offline {
+                return Err(anyhow!(
+                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                ));
+            } else {
+                let meta = self.registry_client.get_package_metadata(name).await
+                    .map_err(|e| anyhow!("Failed to fetch metadata for {name}: {e}"))?;
+                self.metadata_cache.insert(name.to_string(), meta.clone());
+                if let Ok(meta_json) = serde_json::to_vec(&meta) {
+                    let _ = self.cache.put(&format!("pacote:packument:{name}"), &meta_json, None);
+                }
+                meta
+            }
         };
 
         let range = Range::parse(range_str)
@@ -1725,17 +2101,35 @@ impl Installer {
             libc: ver_info.libc.clone(),
             is_file_dir: false,
             is_file_archive: false,
+            is_git: false,
             local_path: None,
         })
     }
 
     /// Prefetch package metadata concurrently for a set of package names.
     pub async fn prefetch_metadata(&mut self, names: &[&str]) -> Result<()> {
-        let missing: Vec<String> = names
-            .iter()
-            .filter(|n| !self.metadata_cache.contains_key(**n))
-            .map(|n| n.to_string())
-            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        for name in names {
+            if self.metadata_cache.contains_key(*name) {
+                continue;
+            }
+            let cached_disk = self
+                .cache
+                .get(&format!("pacote:packument:{name}"))
+                .ok()
+                .flatten()
+                .or_else(|| self.cache.get(*name).ok().flatten());
+
+            if let Some((_entry, data)) = cached_disk {
+                if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                    self.metadata_cache.insert(name.to_string(), meta);
+                    continue;
+                }
+            }
+            if !self.options.offline {
+                missing.push(name.to_string());
+            }
+        }
 
         if missing.is_empty() {
             return Ok(());
@@ -1748,6 +2142,9 @@ impl Installer {
 
         for (name, res) in missing.into_iter().zip(results) {
             if let Ok(meta) = res {
+                if let Ok(meta_json) = serde_json::to_vec(&meta) {
+                    let _ = self.cache.put(&format!("pacote:packument:{name}"), &meta_json, None);
+                }
                 self.metadata_cache.insert(name, meta);
             }
         }
@@ -1756,38 +2153,55 @@ impl Installer {
     }
 
     /// Fetch multiple tarballs concurrently with bounded semaphore limits and local disk cache.
-    /// Does NOT write unverified tarballs into the cache. Cache writing must be performed
-    /// by callers only after SSRI integrity verification.
     pub async fn fetch_tarballs_concurrent(
         &self,
         urls: &[&str],
-    ) -> Vec<Result<(Vec<u8>, bool)>> {
+    ) -> Vec<Result<(PathBuf, bool)>> {
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, url) in urls.iter().enumerate() {
             let cache = self.cache.clone();
             let registry_client = self.registry_client.clone();
             let url_str = url.to_string();
+            let offline = self.options.offline;
 
             join_set.spawn(async move {
-                if let Ok(Some((_entry, data))) = cache.get(&url_str) {
+                if let Ok(Some((_entry, blob_path))) = cache.get_blob_path(&url_str) {
                     debug!("Cache hit for {}", url_str);
-                    return (idx, Ok((data, true)));
+                    return (idx, Ok((blob_path, true)));
+                }
+
+                if offline {
+                    return (
+                        idx,
+                        Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{url_str}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        )),
+                    );
                 }
 
                 info!("Downloading {}", url_str);
-                match registry_client.download_tarball_bytes(&url_str).await {
-                    Ok(bytes) => {
-                        // Do not pollute cache with unverified bytes!
-                        // Caching must be performed after integrity verification by the caller.
-                        (idx, Ok((bytes, false)))
+                let temp_file = match tempfile::NamedTempFile::new_in(cache.tmp_dir()) {
+                    Ok(f) => f,
+                    Err(e) => return (idx, Err(anyhow!("Failed to create temp file: {e}"))),
+                };
+                let temp_path = temp_file.path().to_path_buf();
+
+                if let Err(e) = registry_client.download_tarball_to_file(&url_str, &temp_path).await {
+                    return (idx, Err(anyhow!("Failed to download tarball from {url_str}: {e}")));
+                }
+
+                match cache.put_file_with_integrity(&url_str, &temp_path, None, None) {
+                    Ok(entry) => {
+                        let blob_path = cache.blob_path(&entry.sha512_hex);
+                        (idx, Ok((blob_path, false)))
                     }
-                    Err(e) => (idx, Err(anyhow!("Failed to download tarball from {url_str}: {e}"))),
+                    Err(e) => (idx, Err(anyhow!("Cache write failed for {url_str}: {e}"))),
                 }
             });
         }
 
-        let mut results: Vec<Option<Result<(Vec<u8>, bool)>>> = (0..urls.len()).map(|_| None).collect();
+        let mut results: Vec<Option<Result<(PathBuf, bool)>>> = (0..urls.len()).map(|_| None).collect();
         while let Some(res) = join_set.join_next().await {
             if let Ok((idx, result)) = res {
                 results[idx] = Some(result);
@@ -1801,41 +2215,48 @@ impl Installer {
     }
 
     #[allow(dead_code)]
-    async fn fetch_tarball(&self, tarball_url: &str) -> Result<(Vec<u8>, bool)> {
-        if let Ok(Some((_entry, data))) = self.cache.get(tarball_url) {
+    async fn fetch_tarball(&self, tarball_url: &str) -> Result<(PathBuf, bool)> {
+        if let Ok(Some((_entry, blob_path))) = self.cache.get_blob_path(tarball_url) {
             debug!("Cache hit for {}", tarball_url);
-            return Ok((data, true));
+            return Ok((blob_path, true));
+        }
+
+        if self.options.offline {
+            return Err(anyhow!(
+                "npm error code ENOTCACHED\nnpm error request to download tarball from '{tarball_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+            ));
         }
 
         info!("Downloading {}", tarball_url);
-        let bytes = self.registry_client.download_tarball_bytes(tarball_url).await
+        let temp_file = tempfile::NamedTempFile::new_in(self.cache.tmp_dir())
+            .with_context(|| "Failed to create temp file in cache tmp directory")?;
+        let temp_path = temp_file.path().to_path_buf();
+
+        self.registry_client
+            .download_tarball_to_file(tarball_url, &temp_path)
+            .await
             .map_err(|e| anyhow!("Failed to download tarball from {tarball_url}: {e}"))?;
 
-        // Do not pollute the cache with unverified bytes!
+        let entry = self
+            .cache
+            .put_file_with_integrity(tarball_url, &temp_path, None, None)
+            .map_err(|e| anyhow!("Failed to store tarball in cache: {e}"))?;
 
-        Ok((bytes, false))
+        let blob_path = self.cache.blob_path(&entry.sha512_hex);
+        Ok((blob_path, false))
     }
 
-    /// Helper to reify a package with pre-downloaded or cached bytes.
-    fn reify_package_with_bytes(
+    /// Helper to reify a package from a cached blob path on disk without buffering into memory.
+    fn reify_package_from_blob_path(
         &self,
         node: &ResolvedNode,
-        bytes: &[u8],
+        blob_path: &Path,
         was_hit: bool,
         node_modules_dir: &std::path::Path,
         bin_dir: &std::path::Path,
     ) -> Result<(usize, usize, LockfilePackage, Option<LifecyclePackageNode>)> {
         let cache_hits = if was_hit { 1 } else { 0 };
         let cache_misses = if was_hit { 0 } else { 1 };
-
-        let expected_integrity: Integrity = node.integrity.parse()
-            .map_err(|e| anyhow!("Invalid integrity string: {e}"))?;
-        expected_integrity.verify(bytes)
-            .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
-
-        if !was_hit {
-            let _ = self.cache.put_with_integrity(&node.resolved_url, bytes, Some(&expected_integrity), None);
-        }
 
         // Path containment defense: ensure node.name has no traversal, device names, or escapes
         if node.name.contains("..") || node.name.contains(':') || node.name.contains('\\') || node.name.contains('\0') {
@@ -1849,7 +2270,9 @@ impl Installer {
         if !cleaned_dest.starts_with(node_modules_dir) {
             return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes node_modules"));
         }
-        extract_and_replace(Cursor::new(bytes), &dest_dir, None)
+        let file = std::fs::File::open(blob_path)
+            .with_context(|| format!("Failed to open blob file '{}'", blob_path.display()))?;
+        extract_and_replace(file, &dest_dir, None)
             .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
 
         let pkg_manifest_path = dest_dir.join("package.json");
@@ -1906,8 +2329,8 @@ impl Installer {
         node_modules_dir: &std::path::Path,
         bin_dir: &std::path::Path,
     ) -> Result<(usize, usize, LockfilePackage, Option<LifecyclePackageNode>)> {
-        let (bytes, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
-        self.reify_package_with_bytes(node, &bytes, was_hit, node_modules_dir, bin_dir)
+        let (blob_path, was_hit) = self.fetch_tarball(&node.resolved_url).await?;
+        self.reify_package_from_blob_path(node, &blob_path, was_hit, node_modules_dir, bin_dir)
     }
 
     /// Run package update workflow.
@@ -1972,7 +2395,14 @@ impl Installer {
         let mut new_versions: HashMap<String, String> = HashMap::new();
 
         // 1. Check for newer versions satisfying ranges (prefetch metadata first)
-        let target_names: Vec<&str> = deps_to_update.keys().map(|s| s.as_str()).collect();
+        let target_names: Vec<&str> = deps_to_update
+            .iter()
+            .filter(|(_, r)| {
+                !r.starts_with("file:")
+                    && !PackageTarget::parse(r).map(|t| t.is_git()).unwrap_or(false)
+            })
+            .map(|(k, _)| k.as_str())
+            .collect();
         let _ = self.prefetch_metadata(&target_names).await;
 
         let mut newly_resolved_roots: BTreeMap<String, ResolvedNode> = BTreeMap::new();
@@ -2079,7 +2509,77 @@ impl Installer {
             let mut packages_to_download: Vec<(&String, &ResolvedNode)> = Vec::new();
             for (pkg_name, node) in &full_subgraph {
                 if !node.skipped {
-                    packages_to_download.push((pkg_name, node));
+                    if node.is_git {
+                        let checkout_dir = node.local_path.as_ref().unwrap();
+                        let dest_dir = node_modules_dir.join(pkg_name);
+                        if let Some(parent) = dest_dir.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_junction(&dest_dir);
+                            if dest_dir.exists() && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                                let _ = std::fs::remove_dir_all(&dest_dir);
+                            }
+                        }
+                        crate::git::copy_dir_all(checkout_dir, &dest_dir)?;
+                        cache_hits += 1;
+
+                        let manifest_path = dest_dir.join("package.json");
+                        let (manifest, lifecycle_node) = if manifest_path.exists() {
+                            if let Ok(m) = Manifest::from_file(&manifest_path) {
+                                for (bin_name, script_rel) in m.bin_entries() {
+                                    let target_rel = format!("{pkg_name}/{script_rel}");
+                                    let script_path = dest_dir.join(&script_rel);
+                                    let _ = normalize_shebang(&script_path);
+                                    let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                                }
+                                let l_node = if m.scripts.contains_key("preinstall")
+                                    || m.scripts.contains_key("install")
+                                    || m.scripts.contains_key("postinstall")
+                                    || m.scripts.contains_key("prepare")
+                                {
+                                    Some(LifecyclePackageNode {
+                                        package_path: format!("node_modules/{pkg_name}"),
+                                        disk_path: dest_dir.clone(),
+                                        manifest: m.clone(),
+                                        source: PackageSource::Registry,
+                                        dependencies: m.dependencies.keys().cloned().collect(),
+                                        optional: node.optional,
+                                    })
+                                } else {
+                                    None
+                                };
+                                (Some(m), l_node)
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                        if let Some(l) = lifecycle_node {
+                            lifecycle_nodes.push(l);
+                        }
+
+                        let lockfile_key = format!("node_modules/{pkg_name}");
+                        let mut lock_entry = LockfilePackage {
+                            version: Some(node.version.clone()),
+                            resolved: Some(node.resolved_url.clone()),
+                            integrity: None,
+                            ..Default::default()
+                        };
+                        if let Some(ref m) = manifest {
+                            if m.name.as_deref() != Some(pkg_name.as_str()) {
+                                lock_entry.name = m.name.clone();
+                            }
+                            if !m.dependencies.is_empty() {
+                                lock_entry.dependencies = Some(m.dependencies.clone());
+                            }
+                        }
+                        lockfile.insert_package(&lockfile_key, lock_entry);
+                    } else if !node.is_file_dir && !node.is_file_archive {
+                        packages_to_download.push((pkg_name, node));
+                    }
                 }
             }
 
@@ -2090,9 +2590,9 @@ impl Installer {
             let download_results = self.fetch_tarballs_concurrent(&download_urls).await;
 
             for ((pkg_name, node), fetch_res) in packages_to_download.into_iter().zip(download_results) {
-                let (bytes, was_hit) = fetch_res?;
+                let (blob_path, was_hit) = fetch_res?;
                 let (hits, misses, lock_entry, l_node) = self
-                    .reify_package_with_bytes(node, &bytes, was_hit, &node_modules_dir, &bin_dir)?;
+                    .reify_package_from_blob_path(node, &blob_path, was_hit, &node_modules_dir, &bin_dir)?;
                 cache_hits += hits;
                 cache_misses += misses;
                 if let Some(ln) = l_node {

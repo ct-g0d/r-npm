@@ -10,6 +10,7 @@ license.workspace = true
 rnpm-core = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+path-clean = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -75,8 +75,8 @@ fn test_path_and_argument_escaping_special_chars() {
 
     // 3. Shell metacharacters and injection vectors
     // Batch variable / parameter expansions (%VAR%, %1, !VAR!)
-    assert_eq!(escape_cmd_arg("%PATH%"), "\"%PATH%\"");
-    assert_eq!(escape_cmd_arg("%1"), "\"%1\"");
+    assert_eq!(escape_cmd_arg("%PATH%"), "\"%%PATH%%\"");
+    assert_eq!(escape_cmd_arg("%1"), "\"%%1\"");
     assert_eq!(escape_cmd_arg("!EXPAND!"), "\"!EXPAND!\"");
 
     // Batch compound command delimiters and operators (&, |, <, >, ^, (, ))
@@ -215,7 +215,8 @@ fn test_extreme_shim_argument_escaping_nested_quotes_and_backticks() {
     assert_eq!(escape_ps1_arg(multiline_unix), format!("'{multiline_unix}'"));
     let cmd_multi = escape_cmd_arg(multiline_unix);
     assert!(cmd_multi.starts_with('"') && cmd_multi.ends_with('"'));
-    assert!(cmd_multi.contains("SELECT * FROM users\nWHERE active = 1"));
+    assert!(cmd_multi.contains("SELECT * FROM usersWHERE active = 1"));
+    assert!(!cmd_multi.contains('\n') && !cmd_multi.contains('\r'));
 
     let multiline_crlf = "header line\r\n\"nested middle\"\r\nfooter line";
     let ps1_crlf = escape_ps1_arg(multiline_crlf);
@@ -616,5 +617,39 @@ fn test_shim_exit_code_fidelity_all_codes() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn test_shebang_parsing_with_quotes_and_flags() {
+    use crate::shebang::parse_shebang;
+
+    let s1 = "#!/usr/bin/env -S node --harmony --title=\"my tool\"";
+    let info1 = parse_shebang(s1).unwrap();
+    assert_eq!(info1.program, "node");
+    assert_eq!(info1.args, vec!["--harmony", "--title=my tool"]);
+
+    let s2 = "#!/bin/sh -e -x";
+    let info2 = parse_shebang(s2).unwrap();
+    assert_eq!(info2.program, "sh");
+    assert_eq!(info2.args, vec!["-e", "-x"]);
+}
+
+
+#[test]
+fn test_compute_relative_path_case_insensitivity_windows() {
+    use crate::path::compute_relative_path;
+
+    #[cfg(windows)]
+    {
+        let from = Path::new(r"C:\Users\Developer\Project\node_modules\.bin");
+        let to = Path::new(r"c:\users\developer\project\node_modules\my-tool\bin\cli.js");
+        let rel = compute_relative_path(from, to).unwrap();
+        assert_eq!(rel, "../my-tool/bin/cli.js");
+
+        let from_mixed = Path::new(r"D:\App\Node_Modules\.BIN");
+        let to_mixed = Path::new(r"d:\app\node_modules\PKG\cli.js");
+        let rel_mixed = compute_relative_path(from_mixed, to_mixed).unwrap();
+        assert_eq!(rel_mixed, "../PKG/cli.js");
     }
 }

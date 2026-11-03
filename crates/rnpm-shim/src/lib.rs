@@ -3,6 +3,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rnpm_core::manifest::Manifest;
 
+pub mod error;
+pub mod generator;
+pub mod path;
+pub mod shebang;
+
 #[cfg(test)]
 mod tests;
 
@@ -49,7 +54,10 @@ pub fn escape_cmd_path(path: &str) -> String {
 /// Escapes an argument for Windows command line according to Win32 CommandLineToArgvW rules
 /// and protects against cmd shell metacharacters and injection vectors.
 pub fn escape_cmd_arg(arg: &str) -> String {
-    let sanitized = arg.replace('\0', "");
+    let sanitized = arg
+        .replace('\0', "")
+        .replace('\r', "")
+        .replace('\n', "");
     if sanitized.is_empty() {
         return "\"\"".to_string();
     }
@@ -78,6 +86,13 @@ pub fn escape_cmd_arg(arg: &str) -> String {
             result.push('\\');
             result.push('\"');
             backslashes = 0;
+        } else if c == '%' {
+            for _ in 0..backslashes {
+                result.push('\\');
+            }
+            backslashes = 0;
+            result.push('%');
+            result.push('%');
         } else {
             for _ in 0..backslashes {
                 result.push('\\');

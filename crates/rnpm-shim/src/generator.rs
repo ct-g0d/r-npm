@@ -46,27 +46,14 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let info = shebang.unwrap_or(&default_shebang);
     let prog = &info.program;
 
-    let args_str = if info.args.is_empty() {
+    // 1. Unix POSIX Shell Script (<name>)
+    let sh_args_str = if info.args.is_empty() {
         String::new()
     } else {
-        let escaped_args: Vec<String> = info
-            .args
-            .iter()
-            .map(|arg| {
-                if arg.contains(' ') || arg.contains('"') {
-                    format!("\"{}\"", arg.replace('"', "\\\""))
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect();
-        format!("{} ", escaped_args.join(" "))
+        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_posix_arg(arg)).collect();
+        format!("{} ", escaped.join(" "))
     };
-
-    let win_rel_path = rel_path.replace('/', "\\");
-
-    // 1. Unix POSIX Shell Script (<name>)
-    // Compatible with Git Bash, WSL, MSYS2, Cygwin, and native Unix/Linux/macOS.
+    let sh_rel_path = crate::escape_posix_path(rel_path);
     let sh = format!(
         "#!/bin/sh\n\
          basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\
@@ -80,15 +67,20 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
          esac\n\
          \n\
          if [ -x \"$basedir/{prog}\" ]; then\n\
-           exec \"$basedir/{prog}\" {args_str}\"$basedir/{rel_path}\" \"$@\"\n\
+           exec \"$basedir/{prog}\" {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
          else\n\
-           exec {prog} {args_str}\"$basedir/{rel_path}\" \"$@\"\n\
+           exec {prog} {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
          fi\n"
     );
 
     // 2. Windows Batch Wrapper (<name>.cmd)
-    // Uses subroutine :find_dp0 trick and endLocal & goto #_undefined_# trick
-    // to cleanly handle metacharacters and avoid 'Terminate batch job (Y/N)?'.
+    let cmd_args_str = if info.args.is_empty() {
+        String::new()
+    } else {
+        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_cmd_arg(arg)).collect();
+        format!("{} ", escaped.join(" "))
+    };
+    let win_rel_path = crate::escape_cmd_path(&rel_path.replace('/', "\\"));
     let cmd = format!(
         "@ECHO off\r\n\
          GOTO start\r\n\
@@ -106,12 +98,17 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
            SET PATHEXT=%PATHEXT:;.JS;=;%\r\n\
          )\r\n\
          \r\n\
-         endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" {args_str}\"%dp0%\\{win_rel_path}\" %*\r\n"
+         endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" {cmd_args_str}\"%dp0%\\{win_rel_path}\" %*\r\n"
     );
 
     // 3. Windows PowerShell Wrapper (<name>.ps1)
-    // Supports PowerShell pipeline input, parameter forwarding with $args,
-    // and returns $LASTEXITCODE.
+    let ps1_args_str = if info.args.is_empty() {
+        String::new()
+    } else {
+        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_ps1_arg(arg)).collect();
+        format!("{} ", escaped.join(" "))
+    };
+    let ps1_rel_path = crate::escape_ps1_path(rel_path);
     let ps1 = format!(
         "#!/usr/bin/env pwsh\r\n\
          $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\
@@ -134,20 +131,20 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
          }}\r\n\
          \r\n\
          $ret = 0\r\n\
-         if (Test-Path \"$basedir/{rel_path}\") {{\r\n\
+         if (Test-Path \"$basedir/{ps1_rel_path}\") {{\r\n\
            # Support pipeline input\r\n\
            if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"$exe\" {args_str}\"$basedir/{rel_path}\" $args\r\n\
+             $input | & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }} else {{\r\n\
-             & \"$exe\" {args_str}\"$basedir/{rel_path}\" $args\r\n\
+             & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }}\r\n\
            $ret = $LASTEXITCODE\r\n\
          }} else {{\r\n\
            # Support pipeline input\r\n\
            if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"$exe\" {args_str}\"$basedir/{rel_path}\" $args\r\n\
+             $input | & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }} else {{\r\n\
-             & \"$exe\" {args_str}\"$basedir/{rel_path}\" $args\r\n\
+             & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }}\r\n\
            $ret = $LASTEXITCODE\r\n\
          }}\r\n\

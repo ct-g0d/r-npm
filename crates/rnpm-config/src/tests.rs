@@ -549,3 +549,160 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
     assert_eq!(mask_credential("short"), "[REDACTED]");
     assert_eq!(mask_credential(""), "");
 }
+
+#[test]
+fn test_full_npmrc_precedence_chain() {
+    use std::collections::BTreeMap;
+    use crate::ConfigOptions;
+
+    let temp_root = tempdir().unwrap();
+    let root_path = temp_root.path();
+
+    let global_file = root_path.join("global.npmrc");
+    fs::write(&global_file, "registry=https://global.registry.org/\nglobal_only=1\ncommon=from_global\n").unwrap();
+
+    let user_file = root_path.join("user.npmrc");
+    fs::write(&user_file, "registry=https://user.registry.org/\nuser_only=2\ncommon=from_user\n").unwrap();
+
+    let ws_dir = root_path.join("workspace");
+    let packages_dir = ws_dir.join("packages");
+    let project_dir = packages_dir.join("pkg-member");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let ws_pkg_json = r#"{"name": "root-ws", "workspaces": ["packages/*"]}"#;
+    fs::write(ws_dir.join("package.json"), ws_pkg_json).unwrap();
+    fs::write(ws_dir.join(".npmrc"), "registry=https://ws.registry.org/\nws_only=3\ncommon=from_ws\n").unwrap();
+
+    let member_pkg_json = r#"{"name": "pkg-member", "version": "1.0.0"}"#;
+    fs::write(project_dir.join("package.json"), member_pkg_json).unwrap();
+    fs::write(project_dir.join(".npmrc"), "registry=https://proj.registry.org/\nproj_only=4\ncommon=from_proj\n").unwrap();
+
+    let mut env_map = BTreeMap::new();
+    env_map.insert("npm_config_registry".to_string(), "https://env.registry.org/".to_string());
+    env_map.insert("npm_config_env_only".to_string(), "5".to_string());
+    env_map.insert("npm_config_common".to_string(), "from_env".to_string());
+
+    let mut cli_map = BTreeMap::new();
+    cli_map.insert("registry".to_string(), "https://cli.registry.org/".to_string());
+    cli_map.insert("cli_only".to_string(), "6".to_string());
+    cli_map.insert("common".to_string(), "from_cli".to_string());
+
+    let opts = ConfigOptions::new()
+        .globalconfig(global_file)
+        .userconfig(user_file)
+        .project_dir(&project_dir)
+        .env_vars(env_map)
+        .cli_overrides(cli_map);
+
+    let loaded = Config::load_with_options(opts).unwrap();
+
+    assert_eq!(loaded.npmrc.registry.as_str(), "https://cli.registry.org/");
+    assert_eq!(loaded.get("common"), Some("from_cli"));
+    assert_eq!(loaded.get("cli_only"), Some("6"));
+    assert_eq!(loaded.get("env_only"), Some("5"));
+    assert_eq!(loaded.get("proj_only"), Some("4"));
+    assert_eq!(loaded.get("ws_only"), Some("3"));
+    assert_eq!(loaded.get("user_only"), Some("2"));
+    assert_eq!(loaded.get("global_only"), Some("1"));
+}
+
+#[test]
+fn test_workspace_and_project_npmrc_precedence() {
+    use crate::ConfigOptions;
+
+    let temp_root = tempdir().unwrap();
+    let root_path = temp_root.path();
+
+    let ws_dir = root_path.join("monorepo");
+    let packages_dir = ws_dir.join("packages");
+    let pkg_a_dir = packages_dir.join("pkg-a");
+    let pkg_b_dir = packages_dir.join("pkg-b");
+    fs::create_dir_all(&pkg_a_dir).unwrap();
+    fs::create_dir_all(&pkg_b_dir).unwrap();
+
+    let ws_pkg_json = r#"{"name": "root-ws", "workspaces": ["packages/*"]}"#;
+    fs::write(ws_dir.join("package.json"), ws_pkg_json).unwrap();
+    fs::write(
+        ws_dir.join(".npmrc"),
+        "registry=https://ws.registry.org/\nstrict-ssl=true\nshared_flag=from_ws\n",
+    )
+    .unwrap();
+
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        r#"{"name": "pkg-a", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    fs::write(
+        pkg_b_dir.join("package.json"),
+        r#"{"name": "pkg-b", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_b_dir.join(".npmrc"),
+        "registry=https://pkg-b.registry.org/\nshared_flag=from_pkg_b\n",
+    )
+    .unwrap();
+
+    let loaded_a = Config::load_with_options(
+        ConfigOptions::new()
+            .project_dir(&pkg_a_dir)
+            .env_vars(std::collections::BTreeMap::new()),
+    )
+    .unwrap();
+    assert_eq!(loaded_a.npmrc.registry.as_str(), "https://ws.registry.org/");
+    assert_eq!(loaded_a.get("strict-ssl"), Some("true"));
+    assert_eq!(loaded_a.get("shared_flag"), Some("from_ws"));
+
+    let loaded_b = Config::load_with_options(
+        ConfigOptions::new()
+            .project_dir(&pkg_b_dir)
+            .env_vars(std::collections::BTreeMap::new()),
+    )
+    .unwrap();
+    assert_eq!(loaded_b.npmrc.registry.as_str(), "https://pkg-b.registry.org/");
+    assert_eq!(loaded_b.get("strict-ssl"), Some("true"));
+    assert_eq!(loaded_b.get("shared_flag"), Some("from_pkg_b"));
+}
+
+#[test]
+fn test_env_vars_and_cli_overrides() {
+    use std::collections::BTreeMap;
+    use crate::ConfigOptions;
+
+    let mut env_map = BTreeMap::new();
+    env_map.insert("NPM_CONFIG_STRICT_SSL".to_string(), "false".to_string());
+    env_map.insert("npm_config_proxy".to_string(), "http://proxy.corp:8080".to_string());
+    env_map.insert("NPM_CONFIG_HTTPS_PROXY".to_string(), "https://proxy.corp:8443".to_string());
+    env_map.insert("npm_config_fetch_timeout".to_string(), "45000".to_string());
+    env_map.insert("npm_config_cafile".to_string(), "/path/to/cert.pem".to_string());
+    env_map.insert("npm_config__auth".to_string(), "token_123".to_string());
+
+    let loaded_env = Config::load_with_options(ConfigOptions::new().env_vars(env_map.clone())).unwrap();
+    assert_eq!(loaded_env.get("strict-ssl"), Some("false"));
+    assert_eq!(loaded_env.get("strict_ssl"), Some("false"));
+    assert_eq!(loaded_env.get_bool("strict_ssl"), Some(false));
+    assert_eq!(loaded_env.get("proxy"), Some("http://proxy.corp:8080"));
+    assert_eq!(loaded_env.get("https-proxy"), Some("https://proxy.corp:8443"));
+    assert_eq!(loaded_env.get("https_proxy"), Some("https://proxy.corp:8443"));
+    assert_eq!(loaded_env.get("fetch-timeout"), Some("45000"));
+    assert_eq!(loaded_env.get("fetch_timeout"), Some("45000"));
+    assert_eq!(loaded_env.get("cafile"), Some("/path/to/cert.pem"));
+    assert_eq!(loaded_env.get("_auth"), Some("token_123"));
+
+    let mut cli_map = BTreeMap::new();
+    cli_map.insert("--strict-ssl".to_string(), "true".to_string());
+    cli_map.insert("proxy".to_string(), "http://cli.proxy:9000".to_string());
+
+    let loaded_cli = Config::load_with_options(
+        ConfigOptions::new()
+            .env_vars(env_map)
+            .cli_overrides(cli_map),
+    )
+    .unwrap();
+    assert_eq!(loaded_cli.get("strict-ssl"), Some("true"));
+    assert_eq!(loaded_cli.get_bool("strict-ssl"), Some(true));
+    assert_eq!(loaded_cli.get("proxy"), Some("http://cli.proxy:9000"));
+    assert_eq!(loaded_cli.get("https-proxy"), Some("https://proxy.corp:8443"));
+}

@@ -94,6 +94,46 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
     Ok(changed)
 }
 
+/// Splits a shebang line into tokens respecting quotes and backslash escaping.
+pub fn split_shebang_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escape = false;
+
+    for c in line.chars() {
+        if escape {
+            current.push(c);
+            escape = false;
+            continue;
+        }
+        if c == '\\' && !in_single_quote {
+            escape = true;
+            continue;
+        }
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if c.is_whitespace() && !in_single_quote && !in_double_quote {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Parses the shebang line from script content, returning `ShebangInfo` if present.
 pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
     let clean = content.strip_prefix('\u{feff}').unwrap_or(content);
@@ -107,7 +147,7 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
         return None;
     }
 
-    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let tokens = split_shebang_tokens(line);
     if tokens.is_empty() {
         return None;
     }
@@ -130,7 +170,7 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
         return None;
     }
 
-    let raw_prog = tokens[idx];
+    let raw_prog = &tokens[idx];
     let prog_name = Path::new(raw_prog)
         .file_name()
         .and_then(|s| s.to_str())
