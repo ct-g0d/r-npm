@@ -23,6 +23,13 @@ use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
+pub mod prune;
+pub use prune::{
+    analyze_reachability, discover_extraneous_packages, execute_prune,
+    extract_package_name_from_path, scan_node_modules, ExtraneousPackage,
+    PruneAnalysis, PruneOptions, PruneSummary,
+};
+
 use rnpm_solver::{
     resolve_workspace_graph, Overrides, PackageMetadata, PackageMetadataProvider,
     PackageVersionMetadata, Platform, ResolverOptions, Solver, SolverError,
@@ -3237,6 +3244,21 @@ impl Installer {
             lockfile_path,
         })
     }
+    /// Prunes extraneous dependencies from node_modules based on reachability from package.json.
+    pub fn prune(&self, options: &PruneOptions) -> Result<PruneSummary> {
+        let mut opts = options.clone();
+        opts.project_dir = self.options.project_dir.clone();
+        let analysis = prune::discover_extraneous_packages(&self.options.project_dir, &opts)?;
+        prune::execute_prune(&self.options.project_dir, &analysis.extraneous_packages)
+    }
+
+    /// Discovers extraneous dependencies in node_modules without modifying the filesystem.
+    pub fn analyze_prune(&self, options: &PruneOptions) -> Result<PruneAnalysis> {
+        let mut opts = options.clone();
+        opts.project_dir = self.options.project_dir.clone();
+        prune::discover_extraneous_packages(&self.options.project_dir, &opts)
+    }
+
 }
 
 /// Options for running rnpm uninstall.
