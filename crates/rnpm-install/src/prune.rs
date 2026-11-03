@@ -87,7 +87,7 @@ impl PruneOptions {
 }
 
 /// Information about an extraneous package discovered on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtraneousPackage {
     /// Package name (e.g. "express", "@types/node", "sub-dep").
     pub name: String,
@@ -100,7 +100,7 @@ pub struct ExtraneousPackage {
 }
 
 /// Structured outcome of reachability analysis and extraneous discovery.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PruneAnalysis {
     /// All reachable package paths in node_modules (e.g. "node_modules/foo").
     pub reachable_packages: HashSet<String>,
@@ -123,7 +123,7 @@ impl PruneAnalysis {
 }
 
 /// Summary of an executed pruning operation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PruneSummary {
     /// Relative POSIX paths of removed packages.
     pub removed_packages: Vec<String>,

@@ -271,6 +271,7 @@ fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path) -> PathBuf {
     root_bin_dir.to_path_buf()
 }
 
+#[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub project_dir: PathBuf,
     pub registry_url: Option<String>,

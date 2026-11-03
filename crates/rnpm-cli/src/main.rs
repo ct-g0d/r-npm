@@ -263,6 +263,37 @@ pub(crate) enum Commands {
         dry_run: bool,
     },
 
+    /// Remove extraneous packages from node_modules
+    Prune {
+        /// Dependency types to omit: dev, optional, peer
+        #[arg(long, value_name = "TYPE", value_delimiter = ',', num_args = 1..)]
+        omit: Vec<String>,
+
+        /// Remove devDependencies (alias for --omit=dev)
+        #[arg(long, short = 'p')]
+        production: bool,
+
+        /// Report what would be removed without modifying disk
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output report in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manage package.json properties
+    Pkg {
+        #[command(subcommand)]
+        action: PkgAction,
+        /// Directory containing package.json (defaults to current dir)
+        #[arg(long, default_value = ".", global = true)]
+        prefix: PathBuf,
+        /// Force JSON output format
+        #[arg(long, global = true)]
+        json: bool,
+    },
+
     /// Manage the package cache
     Cache {
         #[command(subcommand)]
@@ -301,6 +332,27 @@ pub(crate) enum Commands {
         /// Additional arguments passed to publish
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum PkgAction {
+    /// Retrieve values from package.json
+    Get {
+        /// Fields to retrieve
+        fields: Vec<String>,
+    },
+    /// Set values in package.json
+    Set {
+        /// Key=value assignments
+        #[arg(required = true)]
+        assignments: Vec<String>,
+    },
+    /// Delete values from package.json
+    Delete {
+        /// Fields to delete
+        #[arg(required = true)]
+        fields: Vec<String>,
     },
 }
 
@@ -423,6 +475,15 @@ where
     let mut i = 0;
     while i < args_to_scan.len() {
         let arg = &args_to_scan[i];
+        // For prune, --production, -p, --omit=..., and --omit are supported options.
+        if first == "prune" && (arg == "--production" || arg == "-p" || arg.starts_with("--omit")) {
+            i += 1;
+            continue;
+        }
+        if first == "pkg" {
+            i += 1;
+            continue;
+        }
         if unsupported_flags.contains(&arg.as_str()) {
             return Some((
                 "ERR_UNSUPPORTED_FLAG".to_string(),
@@ -1054,6 +1115,96 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
                     summary.packages_updated, summary.cache_hits, summary.cache_misses
                 );
+            }
+        }
+        Commands::Prune {
+            omit,
+            production,
+            dry_run,
+            json,
+        } => {
+            let (mut omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
+            if production {
+                omit_dev = true;
+            }
+            let prune_options = rnpm_install::prune::PruneOptions {
+                project_dir: current_dir.clone(),
+                omit_dev,
+                omit_optional,
+                omit_peer,
+            };
+
+            let installer = Installer::new(InstallOptions {
+                project_dir: current_dir,
+                ..Default::default()
+            })?;
+
+            if dry_run {
+                let analysis = installer.analyze_prune(&prune_options)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&analysis)?);
+                } else if analysis.extraneous_packages.is_empty() {
+                    println!("rnpm: dry-run: no packages would be pruned");
+                } else {
+                    for pkg in &analysis.extraneous_packages {
+                        println!("rnpm: would remove {}", pkg.path);
+                    }
+                    println!(
+                        "rnpm: dry-run: {} package(s) would be removed",
+                        analysis.extraneous_packages.len()
+                    );
+                }
+            } else {
+                let summary = installer.prune(&prune_options)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else if summary.removed_packages.is_empty() {
+                    println!("rnpm: no extraneous packages pruned");
+                } else {
+                    for pkg in &summary.removed_packages {
+                        println!("rnpm: removed {pkg}");
+                    }
+                    println!(
+                        "rnpm: successfully pruned {} package(s)",
+                        summary.removed_packages.len()
+                    );
+                }
+            }
+        }
+        Commands::Pkg {
+            action,
+            prefix,
+            json,
+        } => {
+            let base_path = if prefix.is_absolute() {
+                prefix
+            } else {
+                current_dir.join(&prefix)
+            };
+            let manifest_path = if base_path.file_name().map_or(false, |f| f == "package.json") {
+                base_path
+            } else {
+                base_path.join("package.json")
+            };
+
+            if !manifest_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "code ENOENT: package.json not found in {}",
+                    manifest_path.parent().unwrap_or(&manifest_path).display()
+                ));
+            };
+
+            match action {
+                PkgAction::Get { fields } => {
+                    let output = rnpm_core::pkg::pkg_get(&manifest_path, &fields, json)?;
+                    println!("{output}");
+                }
+                PkgAction::Set { assignments } => {
+                    rnpm_core::pkg::pkg_set(&manifest_path, &assignments)?;
+                }
+                PkgAction::Delete { fields } => {
+                    rnpm_core::pkg::pkg_delete(&manifest_path, &fields)?;
+                }
             }
         }
         Commands::Audit {
