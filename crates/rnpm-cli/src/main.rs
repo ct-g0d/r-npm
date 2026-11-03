@@ -48,7 +48,7 @@ pub(crate) enum Commands {
         save_exact: bool,
 
         /// Save to dependencies
-        #[arg(short = 'P', long = "save-prod", alias = "save")]
+        #[arg(short = 'P', short_alias = 'S', long = "save-prod", alias = "save")]
         save_prod: bool,
 
         /// Save to optionalDependencies

@@ -694,7 +694,7 @@ impl Installer {
         if !added_pkgs.is_empty() {
             for added in &added_pkgs {
                 let resolved_version_opt = graph.nodes.get(&format!("node_modules/{}", added.name))
-                    .or_else(|| graph.nodes.values().find(|n| n.name == added.name))
+                    .or_else(|| graph.nodes.values().find(|n| n.install_name == added.name || n.name == added.name))
                     .map(|n| n.version.clone());
 
                 let resolved_ver = resolved_version_opt.unwrap_or_else(|| "1.0.0".to_string());
@@ -711,13 +711,14 @@ impl Installer {
                             format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
                         }
                         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
+                        PackageTarget::Url(u) => u.to_string(),
                         _ => resolved_ver,
                     }
                 } else {
                     match &added.target {
                         PackageTarget::Range(_) => {
                             if let Some(ref u_spec) = added.user_spec {
-                                if u_spec == "*" {
+                                if u_spec == "*" || u_spec.eq_ignore_ascii_case("x") {
                                     format!("^{}", resolved_ver)
                                 } else {
                                     u_spec.clone()
@@ -731,7 +732,7 @@ impl Installer {
                         }
                         PackageTarget::Alias { name: real_name, .. } => {
                             if let Some(ref u_spec) = added.user_spec {
-                                u_spec.clone()
+                                format!("npm:{}@{}", real_name, u_spec)
                             } else {
                                 format!("npm:{}@^{}", real_name, resolved_ver)
                             }
@@ -796,8 +797,7 @@ impl Installer {
         if self.options.package_lock_only {
             for (loc, node) in &graph.nodes {
                 if let Some(ref res) = node.resolved {
-                    if res.starts_with("file:") {
-                        let rel_file = res.strip_prefix("file:").unwrap();
+                    if let Some(rel_file) = res.strip_prefix("file:") {
                         let abs_file = self.options.project_dir.join(rel_file);
                         if abs_file.is_dir() {
                             let link_entry = LockfilePackage {
@@ -1267,14 +1267,16 @@ impl Installer {
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
-        // 4. Write deterministic package-lock.json
         let lockfile_path = self.options.project_dir.join("package-lock.json");
-        lockfile.save_to_file(&lockfile_path)
-            .context("Failed to save package-lock.json")?;
+        if !self.options.no_save {
+            // 4. Write deterministic package-lock.json
+            lockfile.save_to_file(&lockfile_path)
+                .context("Failed to save package-lock.json")?;
 
-        // 5. Persist hidden lockfile to node_modules/.package-lock.json
-        lockfile.save_hidden(&self.options.project_dir)
-            .context("Failed to save hidden package-lock.json")?;
+            // 5. Persist hidden lockfile to node_modules/.package-lock.json
+            lockfile.save_hidden(&self.options.project_dir)
+                .context("Failed to save hidden package-lock.json")?;
+        }
 
         Ok(InstallSummary {
             packages_installed,
