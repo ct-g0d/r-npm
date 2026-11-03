@@ -1710,6 +1710,7 @@ async fn test_ci_drift_detection_dev_dependencies_mutated() {
     let res = installer.run_ci().await;
     assert!(res.is_err(), "run_ci must fail when devDependencies mutated in package.json");
     let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Error must contain ELOCKFILE_DRIFT: {err_msg}");
     assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
     assert!(err_msg.contains("dev-tool"), "Error must mention drifted package: {err_msg}");
 }
@@ -1755,8 +1756,101 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     let res = installer.run_ci().await;
     assert!(res.is_err(), "run_ci must fail when dependency deleted from package.json but present in lockfile");
     let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Error must contain ELOCKFILE_DRIFT: {err_msg}");
     assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
     assert!(err_msg.contains("dep-b"), "Error must mention removed dependency: {err_msg}");
+}
+
+#[tokio::test]
+async fn test_ci_migrates_v1_lockfile_and_detects_drift() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // package.json expecting dep-a ^1.0.0 and dep-b ^2.0.0
+    let manifest_json = r#"{
+        "name": "migrated-app",
+        "version": "1.0.0",
+        "dependencies": {
+            "dep-a": "^1.0.0",
+            "dep-b": "^2.0.0"
+        }
+    }"#;
+    fs::write(project_dir.join("package.json"), manifest_json).unwrap();
+
+    // package-lock.json v1 format only having dep-a
+    let v1_lockfile = r#"{
+        "name": "migrated-app",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "dep-a": {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/dep-a/-/dep-a-1.0.0.tgz",
+                "integrity": "sha512-placeholder"
+            }
+        }
+    }"#;
+    fs::write(project_dir.join("package-lock.json"), v1_lockfile).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_err(), "run_ci must detect missing dep-b after migrating v1 lockfile");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Must emit ELOCKFILE_DRIFT: {err_msg}");
+    assert!(err_msg.contains("dep-b"), "Must mention dep-b: {err_msg}");
+}
+
+#[tokio::test]
+async fn test_ci_junction_safe_node_modules_pruning() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+    let external_dir = tempdir().unwrap();
+    let secret_file = external_dir.path().join("precious-data.txt");
+    fs::write(&secret_file, "do not delete me!").unwrap();
+
+    let manifest_json = r#"{
+        "name": "junc-ci-app",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#;
+    fs::write(project_dir.join("package.json"), manifest_json).unwrap();
+
+    let lockfile = r#"{
+        "name": "junc-ci-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "junc-ci-app",
+                "version": "1.0.0",
+                "dependencies": {}
+            }
+        }
+    }"#;
+    fs::write(project_dir.join("package-lock.json"), lockfile).unwrap();
+
+    // Create pre-existing node_modules containing a junction pointing to external directory
+    let node_modules = project_dir.join("node_modules");
+    fs::create_dir_all(&node_modules).unwrap();
+    let link_path = node_modules.join("external-link");
+    rnpm_fs::create_junction(&link_path, external_dir.path()).unwrap();
+    assert!(rnpm_fs::is_junction(&link_path).unwrap());
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    }).unwrap();
+
+    installer.run_ci().await.unwrap();
+
+    // Crucial check: external target file was NOT deleted!
+    assert!(secret_file.exists(), "External file must be preserved when run_ci cleans node_modules with junctions!");
 }
 
 #[tokio::test]

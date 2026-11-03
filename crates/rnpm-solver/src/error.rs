@@ -20,6 +20,16 @@ pub enum SolverError {
         message: String,
     },
 
+    #[error("EBADPLATFORM: Unsupported platform for {package}@{version}: wanted {wanted} (current: {current})\n{message}")]
+    PlatformIncompatible {
+        package: String,
+        version: String,
+        wanted: String,
+        current: String,
+        required_by: Vec<String>,
+        message: String,
+    },
+
     #[error("Cycle detected during dependency resolution: {0}")]
     CycleDetected(String),
 
@@ -112,6 +122,30 @@ impl SolverError {
     /// Returns true if this error represents an ERESOLVE peer dependency conflict.
     pub fn is_peer_conflict(&self) -> bool {
         matches!(self, SolverError::PeerConflict { .. })
+    }
+
+    /// Constructs a platform incompatibility error.
+    pub fn platform_incompatible(
+        package: impl Into<String>,
+        version: impl Into<String>,
+        wanted: impl Into<String>,
+        current: impl Into<String>,
+        required_by: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        SolverError::PlatformIncompatible {
+            package: package.into(),
+            version: version.into(),
+            wanted: wanted.into(),
+            current: current.into(),
+            required_by,
+            message: message.into(),
+        }
+    }
+
+    /// Returns true if this error represents an EBADPLATFORM platform incompatibility.
+    pub fn is_platform_incompatible(&self) -> bool {
+        matches!(self, SolverError::PlatformIncompatible { .. })
     }
 
     /// Accessor for peer conflict details: (parent, peer, required_spec, found_version, found_location, required_by, message)

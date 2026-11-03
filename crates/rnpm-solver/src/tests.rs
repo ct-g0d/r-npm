@@ -3777,3 +3777,93 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
         other => panic!("Expected PeerConflict, got {other:?}"),
     }
 }
+
+#[test]
+fn test_required_platform_incompatibility_fails_ebadplatform() {
+    use crate::solver::Solver;
+    use crate::overrides::Overrides;
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("darwin-only", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".to_string()]);
+        v.cpu = Some(vec!["arm64".to_string()]);
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("my-app".to_string());
+    manifest.dependencies.insert("darwin-only".to_string(), "^1.0.0".to_string());
+
+    let mut options = ResolverOptions::default();
+    options.platform = Platform {
+        os: "linux".to_string(),
+        cpu: "x64".to_string(),
+        libc: Some("glibc".to_string()),
+    };
+
+    let solver = Solver::new(&provider, options, Overrides::default());
+    let err = solver.resolve(&manifest).unwrap_err();
+    assert!(err.is_platform_incompatible(), "Must be platform incompatible error");
+    let err_str = err.to_string();
+    assert!(err_str.contains("EBADPLATFORM"), "Error must contain EBADPLATFORM: {err_str}");
+    assert!(err_str.contains("darwin-only"), "Error must mention package: {err_str}");
+}
+
+#[test]
+fn test_optional_platform_incompatibility_is_skipped() {
+    use crate::solver::Solver;
+    use crate::overrides::Overrides;
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("darwin-opt", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".to_string()]);
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("my-app".to_string());
+    manifest.optional_dependencies.insert("darwin-opt".to_string(), "^1.0.0".to_string());
+
+    let mut options = ResolverOptions::default();
+    options.platform = Platform {
+        os: "linux".to_string(),
+        cpu: "x64".to_string(),
+        libc: Some("glibc".to_string()),
+    };
+
+    let solver = Solver::new(&provider, options, Overrides::default());
+    let graph = solver.resolve(&manifest).expect("Optional incompatible platform should succeed and skip");
+    assert!(graph.is_skipped("darwin-opt"), "darwin-opt must be in skipped set");
+}
+
+#[test]
+fn test_lockfile_v3_preserves_peer_dependencies_meta_and_overrides() {
+    use rnpm_core::manifest::PeerDependencyMeta;
+    use crate::solver::Solver;
+    use crate::overrides::Overrides;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("my-plugin", "1.0.0", |v| {
+        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies_meta.insert("react".to_string(), PeerDependencyMeta { optional: true });
+    });
+    provider.add_version("react", "18.2.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("root-app".to_string());
+    manifest.dependencies.insert("my-plugin".to_string(), "1.0.0".to_string());
+    manifest.peer_dependencies.insert("root-peer".to_string(), "^2.0.0".to_string());
+    manifest.peer_dependencies_meta.insert("root-peer".to_string(), PeerDependencyMeta { optional: true });
+    manifest.extra.insert("overrides".to_string(), serde_json::json!({ "react": "18.2.0" }));
+
+    let options = ResolverOptions::default();
+    let overrides = Overrides::from_manifest(&manifest).unwrap();
+    let solver = Solver::new(&provider, options, overrides);
+    let graph = solver.resolve(&manifest).unwrap();
+
+    let lockfile = graph.to_lockfile_v3("root-app", Some("1.0.0"));
+    let root_pkg = lockfile.packages.get("").expect("Root package must exist");
+    assert!(root_pkg.extra.contains_key("overrides"), "Root overrides must be preserved");
+    assert!(root_pkg.peer_dependencies.as_ref().unwrap().contains_key("root-peer"));
+    assert!(root_pkg.peer_dependencies_meta.as_ref().unwrap().contains_key("root-peer"));
+
+    let plugin_pkg = lockfile.packages.get("node_modules/my-plugin").expect("my-plugin node must exist");
+    assert!(plugin_pkg.peer_dependencies.as_ref().unwrap().contains_key("react"));
+    assert!(plugin_pkg.peer_dependencies_meta.as_ref().unwrap().contains_key("react"));
+}

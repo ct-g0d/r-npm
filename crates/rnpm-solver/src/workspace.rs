@@ -571,6 +571,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         dependencies: root_manifest.dependencies.clone(),
         dev_dependencies: root_manifest.dev_dependencies.clone(),
         peer_dependencies: root_manifest.peer_dependencies.clone(),
+        peer_dependencies_meta: root_manifest.peer_dependencies_meta.clone(),
         optional_dependencies: root_manifest.optional_dependencies.clone(),
         os: root_manifest.os.clone(),
         cpu: root_manifest.cpu.clone(),
@@ -580,6 +581,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
         }),
         parsed_version: parsed_root_version,
+        extra: root_manifest.extra.clone(),
         ..Default::default()
     };
     graph.nodes.insert(String::new(), root_node);
@@ -603,6 +605,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             dependencies: member.manifest.dependencies.clone(),
             dev_dependencies: member.manifest.dev_dependencies.clone(),
             peer_dependencies: member.manifest.peer_dependencies.clone(),
+            peer_dependencies_meta: member.manifest.peer_dependencies_meta.clone(),
             optional_dependencies: member.manifest.optional_dependencies.clone(),
             os: member.manifest.os.clone(),
             cpu: member.manifest.cpu.clone(),

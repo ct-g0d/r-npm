@@ -177,6 +177,8 @@ pub struct AbbreviatedVersion {
     pub dev_dependencies: HashMap<String, String>,
     #[serde(rename = "peerDependencies", default)]
     pub peer_dependencies: HashMap<String, String>,
+    #[serde(rename = "peerDependenciesMeta", default)]
+    pub peer_dependencies_meta: HashMap<String, rnpm_core::manifest::PeerDependencyMeta>,
     #[serde(rename = "optionalDependencies", default)]
     pub optional_dependencies: HashMap<String, String>,
     #[serde(rename = "bundleDependencies", alias = "bundledDependencies", default)]

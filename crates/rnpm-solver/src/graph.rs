@@ -58,6 +58,8 @@ pub struct Node {
     pub dev_dependencies: BTreeMap<String, String>,
     /// Declared peer dependencies.
     pub peer_dependencies: BTreeMap<String, String>,
+    /// Declared peer dependencies metadata (e.g. optionality).
+    pub peer_dependencies_meta: BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
     /// Declared optional dependencies.
     pub optional_dependencies: BTreeMap<String, String>,
     /// Platform OS constraints.
@@ -197,6 +199,14 @@ impl DependencyGraph {
                     if !node.peer_dependencies.is_empty() {
                         root_pkg.peer_dependencies = Some(node.peer_dependencies.clone());
                     }
+                    if !node.peer_dependencies_meta.is_empty() {
+                        root_pkg.peer_dependencies_meta = Some(
+                            node.peer_dependencies_meta
+                                .iter()
+                                .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                                .collect(),
+                        );
+                    }
                     if !node.optional_dependencies.is_empty() {
                         root_pkg.optional_dependencies = Some(node.optional_dependencies.clone());
                     }
@@ -233,6 +243,16 @@ impl DependencyGraph {
                     },
                     peer_dependencies: if !node.peer_dependencies.is_empty() {
                         Some(node.peer_dependencies.clone())
+                    } else {
+                        None
+                    },
+                    peer_dependencies_meta: if !node.peer_dependencies_meta.is_empty() {
+                        Some(
+                            node.peer_dependencies_meta
+                                .iter()
+                                .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                                .collect(),
+                        )
                     } else {
                         None
                     },
@@ -276,6 +296,20 @@ impl DependencyGraph {
             let parsed_version = rnpm_core::semver::Version::parse(&version).ok();
 
             let is_dev_opt = pkg.dev_optional.unwrap_or(false);
+            let peer_dependencies_meta = pkg
+                .peer_dependencies_meta
+                .as_ref()
+                .map(|meta_map| {
+                    meta_map
+                        .iter()
+                        .map(|(k, v)| {
+                            let meta: rnpm_core::manifest::PeerDependencyMeta =
+                                serde_json::from_value(v.clone()).unwrap_or_default();
+                            (k.clone(), meta)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let node = Node {
                 location: loc.clone(),
                 install_name: install_name.clone(),
@@ -296,6 +330,7 @@ impl DependencyGraph {
                 dependencies: pkg.dependencies.clone().unwrap_or_default(),
                 dev_dependencies: pkg.dev_dependencies.clone().unwrap_or_default(),
                 peer_dependencies: pkg.peer_dependencies.clone().unwrap_or_default(),
+                peer_dependencies_meta,
                 optional_dependencies: pkg.optional_dependencies.clone().unwrap_or_default(),
                 os: pkg.os.clone(),
                 cpu: pkg.cpu.clone(),

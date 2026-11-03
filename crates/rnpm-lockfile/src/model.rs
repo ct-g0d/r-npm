@@ -1,4 +1,4 @@
-use rnpm_core::semver::Version;
+use rnpm_core::semver::{Range, Version};
 use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use serde::{Deserialize, Serialize};
@@ -325,7 +325,29 @@ impl LockfileV3 {
         if manifest_map.is_empty() {
             lock_map.as_ref().map(|m| m.is_empty()).unwrap_or(true)
         } else {
-            lock_map.as_ref().map(|m| m == manifest_map).unwrap_or(false)
+            let Some(lock) = lock_map else {
+                return false;
+            };
+            if manifest_map.len() != lock.len() {
+                return false;
+            }
+            for (k, manifest_spec) in manifest_map {
+                let Some(lock_spec) = lock.get(k) else {
+                    return false;
+                };
+                if lock_spec == manifest_spec {
+                    continue;
+                }
+                if let Ok(v) = Version::parse(lock_spec) {
+                    if let Ok(r) = Range::parse(manifest_spec) {
+                        if r.satisfies(&v) {
+                            continue;
+                        }
+                    }
+                }
+                return false;
+            }
+            true
         }
     }
 
