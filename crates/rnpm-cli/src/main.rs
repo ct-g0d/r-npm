@@ -38,6 +38,10 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -58,6 +62,10 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
     },
 
     /// Run arbitrary package scripts
@@ -357,9 +365,6 @@ where
         "--no-save",
         "--save-peer",
         "--production",
-        "--omit=dev",
-        "--omit=optional",
-        "--omit=peer",
     ];
 
     let mut i = 0;
@@ -377,26 +382,38 @@ where
             ));
         }
 
-        if arg == "--omit" {
-            let flag_str = if i + 1 < args_to_scan.len() && !args_to_scan[i + 1].starts_with('-') {
-                format!("--omit {}", args_to_scan[i + 1])
-            } else {
-                "--omit".to_string()
-            };
-            return Some((
-                "ERR_UNSUPPORTED_FLAG".to_string(),
-                format!(
-                    "npm error code ERR_UNSUPPORTED_FLAG\n\
-                     npm error The flag '{}' is not supported by rnpm.\n\
-                     npm error See docs/compatibility-contract.md for supported options.",
-                    flag_str
-                ),
-            ));
-        }
         i += 1;
     }
 
     None
+}
+
+pub(crate) fn parse_omit_options(omit: &[String]) -> (bool, bool, bool) {
+    let mut omit_dev = false;
+    let mut omit_optional = false;
+    let mut omit_peer = false;
+
+    if omit.is_empty() {
+        if let Ok(node_env) = std::env::var("NODE_ENV") {
+            if node_env == "production" {
+                omit_dev = true;
+            }
+        }
+    } else {
+        for val in omit {
+            for part in val.split(',') {
+                let trimmed = part.trim().to_ascii_lowercase();
+                match trimmed.as_str() {
+                    "dev" | "development" => omit_dev = true,
+                    "optional" => omit_optional = true,
+                    "peer" => omit_peer = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (omit_dev, omit_optional, omit_peer)
 }
 
 pub(crate) fn print_structured_error(err: &anyhow::Error) {
@@ -411,13 +428,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
     };
 
     match cli.command {
-        Commands::Install { registry, cache, offline, ignore_scripts, .. } => {
+        Commands::Install { registry, cache, offline, ignore_scripts, omit, .. } => {
+            let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
+                omit_dev,
+                omit_optional,
+                omit_peer,
             };
 
             let mut installer = Installer::new(options)?;
@@ -428,13 +449,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 summary.packages_installed, summary.cache_hits, summary.cache_misses
             );
         }
-        Commands::Ci { registry, cache, offline, ignore_scripts } => {
+        Commands::Ci { registry, cache, offline, ignore_scripts, omit } => {
+            let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
+                omit_dev,
+                omit_optional,
+                omit_peer,
             };
 
             let mut installer = Installer::new(options)?;
@@ -617,6 +642,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         cache_dir: Some(cache_path.clone()),
                         offline: false,
                         ignore_scripts: false,
+                        ..Default::default()
                     };
 
                     let mut installer = Installer::new(install_options)?;
@@ -779,6 +805,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
+                ..Default::default()
             };
 
             let mut installer = Installer::new(options)?;

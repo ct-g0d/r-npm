@@ -758,9 +758,6 @@ use tokio::net::TcpListener;
             "--no-save",
             "--save-peer",
             "--production",
-            "--omit=dev",
-            "--omit=optional",
-            "--omit=peer",
         ];
 
         for flag in test_flags {
@@ -776,13 +773,11 @@ use tokio::net::TcpListener;
             assert!(msg.contains("docs/compatibility-contract.md"));
         }
 
-        // Space-separated --omit
+        // --omit is supported on install and ci
         for omit_val in ["dev", "optional", "peer"] {
-            let check = check_unsupported_cli_invocation(vec!["rnpm", "install", "--omit", omit_val]);
-            assert!(check.is_some());
-            let (code, msg) = check.unwrap();
-            assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
-            assert!(msg.contains(&format!("--omit {omit_val}")));
+            assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--omit", omit_val]).is_none());
+            assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", &format!("--omit={omit_val}")]).is_none());
+            assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--omit", omit_val]).is_none());
         }
 
         // Pass-through for run and exec
@@ -848,6 +843,7 @@ use tokio::net::TcpListener;
                 cache: None,
                 offline: true,
                 ignore_scripts: true,
+                omit: vec![],
             },
         };
 

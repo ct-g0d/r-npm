@@ -97,6 +97,7 @@ pub struct RegistryPackageProvider {
     client: RegistryClient,
     handle: tokio::runtime::Handle,
     metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
+    cache: Cache,
     offline: bool,
 }
 
@@ -108,10 +109,22 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
+        if let Ok(Some((_entry, data))) = self.cache.get(name) {
+            if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                let meta = abbreviated_to_package_metadata(&abbrev);
+                if let Ok(mut cache) = self.metadata_cache.lock() {
+                    cache.insert(name.to_string(), meta.clone());
+                }
+                return Ok(Some(meta));
+            }
+        }
+
         if self.offline {
             return Err(SolverError::PackageMetadata(
                 name.to_string(),
-                format!("Offline mode: package '{name}' not found in local cache"),
+                format!(
+                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                ),
             ));
         }
 
@@ -136,6 +149,87 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 }
             }
         }
+    }
+}
+
+pub fn apply_npmrc_to_client_config(
+    client_config: &mut RegistryClientConfig,
+    npmrc: &rnpm_config::Npmrc,
+) {
+    if let Some(strict_val) = npmrc
+        .settings
+        .get("strict-ssl")
+        .or_else(|| npmrc.settings.get("strict_ssl"))
+    {
+        let trimmed = strict_val.trim().to_ascii_lowercase();
+        client_config.strict_ssl = !matches!(trimmed.as_str(), "false" | "0" | "no" | "off");
+    }
+
+    if let Some(proxy_val) = npmrc.settings.get("proxy") {
+        client_config.proxy = Some(proxy_val.clone());
+    }
+
+    if let Some(https_val) = npmrc
+        .settings
+        .get("https-proxy")
+        .or_else(|| npmrc.settings.get("https_proxy"))
+    {
+        client_config.https_proxy = Some(https_val.clone());
+    }
+
+    if let Some(http_val) = npmrc
+        .settings
+        .get("http-proxy")
+        .or_else(|| npmrc.settings.get("http_proxy"))
+    {
+        client_config.http_proxy = Some(http_val.clone());
+    }
+
+    if let Some(no_proxy_val) = npmrc
+        .settings
+        .get("no-proxy")
+        .or_else(|| npmrc.settings.get("no_proxy"))
+    {
+        client_config.no_proxy = Some(no_proxy_val.clone());
+    }
+
+    if let Some(ca_val) = npmrc.settings.get("ca") {
+        client_config.ca = Some(ca_val.clone());
+    }
+
+    if let Some(cafile_val) = npmrc
+        .settings
+        .get("cafile")
+        .or_else(|| npmrc.settings.get("ca_file"))
+    {
+        client_config.cafile = Some(PathBuf::from(cafile_val));
+    }
+
+    if let Some(cert_val) = npmrc.settings.get("cert") {
+        client_config.cert = Some(cert_val.clone());
+    }
+
+    if let Some(key_val) = npmrc.settings.get("key") {
+        client_config.key = Some(key_val.clone());
+    }
+
+    let timeout_ms = npmrc
+        .settings
+        .get("fetch-timeout")
+        .or_else(|| npmrc.settings.get("fetch_timeout"))
+        .or_else(|| npmrc.settings.get("timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = timeout_ms {
+        client_config.timeout = std::time::Duration::from_millis(ms);
+    }
+
+    let connect_timeout_ms = npmrc
+        .settings
+        .get("connect-timeout")
+        .or_else(|| npmrc.settings.get("connect_timeout"))
+        .and_then(|val_str| val_str.trim().parse::<u64>().ok());
+    if let Some(ms) = connect_timeout_ms {
+        client_config.connect_timeout = std::time::Duration::from_millis(ms);
     }
 }
 
@@ -178,6 +272,9 @@ pub struct InstallOptions {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub ignore_scripts: bool,
+    pub omit_dev: bool,
+    pub omit_optional: bool,
+    pub omit_peer: bool,
 }
 
 impl Default for InstallOptions {
@@ -188,6 +285,9 @@ impl Default for InstallOptions {
             cache_dir: None,
             offline: false,
             ignore_scripts: false,
+            omit_dev: false,
+            omit_optional: false,
+            omit_peer: false,
         }
     }
 }
@@ -365,6 +465,8 @@ impl Installer {
             }
         }
 
+        apply_npmrc_to_client_config(&mut client_config, &config.npmrc);
+
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;
 
@@ -392,12 +494,26 @@ impl Installer {
 
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
+        self.install_internal().await
+    }
+
+    /// Alias for run().
+    pub async fn install(&mut self) -> Result<InstallSummary> {
+        self.run().await
+    }
+
+    /// Alias for run_ci().
+    pub async fn ci(&mut self) -> Result<InstallSummary> {
+        self.run_ci().await
+    }
+
+    async fn install_internal(&mut self) -> Result<InstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
             return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
         }
 
-        let manifest = Manifest::from_file(&manifest_path)
+        let mut manifest = Manifest::from_file(&manifest_path)
             .context("Failed to parse project package.json")?;
 
         let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
@@ -417,10 +533,29 @@ impl Installer {
         }
 
         // 0. Discover workspace members (if any)
-        let workspace_members = discover_workspaces_from_manifest(
+        let mut workspace_members = discover_workspaces_from_manifest(
             &self.options.project_dir,
             &manifest,
         ).map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
+
+        if self.options.omit_dev {
+            manifest.dev_dependencies.clear();
+            for member in &mut workspace_members {
+                member.manifest.dev_dependencies.clear();
+            }
+        }
+        if self.options.omit_optional {
+            manifest.optional_dependencies.clear();
+            for member in &mut workspace_members {
+                member.manifest.optional_dependencies.clear();
+            }
+        }
+        if self.options.omit_peer {
+            manifest.peer_dependencies.clear();
+            for member in &mut workspace_members {
+                member.manifest.peer_dependencies.clear();
+            }
+        }
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             Some(WorkspaceDependencyGraph::construct(&workspace_members)
@@ -441,6 +576,7 @@ impl Installer {
             client: self.registry_client.clone(),
             handle,
             metadata_cache,
+            cache: self.cache.clone(),
             offline: self.options.offline,
         };
 
@@ -456,9 +592,9 @@ impl Installer {
 
         let resolver_options = ResolverOptions {
             platform: Platform::current(),
-            dev: true,
-            legacy_peer_deps: false,
-            strict_peers: true,
+            dev: !self.options.omit_dev,
+            legacy_peer_deps: self.options.omit_peer,
+            strict_peers: !self.options.omit_peer,
             lockfile: existing_lockfile,
         };
 
@@ -506,6 +642,16 @@ impl Installer {
 
         for (loc, node) in &graph.nodes {
             if loc.is_empty() {
+                continue;
+            }
+
+            if self.options.omit_dev && node.flags.dev {
+                continue;
+            }
+            if self.options.omit_optional && node.flags.optional {
+                continue;
+            }
+            if self.options.omit_peer && node.flags.peer {
                 continue;
             }
 
@@ -697,6 +843,7 @@ impl Installer {
             let registry_client = self.registry_client.clone();
             let project_dir = self.options.project_dir.clone();
             let root_bin = root_bin_dir.clone();
+            let offline = self.options.offline;
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -748,6 +895,14 @@ impl Installer {
                     } else {
                         debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
                         let _ = cache.purge_key(resolved_url);
+                        if offline {
+                            if node.flags.optional {
+                                return Ok(None);
+                            }
+                            return Err(anyhow!(
+                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
+                            ));
+                        }
                         match registry_client.download_tarball_bytes(resolved_url).await {
                             Ok(bytes) => {
                                 if let Some(ref exp) = expected_integrity {
@@ -769,6 +924,14 @@ impl Installer {
                             Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
                         }
                     }
+                } else if offline {
+                    if node.flags.optional {
+                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
+                        return Ok(None);
+                    }
+                    return Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                    ));
                 } else {
                     info!("Downloading {}", resolved_url);
                     match registry_client.download_tarball_bytes(resolved_url).await {
@@ -1019,6 +1182,7 @@ impl Installer {
         // 2. Dev dependencies drift check
         let lock_dev_deps = root_pkg.dev_dependencies.as_ref().unwrap_or(&empty_deps);
 
+        if !self.options.omit_dev {
         for (dep_name, dep_spec) in &manifest.dev_dependencies {
             if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
                 if lock_spec != dep_spec {
@@ -1053,10 +1217,12 @@ impl Installer {
                 ));
             }
         }
+        }
 
         // 3. Optional dependencies drift check
         let lock_opt_deps = root_pkg.optional_dependencies.as_ref().unwrap_or(&empty_deps);
 
+        if !self.options.omit_optional {
         for (dep_name, dep_spec) in &manifest.optional_dependencies {
             if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
                 if lock_spec != dep_spec {
@@ -1091,9 +1257,10 @@ impl Installer {
                 ));
             }
         }
+        }
 
         // 4. Comprehensive lockfile validation via matches_manifest
-        if !lockfile.matches_manifest(&manifest, true) {
+        if !lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and package-lock.json are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)"
             ));
@@ -1123,6 +1290,7 @@ impl Installer {
 
             if has_scripts {
                 let mut member_deps: Vec<String> = member.manifest.dependencies.keys().cloned().collect();
+                if !self.options.omit_dev {
                 for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
                     let is_sibling = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
                         || dep_spec.starts_with("workspace:")
@@ -1130,6 +1298,7 @@ impl Installer {
                     if is_sibling && !member_deps.contains(dep_name) {
                         member_deps.push(dep_name.clone());
                     }
+                }
                 }
                 if let Some(ref ws_graph) = ws_graph_opt {
                     if let Some(sibling_map) = ws_graph.dependencies.get(&member.name) {
@@ -1162,6 +1331,55 @@ impl Installer {
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
                 continue;
+            }
+
+            // Omit filtering
+            let is_dev = pkg_info.dev.unwrap_or(false);
+            let is_optional = pkg_info.optional.unwrap_or(false);
+            let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
+            let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
+
+            if self.options.omit_dev {
+                if is_dev || is_dev_optional {
+                    continue;
+                }
+                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
+                    if !clean_name.contains('/') {
+                        if manifest.dev_dependencies.contains_key(clean_name)
+                            && !manifest.dependencies.contains_key(clean_name)
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
+            if self.options.omit_optional {
+                if is_optional || is_dev_optional {
+                    continue;
+                }
+                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
+                    if !clean_name.contains('/') {
+                        if manifest.optional_dependencies.contains_key(clean_name)
+                            && !manifest.dependencies.contains_key(clean_name)
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
+            if self.options.omit_peer {
+                if is_peer {
+                    continue;
+                }
+                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
+                    if !clean_name.contains('/') {
+                        if manifest.peer_dependencies.contains_key(clean_name)
+                            && !manifest.dependencies.contains_key(clean_name)
+                        {
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Handle workspace links
@@ -1430,6 +1648,40 @@ impl Installer {
             packages_to_download.push((pkg_key, resolved_url, integrity_str, is_optional));
         }
 
+        if self.options.offline {
+            for (pkg_key, resolved_url, integrity_str, is_optional) in &packages_to_download {
+                match self.cache.get(resolved_url) {
+                    Ok(Some((_entry, data))) => {
+                        if let Ok(expected) = integrity_str.parse::<Integrity>() {
+                            if let Err(e) = expected.verify(&data) {
+                                if *is_optional {
+                                    warn!(
+                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for cached package {pkg_key}: {e}"
+                                    );
+                                    continue;
+                                }
+                                return Err(anyhow!(
+                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        if *is_optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)",
+                                pkg_key
+                            );
+                            continue;
+                        }
+                        return Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        ));
+                    }
+                }
+            }
+        }
+
         let ci_urls: Vec<&str> = packages_to_download
             .iter()
             .map(|(_, url, _, _)| url.as_str())
@@ -1479,6 +1731,18 @@ impl Installer {
                 if was_hit {
                     debug!("Cached blob for {pkg_key} failed integrity ({e}), re-fetching from registry");
                     let _ = self.cache.purge_key(_resolved_url);
+                    if self.options.offline {
+                        if is_optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
+                            );
+                            continue;
+                        } else {
+                            return Err(anyhow!(
+                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for {pkg_key}: {e}"
+                            ));
+                        }
+                    }
                     match self.registry_client.download_tarball_bytes(_resolved_url).await {
                         Ok(fresh_bytes) => {
                             if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
@@ -2066,6 +2330,7 @@ impl Installer {
         urls: &[&str],
     ) -> Vec<Result<(Vec<u8>, bool)>> {
         let mut join_set = tokio::task::JoinSet::new();
+        let offline = self.options.offline;
 
         for (idx, url) in urls.iter().enumerate() {
             let cache = self.cache.clone();
@@ -2076,6 +2341,15 @@ impl Installer {
                 if let Ok(Some((_entry, data))) = cache.get(&url_str) {
                     debug!("Cache hit for {}", url_str);
                     return (idx, Ok((data, true)));
+                }
+
+                if offline {
+                    return (
+                        idx,
+                        Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{url_str}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        )),
+                    );
                 }
 
                 info!("Downloading {}", url_str);
