@@ -997,3 +997,163 @@ use tokio::net::TcpListener;
         assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
     }
 
+    #[test]
+    fn test_cli_parse_shortcuts_and_bare_run() {
+        // rnpm test and aliases
+        let parsed = Cli::try_parse_from(["rnpm", "test"]).unwrap();
+        match parsed.command {
+            Commands::Test { args } => assert!(args.is_empty()),
+            _ => panic!("Expected Commands::Test"),
+        }
+
+        let parsed = Cli::try_parse_from(["rnpm", "t"]).unwrap();
+        match parsed.command {
+            Commands::Test { args } => assert!(args.is_empty()),
+            _ => panic!("Expected Commands::Test via 't' alias"),
+        }
+
+        let parsed = Cli::try_parse_from(["rnpm", "tst"]).unwrap();
+        match parsed.command {
+            Commands::Test { args } => assert!(args.is_empty()),
+            _ => panic!("Expected Commands::Test via 'tst' alias"),
+        }
+
+        let parsed = Cli::try_parse_from(["rnpm", "test", "--", "--reporter", "spec"]).unwrap();
+        match parsed.command {
+            Commands::Test { args } => assert_eq!(args, vec!["--reporter", "spec"]),
+            _ => panic!("Expected Commands::Test with forwarded args"),
+        }
+
+        // rnpm start
+        let parsed = Cli::try_parse_from(["rnpm", "start", "--port", "3000"]).unwrap();
+        match parsed.command {
+            Commands::Start { args } => assert_eq!(args, vec!["--port", "3000"]),
+            _ => panic!("Expected Commands::Start"),
+        }
+
+        // rnpm restart
+        let parsed = Cli::try_parse_from(["rnpm", "restart"]).unwrap();
+        match parsed.command {
+            Commands::Restart { args } => assert!(args.is_empty()),
+            _ => panic!("Expected Commands::Restart"),
+        }
+
+        // rnpm stop
+        let parsed = Cli::try_parse_from(["rnpm", "stop"]).unwrap();
+        match parsed.command {
+            Commands::Stop { args } => assert!(args.is_empty()),
+            _ => panic!("Expected Commands::Stop"),
+        }
+
+        // rnpm run without script
+        let parsed = Cli::try_parse_from(["rnpm", "run"]).unwrap();
+        match parsed.command {
+            Commands::Run { script, args, .. } => {
+                assert!(script.is_none());
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected Commands::Run with None script"),
+        }
+
+        // rnpm run-script alias
+        let parsed = Cli::try_parse_from(["rnpm", "run-script"]).unwrap();
+        match parsed.command {
+            Commands::Run { script, .. } => assert!(script.is_none()),
+            _ => panic!("Expected Commands::Run via 'run-script' alias"),
+        }
+
+        // rnpm run with script and extra args
+        let parsed = Cli::try_parse_from(["rnpm", "run", "build", "extra"]).unwrap();
+        match parsed.command {
+            Commands::Run { script, args, .. } => {
+                assert_eq!(script, Some("build".to_string()));
+                assert_eq!(args, vec!["extra"]);
+            }
+            _ => panic!("Expected Commands::Run with build script"),
+        }
+    }
+
+    #[test]
+    fn test_check_unsupported_cli_invocation_shortcuts() {
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "test", "-g"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "t", "--production"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "tst", "--omit=dev"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "start", "--save-exact"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "restart", "--global"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "stop", "-E"]).is_none());
+    }
+
+    #[test]
+    fn test_is_lifecycle_script_classification() {
+        use crate::is_lifecycle_script;
+
+        assert!(is_lifecycle_script("test"));
+        assert!(is_lifecycle_script("start"));
+        assert!(is_lifecycle_script("restart"));
+        assert!(is_lifecycle_script("stop"));
+        assert!(is_lifecycle_script("pretest"));
+        assert!(is_lifecycle_script("posttest"));
+        assert!(is_lifecycle_script("install"));
+        assert!(is_lifecycle_script("preinstall"));
+        assert!(is_lifecycle_script("postinstall"));
+        assert!(is_lifecycle_script("prepare"));
+        assert!(is_lifecycle_script("prepublishOnly"));
+        assert!(is_lifecycle_script("version"));
+
+        // Non-lifecycle scripts must not be miscategorized
+        assert!(!is_lifecycle_script("build"));
+        assert!(!is_lifecycle_script("lint"));
+        assert!(!is_lifecycle_script("compile"));
+        assert!(!is_lifecycle_script("preview"));
+        assert!(!is_lifecycle_script("postcss"));
+        assert!(!is_lifecycle_script("prebuild"));
+    }
+
+    #[tokio::test]
+    async fn test_bare_run_empty_scripts_silent() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name": "empty-app", "version": "1.0.0", "scripts": {}}"#,
+        ).unwrap();
+
+        let cli = Cli {
+            command: Commands::Run {
+                script: None,
+                args: vec![],
+                workspaces: false,
+                workspace: vec![],
+                filter: vec![],
+                scope: vec![],
+                if_present: false,
+                ignore_scripts: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+        assert!(res.is_ok(), "Bare run on empty scripts should succeed: {:?}", res.err());
+    }
+
+    #[tokio::test]
+    async fn test_bare_run_missing_package_json() {
+        let tmp = tempdir().unwrap();
+
+        let cli = Cli {
+            command: Commands::Run {
+                script: None,
+                args: vec![],
+                workspaces: false,
+                workspace: vec![],
+                filter: vec![],
+                scope: vec![],
+                if_present: false,
+                ignore_scripts: false,
+            },
+        };
+
+        let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+        assert!(res.is_err(), "Bare run must fail when package.json does not exist");
+        let err_str = res.unwrap_err().to_string();
+        assert!(err_str.contains("package.json not found"), "Got: {err_str}");
+    }
+

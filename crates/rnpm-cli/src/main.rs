@@ -61,7 +61,7 @@ pub(crate) enum Commands {
     },
 
     /// Run package test script
-    #[command(alias = "t")]
+    #[command(alias = "t", alias = "tst")]
     Test {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -371,7 +371,7 @@ where
             }
             idx += 1;
         }
-    } else if first == "test" || first == "t" || first == "start" || first == "restart" || first == "stop" {
+    } else if first == "test" || first == "t" || first == "tst" || first == "start" || first == "restart" || first == "stop" {
         // Trailing arguments for script shortcuts are forwarded payloads to the script
     } else {
         args_to_scan.extend_from_slice(pre_dash_dash);
@@ -448,7 +448,7 @@ fn is_lifecycle_script(name: &str) -> bool {
         "preuninstall", "uninstall", "postuninstall",
         "preversion", "version", "postversion",
     ];
-    LIFECYCLE_NAMES.contains(&name) || name.starts_with("pre") || name.starts_with("post")
+    LIFECYCLE_NAMES.contains(&name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -465,7 +465,7 @@ async fn execute_run(
 ) -> anyhow::Result<()> {
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
-        return Err(anyhow::anyhow!("code ENOENT: package.json not found in {}", current_dir.display()));
+        return Err(anyhow::anyhow!("package.json not found in {}", current_dir.display()));
     }
 
     let manifest = Manifest::from_file(&manifest_path)?;
@@ -474,7 +474,6 @@ async fn execute_run(
         Some(s) => s,
         None => {
             if manifest.scripts.is_empty() {
-                println!("No scripts found in package.json");
                 return Ok(());
             }
 
@@ -505,7 +504,11 @@ async fn execute_run(
             }
 
             if !available_scripts.is_empty() {
-                println!("Available scripts via `rnpm run-script <name>`:");
+                if lifecycle_scripts.is_empty() {
+                    println!("Scripts available in {pkg_id} via `rnpm run`:");
+                } else {
+                    println!("available via `rnpm run`:");
+                }
                 for (name, cmd) in &available_scripts {
                     println!("  {name}");
                     println!("    {cmd}");
@@ -579,7 +582,17 @@ async fn execute_run(
         let full_cmd = if args.is_empty() {
             script_cmd.clone()
         } else {
-            format!("{script_cmd} {}", args.join(" "))
+            let formatted_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                        format!("\"{}\"", a.replace('"', "\\\""))
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            format!("{script_cmd} {}", formatted_args.join(" "))
         };
 
         let pkg_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
