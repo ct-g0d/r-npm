@@ -978,27 +978,6 @@ use tokio::net::TcpListener;
         let tmp = tempdir().unwrap();
         let dir = Some(tmp.path().to_path_buf());
 
-        let list_cli = Cli {
-            command: Commands::List { args: vec![] },
-        };
-        let res = run_cli(list_cli, dir.clone()).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
-
-        let outdated_cli = Cli {
-            command: Commands::Outdated { args: vec![] },
-        };
-        let res = run_cli(outdated_cli, dir.clone()).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
-
-        let view_cli = Cli {
-            command: Commands::View { args: vec![] },
-        };
-        let res = run_cli(view_cli, dir.clone()).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
-
         let publish_cli = Cli {
             command: Commands::Publish { args: vec![] },
         };

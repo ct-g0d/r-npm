@@ -1,5 +1,10 @@
 mod audit;
 pub mod diagnostics;
+pub mod inspect_tree;
+pub mod list;
+pub mod outdated;
+pub mod query;
+pub mod view;
 
 use reqwest::Url;
 use std::path::PathBuf;
@@ -329,27 +334,95 @@ pub(crate) enum Commands {
         cache: Option<PathBuf>,
     },
 
-    /// List installed packages (deferred command)
+    /// List installed packages
     #[command(alias = "ls", alias = "la", alias = "ll")]
     List {
-        /// Additional arguments passed to list
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Specific package name(s) or specs to filter the tree
+        packages: Vec<String>,
+
+        /// Maximum depth to recurse (default 0 for direct dependencies)
+        #[arg(long)]
+        depth: Option<usize>,
+
+        /// Show all dependencies regardless of depth
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+
+        /// Output tree as structured JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show extended information (description, license, path)
+        #[arg(short = 'l', long = "long")]
+        long: bool,
+
+        /// Output parseable list of paths
+        #[arg(short = 'p', long = "parseable")]
+        parseable: bool,
+
+        /// Inspect only package-lock.json without node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
     },
 
-    /// Check for outdated packages (deferred command)
+    /// Check for outdated packages
     Outdated {
-        /// Additional arguments passed to outdated
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Specific package name(s) to check
+        packages: Vec<String>,
+
+        /// Show all dependencies
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+
+        /// Output outdated report as structured JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show extended information (package type, homepage)
+        #[arg(short = 'l', long = "long")]
+        long: bool,
+
+        /// Output parseable list of outdated specs
+        #[arg(short = 'p', long = "parseable")]
+        parseable: bool,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
     },
 
-    /// View package information from registry (deferred command)
+    /// View package information from registry
     #[command(alias = "info", alias = "v", alias = "show")]
     View {
-        /// Additional arguments passed to view
+        /// Package spec and optional field paths
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Output as structured JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Execute CSS-like selector queries on the dependency tree
+    Query {
+        /// CSS-like selector query string (e.g. :root, [name=react], :outdated)
+        selector: Option<String>,
+
+        /// Query only package-lock.json without inspecting node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
     },
 
     /// Publish a package to the registry (deferred command)
@@ -420,11 +493,10 @@ where
 
     let unsupported_commands = [
         "publish", "login", "adduser", "logout", "token", "team",
-        "fix", "outdated", "deprecate",
+        "fix", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
-        "view", "info", "v", "show", "search", "stars", "star", "unstar",
+        "search", "stars", "star", "unstar",
         "ping", "whoami", "version", "init", "create",
-        "list", "ls", "la", "ll",
     ];
 
     if unsupported_commands.contains(&first.as_str()) {
@@ -1428,26 +1500,89 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::List { .. } => {
-            return Err(anyhow::anyhow!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command 'list' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface."
-            ));
+        Commands::List {
+            packages,
+            depth,
+            all,
+            json,
+            long,
+            parseable,
+            package_lock_only,
+            omit,
+        } => {
+            let opts = list::ListOptions {
+                packages,
+                depth,
+                all,
+                json,
+                long,
+                parseable,
+                package_lock_only,
+                omit,
+            };
+            let code = list::run_list(&current_dir, &opts)?;
+            if code != 0 {
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: "list finished with problems".to_string(),
+                }));
+            }
         }
-        Commands::Outdated { .. } => {
-            return Err(anyhow::anyhow!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command 'outdated' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface."
-            ));
+        Commands::Outdated {
+            packages,
+            all,
+            json,
+            long,
+            parseable,
+            registry,
+        } => {
+            let opts = outdated::OutdatedOptions {
+                packages,
+                all,
+                json,
+                long,
+                parseable,
+                registry,
+            };
+            let code = outdated::run_outdated(&current_dir, &opts).await?;
+            if code != 0 {
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: "outdated dependencies found".to_string(),
+                }));
+            }
         }
-        Commands::View { .. } => {
-            return Err(anyhow::anyhow!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command 'view' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface."
-            ));
+        Commands::View { args, json, registry } => {
+            let opts = view::ViewOptions {
+                args,
+                json,
+                registry,
+            };
+            let code = view::run_view(&current_dir, &opts).await?;
+            if code != 0 {
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: "view finished with non-zero exit code".to_string(),
+                }));
+            }
+        }
+        Commands::Query {
+            selector,
+            package_lock_only,
+            registry,
+        } => {
+            let opts = query::QueryOptions {
+                selector,
+                package_lock_only,
+                registry,
+            };
+            let code = query::run_query(&current_dir, &opts).await?;
+            if code != 0 {
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: "query finished with non-zero exit code".to_string(),
+                }));
+            }
         }
         Commands::Publish { .. } => {
             return Err(anyhow::anyhow!(
@@ -1522,7 +1657,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let cli = match Cli::try_parse_from(&filtered_args) {
+    let mut cli = match Cli::try_parse_from(&filtered_args) {
         Ok(c) => c,
         Err(e) => {
             if !e.use_stderr() {
@@ -1541,6 +1676,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    if filtered_args.get(1).map_or(false, |s| s == "la" || s == "ll") {
+        if let Commands::List { ref mut long, .. } = cli.command {
+            *long = true;
+        }
+    }
 
     if let Err(err) = run_cli(cli, None).await {
         if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
