@@ -28,6 +28,9 @@ reqwest = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+data-encoding = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

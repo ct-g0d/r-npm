@@ -56,6 +56,36 @@ fn test_semver_version_parsing_and_order() {
 }
 
 #[test]
+fn test_semver_inc_node_semver_rules() {
+    let v = Version::parse("1.2.3").unwrap();
+    assert_eq!(v.inc("major", None).unwrap().to_string(), "2.0.0");
+    assert_eq!(v.inc("minor", None).unwrap().to_string(), "1.3.0");
+    assert_eq!(v.inc("patch", None).unwrap().to_string(), "1.2.4");
+    assert_eq!(v.inc("prerelease", None).unwrap().to_string(), "1.2.4-0");
+    assert_eq!(v.inc("prepatch", Some("beta")).unwrap().to_string(), "1.2.4-beta.0");
+    assert_eq!(v.inc("preminor", Some("beta")).unwrap().to_string(), "1.3.0-beta.0");
+    assert_eq!(v.inc("premajor", Some("beta")).unwrap().to_string(), "2.0.0-beta.0");
+
+    let v_pre = Version::parse("1.0.0-alpha").unwrap();
+    assert_eq!(v_pre.inc("major", None).unwrap().to_string(), "1.0.0");
+
+    let v_pre_minor = Version::parse("1.2.0-alpha").unwrap();
+    assert_eq!(v_pre_minor.inc("minor", None).unwrap().to_string(), "1.2.0");
+
+    let v_pre_patch = Version::parse("1.2.3-alpha").unwrap();
+    assert_eq!(v_pre_patch.inc("patch", None).unwrap().to_string(), "1.2.3");
+
+    let v_b0 = Version::parse("1.2.3-beta.0").unwrap();
+    assert_eq!(v_b0.inc("prerelease", None).unwrap().to_string(), "1.2.3-beta.1");
+    assert_eq!(v_b0.inc("prerelease", Some("beta")).unwrap().to_string(), "1.2.3-beta.1");
+    assert_eq!(v_b0.inc("prerelease", Some("alpha")).unwrap().to_string(), "1.2.3-alpha.0");
+
+    let v_b = Version::parse("1.2.3-beta").unwrap();
+    assert_eq!(v_b.inc("prerelease", None).unwrap().to_string(), "1.2.3-beta.0");
+    assert_eq!(v_b.inc("prerelease", Some("beta")).unwrap().to_string(), "1.2.3-beta.0");
+}
+
+#[test]
 fn test_semver_range_caret() {
     let r1 = Range::parse("^1.2.3").unwrap();
     assert!(r1.satisfies(&Version::parse("1.2.3").unwrap()));

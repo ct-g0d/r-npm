@@ -161,6 +161,11 @@ use tokio::net::TcpListener;
         // Verify exec and npx are recognized and not blocked as unsupported commands
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "exec"]).is_none());
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "npx"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "init"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "create"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "version"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "diff"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "sbom"]).is_none());
     }
 
     #[test]

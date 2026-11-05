@@ -22,6 +22,11 @@
 - `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies and update package.json/lockfile.
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
+- `init` (aliases: `create`, `innit`): Interactive and non-interactive (`-y` / `--yes` / `-f` / `--force`) `package.json` generation with npm default fields (name, version, description, main, scripts, author, license), preserving existing manifest values, `--scope` support, and initializer delegation to `create-<name>` via dynamic `exec`.
+- `version`: Inspect or bump package versions in `package.json` and `package-lock.json` (`major`, `minor`, `patch`, `premajor`, `preminor`, `prepatch`, `prerelease`, `from-git`, or explicit semver), execute lifecycle scripts (`preversion`, `version`, `postversion`), and integrate with Git (clean working tree checks, commit, and annotated `v<version>` tag creation unless `--no-git-tag-version`).
+- `diff`: Standard unified diff generation comparing package versions, registry tarballs, local directories, or arbitrary tarball archives. Supports `--diff=<spec>`, `--diff-name-only`, `--diff-unified=<lines>`, `--diff-ignore-all-space`, `--diff-no-prefix`, and custom prefixes.
+- `sbom`: Software Bill of Materials generation in SPDX 2.3 (`--sbom-format=spdx`) or CycloneDX 1.5 (`--sbom-format=cyclonedx`) JSON formats, with purl identifiers, SHA-512 integrity hashes, license expressions, and complete dependency relationships.
+- `pkg`: Package manifest inspection and mutation (`get <key>`, `set <key>=<val>`, `delete <key>`) supporting primitive coercion, array indexing and appending, bracket notation, and workspace targeting via `--workspace` (`-w`) and `--workspaces` (`-ws`).
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
@@ -54,7 +59,7 @@ npm error See docs/compatibility-contract.md for supported options.
 - `view` / `info` / `v`: Registry metadata inspection (deferred).
 - `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
 - `fix`: Vulnerability automated remediation.
-- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
+- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`.
 - Writing legacy lockfile formats (v1 or v2).
 
 ### Unsupported Command Handling (DEC-004)

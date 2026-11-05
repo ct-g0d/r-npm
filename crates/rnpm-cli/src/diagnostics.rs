@@ -70,6 +70,7 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOLOCK" => "ENOLOCK",
                 "ENOENT" => "ENOENT",
                 "ENOWORKSPACES" => "ENOWORKSPACES",
+                "ENOWORKSPACE" => "ENOWORKSPACE",
                 "ENOTCACHED" => "ENOTCACHED",
                 _ => "EUNKNOWN",
             };
