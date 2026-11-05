@@ -94,7 +94,7 @@ struct InstalledPackage {
 /// Helper to check if a version string satisfies a declared semver range string.
 pub fn version_matches_range(ver_str: &str, range_str: &str) -> bool {
     let clean_range = range_str.trim();
-    if clean_range == "*" || clean_range == "" || clean_range == "latest" {
+    if clean_range == "*" || clean_range.is_empty() || clean_range == "latest" {
         return true;
     }
 

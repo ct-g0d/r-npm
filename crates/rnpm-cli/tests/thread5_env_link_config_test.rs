@@ -362,7 +362,7 @@ fn test_global_install_and_uninstall_cli() {
 
     // 2. rnpm install -g <pkg>
     let out = Command::new(rnpm_bin)
-        .current_dir(&root)
+        .current_dir(root)
         .env("PREFIX", &global_prefix)
         .args(["install", "-g", &spec])
         .output()
@@ -389,7 +389,7 @@ fn test_global_install_and_uninstall_cli() {
 
     // 3. rnpm uninstall --global glob-cli-pkg
     let out = Command::new(rnpm_bin)
-        .current_dir(&root)
+        .current_dir(root)
         .env("PREFIX", &global_prefix)
         .args(["uninstall", "--global", "glob-cli-pkg"])
         .output()

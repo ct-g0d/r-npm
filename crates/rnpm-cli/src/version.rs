@@ -56,13 +56,11 @@ fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
         .output()
     {
         if output.status.success() {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let serde_json::Value::Object(map) = val {
-                    for (k, v) in map {
-                        results.insert(k, v);
-                    }
-                    node_versions_found = true;
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                for (k, v) in map {
+                    results.insert(k, v);
                 }
+                node_versions_found = true;
             }
         }
     }

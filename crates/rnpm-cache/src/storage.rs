@@ -1013,13 +1013,8 @@ impl Cache {
                     if max_age.is_zero() {
                         // If file is an active in-flight temporary file created by the current process recently (< 5000ms),
                         // preserve it so concurrent threads are not interrupted under thread starvation.
-                        if (file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx))
-                            && age < Duration::from_millis(5000)
-                        {
-                            false
-                        } else {
-                            true
-                        }
+                        !((file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx))
+                            && age < Duration::from_millis(5000))
                     } else {
                         age >= max_age
                     }

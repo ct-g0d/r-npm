@@ -257,7 +257,7 @@ impl Config {
                     .or_else(|| env_lookup("npm_config_globalconfig"))
                     .map(PathBuf::from)
             })
-            .or_else(|| find_global_npmrc_with_env(&env_lookup));
+            .or_else(|| find_global_npmrc_with_env(env_lookup));
 
         if let Some(path) = &global_config_path {
             if path.exists() {
@@ -288,7 +288,7 @@ impl Config {
             .or_else(|| {
                 base_npmrc.settings.get("userconfig").map(PathBuf::from)
             })
-            .or_else(|| find_user_npmrc_with_env(&env_lookup));
+            .or_else(|| find_user_npmrc_with_env(env_lookup));
 
         if let Some(path) = &user_config_path {
             if path.exists() {
@@ -403,7 +403,7 @@ impl Config {
             }
         }
 
-        let global_prefix = find_global_prefix_with_env(&env_lookup);
+        let global_prefix = find_global_prefix_with_env(env_lookup);
         let local_prefix = options.project_dir.map(find_local_prefix).unwrap_or_else(|| {
             env::current_dir().map(|d| find_local_prefix(&d)).unwrap_or_else(|_| PathBuf::from("."))
         });

@@ -251,7 +251,7 @@ pub async fn run_outdated_inner(
                 .insert(format!("{}:{}", host.to_ascii_lowercase(), port));
         }
     }
-    for (_, scoped_reg) in &config.npmrc.scoped_registries {
+    for scoped_reg in config.npmrc.scoped_registries.values() {
         if let Some(h) = scoped_reg.host_str() {
             client_config.trusted_hosts.insert(h.to_ascii_lowercase());
             if let Some(p) = scoped_reg.port_or_known_default() {
@@ -345,7 +345,7 @@ pub fn resolve_wanted_and_latest(
             let mut max_ver: Option<(Version, String)> = None;
             for v_str in versions.keys() {
                 if let Ok(v) = Version::parse(v_str) {
-                    if max_ver.as_ref().map_or(true, |(m, _)| &v > m) {
+                    if max_ver.as_ref().is_none_or(|(m, _)| &v > m) {
                         max_ver = Some((v, v_str.clone()));
                     }
                 }
@@ -367,10 +367,8 @@ pub fn resolve_wanted_and_latest(
         let mut max_satisfying: Option<(Version, String)> = None;
         for v_str in versions.keys() {
             if let Ok(v) = Version::parse(v_str) {
-                if range.satisfies(&v) {
-                    if max_satisfying.as_ref().map_or(true, |(m, _)| &v > m) {
-                        max_satisfying = Some((v, v_str.clone()));
-                    }
+                if range.satisfies(&v) && max_satisfying.as_ref().is_none_or(|(m, _)| &v > m) {
+                    max_satisfying = Some((v, v_str.clone()));
                 }
             }
         }

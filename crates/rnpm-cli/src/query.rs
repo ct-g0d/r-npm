@@ -207,7 +207,7 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
                 tokens.push(std::mem::take(&mut current));
             }
             let mut bracket = String::new();
-            while let Some(b) = chars.next() {
+            for b in chars.by_ref() {
                 bracket.push(b);
                 if b == ']' {
                     break;

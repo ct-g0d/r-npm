@@ -644,7 +644,7 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
 
     // 4. Assemble hierarchical tree under root
     // For direct dependencies of root:
-    for (dep_name, _) in &direct_deps {
+    for dep_name in direct_deps.keys() {
         let loc = format!("node_modules/{dep_name}");
         if let Some(node) = resolved_nodes_by_loc.remove(&loc) {
             root.dependencies.insert(dep_name.clone(), node);

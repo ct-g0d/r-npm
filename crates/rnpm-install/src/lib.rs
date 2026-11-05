@@ -3576,9 +3576,7 @@ impl Installer {
                     removed = true;
                 }
 
-            if removed {
-                removed_packages.push(pkg.to_string());
-            } else if options.is_global || self.options.is_global {
+            if removed || options.is_global || self.options.is_global {
                 removed_packages.push(pkg.to_string());
             }
         }
@@ -3708,7 +3706,7 @@ impl Installer {
         }
 
         // Clean up .bin if empty
-        if bin_dir.exists() && bin_dir.file_name().map_or(false, |f| f == ".bin") {
+        if bin_dir.exists() && bin_dir.file_name().is_some_and(|f| f == ".bin") {
             if let Ok(mut entries) = std::fs::read_dir(&bin_dir) {
                 if entries.next().is_none() {
                     let _ = std::fs::remove_dir(&bin_dir);

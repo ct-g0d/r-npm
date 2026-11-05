@@ -197,7 +197,7 @@ fn test_dedupe_hoist_and_dedupe_when_root_vacant() {
     // Filesystem check: node_modules/helper must now exist with v1.2.0
     let root_helper = root.join("node_modules").join("helper");
     assert!(root_helper.exists(), "Helper must be hoisted to shallowest ancestor level (root node_modules)");
-    let hoisted_manifest: Manifest = Manifest::from_file(&root_helper.join("package.json")).unwrap();
+    let hoisted_manifest: Manifest = Manifest::from_file(root_helper.join("package.json")).unwrap();
     assert_eq!(hoisted_manifest.version.as_deref(), Some("1.2.0"));
 
     // Nested directories must be deleted

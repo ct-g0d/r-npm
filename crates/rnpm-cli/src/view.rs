@@ -19,6 +19,7 @@ pub struct ViewOptions {
 ///
 /// Normalizes flags like `--json` or `--registry <url>` / `--registry=<url>` if passed inside `args`,
 /// extracts target package name and optional version/dist-tag specifier, and collects any requested fields.
+#[allow(clippy::type_complexity)]
 pub fn parse_view_options(
     options: &ViewOptions,
 ) -> Result<(String, Option<String>, Vec<String>, bool, Option<String>), String> {

@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use rnpm_registry::{
     create_publish_payload, PublishPayloadOptions, PublishTarballData, RegistryClient,
     RegistryClientConfig, RegistryError,
@@ -101,7 +103,7 @@ impl PublishMockServer {
                                     let mut lines = header_text.lines();
                                     let req_line = lines.next().unwrap_or_default();
                                     let parts: Vec<&str> = req_line.split_whitespace().collect();
-                                    let method = parts.get(0).copied().unwrap_or("GET").to_string();
+                                    let method = parts.first().copied().unwrap_or("GET").to_string();
                                     let path = parts.get(1).copied().unwrap_or("/").to_string();
 
                                     let mut headers = Vec::new();

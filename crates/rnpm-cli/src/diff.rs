@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_cli_diff_parse() {
-        let parsed = crate::Cli::try_parse_from(&["rnpm", "diff", "a", "b"]);
+        let parsed = crate::Cli::try_parse_from(["rnpm", "diff", "a", "b"]);
         assert!(parsed.is_ok());
     }
 

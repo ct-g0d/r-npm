@@ -1,4 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::too_many_arguments)]
 
 mod audit;
 pub mod diagnostics;
@@ -2926,12 +2927,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 current_dir.join(&prefix)
             };
-            let root_manifest_path = if base_path.file_name().map_or(false, |f| f == "package.json") {
+            let root_manifest_path = if base_path.file_name().is_some_and(|f| f == "package.json") {
                 base_path.clone()
             } else {
                 base_path.join("package.json")
             };
-            let project_root = if base_path.file_name().map_or(false, |f| f == "package.json") {
+            let project_root = if base_path.file_name().is_some_and(|f| f == "package.json") {
                 base_path.parent().unwrap_or(&base_path).to_path_buf()
             } else {
                 base_path.clone()
@@ -3457,7 +3458,7 @@ async fn main() {
         }
     };
 
-    if filtered_args.get(1).map_or(false, |s| s == "la" || s == "ll") {
+    if filtered_args.get(1).is_some_and(|s| s == "la" || s == "ll") {
         if let Commands::List { ref mut long, .. } = cli.command {
             *long = true;
         }

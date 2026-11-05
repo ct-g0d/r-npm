@@ -2010,7 +2010,7 @@ pub struct WorkspaceScriptMember {
     pub manifest: Manifest,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceRunOptions {
     pub script: String,
     pub args: Vec<String>,
@@ -2019,20 +2019,6 @@ pub struct WorkspaceRunOptions {
     pub strict_sandbox: bool,
     pub if_present: bool,
     pub filter_members: Option<Vec<String>>,
-}
-
-impl Default for WorkspaceRunOptions {
-    fn default() -> Self {
-        Self {
-            script: String::new(),
-            args: Vec::new(),
-            ignore_scripts: false,
-            foreground_scripts: false,
-            strict_sandbox: false,
-            if_present: false,
-            filter_members: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]

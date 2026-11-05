@@ -271,7 +271,7 @@ pub fn create_shims(
     fs::create_dir_all(bin_dir)
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
-    let is_dot_bin = bin_dir.file_name().map_or(false, |f| f == ".bin");
+    let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
     if is_dot_bin {
         // 1. POSIX shell script
         let posix_path = bin_dir.join(bin_name);
