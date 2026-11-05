@@ -131,6 +131,7 @@ use tokio::net::TcpListener;
                 offline: false,
                 ignore_scripts: true,
                 legacy_peer_deps: false,
+                strict_peer_deps: false,
             },
         };
 
@@ -175,10 +176,13 @@ use tokio::net::TcpListener;
             assert!(msg.contains(&format!("The flag '{flag}' is not supported by rnpm.")));
         }
 
-        // --legacy-peer-deps is supported on install, but unsupported on commands like audit/pack
+        // --legacy-peer-deps and --strict-peer-deps are supported on install, but unsupported on commands like audit/pack
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--strict-peer-deps"]).is_none());
         let res = check_unsupported_cli_invocation(vec!["rnpm", "audit", "--legacy-peer-deps"]);
         assert!(res.is_some());
+        let res_strict = check_unsupported_cli_invocation(vec!["rnpm", "audit", "--strict-peer-deps"]);
+        assert!(res_strict.is_some());
     }
 
     #[test]
@@ -780,10 +784,13 @@ use tokio::net::TcpListener;
             assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--omit", omit_val]).is_none());
         }
 
-        // --legacy-peer-deps is supported on install, ci, and update
+        // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, and update
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none());
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--legacy-peer-deps"]).is_none());
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "update", "--legacy-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--strict-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--strict-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "update", "--strict-peer-deps"]).is_none());
 
         // Pass-through for run and exec
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "run", "build", "--", "-g"]).is_none());
@@ -1212,6 +1219,13 @@ use tokio::net::TcpListener;
         match parsed_ci.command {
             Commands::Ci { strict_peer_deps, .. } => assert!(strict_peer_deps),
             _ => panic!("Expected Commands::Ci"),
+        }
+
+        // update command parses --strict-peer-deps
+        let parsed_up = Cli::try_parse_from(["rnpm", "update", "--strict-peer-deps"]).unwrap();
+        match parsed_up.command {
+            Commands::Update { strict_peer_deps, .. } => assert!(strict_peer_deps),
+            _ => panic!("Expected Commands::Update"),
         }
 
         // default is false
