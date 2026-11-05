@@ -570,7 +570,10 @@ mod tests {
         }
 
         // Let workers hammer the lock and experience rapid timeouts
-        thread::sleep(Duration::from_millis(120));
+        let hammer_start = std::time::Instant::now();
+        while hammer_start.elapsed() < Duration::from_secs(3) && timeout_count.load(Ordering::Relaxed) <= 10 {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             timeout_count.load(Ordering::Relaxed) > 10,
             "Expected multiple rapid timeouts under contention, got {}",

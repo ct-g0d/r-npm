@@ -22,6 +22,8 @@
 - `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies and update package.json/lockfile.
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
+- `dedupe` / `find-dupes` (alias: `deduplicate`): Traverse installed `node_modules` and `package-lock.json`, find duplicate packages satisfying common semver ranges, hoist to shallowest ancestor level, and delete redundant copies. Supports `--dry-run`.
+- `rebuild` (alias: `rb`): Re-run compilation and lifecycle build scripts (`install`, `postinstall`) for installed packages, with selective rebuild `npm rebuild [<pkg> ...]`, and automatic native tool invocation (`node-gyp rebuild`, `cmake-js`) when `binding.gyp` is present. Supports `--ignore-scripts`, `--foreground-scripts`, `--strict-sandbox`.
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).

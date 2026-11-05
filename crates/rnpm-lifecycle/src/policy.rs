@@ -6,15 +6,34 @@ use crate::sandbox::check_dangerous_command_patterns;
 /// Policy enforcement level for lifecycle script execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxLevel {
-    /// Permissive mode: allows script execution without command pattern filtering; honors explicit allowlist and denylist.
-    Permissive,
-    /// Restricted mode (default): blocks dangerous command patterns (network calls, obfuscation, sensitive paths); honors allowlist and denylist.
+    /// Permissive mode (default): allows script execution without command pattern filtering; honors explicit allowlist and denylist.
+    /// Matches standard npm behavior: allows standard native build invocations and legitimate scripts without artificial command blocking.
     #[default]
+    Permissive,
+    /// Restricted mode (opt-in via --strict-sandbox or config): blocks dangerous command patterns (network calls, obfuscation, sensitive paths); honors allowlist and denylist.
     Restricted,
     /// Strict mode: only explicitly allowlisted packages may execute scripts, blocks all dangerous patterns, enforces strict limits.
     Strict,
     /// Disabled mode: all lifecycle scripts are ignored and skipped entirely (equivalent to --ignore-scripts).
     Disabled,
+}
+
+impl SandboxLevel {
+    pub fn is_permissive(&self) -> bool {
+        matches!(self, Self::Permissive)
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, Self::Restricted)
+    }
+
+    pub fn is_strict(&self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
 }
 
 /// Comprehensive sandboxing policy governing lifecycle script execution.
@@ -39,7 +58,7 @@ pub struct ScriptSandboxPolicy {
 
 impl Default for ScriptSandboxPolicy {
     fn default() -> Self {
-        Self::restricted()
+        Self::permissive()
     }
 }
 

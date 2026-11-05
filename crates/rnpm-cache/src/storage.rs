@@ -359,7 +359,9 @@ impl Cache {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let filename = format!("{prefix}_{pid}_{now}_{count}.tmp");
-        self.tmp_dir().join(filename)
+        let tmp = self.tmp_dir();
+        let _ = fs::create_dir_all(&tmp);
+        tmp.join(filename)
     }
 
     /// Atomically store raw bytes into content-addressable storage.
@@ -1009,10 +1011,10 @@ impl Cache {
                     let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
 
                     if max_age.is_zero() {
-                        // If file is an active in-flight temporary file created by the current process very recently (< 500ms),
-                        // preserve it so concurrent threads are not interrupted.
+                        // If file is an active in-flight temporary file created by the current process recently (< 5000ms),
+                        // preserve it so concurrent threads are not interrupted under thread starvation.
                         if (file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx))
-                            && age < Duration::from_millis(500)
+                            && age < Duration::from_millis(5000)
                         {
                             false
                         } else {

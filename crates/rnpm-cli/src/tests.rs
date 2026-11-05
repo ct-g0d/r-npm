@@ -130,6 +130,8 @@ use tokio::net::TcpListener;
                 cache: Some(cache_dir.path().to_path_buf()),
                 offline: false,
                 ignore_scripts: true,
+                foreground_scripts: false,
+                strict_sandbox: false,
                 legacy_peer_deps: false,
             },
         };
@@ -273,6 +275,8 @@ use tokio::net::TcpListener;
                 scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
+                foreground_scripts: false,
+                strict_sandbox: false,
             },
         };
 
@@ -397,6 +401,8 @@ use tokio::net::TcpListener;
                 scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
+                foreground_scripts: false,
+                strict_sandbox: false,
             },
         };
 
@@ -697,6 +703,8 @@ use tokio::net::TcpListener;
                 scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
+                foreground_scripts: false,
+                strict_sandbox: false,
             },
         };
 
@@ -848,6 +856,8 @@ use tokio::net::TcpListener;
                 cache: None,
                 offline: true,
                 ignore_scripts: true,
+                foreground_scripts: false,
+                strict_sandbox: false,
                 legacy_peer_deps: false,
                 strict_peer_deps: false,
                 omit: vec![],
@@ -1137,6 +1147,8 @@ use tokio::net::TcpListener;
                 scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
+                foreground_scripts: false,
+                strict_sandbox: false,
             },
         };
 
@@ -1158,6 +1170,8 @@ use tokio::net::TcpListener;
                 scope: vec![],
                 if_present: false,
                 ignore_scripts: false,
+                foreground_scripts: false,
+                strict_sandbox: false,
             },
         };
 
