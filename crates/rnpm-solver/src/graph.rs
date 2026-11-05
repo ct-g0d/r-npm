@@ -230,6 +230,7 @@ impl DependencyGraph {
                     dev: if node.flags.dev && !is_dev_and_opt { Some(true) } else { None },
                     optional: if node.flags.optional && !is_dev_and_opt { Some(true) } else { None },
                     dev_optional: if is_dev_and_opt { Some(true) } else { None },
+                    peer: if node.flags.peer { Some(true) } else { None },
                     in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
                         Some(true)
@@ -321,7 +322,7 @@ impl DependencyGraph {
                 flags: NodeFlags {
                     dev: pkg.dev.unwrap_or(false) || is_dev_opt,
                     optional: pkg.optional.unwrap_or(false) || is_dev_opt,
-                    peer: false,
+                    peer: pkg.peer.unwrap_or(false),
                     bundled: pkg.in_bundle.unwrap_or(false),
                     has_install_script: pkg.has_install_script.unwrap_or(false),
                     skipped: false,

@@ -3867,3 +3867,211 @@ fn test_lockfile_v3_preserves_peer_dependencies_meta_and_overrides() {
     assert!(plugin_pkg.peer_dependencies.as_ref().unwrap().contains_key("react"));
     assert!(plugin_pkg.peer_dependencies_meta.as_ref().unwrap().contains_key("react"));
 }
+
+#[test]
+fn test_default_peer_resolution_auto_installs_transitive_peer() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("core-lib", "1.2.0", |_| {});
+    provider.add_version("plugin-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("default-peer-auto-install".to_string());
+    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    assert!(graph.nodes.contains_key("node_modules/plugin-a"));
+    assert!(graph.nodes.contains_key("node_modules/core-lib"));
+    let core_node = graph.nodes.get("node_modules/core-lib").unwrap();
+    assert_eq!(core_node.version, "1.2.0");
+    assert!(core_node.flags.peer, "Auto-installed peer dependency must have peer flag set");
+
+    let peer_edge = graph.edges.iter().find(|e| e.package_name == "core-lib").unwrap();
+    assert_eq!(peer_edge.from_location, "node_modules/plugin-a");
+    assert_eq!(peer_edge.to_location, "node_modules/core-lib");
+    assert_eq!(peer_edge.dep_type, DependencyType::Peer);
+}
+
+#[test]
+fn test_default_peer_resolution_fails_on_conflict_with_eresolve() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("core-lib", "1.0.0", |_| {});
+    provider.add_version("core-lib", "2.0.0", |_| {});
+    provider.add_version("plugin-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("peer-conflict-default".to_string());
+    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+
+    assert!(err.is_peer_conflict());
+    let err_str = err.to_string();
+    assert!(err_str.contains("ERESOLVE: Conflicting peer dependency 'core-lib' required by 'plugin-a'"));
+    assert!(err_str.contains("peer core-lib@\"^1.0.0\" from plugin-a"));
+    assert!(err_str.contains("Found: core-lib@2.0.0 at node_modules/core-lib"));
+    assert!(err_str.contains("--legacy-peer-deps"));
+}
+
+#[test]
+fn test_default_peer_resolution_with_overrides_resolves_conflict() {
+    use crate::solver::Solver;
+    use crate::overrides::Overrides;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("core-lib", "1.0.0", |_| {});
+    provider.add_version("core-lib", "2.0.0", |_| {});
+    provider.add_version("plugin-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("peer-conflict-override".to_string());
+    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest.extra.insert("overrides".to_string(), serde_json::json!({ "core-lib": "2.0.0" }));
+
+    let options = ResolverOptions::default();
+    let overrides = Overrides::from_manifest(&manifest).unwrap();
+    let solver = Solver::new(&provider, options, overrides);
+    let graph = solver.resolve(&manifest).expect("Overrides must resolve conflicting peer dependency");
+
+    assert!(graph.nodes.contains_key("node_modules/core-lib"));
+    assert_eq!(graph.nodes.get("node_modules/core-lib").unwrap().version, "2.0.0");
+}
+
+#[test]
+fn test_legacy_peer_deps_completely_bypasses_peer_dependencies_and_conflicts() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("core-lib", "1.0.0", |_| {});
+    provider.add_version("core-lib", "2.0.0", |_| {});
+    provider.add_version("plugin-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+    });
+    // Root also declares peerDependencies that should be ignored
+    let mut manifest = Manifest::default();
+    manifest.name = Some("legacy-peer-app".to_string());
+    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest.peer_dependencies.insert("uninstalled-peer".to_string(), "^1.0.0".to_string());
+
+    let options = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("legacy_peer_deps must succeed and completely bypass peer checks");
+
+    assert!(graph.nodes.contains_key("node_modules/core-lib"));
+    assert!(graph.nodes.contains_key("node_modules/plugin-a"));
+    assert!(!graph.nodes.contains_key("node_modules/uninstalled-peer"), "Root peer must not be auto-installed in legacy mode");
+    // Ensure no peer edges exist
+    assert!(graph.edges.iter().all(|e| e.dep_type != DependencyType::Peer && e.dep_type != DependencyType::PeerOptional));
+}
+
+#[test]
+fn test_legacy_peer_deps_bypasses_missing_and_cyclic_peers() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("cyclic-a", "1.0.0", |v| {
+        v.peer_dependencies.insert("cyclic-b".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies.insert("missing-pkg".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("cyclic-b", "1.0.0", |v| {
+        v.peer_dependencies.insert("cyclic-a".to_string(), "^2.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("legacy-cyclic-test".to_string());
+    manifest.dependencies.insert("cyclic-a".to_string(), "1.0.0".to_string());
+
+    let legacy_opts = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &legacy_opts)
+        .expect("legacy_peer_deps must succeed even with cyclic and missing peers");
+    assert!(graph.nodes.contains_key("node_modules/cyclic-a"));
+    assert!(!graph.nodes.contains_key("node_modules/missing-pkg"));
+
+    // Under strict_peer_deps, it MUST fail
+    let strict_opts = ResolverOptions {
+        strict_peer_deps: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&manifest, &provider, &strict_opts).unwrap_err();
+    assert!(err.is_peer_conflict());
+}
+
+#[test]
+fn test_strict_peer_deps_fails_on_missing_peer_package() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("lib-with-missing-peer", "1.0.0", |v| {
+        v.peer_dependencies.insert("ghost-pkg".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("strict-missing-peer".to_string());
+    manifest.dependencies.insert("lib-with-missing-peer".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions {
+        strict_peer_deps: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+    assert!(err.is_peer_conflict());
+    let err_str = err.to_string();
+    assert!(err_str.contains("ERESOLVE: Conflicting peer dependency 'ghost-pkg'"));
+    assert!(err_str.contains("Peer package '^1.0.0' not found in registry") || err_str.contains("ghost-pkg"));
+}
+
+#[test]
+fn test_strict_peer_deps_fails_on_no_matching_version() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("peer-lib", "1.0.0", |_| {});
+    provider.add_version("pkg-requiring-v5", "1.0.0", |v| {
+        v.peer_dependencies.insert("peer-lib".to_string(), "^5.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("strict-no-version".to_string());
+    manifest.dependencies.insert("pkg-requiring-v5".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions {
+        strict_peer_deps: true,
+        ..Default::default()
+    };
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+    assert!(err.is_peer_conflict());
+    let err_str = err.to_string();
+    assert!(err_str.contains("No version satisfying '^5.0.0'"));
+}
+
+#[test]
+fn test_strict_peer_deps_succeeds_when_peers_are_satisfied() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("core-lib", "1.5.0", |_| {});
+    provider.add_version("plugin-ok", "1.0.0", |v| {
+        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("strict-satisfied".to_string());
+    manifest.dependencies.insert("core-lib".to_string(), "1.5.0".to_string());
+    manifest.dependencies.insert("plugin-ok".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions {
+        strict_peer_deps: true,
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("strict_peer_deps must succeed when peer constraints are satisfied");
+    assert!(graph.nodes.contains_key("node_modules/core-lib"));
+    assert!(graph.nodes.contains_key("node_modules/plugin-ok"));
+}

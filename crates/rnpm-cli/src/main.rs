@@ -267,6 +267,10 @@ pub(crate) enum Commands {
         /// Bypass peer dependency installation conflicts
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
+
+        /// Fail installation if any peer dependencies are missing or invalid
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -491,6 +495,7 @@ where
 
     let unsupported_flags = [
         "--legacy-peer-deps",
+        "--strict-peer-deps",
         "--global",
         "-g",
         "--save-bundle",
@@ -509,11 +514,14 @@ where
             i += 1;
             continue;
         }
-        // --legacy-peer-deps is supported on install, ci, update (and their aliases)
+        // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, update (and their aliases)
         if matches!(
             first.as_str(),
             "install" | "i" | "add" | "isntall" | "ci" | "clean-install" | "ic" | "update" | "up"
-        ) && (arg == "--legacy-peer-deps" || arg.starts_with("--legacy-peer-deps="))
+        ) && (arg == "--legacy-peer-deps"
+            || arg.starts_with("--legacy-peer-deps=")
+            || arg == "--strict-peer-deps"
+            || arg.starts_with("--strict-peer-deps="))
         {
             i += 1;
             continue;
@@ -886,8 +894,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             no_save,
             package_lock_only,
             omit,
-            legacy_peer_deps: _,
-            strict_peer_deps: _,
+            legacy_peer_deps,
+            strict_peer_deps,
         } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
@@ -899,6 +907,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_dev,
                 omit_optional,
                 omit_peer,
+                legacy_peer_deps,
+                strict_peer_deps,
                 save_dev,
                 save_exact,
                 save_prod,
@@ -923,8 +933,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             offline,
             ignore_scripts,
             omit,
-            legacy_peer_deps: _,
-            strict_peer_deps: _,
+            legacy_peer_deps,
+            strict_peer_deps,
             package_lock_only,
         } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
@@ -937,6 +947,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_dev,
                 omit_optional,
                 omit_peer,
+                legacy_peer_deps,
+                strict_peer_deps,
                 package_lock_only,
                 ..Default::default()
             };
@@ -1252,7 +1264,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
             ignore_scripts,
-            legacy_peer_deps: _,
+            legacy_peer_deps,
+            strict_peer_deps,
         } => {
             let options = InstallOptions {
                 project_dir: current_dir,
@@ -1260,6 +1273,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
+                legacy_peer_deps,
+                strict_peer_deps,
                 ..Default::default()
             };
 

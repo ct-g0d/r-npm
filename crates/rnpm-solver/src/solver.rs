@@ -24,6 +24,8 @@ pub struct ResolverOptions {
     pub legacy_peer_deps: bool,
     /// When true, unresolved or conflicting peer dependencies cause an ERESOLVE error.
     pub strict_peers: bool,
+    /// When true, fail immediately with npm-compatible ERESOLVE error on any peer dependency conflict/mismatch.
+    pub strict_peer_deps: bool,
     /// Optional lockfile v3 to enable fast-path resolution when matching package.json specs.
     pub lockfile: Option<std::sync::Arc<rnpm_lockfile::LockfileV3>>,
 }
@@ -35,8 +37,17 @@ impl Default for ResolverOptions {
             dev: true,
             legacy_peer_deps: false,
             strict_peers: true,
+            strict_peer_deps: false,
             lockfile: None,
         }
+    }
+}
+
+impl ResolverOptions {
+    /// Returns true if peer conflicts or mismatches should fail with an ERESOLVE error.
+    #[inline]
+    pub fn is_strict_peers(&self) -> bool {
+        !self.legacy_peer_deps && (self.strict_peers || self.strict_peer_deps)
     }
 }
 
@@ -95,6 +106,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         dep_type: DependencyType,
         ancestors: std::sync::Arc<Vec<String>>,
     ) {
+        if self.options.legacy_peer_deps
+            && (dep_type == DependencyType::Peer || dep_type == DependencyType::PeerOptional)
+        {
+            return;
+        }
         if dep_type == DependencyType::Peer || dep_type == DependencyType::PeerOptional {
             self.peer_ctx.enter(&parent_package_name, &install_name);
         }
@@ -230,6 +246,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn process_task(&mut self, task: ResolveTask) -> Result<(), SolverError> {
+        if self.options.legacy_peer_deps
+            && (task.dep_type == DependencyType::Peer || task.dep_type == DependencyType::PeerOptional)
+        {
+            return Ok(());
+        }
+
         // 1. Apply overrides without allocations if no rules exist
         let effective_spec = if self.overrides.rules.is_empty() {
             task.raw_spec.clone()
@@ -318,7 +340,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 ) {
                     if !crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         if task.dep_type == DependencyType::Peer {
-                            if self.options.strict_peers {
+                            if self.options.is_strict_peers() {
                                 return Err(SolverError::peer_conflict(
                                     &task.parent_package_name,
                                     &dep_spec.package_name,
@@ -381,7 +403,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         });
                         return Ok(());
                     } else if task.dep_type == DependencyType::Peer {
-                        if self.options.strict_peers {
+                        if self.options.is_strict_peers() {
                             return Err(SolverError::peer_conflict(
                                 &task.parent_package_name,
                                 &dep_spec.package_name,
@@ -435,7 +457,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 return Ok(());
             }
             if task.dep_type == DependencyType::Peer {
-                if !self.options.strict_peers {
+                if !self.options.is_strict_peers() {
                     warn!(
                         "Unresolved peer dependency '{}@{}' (non-strict mode), skipping",
                         dep_spec.package_name, effective_spec
@@ -475,7 +497,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 return Ok(());
             }
             if task.dep_type == DependencyType::Peer {
-                if !self.options.strict_peers {
+                if !self.options.is_strict_peers() {
                     warn!(
                         "Unresolved peer dependency '{}@{}' (non-strict mode), skipping",
                         dep_spec.package_name, effective_spec
@@ -925,7 +947,7 @@ fn validate_fast_path_dep(
             return true;
         }
         if dep_type == DependencyType::Peer {
-            return !options.strict_peers;
+            return !options.is_strict_peers();
         }
         // Required dependency missing in lockfile -> drift!
         return false;
@@ -978,7 +1000,7 @@ fn validate_fast_path_dep(
 
     if !crate::hoisting::node_satisfies_target(target_node, &parsed_spec.target) {
         if dep_type == DependencyType::Peer {
-            return !options.strict_peers;
+            return !options.is_strict_peers();
         }
         return false;
     }

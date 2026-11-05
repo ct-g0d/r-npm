@@ -354,6 +354,8 @@ pub struct InstallOptions {
     pub omit_dev: bool,
     pub omit_optional: bool,
     pub omit_peer: bool,
+    pub legacy_peer_deps: bool,
+    pub strict_peer_deps: bool,
 }
 
 impl Default for InstallOptions {
@@ -375,6 +377,8 @@ impl Default for InstallOptions {
             omit_dev: false,
             omit_optional: false,
             omit_peer: false,
+            legacy_peer_deps: false,
+            strict_peer_deps: false,
         }
     }
 }
@@ -736,12 +740,6 @@ impl Installer {
                 member.manifest.optional_dependencies.clear();
             }
         }
-        if self.options.omit_peer {
-            manifest.peer_dependencies.clear();
-            for member in &mut workspace_members {
-                member.manifest.peer_dependencies.clear();
-            }
-        }
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             Some(WorkspaceDependencyGraph::construct(&workspace_members)
@@ -780,8 +778,9 @@ impl Installer {
         let resolver_options = ResolverOptions {
             platform: Platform::current(),
             dev: !self.options.omit_dev,
-            legacy_peer_deps: self.options.omit_peer,
-            strict_peers: !self.options.omit_peer,
+            legacy_peer_deps: self.options.legacy_peer_deps,
+            strict_peers: !self.options.legacy_peer_deps,
+            strict_peer_deps: self.options.strict_peer_deps,
             lockfile: existing_lockfile,
         };
 
@@ -1735,7 +1734,7 @@ impl Installer {
                     }
                 }
             }
-            if self.options.omit_peer {
+            if self.options.omit_peer || self.options.legacy_peer_deps {
                 if is_peer {
                     continue;
                 }

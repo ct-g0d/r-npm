@@ -326,3 +326,49 @@ fn test_additional_aliases_and_flag_routing() {
         assert!(stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"), "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}", flag_args);
     }
 }
+
+#[test]
+fn test_cli_peer_dependency_flags_and_resolution() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    // 1. Verify --legacy-peer-deps and --strict-peer-deps appear in help for install, ci, and update
+    for cmd in ["install", "ci", "update"] {
+        let output = Command::new(rnpm_bin)
+            .arg(cmd)
+            .arg("--help")
+            .output()
+            .expect("Failed to run rnpm help");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--legacy-peer-deps"), "{cmd} --help must contain --legacy-peer-deps");
+        assert!(stdout.contains("--strict-peer-deps"), "{cmd} --help must contain --strict-peer-deps");
+    }
+
+    // 2. Verify flags are supported on install, ci, update and rejected on audit
+    for cmd in ["install", "ci", "update", "i", "clean-install", "up"] {
+        for flag in ["--legacy-peer-deps", "--strict-peer-deps"] {
+            let output = Command::new(rnpm_bin)
+                .args([cmd, flag, "--help"])
+                .output()
+                .expect("Failed to run command");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("ERR_UNSUPPORTED_FLAG"),
+                "Flag {flag} on {cmd} must not be gated as ERR_UNSUPPORTED_FLAG"
+            );
+        }
+    }
+
+    for flag in ["--legacy-peer-deps", "--strict-peer-deps"] {
+        let output = Command::new(rnpm_bin)
+            .args(["audit", flag])
+            .output()
+            .expect("Failed to run command");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"),
+            "Flag {flag} on audit must be gated as ERR_UNSUPPORTED_FLAG, got: {stderr}"
+        );
+    }
+}
