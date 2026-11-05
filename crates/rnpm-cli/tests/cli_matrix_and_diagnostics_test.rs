@@ -36,7 +36,7 @@ fn test_deferred_commands_cli_execution_matrix() {
         ("view", vec!["view", "lodash"]),
         ("info", vec!["info", "react"]),
         ("v", vec!["v", "express"]),
-        ("publish", vec!["publish"]),
+        ("show", vec!["show", "lodash"]),
     ];
 
     for (cmd_name, args) in cases {

@@ -59,6 +59,8 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "E401" => "E401",
                 "E403" => "E403",
                 "E429" => "E429",
+                "EPUBLISHCONFLICT" => "EPUBLISHCONFLICT",
+                "ENEEDAUTH" => "ENEEDAUTH",
                 "EINTEGRITY" => "EINTEGRITY",
                 "ELOCKFILE_DRIFT" => "ELOCKFILE_DRIFT",
                 "EUNSUPPORTEDPROTOCOL" => "EUNSUPPORTEDPROTOCOL",
@@ -137,17 +139,31 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     format!("No matching version found for {package}@{version}"),
                 );
             }
-            RegistryError::Unauthorized { message, status, url } => {
+            RegistryError::Unauthorized { message, status: _, url } => {
                 return Diagnostic::new(
-                    "E401",
-                    format!("Authentication failed for {url} (HTTP {status}): {message}"),
-                );
+                    "ENEEDAUTH",
+                    format!("This command requires you to be logged in to {url}"),
+                )
+                .with_detail(if message.is_empty() {
+                    "You need to authorize this machine using `npm adduser` or `npm login`".to_string()
+                } else {
+                    format!("{message}\nYou need to authorize this machine using `npm adduser` or `npm login`")
+                });
             }
-            RegistryError::Forbidden { message, status, url } => {
+            RegistryError::Forbidden { message, status: _, url } => {
                 return Diagnostic::new(
                     "E403",
-                    format!("Access forbidden for {url} (HTTP {status}): {message}"),
+                    format!("403 Forbidden - {url}: {message}"),
                 );
+            }
+            RegistryError::PublishConflict { message, status: _, url: _ } => {
+                let msg = if message.is_empty() || message.to_ascii_lowercase().contains("cannot publish over existing") {
+                    "Cannot publish over existing version.".to_string()
+                } else {
+                    message.clone()
+                };
+                return Diagnostic::new("EPUBLISHCONFLICT", msg)
+                    .with_detail("Update the version in package.json before publishing.");
             }
             RegistryError::RateLimited { .. } => {
                 return Diagnostic::new(

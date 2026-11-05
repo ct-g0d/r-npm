@@ -352,11 +352,113 @@ pub(crate) enum Commands {
         args: Vec<String>,
     },
 
-    /// Publish a package to the registry (deferred command)
+    /// Publish a package to the registry
     Publish {
-        /// Additional arguments passed to publish
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Target package directory or spec (defaults to current directory)
+        #[arg(default_value = ".")]
+        target: PathBuf,
+
+        /// Tag to publish to (defaults to 'latest')
+        #[arg(long, default_value = "latest")]
+        tag: String,
+
+        /// Package access: public or restricted
+        #[arg(long)]
+        access: Option<String>,
+
+        /// Perform all pack and verification steps without uploading to registry
+        #[arg(long)]
+        dry_run: bool,
+
+        /// One-time password for two-factor authentication
+        #[arg(long)]
+        otp: Option<String>,
+
+        /// Generate and include provenance attestations
+        #[arg(long)]
+        provenance: bool,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Output JSON summary
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Display npm username for the active registry
+    Whoami {
+        /// Custom registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ping the registry and report response time
+    Ping {
+        /// Custom registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Log in to a registry
+    #[command(alias = "adduser")]
+    Login {
+        /// Custom registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Auth type
+        #[arg(long)]
+        auth_type: Option<String>,
+    },
+
+    /// Log out of a registry
+    Logout {
+        /// Custom registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Scope to log out from
+        #[arg(long)]
+        scope: Option<String>,
+    },
+
+    /// Manage registry authentication tokens
+    Token {
+        #[command(subcommand)]
+        action: Option<TokenAction>,
+
+        /// Custom registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TokenAction {
+    /// List active authentication tokens
+    List,
+    /// Revoke an authentication token
+    #[command(alias = "delete")]
+    Revoke {
+        token_id: String,
     },
 }
 
@@ -419,11 +521,10 @@ where
     let first = &args[1];
 
     let unsupported_commands = [
-        "publish", "login", "adduser", "logout", "token", "team",
-        "fix", "outdated", "deprecate",
+        "team", "fix", "outdated", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
         "view", "info", "v", "show", "search", "stars", "star", "unstar",
-        "ping", "whoami", "version", "init", "create",
+        "version", "init", "create",
         "list", "ls", "la", "ll",
     ];
 
@@ -858,6 +959,492 @@ async fn execute_run(
                     message: format!("Lifecycle script '{}' failed with exit code: {}", script, code),
                 }));
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_publish_lifecycle_hook(
+    package_dir: &std::path::Path,
+    manifest: &Manifest,
+    hook_name: &str,
+    ignore_scripts: bool,
+) -> anyhow::Result<()> {
+    if ignore_scripts {
+        return Ok(());
+    }
+
+    if let Some(script_cmd) = manifest.scripts.get(hook_name) {
+        let pkg_name = manifest.name.clone().unwrap_or_else(|| "package".to_string());
+        let mut ctx = LifecycleContext::new(package_dir, package_dir, &pkg_name, hook_name, script_cmd);
+        ctx.package_version = manifest.version.clone();
+        let status = execute_lifecycle_script(&ctx)?;
+        if !status.success() {
+            let code = rnpm_lifecycle::extract_exit_status_code(&status);
+            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                exit_code: code,
+                message: format!("Lifecycle script '{}' failed with exit code: {}", hook_name, code),
+            }));
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_publish(
+    current_dir: PathBuf,
+    target: PathBuf,
+    tag: String,
+    access: Option<String>,
+    dry_run: bool,
+    otp: Option<String>,
+    provenance: bool,
+    registry: Option<String>,
+    ignore_scripts: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let package_dir = if target.is_absolute() {
+        target
+    } else {
+        current_dir.join(target)
+    };
+
+    let manifest_path = package_dir.join("package.json");
+    if !manifest_path.exists() {
+        return Err(anyhow::anyhow!(
+            "npm error code ENOENT\nnpm error package.json not found in {}",
+            package_dir.display()
+        ));
+    }
+
+    let manifest_content = std::fs::read_to_string(&manifest_path)?;
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content)
+        .map_err(|e| anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}"))?;
+
+    if manifest_json.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(anyhow::anyhow!(
+            "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
+        ));
+    }
+
+    let manifest = Manifest::from_file(&manifest_path)?;
+    let pkg_name = manifest.name.clone().ok_or_else(|| {
+        anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field")
+    })?;
+    let pkg_version = manifest.version.clone().ok_or_else(|| {
+        anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field")
+    })?;
+
+    if let Some(ref acc) = access {
+        if acc != "public" && acc != "restricted" {
+            return Err(anyhow::anyhow!(
+                "npm error code EUSAGE\nnpm error Invalid access type: '{}'. Valid options are 'public' or 'restricted'.",
+                acc
+            ));
+        }
+    }
+
+    if provenance {
+        let is_ci = std::env::var("CI").is_ok()
+            || std::env::var("GITHUB_ACTIONS").is_ok()
+            || std::env::var("GITLAB_CI").is_ok()
+            || std::env::var("CIRCLECI").is_ok()
+            || std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").is_ok();
+        if !is_ci && !dry_run {
+            return Err(anyhow::anyhow!(
+                "npm error code EUSAGE\nnpm error --provenance can only be used from a supported CI/CD environment (such as GitHub Actions or GitLab CI)"
+            ));
+        }
+    }
+
+    // 1. prepublishOnly
+    run_publish_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts).await?;
+
+    // 2. prepack
+    run_publish_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts).await?;
+
+    let updated_manifest = Manifest::from_file(&manifest_path).unwrap_or_else(|_| manifest.clone());
+    let updated_manifest_content = std::fs::read_to_string(&manifest_path).unwrap_or_else(|_| manifest_content.clone());
+    let updated_manifest_json: serde_json::Value = serde_json::from_str(&updated_manifest_content).unwrap_or_else(|_| manifest_json.clone());
+
+    // 3. Packaging into memory using canonical rnpm-fs tarball pack logic
+    let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
+        Ok(res) => res,
+        Err(e) => {
+            return Err(anyhow::anyhow!("npm error pack failed: {e}"));
+        }
+    };
+
+    // 4. postpack
+    run_publish_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts).await?;
+
+    if dry_run {
+        if json {
+            let json_output = serde_json::json!({
+                "id": format!("{}@{}", summary.name, summary.version),
+                "name": summary.name,
+                "version": summary.version,
+                "size": summary.package_size,
+                "unpackedSize": summary.unpacked_size,
+                "shasum": summary.shasum,
+                "integrity": summary.integrity,
+                "filename": summary.filename,
+                "files": summary.files.iter().map(|f| serde_json::json!({
+                    "path": f.path,
+                    "size": f.size,
+                    "mode": f.mode,
+                })).collect::<Vec<_>>(),
+                "entryCount": summary.entry_count,
+                "bundled": summary.bundled,
+                "tag": tag,
+                "access": access.as_deref().or_else(|| {
+                    updated_manifest_json.get("publishConfig")
+                        .and_then(|c| c.get("access"))
+                        .and_then(|a| a.as_str())
+                }),
+                "dryRun": true,
+            });
+            println!("{}", serde_json::to_string_pretty(&json_output)?);
+        } else {
+            print_pack_notices(&summary);
+            if provenance {
+                eprintln!("npm notice provenance would be generated and verified in CI environment");
+            }
+            println!("+ {}@{}", summary.name, summary.version);
+        }
+        return Ok(());
+    }
+
+    // 5. publish
+    run_publish_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts).await?;
+
+    let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else if let Some(pub_reg) = updated_manifest_json.get("publishConfig").and_then(|c| c.get("registry")).and_then(|r| r.as_str()) {
+        Url::parse(pub_reg).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid publishConfig registry URL '{pub_reg}': {e}"))?
+    } else {
+        config.npmrc.registry_for_package(&pkg_name).clone()
+    };
+
+    let effective_access = access.as_deref().or_else(|| {
+        updated_manifest_json.get("publishConfig")
+            .and_then(|c| c.get("access"))
+            .and_then(|a| a.as_str())
+    });
+
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        ..Default::default()
+    };
+    if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+        client_config.auth_token = Some(token.to_string());
+    }
+
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+
+    let tarball_data = rnpm_registry::PublishTarballData {
+        filename: &summary.filename,
+        bytes: &tarball_bytes,
+        shasum: &summary.shasum,
+        integrity: &summary.integrity,
+    };
+
+    let desc = updated_manifest_json.get("description").and_then(|d| d.as_str());
+
+    let payload_opts = rnpm_registry::PublishPayloadOptions {
+        name: &pkg_name,
+        version: &pkg_version,
+        description: desc,
+        tag: &tag,
+        access: effective_access,
+        manifest: &updated_manifest_json,
+        tarball: tarball_data,
+        registry_url: &registry_url,
+        provenance_attestation: None,
+    };
+
+    let payload = rnpm_registry::create_publish_payload(&payload_opts);
+
+    // Send HTTP PUT request to registry
+    client.publish_to(&registry_url, &pkg_name, &payload, otp.as_deref()).await?;
+
+    if json {
+        let json_output = serde_json::json!({
+            "id": format!("{}@{}", summary.name, summary.version),
+            "name": summary.name,
+            "version": summary.version,
+            "size": summary.package_size,
+            "unpackedSize": summary.unpacked_size,
+            "shasum": summary.shasum,
+            "integrity": summary.integrity,
+            "filename": summary.filename,
+            "files": summary.files.iter().map(|f| serde_json::json!({
+                "path": f.path,
+                "size": f.size,
+                "mode": f.mode,
+            })).collect::<Vec<_>>(),
+            "entryCount": summary.entry_count,
+            "bundled": summary.bundled,
+            "tag": tag,
+            "access": effective_access,
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else {
+        print_pack_notices(&summary);
+        if provenance {
+            eprintln!("npm notice published with provenance attestations");
+        }
+        println!("+ {}@{}", summary.name, summary.version);
+    }
+
+    // 6. postpublish
+    run_publish_lifecycle_hook(&package_dir, &updated_manifest, "postpublish", ignore_scripts).await?;
+
+    Ok(())
+}
+
+async fn execute_whoami(
+    current_dir: &std::path::Path,
+    registry: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else {
+        config.npmrc.registry.clone()
+    };
+
+    let token = config.npmrc.get_auth_token(&registry_url);
+    if token.is_none() {
+        return Err(anyhow::anyhow!(
+            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
+        ));
+    }
+
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        ..Default::default()
+    };
+    if let Some(tok) = token {
+        client_config.auth_token = Some(tok.to_string());
+    }
+
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+    let username = client.whoami(Some(&registry_url)).await?;
+
+    if json {
+        println!("{}", serde_json::to_string(&username)?);
+    } else {
+        println!("{username}");
+    }
+
+    Ok(())
+}
+
+async fn execute_ping(
+    current_dir: &std::path::Path,
+    registry: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else {
+        config.npmrc.registry.clone()
+    };
+
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        ..Default::default()
+    };
+    if let Some(tok) = config.npmrc.get_auth_token(&registry_url) {
+        client_config.auth_token = Some(tok.to_string());
+    }
+
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+    let duration = client.ping(Some(&registry_url)).await?;
+
+    if json {
+        let json_out = serde_json::json!({
+            "registry": registry_url.to_string(),
+            "time": duration.as_millis(),
+            "details": {}
+        });
+        println!("{}", serde_json::to_string_pretty(&json_out)?);
+    } else {
+        eprintln!("npm notice PING {registry_url}");
+        eprintln!("npm notice PONG {}ms", duration.as_millis());
+    }
+
+    Ok(())
+}
+
+async fn execute_login(
+    current_dir: &std::path::Path,
+    registry: Option<String>,
+    auth_type: Option<String>,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else {
+        config.npmrc.registry.clone()
+    };
+
+    let host = registry_url.host_str().unwrap_or("registry.npmjs.org");
+    let auth_str = auth_type.unwrap_or_else(|| "web".to_string());
+
+    println!("rnpm: To log in to '{registry_url}' (auth-type: {auth_str}):");
+    println!("  1. Generate an authentication token in your npm/registry user account settings.");
+    println!("  2. Add the token to your .npmrc file:");
+    println!("     //{host}/:_authToken=<your_token>");
+    println!("  3. Alternatively, export the NPM_TOKEN environment variable in your terminal session.");
+
+    Ok(())
+}
+
+async fn execute_logout(
+    current_dir: &std::path::Path,
+    registry: Option<String>,
+    scope: Option<String>,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else if let Some(ref sc) = scope {
+        let sc_norm = if sc.starts_with('@') { sc.clone() } else { format!("@{sc}") };
+        config.npmrc.scoped_registries.get(&sc_norm.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| config.npmrc.registry.clone())
+    } else {
+        config.npmrc.registry.clone()
+    };
+
+    let user_home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok();
+    let mut modified = false;
+
+    if let Some(home) = user_home {
+        let user_npmrc = PathBuf::from(home).join(".npmrc");
+        if user_npmrc.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&user_npmrc) {
+                let host = registry_url.host_str().unwrap_or("");
+                let mut new_lines = Vec::new();
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !host.is_empty() && trimmed.contains(host) && trimmed.contains(":_authToken") {
+                        modified = true;
+                        continue;
+                    }
+                    new_lines.push(line);
+                }
+                if modified {
+                    let _ = std::fs::write(&user_npmrc, new_lines.join("\n"));
+                }
+            }
+        }
+    }
+
+    let local_npmrc = current_dir.join(".npmrc");
+    if local_npmrc.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&local_npmrc) {
+            let host = registry_url.host_str().unwrap_or("");
+            let mut new_lines = Vec::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !host.is_empty() && trimmed.contains(host) && trimmed.contains(":_authToken") {
+                    modified = true;
+                    continue;
+                }
+                new_lines.push(line);
+            }
+            if modified {
+                let _ = std::fs::write(&local_npmrc, new_lines.join("\n"));
+            }
+        }
+    }
+
+    if modified {
+        println!("rnpm: successfully logged out of {registry_url}");
+    } else {
+        println!("rnpm: logged out of {registry_url} (no active session token found)");
+    }
+
+    Ok(())
+}
+
+async fn execute_token(
+    current_dir: &std::path::Path,
+    action: Option<TokenAction>,
+    registry: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"))?
+    } else {
+        config.npmrc.registry.clone()
+    };
+
+    let token = config.npmrc.get_auth_token(&registry_url);
+    if token.is_none() {
+        return Err(anyhow::anyhow!(
+            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
+        ));
+    }
+
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        ..Default::default()
+    };
+    if let Some(tok) = token {
+        client_config.auth_token = Some(tok.to_string());
+    }
+
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+
+    match action.unwrap_or(TokenAction::List) {
+        TokenAction::List => {
+            match client.token_list(Some(&registry_url)).await {
+                Ok(val) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&val)?);
+                    } else if let Some(tokens) = val.get("objects").and_then(|o| o.as_array()) {
+                        println!("id\ttoken\tcreated\tread-only\tCIDR whitelist");
+                        for t in tokens {
+                            let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let tok = t.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                            let created = t.get("created").and_then(|v| v.as_str()).unwrap_or("");
+                            let ro = t.get("readonly").and_then(|v| v.as_bool()).unwrap_or(false);
+                            println!("{id}\t{tok}…\t{created}\t{ro}");
+                        }
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&val)?);
+                    }
+                }
+                Err(e) => {
+                    if json {
+                        println!("{}", serde_json::json!({ "error": e.to_string() }));
+                    } else {
+                        eprintln!("npm notice Token management API not available or returned: {e}");
+                        eprintln!("npm notice Please manage security tokens via the web dashboard at {registry_url}");
+                    }
+                }
+            }
+        }
+        TokenAction::Revoke { token_id } => {
+            client.token_revoke(Some(&registry_url), &token_id).await?;
+            println!("rnpm: successfully revoked token {token_id}");
         }
     }
 
@@ -1449,12 +2036,44 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                  npm error See docs/compatibility-contract.md for the active compatibility surface."
             ));
         }
-        Commands::Publish { .. } => {
-            return Err(anyhow::anyhow!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command 'publish' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface."
-            ));
+        Commands::Publish {
+            target,
+            tag,
+            access,
+            dry_run,
+            otp,
+            provenance,
+            registry,
+            ignore_scripts,
+            json,
+        } => {
+            execute_publish(
+                current_dir,
+                target,
+                tag,
+                access,
+                dry_run,
+                otp,
+                provenance,
+                registry,
+                ignore_scripts,
+                json,
+            ).await?;
+        }
+        Commands::Whoami { registry, json } => {
+            execute_whoami(&current_dir, registry, json).await?;
+        }
+        Commands::Ping { registry, json } => {
+            execute_ping(&current_dir, registry, json).await?;
+        }
+        Commands::Login { registry, auth_type } => {
+            execute_login(&current_dir, registry, auth_type).await?;
+        }
+        Commands::Logout { registry, scope } => {
+            execute_logout(&current_dir, registry, scope).await?;
+        }
+        Commands::Token { action, registry, json } => {
+            execute_token(&current_dir, action, registry, json).await?;
         }
     }
 

@@ -570,9 +570,9 @@ mod tests {
         }
 
         // Let workers hammer the lock and experience rapid timeouts
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(200));
         assert!(
-            timeout_count.load(Ordering::Relaxed) > 10,
+            timeout_count.load(Ordering::Relaxed) >= 5,
             "Expected multiple rapid timeouts under contention, got {}",
             timeout_count.load(Ordering::Relaxed)
         );

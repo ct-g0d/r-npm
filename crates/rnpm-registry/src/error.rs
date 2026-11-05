@@ -31,6 +31,13 @@ pub enum RegistryError {
         message: String,
     },
 
+    #[error("Cannot publish over existing package version for {url} (HTTP {status}): {message}")]
+    PublishConflict {
+        url: String,
+        status: u16,
+        message: String,
+    },
+
     #[error("Registry rate limit exceeded (HTTP 429)")]
     RateLimited { retry_after: Option<u64> },
 
@@ -98,6 +105,7 @@ impl RegistryError {
             Self::PackageNotFound { status, .. } => Some(*status),
             Self::Unauthorized { status, .. } => Some(*status),
             Self::Forbidden { status, .. } => Some(*status),
+            Self::PublishConflict { status, .. } => Some(*status),
             Self::RateLimited { .. } => Some(429),
             Self::ServerError { status, .. } => Some(*status),
             Self::Http(e) => e.status().map(|s| s.as_u16()),
@@ -237,6 +245,7 @@ impl RegistryError {
             Self::VersionNotFound { .. } => false,
             Self::Unauthorized { .. } => false,
             Self::Forbidden { .. } => false,
+            Self::PublishConflict { .. } => false,
             Self::CircuitBreakerOpen { .. } => false,
             Self::ProvenanceVerificationFailed(_) => false,
             Self::AttestationDigestMismatch { .. } => false,

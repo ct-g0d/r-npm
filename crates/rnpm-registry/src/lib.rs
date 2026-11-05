@@ -10,6 +10,7 @@ pub mod client;
 pub mod error;
 pub mod metadata;
 pub mod provenance;
+pub mod publish;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 pub use client::{
@@ -22,6 +23,9 @@ pub use error::RegistryError;
 pub use metadata::{
     AbbreviatedPackageMetadata, AbbreviatedVersion, AttestationProvenance, DistAttestations,
     DistInfo, DistSignature, PackageBin,
+};
+pub use publish::{
+    create_publish_payload, PublishAttachment, PublishPayloadOptions, PublishTarballData,
 };
 pub use provenance::{
     format_registry_signature_payload, normalize_repository_url, validate_dist_signatures,

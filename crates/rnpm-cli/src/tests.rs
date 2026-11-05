@@ -147,7 +147,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_commands_gate_e_diagnostics() {
-        let commands = ["publish", "login", "fix", "token", "deprecate"];
+        let commands = ["team", "fix", "deprecate", "doctor", "fund"];
         for cmd in commands {
             let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
             assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
@@ -158,9 +158,15 @@ use tokio::net::TcpListener;
             assert!(msg.contains("docs/compatibility-contract.md"));
         }
 
-        // Verify exec and npx are recognized and not blocked as unsupported commands
+        // Verify exec, npx, publish, whoami, ping, login, logout, token are recognized and not blocked as unsupported commands
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "exec"]).is_none());
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "npx"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "publish"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "whoami"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "ping"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "login"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "logout"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "token"]).is_none());
     }
 
     #[test]
@@ -998,13 +1004,6 @@ use tokio::net::TcpListener;
         let res = run_cli(view_cli, dir.clone()).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
-
-        let publish_cli = Cli {
-            command: Commands::Publish { args: vec![] },
-        };
-        let res = run_cli(publish_cli, dir).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("ERR_UNSUPPORTED_COMMAND"));
     }
 
     #[test]
@@ -1401,4 +1400,141 @@ use tokio::net::TcpListener;
             config.registry_for_package("express").as_str(),
             "https://registry.npmjs.org/"
         );
+    }
+
+    #[test]
+    fn test_cli_parse_publish_flags() {
+        let parsed = Cli::try_parse_from([
+            "rnpm", "publish",
+            "--tag", "beta",
+            "--access", "restricted",
+            "--dry-run",
+            "--otp", "123456",
+            "--provenance",
+            "--registry", "https://custom-registry.org/",
+            "--ignore-scripts",
+            "--json",
+        ]).unwrap();
+
+        match parsed.command {
+            Commands::Publish {
+                tag,
+                access,
+                dry_run,
+                otp,
+                provenance,
+                registry,
+                ignore_scripts,
+                json,
+                ..
+            } => {
+                assert_eq!(tag, "beta");
+                assert_eq!(access, Some("restricted".to_string()));
+                assert!(dry_run);
+                assert_eq!(otp, Some("123456".to_string()));
+                assert!(provenance);
+                assert_eq!(registry, Some("https://custom-registry.org/".to_string()));
+                assert!(ignore_scripts);
+                assert!(json);
+            }
+            _ => panic!("Expected Commands::Publish"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_whoami_ping_login_logout_token() {
+        // whoami
+        let parsed_whoami = Cli::try_parse_from(["rnpm", "whoami", "--registry", "https://reg.org/", "--json"]).unwrap();
+        match parsed_whoami.command {
+            Commands::Whoami { registry, json } => {
+                assert_eq!(registry, Some("https://reg.org/".to_string()));
+                assert!(json);
+            }
+            _ => panic!("Expected Commands::Whoami"),
+        }
+
+        // ping
+        let parsed_ping = Cli::try_parse_from(["rnpm", "ping", "--registry", "https://reg.org/"]).unwrap();
+        match parsed_ping.command {
+            Commands::Ping { registry, json } => {
+                assert_eq!(registry, Some("https://reg.org/".to_string()));
+                assert!(!json);
+            }
+            _ => panic!("Expected Commands::Ping"),
+        }
+
+        // login / adduser alias
+        let parsed_login = Cli::try_parse_from(["rnpm", "login", "--registry", "https://reg.org/", "--auth-type", "web"]).unwrap();
+        match parsed_login.command {
+            Commands::Login { registry, auth_type } => {
+                assert_eq!(registry, Some("https://reg.org/".to_string()));
+                assert_eq!(auth_type, Some("web".to_string()));
+            }
+            _ => panic!("Expected Commands::Login"),
+        }
+        let parsed_adduser = Cli::try_parse_from(["rnpm", "adduser"]).unwrap();
+        match parsed_adduser.command {
+            Commands::Login { .. } => {}
+            _ => panic!("Expected Commands::Login via adduser"),
+        }
+
+        // logout
+        let parsed_logout = Cli::try_parse_from(["rnpm", "logout", "--scope", "@mycorp"]).unwrap();
+        match parsed_logout.command {
+            Commands::Logout { scope, .. } => {
+                assert_eq!(scope, Some("@mycorp".to_string()));
+            }
+            _ => panic!("Expected Commands::Logout"),
+        }
+
+        // token list & token revoke
+        let parsed_token_list = Cli::try_parse_from(["rnpm", "token", "list"]).unwrap();
+        match parsed_token_list.command {
+            Commands::Token { action: Some(TokenAction::List), .. } => {}
+            _ => panic!("Expected Commands::Token List"),
+        }
+
+        let parsed_token_revoke = Cli::try_parse_from(["rnpm", "token", "revoke", "tok_xyz"]).unwrap();
+        match parsed_token_revoke.command {
+            Commands::Token { action: Some(TokenAction::Revoke { token_id }), .. } => {
+                assert_eq!(token_id, "tok_xyz");
+            }
+            _ => panic!("Expected Commands::Token Revoke"),
+        }
+    }
+
+    #[test]
+    fn test_diagnostics_classification_publish_codes() {
+        use crate::diagnostics::classify_error;
+        use rnpm_registry::RegistryError;
+
+        // 409 Conflict -> EPUBLISHCONFLICT
+        let conflict_err = anyhow::Error::from(RegistryError::PublishConflict {
+            url: "https://registry.npmjs.org/my-pkg".to_string(),
+            status: 409,
+            message: "cannot publish over existing version".to_string(),
+        });
+        let diag1 = classify_error(&conflict_err);
+        assert_eq!(diag1.code, "EPUBLISHCONFLICT");
+        assert!(diag1.message.contains("Cannot publish over existing version."));
+
+        // 401 Unauthorized -> ENEEDAUTH
+        let unauth_err = anyhow::Error::from(RegistryError::Unauthorized {
+            url: "https://registry.npmjs.org/-/whoami".to_string(),
+            status: 401,
+            message: "login required".to_string(),
+        });
+        let diag2 = classify_error(&unauth_err);
+        assert_eq!(diag2.code, "ENEEDAUTH");
+        assert!(diag2.message.contains("This command requires you to be logged in to"));
+
+        // 403 Forbidden -> E403
+        let forbid_err = anyhow::Error::from(RegistryError::Forbidden {
+            url: "https://registry.npmjs.org/my-pkg".to_string(),
+            status: 403,
+            message: "permission denied".to_string(),
+        });
+        let diag3 = classify_error(&forbid_err);
+        assert_eq!(diag3.code, "E403");
+        assert!(diag3.message.contains("403 Forbidden"));
     }
