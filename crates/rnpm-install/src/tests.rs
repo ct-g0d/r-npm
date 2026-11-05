@@ -2367,3 +2367,141 @@ async fn test_install_save_flags_and_package_lock_only_matrix() {
     }
 }
 
+#[tokio::test]
+async fn test_link_and_unlink_package_flow() {
+    use crate::link::{link_package, link_package_from_global, unlink_package, unlink_package_from_consumer};
+    use rnpm_config::{find_global_bin_dir, find_global_node_modules};
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let global_prefix = root.join("global");
+    fs::create_dir_all(&global_prefix).unwrap();
+
+    // 1. Create a package to link
+    let pkg_dir = root.join("tools").join("my-linked-tool");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    let manifest_content = r#"{
+        "name": "my-linked-tool",
+        "version": "1.0.0",
+        "bin": {
+            "my-linked-tool": "./bin/cli.js"
+        }
+    }"#;
+    fs::write(pkg_dir.join("package.json"), manifest_content).unwrap();
+    let bin_dir = pkg_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(bin_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('linked');\n").unwrap();
+
+    // 2. Run link_package (npm link in package dir)
+    let global_link_path = link_package(&pkg_dir, &global_prefix).unwrap();
+    assert!(global_link_path.exists());
+    assert!(rnpm_fs::is_junction(&global_link_path).unwrap());
+
+    let global_bin = find_global_bin_dir(&global_prefix);
+    #[cfg(windows)]
+    assert!(global_bin.join("my-linked-tool.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(global_bin.join("my-linked-tool").exists());
+
+    // 3. Create consumer project
+    let consumer_dir = root.join("consumer");
+    fs::create_dir_all(&consumer_dir).unwrap();
+    fs::write(
+        consumer_dir.join("package.json"),
+        r#"{"name": "consumer", "version": "1.0.0"}"#,
+    ).unwrap();
+
+    // 4. Run link_package_from_global (npm link my-linked-tool in consumer)
+    let consumer_link_path = link_package_from_global(&consumer_dir, "my-linked-tool", &global_prefix).unwrap();
+    assert!(consumer_link_path.exists());
+    assert!(rnpm_fs::is_junction(&consumer_link_path).unwrap());
+
+    let local_bin = consumer_dir.join("node_modules").join(".bin");
+    #[cfg(windows)]
+    assert!(local_bin.join("my-linked-tool.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(local_bin.join("my-linked-tool").exists());
+
+    // 5. Test consumer unlink (npm unlink my-linked-tool in consumer)
+    unlink_package_from_consumer(&consumer_dir, "my-linked-tool").unwrap();
+    assert!(!consumer_dir.join("node_modules").join("my-linked-tool").exists());
+    #[cfg(windows)]
+    assert!(!local_bin.join("my-linked-tool.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(!local_bin.join("my-linked-tool").exists());
+
+    // 6. Test global unlink (npm unlink in linked package dir)
+    unlink_package(&pkg_dir, &global_prefix).unwrap();
+    let global_nm = find_global_node_modules(&global_prefix);
+    assert!(!global_nm.join("my-linked-tool").exists());
+    #[cfg(windows)]
+    assert!(!global_bin.join("my-linked-tool.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(!global_bin.join("my-linked-tool").exists());
+}
+
+#[tokio::test]
+async fn test_global_install_and_uninstall_mode() {
+    use rnpm_config::{find_global_bin_dir, find_global_node_modules};
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let global_prefix = root.join("global-env");
+    fs::create_dir_all(&global_prefix).unwrap();
+
+    // 1. Create a local package
+    let pkg_dir = root.join("my-global-pkg");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(
+        pkg_dir.join("package.json"),
+        r#"{
+            "name": "my-global-pkg",
+            "version": "1.0.0",
+            "bin": {
+                "my-global-bin": "./cli.js"
+            }
+        }"#,
+    ).unwrap();
+    fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('global');\n").unwrap();
+
+    let target_spec = format!("my-global-pkg@file:{}", pkg_dir.display());
+
+    // 2. Global install
+    let options = InstallOptions {
+        project_dir: global_prefix.clone(),
+        packages: vec![target_spec],
+        is_global: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    let global_nm = find_global_node_modules(&global_prefix);
+    let installed_pkg = global_nm.join("my-global-pkg");
+    assert!(installed_pkg.exists());
+
+    let global_bin = find_global_bin_dir(&global_prefix);
+    #[cfg(windows)]
+    assert!(global_bin.join("my-global-bin.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(global_bin.join("my-global-bin").exists());
+
+    // 3. Global uninstall
+    let uninstall_opts = UninstallOptions {
+        packages: vec!["my-global-pkg".to_string()],
+        is_global: true,
+        ..Default::default()
+    };
+    let un_summary = installer.uninstall(&uninstall_opts).unwrap();
+    assert_eq!(un_summary.removed_packages.len(), 1);
+
+    assert!(!installed_pkg.exists());
+    #[cfg(windows)]
+    assert!(!global_bin.join("my-global-bin.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(!global_bin.join("my-global-bin").exists());
+}
+

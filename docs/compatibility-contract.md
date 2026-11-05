@@ -13,13 +13,19 @@
 ## 2. Command Surface & Scope Boundaries
 
 ### Active Command Matrix & Aliases
-- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3. Supports `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`.
+- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3. Supports `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`, `--global` (`-g`).
 - `ci` / `clean-install` (aliases: `clean-install`, `ic`): Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination (`ELOCKFILE_DRIFT`) and zero network/filesystem side effects.
 - `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls. Supports `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
 - `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance.
 - `pack`: Package project files into a canonical npm-compatible `.tgz` archive. Supports `--dry-run`, `--json`, and `--pack-destination`.
-- `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile. Supports `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`).
+- `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile. Supports `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`), `--global` (`-g`).
 - `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies and update package.json/lockfile.
+- `config` (alias: `c`): Configuration management: `set <key> <value> [--global]`, `get <key>`, `delete <key> [--global]`, `list [--json]`.
+- `link` (alias: `ln`): Global package linking (`npm link` creates a global link and bin shims in global prefix; `npm link <pkg>` links from global prefix into local project).
+- `unlink`: Unlink global package entry (`npm unlink`) or local consumer reference (`npm unlink <pkg>`).
+- `prefix`: Print local project prefix directory or global prefix (`--global`, `-g`).
+- `root`: Print local or global `node_modules` directory (`--global`, `-g`).
+- `bin`: Print local executable bin folder (`node_modules/.bin`) or global bin directory (`--global`, `-g`).
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
 
@@ -40,7 +46,7 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--save-bundle`, `--production`) terminate immediately with exit code `1` and a structured diagnostic:
+Flags not supported or outside the scope of `rnpm` (e.g., `--save-bundle`, `--production` on non-prune commands) terminate immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_FLAG
 npm error The flag '<flag>' is not supported by rnpm.

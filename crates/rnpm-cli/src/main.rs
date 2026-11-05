@@ -78,6 +78,10 @@ pub(crate) enum Commands {
         /// Do not write or mutate package.json
         #[arg(long = "no-save")]
         no_save: bool,
+
+        /// Install into global prefix
+        #[arg(short = 'g', long = "global")]
+        global: bool,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -240,6 +244,10 @@ pub(crate) enum Commands {
         /// Remove only from regular dependencies
         #[arg(short = 'P', long = "save-prod", alias = "save")]
         save_prod: bool,
+
+        /// Remove from global prefix
+        #[arg(short = 'g', long = "global")]
+        global: bool,
     },
 
     /// Update packages
@@ -357,6 +365,88 @@ pub(crate) enum Commands {
         /// Additional arguments passed to publish
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Manage npm configuration
+    #[command(alias = "c")]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
+    /// Link a package folder locally or globally
+    #[command(alias = "ln")]
+    Link {
+        /// Package name to link from global prefix into local node_modules
+        package: Option<String>,
+    },
+
+    /// Unlink a package locally or globally
+    Unlink {
+        /// Package name to unlink from local node_modules
+        package: Option<String>,
+    },
+
+    /// Display npm prefix
+    Prefix {
+        /// Display global prefix
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+    },
+
+    /// Display npm root (node_modules directory)
+    Root {
+        /// Display global node_modules
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+    },
+
+    /// Display npm bin directory
+    Bin {
+        /// Display global bin directory
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigAction {
+    /// Set a configuration key to a value
+    Set {
+        /// Configuration key to set
+        key: String,
+        /// Value to assign
+        value: String,
+        /// Set in global configuration
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
+    /// Retrieve a configuration key value
+    Get {
+        /// Configuration key to retrieve
+        key: String,
+    },
+    /// Delete a configuration key
+    #[command(alias = "rm", alias = "del")]
+    Delete {
+        /// Configuration key to delete
+        key: String,
+        /// Delete from global configuration
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
+    /// List configuration settings
+    #[command(alias = "ls")]
+    List {
+        /// Output configuration in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -491,8 +581,6 @@ where
 
     let unsupported_flags = [
         "--legacy-peer-deps",
-        "--global",
-        "-g",
         "--save-bundle",
         "--production",
     ];
@@ -872,7 +960,6 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
     match cli.command {
         Commands::Install {
-
             packages,
             registry,
             cache,
@@ -888,10 +975,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             omit,
             legacy_peer_deps: _,
             strict_peer_deps: _,
+            global,
         } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
+            let target_dir = if global {
+                rnpm_config::find_global_prefix()
+            } else {
+                current_dir
+            };
             let options = InstallOptions {
-                project_dir: current_dir,
+                project_dir: target_dir,
+                is_global: global,
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
@@ -1227,9 +1321,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_dev,
             save_optional,
             save_prod,
+            global,
         } => {
+            let target_dir = if global {
+                rnpm_config::find_global_prefix()
+            } else {
+                current_dir
+            };
             let options = InstallOptions {
-                project_dir: current_dir,
+                project_dir: target_dir,
+                is_global: global,
                 ..Default::default()
             };
             let installer = Installer::new(options)?;
@@ -1238,6 +1339,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_dev,
                 save_optional,
                 save_prod,
+                is_global: global,
             };
             let summary = installer.uninstall(&uninstall_options)?;
             println!(
@@ -1455,6 +1557,117 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                  npm error The command 'publish' is not currently implemented in rnpm.\n\
                  npm error See docs/compatibility-contract.md for the active compatibility surface."
             ));
+        }
+        Commands::Config { action } => {
+            match action {
+                ConfigAction::Set { key, value, global, location } => {
+                    let target_path = if global || location.as_deref() == Some("global") {
+                        rnpm_config::find_global_npmrc().unwrap_or_else(|| {
+                            rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
+                        })
+                    } else if location.as_deref() == Some("project") {
+                        current_dir.join(".npmrc")
+                    } else if location.as_deref() == Some("user") {
+                        rnpm_config::get_default_user_npmrc()
+                    } else if current_dir.join(".npmrc").exists() {
+                        current_dir.join(".npmrc")
+                    } else {
+                        rnpm_config::get_default_user_npmrc()
+                    };
+
+                    rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
+                }
+                ConfigAction::Get { key } => {
+                    let config = rnpm_config::Config::load(Some(&current_dir))?;
+                    if let Some(val) = config.get(&key) {
+                        println!("{val}");
+                    } else {
+                        println!("undefined");
+                    }
+                }
+                ConfigAction::Delete { key, global, location } => {
+                    let target_path = if global || location.as_deref() == Some("global") {
+                        rnpm_config::find_global_npmrc().unwrap_or_else(|| {
+                            rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
+                        })
+                    } else if location.as_deref() == Some("project") {
+                        current_dir.join(".npmrc")
+                    } else if location.as_deref() == Some("user") {
+                        rnpm_config::get_default_user_npmrc()
+                    } else if current_dir.join(".npmrc").exists() {
+                        current_dir.join(".npmrc")
+                    } else {
+                        rnpm_config::get_default_user_npmrc()
+                    };
+
+                    let _ = rnpm_config::delete_config_value_from_file(&target_path, &key)?;
+                }
+                ConfigAction::List { json } => {
+                    let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
+                    let detailed = rnpm_config::Config::load_detailed(opts)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&detailed.effective)?);
+                    } else {
+                        print!("{}", detailed.format_text());
+                    }
+                }
+            }
+        }
+        Commands::Link { package } => {
+            let global_prefix = rnpm_config::find_global_prefix();
+            match package {
+                None => {
+                    let target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
+                    println!("{} -> {}", target_link.display(), current_dir.display());
+                }
+                Some(pkg) => {
+                    let target_link = rnpm_install::link_package_from_global(&current_dir, &pkg, &global_prefix)?;
+                    let global_nm = rnpm_config::find_global_node_modules(&global_prefix);
+                    println!("{} -> {}", target_link.display(), global_nm.join(&pkg).display());
+                }
+            }
+        }
+        Commands::Unlink { package } => {
+            let global_prefix = rnpm_config::find_global_prefix();
+            match package {
+                None => {
+                    if let Some(target) = rnpm_install::unlink_package(&current_dir, &global_prefix)? {
+                        println!("unlinked {}", target.display());
+                    }
+                }
+                Some(pkg) => {
+                    if let Some(target) = rnpm_install::unlink_package_from_consumer(&current_dir, &pkg)? {
+                        println!("unlinked {}", target.display());
+                    }
+                }
+            }
+        }
+        Commands::Prefix { global } => {
+            if global {
+                let p = rnpm_config::find_global_prefix();
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_prefix(&current_dir);
+                println!("{}", p.display());
+            }
+        }
+        Commands::Root { global } => {
+            if global {
+                let p = rnpm_config::find_global_node_modules(&rnpm_config::find_global_prefix());
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_node_modules(&current_dir);
+                println!("{}", p.display());
+            }
+        }
+        Commands::Bin { global } => {
+            if global {
+                let p = rnpm_config::find_global_bin_dir(&rnpm_config::find_global_prefix());
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_bin_dir(&current_dir);
+                println!("{}", p.display());
+            }
         }
     }
 

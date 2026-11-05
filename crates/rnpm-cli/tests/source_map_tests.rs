@@ -44,7 +44,7 @@ fn test_source_map_01_cli_dispatch() {
     assert!(stderr.contains("ERR_UNSUPPORTED_COMMAND"));
 
     // Test unsupported flag
-    let out = Command::new(rnpm_bin).args(["install", "--global"]).output().unwrap();
+    let out = Command::new(rnpm_bin).args(["install", "--save-bundle"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ERR_UNSUPPORTED_FLAG"));
