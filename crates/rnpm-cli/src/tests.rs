@@ -130,6 +130,7 @@ use tokio::net::TcpListener;
                 cache: Some(cache_dir.path().to_path_buf()),
                 offline: false,
                 ignore_scripts: true,
+                legacy_peer_deps: false,
             },
         };
 
@@ -164,7 +165,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_flags_gate_e_diagnostics() {
-        let flags = ["--legacy-peer-deps", "--global", "-g"];
+        let flags = ["--global", "-g"];
         for flag in flags {
             let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
             assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
@@ -173,6 +174,11 @@ use tokio::net::TcpListener;
             assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
             assert!(msg.contains(&format!("The flag '{flag}' is not supported by rnpm.")));
         }
+
+        // --legacy-peer-deps is supported on install, but unsupported on commands like audit/pack
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none());
+        let res = check_unsupported_cli_invocation(vec!["rnpm", "audit", "--legacy-peer-deps"]);
+        assert!(res.is_some());
     }
 
     #[test]
@@ -748,7 +754,6 @@ use tokio::net::TcpListener;
     #[tokio::test]
     async fn test_cli_unsupported_flags_filtering() {
         let test_flags = [
-            "--legacy-peer-deps",
             "--global",
             "-g",
             "--save-bundle",
@@ -774,6 +779,11 @@ use tokio::net::TcpListener;
             assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", &format!("--omit={omit_val}")]).is_none());
             assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--omit", omit_val]).is_none());
         }
+
+        // --legacy-peer-deps is supported on install, ci, and update
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--legacy-peer-deps"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "update", "--legacy-peer-deps"]).is_none());
 
         // Pass-through for run and exec
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "run", "build", "--", "-g"]).is_none());
@@ -838,6 +848,8 @@ use tokio::net::TcpListener;
                 cache: None,
                 offline: true,
                 ignore_scripts: true,
+                legacy_peer_deps: false,
+                strict_peer_deps: false,
                 omit: vec![],
                 save_dev: false,
                 save_exact: false,
@@ -1155,3 +1167,238 @@ use tokio::net::TcpListener;
         assert!(err_str.contains("package.json not found"), "Got: {err_str}");
     }
 
+    #[test]
+    fn test_cli_parse_legacy_peer_deps() {
+        // install command parses --legacy-peer-deps
+        let parsed = Cli::try_parse_from(["rnpm", "install", "--legacy-peer-deps"]).unwrap();
+        match parsed.command {
+            Commands::Install { legacy_peer_deps, .. } => assert!(legacy_peer_deps),
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // ci command parses --legacy-peer-deps
+        let parsed_ci = Cli::try_parse_from(["rnpm", "ci", "--legacy-peer-deps"]).unwrap();
+        match parsed_ci.command {
+            Commands::Ci { legacy_peer_deps, .. } => assert!(legacy_peer_deps),
+            _ => panic!("Expected Commands::Ci"),
+        }
+
+        // update command parses --legacy-peer-deps
+        let parsed_up = Cli::try_parse_from(["rnpm", "update", "--legacy-peer-deps"]).unwrap();
+        match parsed_up.command {
+            Commands::Update { legacy_peer_deps, .. } => assert!(legacy_peer_deps),
+            _ => panic!("Expected Commands::Update"),
+        }
+
+        // default is false
+        let parsed_def = Cli::try_parse_from(["rnpm", "install"]).unwrap();
+        match parsed_def.command {
+            Commands::Install { legacy_peer_deps, .. } => assert!(!legacy_peer_deps),
+            _ => panic!("Expected Commands::Install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_strict_peer_deps() {
+        // install command parses --strict-peer-deps
+        let parsed = Cli::try_parse_from(["rnpm", "install", "--strict-peer-deps"]).unwrap();
+        match parsed.command {
+            Commands::Install { strict_peer_deps, .. } => assert!(strict_peer_deps),
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // ci command parses --strict-peer-deps
+        let parsed_ci = Cli::try_parse_from(["rnpm", "ci", "--strict-peer-deps"]).unwrap();
+        match parsed_ci.command {
+            Commands::Ci { strict_peer_deps, .. } => assert!(strict_peer_deps),
+            _ => panic!("Expected Commands::Ci"),
+        }
+
+        // default is false
+        let parsed_def = Cli::try_parse_from(["rnpm", "install"]).unwrap();
+        match parsed_def.command {
+            Commands::Install { strict_peer_deps, .. } => assert!(!strict_peer_deps),
+            _ => panic!("Expected Commands::Install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_package_lock_only() {
+        // install parses --package-lock-only
+        let parsed = Cli::try_parse_from(["rnpm", "install", "--package-lock-only"]).unwrap();
+        match parsed.command {
+            Commands::Install { package_lock_only, .. } => assert!(package_lock_only),
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // ci parses --package-lock-only
+        let parsed_ci = Cli::try_parse_from(["rnpm", "ci", "--package-lock-only"]).unwrap();
+        match parsed_ci.command {
+            Commands::Ci { package_lock_only, .. } => assert!(package_lock_only),
+            _ => panic!("Expected Commands::Ci"),
+        }
+
+        // default is false
+        let parsed_def = Cli::try_parse_from(["rnpm", "install"]).unwrap();
+        match parsed_def.command {
+            Commands::Install { package_lock_only, .. } => assert!(!package_lock_only),
+            _ => panic!("Expected Commands::Install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_omit_edge_cases() {
+        // Comma-separated: --omit=dev,optional
+        let parsed = Cli::try_parse_from(["rnpm", "install", "--omit=dev,optional"]).unwrap();
+        match parsed.command {
+            Commands::Install { omit, .. } => {
+                let (d, o, p) = parse_omit_options(&omit);
+                assert!(d, "dev omitted");
+                assert!(o, "optional omitted");
+                assert!(!p, "peer not omitted");
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Comma-separated space: --omit dev,peer
+        let parsed_space = Cli::try_parse_from(["rnpm", "install", "--omit", "dev,peer"]).unwrap();
+        match parsed_space.command {
+            Commands::Install { omit, .. } => {
+                let (d, o, p) = parse_omit_options(&omit);
+                assert!(d, "dev omitted");
+                assert!(!o, "optional not omitted");
+                assert!(p, "peer omitted");
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Multiple flags: --omit dev --omit optional
+        let parsed_multi = Cli::try_parse_from(["rnpm", "install", "--omit", "dev", "--omit", "optional"]).unwrap();
+        match parsed_multi.command {
+            Commands::Install { omit, .. } => {
+                let (d, o, p) = parse_omit_options(&omit);
+                assert!(d, "dev omitted");
+                assert!(o, "optional omitted");
+                assert!(!p, "peer not omitted");
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Aliases: development, optional, peer
+        let parsed_alias = Cli::try_parse_from(["rnpm", "ci", "--omit", "development"]).unwrap();
+        match parsed_alias.command {
+            Commands::Ci { omit, .. } => {
+                let (d, o, p) = parse_omit_options(&omit);
+                assert!(d, "development alias sets omit_dev");
+                assert!(!o);
+                assert!(!p);
+            }
+            _ => panic!("Expected Commands::Ci"),
+        }
+
+        // Direct parse_omit_options alias checks
+        assert_eq!(parse_omit_options(&["dev".to_string()]), (true, false, false));
+        assert_eq!(parse_omit_options(&["development".to_string()]), (true, false, false));
+        assert_eq!(parse_omit_options(&["optional".to_string()]), (false, true, false));
+        assert_eq!(parse_omit_options(&["peer".to_string()]), (false, false, true));
+        assert_eq!(parse_omit_options(&["dev".to_string(), "optional".to_string()]), (true, true, false));
+        assert_eq!(parse_omit_options(&["development,peer".to_string()]), (true, false, true));
+
+        // Prune --production and -p aliases for --omit=dev
+        let parsed_prod = Cli::try_parse_from(["rnpm", "prune", "--production"]).unwrap();
+        match parsed_prod.command {
+            Commands::Prune { production, omit, .. } => {
+                assert!(production);
+                let (mut d, _, _) = parse_omit_options(&omit);
+                if production { d = true; }
+                assert!(d, "--production sets omit_dev");
+            }
+            _ => panic!("Expected Commands::Prune"),
+        }
+
+        let parsed_p = Cli::try_parse_from(["rnpm", "prune", "-p"]).unwrap();
+        match parsed_p.command {
+            Commands::Prune { production, omit, .. } => {
+                assert!(production);
+                let (mut d, _, _) = parse_omit_options(&omit);
+                if production { d = true; }
+                assert!(d, "-p sets omit_dev");
+            }
+            _ => panic!("Expected Commands::Prune"),
+        }
+    }
+
+    #[test]
+    fn test_cli_scoped_registry_resolution() {
+        // 1. Parsing scoped registry CLI argument (--@scope:registry=https://...)
+        let res1 = parse_scoped_registry_arg("--@myorg:registry=https://npm.myorg.internal");
+        assert!(res1.is_some());
+        let (scope1, url1) = res1.unwrap();
+        assert_eq!(scope1, "@myorg");
+        assert_eq!(url1.as_str(), "https://npm.myorg.internal/");
+
+        // 2. Parsing scoped registry without leading dashes (@scope:registry=https://...)
+        let res2 = parse_scoped_registry_arg("@corp:registry=https://npm.corp.com/");
+        assert!(res2.is_some());
+        let (scope2, url2) = res2.unwrap();
+        assert_eq!(scope2, "@corp");
+        assert_eq!(url2.as_str(), "https://npm.corp.com/");
+
+        // 3. Extracting scoped registries from CLI argument list
+        let raw_args = vec![
+            "rnpm".to_string(),
+            "install".to_string(),
+            "@myorg/pkg".to_string(),
+            "--@myorg:registry=https://npm.myorg.internal".to_string(),
+            "--@corp:registry".to_string(),
+            "https://npm.corp.com".to_string(),
+            "--save-exact".to_string(),
+        ];
+        let (filtered, scoped_regs) = extract_scoped_registries(raw_args);
+        assert_eq!(
+            filtered,
+            vec!["rnpm", "install", "@myorg/pkg", "--save-exact"]
+        );
+        assert_eq!(scoped_regs.len(), 2);
+        assert_eq!(
+            scoped_regs.get("@myorg").unwrap().as_str(),
+            "https://npm.myorg.internal/"
+        );
+        assert_eq!(
+            scoped_regs.get("@corp").unwrap().as_str(),
+            "https://npm.corp.com/"
+        );
+
+        // 4. Resolving packages to scoped vs default registry
+        let default_reg = Url::parse("https://registry.npmjs.org/").unwrap();
+
+        // Scoped package with matching scope -> custom registry URL
+        let myorg_url = resolve_registry_for_package("@myorg/pkg", &default_reg, &scoped_regs);
+        assert_eq!(myorg_url.as_str(), "https://npm.myorg.internal/");
+
+        // Encoded scope (@myorg%2fpkg) -> custom registry URL
+        let encoded_url = resolve_registry_for_package("@myorg%2fpkg", &default_reg, &scoped_regs);
+        assert_eq!(encoded_url.as_str(), "https://npm.myorg.internal/");
+
+        // Scoped package without configured custom registry -> fallback to default
+        let other_url = resolve_registry_for_package("@unconfigured/pkg", &default_reg, &scoped_regs);
+        assert_eq!(other_url.as_str(), "https://registry.npmjs.org/");
+
+        // Unscoped package -> fallback to default
+        let unscoped_url = resolve_registry_for_package("lodash", &default_reg, &scoped_regs);
+        assert_eq!(unscoped_url.as_str(), "https://registry.npmjs.org/");
+
+        // 5. Integration with rnpm_config::Config
+        let mut config = rnpm_config::Config::new();
+        config
+            .apply_scoped_registry("--@myorg:registry=https://npm.myorg.internal", None)
+            .unwrap();
+        assert_eq!(
+            config.registry_for_package("@myorg/client").as_str(),
+            "https://npm.myorg.internal/"
+        );
+        assert_eq!(
+            config.registry_for_package("express").as_str(),
+            "https://registry.npmjs.org/"
+        );
+    }

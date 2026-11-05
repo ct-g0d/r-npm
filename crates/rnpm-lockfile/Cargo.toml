@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "rnpm-lockfile"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,7 @@ rnpm-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

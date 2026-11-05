@@ -1,21 +1,27 @@
-//! Lockfile parsing, generation, migration, and deterministic serialization for rnpm.
+﻿//! Lockfile parsing, generation, migration, and deterministic serialization for rnpm.
 //!
 //! Implements npm lockfile version 3 model with deterministic sorted keys,
 //! POSIX forward-slash path keys, flag preservation (dev, optional, inBundle, hasInstallScript),
 //! and full migration support for legacy lockfile v1 and v2 formats.
 
 pub mod error;
+pub mod integrity;
 pub mod migration;
 pub mod model;
 
 pub use error::LockfileError;
+pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrityChecker};
 pub use migration::{load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency};
 pub use model::{LockfilePackage, LockfileV3, PackageBin};
+pub use rnpm_core::manifest::BundledDependencies;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    const VALID_SHA512: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    const VALID_SHA1: &str = "sha1-AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
     #[test]
     fn test_lockfile_v3_deterministic_serialization() {
@@ -424,5 +430,800 @@ mod tests {
         let p2 = parsed.packages.get("node_modules/peer-opt-pkg").unwrap();
         assert_eq!(p2.peer, Some(true));
         assert_eq!(p2.peer_optional, Some(true));
+    }
+
+    #[test]
+    fn test_integrity_checker_clean_lockfile() {
+        let mut lockfile = LockfileV3::new("my-clean-app", Some("1.0.0".to_string()));
+        if let Some(root) = lockfile.root_package_mut() {
+            let mut deps = BTreeMap::new();
+            deps.insert("chalk".to_string(), "^5.0.0".to_string());
+            root.dependencies = Some(deps);
+        }
+
+        let chalk_pkg = LockfilePackage {
+            version: Some("5.3.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/chalk", chalk_pkg);
+
+        let policy = IntegrityPolicy::default();
+        let checker = LockfileIntegrityChecker::new(policy);
+        assert!(checker.verify(&lockfile).is_ok());
+    }
+
+    #[test]
+    fn test_integrity_checker_missing_integrity() {
+        let mut lockfile = LockfileV3::new("missing-integrity-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz".to_string()),
+            integrity: None,
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/foo", pkg);
+
+        let res = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res, Err(LockfileError::MissingIntegrity(ref path)) if path == "node_modules/foo"));
+
+        // Permissive allows missing integrity
+        assert!(verify_lockfile_integrity(&lockfile, &IntegrityPolicy::permissive()).is_ok());
+    }
+
+    #[test]
+    fn test_integrity_checker_weak_integrity_flagged() {
+        let mut lockfile = LockfileV3::new("weak-hash-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/bar/-/bar-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA1.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/bar", pkg);
+
+        let res = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res, Err(LockfileError::WeakIntegrity { ref package, ref algorithm, ref required })
+            if package == "node_modules/bar" && algorithm == "sha1" && required == "sha512"));
+    }
+
+    #[test]
+    fn test_integrity_checker_insecure_http_flagged() {
+        let mut lockfile = LockfileV3::new("insecure-http-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("http://registry.npmjs.org/foo/-/foo-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/foo", pkg);
+
+        let res = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res, Err(LockfileError::InsecureResolvedUrl { ref package, ref url })
+            if package == "node_modules/foo" && url.starts_with("http://")));
+
+        // Allowed when configured
+        let permissive_http = IntegrityPolicy::default().with_allow_insecure_http(true);
+        assert!(verify_lockfile_integrity(&lockfile, &permissive_http).is_ok());
+    }
+
+    #[test]
+    fn test_integrity_checker_poisoned_name_mismatch() {
+        let mut lockfile = LockfileV3::new("poison-name-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/evil-pkg/-/evil-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/legit-pkg", pkg);
+
+        let res = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res, Err(LockfileError::PoisonedDependency { ref package, .. })
+            if package == "node_modules/legit-pkg"));
+    }
+
+    #[test]
+    fn test_integrity_checker_poisoned_version_mismatch() {
+        let mut lockfile = LockfileV3::new("poison-version-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/my-pkg/-/my-pkg-2.5.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/my-pkg", pkg);
+
+        let res = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res, Err(LockfileError::PoisonedDependency { ref package, .. })
+            if package == "node_modules/my-pkg"));
+    }
+
+    #[test]
+    fn test_integrity_checker_poisoned_transitive_git_and_file() {
+        let mut lockfile = LockfileV3::new("poison-transitive-app", Some("1.0.0".to_string()));
+        if let Some(root) = lockfile.root_package_mut() {
+            let mut deps = BTreeMap::new();
+            deps.insert("direct-pkg".to_string(), "^1.0.0".to_string());
+            root.dependencies = Some(deps);
+        }
+
+        // 1. Nested transitive git injection
+        let trans_git = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+https://github.com/attacker/malicious.git".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/direct-pkg/node_modules/trans-git", trans_git);
+
+        let res_git = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res_git, Err(LockfileError::PoisonedDependency { ref package, .. })
+            if package == "node_modules/direct-pkg/node_modules/trans-git"));
+
+        // 2. Nested transitive file injection
+        let mut lockfile2 = LockfileV3::new("poison-file-app", Some("1.0.0".to_string()));
+        let trans_file = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:../../exploit/payload".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile2.insert_package("node_modules/a/node_modules/b", trans_file);
+
+        let res_file = verify_lockfile_integrity(&lockfile2, &IntegrityPolicy::default());
+        assert!(matches!(res_file, Err(LockfileError::PoisonedDependency { ref package, .. })
+            if package == "node_modules/a/node_modules/b"));
+    }
+
+    #[test]
+    fn test_integrity_checker_suspicious_domain_and_spoofing() {
+        let mut lockfile = LockfileV3::new("suspicious-domain-app", Some("1.0.0".to_string()));
+
+        // Raw IP address
+        let ip_pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://192.168.1.100/foo/-/foo-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/foo", ip_pkg);
+
+        let res_ip = verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default());
+        assert!(matches!(res_ip, Err(LockfileError::SuspiciousResolution { ref package, .. })
+            if package == "node_modules/foo"));
+
+        // Userinfo spoofing
+        let mut lockfile_spoof = LockfileV3::new("spoof-app", Some("1.0.0".to_string()));
+        let spoof_pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org@evil-domain.com/bar/-/bar-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile_spoof.insert_package("node_modules/bar", spoof_pkg);
+
+        let res_spoof = verify_lockfile_integrity(&lockfile_spoof, &IntegrityPolicy::default());
+        assert!(matches!(res_spoof, Err(LockfileError::SuspiciousResolution { ref package, .. })
+            if package == "node_modules/bar"));
+
+        // Allowed registries filter
+        let mut lockfile_reg = LockfileV3::new("reg-filter-app", Some("1.0.0".to_string()));
+        let reg_pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://unknown-registry.com/baz/-/baz-1.0.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile_reg.insert_package("node_modules/baz", reg_pkg);
+
+        let policy = IntegrityPolicy::default()
+            .with_allowed_registries(vec!["registry.npmjs.org".to_string()]);
+        let res_reg = verify_lockfile_integrity(&lockfile_reg, &policy);
+        assert!(matches!(res_reg, Err(LockfileError::SuspiciousResolution { ref package, .. })
+            if package == "node_modules/baz"));
+    }
+
+    #[test]
+    fn test_integrity_checker_scoped_package_tarball_matching() {
+        let mut lockfile = LockfileV3::new("scoped-app", Some("1.0.0".to_string()));
+        let pkg = LockfilePackage {
+            name: Some("@babel/core".to_string()),
+            version: Some("7.24.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz".to_string()),
+            integrity: Some(VALID_SHA512.to_string()),
+            ..Default::default()
+        };
+        lockfile.insert_package("node_modules/@babel/core", pkg);
+
+        assert!(verify_lockfile_integrity(&lockfile, &IntegrityPolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn test_exact_v3_flag_combinations_serialization_deserialization() {
+        let mut lockfile = LockfileV3::new("flag-matrix-app", Some("1.0.0".to_string()));
+
+        // 1. dev only
+        lockfile.insert_package("node_modules/pkg-dev", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        });
+
+        // 2. optional only
+        lockfile.insert_package("node_modules/pkg-opt", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            optional: Some(true),
+            ..Default::default()
+        });
+
+        // 3. dev + optional combined -> npm v9/v10 devOptional
+        lockfile.insert_package("node_modules/pkg-dev-opt", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(true),
+            optional: Some(true),
+            ..Default::default()
+        });
+
+        // 4. explicit devOptional
+        lockfile.insert_package("node_modules/pkg-dev-opt-explicit", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev_optional: Some(true),
+            ..Default::default()
+        });
+
+        // 5. peer only
+        lockfile.insert_package("node_modules/pkg-peer", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            peer: Some(true),
+            ..Default::default()
+        });
+
+        // 6. peer + peerOptional
+        lockfile.insert_package("node_modules/pkg-peer-opt", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            peer: Some(true),
+            peer_optional: Some(true),
+            ..Default::default()
+        });
+
+        // 7. inBundle
+        lockfile.insert_package("node_modules/pkg-bundled", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            in_bundle: Some(true),
+            ..Default::default()
+        });
+
+        // 8. hasInstallScript
+        lockfile.insert_package("node_modules/pkg-script", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            has_install_script: Some(true),
+            ..Default::default()
+        });
+
+        // 9. hasShrinkwrap
+        lockfile.insert_package("node_modules/pkg-shrinkwrap", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            has_shrinkwrap: Some(true),
+            ..Default::default()
+        });
+
+        // 10. multi-flag combo: bundled + devOptional + hasInstallScript
+        lockfile.insert_package("node_modules/pkg-multi", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            in_bundle: Some(true),
+            dev: Some(true),
+            optional: Some(true),
+            has_install_script: Some(true),
+            ..Default::default()
+        });
+
+        let json = lockfile.to_json_string().unwrap();
+
+        // Verify exact flag outputs
+        assert!(json.contains("\"node_modules/pkg-dev\": {\n      \"version\": \"1.0.0\",\n      \"dev\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-opt\": {\n      \"version\": \"1.0.0\",\n      \"optional\": true\n    }"));
+
+        // Combined dev + optional must serialize as devOptional: true and omit both dev and optional
+        assert!(json.contains("\"node_modules/pkg-dev-opt\": {\n      \"version\": \"1.0.0\",\n      \"devOptional\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-dev-opt-explicit\": {\n      \"version\": \"1.0.0\",\n      \"devOptional\": true\n    }"));
+
+        assert!(json.contains("\"node_modules/pkg-peer\": {\n      \"version\": \"1.0.0\",\n      \"peer\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-peer-opt\": {\n      \"version\": \"1.0.0\",\n      \"peer\": true,\n      \"peerOptional\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-bundled\": {\n      \"version\": \"1.0.0\",\n      \"inBundle\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-script\": {\n      \"version\": \"1.0.0\",\n      \"hasInstallScript\": true\n    }"));
+        assert!(json.contains("\"node_modules/pkg-shrinkwrap\": {\n      \"version\": \"1.0.0\",\n      \"hasShrinkwrap\": true\n    }"));
+
+        // Multi-flag check
+        let multi_pkg = lockfile.get_package("node_modules/pkg-multi").unwrap();
+        assert!(multi_pkg.is_in_bundle());
+        assert!(multi_pkg.is_dev_optional());
+        assert!(multi_pkg.has_install_script());
+
+        // Round-trip deserialization
+        let parsed = LockfileV3::from_json_str(&json).unwrap();
+        assert_eq!(parsed.packages.get("node_modules/pkg-dev").unwrap().dev, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-opt").unwrap().optional, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-dev-opt").unwrap().dev_optional, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-dev-opt").unwrap().dev, None);
+        assert_eq!(parsed.packages.get("node_modules/pkg-dev-opt").unwrap().optional, None);
+        assert_eq!(parsed.packages.get("node_modules/pkg-peer").unwrap().peer, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-peer-opt").unwrap().peer, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-peer-opt").unwrap().peer_optional, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-bundled").unwrap().in_bundle, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-script").unwrap().has_install_script, Some(true));
+        assert_eq!(parsed.packages.get("node_modules/pkg-shrinkwrap").unwrap().has_shrinkwrap, Some(true));
+        let parsed_multi = parsed.packages.get("node_modules/pkg-multi").unwrap();
+        assert_eq!(parsed_multi.in_bundle, Some(true));
+        assert_eq!(parsed_multi.dev_optional, Some(true));
+        assert_eq!(parsed_multi.has_install_script, Some(true));
+    }
+
+    #[test]
+    fn test_absence_of_false_boolean_fields_and_deterministic_ordering() {
+        let mut lockfile = LockfileV3::new("false-app", Some("1.0.0".to_string()));
+
+        // Set every boolean flag explicitly to Some(false)
+        let false_pkg = LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(false),
+            optional: Some(false),
+            dev_optional: Some(false),
+            peer: Some(false),
+            peer_optional: Some(false),
+            in_bundle: Some(false),
+            has_install_script: Some(false),
+            has_shrinkwrap: Some(false),
+            link: Some(false),
+            ..Default::default()
+        };
+
+        // Insert in arbitrary order
+        lockfile.insert_package("node_modules/zzz", false_pkg.clone());
+        lockfile.insert_package("node_modules/mmm", false_pkg.clone());
+        lockfile.insert_package("node_modules/aaa", false_pkg);
+
+        let json = lockfile.to_json_string().unwrap();
+
+        // Assert that NONE of the false flags appear in JSON
+        assert!(!json.contains("\"dev\": false"));
+        assert!(!json.contains("\"optional\": false"));
+        assert!(!json.contains("\"devOptional\": false"));
+        assert!(!json.contains("\"peer\": false"));
+        assert!(!json.contains("\"peerOptional\": false"));
+        assert!(!json.contains("\"inBundle\": false"));
+        assert!(!json.contains("\"hasInstallScript\": false"));
+        assert!(!json.contains("\"hasShrinkwrap\": false"));
+        assert!(!json.contains("\"link\": false"));
+
+        // Assert deterministic key ordering
+        let pos_root = json.find("\"\"").unwrap();
+        let pos_aaa = json.find("\"node_modules/aaa\"").unwrap();
+        let pos_mmm = json.find("\"node_modules/mmm\"").unwrap();
+        let pos_zzz = json.find("\"node_modules/zzz\"").unwrap();
+
+        assert!(pos_root < pos_aaa);
+        assert!(pos_aaa < pos_mmm);
+        assert!(pos_mmm < pos_zzz);
+
+        // Multiple serialization calls are 100% byte identical
+        let json2 = lockfile.to_json_string().unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn test_v1_migration_with_optional_peer_bundled_flags() {
+        let v1_json = r#"{
+            "name": "v1-edge-cases",
+            "version": "1.0.0",
+            "lockfileVersion": 1,
+            "requires": true,
+            "dependencies": {
+                "opt-dep": {
+                    "version": "1.2.0",
+                    "resolved": "https://registry.npmjs.org/opt-dep/-/opt-dep-1.2.0.tgz",
+                    "integrity": "sha512-opt123",
+                    "optional": true
+                },
+                "peer-dep": {
+                    "version": "2.0.0",
+                    "resolved": "https://registry.npmjs.org/peer-dep/-/peer-dep-2.0.0.tgz",
+                    "integrity": "sha512-peer123",
+                    "peer": true,
+                    "peerOptional": true
+                },
+                "bundled-dep": {
+                    "version": "3.1.0",
+                    "resolved": "https://registry.npmjs.org/bundled-dep/-/bundled-dep-3.1.0.tgz",
+                    "integrity": "sha512-bundle123",
+                    "bundled": true
+                },
+                "dev-opt-dep": {
+                    "version": "4.0.0",
+                    "resolved": "https://registry.npmjs.org/dev-opt-dep/-/dev-opt-dep-4.0.0.tgz",
+                    "integrity": "sha512-devopt123",
+                    "dev": true,
+                    "optional": true,
+                    "hasInstallScript": true
+                },
+                "parent-dev": {
+                    "version": "5.0.0",
+                    "dev": true,
+                    "dependencies": {
+                        "nested-bundled": {
+                            "version": "1.0.0",
+                            "bundled": true
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let migrated = parse_and_migrate(v1_json).unwrap();
+        assert_eq!(migrated.lockfile_version, 3);
+
+        // Check opt-dep
+        let opt = migrated.packages.get("node_modules/opt-dep").unwrap();
+        assert_eq!(opt.optional, Some(true));
+        assert_eq!(opt.dev, None);
+
+        // Check peer-dep
+        let peer = migrated.packages.get("node_modules/peer-dep").unwrap();
+        assert_eq!(peer.peer, Some(true));
+        assert_eq!(peer.peer_optional, Some(true));
+
+        // Check bundled-dep
+        let bundled = migrated.packages.get("node_modules/bundled-dep").unwrap();
+        assert_eq!(bundled.in_bundle, Some(true));
+
+        // Check dev-opt-dep (dev + optional mapped to devOptional)
+        let dev_opt = migrated.packages.get("node_modules/dev-opt-dep").unwrap();
+        assert_eq!(dev_opt.dev_optional, Some(true));
+        assert_eq!(dev_opt.dev, None);
+        assert_eq!(dev_opt.optional, None);
+        assert_eq!(dev_opt.has_install_script, Some(true));
+
+        // Check nested bundled
+        let nested = migrated.packages.get("node_modules/parent-dev/node_modules/nested-bundled").unwrap();
+        assert_eq!(nested.in_bundle, Some(true));
+
+        // Check root package has accurately mapped descriptors
+        let root = migrated.root_package().unwrap();
+        assert!(root.optional_dependencies.as_ref().unwrap().contains_key("opt-dep"));
+        assert!(root.peer_dependencies.as_ref().unwrap().contains_key("peer-dep"));
+        assert!(root.is_peer_dep_optional("peer-dep"));
+        assert!(root.bundled_package_names().contains(&"bundled-dep".to_string()));
+    }
+
+    #[test]
+    fn test_v2_migration_with_optional_peer_bundled_flags() {
+        let v2_json = r#"{
+            "name": "v2-edge-cases",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": {
+                    "name": "v2-edge-cases",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "prod-dep": "^1.0.0"
+                    },
+                    "optionalDependencies": {
+                        "opt-dep": "^2.0.0"
+                    },
+                    "peerDependencies": {
+                        "peer-dep": "^3.0.0"
+                    },
+                    "peerDependenciesMeta": {
+                        "peer-dep": {
+                            "optional": true
+                        }
+                    },
+                    "bundleDependencies": ["bundled-dep"]
+                },
+                "node_modules/prod-dep": {
+                    "version": "1.0.0"
+                },
+                "node_modules/opt-dep": {
+                    "version": "2.0.0",
+                    "optional": true
+                },
+                "node_modules/peer-dep": {
+                    "version": "3.0.0",
+                    "peer": true,
+                    "peerOptional": true
+                },
+                "node_modules/bundled-dep": {
+                    "version": "4.0.0",
+                    "bundled": true
+                },
+                "node_modules/dev-opt-dep": {
+                    "version": "5.0.0",
+                    "dev": true,
+                    "optional": true
+                }
+            },
+            "dependencies": {
+                "prod-dep": {
+                    "version": "1.0.0"
+                },
+                "opt-dep": {
+                    "version": "2.0.0",
+                    "optional": true
+                },
+                "peer-dep": {
+                    "version": "3.0.0",
+                    "peer": true,
+                    "peerOptional": true
+                },
+                "bundled-dep": {
+                    "version": "4.0.0",
+                    "bundled": true
+                },
+                "dev-opt-dep": {
+                    "version": "5.0.0",
+                    "dev": true,
+                    "optional": true
+                }
+            }
+        }"#;
+
+        let migrated = parse_and_migrate(v2_json).unwrap();
+        assert_eq!(migrated.lockfile_version, 3);
+
+        let p_opt = migrated.packages.get("node_modules/opt-dep").unwrap();
+        assert_eq!(p_opt.optional, Some(true));
+
+        let p_peer = migrated.packages.get("node_modules/peer-dep").unwrap();
+        assert_eq!(p_peer.peer, Some(true));
+        assert_eq!(p_peer.peer_optional, Some(true));
+
+        let p_bundled = migrated.packages.get("node_modules/bundled-dep").unwrap();
+        assert_eq!(p_bundled.in_bundle, Some(true));
+
+        let p_dev_opt = migrated.packages.get("node_modules/dev-opt-dep").unwrap();
+        assert_eq!(p_dev_opt.dev_optional, Some(true));
+        assert_eq!(p_dev_opt.dev, None);
+        assert_eq!(p_dev_opt.optional, None);
+
+        // Ensure serialization strips top-level dependencies
+        let serialized = migrated.to_json_string().unwrap();
+        assert!(!serialized.contains("\n  \"dependencies\": {\n    \"prod-dep\":"));
+        assert!(serialized.contains("\"inBundle\": true"));
+        assert!(serialized.contains("\"devOptional\": true"));
+    }
+
+    #[test]
+    fn test_lockfile_package_helper_methods_and_npm_rules() {
+        let mut pkg = LockfilePackage::default();
+
+        // Test set_* and query methods
+        pkg.set_dev(true);
+        assert!(pkg.is_dev());
+        assert!(pkg.is_effective_dev());
+        pkg.set_dev(false);
+        assert!(!pkg.is_dev());
+
+        pkg.set_optional(true);
+        assert!(pkg.is_optional());
+        assert!(pkg.is_effective_optional());
+        pkg.set_optional(false);
+        assert!(!pkg.is_optional());
+
+        // Test set_dependency_types
+        pkg.set_dependency_types(true, true);
+        assert!(pkg.is_dev_optional());
+        assert!(pkg.is_effective_dev());
+        assert!(pkg.is_effective_optional());
+        assert!(!pkg.is_dev());
+        assert!(!pkg.is_optional());
+
+        pkg.set_dependency_types(true, false);
+        assert!(pkg.is_dev());
+        assert!(!pkg.is_optional());
+        assert!(!pkg.is_dev_optional());
+
+        pkg.set_dependency_types(false, true);
+        assert!(!pkg.is_dev());
+        assert!(pkg.is_optional());
+        assert!(!pkg.is_dev_optional());
+
+        // Test peer & peerOptional
+        pkg.set_peer(true);
+        pkg.set_peer_optional(true);
+        assert!(pkg.is_peer());
+        assert!(pkg.is_peer_optional());
+
+        // Test in_bundle
+        pkg.set_in_bundle(true);
+        assert!(pkg.is_in_bundle());
+
+        // Test install scripts & shrinkwrap
+        pkg.set_has_install_script(true);
+        assert!(pkg.has_install_script());
+        pkg.set_has_shrinkwrap(true);
+        assert!(pkg.has_shrinkwrap());
+
+        // Test peerDependenciesMeta helpers
+        let mut root = LockfilePackage::default();
+        assert!(!root.is_peer_dep_optional("react"));
+        root.set_peer_dep_optional("react", true);
+        assert!(root.is_peer_dep_optional("react"));
+        root.set_peer_dep_optional("react", false);
+        assert!(!root.is_peer_dep_optional("react"));
+
+        // Test bundle_dependencies helper
+        let mut b_pkg = LockfilePackage {
+            dependencies: Some({
+                let mut m = BTreeMap::new();
+                m.insert("lib-a".to_string(), "1.0.0".to_string());
+                m.insert("lib-b".to_string(), "1.0.0".to_string());
+                m
+            }),
+            bundle_dependencies: Some(BundledDependencies::Boolean(true)),
+            ..Default::default()
+        };
+        let names = b_pkg.bundled_package_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"lib-a".to_string()));
+        assert!(names.contains(&"lib-b".to_string()));
+
+        b_pkg.bundle_dependencies = Some(BundledDependencies::List(vec!["lib-a".to_string()]));
+        assert_eq!(b_pkg.bundled_package_names(), vec!["lib-a".to_string()]);
+    }
+
+    #[test]
+    fn test_lockfile_v3_helper_methods_and_iterators() {
+        let mut lockfile = LockfileV3::new("helpers-app", Some("1.0.0".to_string()));
+
+        lockfile.insert_package("node_modules/dev-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/opt-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            optional: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/dev-opt-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev_optional: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/peer-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            peer: Some(true),
+            peer_optional: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/bundled-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            in_bundle: Some(true),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/script-pkg", LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            has_install_script: Some(true),
+            ..Default::default()
+        });
+
+        assert_eq!(lockfile.dev_packages().count(), 1);
+        assert_eq!(lockfile.optional_packages().count(), 1);
+        assert_eq!(lockfile.dev_optional_packages().count(), 1);
+        assert_eq!(lockfile.peer_packages().count(), 1);
+        assert_eq!(lockfile.peer_optional_packages().count(), 1);
+        assert_eq!(lockfile.bundled_packages().count(), 1);
+        assert_eq!(lockfile.script_packages().count(), 1);
+
+        // Test populate_package_flags
+        assert!(lockfile.populate_package_flags(
+            "node_modules/script-pkg",
+            Some(true),
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let updated = lockfile.get_package("node_modules/script-pkg").unwrap();
+        assert!(updated.is_dev_optional());
+        assert!(updated.has_install_script());
+    }
+
+    #[test]
+    fn test_matches_manifest_all_dependency_types() {
+        use rnpm_core::manifest::PeerDependencyMeta;
+        use rnpm_core::Manifest;
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some("peer-matches-app".to_string());
+        manifest.version = Some("1.0.0".to_string());
+
+        let mut deps = BTreeMap::new();
+        deps.insert("prod-pkg".to_string(), "^1.0.0".to_string());
+        manifest.dependencies = deps;
+
+        let mut dev_deps = BTreeMap::new();
+        dev_deps.insert("dev-pkg".to_string(), "^2.0.0".to_string());
+        manifest.dev_dependencies = dev_deps;
+
+        let mut opt_deps = BTreeMap::new();
+        opt_deps.insert("opt-pkg".to_string(), "^3.0.0".to_string());
+        manifest.optional_dependencies = opt_deps;
+
+        let mut peer_deps = BTreeMap::new();
+        peer_deps.insert("peer-required".to_string(), "^4.0.0".to_string());
+        peer_deps.insert("peer-optional".to_string(), "^5.0.0".to_string());
+        manifest.peer_dependencies = peer_deps;
+
+        let mut peer_meta = BTreeMap::new();
+        peer_meta.insert("peer-optional".to_string(), PeerDependencyMeta { optional: true });
+        manifest.peer_dependencies_meta = peer_meta;
+
+        manifest.bundled_dependencies = Some(BundledDependencies::List(vec!["bundled-dep".to_string()]));
+
+        // Construct matching LockfileV3 using from_manifest
+        let mut lockfile = LockfileV3::from_manifest(&manifest);
+
+        lockfile.insert_package("node_modules/prod-pkg", LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            ..Default::default()
+        });
+        lockfile.insert_package("node_modules/dev-pkg", LockfilePackage {
+            version: Some("2.1.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        });
+        // Note: opt-pkg is missing from packages, which is permitted for optional dependencies!
+        // peer-optional is missing from packages, which is permitted because it is marked optional in peerDependenciesMeta!
+
+        // peer-required is non-optional peer, so it MUST be present
+        lockfile.insert_package("node_modules/peer-required", LockfilePackage {
+            version: Some("4.2.0".to_string()),
+            peer: Some(true),
+            ..Default::default()
+        });
+
+        // Should match perfectly
+        assert!(lockfile.matches_manifest(&manifest, true));
+
+        // Case 1: Missing non-optional peer dependency must fail
+        let mut lf_missing_peer = lockfile.clone();
+        lf_missing_peer.packages.remove("node_modules/peer-required");
+        assert!(!lf_missing_peer.matches_manifest(&manifest, true), "Must fail if non-optional peer is missing");
+
+        // Case 2: Incompatible version for optional peer must fail if present
+        let mut lf_bad_opt_peer = lockfile.clone();
+        lf_bad_opt_peer.insert_package("node_modules/peer-optional", LockfilePackage {
+            version: Some("4.0.0".to_string()), // violates ^5.0.0
+            peer: Some(true),
+            peer_optional: Some(true),
+            ..Default::default()
+        });
+        assert!(!lf_bad_opt_peer.matches_manifest(&manifest, true), "Must fail if optional peer has unsatisfying version");
+
+        // Case 3: Compatible version for optional peer succeeds
+        let mut lf_good_opt_peer = lockfile.clone();
+        lf_good_opt_peer.insert_package("node_modules/peer-optional", LockfilePackage {
+            version: Some("5.2.0".to_string()),
+            peer: Some(true),
+            peer_optional: Some(true),
+            ..Default::default()
+        });
+        assert!(lf_good_opt_peer.matches_manifest(&manifest, true));
+
+        // Case 4: peerDependenciesMeta mismatch must fail
+        let mut lf_meta_mismatch = lockfile.clone();
+        lf_meta_mismatch.root_package_mut().unwrap().peer_dependencies_meta = None;
+        assert!(!lf_meta_mismatch.matches_manifest(&manifest, true), "Must fail on peerDependenciesMeta drift");
+
+        // Case 5: bundleDependencies mismatch must fail
+        let mut lf_bundle_mismatch = lockfile.clone();
+        lf_bundle_mismatch.root_package_mut().unwrap().bundle_dependencies = None;
+        assert!(!lf_bundle_mismatch.matches_manifest(&manifest, true), "Must fail on bundleDependencies drift");
     }
 }

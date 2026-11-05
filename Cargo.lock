@@ -1140,6 +1140,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "url",
 ]
 
 [[package]]
@@ -1147,11 +1148,13 @@ name = "rnpm-registry"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "data-encoding",
  "flate2",
  "reqwest",
  "rnpm-core",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

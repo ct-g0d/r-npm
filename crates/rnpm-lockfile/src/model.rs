@@ -1,4 +1,5 @@
 use rnpm_core::semver::{Range, Version};
+use rnpm_core::manifest::BundledDependencies;
 use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,21 @@ use crate::error::LockfileError;
 /// Helper function to omit booleans during serialization if false or None.
 fn is_false_or_none(v: &Option<bool>) -> bool {
     v.map(|b| !b).unwrap_or(true)
+}
+
+/// Helper function to omit empty maps or None during serialization.
+fn is_none_or_empty_map<V>(v: &Option<BTreeMap<String, V>>) -> bool {
+    v.as_ref().map(|m| m.is_empty()).unwrap_or(true)
+}
+
+/// Helper function to omit empty bundleDependencies or false during serialization.
+fn is_empty_bundle_deps(v: &Option<BundledDependencies>) -> bool {
+    match v {
+        None => true,
+        Some(BundledDependencies::Boolean(false)) => true,
+        Some(BundledDependencies::List(list)) => list.is_empty(),
+        _ => false,
+    }
 }
 
 /// Package executable configuration: single path or named binaries.
@@ -53,7 +69,7 @@ pub struct LockfilePackage {
     #[serde(rename = "peerOptional", skip_serializing_if = "is_false_or_none", default)]
     pub peer_optional: Option<bool>,
 
-    #[serde(rename = "inBundle", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(rename = "inBundle", alias = "bundled", skip_serializing_if = "is_false_or_none", default)]
     pub in_bundle: Option<bool>,
 
     #[serde(rename = "hasInstallScript", skip_serializing_if = "is_false_or_none", default)]
@@ -80,20 +96,28 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub libc: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
     pub dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "devDependencies", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "devDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
     pub dev_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "peerDependencies", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "peerDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
     pub peer_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "peerDependenciesMeta", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "peerDependenciesMeta", skip_serializing_if = "is_none_or_empty_map", default)]
     pub peer_dependencies_meta: Option<BTreeMap<String, serde_json::Value>>,
 
-    #[serde(rename = "optionalDependencies", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "optionalDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
     pub optional_dependencies: Option<BTreeMap<String, String>>,
+
+    #[serde(
+        rename = "bundleDependencies",
+        alias = "bundledDependencies",
+        skip_serializing_if = "is_empty_bundle_deps",
+        default
+    )]
+    pub bundle_dependencies: Option<BundledDependencies>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspaces: Option<Vec<String>>,
@@ -101,6 +125,253 @@ pub struct LockfilePackage {
     /// Preserved hidden-tree metadata or arbitrary package properties.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl LockfilePackage {
+    /// Returns true if this package is a development dependency (`dev: true`).
+    pub fn is_dev(&self) -> bool {
+        self.dev == Some(true)
+    }
+
+    /// Returns true if this package is an optional dependency (`optional: true`).
+    pub fn is_optional(&self) -> bool {
+        self.optional == Some(true)
+    }
+
+    /// Returns true if this package is both dev and optional (`devOptional: true`).
+    pub fn is_dev_optional(&self) -> bool {
+        self.dev_optional == Some(true)
+    }
+
+    /// Returns true if this package is needed for development (either `dev: true` or `devOptional: true`).
+    pub fn is_effective_dev(&self) -> bool {
+        self.is_dev() || self.is_dev_optional()
+    }
+
+    /// Returns true if this package is optional (either `optional: true` or `devOptional: true`).
+    pub fn is_effective_optional(&self) -> bool {
+        self.is_optional() || self.is_dev_optional()
+    }
+
+    /// Returns true if this package is a peer dependency (`peer: true`).
+    pub fn is_peer(&self) -> bool {
+        self.peer == Some(true)
+    }
+
+    /// Returns true if this package is an optional peer dependency (`peerOptional: true`).
+    pub fn is_peer_optional(&self) -> bool {
+        self.peer_optional == Some(true)
+    }
+
+    /// Returns true if this package is bundled in its parent package (`inBundle: true`).
+    pub fn is_in_bundle(&self) -> bool {
+        self.in_bundle == Some(true)
+    }
+
+    /// Returns true if this package has an install or postinstall lifecycle script (`hasInstallScript: true`).
+    pub fn has_install_script(&self) -> bool {
+        self.has_install_script == Some(true)
+    }
+
+    /// Returns true if this package contains a shrinkwrap file (`hasShrinkwrap: true`).
+    pub fn has_shrinkwrap(&self) -> bool {
+        self.has_shrinkwrap == Some(true)
+    }
+
+    /// Returns true if this package is a symlink or workspace link (`link: true`).
+    pub fn is_link(&self) -> bool {
+        self.link == Some(true)
+    }
+
+    /// Sets the `dev` flag (clearing `false` to `None`).
+    pub fn set_dev(&mut self, val: bool) {
+        self.dev = if val { Some(true) } else { None };
+    }
+
+    pub fn with_dev(mut self, val: bool) -> Self {
+        self.set_dev(val);
+        self
+    }
+
+    /// Sets the `optional` flag (clearing `false` to `None`).
+    pub fn set_optional(&mut self, val: bool) {
+        self.optional = if val { Some(true) } else { None };
+    }
+
+    pub fn with_optional(mut self, val: bool) -> Self {
+        self.set_optional(val);
+        self
+    }
+
+    /// Sets the `devOptional` flag (clearing `false` to `None`).
+    pub fn set_dev_optional(&mut self, val: bool) {
+        self.dev_optional = if val { Some(true) } else { None };
+    }
+
+    pub fn with_dev_optional(mut self, val: bool) -> Self {
+        self.set_dev_optional(val);
+        self
+    }
+
+    /// Sets the `peer` flag (clearing `false` to `None`).
+    pub fn set_peer(&mut self, val: bool) {
+        self.peer = if val { Some(true) } else { None };
+    }
+
+    pub fn with_peer(mut self, val: bool) -> Self {
+        self.set_peer(val);
+        self
+    }
+
+    /// Sets the `peerOptional` flag (clearing `false` to `None`).
+    pub fn set_peer_optional(&mut self, val: bool) {
+        self.peer_optional = if val { Some(true) } else { None };
+    }
+
+    pub fn with_peer_optional(mut self, val: bool) -> Self {
+        self.set_peer_optional(val);
+        self
+    }
+
+    /// Sets the `inBundle` flag (clearing `false` to `None`).
+    pub fn set_in_bundle(&mut self, val: bool) {
+        self.in_bundle = if val { Some(true) } else { None };
+    }
+
+    pub fn with_in_bundle(mut self, val: bool) -> Self {
+        self.set_in_bundle(val);
+        self
+    }
+
+    /// Sets the `hasInstallScript` flag (clearing `false` to `None`).
+    pub fn set_has_install_script(&mut self, val: bool) {
+        self.has_install_script = if val { Some(true) } else { None };
+    }
+
+    pub fn with_has_install_script(mut self, val: bool) -> Self {
+        self.set_has_install_script(val);
+        self
+    }
+
+    /// Sets the `hasShrinkwrap` flag (clearing `false` to `None`).
+    pub fn set_has_shrinkwrap(&mut self, val: bool) {
+        self.has_shrinkwrap = if val { Some(true) } else { None };
+    }
+
+    pub fn with_has_shrinkwrap(mut self, val: bool) -> Self {
+        self.set_has_shrinkwrap(val);
+        self
+    }
+
+    /// Sets the `link` flag (clearing `false` to `None`).
+    pub fn set_link(&mut self, val: bool) {
+        self.link = if val { Some(true) } else { None };
+    }
+
+    pub fn with_link(mut self, val: bool) -> Self {
+        self.set_link(val);
+        self
+    }
+
+    /// Sets npm v9/v10 dependency relationship rules:
+    /// - If both `is_dev` and `is_optional` are true, sets `devOptional: true` and clears `dev` and `optional`.
+    /// - If only `is_dev` is true, sets `dev: true`.
+    /// - If only `is_optional` is true, sets `optional: true`.
+    /// - If neither, clears all three flags.
+    pub fn set_dependency_types(&mut self, is_dev: bool, is_optional: bool) {
+        if is_dev && is_optional {
+            self.dev_optional = Some(true);
+            self.dev = None;
+            self.optional = None;
+        } else if is_dev {
+            self.dev = Some(true);
+            self.dev_optional = None;
+            self.optional = None;
+        } else if is_optional {
+            self.optional = Some(true);
+            self.dev = None;
+            self.dev_optional = None;
+        } else {
+            self.dev = None;
+            self.optional = None;
+            self.dev_optional = None;
+        }
+    }
+
+    /// Normalizes boolean flags to ensure npm v9/v10 lockfile v3 fidelity:
+    /// - `devOptional` is set when both `dev` and `optional` are true, clearing `dev` and `optional`.
+    /// - Any `false` boolean flags are normalized to `None`.
+    pub fn normalize_flags(&mut self) {
+        if self.dev == Some(false) { self.dev = None; }
+        if self.optional == Some(false) { self.optional = None; }
+        if self.dev_optional == Some(false) { self.dev_optional = None; }
+        if self.peer == Some(false) { self.peer = None; }
+        if self.peer_optional == Some(false) { self.peer_optional = None; }
+        if self.in_bundle == Some(false) { self.in_bundle = None; }
+        if self.has_install_script == Some(false) { self.has_install_script = None; }
+        if self.has_shrinkwrap == Some(false) { self.has_shrinkwrap = None; }
+        if self.link == Some(false) { self.link = None; }
+
+        if self.dev_optional == Some(true) {
+            self.dev = None;
+            self.optional = None;
+        } else if self.dev == Some(true) && self.optional == Some(true) {
+            self.dev_optional = Some(true);
+            self.dev = None;
+            self.optional = None;
+        }
+    }
+
+    /// Returns list of package names that are marked as bundled in this package.
+    pub fn bundled_package_names(&self) -> Vec<String> {
+        match &self.bundle_dependencies {
+            None => {
+                if let Some(extra_val) = self.extra.get("bundleDependencies").or_else(|| self.extra.get("bundledDependencies")) {
+                    if let Some(list) = extra_val.as_array() {
+                        return list.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    } else if let Some(b) = extra_val.as_bool() {
+                        if b {
+                            return self.dependencies.as_ref().map(|d| d.keys().cloned().collect()).unwrap_or_default();
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            Some(BundledDependencies::Boolean(true)) => {
+                self.dependencies
+                    .as_ref()
+                    .map(|d| d.keys().cloned().collect())
+                    .unwrap_or_default()
+            }
+            Some(BundledDependencies::Boolean(false)) => Vec::new(),
+            Some(BundledDependencies::List(list)) => list.clone(),
+        }
+    }
+
+    /// Checks if a dependency is marked as an optional peer dependency in `peerDependenciesMeta`.
+    pub fn is_peer_dep_optional(&self, dep_name: &str) -> bool {
+        let Some(meta_map) = &self.peer_dependencies_meta else {
+            return false;
+        };
+        let Some(val) = meta_map.get(dep_name) else {
+            return false;
+        };
+        val.get("optional").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// Sets or unsets `optional: true` for a peer dependency in `peerDependenciesMeta`.
+    pub fn set_peer_dep_optional(&mut self, dep_name: impl Into<String>, optional: bool) {
+        let name = dep_name.into();
+        if optional {
+            let map = self.peer_dependencies_meta.get_or_insert_with(BTreeMap::new);
+            map.insert(name, serde_json::json!({ "optional": true }));
+        } else if let Some(map) = &mut self.peer_dependencies_meta {
+            map.remove(&name);
+            if map.is_empty() {
+                self.peer_dependencies_meta = None;
+            }
+        }
+    }
 }
 
 /// npm `package-lock.json` lockfile version 3 document.
@@ -146,8 +417,9 @@ impl LockfileV3 {
     }
 
     /// Insert a package into the lockfile, normalizing the path to POSIX forward slashes.
-    pub fn insert_package(&mut self, path: &str, package: LockfilePackage) {
+    pub fn insert_package(&mut self, path: &str, mut package: LockfilePackage) {
         let posix_key = to_posix_path(path);
+        package.normalize_flags();
         self.packages.insert(posix_key, package);
     }
 
@@ -171,6 +443,192 @@ impl LockfileV3 {
     /// Access mutable reference to the root package `""`.
     pub fn root_package_mut(&mut self) -> Option<&mut LockfilePackage> {
         self.packages.get_mut("")
+    }
+
+    /// Create a new LockfileV3 populated from a `package.json` Manifest.
+    pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Self {
+        let name_str = manifest.name.clone().unwrap_or_default();
+        let version = manifest.version.clone();
+        let mut packages = BTreeMap::new();
+
+        let peer_meta = if manifest.peer_dependencies_meta.is_empty() {
+            None
+        } else {
+            let mut map = BTreeMap::new();
+            for (k, v) in &manifest.peer_dependencies_meta {
+                if v.optional {
+                    map.insert(k.clone(), serde_json::json!({ "optional": true }));
+                }
+            }
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        };
+
+        packages.insert(
+            "".to_string(),
+            LockfilePackage {
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                dependencies: if manifest.dependencies.is_empty() {
+                    None
+                } else {
+                    Some(manifest.dependencies.clone())
+                },
+                dev_dependencies: if manifest.dev_dependencies.is_empty() {
+                    None
+                } else {
+                    Some(manifest.dev_dependencies.clone())
+                },
+                peer_dependencies: if manifest.peer_dependencies.is_empty() {
+                    None
+                } else {
+                    Some(manifest.peer_dependencies.clone())
+                },
+                peer_dependencies_meta: peer_meta,
+                optional_dependencies: if manifest.optional_dependencies.is_empty() {
+                    None
+                } else {
+                    Some(manifest.optional_dependencies.clone())
+                },
+                bundle_dependencies: manifest.bundled_dependencies.clone(),
+                extra: manifest.extra.clone(),
+                ..Default::default()
+            },
+        );
+
+        Self {
+            name: name_str,
+            version,
+            lockfile_version: 3,
+            requires: Some(true),
+            packages,
+        }
+    }
+
+    /// Synchronize the root package descriptor `""` from a manifest.
+    pub fn sync_root_manifest(&mut self, manifest: &rnpm_core::manifest::Manifest) {
+        if let Some(name) = &manifest.name {
+            self.name = name.clone();
+        }
+        self.version = manifest.version.clone();
+
+        let root = self.packages.entry("".to_string()).or_default();
+        root.name = manifest.name.clone();
+        root.version = manifest.version.clone();
+        root.dependencies = if manifest.dependencies.is_empty() {
+            None
+        } else {
+            Some(manifest.dependencies.clone())
+        };
+        root.dev_dependencies = if manifest.dev_dependencies.is_empty() {
+            None
+        } else {
+            Some(manifest.dev_dependencies.clone())
+        };
+        root.optional_dependencies = if manifest.optional_dependencies.is_empty() {
+            None
+        } else {
+            Some(manifest.optional_dependencies.clone())
+        };
+        root.peer_dependencies = if manifest.peer_dependencies.is_empty() {
+            None
+        } else {
+            Some(manifest.peer_dependencies.clone())
+        };
+        root.peer_dependencies_meta = if manifest.peer_dependencies_meta.is_empty() {
+            None
+        } else {
+            let mut map = BTreeMap::new();
+            for (k, v) in &manifest.peer_dependencies_meta {
+                if v.optional {
+                    map.insert(k.clone(), serde_json::json!({ "optional": true }));
+                }
+            }
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        };
+        root.bundle_dependencies = manifest.bundled_dependencies.clone();
+        for (k, v) in &manifest.extra {
+            root.extra.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// Normalizes all package keys to POSIX forward slashes and normalizes package flags.
+    pub fn normalize(&mut self) {
+        let old_packages = std::mem::take(&mut self.packages);
+        for (k, mut v) in old_packages {
+            v.normalize_flags();
+            self.packages.insert(to_posix_path(&k), v);
+        }
+    }
+
+    /// Populates or updates the flags for a specific package path.
+    pub fn populate_package_flags(
+        &mut self,
+        path: &str,
+        dev: Option<bool>,
+        optional: Option<bool>,
+        dev_optional: Option<bool>,
+        peer: Option<bool>,
+        peer_optional: Option<bool>,
+        in_bundle: Option<bool>,
+        has_install_script: Option<bool>,
+    ) -> bool {
+        let key = to_posix_path(path);
+        if let Some(pkg) = self.packages.get_mut(&key) {
+            if let Some(v) = dev { pkg.set_dev(v); }
+            if let Some(v) = optional { pkg.set_optional(v); }
+            if let Some(v) = dev_optional { pkg.set_dev_optional(v); }
+            if let Some(v) = peer { pkg.set_peer(v); }
+            if let Some(v) = peer_optional { pkg.set_peer_optional(v); }
+            if let Some(v) = in_bundle { pkg.set_in_bundle(v); }
+            if let Some(v) = has_install_script { pkg.set_has_install_script(v); }
+            pkg.normalize_flags();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Iterator over packages that have `dev: true`.
+    pub fn dev_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_dev())
+    }
+
+    /// Iterator over packages that have `optional: true`.
+    pub fn optional_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_optional())
+    }
+
+    /// Iterator over packages that have `devOptional: true`.
+    pub fn dev_optional_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_dev_optional())
+    }
+
+    /// Iterator over packages that have `peer: true`.
+    pub fn peer_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_peer())
+    }
+
+    /// Iterator over packages that have `peerOptional: true`.
+    pub fn peer_optional_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_peer_optional())
+    }
+
+    /// Iterator over packages that have `inBundle: true`.
+    pub fn bundled_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.is_in_bundle())
+    }
+
+    /// Iterator over packages that have `hasInstallScript: true`.
+    pub fn script_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
+        self.packages.iter().filter(|(_, pkg)| pkg.has_install_script())
     }
 
     /// Standard relative path to the hidden lockfile inside `node_modules`.
@@ -229,8 +687,21 @@ impl LockfileV3 {
             return false;
         }
 
-        // 5. Verify direct dependencies exist in packages map and satisfy specs
+        // 5. Check peerDependenciesMeta
+        if !Self::peer_meta_matches(&manifest.peer_dependencies_meta, &root_pkg.peer_dependencies_meta) {
+            return false;
+        }
+
+        // 6. Check bundleDependencies
+        if !Self::bundled_deps_matches(manifest, root_pkg) {
+            return false;
+        }
+
+        // 7. Verify direct dependencies exist in packages map and satisfy specs
         for (dep, spec) in &manifest.dependencies {
+            if manifest.optional_dependencies.contains_key(dep) {
+                continue;
+            }
             let key = format!("node_modules/{dep}");
             let Some(pkg) = self.packages.get(&key) else {
                 return false;
@@ -240,6 +711,7 @@ impl LockfileV3 {
             }
         }
 
+        // 8. Verify direct devDependencies exist in packages map and satisfy specs
         if include_dev {
             for (dep, spec) in &manifest.dev_dependencies {
                 let key = format!("node_modules/{dep}");
@@ -252,12 +724,31 @@ impl LockfileV3 {
             }
         }
 
+        // 9. Verify optional dependencies in packages map satisfy specs if present
         for (dep, spec) in &manifest.optional_dependencies {
             let key = format!("node_modules/{dep}");
             if let Some(pkg) = self.packages.get(&key) {
                 if !Self::package_satisfies_spec(dep, pkg, spec) {
                     return false;
                 }
+            }
+        }
+
+        // 10. Verify peer dependencies in packages map
+        for (dep, spec) in &manifest.peer_dependencies {
+            let is_optional = manifest
+                .peer_dependencies_meta
+                .get(dep)
+                .map(|m| m.optional)
+                .unwrap_or_else(|| root_pkg.is_peer_dep_optional(dep));
+
+            let key = format!("node_modules/{dep}");
+            if let Some(pkg) = self.packages.get(&key) {
+                if !Self::package_satisfies_spec(dep, pkg, spec) {
+                    return false;
+                }
+            } else if !is_optional {
+                return false;
             }
         }
 
@@ -357,22 +848,62 @@ impl LockfileV3 {
         }
     }
 
+    fn peer_meta_matches(
+        manifest_meta: &BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
+        lock_meta: &Option<BTreeMap<String, serde_json::Value>>,
+    ) -> bool {
+        let manifest_opts: BTreeMap<&str, bool> = manifest_meta
+            .iter()
+            .filter(|(_, meta)| meta.optional)
+            .map(|(k, meta)| (k.as_str(), meta.optional))
+            .collect();
+
+        let lock_opts: BTreeMap<&str, bool> = lock_meta
+            .as_ref()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| {
+                        let opt = v.get("optional").and_then(|o| o.as_bool()).unwrap_or(false);
+                        if opt {
+                            Some((k.as_str(), true))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        manifest_opts == lock_opts
+    }
+
+    fn bundled_deps_matches(
+        manifest: &rnpm_core::manifest::Manifest,
+        root_pkg: &LockfilePackage,
+    ) -> bool {
+        let mut m_names = manifest.bundled_package_names();
+        let mut r_names = root_pkg.bundled_package_names();
+        if m_names.is_empty() && r_names.is_empty() {
+            return true;
+        }
+        m_names.sort();
+        r_names.sort();
+        m_names == r_names
+    }
+
     /// Deterministic serialization to formatted JSON string (2-space indent, trailing newline).
     /// Guarantees strict LF line endings and normalized POSIX forward-slash package keys.
     /// Fast-path avoids cloning the entire package tree when all keys are already normalized POSIX paths.
     pub fn to_json_string(&self) -> Result<String, LockfileError> {
-        let has_non_posix = self.packages.keys().any(|k| k.contains('\\'));
-        let json = if has_non_posix {
-            let mut normalized_packages = BTreeMap::new();
-            for (k, v) in &self.packages {
-                normalized_packages.insert(to_posix_path(k), v.clone());
-            }
-            let mut copy = self.clone();
-            copy.packages = normalized_packages;
-            serde_json::to_string_pretty(&copy)?
-        } else {
-            serde_json::to_string_pretty(self)?
-        };
+        let mut normalized_packages = BTreeMap::new();
+        for (k, v) in &self.packages {
+            let mut pkg = v.clone();
+            pkg.normalize_flags();
+            normalized_packages.insert(to_posix_path(k), pkg);
+        }
+        let mut copy = self.clone();
+        copy.packages = normalized_packages;
+        let json = serde_json::to_string_pretty(&copy)?;
         let mut lf_json = json.replace("\r\n", "\n");
         if !lf_json.ends_with('\n') {
             lf_json.push('\n');
@@ -394,7 +925,8 @@ impl LockfileV3 {
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
         let mut lockfile: Self = serde_json::from_str(s)?;
         let packages = std::mem::take(&mut lockfile.packages);
-        for (k, v) in packages {
+        for (k, mut v) in packages {
+            v.normalize_flags();
             lockfile.packages.insert(to_posix_path(&k), v);
         }
         Ok(lockfile)

@@ -24,6 +24,8 @@ impl<R> BatchExtractionItem<R> {
 
 /// Executes a batch of extraction tasks in parallel using a bounded thread pool.
 /// Bounded concurrency saturates multi-core CPUs without overwhelming disk queues.
+/// Work dispatch uses guided batch pulling to minimize queue mutex contention,
+/// and worker threads collect local results to avoid locking during extraction.
 pub fn extract_batch_parallel<R: Read + Send>(
     items: Vec<BatchExtractionItem<R>>,
     concurrency_limit: usize,
@@ -42,49 +44,68 @@ pub fn extract_batch_parallel<R: Read + Send>(
         concurrency_limit
     };
 
-    let items_queue = Arc::new(Mutex::new(items.into_iter().enumerate().collect::<Vec<_>>()));
-    let results = Arc::new(Mutex::new(Vec::with_capacity(num_items)));
-    {
-        let mut guard = results.lock().unwrap();
-        for _ in 0..num_items {
-            guard.push(None);
-        }
-    }
-
     let actual_threads = concurrency.min(num_items);
+    let items_queue = Arc::new(Mutex::new(items.into_iter().enumerate().collect::<Vec<_>>()));
+
     std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(actual_threads);
+
         for _ in 0..actual_threads {
             let queue_clone = Arc::clone(&items_queue);
-            let results_clone = Arc::clone(&results);
 
-            scope.spawn(move || loop {
-                let next_item = {
-                    let mut guard = queue_clone.lock().unwrap();
-                    guard.pop()
-                };
+            let handle = scope.spawn(move || {
+                let mut local_results = Vec::new();
+                let mut local_batch = Vec::new();
 
-                match next_item {
-                    Some((index, item)) => {
-                        let res = extract_and_replace(item.reader, &item.destination, item.limits);
-                        let mut res_guard = results_clone.lock().unwrap();
-                        res_guard[index] = Some(res);
+                loop {
+                    // Guided batch extraction: take a proportional chunk of tasks to minimize mutex contention
+                    {
+                        let mut guard = queue_clone.lock().unwrap();
+                        let remaining = guard.len();
+                        if remaining == 0 {
+                            break;
+                        }
+                        let chunk_size = (remaining / (actual_threads * 2)).clamp(1, 8);
+                        let start_idx = remaining.saturating_sub(chunk_size);
+                        local_batch.extend(guard.split_off(start_idx));
                     }
-                    None => break,
-                }
-            });
-        }
-    });
 
-    let mut guard = results.lock().unwrap();
-    guard
-        .drain(..)
-        .map(|opt| {
-            opt.unwrap_or_else(|| {
-                Err(FsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Extraction worker terminated unexpectedly",
-                )))
+                    // Process local batch without holding any lock
+                    while let Some((index, item)) = local_batch.pop() {
+                        let res = extract_and_replace(item.reader, &item.destination, item.limits);
+                        local_results.push((index, res));
+                    }
+                }
+
+                local_results
+            });
+
+            handles.push(handle);
+        }
+
+        let mut final_results: Vec<Option<Result<ExtractionSummary, FsError>>> =
+            (0..num_items).map(|_| None).collect();
+
+        for handle in handles {
+            if let Ok(worker_results) = handle.join() {
+                for (index, res) in worker_results {
+                    if index < num_items {
+                        final_results[index] = Some(res);
+                    }
+                }
+            }
+        }
+
+        final_results
+            .into_iter()
+            .map(|opt| {
+                opt.unwrap_or_else(|| {
+                    Err(FsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Extraction worker terminated unexpectedly",
+                    )))
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }

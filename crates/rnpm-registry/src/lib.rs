@@ -9,6 +9,7 @@ pub mod circuit_breaker;
 pub mod client;
 pub mod error;
 pub mod metadata;
+pub mod provenance;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 pub use client::{
@@ -19,5 +20,13 @@ pub use client::{
 };
 pub use error::RegistryError;
 pub use metadata::{
-    AbbreviatedPackageMetadata, AbbreviatedVersion, DistInfo, PackageBin,
+    AbbreviatedPackageMetadata, AbbreviatedVersion, AttestationProvenance, DistAttestations,
+    DistInfo, DistSignature, PackageBin,
+};
+pub use provenance::{
+    format_registry_signature_payload, normalize_repository_url, validate_dist_signatures,
+    verify_provenance, AttestationItem, AttestationResponse, BuildProvenance, DsseEnvelope,
+    DsseSignature, InTotoStatement, InTotoSubject, ProvenancePolicy, ProvenanceVerifier,
+    SigstoreBundle, SlsaPredicate, TransparencyLogMetadata, VerificationMaterial,
+    VerifiedProvenance, NPM_REGISTRY_KEYID,
 };

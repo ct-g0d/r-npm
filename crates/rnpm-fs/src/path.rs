@@ -22,7 +22,15 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
         // If it already has verbatim prefix, just normalize separators
         if path_str.starts_with(r"\\?\") || path_str.starts_with(r"\??\") {
             let normalized = path_str.replace('/', "\\");
-            return PathBuf::from(normalized);
+            if normalized.starts_with(r"\\?\UNC\") || normalized.starts_with(r"\??\UNC\") {
+                let unc_tail = &normalized[8..];
+                let cleaned = clean_windows_components(unc_tail);
+                return PathBuf::from(format!(r"\\?\UNC\{cleaned}"));
+            } else {
+                let tail = &normalized[4..];
+                let cleaned = clean_windows_components(tail);
+                return PathBuf::from(format!(r"\\?\{cleaned}"));
+            }
         }
 
         // Make path absolute if relative so verbatim path has a valid root

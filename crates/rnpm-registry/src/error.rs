@@ -65,6 +65,28 @@ pub enum RegistryError {
         actual: u64,
     },
 
+    #[error("Provenance verification failed: {0}")]
+    ProvenanceVerificationFailed(String),
+
+    #[error("Attestation digest mismatch for {algorithm}: expected {expected}, actual {actual}")]
+    AttestationDigestMismatch {
+        algorithm: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Untrusted source repository: expected '{expected}', found '{actual}'")]
+    UntrustedSourceRepository {
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Invalid Sigstore bundle: {0}")]
+    InvalidSigstoreBundle(String),
+
+    #[error("Invalid registry signature: {0}")]
+    InvalidSignature(String),
+
     #[error("Unexpected error: {0}")]
     Other(String),
 }
@@ -216,6 +238,11 @@ impl RegistryError {
             Self::Unauthorized { .. } => false,
             Self::Forbidden { .. } => false,
             Self::CircuitBreakerOpen { .. } => false,
+            Self::ProvenanceVerificationFailed(_) => false,
+            Self::AttestationDigestMismatch { .. } => false,
+            Self::UntrustedSourceRepository { .. } => false,
+            Self::InvalidSigstoreBundle(_) => false,
+            Self::InvalidSignature(_) => false,
             Self::Other(_) => false,
         }
     }
@@ -312,6 +339,28 @@ mod tests {
 
         let other = RegistryError::Other("custom error".into());
         assert!(!other.is_transient());
+
+        let prov_err = RegistryError::ProvenanceVerificationFailed("bad provenance".into());
+        assert!(!prov_err.is_transient());
+
+        let digest_err = RegistryError::AttestationDigestMismatch {
+            algorithm: "sha512".into(),
+            expected: "a".into(),
+            actual: "b".into(),
+        };
+        assert!(!digest_err.is_transient());
+
+        let repo_err = RegistryError::UntrustedSourceRepository {
+            expected: "org/repo".into(),
+            actual: "bad/repo".into(),
+        };
+        assert!(!repo_err.is_transient());
+
+        let bundle_err = RegistryError::InvalidSigstoreBundle("corrupt".into());
+        assert!(!bundle_err.is_transient());
+
+        let sig_err = RegistryError::InvalidSignature("bad sig".into());
+        assert!(!sig_err.is_transient());
 
         let url_err = RegistryError::UrlParse(url::ParseError::EmptyHost);
         assert!(!url_err.is_transient());

@@ -1,6 +1,7 @@
 mod audit;
 pub mod diagnostics;
 
+use reqwest::Url;
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -39,6 +40,18 @@ pub(crate) enum Commands {
         #[arg(long)]
         ignore_scripts: bool,
 
+        /// Bypass peer dependency installation conflicts
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+
+        /// Fail installation if any peer dependencies are missing or invalid
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+
+        /// Resolve and write package-lock.json without extracting or modifying node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
         omit: Vec<String>,
@@ -65,10 +78,6 @@ pub(crate) enum Commands {
         /// Do not write or mutate package.json
         #[arg(long = "no-save")]
         no_save: bool,
-
-        /// Resolve and write package-lock.json without extracting or modifying node_modules
-        #[arg(long = "package-lock-only")]
-        package_lock_only: bool,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -89,6 +98,18 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Bypass peer dependency installation conflicts
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+
+        /// Fail installation if any peer dependencies are missing or invalid
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+
+        /// Resolve and write package-lock.json without extracting or modifying node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
 
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
@@ -242,6 +263,10 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Bypass peer dependency installation conflicts
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -484,6 +509,15 @@ where
             i += 1;
             continue;
         }
+        // --legacy-peer-deps is supported on install, ci, update (and their aliases)
+        if matches!(
+            first.as_str(),
+            "install" | "i" | "add" | "isntall" | "ci" | "clean-install" | "ic" | "update" | "up"
+        ) && (arg == "--legacy-peer-deps" || arg.starts_with("--legacy-peer-deps="))
+        {
+            i += 1;
+            continue;
+        }
         if unsupported_flags.contains(&arg.as_str()) {
             return Some((
                 "ERR_UNSUPPORTED_FLAG".to_string(),
@@ -518,7 +552,7 @@ pub(crate) fn parse_omit_options(omit: &[String]) -> (bool, bool, bool) {
             for part in val.split(',') {
                 let trimmed = part.trim().to_ascii_lowercase();
                 match trimmed.as_str() {
-                    "dev" | "development" => omit_dev = true,
+                    "dev" | "development" | "prod" | "production" => omit_dev = true,
                     "optional" => omit_optional = true,
                     "peer" => omit_peer = true,
                     _ => {}
@@ -528,6 +562,122 @@ pub(crate) fn parse_omit_options(omit: &[String]) -> (bool, bool, bool) {
     }
 
     (omit_dev, omit_optional, omit_peer)
+}
+
+/// Parse a scoped registry flag or argument, e.g. `--@scope:registry=https://...`,
+/// `@scope:registry=https://...`, `--scope:registry=https://...`, or `scope:registry=https://...`.
+pub(crate) fn parse_scoped_registry_arg(arg: &str) -> Option<(String, Url)> {
+    let (key, val_str) = arg.split_once('=')?;
+    let clean_key = key.strip_prefix("--").unwrap_or(key).trim();
+    let raw_scope = clean_key
+        .strip_suffix(":registry")
+        .or_else(|| clean_key.strip_suffix("/registry"))?;
+    let s = raw_scope.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let scope = if !s.starts_with('@') {
+        format!("@{s}")
+    } else {
+        s.to_string()
+    };
+    let mut parsed_url = Url::parse(val_str.trim()).ok()?;
+    if !parsed_url.path().ends_with('/') {
+        let new_path = format!("{}/", parsed_url.path());
+        parsed_url.set_path(&new_path);
+    }
+    Some((scope.to_ascii_lowercase(), parsed_url))
+}
+
+/// Extract scoped registry flags/arguments from CLI arguments.
+///
+/// Returns a tuple of `(remaining_arguments, map_of_scope_to_url)`.
+/// This strips `--@scope:registry=...` and `@scope:registry=...` from the command line
+/// so that positional package lists and clap flag parsing are not polluted.
+pub(crate) fn extract_scoped_registries<I, T>(
+    raw_args: I,
+) -> (Vec<String>, std::collections::BTreeMap<String, Url>)
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .map(|a| a.into().to_string_lossy().to_string())
+        .collect();
+
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut scoped = std::collections::BTreeMap::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
+        // 1. Check combined form: `--@scope:registry=https://...` or `@scope:registry=https://...`
+        if let Some((scope, url)) = parse_scoped_registry_arg(arg) {
+            scoped.insert(scope, url);
+            i += 1;
+            continue;
+        }
+
+        // 2. Check separated form: `--@scope:registry https://...` or `@scope:registry https://...`
+        let clean = arg.strip_prefix("--").unwrap_or(arg).trim();
+        if (clean.starts_with('@') || clean.contains(':'))
+            && (clean.ends_with(":registry") || clean.ends_with("/registry"))
+            && i + 1 < args.len()
+        {
+            let raw_scope = clean
+                .strip_suffix(":registry")
+                .or_else(|| clean.strip_suffix("/registry"))
+                .unwrap();
+            let s = raw_scope.trim();
+            if !s.is_empty() {
+                let scope = if !s.starts_with('@') {
+                    format!("@{s}")
+                } else {
+                    s.to_string()
+                };
+                if let Ok(mut url) = Url::parse(args[i + 1].trim()) {
+                    if !url.path().ends_with('/') {
+                        let new_path = format!("{}/", url.path());
+                        url.set_path(&new_path);
+                    }
+                    scoped.insert(scope.to_ascii_lowercase(), url);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        remaining.push(arg.clone());
+        i += 1;
+    }
+
+    (remaining, scoped)
+}
+
+/// Resolve the registry URL for a package using a default registry and scoped registries map.
+#[allow(dead_code)]
+pub(crate) fn resolve_registry_for_package<'a>(
+    package_name: &str,
+    default_registry: &'a Url,
+    scoped_registries: &'a std::collections::BTreeMap<String, Url>,
+) -> &'a Url {
+    let pkg_trimmed = package_name.trim();
+    if pkg_trimmed.starts_with('@') {
+        let scope_part = if let Some(slash_idx) = pkg_trimmed.find('/') {
+            &pkg_trimmed[..slash_idx]
+        } else if let Some(enc_idx) = pkg_trimmed.to_ascii_lowercase().find("%2f") {
+            &pkg_trimmed[..enc_idx]
+        } else {
+            pkg_trimmed
+        };
+        let scope_lower = scope_part.to_ascii_lowercase();
+        if let Some(scoped_url) = scoped_registries.get(&scope_lower) {
+            return scoped_url;
+        }
+    }
+    default_registry
 }
 
 pub(crate) fn print_structured_error(err: &anyhow::Error) {
@@ -735,7 +885,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_peer,
             no_save,
             package_lock_only,
-                    omit,
+            omit,
+            legacy_peer_deps: _,
+            strict_peer_deps: _,
         } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
@@ -765,7 +917,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 summary.packages_installed, summary.cache_hits, summary.cache_misses
             );
         }
-        Commands::Ci { registry, cache, offline, ignore_scripts, omit } => {
+        Commands::Ci {
+            registry,
+            cache,
+            offline,
+            ignore_scripts,
+            omit,
+            legacy_peer_deps: _,
+            strict_peer_deps: _,
+            package_lock_only,
+        } => {
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
                 project_dir: current_dir,
@@ -776,6 +937,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_dev,
                 omit_optional,
                 omit_peer,
+                package_lock_only,
                 ..Default::default()
             };
 
@@ -1090,6 +1252,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
             ignore_scripts,
+            legacy_peer_deps: _,
         } => {
             let options = InstallOptions {
                 project_dir: current_dir,
@@ -1352,12 +1515,14 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    if let Some((_, msg)) = check_unsupported_cli_invocation(std::env::args_os()) {
+    let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
+
+    if let Some((_, msg)) = check_unsupported_cli_invocation(&filtered_args) {
         eprintln!("{msg}");
         std::process::exit(1);
     }
 
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse_from(&filtered_args) {
         Ok(c) => c,
         Err(e) => {
             if !e.use_stderr() {
@@ -1366,7 +1531,7 @@ async fn main() {
             }
             let rendered = e.render().to_string();
             if rendered.contains("unrecognized subcommand") {
-                let first_arg = std::env::args().nth(1).unwrap_or_default();
+                let first_arg = filtered_args.get(1).cloned().unwrap_or_default();
                 eprintln!("npm error code ERR_UNSUPPORTED_COMMAND");
                 eprintln!("npm error The command '{first_arg}' is not currently implemented in rnpm.");
                 eprintln!("npm error See docs/compatibility-contract.md for the active compatibility surface.");

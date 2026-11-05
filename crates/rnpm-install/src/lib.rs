@@ -23,6 +23,9 @@ use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
+pub mod git;
+pub use git::GitFetcher;
+
 pub mod prune;
 pub use prune::{
     analyze_reachability, discover_extraneous_packages, execute_prune,
@@ -106,6 +109,7 @@ pub struct RegistryPackageProvider {
     metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
     cache: Cache,
     offline: bool,
+    git_fetcher: crate::git::GitFetcher,
 }
 
 impl PackageMetadataProvider for RegistryPackageProvider {
@@ -123,6 +127,67 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     cache.insert(name.to_string(), meta.clone());
                 }
                 return Ok(Some(meta));
+            }
+        }
+
+        if name.starts_with("git+")
+            || name.starts_with("git:")
+            || PackageTarget::parse(name).map(|t| t.is_git()).unwrap_or(false)
+        {
+            if let Ok(target) = PackageTarget::parse(name) {
+                let fetcher = self.git_fetcher.clone();
+                let offline = self.offline;
+                let res = self.handle.block_on(async move {
+                    fetcher.resolve_git_dependency(&target, offline).await
+                });
+                match res {
+                    Ok(resolved) => {
+                        let m = resolved.manifest;
+                        let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                        let bin = m.bin.as_ref().map(|b| match b {
+                            rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
+                            rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                        });
+
+                        let ver_meta = PackageVersionMetadata {
+                            name: name.to_string(),
+                            version: version.clone(),
+                            dist_tarball: Some(resolved.resolved_url.clone()),
+                            dist_integrity: None,
+                            dependencies: m.dependencies.clone(),
+                            dev_dependencies: m.dev_dependencies.clone(),
+                            peer_dependencies: m.peer_dependencies.clone(),
+                            peer_dependencies_meta: m.peer_dependencies_meta.clone(),
+                            optional_dependencies: m.optional_dependencies.clone(),
+                            os: m.os.clone(),
+                            cpu: m.cpu.clone(),
+                            libc: m.libc.clone(),
+                            bin,
+                            has_install_script: m.scripts.contains_key("install")
+                                || m.scripts.contains_key("postinstall")
+                                || m.scripts.contains_key("preinstall"),
+                            deprecated: None,
+                        };
+
+                        let mut dist_tags = BTreeMap::new();
+                        dist_tags.insert("latest".to_string(), version.clone());
+                        let mut versions = BTreeMap::new();
+                        versions.insert(version, ver_meta);
+
+                        let meta = PackageMetadata {
+                            name: name.to_string(),
+                            dist_tags,
+                            versions,
+                        };
+                        if let Ok(mut cache) = self.metadata_cache.lock() {
+                            cache.insert(name.to_string(), meta.clone());
+                        }
+                        return Ok(Some(meta));
+                    }
+                    Err(e) => {
+                        return Err(SolverError::PackageMetadata(name.to_string(), e.to_string()));
+                    }
+                }
             }
         }
 
@@ -688,9 +753,9 @@ impl Installer {
         // 1. Resolve dependency graph via Solver directly
         let handle = tokio::runtime::Handle::current();
         let metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        self.populate_custom_target_metadata(&manifest, &metadata_cache);
+        self.populate_custom_target_metadata(&manifest, &metadata_cache).await?;
         for member in &workspace_members {
-            self.populate_custom_target_metadata(&member.manifest, &metadata_cache);
+            self.populate_custom_target_metadata(&member.manifest, &metadata_cache).await?;
         }
 
         let provider = RegistryPackageProvider {
@@ -699,6 +764,7 @@ impl Installer {
             metadata_cache,
             cache: self.cache.clone(),
             offline: self.options.offline,
+            git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
         };
 
         let lockfile_path = self.options.project_dir.join("package-lock.json");
@@ -964,6 +1030,49 @@ impl Installer {
             std::fs::create_dir_all(&bin_dir)?;
 
             if let Some(ref res) = node.resolved {
+                let is_git = res.starts_with("git+")
+                    || res.starts_with("git:")
+                    || PackageTarget::parse(res).map(|t| t.is_git()).unwrap_or(false);
+
+                if is_git {
+                    let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                    let target = PackageTarget::parse(res)
+                        .map_err(|e| anyhow!("Failed to parse git target: {e}"))?;
+                    let checkout_dir = git_fetcher
+                        .checkout_git_dependency(&target, self.options.offline)
+                        .await?;
+
+                    crate::git::copy_dir_all(&checkout_dir, &dest_dir)?;
+                    packages_installed += 1;
+                    cache_hits += 1;
+
+                    let pkg_manifest_path = dest_dir.join("package.json");
+                    if pkg_manifest_path.exists() {
+                        if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                            for (bin_name, script_rel) in m.bin_entries() {
+                                let target_rel = format!("{}/{}", node.install_name, script_rel);
+                                let script_path = dest_dir.join(&script_rel);
+                                let _ = normalize_shebang(&script_path);
+                                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                            }
+                            if m.scripts.contains_key("preinstall")
+                                || m.scripts.contains_key("install")
+                                || m.scripts.contains_key("postinstall")
+                            {
+                                lifecycle_nodes.push(LifecyclePackageNode {
+                                    package_path: loc.clone(),
+                                    disk_path: dest_dir.clone(),
+                                    manifest: m,
+                                    source: PackageSource::Registry,
+                                    dependencies: node.dependencies.keys().cloned().collect(),
+                                    optional: node.flags.optional,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if res.starts_with("file:") {
                     let rel_file = res.strip_prefix("file:").unwrap();
                     let abs_file = self.options.project_dir.join(rel_file);
@@ -1341,6 +1450,7 @@ impl Installer {
                 ignore_scripts: false,
                 capture_output: false,
                 timeout: None,
+                sandbox_policy: Default::default(),
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
@@ -1777,6 +1887,40 @@ impl Installer {
                 }
             };
 
+            let is_git = resolved_url.starts_with("git+")
+                || resolved_url.starts_with("git:")
+                || PackageTarget::parse(resolved_url).map(|t| t.is_git()).unwrap_or(false);
+
+            if is_git {
+                let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                let target = PackageTarget::parse(resolved_url)
+                    .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
+                let checkout_dir = git_fetcher
+                    .checkout_git_dependency(&target, self.options.offline)
+                    .await?;
+
+                crate::git::copy_dir_all(&checkout_dir, &full_target)?;
+                packages_installed += 1;
+                cache_hits += 1;
+
+                let target_bin_dir = find_enclosing_bin_dir(&full_target, &bin_dir);
+                let _ = std::fs::create_dir_all(&target_bin_dir);
+
+                let pkg_manifest_path = full_target.join("package.json");
+                if pkg_manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let target_rel = format!("{clean_pkg_name}/{script_rel}");
+                            let script_path = full_target.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&target_bin_dir, &bin_name, &target_rel);
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Validate that lockfile packages have non-empty valid integrity hashes
             let integrity_str = match pkg_info.integrity.as_deref() {
                 Some(i) if !i.trim().is_empty() => {
@@ -2104,6 +2248,7 @@ impl Installer {
                 ignore_scripts: false,
                 capture_output: false,
                 timeout: None,
+                sandbox_policy: Default::default(),
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
@@ -2120,11 +2265,11 @@ impl Installer {
         })
     }
 
-    fn populate_custom_target_metadata(
+    async fn populate_custom_target_metadata(
         &self,
         manifest: &Manifest,
         cache: &Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
-    ) {
+    ) -> Result<()> {
         let mut all_deps = Vec::new();
         for (name, spec) in &manifest.dependencies {
             all_deps.push((name, spec));
@@ -2150,6 +2295,63 @@ impl Installer {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+
+            let git_target_opt = match &parsed {
+                PackageTarget::Git { .. } => Some(parsed.clone()),
+                PackageTarget::Alias { target, .. } if target.is_git() => Some((**target).clone()),
+                _ => None,
+            };
+
+            if let Some(git_target) = git_target_opt {
+                let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                let resolved = git_fetcher
+                    .resolve_git_dependency(&git_target, self.options.offline)
+                    .await?;
+
+                let m = resolved.manifest;
+                let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+
+                let bin = m.bin.as_ref().map(|b| match b {
+                    rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
+                    rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                });
+
+                let ver_meta = PackageVersionMetadata {
+                    name: name.clone(),
+                    version: version.clone(),
+                    dist_tarball: Some(resolved.resolved_url.clone()),
+                    dist_integrity: None,
+                    dependencies: m.dependencies.clone(),
+                    dev_dependencies: m.dev_dependencies.clone(),
+                    peer_dependencies: m.peer_dependencies.clone(),
+                    peer_dependencies_meta: m.peer_dependencies_meta.clone(),
+                    optional_dependencies: m.optional_dependencies.clone(),
+                    os: m.os.clone(),
+                    cpu: m.cpu.clone(),
+                    libc: m.libc.clone(),
+                    bin,
+                    has_install_script: m.scripts.contains_key("install")
+                        || m.scripts.contains_key("postinstall")
+                        || m.scripts.contains_key("preinstall"),
+                    deprecated: None,
+                };
+
+                let mut dist_tags = BTreeMap::new();
+                dist_tags.insert("latest".to_string(), version.clone());
+                let mut versions = BTreeMap::new();
+                versions.insert(version.clone(), ver_meta);
+
+                if let Ok(mut locked) = cache.lock() {
+                    locked.insert(name.clone(), PackageMetadata {
+                        name: name.clone(),
+                        dist_tags: dist_tags.clone(),
+                        versions: versions.clone(),
+                    });
+                }
+
+                Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
+                continue;
+            }
 
             match parsed {
                 PackageTarget::File(ref rel_path) => {
@@ -2215,7 +2417,7 @@ impl Installer {
                                 });
                             }
 
-                            self.populate_custom_target_metadata(&m, cache);
+                            Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
                         }
                     } else if abs_path.exists() && abs_path.is_dir() {
                         let manifest_path = abs_path.join("package.json");
@@ -2267,7 +2469,7 @@ impl Installer {
                             });
                         }
 
-                        self.populate_custom_target_metadata(&m, cache);
+                        Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
                     }
                 }
                 PackageTarget::Url(ref url) => {
@@ -2305,6 +2507,7 @@ impl Installer {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     async fn resolve_package(
@@ -3034,6 +3237,7 @@ impl Installer {
                     ignore_scripts: false,
                     capture_output: false,
                     timeout: None,
+                    sandbox_policy: Default::default(),
                 };
                 let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
             }

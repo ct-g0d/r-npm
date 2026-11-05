@@ -1,9 +1,18 @@
-use std::collections::{HashMap, HashSet};
+﻿use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::collections::BinaryHeap;
 use std::process::{Command, ExitStatus};
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use rnpm_core::manifest::Manifest;
+
+pub mod error;
+pub mod policy;
+pub mod sandbox;
+
+pub use error::LifecycleError;
+pub use policy::{SandboxLevel, ScriptSandboxPolicy};
+pub use sandbox::{check_dangerous_command_patterns, CommandPatternAnalyzer};
 
 #[cfg(test)]
 mod tests;
@@ -50,6 +59,7 @@ pub mod process_guard {
     }
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: DWORD = 0x00000008;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 
     extern "system" {
@@ -75,6 +85,10 @@ pub mod process_guard {
 
     impl ProcessTreeGuard {
         pub fn new() -> Option<Self> {
+            Self::new_with_limits(None)
+        }
+
+        pub fn new_with_limits(active_process_limit: Option<u32>) -> Option<Self> {
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
@@ -82,6 +96,10 @@ pub mod process_guard {
                 }
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if let Some(limit) = active_process_limit {
+                    info.basic_limit_information.limit_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                    info.basic_limit_information.active_process_limit = limit;
+                }
                 let res = SetInformationJobObject(
                     job,
                     JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -167,6 +185,10 @@ pub mod process_guard {
 
     impl ProcessTreeGuard {
         pub fn new() -> Option<Self> {
+            Self::new_with_limits(None)
+        }
+
+        pub fn new_with_limits(_active_process_limit: Option<u32>) -> Option<Self> {
             Some(Self {
                 pgid: AtomicI32::new(0),
                 terminated: AtomicBool::new(false),
@@ -249,6 +271,7 @@ pub struct LifecycleOptions {
     pub ignore_scripts: bool,
     pub capture_output: bool,
     pub timeout: Option<std::time::Duration>,
+    pub sandbox_policy: ScriptSandboxPolicy,
 }
 
 impl Default for LifecycleOptions {
@@ -259,6 +282,7 @@ impl Default for LifecycleOptions {
             ignore_scripts: false,
             capture_output: true,
             timeout: None,
+            sandbox_policy: ScriptSandboxPolicy::default(),
         }
     }
 }
@@ -272,11 +296,17 @@ impl LifecycleOptions {
             ignore_scripts: false,
             capture_output: true,
             timeout: None,
+            sandbox_policy: ScriptSandboxPolicy::default(),
         }
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_sandbox_policy(mut self, policy: ScriptSandboxPolicy) -> Self {
+        self.sandbox_policy = policy;
         self
     }
 }
@@ -314,6 +344,7 @@ pub struct LifecycleContext {
     pub timeout: Option<std::time::Duration>,
     pub capture_output: bool,
     pub captured_output: std::sync::Arc<std::sync::Mutex<Option<ScriptOutput>>>,
+    pub sandbox_policy: ScriptSandboxPolicy,
 }
 
 impl LifecycleContext {
@@ -337,6 +368,7 @@ impl LifecycleContext {
             timeout: None,
             capture_output: false,
             captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sandbox_policy: ScriptSandboxPolicy::default(),
         }
     }
 
@@ -347,6 +379,11 @@ impl LifecycleContext {
 
     pub fn with_capture_output(mut self, capture: bool) -> Self {
         self.capture_output = capture;
+        self
+    }
+
+    pub fn with_sandbox_policy(mut self, policy: ScriptSandboxPolicy) -> Self {
+        self.sandbox_policy = policy;
         self
     }
 
@@ -748,6 +785,10 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         ctx.package_dir.display()
     );
 
+    // Validate against sandbox policy
+    ctx.sandbox_policy.check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let env = build_lifecycle_env(ctx);
 
     #[cfg(windows)]
@@ -780,7 +821,9 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         cmd.stderr(std::process::Stdio::inherit());
     }
 
-    let guard = process_guard::ProcessTreeGuard::new();
+    let guard = process_guard::ProcessTreeGuard::new_with_limits(
+        ctx.sandbox_policy.max_active_processes,
+    );
 
     let mut child = cmd.spawn()
         .with_context(|| format!("Failed to spawn lifecycle script for {}", ctx.package_name))?;
@@ -813,7 +856,8 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         None
     };
 
-    let status = if let Some(timeout) = ctx.timeout {
+    let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
+    let status = if let Some(timeout) = effective_timeout {
         let start = std::time::Instant::now();
         let poll_interval = std::time::Duration::from_millis(10);
         loop {
@@ -891,6 +935,10 @@ where
         ctx.package_dir.display()
     );
 
+    // Validate against sandbox policy
+    ctx.sandbox_policy.check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let env = build_lifecycle_env(ctx);
 
     #[cfg(windows)]
@@ -923,7 +971,9 @@ where
         cmd.stderr(std::process::Stdio::inherit());
     }
 
-    let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new());
+    let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new_with_limits(
+        ctx.sandbox_policy.max_active_processes,
+    ));
 
     let mut child = cmd.spawn()
         .with_context(|| format!("Failed to spawn lifecycle script for {}", ctx.package_name))?;
@@ -989,7 +1039,8 @@ where
     });
 
     let timeout_fut = async {
-        if let Some(timeout) = ctx.timeout {
+        let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
+        if let Some(timeout) = effective_timeout {
             tokio::time::sleep(timeout).await;
             true
         } else {
@@ -1724,7 +1775,7 @@ pub async fn execute_topological_with_abort(
     opts: &LifecycleOptions,
     abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
-    if opts.ignore_scripts {
+    if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
         return Ok(());
     }
 
@@ -1806,6 +1857,7 @@ pub async fn execute_topological_with_abort(
                 );
                 ctx.package_version = node.manifest.version.clone();
                 ctx.timeout = opts.timeout;
+                ctx.sandbox_policy = opts.sandbox_policy.clone();
 
                 let abort_fut = {
                     let mut rx_opt = abort_rx.clone();
@@ -1889,6 +1941,7 @@ pub async fn execute_topological_with_abort(
             );
             ctx.package_version = root_manifest.version.clone();
             ctx.timeout = opts.timeout;
+                ctx.sandbox_policy = opts.sandbox_policy.clone();
 
             let abort_fut = {
                 let mut rx_opt = abort_rx.clone();
@@ -1946,6 +1999,142 @@ pub struct WorkspaceRunSummary {
     pub skipped_packages: Vec<String>,
 }
 
+/// Topologically sorts workspace members such that dependencies precede dependents (bottom-up).
+/// If `topological_order` provides a preferred sequence, it is respected as a priority guide
+/// while strictly maintaining the topological dependency invariant.
+pub fn sort_workspace_members_topologically<'a>(
+    members: &'a [WorkspaceScriptMember],
+    topological_order: &[String],
+) -> Vec<&'a WorkspaceScriptMember> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+
+    let n = members.len();
+
+    let mut name_to_indices: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, m) in members.iter().enumerate() {
+        name_to_indices.entry(m.name.as_str()).or_default().push(idx);
+        if let Some(ref m_name) = m.manifest.name {
+            if m_name.as_str() != m.name.as_str() {
+                name_to_indices.entry(m_name.as_str()).or_default().push(idx);
+            }
+        }
+    }
+
+    let mut order_rank: HashMap<&str, usize> = HashMap::new();
+    for (pos, name) in topological_order.iter().enumerate() {
+        order_rank.entry(name.as_str()).or_insert(pos);
+    }
+
+    let base_rank = topological_order.len();
+    let mut member_ranks: Vec<usize> = Vec::with_capacity(n);
+    for (idx, m) in members.iter().enumerate() {
+        let rank = order_rank
+            .get(m.name.as_str())
+            .copied()
+            .or_else(|| {
+                m.manifest
+                    .name
+                    .as_deref()
+                    .and_then(|nm| order_rank.get(nm).copied())
+            })
+            .unwrap_or(base_rank + idx);
+        member_ranks.push(rank);
+    }
+
+    let mut in_degrees: Vec<usize> = vec![0; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (b_idx, member) in members.iter().enumerate() {
+        let mut dep_names = HashSet::new();
+        for dep_name in member
+            .manifest
+            .dependencies
+            .keys()
+            .chain(member.manifest.dev_dependencies.keys())
+            .chain(member.manifest.optional_dependencies.keys())
+            .chain(member.manifest.peer_dependencies.keys())
+        {
+            if dep_name.as_str() != member.name.as_str() {
+                dep_names.insert(dep_name.as_str());
+            }
+        }
+
+        let mut prereq_indices = HashSet::new();
+        for dep_name in dep_names {
+            if let Some(a_indices) = name_to_indices.get(dep_name) {
+                for &a_idx in a_indices {
+                    if a_idx != b_idx {
+                        prereq_indices.insert(a_idx);
+                    }
+                }
+            }
+        }
+
+        in_degrees[b_idx] = prereq_indices.len();
+        for &a_idx in &prereq_indices {
+            adj[a_idx].push(b_idx);
+        }
+    }
+
+    let mut visited = vec![false; n];
+    let mut ordered: Vec<&'a WorkspaceScriptMember> = Vec::with_capacity(n);
+
+    let mut ready: BinaryHeap<std::cmp::Reverse<(usize, usize)>> = BinaryHeap::new();
+    for idx in 0..n {
+        if in_degrees[idx] == 0 {
+            ready.push(std::cmp::Reverse((member_ranks[idx], idx)));
+        }
+    }
+
+    while ordered.len() < n {
+        if let Some(std::cmp::Reverse((_, curr_idx))) = ready.pop() {
+            if visited[curr_idx] {
+                continue;
+            }
+            visited[curr_idx] = true;
+            ordered.push(&members[curr_idx]);
+
+            for &next_idx in &adj[curr_idx] {
+                if in_degrees[next_idx] > 0 {
+                    in_degrees[next_idx] -= 1;
+                    if in_degrees[next_idx] == 0 && !visited[next_idx] {
+                        ready.push(std::cmp::Reverse((member_ranks[next_idx], next_idx)));
+                    }
+                }
+            }
+        } else {
+            let mut best_idx = None;
+            let mut best_rank = usize::MAX;
+            for idx in 0..n {
+                if !visited[idx] && member_ranks[idx] < best_rank {
+                    best_rank = member_ranks[idx];
+                    best_idx = Some(idx);
+                }
+            }
+
+            if let Some(curr_idx) = best_idx {
+                visited[curr_idx] = true;
+                ordered.push(&members[curr_idx]);
+
+                for &next_idx in &adj[curr_idx] {
+                    if in_degrees[next_idx] > 0 {
+                        in_degrees[next_idx] -= 1;
+                        if in_degrees[next_idx] == 0 && !visited[next_idx] {
+                            ready.push(std::cmp::Reverse((member_ranks[next_idx], next_idx)));
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    ordered
+}
+
 /// Executes an arbitrary script across workspace members in topological dependency order (leaf packages first),
 /// with optional abort signal support.
 pub async fn execute_workspace_scripts_topological_with_abort(
@@ -1977,26 +2166,18 @@ pub async fn execute_workspace_scripts_topological_with_abort(
         }
     }
 
-    let mut name_to_member: HashMap<&str, &WorkspaceScriptMember> = HashMap::new();
-    for m in members {
-        name_to_member.insert(m.name.as_str(), m);
-    }
-
+    let ordered_members = sort_workspace_members_topologically(members, topological_order);
     let mut summary = WorkspaceRunSummary::default();
-    let mut executed_or_skipped: HashSet<String> = HashSet::new();
 
-    // 1. Run members in explicit topological order
-    for pkg_name in topological_order {
+    let pre_hook_name = format!("pre{}", opts.script);
+    let post_hook_name = format!("post{}", opts.script);
+
+    for member in ordered_members {
         if let Some(ref rx) = abort_rx {
             if *rx.borrow() {
                 return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
             }
         }
-
-        let member = match name_to_member.get(pkg_name.as_str()) {
-            Some(m) => *m,
-            None => continue,
-        };
 
         if let Some(ref filter) = opts.filter_members {
             if !filter.iter().any(|f| matches_filter(f, &member.name, &member.path, root_dir)) {
@@ -2004,64 +2185,18 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             }
         }
 
-        executed_or_skipped.insert(pkg_name.clone());
-        if let Some(cmd) = member.manifest.scripts.get(&opts.script) {
-            let full_cmd = if opts.args.is_empty() {
-                cmd.clone()
-            } else {
-                format!("{cmd} {}", opts.args.join(" "))
-            };
+        let pre_cmd = member.manifest.scripts.get(&pre_hook_name);
+        let main_cmd = member.manifest.scripts.get(&opts.script);
+        let post_cmd = member.manifest.scripts.get(&post_hook_name);
 
-            println!(
-                "\n> {}@{} {} {}",
-                member.name,
-                member.manifest.version.as_deref().unwrap_or("0.0.0"),
-                opts.script,
-                member.path.display()
-            );
-            println!("> {full_cmd}\n");
-
-            let mut ctx = LifecycleContext::new(
-                root_dir,
-                &member.path,
-                &member.name,
-                &opts.script,
-                &full_cmd,
-            );
-            ctx.package_version = member.manifest.version.clone();
-
-            let abort_fut = {
-                let mut rx_opt = abort_rx.clone();
-                async move {
-                    if let Some(ref mut rx) = rx_opt {
-                        let _ = rx.wait_for(|&val| val).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                }
-            };
-
-            let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
-            if !status.success() {
-                let code = extract_exit_status_code(&status);
-                return Err(anyhow::Error::from(ScriptExitError {
-                    exit_code: code,
-                    message: format!(
-                        "Workspace member '{}' script '{}' exited with status code: {}",
-                        member.name,
-                        opts.script,
-                        code
-                    ),
-                }));
-            }
-            summary.executed_packages.push(member.name.clone());
-        } else {
+        if pre_cmd.is_none() && main_cmd.is_none() && post_cmd.is_none() {
             if opts.if_present || opts.filter_members.is_none() {
                 debug!(
                     "Skipping package '{}': script '{}' not found",
                     member.name, opts.script
                 );
                 summary.skipped_packages.push(member.name.clone());
+                continue;
             } else {
                 return Err(anyhow::anyhow!(
                     "rnpm ERR! missing script: {} in workspace package {}",
@@ -2070,37 +2205,36 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                 ));
             }
         }
-    }
 
-    // 2. Run any members not covered in topological_order
-    for member in members {
-        if let Some(ref rx) = abort_rx {
-            if *rx.borrow() {
-                return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
+        let mut hooks_to_run = Vec::new();
+        if let Some(cmd) = pre_cmd {
+            hooks_to_run.push((pre_hook_name.as_str(), cmd, false));
+        }
+        if let Some(cmd) = main_cmd {
+            hooks_to_run.push((opts.script.as_str(), cmd, true));
+        }
+        if let Some(cmd) = post_cmd {
+            hooks_to_run.push((post_hook_name.as_str(), cmd, false));
+        }
+
+        for (hook_name, cmd, pass_args) in hooks_to_run {
+            if let Some(ref rx) = abort_rx {
+                if *rx.borrow() {
+                    return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
+                }
             }
-        }
 
-        if executed_or_skipped.contains(&member.name) {
-            continue;
-        }
-        if let Some(ref filter) = opts.filter_members {
-            if !filter.iter().any(|f| matches_filter(f, &member.name, &member.path, root_dir)) {
-                continue;
-            }
-        }
-
-        if let Some(cmd) = member.manifest.scripts.get(&opts.script) {
-            let full_cmd = if opts.args.is_empty() {
-                cmd.clone()
-            } else {
+            let full_cmd = if pass_args && !opts.args.is_empty() {
                 format!("{cmd} {}", opts.args.join(" "))
+            } else {
+                cmd.clone()
             };
 
             println!(
                 "\n> {}@{} {} {}",
                 member.name,
                 member.manifest.version.as_deref().unwrap_or("0.0.0"),
-                opts.script,
+                hook_name,
                 member.path.display()
             );
             println!("> {full_cmd}\n");
@@ -2109,7 +2243,7 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                 root_dir,
                 &member.path,
                 &member.name,
-                &opts.script,
+                hook_name,
                 &full_cmd,
             );
             ctx.package_version = member.manifest.version.clone();
@@ -2133,25 +2267,14 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                     message: format!(
                         "Workspace member '{}' script '{}' exited with status code: {}",
                         member.name,
-                        opts.script,
+                        hook_name,
                         code
                     ),
                 }));
             }
-            summary.executed_packages.push(member.name.clone());
-        } else if opts.if_present || opts.filter_members.is_none() {
-            debug!(
-                "Skipping package '{}': script '{}' not found",
-                member.name, opts.script
-            );
-            summary.skipped_packages.push(member.name.clone());
-        } else {
-            return Err(anyhow::anyhow!(
-                "rnpm ERR! missing script: {} in workspace package {}",
-                opts.script,
-                member.name
-            ));
         }
+
+        summary.executed_packages.push(member.name.clone());
     }
 
     Ok(summary)

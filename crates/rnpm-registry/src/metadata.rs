@@ -163,6 +163,33 @@ pub struct DistInfo {
     pub shasum: Option<String>,
     #[serde(default)]
     pub integrity: Option<String>,
+    #[serde(default)]
+    pub signatures: Vec<DistSignature>,
+    #[serde(default)]
+    pub attestations: Option<DistAttestations>,
+}
+
+/// npm package signature in `dist.signatures`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DistSignature {
+    pub keyid: String,
+    pub sig: String,
+}
+
+/// npm package attestations reference in `dist.attestations`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DistAttestations {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<AttestationProvenance>,
+}
+
+/// Provenance metadata summary in `dist.attestations.provenance`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AttestationProvenance {
+    #[serde(rename = "predicateType", default)]
+    pub predicate_type: Option<String>,
 }
 
 /// Abbreviated version metadata matching `application/vnd.npm.install-v1+json`.
