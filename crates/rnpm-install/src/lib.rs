@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -516,15 +518,17 @@ impl Installer {
             trusted_hosts.insert(host.to_ascii_lowercase());
         }
 
-        let mut client_config = RegistryClientConfig::default();
-        client_config.default_registry = registry_url.clone();
-        client_config.auth_tokens = config.npmrc.auth_tokens.clone();
-        client_config.scoped_registries = config.npmrc.scoped_registries.clone();
+        let mut client_config = RegistryClientConfig {
+            default_registry: registry_url.clone(),
+            auth_tokens: config.npmrc.auth_tokens.clone(),
+            scoped_registries: config.npmrc.scoped_registries.clone(),
+            ..Default::default()
+        };
         if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
             client_config.auth_token = Some(token.to_string());
         }
 
-        for (_, scoped_reg) in &config.npmrc.scoped_registries {
+        for scoped_reg in config.npmrc.scoped_registries.values() {
             if let Some(h) = scoped_reg.host_str() {
                 trusted_hosts.insert(h.to_ascii_lowercase());
                 if let Some(p) = scoped_reg.port_or_known_default() {
@@ -1200,74 +1204,113 @@ impl Installer {
             .unwrap_or(4)
             .clamp(4, 16);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut join_set = tokio::task::JoinSet::new();
 
+        let mut tiers: BTreeMap<usize, Vec<(String, rnpm_solver::Node)>> = BTreeMap::new();
         for (loc, node) in packages_to_download {
-            let sem = Arc::clone(&semaphore);
-            let cache = self.cache.clone();
-            let registry_client = self.registry_client.clone();
-            let project_dir = self.options.project_dir.clone();
-            let root_bin = root_bin_dir.clone();
-            let offline = self.options.offline;
+            let depth = loc.matches("node_modules").count();
+            tiers.entry(depth).or_default().push((loc, node));
+        }
 
-            join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+        for (_depth, tier_packages) in tiers {
+            let mut join_set = tokio::task::JoinSet::new();
 
-                let dest_dir = project_dir.join(&loc);
-                if let Some(parent) = dest_dir.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin);
-                std::fs::create_dir_all(&bin_dir)?;
+            for (loc, node) in tier_packages {
+                let sem = Arc::clone(&semaphore);
+                let cache = self.cache.clone();
+                let registry_client = self.registry_client.clone();
+                let project_dir = self.options.project_dir.clone();
+                let root_bin = root_bin_dir.clone();
+                let offline = self.options.offline;
 
-                let resolved_url = node.resolved.as_ref().ok_or_else(|| {
-                    anyhow!("Missing resolved URL for package at {loc}")
-                })?;
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
-                let expected_integrity: Option<Integrity> = if let Some(ref integ_str) = node.integrity {
-                    if !integ_str.is_empty() {
-                        match integ_str.parse::<Integrity>() {
-                            Ok(i) => Some(i),
-                            Err(e) => {
-                                if node.flags.optional {
-                                    warn!(
-                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
-                                        loc, e
-                                    );
-                                    return Ok(None);
-                                } else {
-                                    return Err(anyhow!("Invalid integrity string for {loc}: {e}"));
+                    let dest_dir = project_dir.join(&loc);
+                    if let Some(parent) = dest_dir.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin);
+                    std::fs::create_dir_all(&bin_dir)?;
+
+                    let resolved_url = node.resolved.as_ref().ok_or_else(|| {
+                        anyhow!("Missing resolved URL for package at {loc}")
+                    })?;
+
+                    let expected_integrity: Option<Integrity> = if let Some(ref integ_str) = node.integrity {
+                        if !integ_str.is_empty() {
+                            match integ_str.parse::<Integrity>() {
+                                Ok(i) => Some(i),
+                                Err(e) => {
+                                    if node.flags.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                            loc, e
+                                        );
+                                        return Ok(None);
+                                    } else {
+                                        return Err(anyhow!("Invalid integrity string for {loc}: {e}"));
+                                    }
                                 }
                             }
+                        } else {
+                            None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-
-                let fetch_res = if let Ok(Some((_entry, data))) = cache.get(resolved_url) {
-                    let is_valid = if let Some(ref exp) = expected_integrity {
-                        exp.verify(&data).is_ok()
-                    } else {
-                        true
                     };
 
-                    if is_valid {
-                        debug!("Cache hit for {}", resolved_url);
-                        Ok((data, true))
-                    } else {
-                        debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
-                        let _ = cache.purge_key(resolved_url);
-                        if offline {
-                            if node.flags.optional {
-                                return Ok(None);
+                    let fetch_res = if let Ok(Some((_entry, data))) = cache.get(resolved_url) {
+                        let is_valid = if let Some(ref exp) = expected_integrity {
+                            exp.verify(&data).is_ok()
+                        } else {
+                            true
+                        };
+
+                        if is_valid {
+                            debug!("Cache hit for {}", resolved_url);
+                            Ok((data, true))
+                        } else {
+                            debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
+                            let _ = cache.purge_key(resolved_url);
+                            if offline {
+                                if node.flags.optional {
+                                    return Ok(None);
+                                }
+                                return Err(anyhow!(
+                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
+                                ));
                             }
-                            return Err(anyhow!(
-                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
-                            ));
+                            match registry_client.download_tarball_bytes(resolved_url).await {
+                                Ok(bytes) => {
+                                    if let Some(ref exp) = expected_integrity {
+                                        if let Err(e) = exp.verify(&bytes) {
+                                            if node.flags.optional {
+                                                warn!(
+                                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                                    loc, e
+                                                );
+                                                return Ok(None);
+                                            } else {
+                                                return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
+                                            }
+                                        }
+                                    }
+                                    let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
+                                    Ok((bytes, false))
+                                }
+                                Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
+                            }
                         }
+                    } else if offline {
+                        if node.flags.optional {
+                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
+                            return Ok(None);
+                        }
+                        return Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        ));
+                    } else {
+                        info!("Downloading {}", resolved_url);
                         match registry_client.download_tarball_bytes(resolved_url).await {
                             Ok(bytes) => {
                                 if let Some(ref exp) = expected_integrity {
@@ -1288,156 +1331,126 @@ impl Installer {
                             }
                             Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
                         }
-                    }
-                } else if offline {
-                    if node.flags.optional {
-                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
-                        return Ok(None);
-                    }
-                    return Err(anyhow!(
-                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
-                    ));
-                } else {
-                    info!("Downloading {}", resolved_url);
-                    match registry_client.download_tarball_bytes(resolved_url).await {
-                        Ok(bytes) => {
-                            if let Some(ref exp) = expected_integrity {
-                                if let Err(e) = exp.verify(&bytes) {
-                                    if node.flags.optional {
-                                        warn!(
-                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                            loc, e
-                                        );
-                                        return Ok(None);
-                                    } else {
-                                        return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
-                                    }
-                                }
+                    };
+
+                    let (bytes, was_hit) = match fetch_res {
+                        Ok(res) => res,
+                        Err(err) => {
+                            if node.flags.optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
+                                    loc, err
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(err);
                             }
-                            let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
-                            Ok((bytes, false))
                         }
-                        Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
-                    }
-                };
+                    };
 
-                let (bytes, was_hit) = match fetch_res {
-                    Ok(res) => res,
-                    Err(err) => {
-                        if node.flags.optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
-                                loc, err
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(err);
+                    // Verify integrity in memory (defense in depth)
+                    if let Some(ref exp) = expected_integrity {
+                        if let Err(e) = exp.verify(&bytes) {
+                            if node.flags.optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                    loc, e
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!("Integrity verification failed for {}: {e}", loc));
+                            }
                         }
                     }
-                };
 
-                // Verify integrity in memory (defense in depth)
-                if let Some(ref exp) = expected_integrity {
-                    if let Err(e) = exp.verify(&bytes) {
+                    // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
+                    const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
+                    if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
+                        return Err(anyhow!(
+                            "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
+                            loc, MAX_COMPRESSED_TARBALL_BYTES
+                        ));
+                    }
+
+                    // Path containment defense: ensure loc has no traversal or device escaping
+                    if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
+                        return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
+                    }
+
+                    let cleaned_dest = path_clean::clean(&dest_dir);
+                    let cleaned_project = path_clean::clean(&project_dir);
+                    if !cleaned_dest.starts_with(&cleaned_project) {
+                        return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
+                    }
+
+                    // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
+                    let dest_dir_clone = dest_dir.clone();
+                    let extract_res = tokio::task::spawn_blocking(move || {
+                        extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)
+                    }).await?;
+
+                    if let Err(e) = extract_res {
                         if node.flags.optional {
                             warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
                                 loc, e
                             );
+                            let _ = std::fs::remove_dir_all(&dest_dir);
                             return Ok(None);
                         } else {
-                            return Err(anyhow!("Integrity verification failed for {}: {e}", loc));
+                            return Err(anyhow!("Failed to extract package {}: {e}", loc));
                         }
                     }
-                }
 
-                // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
-                const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
-                if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
-                    return Err(anyhow!(
-                        "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
-                        loc, MAX_COMPRESSED_TARBALL_BYTES
-                    ));
-                }
+                    // Generate shims if package declares bin and collect lifecycle node
+                    let pkg_manifest_path = dest_dir.join("package.json");
+                    let mut lifecycle_node = None;
 
-                // Path containment defense: ensure loc has no traversal or device escaping
-                if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
-                    return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
-                }
+                    if pkg_manifest_path.exists() {
+                        if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                            for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                                let target_rel = format!("{}/{}", node.install_name, script_rel);
+                                let script_path = dest_dir.join(&script_rel);
+                                let _ = normalize_shebang(&script_path);
+                                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                            }
 
-                let cleaned_dest = path_clean::clean(&dest_dir);
-                let cleaned_project = path_clean::clean(&project_dir);
-                if !cleaned_dest.starts_with(&cleaned_project) {
-                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
-                }
+                            let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                                || pkg_manifest.scripts.contains_key("install")
+                                || pkg_manifest.scripts.contains_key("postinstall");
 
-                // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
-                let dest_dir_clone = dest_dir.clone();
-                let extract_res = tokio::task::spawn_blocking(move || {
-                    extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)
-                }).await?;
+                            if has_install_script {
+                                lifecycle_node = Some(LifecyclePackageNode {
+                                    package_path: loc.clone(),
+                                    disk_path: dest_dir.clone(),
+                                    manifest: pkg_manifest,
+                                    source: PackageSource::Registry,
+                                    dependencies: node.dependencies.keys().cloned().collect(),
+                                    optional: node.flags.optional,
+                                });
+                            }
+                        }
+                    }
 
-                if let Err(e) = extract_res {
-                    if node.flags.optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
-                            loc, e
-                        );
-                        let _ = std::fs::remove_dir_all(&dest_dir);
-                        return Ok(None);
+                    Ok(Some((
+                        was_hit,
+                        lifecycle_node,
+                    )))
+                });
+            }
+
+            while let Some(join_res) = join_set.join_next().await {
+                let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
+                if let Some((was_hit, lifecycle_node)) = item_opt {
+                    if was_hit {
+                        cache_hits += 1;
                     } else {
-                        return Err(anyhow!("Failed to extract package {}: {e}", loc));
+                        cache_misses += 1;
                     }
-                }
-
-                // Generate shims if package declares bin and collect lifecycle node
-                let pkg_manifest_path = dest_dir.join("package.json");
-                let mut lifecycle_node = None;
-
-                if pkg_manifest_path.exists() {
-                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                            let target_rel = format!("{}/{}", node.install_name, script_rel);
-                            let script_path = dest_dir.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
-                        }
-
-                        let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
-                            || pkg_manifest.scripts.contains_key("install")
-                            || pkg_manifest.scripts.contains_key("postinstall");
-
-                        if has_install_script {
-                            lifecycle_node = Some(LifecyclePackageNode {
-                                package_path: loc.clone(),
-                                disk_path: dest_dir.clone(),
-                                manifest: pkg_manifest,
-                                source: PackageSource::Registry,
-                                dependencies: node.dependencies.keys().cloned().collect(),
-                                optional: node.flags.optional,
-                            });
-                        }
+                    packages_installed += 1;
+                    if let Some(l_node) = lifecycle_node {
+                        lifecycle_nodes.push(l_node);
                     }
-                }
-
-                Ok(Some((
-                    was_hit,
-                    lifecycle_node,
-                )))
-            });
-        }
-
-        while let Some(join_res) = join_set.join_next().await {
-            let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
-            if let Some((was_hit, lifecycle_node)) = item_opt {
-                if was_hit {
-                    cache_hits += 1;
-                } else {
-                    cache_misses += 1;
-                }
-                packages_installed += 1;
-                if let Some(l_node) = lifecycle_node {
-                    lifecycle_nodes.push(l_node);
                 }
             }
         }
@@ -1712,13 +1725,12 @@ impl Installer {
                     continue;
                 }
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/') {
-                        if manifest.dev_dependencies.contains_key(clean_name)
+                    if !clean_name.contains('/')
+                        && manifest.dev_dependencies.contains_key(clean_name)
                             && !manifest.dependencies.contains_key(clean_name)
                         {
                             continue;
                         }
-                    }
                 }
             }
             if self.options.omit_optional {
@@ -1726,13 +1738,12 @@ impl Installer {
                     continue;
                 }
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/') {
-                        if manifest.optional_dependencies.contains_key(clean_name)
+                    if !clean_name.contains('/')
+                        && manifest.optional_dependencies.contains_key(clean_name)
                             && !manifest.dependencies.contains_key(clean_name)
                         {
                             continue;
                         }
-                    }
                 }
             }
             if self.options.omit_peer {
@@ -1740,13 +1751,12 @@ impl Installer {
                     continue;
                 }
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/') {
-                        if manifest.peer_dependencies.contains_key(clean_name)
+                    if !clean_name.contains('/')
+                        && manifest.peer_dependencies.contains_key(clean_name)
                             && !manifest.dependencies.contains_key(clean_name)
                         {
                             continue;
                         }
-                    }
                 }
             }
 
@@ -2551,10 +2561,11 @@ impl Installer {
                     let manifest = match inspect_manifest_from_tarball(&archive_bytes) {
                         Ok(m) => m,
                         Err(_) => {
-                            let mut m = Manifest::default();
-                            m.name = Some(name.to_string());
-                            m.version = Some("1.0.0".to_string());
-                            m
+                            Manifest {
+                                name: Some(name.to_string()),
+                                version: Some("1.0.0".to_string()),
+                                ..Default::default()
+                            }
                         }
                     };
 
@@ -2683,7 +2694,7 @@ impl Installer {
             }
             PackageTarget::Range(range) => {
                 let mut matching: Vec<(Version, String)> = Vec::new();
-                for (ver_str, _) in &metadata.versions {
+                for ver_str in metadata.versions.keys() {
                     if let Ok(ver) = ver_str.parse::<Version>() {
                         if range.satisfies(&ver) {
                             matching.push((ver, ver_str.clone()));
@@ -2729,13 +2740,11 @@ impl Installer {
 
         let host_platform = Platform::current();
         let compatible = host_platform.matches_with_libc(os_list, cpu_list, libc_list);
-        if !compatible {
-            if !is_optional {
-                return Err(anyhow!(
-                    "rnpm ERR! code EBADPLATFORM: Unsupported platform for {}@{}: wanted os: {:?}, cpu: {:?}, libc: {:?}",
-                    name, best_ver_str, ver_info.os, ver_info.cpu, ver_info.libc
-                ));
-            }
+        if !compatible && !is_optional {
+            return Err(anyhow!(
+                "rnpm ERR! code EBADPLATFORM: Unsupported platform for {}@{}: wanted os: {:?}, cpu: {:?}, libc: {:?}",
+                name, best_ver_str, ver_info.os, ver_info.cpu, ver_info.libc
+            ));
         }
         let skipped = is_optional && !compatible;
 
@@ -2825,7 +2834,8 @@ impl Installer {
             });
         }
 
-        let mut results: Vec<Option<Result<(Vec<u8>, bool)>>> = (0..urls.len()).map(|_| None).collect();
+        type DownloadItemResult = Result<(Vec<u8>, bool)>;
+        let mut results: Vec<Option<DownloadItemResult>> = (0..urls.len()).map(|_| None).collect();
         while let Some(res) = join_set.join_next().await {
             if let Ok((idx, result)) = res {
                 results[idx] = Some(result);
@@ -3218,15 +3228,14 @@ impl Installer {
                     continue;
                 }
                 let pkg_name = key.strip_prefix("node_modules/").unwrap_or(&key);
-                if !pkg_name.contains('/') || (pkg_name.starts_with('@') && pkg_name.matches('/').count() == 1) {
-                    if !reachable.contains(pkg_name) {
+                if (!pkg_name.contains('/') || (pkg_name.starts_with('@') && pkg_name.matches('/').count() == 1))
+                    && !reachable.contains(pkg_name) {
                         lockfile.remove_package(&key);
                         let path_to_remove = self.options.project_dir.join(&key);
                         if path_to_remove.exists() {
                             let _ = std::fs::remove_dir_all(&path_to_remove);
                         }
                     }
-                }
             }
 
             // 5. Run lifecycle scripts if needed
@@ -3300,23 +3309,20 @@ impl Installer {
 
             let mut removed = false;
 
-            if options.save_dev || target_all {
-                if manifest.dev_dependencies.remove(pkg).is_some() {
+            if (options.save_dev || target_all)
+                && manifest.dev_dependencies.remove(pkg).is_some() {
                     removed = true;
                 }
-            }
 
-            if options.save_optional || target_all {
-                if manifest.optional_dependencies.remove(pkg).is_some() {
+            if (options.save_optional || target_all)
+                && manifest.optional_dependencies.remove(pkg).is_some() {
                     removed = true;
                 }
-            }
 
-            if options.save_prod || target_all {
-                if manifest.dependencies.remove(pkg).is_some() {
+            if (options.save_prod || target_all)
+                && manifest.dependencies.remove(pkg).is_some() {
                     removed = true;
                 }
-            }
 
             if removed {
                 removed_packages.push(pkg.to_string());

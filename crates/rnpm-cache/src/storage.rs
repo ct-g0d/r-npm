@@ -830,7 +830,7 @@ impl Cache {
 
         if let Ok(parsed_integrity) = Integrity::parse(&entry.integrity) {
             let mut sorted_entries = parsed_integrity.entries.clone();
-            sorted_entries.sort_by(|a, b| b.algorithm.cmp(&a.algorithm));
+            sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
 
             for ssri in sorted_entries {
                 let hex = HEXLOWER.encode(&ssri.digest);
@@ -956,7 +956,7 @@ impl Cache {
     /// If corrupted, auto-purges the corrupt blob, logs a diagnostic, and returns `Ok(None)` for clean re-fetching.
     pub fn get_by_integrity(&self, integrity: &Integrity) -> Result<Option<Vec<u8>>, CacheError> {
         let mut sorted_entries = integrity.entries.clone();
-        sorted_entries.sort_by(|a, b| b.algorithm.cmp(&a.algorithm));
+        sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
 
         for entry in sorted_entries {
             let hex = HEXLOWER.encode(&entry.digest);
@@ -1011,13 +1011,7 @@ impl Cache {
                     if max_age.is_zero() {
                         // If file is an active in-flight temporary file created by the current process very recently (< 500ms),
                         // preserve it so concurrent threads are not interrupted.
-                        if (file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx))
-                            && age < Duration::from_millis(500)
-                        {
-                            false
-                        } else {
-                            true
-                        }
+                        !((file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx)) && age < Duration::from_millis(500))
                     } else {
                         age >= max_age
                     }

@@ -100,8 +100,7 @@ pub fn extract_batch_parallel<R: Read + Send>(
             .into_iter()
             .map(|opt| {
                 opt.unwrap_or_else(|| {
-                    Err(FsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(FsError::Io(std::io::Error::other(
                         "Extraction worker terminated unexpectedly",
                     )))
                 })

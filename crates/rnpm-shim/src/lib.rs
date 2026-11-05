@@ -1,3 +1,5 @@
+#![allow(clippy::permissions_set_readonly_false)]
+
 use std::fs;
 use std::path::Path;
 use anyhow::{Context, Result};
@@ -15,9 +17,7 @@ mod tests;
 pub fn escape_posix_path(path: &str) -> String {
     let forward = path.replace('\\', "/");
     let sanitized = forward
-        .replace('\0', "")
-        .replace('\r', "")
-        .replace('\n', "");
+        .replace(['\0', '\r', '\n'], "");
     sanitized
         .replace('\\', "\\\\")
         .replace('\"', "\\\"")
@@ -44,10 +44,7 @@ pub fn escape_posix_arg(arg: &str) -> String {
 pub fn escape_cmd_path(path: &str) -> String {
     let win = path.replace('/', "\\");
     let sanitized = win
-        .replace('\0', "")
-        .replace('\r', "")
-        .replace('\n', "")
-        .replace('\"', "");
+        .replace(['\0', '\r', '\n', '\"'], "");
     sanitized.replace('%', "%%")
 }
 
@@ -55,9 +52,7 @@ pub fn escape_cmd_path(path: &str) -> String {
 /// and protects against cmd shell metacharacters and injection vectors.
 pub fn escape_cmd_arg(arg: &str) -> String {
     let sanitized = arg
-        .replace('\0', "")
-        .replace('\r', "")
-        .replace('\n', "");
+        .replace(['\0', '\r', '\n'], "");
     if sanitized.is_empty() {
         return "\"\"".to_string();
     }

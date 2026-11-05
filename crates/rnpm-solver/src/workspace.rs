@@ -582,7 +582,6 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         }),
         parsed_version: parsed_root_version,
         extra: root_manifest.extra.clone(),
-        ..Default::default()
     };
     graph.nodes.insert(String::new(), root_node);
 

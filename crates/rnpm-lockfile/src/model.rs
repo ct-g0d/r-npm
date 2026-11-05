@@ -671,11 +671,10 @@ impl LockfileV3 {
         }
 
         // 2. Check devDependencies
-        if include_dev {
-            if !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies) {
+        if include_dev
+            && !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies) {
                 return false;
             }
-        }
 
         // 3. Check optionalDependencies
         if !Self::map_matches(&manifest.optional_dependencies, &root_pkg.optional_dependencies) {
@@ -806,7 +805,7 @@ impl LockfileV3 {
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                     range.satisfies(&v)
                 } else if let Ok(expected) = Version::parse(s) {
-                    &v == &expected
+                    v == expected
                 } else {
                     true
                 }

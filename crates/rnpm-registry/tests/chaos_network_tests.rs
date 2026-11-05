@@ -232,7 +232,7 @@ async fn test_chaos_abrupt_connection_drop_exhausts_retries_fails() {
         let _ = stream.read(&mut buf).await;
         let header = "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nContent-Type: application/octet-stream\r\n\r\n";
         let _ = stream.write_all(header.as_bytes()).await;
-        let _ = stream.write_all(&vec![0xAA; 100]).await;
+        let _ = stream.write_all(&[0xAA; 100]).await;
         let _ = stream.flush().await;
         drop(stream);
     })
@@ -611,7 +611,7 @@ async fn test_chaos_http_429_http_date_budget_exceeded_fails_fast() {
     let err = res.unwrap_err();
     assert!(err.is_rate_limited());
     let parsed_wait = err.retry_after().expect("should have parsed Retry-After");
-    assert!(parsed_wait >= 115 && parsed_wait <= 125);
+    assert!((115..=125).contains(&parsed_wait));
     assert_eq!(server.connection_count.load(Ordering::SeqCst), 1);
 
     server.stop();

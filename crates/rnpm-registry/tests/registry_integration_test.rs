@@ -1136,7 +1136,7 @@ async fn test_chaotic_retry_oscillating_exceeds_max_retries_fails() {
     let server = MockHttpServer::start(move |req| {
         if req.contains("GET /chaotic-exhaust-pkg") {
             let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
-            if attempt % 2 == 0 {
+            if attempt.is_multiple_of(2) {
                 (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec())
             } else {
                 (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())

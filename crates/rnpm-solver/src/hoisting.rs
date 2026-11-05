@@ -31,7 +31,7 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
             } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                 range.satisfies(&v)
             } else if let Ok(expected) = Version::parse(s) {
-                &v == &expected
+                v == expected
             } else {
                 true
             }
@@ -130,11 +130,10 @@ pub fn determine_placement(
         candidate.push_str(install_name);
 
         if let Some(existing) = graph.nodes.get(&candidate) {
-            if existing.name == package_name && node_satisfies_target(existing, target) {
-                if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
+            if existing.name == package_name && node_satisfies_target(existing, target)
+                && !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
                     return PlacementDecision::Reuse(candidate);
                 }
-            }
         } else if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
             return PlacementDecision::PlaceNew(candidate);
         }

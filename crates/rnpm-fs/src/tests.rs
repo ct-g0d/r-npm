@@ -981,11 +981,10 @@ impl std::io::Read for TarStreamOfMillionEntries {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.header_offset >= 512 {
-            if !self.prepare_next_header() {
+        if self.header_offset >= 512
+            && !self.prepare_next_header() {
                 return Ok(0);
             }
-        }
 
         let available = 512 - self.header_offset;
         let to_copy = available.min(buf.len());
@@ -1310,7 +1309,7 @@ fn test_readonly_file_overwriting_and_removal() {
     let summary = extract_and_replace(Cursor::new(&tar_bytes), &dest, None).unwrap();
     assert_eq!(summary.entries_extracted, 2);
 
-    let content = fs::read(&dest.join("file.txt")).unwrap();
+    let content = fs::read(dest.join("file.txt")).unwrap();
     assert_eq!(content, b"overwritten content with new permissions");
 
     // 3. Mark extracted file as read-only again

@@ -60,7 +60,7 @@ impl Version {
     pub fn parse(input: &str) -> Result<Self, SemverError> {
         let trimmed = input.trim();
         // node-semver strips leading 'v', 'V', or '='
-        let s = trimmed.trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+        let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
         let s = s.trim();
         if s.is_empty() {
             return Err(SemverError::InvalidVersion(input.to_string()));
@@ -136,7 +136,7 @@ impl Version {
     pub fn parse_loose(input: &str) -> Result<Self, SemverError> {
         let trimmed = input.trim();
         // node-semver loose mode strips leading 'v', 'V', '=', and whitespace
-        let s = trimmed.trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+        let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
         let s = s.trim();
         if s.is_empty() {
             return Err(SemverError::InvalidVersion(input.to_string()));

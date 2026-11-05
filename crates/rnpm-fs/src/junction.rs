@@ -303,14 +303,13 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
     match fs::create_dir(&link_v) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !is_reparse_point_or_symlink(&link_v)? {
-                if fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some() {
+            if !is_reparse_point_or_symlink(&link_v)?
+                && fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some() {
                     return Err(FsError::JunctionError {
                         path: link.to_path_buf(),
                         detail: "Destination directory already exists and is not empty".to_string(),
                     });
                 }
-            }
         }
         Err(e) => return Err(FsError::Io(e)),
     }

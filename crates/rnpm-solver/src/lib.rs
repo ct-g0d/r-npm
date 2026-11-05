@@ -1,5 +1,7 @@
 //! Dependency graph resolution, hoisting, overrides, peer dependencies, and workspaces.
 
+#![allow(clippy::result_large_err, clippy::type_complexity, clippy::too_many_arguments, clippy::field_reassign_with_default)]
+
 pub mod aliases;
 pub mod error;
 pub mod graph;

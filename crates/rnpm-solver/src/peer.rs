@@ -28,10 +28,10 @@ impl PeerContext {
         peer_alias: Option<&str>,
     ) -> bool {
         let dep_matches = |name: &str| -> bool {
-            name == dependent || dep_alias.map_or(false, |a| a == name)
+            name == dependent || (dep_alias == Some(name))
         };
 
-        if dep_matches(peer) || peer_alias.map_or(false, |pa| dep_matches(pa)) {
+        if dep_matches(peer) || peer_alias.is_some_and(dep_matches) {
             return true;
         }
 
@@ -78,7 +78,7 @@ impl PeerContext {
         peer_alias: Option<&str>,
     ) -> Option<Vec<String>> {
         let dep_matches = |name: &str| -> bool {
-            name == dependent || dep_alias.map_or(false, |a| a == name)
+            name == dependent || (dep_alias == Some(name))
         };
 
         if dep_matches(peer) {
@@ -125,7 +125,7 @@ impl PeerContext {
         let mut path = Vec::new();
         let mut curr = target;
         path.push(curr.to_string());
-        while curr != peer && peer_alias.map_or(true, |pa| curr != pa) {
+        while curr != peer && (peer_alias != Some(curr)) {
             if let Some(&p) = parent_map.get(curr) {
                 path.push(p.to_string());
                 curr = p;
@@ -156,7 +156,7 @@ impl PeerContext {
         peer_alias: Option<&str>,
     ) -> bool {
         path.iter().any(|ancestor| {
-            ancestor == peer || peer_alias.map_or(false, |pa| ancestor == pa)
+            ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa)
         })
     }
 
@@ -168,7 +168,7 @@ impl PeerContext {
         peer_alias: Option<&str>,
     ) -> Option<Vec<String>> {
         let idx = path.iter().position(|ancestor| {
-            ancestor == peer || peer_alias.map_or(false, |pa| ancestor == pa)
+            ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa)
         })?;
         let mut cycle = path[idx..].to_vec();
         cycle.push(peer.to_string());

@@ -314,15 +314,12 @@ fn test_additional_aliases_and_flag_routing() {
     assert!(stderr.contains("show"));
 
     // Additional unsupported flags --production on install
-    for flag_args in [
-        vec!["install", "--production"],
-    ] {
-        let output = Command::new(rnpm_bin)
-            .args(&flag_args)
-            .output()
-            .expect("Failed to execute rnpm");
-        assert!(!output.status.success(), "Flag args '{:?}' must fail", flag_args);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"), "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}", flag_args);
-    }
+    let flag_args = ["install", "--production"];
+    let output = Command::new(rnpm_bin)
+        .args(flag_args)
+        .output()
+        .expect("Failed to execute rnpm");
+    assert!(!output.status.success(), "Flag args '{:?}' must fail", flag_args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"), "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}", flag_args);
 }

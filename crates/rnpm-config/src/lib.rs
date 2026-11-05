@@ -1,3 +1,5 @@
+#![allow(clippy::manual_strip)]
+
 pub mod config;
 pub mod error;
 pub mod npmrc;

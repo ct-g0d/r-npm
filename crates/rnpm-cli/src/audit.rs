@@ -216,10 +216,12 @@ async fn fetch_advisories(
     let target_parsed = Url::parse(&target_url)
         .map_err(|e| anyhow::anyhow!("Invalid registry URL '{target_url}': {e}"))?;
 
-    let mut client_config = rnpm_registry::RegistryClientConfig::default();
-    client_config.default_registry = target_parsed.clone();
-    client_config.auth_tokens = config.npmrc.auth_tokens.clone();
-    client_config.scoped_registries = config.npmrc.scoped_registries.clone();
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: target_parsed.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        ..Default::default()
+    };
     if let Some(token) = config.npmrc.get_auth_token(&target_parsed) {
         client_config.auth_token = Some(token.to_string());
     }
@@ -229,7 +231,7 @@ async fn fetch_advisories(
             client_config.trusted_hosts.insert(format!("{}:{}", host.to_ascii_lowercase(), port));
         }
     }
-    for (_, scoped_reg) in &config.npmrc.scoped_registries {
+    for scoped_reg in config.npmrc.scoped_registries.values() {
         if let Some(h) = scoped_reg.host_str() {
             client_config.trusted_hosts.insert(h.to_ascii_lowercase());
             if let Some(p) = scoped_reg.port_or_known_default() {

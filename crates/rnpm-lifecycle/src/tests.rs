@@ -639,7 +639,7 @@ async fn test_monorepo_topological_sort_stress_large_dag() {
 
     // Create manifest and directories for all 65 packages
     let mut all_names = Vec::new();
-    for (name, _) in &dependencies {
+    for name in dependencies.keys() {
         all_names.push(name.clone());
         let pkg_dir = root.join("packages").join(name);
         std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -766,7 +766,7 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         manifest.scripts.insert("install".to_string(), "node -e \"process.exit(0)\"".to_string());
 
         let mut deps = Vec::new();
-        if i >= 1 && i < 10 {
+        if (1..10).contains(&i) {
             deps.push("pkg-dag-00".to_string());
         } else if (10..30).contains(&i) {
             deps.push(format!("pkg-dag-{:02}", i - 5));
