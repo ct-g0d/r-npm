@@ -1082,6 +1082,8 @@ where
     }
 
     let unsupported_flags = [
+        "--legacy-peer-deps",
+        "--strict-peer-deps",
         "--save-bundle",
         "--production",
     ];

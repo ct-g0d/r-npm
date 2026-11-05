@@ -1725,7 +1725,6 @@ use tokio::net::TcpListener;
     }
 
     #[test]
-    #[test]
     fn test_cli_parse_publish_flags() {
         let parsed = Cli::try_parse_from([
             "rnpm", "publish",
