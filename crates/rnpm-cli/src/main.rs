@@ -55,6 +55,63 @@ pub(crate) enum Commands {
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
         omit: Vec<String>,
+
+        /// Dependency types to include (dev, prod, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+
+        /// Do not read or write package-lock.json
+        #[arg(long = "no-package-lock")]
+        no_package_lock: bool,
+
+        /// Ignore or enable package-lock.json
+        #[arg(long = "package-lock", num_args = 0..=1, default_missing_value = "true")]
+        package_lock: Option<bool>,
+
+        /// Simulate installation without modifying filesystem
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Override target OS for platform evaluation
+        #[arg(long = "os")]
+        os: Option<String>,
+
+        /// Override target CPU architecture for platform evaluation
+        #[arg(long = "cpu")]
+        cpu: Option<String>,
+
+        /// Override target libc for platform evaluation
+        #[arg(long = "libc")]
+        libc: Option<String>,
+
+        /// Suppress post-install vulnerability checks
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Submit or suppress audit reports
+        #[arg(long = "audit", num_args = 0..=1, default_missing_value = "true")]
+        audit: Option<bool>,
+
+        /// Suppress funding notices after install
+        #[arg(long = "no-fund")]
+        no_fund: bool,
+
+        /// Display or suppress funding notices
+        #[arg(long = "fund", num_args = 0..=1, default_missing_value = "true")]
+        fund: Option<bool>,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
         /// Save added dependencies to devDependencies
         #[arg(short = 'D', long = "save-dev")]
         save_dev: bool,
@@ -114,6 +171,62 @@ pub(crate) enum Commands {
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
         omit: Vec<String>,
+
+        /// Dependency types to include (dev, prod, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+
+        /// Do not read or write package-lock.json
+        #[arg(long = "no-package-lock")]
+        no_package_lock: bool,
+
+        /// Ignore or enable package-lock.json
+        #[arg(long = "package-lock", num_args = 0..=1, default_missing_value = "true")]
+        package_lock: Option<bool>,
+
+        /// Simulate installation without modifying filesystem
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Override target OS for platform evaluation
+        #[arg(long = "os")]
+        os: Option<String>,
+
+        /// Override target CPU architecture for platform evaluation
+        #[arg(long = "cpu")]
+        cpu: Option<String>,
+
+        /// Override target libc for platform evaluation
+        #[arg(long = "libc")]
+        libc: Option<String>,
+
+        /// Suppress post-install vulnerability checks
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Submit or suppress audit reports
+        #[arg(long = "audit", num_args = 0..=1, default_missing_value = "true")]
+        audit: Option<bool>,
+
+        /// Suppress funding notices after install
+        #[arg(long = "no-fund")]
+        no_fund: bool,
+
+        /// Display or suppress funding notices
+        #[arg(long = "fund", num_args = 0..=1, default_missing_value = "true")]
+        fund: Option<bool>,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Run package test script
@@ -178,6 +291,10 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run arbitrary package binaries dynamically (npx equivalent)
@@ -293,6 +410,10 @@ pub(crate) enum Commands {
         /// Dependency types to omit: dev, optional, peer
         #[arg(long, value_name = "TYPE", value_delimiter = ',', num_args = 1..)]
         omit: Vec<String>,
+
+        /// Dependency types to include: dev, prod, optional, peer
+        #[arg(long, value_name = "TYPE", value_delimiter = ',', num_args = 1..)]
+        include: Vec<String>,
 
         /// Remove devDependencies (alias for --omit=dev)
         #[arg(long, short = 'p')]
@@ -500,8 +621,8 @@ where
     let mut i = 0;
     while i < args_to_scan.len() {
         let arg = &args_to_scan[i];
-        // For prune, --production, -p, --omit=..., and --omit are supported options.
-        if first == "prune" && (arg == "--production" || arg == "-p" || arg.starts_with("--omit")) {
+        // For prune, --production, -p, --omit=..., and --include=... are supported options.
+        if first == "prune" && (arg == "--production" || arg == "-p" || arg.starts_with("--omit") || arg.starts_with("--include")) {
             i += 1;
             continue;
         }
@@ -536,32 +657,48 @@ where
     None
 }
 
-pub(crate) fn parse_omit_options(omit: &[String]) -> (bool, bool, bool) {
+pub(crate) fn parse_omit_and_include_options(omit: &[String], include: &[String]) -> (bool, bool, bool) {
     let mut omit_dev = false;
     let mut omit_optional = false;
     let mut omit_peer = false;
 
-    if omit.is_empty() {
-        if let Ok(node_env) = std::env::var("NODE_ENV") {
-            if node_env == "production" {
-                omit_dev = true;
+    if let Ok(node_env) = std::env::var("NODE_ENV") {
+        if node_env == "production" {
+            omit_dev = true;
+        }
+    }
+
+    for val in omit {
+        for part in val.split(',') {
+            let trimmed = part.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "dev" | "development" | "prod" | "production" => omit_dev = true,
+                "optional" => omit_optional = true,
+                "peer" => omit_peer = true,
+                _ => {}
             }
         }
-    } else {
-        for val in omit {
-            for part in val.split(',') {
-                let trimmed = part.trim().to_ascii_lowercase();
-                match trimmed.as_str() {
-                    "dev" | "development" | "prod" | "production" => omit_dev = true,
-                    "optional" => omit_optional = true,
-                    "peer" => omit_peer = true,
-                    _ => {}
-                }
+    }
+
+    // --include takes absolute precedence over --omit and NODE_ENV according to npm 11.x semantics
+    for val in include {
+        for part in val.split(',') {
+            let trimmed = part.trim().to_ascii_lowercase();
+            match trimmed.as_str() {
+                "dev" | "development" | "prod" | "production" => omit_dev = false,
+                "optional" => omit_optional = false,
+                "peer" => omit_peer = false,
+                _ => {}
             }
         }
     }
 
     (omit_dev, omit_optional, omit_peer)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_omit_options(omit: &[String]) -> (bool, bool, bool) {
+    parse_omit_and_include_options(omit, &[])
 }
 
 /// Parse a scoped registry flag or argument, e.g. `--@scope:registry=https://...`,
@@ -712,6 +849,7 @@ async fn execute_run(
     scope: Vec<String>,
     if_present: bool,
     ignore_scripts: bool,
+    workspace_root: bool,
 ) -> anyhow::Result<()> {
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
@@ -821,6 +959,62 @@ async fn execute_run(
             summary.executed_packages.len(),
             summary.skipped_packages.len()
         );
+
+        if workspace_root {
+            if let Some(cmd) = manifest.scripts.get(&ws_opts.script) {
+                let full_cmd = if ws_opts.args.is_empty() {
+                    cmd.clone()
+                } else {
+                    let formatted_args: Vec<String> = ws_opts
+                        .args
+                        .iter()
+                        .map(|a| {
+                            if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                                format!("\"{}\"", a.replace('"', "\\\""))
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    format!("{cmd} {}", formatted_args.join(" "))
+                };
+
+                let pkg_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
+                println!(
+                    "\n> {}@{} {} {}",
+                    pkg_name,
+                    manifest.version.as_deref().unwrap_or("0.0.0"),
+                    ws_opts.script,
+                    current_dir.display()
+                );
+                println!("> {full_cmd}\n");
+
+                let mut ctx = LifecycleContext::new(
+                    &current_dir,
+                    &current_dir,
+                    &pkg_name,
+                    &ws_opts.script,
+                    &full_cmd,
+                );
+                ctx.package_version = manifest.version.clone();
+
+                if !ignore_scripts {
+                    let status = execute_lifecycle_script(&ctx)?;
+                    if !status.success() {
+                        let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                            exit_code: code,
+                            message: format!(
+                                "Workspace root script '{}' failed with exit code: {}",
+                                ws_opts.script, code
+                            ),
+                        }));
+                    }
+                }
+            } else if !if_present && !has_filter {
+                return Err(anyhow::anyhow!("missing script: {}", ws_opts.script));
+            }
+        }
     } else {
         let script_cmd = match manifest.scripts.get(&script) {
             Some(cmd) => cmd,
@@ -872,7 +1066,6 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
     match cli.command {
         Commands::Install {
-
             packages,
             registry,
             cache,
@@ -886,13 +1079,43 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             no_save,
             package_lock_only,
             omit,
+            include,
+            no_package_lock,
+            package_lock,
+            dry_run,
+            os,
+            cpu,
+            libc,
+            no_audit,
+            audit,
+            no_fund,
+            fund,
+            workspace_root,
+            workspace,
+            workspaces,
             legacy_peer_deps: _,
             strict_peer_deps: _,
         } => {
-            let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
+            let (omit_dev, omit_optional, omit_peer) = parse_omit_and_include_options(&omit, &include);
+            let package_lock_val = if no_package_lock || package_lock == Some(false) {
+                false
+            } else {
+                package_lock.unwrap_or(true)
+            };
+            let audit_val = if no_audit || audit == Some(false) {
+                false
+            } else {
+                audit.unwrap_or(true)
+            };
+            let fund_val = if no_fund || fund == Some(false) {
+                false
+            } else {
+                fund.unwrap_or(true)
+            };
+
             let options = InstallOptions {
-                project_dir: current_dir,
-                registry_url: registry,
+                project_dir: current_dir.clone(),
+                registry_url: registry.clone(),
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
@@ -907,15 +1130,48 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 no_save,
                 package_lock_only,
                 packages,
+                include,
+                package_lock: package_lock_val,
+                no_package_lock,
+                dry_run,
+                os,
+                cpu,
+                libc,
+                audit: audit_val,
+                fund: fund_val,
+                workspace_root,
+                workspace,
+                workspaces,
             };
 
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
 
-            println!(
-                "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
-                summary.packages_installed, summary.cache_hits, summary.cache_misses
-            );
+            if dry_run {
+                println!(
+                    "rnpm: dry-run: would install {} package(s)",
+                    summary.packages_installed
+                );
+            } else {
+                println!(
+                    "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
+                    summary.packages_installed, summary.cache_hits, summary.cache_misses
+                );
+
+                if fund_val {
+                    let count = audit::count_funding_packages(&current_dir);
+                    if count > 0 {
+                        println!(
+                            "\n{} packages are looking for funding\n  run `rnpm fund`",
+                            count
+                        );
+                    }
+                }
+
+                if audit_val {
+                    let _ = audit::run_post_install_audit(&current_dir, registry).await;
+                }
+            }
         }
         Commands::Ci {
             registry,
@@ -923,14 +1179,44 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             offline,
             ignore_scripts,
             omit,
+            include,
+            no_package_lock,
+            package_lock,
+            dry_run,
+            os,
+            cpu,
+            libc,
+            no_audit,
+            audit,
+            no_fund,
+            fund,
+            workspace_root,
+            workspace,
+            workspaces,
             legacy_peer_deps: _,
             strict_peer_deps: _,
             package_lock_only,
         } => {
-            let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
+            let (omit_dev, omit_optional, omit_peer) = parse_omit_and_include_options(&omit, &include);
+            let package_lock_val = if no_package_lock || package_lock == Some(false) {
+                false
+            } else {
+                package_lock.unwrap_or(true)
+            };
+            let audit_val = if no_audit || audit == Some(false) {
+                false
+            } else {
+                audit.unwrap_or(true)
+            };
+            let fund_val = if no_fund || fund == Some(false) {
+                false
+            } else {
+                fund.unwrap_or(true)
+            };
+
             let options = InstallOptions {
-                project_dir: current_dir,
-                registry_url: registry,
+                project_dir: current_dir.clone(),
+                registry_url: registry.clone(),
                 cache_dir: cache,
                 offline,
                 ignore_scripts,
@@ -938,16 +1224,49 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit_optional,
                 omit_peer,
                 package_lock_only,
+                include,
+                package_lock: package_lock_val,
+                no_package_lock,
+                dry_run,
+                os,
+                cpu,
+                libc,
+                audit: audit_val,
+                fund: fund_val,
+                workspace_root,
+                workspace,
+                workspaces,
                 ..Default::default()
             };
 
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
 
-            println!(
-                "rnpm: successfully verified and installed {} package(s) from lockfile",
-                summary.packages_installed
-            );
+            if dry_run {
+                println!(
+                    "rnpm: dry-run: would install {} package(s)",
+                    summary.packages_installed
+                );
+            } else {
+                println!(
+                    "rnpm: successfully verified and installed {} package(s) from lockfile",
+                    summary.packages_installed
+                );
+
+                if fund_val {
+                    let count = audit::count_funding_packages(&current_dir);
+                    if count > 0 {
+                        println!(
+                            "\n{} packages are looking for funding\n  run `rnpm fund`",
+                            count
+                        );
+                    }
+                }
+
+                if audit_val {
+                    let _ = audit::run_post_install_audit(&current_dir, registry).await;
+                }
+            }
         }
         Commands::Test { args } => {
             execute_run(
@@ -958,6 +1277,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                false,
                 false,
                 false,
             ).await?;
@@ -973,6 +1293,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 false,
                 false,
+                false,
             ).await?;
         }
         Commands::Restart { args } => {
@@ -984,6 +1305,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                false,
                 false,
                 false,
             ).await?;
@@ -999,6 +1321,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 false,
                 false,
+                false,
             ).await?;
         }
         Commands::Run {
@@ -1010,6 +1333,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             scope,
             if_present,
             ignore_scripts,
+            workspace_root,
         } => {
             execute_run(
                 current_dir,
@@ -1021,6 +1345,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 scope,
                 if_present,
                 ignore_scripts,
+                workspace_root,
             ).await?;
         }
         Commands::Exec {
@@ -1282,13 +1607,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         }
         Commands::Prune {
             omit,
+            include,
             production,
             dry_run,
             json,
         } => {
-            let (mut omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
+            let (mut omit_dev, omit_optional, omit_peer) = parse_omit_and_include_options(&omit, &include);
             if production {
-                omit_dev = true;
+                let has_dev_included = include.iter().any(|val| {
+                    val.split(',').any(|part| {
+                        let t = part.trim().to_ascii_lowercase();
+                        t == "dev" || t == "development"
+                    })
+                });
+                if !has_dev_included {
+                    omit_dev = true;
+                }
             }
             let prune_options = rnpm_install::prune::PruneOptions {
                 project_dir: current_dir.clone(),
