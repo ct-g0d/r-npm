@@ -381,37 +381,6 @@ pub(crate) enum Commands {
         cache: Option<PathBuf>,
     },
 
-    /// Create a package.json file or run an initializer
-    #[command(alias = "create", alias = "innit")]
-    Init {
-        /// Initializer package or template (e.g. react-app, @scope/pkg, vite)
-        initializer: Option<String>,
-
-        /// Arguments forwarded to initializer binary
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-
-        /// Generate package.json with defaults without prompting
-        #[arg(short = 'y', long = "yes", short_alias = 'f', alias = "force")]
-        yes: bool,
-
-        /// Scope to prefix package name with (e.g. @myorg or myorg)
-        #[arg(long)]
-        scope: Option<String>,
-
-        /// Custom npm registry URL
-        #[arg(long)]
-        registry: Option<String>,
-
-        /// Cache directory path
-        #[arg(long)]
-        cache: Option<PathBuf>,
-
-        /// Offline mode (only use cache)
-        #[arg(long)]
-        offline: bool,
-    },
-
     /// Compare package versions, tarballs, or directories
     Diff {
         /// Specs to compare (positional arguments, 0 to 2)
