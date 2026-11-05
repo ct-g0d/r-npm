@@ -177,7 +177,7 @@ use tokio::net::TcpListener;
 
     #[test]
     fn test_unsupported_flags_gate_e_diagnostics() {
-        let flags = ["--global", "-g"];
+        let flags = ["--save-bundle", "--production"];
         for flag in flags {
             let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
             assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
@@ -186,6 +186,12 @@ use tokio::net::TcpListener;
             assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
             assert!(msg.contains(&format!("The flag '{flag}' is not supported by rnpm.")));
         }
+
+        // --global and -g are supported on install and uninstall
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--global"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "-g"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "uninstall", "--global"]).is_none());
+        assert!(check_unsupported_cli_invocation(vec!["rnpm", "uninstall", "-g"]).is_none());
 
         // --legacy-peer-deps and --strict-peer-deps are supported on install, but unsupported on commands like audit/pack
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none());
@@ -769,8 +775,6 @@ use tokio::net::TcpListener;
     #[tokio::test]
     async fn test_cli_unsupported_flags_filtering() {
         let test_flags = [
-            "--global",
-            "-g",
             "--save-bundle",
             "--production",
         ];
@@ -876,6 +880,7 @@ use tokio::net::TcpListener;
                 save_peer: false,
                 no_save: false,
                 package_lock_only: false,
+                global: false,
             },
         };
 
@@ -1406,6 +1411,7 @@ use tokio::net::TcpListener;
     }
 
     #[test]
+    #[test]
     fn test_cli_parse_publish_flags() {
         let parsed = Cli::try_parse_from([
             "rnpm", "publish",
@@ -1540,4 +1546,120 @@ use tokio::net::TcpListener;
         let diag3 = classify_error(&forbid_err);
         assert_eq!(diag3.code, "E403");
         assert!(diag3.message.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_thread5_cli_command_parsing() {
+        // 1. config set / get / delete / list
+        let cli = Cli::try_parse_from(["rnpm", "config", "set", "foo", "bar"]).unwrap();
+        match cli.command {
+            Commands::Config { action: ConfigAction::Set { key, value, global, .. } } => {
+                assert_eq!(key, "foo");
+                assert_eq!(value, "bar");
+                assert!(!global);
+            }
+            _ => panic!("Expected Config Set"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "config", "set", "foo", "bar", "--global"]).unwrap();
+        match cli.command {
+            Commands::Config { action: ConfigAction::Set { global, .. } } => {
+                assert!(global);
+            }
+            _ => panic!("Expected Config Set with global"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "config", "get", "foo"]).unwrap();
+        match cli.command {
+            Commands::Config { action: ConfigAction::Get { key } } => {
+                assert_eq!(key, "foo");
+            }
+            _ => panic!("Expected Config Get"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "config", "delete", "foo", "-g"]).unwrap();
+        match cli.command {
+            Commands::Config { action: ConfigAction::Delete { key, global, .. } } => {
+                assert_eq!(key, "foo");
+                assert!(global);
+            }
+            _ => panic!("Expected Config Delete"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "config", "list", "--json"]).unwrap();
+        match cli.command {
+            Commands::Config { action: ConfigAction::List { json } } => {
+                assert!(json);
+            }
+            _ => panic!("Expected Config List"),
+        }
+
+        // 2. link and unlink
+        let cli = Cli::try_parse_from(["rnpm", "link"]).unwrap();
+        match cli.command {
+            Commands::Link { package } => assert_eq!(package, None),
+            _ => panic!("Expected bare Link"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "link", "my-pkg"]).unwrap();
+        match cli.command {
+            Commands::Link { package } => assert_eq!(package, Some("my-pkg".to_string())),
+            _ => panic!("Expected Link with package"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "unlink"]).unwrap();
+        match cli.command {
+            Commands::Unlink { package } => assert_eq!(package, None),
+            _ => panic!("Expected bare Unlink"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "unlink", "my-pkg"]).unwrap();
+        match cli.command {
+            Commands::Unlink { package } => assert_eq!(package, Some("my-pkg".to_string())),
+            _ => panic!("Expected Unlink with package"),
+        }
+
+        // 3. prefix, root, bin
+        let cli = Cli::try_parse_from(["rnpm", "prefix"]).unwrap();
+        match cli.command {
+            Commands::Prefix { global } => assert!(!global),
+            _ => panic!("Expected Prefix"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "prefix", "-g"]).unwrap();
+        match cli.command {
+            Commands::Prefix { global } => assert!(global),
+            _ => panic!("Expected Prefix -g"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "root", "--global"]).unwrap();
+        match cli.command {
+            Commands::Root { global } => assert!(global),
+            _ => panic!("Expected Root --global"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "bin", "-g"]).unwrap();
+        match cli.command {
+            Commands::Bin { global } => assert!(global),
+            _ => panic!("Expected Bin -g"),
+        }
+
+        // 4. install -g and uninstall -g
+        let cli = Cli::try_parse_from(["rnpm", "install", "-g", "cowsay"]).unwrap();
+        match cli.command {
+            Commands::Install { global, packages, .. } => {
+                assert!(global);
+                assert_eq!(packages, vec!["cowsay"]);
+            }
+            _ => panic!("Expected Install -g"),
+        }
+
+        let cli = Cli::try_parse_from(["rnpm", "uninstall", "--global", "cowsay"]).unwrap();
+        match cli.command {
+            Commands::Uninstall { global, packages, .. } => {
+                assert!(global);
+                assert_eq!(packages, vec!["cowsay"]);
+            }
+            _ => panic!("Expected Uninstall -g"),
+        }
     }

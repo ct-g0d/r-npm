@@ -271,31 +271,61 @@ pub fn create_shims(
     fs::create_dir_all(bin_dir)
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
-    // 1. POSIX shell script
-    let posix_path = bin_dir.join(bin_name);
-    let posix_content = generate_posix_shim(target_rel_from_node_modules);
-    fs::write(&posix_path, posix_content)
-        .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
+    let is_dot_bin = bin_dir.file_name().map_or(false, |f| f == ".bin");
+    if is_dot_bin {
+        // 1. POSIX shell script
+        let posix_path = bin_dir.join(bin_name);
+        let posix_content = generate_posix_shim(target_rel_from_node_modules);
+        fs::write(&posix_path, posix_content)
+            .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&posix_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&posix_path, perms)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&posix_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&posix_path, perms)?;
+        }
+
+        // 2. Windows cmd wrapper
+        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
+        let cmd_content = generate_cmd_shim(target_rel_from_node_modules);
+        fs::write(&cmd_path, cmd_content)
+            .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
+
+        // 3. PowerShell wrapper
+        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
+        let ps1_content = generate_ps1_shim(target_rel_from_node_modules);
+        fs::write(&ps1_path, ps1_content)
+            .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
+    } else {
+        // Global bin directory (Windows: %APPDATA%/npm, Unix: /usr/local/bin)
+        let rel_path = if cfg!(windows) {
+            format!("node_modules/{target_rel_from_node_modules}")
+        } else {
+            format!("../lib/node_modules/{target_rel_from_node_modules}")
+        };
+        let content = generator::generate_shim_content(&rel_path, None);
+
+        let posix_path = bin_dir.join(bin_name);
+        fs::write(&posix_path, content.sh)
+            .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&posix_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&posix_path, perms)?;
+        }
+
+        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
+        fs::write(&cmd_path, content.cmd)
+            .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
+
+        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
+        fs::write(&ps1_path, content.ps1)
+            .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
     }
-
-    // 2. Windows cmd wrapper
-    let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
-    let cmd_content = generate_cmd_shim(target_rel_from_node_modules);
-    fs::write(&cmd_path, cmd_content)
-        .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
-
-    // 3. PowerShell wrapper
-    let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
-    let ps1_content = generate_ps1_shim(target_rel_from_node_modules);
-    fs::write(&ps1_path, ps1_content)
-        .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
 
     Ok(())
 }

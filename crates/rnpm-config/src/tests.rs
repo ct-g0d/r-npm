@@ -706,3 +706,92 @@ fn test_env_vars_and_cli_overrides() {
     assert_eq!(loaded_cli.get("proxy"), Some("http://cli.proxy:9000"));
     assert_eq!(loaded_cli.get("https-proxy"), Some("https://proxy.corp:8443"));
 }
+
+#[test]
+fn test_config_file_set_and_delete() {
+    use crate::{delete_config_value_from_file, set_config_value_in_file};
+
+    let dir = tempdir().unwrap();
+    let npmrc_path = dir.path().join(".npmrc");
+
+    // Setting a new key creates file
+    set_config_value_in_file(&npmrc_path, "registry", "https://custom.registry.com/").unwrap();
+    let content = fs::read_to_string(&npmrc_path).unwrap();
+    assert!(content.contains("registry=https://custom.registry.com/"));
+
+    // Setting another key appends
+    set_config_value_in_file(&npmrc_path, "save-exact", "true").unwrap();
+    let content = fs::read_to_string(&npmrc_path).unwrap();
+    assert!(content.contains("save-exact=true"));
+
+    // Updating existing key replaces in place
+    set_config_value_in_file(&npmrc_path, "registry", "https://updated.registry.com/").unwrap();
+    let content = fs::read_to_string(&npmrc_path).unwrap();
+    assert!(content.contains("registry=https://updated.registry.com/"));
+    assert!(!content.contains("https://custom.registry.com/"));
+
+    // Deleting a key removes it
+    let deleted = delete_config_value_from_file(&npmrc_path, "save-exact").unwrap();
+    assert!(deleted);
+    let content = fs::read_to_string(&npmrc_path).unwrap();
+    assert!(!content.contains("save-exact"));
+    assert!(content.contains("registry=https://updated.registry.com/"));
+
+    // Deleting nonexistent key returns false
+    let not_deleted = delete_config_value_from_file(&npmrc_path, "nonexistent").unwrap();
+    assert!(!not_deleted);
+}
+
+#[test]
+fn test_config_detailed_and_paths() {
+    use std::path::PathBuf;
+    use crate::{
+        find_global_bin_dir, find_global_node_modules, find_global_prefix_with_env,
+        find_local_bin_dir, find_local_node_modules, find_local_prefix, Config, ConfigOptions,
+    };
+
+    let dir = tempdir().unwrap();
+    let proj_dir = dir.path().join("my-app");
+    fs::create_dir_all(&proj_dir).unwrap();
+    fs::write(proj_dir.join("package.json"), r#"{"name": "my-app"}"#).unwrap();
+
+    // Local path resolution
+    let local_pref = find_local_prefix(&proj_dir);
+    assert_eq!(local_pref, proj_dir);
+    let local_nm = find_local_node_modules(&proj_dir);
+    assert_eq!(local_nm, proj_dir.join("node_modules"));
+    let local_bin = find_local_bin_dir(&proj_dir);
+    assert_eq!(local_bin, proj_dir.join("node_modules").join(".bin"));
+
+    // Global path resolution with env mock
+    let mock_prefix = PathBuf::from(r"D:\custom-npm-prefix");
+    let global_pref = find_global_prefix_with_env(|var| {
+        if var == "PREFIX" {
+            Some(mock_prefix.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(global_pref, mock_prefix);
+
+    let global_bin = find_global_bin_dir(&mock_prefix);
+    #[cfg(windows)]
+    assert_eq!(global_bin, mock_prefix);
+    #[cfg(not(windows))]
+    assert_eq!(global_bin, mock_prefix.join("bin"));
+
+    let global_nm = find_global_node_modules(&mock_prefix);
+    #[cfg(windows)]
+    assert_eq!(global_nm, mock_prefix.join("node_modules"));
+    #[cfg(not(windows))]
+    assert_eq!(global_nm, mock_prefix.join("lib").join("node_modules"));
+
+    // Detailed config report
+    fs::write(proj_dir.join(".npmrc"), "my-key = my-val\n").unwrap();
+    let opts = ConfigOptions::new().project_dir(&proj_dir);
+    let detailed = Config::load_detailed(opts).unwrap();
+    assert_eq!(detailed.effective.get("my-key").unwrap(), "my-val");
+    let formatted = detailed.format_text();
+    assert!(formatted.contains("my-key = \"my-val\""));
+    assert!(formatted.contains("npm local prefix ="));
+}

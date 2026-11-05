@@ -14,7 +14,7 @@
 
 ### Active Command Matrix & Aliases
 - `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3.
-  - Flags: `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `-S`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`, `--omit` (`dev`, `optional`, `peer`), `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--registry`, `--cache`, scoped registries (`--@scope:registry=...`, `@scope:registry=...`).
+  - Flags: `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `-S`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`, `--omit` (`dev`, `optional`, `peer`), `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--registry`, `--cache`, scoped registries (`--@scope:registry=...`, `@scope:registry=...`), `--global` (`-g`).
 - `ci` / `clean-install` (aliases: `clean-install`, `ic`): Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination (`ELOCKFILE_DRIFT`) and zero network/filesystem side effects.
   - Flags: `--omit` (`dev`, `optional`, `peer`), `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--package-lock-only`, `--registry`, `--cache`.
 - `test` (aliases: `t`, `tst`): Dedicated shortcut to execute package `test` script defined in `package.json`, passing arbitrary trailing arguments through to the underlying runner.
@@ -29,7 +29,7 @@
 - `pack`: Package project files into a canonical npm-compatible `.tgz` archive with npm ignore/files filtering.
   - Flags: `--dry-run`, `--json`, `--pack-destination`.
 - `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile, and clean empty scope directories.
-  - Flags: `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`).
+  - Flags: `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`), `--global` (`-g`).
 - `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies, clean superseded packages, and update package.json/lockfile.
   - Flags: `--registry`, `--cache`, `--offline`, `--ignore-scripts`, `--legacy-peer-deps`.
 - `prune`: Remove extraneous packages from `node_modules` not reachable from `package.json` manifest declarations or pruned by omit flags.
@@ -37,6 +37,12 @@
 - `pkg`: Programmatically inspect, mutate, or delete properties in `package.json` with dot-notated field path expressions.
   - Subcommands: `get <field...>`, `set <key>=<val...>`, `delete <field...>`.
   - Flags: `--prefix`, `--json`.
+- `config` (alias: `c`): Configuration management: `set <key> <value> [--global]`, `get <key>`, `delete <key> [--global]`, `list [--json]`.
+- `link` (alias: `ln`): Global package linking (`npm link` creates a global link and bin shims in global prefix; `npm link <pkg>` links from global prefix into local project).
+- `unlink`: Unlink global package entry (`npm unlink`) or local consumer reference (`npm unlink <pkg>`).
+- `prefix`: Print local project prefix directory or global prefix (`--global`, `-g`).
+- `root`: Print local or global `node_modules` directory (`--global`, `-g`).
+- `bin`: Print local executable bin folder (`node_modules/.bin`) or global bin directory (`--global`, `-g`).
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
@@ -68,7 +74,7 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the active scope of `rnpm` (e.g., `--global`, `-g`, `--save-bundle`, `--production` on install) terminate immediately with exit code `1` and a structured diagnostic:
+Flags not supported or outside the scope of `rnpm` (e.g., `--save-bundle`, `--production` on non-prune commands) terminate immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_FLAG
 npm error The flag '<flag>' is not supported by rnpm.

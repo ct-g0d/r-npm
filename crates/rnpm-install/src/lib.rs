@@ -28,6 +28,9 @@ use rnpm_solver::graph::DependencyGraph;
 pub mod git;
 pub use git::GitFetcher;
 
+pub mod link;
+pub use link::*;
+
 pub mod prune;
 pub use prune::{
     analyze_reachability, discover_extraneous_packages, execute_prune,
@@ -327,9 +330,12 @@ pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) 
     Ok(())
 }
 
-fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path) -> PathBuf {
+fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path, root_node_modules: &Path) -> PathBuf {
     let mut curr = dest_dir.parent();
     while let Some(p) = curr {
+        if p == root_node_modules {
+            return root_bin_dir.to_path_buf();
+        }
         if p.file_name().map(|n| n == "node_modules").unwrap_or(false) {
             return p.join(".bin");
         }
@@ -358,6 +364,7 @@ pub struct InstallOptions {
     pub omit_peer: bool,
     pub legacy_peer_deps: bool,
     pub strict_peer_deps: bool,
+    pub is_global: bool,
 }
 
 impl Default for InstallOptions {
@@ -381,6 +388,7 @@ impl Default for InstallOptions {
             omit_peer: false,
             legacy_peer_deps: false,
             strict_peer_deps: false,
+            is_global: false,
         }
     }
 }
@@ -497,6 +505,16 @@ pub struct Installer {
 impl Installer {
     pub fn new(options: InstallOptions) -> Result<Self> {
         let root_dir = &options.project_dir;
+        if options.is_global && !root_dir.join("package.json").exists() {
+            let _ = std::fs::create_dir_all(root_dir);
+            let minimal_pkg = serde_json::json!({
+                "name": "global-packages",
+                "version": "1.0.0",
+                "private": true,
+                "dependencies": {}
+            });
+            let _ = std::fs::write(root_dir.join("package.json"), serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default());
+        }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
 
         let registry_url = if let Some(ref reg_str) = options.registry_url {
@@ -953,10 +971,23 @@ impl Installer {
         }
 
         // 2. Build proper nested node_modules trees and lockfile v3 from solver graph
-        let node_modules_dir = self.options.project_dir.join("node_modules");
-        let root_bin_dir = node_modules_dir.join(".bin");
+        let (node_modules_dir, root_bin_dir, loc_base_dir) = if self.options.is_global {
+            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+            let base = if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            };
+            (nm, bin, base)
+        } else {
+            let nm = self.options.project_dir.join("node_modules");
+            let bin = nm.join(".bin");
+            let base = self.options.project_dir.clone();
+            (nm, bin, base)
+        };
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
-        std::fs::create_dir_all(&root_bin_dir).context("Failed to create node_modules/.bin")?;
+        std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
 
         let mut cache_hits = 0;
         let mut cache_misses = 0;
@@ -981,7 +1012,7 @@ impl Installer {
             }
 
             if node.flags.link {
-                let link_target = self.options.project_dir.join(loc);
+                let link_target = loc_base_dir.join(loc);
                 if let Some(parent) = link_target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -1002,7 +1033,7 @@ impl Installer {
 
                 packages_installed += 1;
 
-                let bin_dir = find_enclosing_bin_dir(&link_target, &root_bin_dir);
+                let bin_dir = find_enclosing_bin_dir(&link_target, &root_bin_dir, &node_modules_dir);
                 std::fs::create_dir_all(&bin_dir)?;
                 let manifest_path = source_path.join("package.json");
                 if let Ok(m) = Manifest::from_file(&manifest_path) {
@@ -1025,11 +1056,11 @@ impl Installer {
                 continue;
             }
 
-            let dest_dir = self.options.project_dir.join(loc);
+            let dest_dir = loc_base_dir.join(loc);
             if let Some(parent) = dest_dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin_dir);
+            let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
             std::fs::create_dir_all(&bin_dir)?;
 
             if let Some(ref res) = node.resolved {
@@ -1217,8 +1248,9 @@ impl Installer {
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache.clone();
                 let registry_client = self.registry_client.clone();
-                let project_dir = self.options.project_dir.clone();
+                let project_dir = loc_base_dir.clone();
                 let root_bin = root_bin_dir.clone();
+                let root_nm = node_modules_dir.clone();
                 let offline = self.options.offline;
 
                 join_set.spawn(async move {
@@ -1228,7 +1260,7 @@ impl Installer {
                     if let Some(parent) = dest_dir.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin);
+                    let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin, &root_nm);
                     std::fs::create_dir_all(&bin_dir)?;
 
                     let resolved_url = node.resolved.as_ref().ok_or_else(|| {
@@ -1647,8 +1679,21 @@ impl Installer {
         }
 
         // Clean-slate: remove node_modules completely using junction-safe removal
-        let node_modules_dir = self.options.project_dir.join("node_modules");
-        let bin_dir = node_modules_dir.join(".bin");
+        let (node_modules_dir, bin_dir, loc_base_dir) = if self.options.is_global {
+            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+            let base = if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            };
+            (nm, bin, base)
+        } else {
+            let nm = self.options.project_dir.join("node_modules");
+            let bin = nm.join(".bin");
+            let base = self.options.project_dir.clone();
+            (nm, bin, base)
+        };
         if node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false) {
             rnpm_fs::remove_dir_all_safe(&node_modules_dir)?;
         }
@@ -1856,9 +1901,9 @@ impl Installer {
             rnpm_fs::validate_entry_path(Path::new(pkg_key))
                 .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
 
-            let full_target = self.options.project_dir.join(pkg_key);
+            let full_target = loc_base_dir.join(pkg_key);
             let cleaned = path_clean::clean(&full_target);
-            if !cleaned.starts_with(&self.options.project_dir) {
+            if !cleaned.starts_with(&loc_base_dir) {
                 return Err(anyhow!("Package path '{cleaned:?}' escapes project boundary"));
             }
             if !cleaned.starts_with(&node_modules_dir) {
@@ -1912,7 +1957,7 @@ impl Installer {
                 packages_installed += 1;
                 cache_hits += 1;
 
-                let target_bin_dir = find_enclosing_bin_dir(&full_target, &bin_dir);
+                let target_bin_dir = find_enclosing_bin_dir(&full_target, &bin_dir, &node_modules_dir);
                 let _ = std::fs::create_dir_all(&target_bin_dir);
 
                 let pkg_manifest_path = full_target.join("package.json");
@@ -2018,7 +2063,7 @@ impl Installer {
                     }
                 }
 
-                let target_path = self.options.project_dir.join(pkg_key);
+                let target_path = loc_base_dir.join(pkg_key);
                 extract_and_replace(Cursor::new(&bytes), &target_path, None)
                     .map_err(|e| anyhow!("Failed to extract local archive {pkg_key}: {e}"))?;
 
@@ -3045,8 +3090,21 @@ impl Installer {
             }
         }
 
-        let node_modules_dir = self.options.project_dir.join("node_modules");
-        let bin_dir = node_modules_dir.join(".bin");
+        let (node_modules_dir, bin_dir, _loc_base_dir) = if self.options.is_global {
+            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+            let base = if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            };
+            (nm, bin, base)
+        } else {
+            let nm = self.options.project_dir.join("node_modules");
+            let bin = nm.join(".bin");
+            let base = self.options.project_dir.clone();
+            (nm, bin, base)
+        };
         std::fs::create_dir_all(&node_modules_dir)?;
 
         let mut cache_hits = 0;
@@ -3278,7 +3336,18 @@ impl Installer {
     pub fn uninstall(&self, options: &UninstallOptions) -> Result<UninstallSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
-            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+            if options.is_global || self.options.is_global {
+                let minimal_pkg = serde_json::json!({
+                    "name": "global-packages",
+                    "version": "1.0.0",
+                    "private": true,
+                    "dependencies": {}
+                });
+                let _ = std::fs::create_dir_all(&self.options.project_dir);
+                let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default());
+            } else {
+                return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+            }
         }
 
         let mut manifest = Manifest::from_file(&manifest_path)
@@ -3324,6 +3393,8 @@ impl Installer {
                 }
 
             if removed {
+                removed_packages.push(pkg.to_string());
+            } else if options.is_global || self.options.is_global {
                 removed_packages.push(pkg.to_string());
             }
         }
@@ -3382,8 +3453,21 @@ impl Installer {
         }
 
         // Remove deleted package directories from node_modules
-        let node_modules_dir = self.options.project_dir.join("node_modules");
-        let bin_dir = node_modules_dir.join(".bin");
+        let (_node_modules_dir, bin_dir, loc_base_dir) = if options.is_global || self.options.is_global {
+            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+            let base = if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            };
+            (nm, bin, base)
+        } else {
+            let nm = self.options.project_dir.join("node_modules");
+            let bin = nm.join(".bin");
+            let base = self.options.project_dir.clone();
+            (nm, bin, base)
+        };
 
         // Clean direct removed packages and all pruned lockfile nodes
         let mut dirs_to_remove = HashSet::new();
@@ -3399,7 +3483,7 @@ impl Installer {
         sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         for rel_dir in sorted_dirs {
-            let target_path = self.options.project_dir.join(&rel_dir);
+            let target_path = loc_base_dir.join(&rel_dir);
             let is_junc = is_junction(&target_path).unwrap_or(false);
             if target_path.exists() || is_junc {
                 // Remove shims from .bin if package had bin entries
@@ -3440,7 +3524,7 @@ impl Installer {
         }
 
         // Clean up .bin if empty
-        if bin_dir.exists() {
+        if bin_dir.exists() && bin_dir.file_name().map_or(false, |f| f == ".bin") {
             if let Ok(mut entries) = std::fs::read_dir(&bin_dir) {
                 if entries.next().is_none() {
                     let _ = std::fs::remove_dir(&bin_dir);
@@ -3478,6 +3562,7 @@ pub struct UninstallOptions {
     pub save_dev: bool,
     pub save_optional: bool,
     pub save_prod: bool,
+    pub is_global: bool,
 }
 
 /// Result of an uninstall run.

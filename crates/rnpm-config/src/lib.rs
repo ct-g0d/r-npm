@@ -5,8 +5,11 @@ pub mod error;
 pub mod npmrc;
 
 pub use config::{
-    find_global_npmrc, find_global_npmrc_with_env, find_user_npmrc, find_user_npmrc_with_env,
-    find_workspace_root, Config, ConfigOptions,
+    delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
+    find_global_npmrc, find_global_npmrc_with_env, find_global_prefix, find_global_prefix_with_env,
+    find_local_bin_dir, find_local_node_modules, find_local_prefix, find_user_npmrc,
+    find_user_npmrc_with_env, find_workspace_root, get_default_global_npmrc, get_default_user_npmrc,
+    set_config_value_in_file, Config, ConfigDetailed, ConfigLayer, ConfigOptions,
 };
 pub use error::ConfigError;
 pub use npmrc::{
