@@ -2,7 +2,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, ETAG, IF_NONE_MATCH,
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
     LOCATION, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode};
@@ -943,6 +943,23 @@ impl RegistryClient {
         Ok((resp, permit))
     }
 
+    /// Execute a request with an explicit body, content-type, and optional OTP header under semaphore permit.
+    pub async fn execute_with_body_permit(
+        &self,
+        method: Method,
+        initial_url: Url,
+        content_type: Option<&str>,
+        accept_header: Option<&str>,
+        otp: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
+        let permit = self.acquire_permit().await?;
+        let resp = self
+            .execute_request_loop_with_body(method, initial_url, content_type, accept_header, otp, body)
+            .await?;
+        Ok((resp, permit))
+    }
+
     /// Internal request dispatch loop with redirect security policy, circuit breaking, and retry backoff.
     async fn execute_request_loop(
         &self,
@@ -1131,6 +1148,221 @@ impl RegistryClient {
                 }
                 Err(err) => {
                     // Check if network error is transient and retryable
+                    if err.is_transient() && attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                            .min(self.config.max_retry_backoff);
+                        debug!(
+                            "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
+                            err, initial_url, delay, attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    } else {
+                        if self.config.circuit_breaker_enabled && err.is_transient() {
+                            self.circuit_breaker.record_failure(&host_key).await;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal request dispatch loop with body, content-type, and optional OTP.
+    async fn execute_request_loop_with_body(
+        &self,
+        method: Method,
+        initial_url: Url,
+        content_type: Option<&str>,
+        accept_header: Option<&str>,
+        otp: Option<&str>,
+        body: Vec<u8>,
+    ) -> Result<Response, RegistryError> {
+        let host_key = if let Some(port) = initial_url.port() {
+            format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        } else {
+            initial_url.host_str().unwrap_or_default().to_ascii_lowercase()
+        };
+
+        if self.config.circuit_breaker_enabled {
+            let state = self.circuit_breaker.check_state(&host_key).await;
+            if state == CircuitBreakerState::Open {
+                return Err(RegistryError::CircuitBreakerOpen {
+                    host: host_key,
+                });
+            }
+        }
+
+        let mut attempt = 0;
+
+        loop {
+            let mut current_url = initial_url.clone();
+            let mut redirect_count = 0;
+            let mut seen_redirect_urls: HashSet<Url> = HashSet::new();
+            seen_redirect_urls.insert(current_url.clone());
+
+            let response_result: Result<Response, RegistryError> = loop {
+                let mut req = self.client.request(method.clone(), current_url.clone());
+
+                if let Some(ct) = content_type {
+                    req = req.header(CONTENT_TYPE, ct);
+                }
+
+                if let Some(accept) = accept_header {
+                    req = req.header(ACCEPT, accept);
+                }
+
+                if let Some(otp_code) = otp {
+                    req = req.header("npm-otp", otp_code);
+                }
+
+                // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts)
+                let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
+
+                if should_send_auth {
+                    if let Some(token) = self.auth_token_for_url(&current_url) {
+                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    }
+                } else {
+                    debug!(
+                        "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
+                        initial_url, current_url
+                    );
+                }
+
+                req = req.body(body.clone());
+
+                let resp = match req.send().await {
+                    Ok(r) => r,
+                    Err(e) => break Err(RegistryError::Http(e)),
+                };
+
+                let status = resp.status();
+
+                if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
+                    redirect_count += 1;
+                    if redirect_count > MAX_REDIRECTS {
+                        break Err(RegistryError::TooManyRedirects(MAX_REDIRECTS));
+                    }
+
+                    if let Some(location) = resp.headers().get(LOCATION) {
+                        let loc_str = match location.to_str() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                break Err(RegistryError::SecurityViolation(
+                                    "Invalid characters in redirect Location header".into(),
+                                ))
+                            }
+                        };
+                        if loc_str.contains('\r') || loc_str.contains('\n') {
+                            break Err(RegistryError::SecurityViolation(
+                                "Location header contains forbidden CR/LF characters".into(),
+                            ));
+                        }
+                        let next_url = match current_url.join(loc_str) {
+                            Ok(u) => u,
+                            Err(e) => break Err(RegistryError::UrlParse(e)),
+                        };
+                        let next_scheme = next_url.scheme().to_ascii_lowercase();
+                        if next_scheme != "http" && next_scheme != "https" {
+                            break Err(RegistryError::SecurityViolation(format!(
+                                "Redirect to unsupported scheme '{next_scheme}': only http and https are allowed"
+                            )));
+                        }
+                        if !seen_redirect_urls.insert(next_url.clone()) {
+                            break Err(RegistryError::SecurityViolation(format!(
+                                "Redirect loop detected: '{next_url}' was visited more than once"
+                            )));
+                        }
+                        debug!("Following redirect {} -> {}", current_url, next_url);
+                        current_url = next_url;
+                        continue;
+                    } else {
+                        break Err(RegistryError::ServerError {
+                            status: status.as_u16(),
+                            body: "Redirect response missing Location header".into(),
+                        });
+                    }
+                }
+
+                break Ok(resp);
+            };
+
+            match response_result {
+                Ok(resp) => {
+                    let status = resp.status();
+
+                    let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
+                    let is_retryable_server_error = self.config.retry_on_status.contains(&status.as_u16())
+                        || status.is_server_error();
+
+                    if is_rate_limited {
+                        let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
+
+                        let within_backoff_budget = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs) <= self.config.max_retry_backoff
+                        } else {
+                            true
+                        };
+
+                        if within_backoff_budget && attempt < self.config.max_retries {
+                            let delay = if let Some(secs) = retry_after_secs {
+                                Duration::from_secs(secs)
+                            } else {
+                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                                    .min(self.config.max_retry_backoff)
+                            };
+                            debug!(
+                                "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
+                                initial_url, delay, attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
+                            return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
+                        }
+                    } else if is_retryable_server_error {
+                        let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
+
+                        let within_backoff_budget = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs) <= self.config.max_retry_backoff
+                        } else {
+                            true
+                        };
+
+                        if within_backoff_budget && attempt < self.config.max_retries {
+                            let delay = if let Some(secs) = retry_after_secs {
+                                Duration::from_secs(secs)
+                            } else {
+                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
+                                    .min(self.config.max_retry_backoff)
+                            };
+                            debug!(
+                                "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
+                                status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        } else {
+                            if self.config.circuit_breaker_enabled {
+                                self.circuit_breaker.record_failure(&host_key).await;
+                            }
+                            return Ok(resp);
+                        }
+                    }
+
+                    if self.config.circuit_breaker_enabled {
+                        self.circuit_breaker.record_success(&host_key).await;
+                    }
+                    return Ok(resp);
+                }
+                Err(err) => {
                     if err.is_transient() && attempt < self.config.max_retries {
                         let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
                             .min(self.config.max_retry_backoff);
@@ -1997,6 +2229,253 @@ impl RegistryClient {
             .into_iter()
             .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
             .collect()
+    }
+
+    /// Publish a package to its assigned registry (scoped or default).
+    pub async fn publish(
+        &self,
+        package_name: &str,
+        publish_payload: &serde_json::Value,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        let registry = self.registry_for_package(package_name);
+        self.publish_to(registry, package_name, publish_payload, otp).await
+    }
+
+    /// Publish a package to a specific registry URL.
+    pub async fn publish_to(
+        &self,
+        registry: &Url,
+        package_name: &str,
+        publish_payload: &serde_json::Value,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        let encoded = encode_package_name(package_name);
+        let base_str = registry.as_str().trim_end_matches('/');
+        let target_url = Url::parse(&format!("{base_str}/{encoded}")).map_err(RegistryError::UrlParse)?;
+
+        let body_bytes = serde_json::to_vec(publish_payload)?;
+
+        let (resp, _permit) = self
+            .execute_with_body_permit(
+                Method::PUT,
+                target_url.clone(),
+                Some("application/json"),
+                Some("application/json"),
+                otp,
+                body_bytes,
+            )
+            .await?;
+
+        let status = resp.status();
+        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+            parse_retry_after(resp.headers().get(RETRY_AFTER))
+        } else {
+            None
+        };
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+
+        if status == StatusCode::CONFLICT {
+            return Err(RegistryError::PublishConflict {
+                url: target_url.to_string(),
+                status: 409,
+                message: if body_text.is_empty() {
+                    "Cannot publish over existing package version.".to_string()
+                } else {
+                    body_text
+                },
+            });
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(RegistryError::Unauthorized {
+                url: target_url.to_string(),
+                status: 401,
+                message: if body_text.is_empty() {
+                    format!("Authentication required to publish package to {}.", registry)
+                } else {
+                    body_text
+                },
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            return Err(RegistryError::Forbidden {
+                url: target_url.to_string(),
+                status: 403,
+                message: if body_text.is_empty() {
+                    format!("Access forbidden to publish package to {}.", registry)
+                } else {
+                    body_text
+                },
+            });
+        }
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(RegistryError::RateLimited { retry_after });
+        }
+
+        Err(RegistryError::ServerError {
+            status: status.as_u16(),
+            body: body_text,
+        })
+    }
+
+    /// Check the logged-in username for a registry.
+    pub async fn whoami(&self, registry: Option<&Url>) -> Result<String, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let base_str = reg_url.as_str().trim_end_matches('/');
+        let target_url = Url::parse(&format!("{base_str}/-/whoami")).map_err(RegistryError::UrlParse)?;
+
+        // Verify that we have an active auth token for this registry
+        let token = self.auth_token_for_url(&target_url);
+        if token.is_none() {
+            return Err(RegistryError::Unauthorized {
+                url: target_url.to_string(),
+                status: 401,
+                message: format!("This command requires you to be logged in to {}", reg_url),
+            });
+        }
+
+        let (resp, _permit) = self
+            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .await?;
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Unauthorized {
+                url: target_url.to_string(),
+                status: 401,
+                message: if body_text.is_empty() {
+                    format!("This command requires you to be logged in to {}", reg_url)
+                } else {
+                    body_text
+                },
+            });
+        }
+
+        if status == StatusCode::FORBIDDEN {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::Forbidden {
+                url: target_url.to_string(),
+                status: 403,
+                message: body_text,
+            });
+        }
+
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body_text) {
+            if let Some(username) = val.get("username").and_then(|u| u.as_str()) {
+                return Ok(username.to_string());
+            }
+        }
+        let trimmed = body_text.trim().trim_matches('"').to_string();
+        if !trimmed.is_empty() {
+            Ok(trimmed)
+        } else {
+            Err(RegistryError::MalformedMetadata("Empty or invalid whoami response".into()))
+        }
+    }
+
+    /// Ping a registry and report latency.
+    pub async fn ping(&self, registry: Option<&Url>) -> Result<std::time::Duration, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let base_str = reg_url.as_str().trim_end_matches('/');
+        let target_url = Url::parse(&format!("{base_str}/-/ping")).map_err(RegistryError::UrlParse)?;
+
+        let start = std::time::Instant::now();
+        let (resp, _permit) = self
+            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .await?;
+
+        let elapsed = start.elapsed();
+        let status = resp.status();
+        if status.is_success() {
+            Ok(elapsed)
+        } else {
+            let body_text = resp.text().await.unwrap_or_default();
+            Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body: body_text,
+            })
+        }
+    }
+
+    /// List active authentication tokens on the registry (GET /-/npm/v1/tokens).
+    pub async fn token_list(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let base_str = reg_url.as_str().trim_end_matches('/');
+        let target_url = Url::parse(&format!("{base_str}/-/npm/v1/tokens")).map_err(RegistryError::UrlParse)?;
+
+        let token = self.auth_token_for_url(&target_url);
+        if token.is_none() {
+            return Err(RegistryError::Unauthorized {
+                url: target_url.to_string(),
+                status: 401,
+                message: format!("This command requires you to be logged in to {}", reg_url),
+            });
+        }
+
+        let (resp, _permit) = self
+            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        let body_json = resp.json::<serde_json::Value>().await.map_err(RegistryError::Http)?;
+        Ok(body_json)
+    }
+
+    /// Delete/revoke an authentication token on the registry (DELETE /-/npm/v1/tokens/token/<key>).
+    pub async fn token_revoke(&self, registry: Option<&Url>, token_id: &str) -> Result<(), RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let base_str = reg_url.as_str().trim_end_matches('/');
+        let target_url = Url::parse(&format!("{base_str}/-/npm/v1/tokens/token/{token_id}")).map_err(RegistryError::UrlParse)?;
+
+        let token = self.auth_token_for_url(&target_url);
+        if token.is_none() {
+            return Err(RegistryError::Unauthorized {
+                url: target_url.to_string(),
+                status: 401,
+                message: format!("This command requires you to be logged in to {}", reg_url),
+            });
+        }
+
+        let (resp, _permit) = self
+            .execute_with_permit(Method::DELETE, target_url.clone(), Some("application/json"), None)
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() || status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            let body_text = resp.text().await.unwrap_or_default();
+            Err(RegistryError::ServerError {
+                status: status.as_u16(),
+                body: body_text,
+            })
+        }
     }
 }
 

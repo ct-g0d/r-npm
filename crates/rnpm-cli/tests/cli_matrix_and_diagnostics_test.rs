@@ -28,15 +28,10 @@ fn test_deferred_commands_cli_execution_matrix() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     let cases = [
-        ("publish", vec!["publish"]),
-        ("login", vec!["login"]),
-        ("adduser", vec!["adduser"]),
-        ("logout", vec!["logout"]),
-        ("token", vec!["token"]),
+        ("team", vec!["team"]),
         ("search", vec!["search", "lodash"]),
         ("star", vec!["star", "express"]),
-        ("ping", vec!["ping"]),
-        ("whoami", vec!["whoami"]),
+        ("doctor", vec!["doctor"]),
     ];
 
     for (cmd_name, args) in cases {
