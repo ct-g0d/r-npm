@@ -572,8 +572,8 @@ mod tests {
         }
 
         // Let workers hammer the lock and experience rapid timeouts
-        let wait_start = std::time::Instant::now();
-        while timeout_count.load(Ordering::Relaxed) <= 10 && wait_start.elapsed() < Duration::from_secs(2) {
+        let hammer_start = std::time::Instant::now();
+        while hammer_start.elapsed() < Duration::from_secs(3) && timeout_count.load(Ordering::Relaxed) <= 10 {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(

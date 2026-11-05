@@ -38,6 +38,15 @@ pub use prune::{
     PruneAnalysis, PruneOptions, PruneSummary,
 };
 
+pub mod rebuild;
+pub use rebuild::{execute_rebuild, matches_rebuild_filter, RebuildOptions, RebuildSummary};
+
+pub mod dedupe;
+pub use dedupe::{
+    execute_dedupe, version_matches_range, DedupeAction, DedupeActionType,
+    DedupeOptions, DedupeSummary,
+};
+
 use rnpm_solver::{
     resolve_workspace_graph, Overrides, PackageMetadata, PackageMetadataProvider,
     PackageVersionMetadata, Platform, ResolverOptions, Solver, SolverError,
@@ -351,6 +360,8 @@ pub struct InstallOptions {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub ignore_scripts: bool,
+    pub foreground_scripts: bool,
+    pub strict_sandbox: bool,
     pub save_dev: bool,
     pub save_exact: bool,
     pub save_prod: bool,
@@ -375,6 +386,8 @@ impl Default for InstallOptions {
             cache_dir: None,
             offline: false,
             ignore_scripts: false,
+            foreground_scripts: false,
+            strict_sandbox: false,
             save_dev: false,
             save_exact: false,
             save_prod: false,
@@ -1488,13 +1501,19 @@ impl Installer {
 
         // 3. Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
+            let sandbox_policy = if self.options.strict_sandbox {
+                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
+            } else {
+                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
+            };
             let lifecycle_opts = LifecycleOptions {
                 root_dir: self.options.project_dir.clone(),
                 init_cwd: self.options.project_dir.clone(),
                 ignore_scripts: false,
-                capture_output: false,
+                capture_output: !self.options.foreground_scripts,
+                foreground_scripts: self.options.foreground_scripts,
                 timeout: None,
-                sandbox_policy: Default::default(),
+                sandbox_policy,
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
@@ -2296,13 +2315,19 @@ impl Installer {
 
         // Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
+            let sandbox_policy = if self.options.strict_sandbox {
+                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
+            } else {
+                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
+            };
             let lifecycle_opts = LifecycleOptions {
                 root_dir: self.options.project_dir.clone(),
                 init_cwd: self.options.project_dir.clone(),
                 ignore_scripts: false,
-                capture_output: false,
+                capture_output: !self.options.foreground_scripts,
+                foreground_scripts: self.options.foreground_scripts,
                 timeout: None,
-                sandbox_policy: Default::default(),
+                sandbox_policy,
             };
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
@@ -3297,13 +3322,19 @@ impl Installer {
 
             // 5. Run lifecycle scripts if needed
             if !self.options.ignore_scripts && !lifecycle_nodes.is_empty() {
+                let sandbox_policy = if self.options.strict_sandbox {
+                    rnpm_lifecycle::ScriptSandboxPolicy::restricted()
+                } else {
+                    rnpm_lifecycle::ScriptSandboxPolicy::permissive()
+                };
                 let lifecycle_opts = LifecycleOptions {
                     root_dir: self.options.project_dir.clone(),
                     init_cwd: self.options.project_dir.clone(),
                     ignore_scripts: false,
-                    capture_output: false,
+                    capture_output: !self.options.foreground_scripts,
+                    foreground_scripts: self.options.foreground_scripts,
                     timeout: None,
-                    sandbox_policy: Default::default(),
+                    sandbox_policy,
                 };
                 let _ = execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await;
             }
@@ -3551,6 +3582,34 @@ impl Installer {
         let mut opts = options.clone();
         opts.project_dir = self.options.project_dir.clone();
         prune::discover_extraneous_packages(&self.options.project_dir, &opts)
+    }
+
+    /// Re-runs compilation and lifecycle build scripts for installed packages.
+    pub async fn rebuild(&self, options: &RebuildOptions) -> Result<RebuildSummary> {
+        let mut opts = options.clone();
+        if opts.project_dir.as_os_str().is_empty() || opts.project_dir == Path::new(".") {
+            opts.project_dir = self.options.project_dir.clone();
+        }
+        rebuild::execute_rebuild(&opts).await
+    }
+
+    /// Reduces duplicate packages in node_modules and package-lock.json by hoisting compatible versions.
+    pub fn dedupe(&self, options: &DedupeOptions) -> Result<DedupeSummary> {
+        let mut opts = options.clone();
+        if opts.project_dir.as_os_str().is_empty() || opts.project_dir == Path::new(".") {
+            opts.project_dir = self.options.project_dir.clone();
+        }
+        dedupe::execute_dedupe(&opts)
+    }
+
+    /// Inspects and reports duplicate packages without modifying the filesystem or lockfile.
+    pub fn find_dupes(&self, options: &DedupeOptions) -> Result<DedupeSummary> {
+        let mut opts = options.clone();
+        if opts.project_dir.as_os_str().is_empty() || opts.project_dir == Path::new(".") {
+            opts.project_dir = self.options.project_dir.clone();
+        }
+        opts.dry_run = true;
+        dedupe::execute_dedupe(&opts)
     }
 
 }

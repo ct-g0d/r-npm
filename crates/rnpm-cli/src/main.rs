@@ -51,6 +51,14 @@ pub(crate) enum Commands {
         #[arg(long)]
         ignore_scripts: bool,
 
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
         /// Bypass peer dependency installation conflicts
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -113,6 +121,14 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
 
         /// Bypass peer dependency installation conflicts
         #[arg(long = "legacy-peer-deps")]
@@ -193,6 +209,14 @@ pub(crate) enum Commands {
         /// Skip lifecycle scripts
         #[arg(long)]
         ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
     },
 
     /// Run arbitrary package binaries dynamically (npx equivalent)
@@ -283,6 +307,14 @@ pub(crate) enum Commands {
         #[arg(long)]
         ignore_scripts: bool,
 
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
         /// Bypass peer dependency installation conflicts
         #[arg(long = "legacy-peer-deps")]
         legacy_peer_deps: bool,
@@ -328,6 +360,42 @@ pub(crate) enum Commands {
         /// Output report in JSON format
         #[arg(long)]
         json: bool,
+    },
+
+    /// Reduce duplication in node_modules and package-lock.json
+    #[command(alias = "deduplicate")]
+    Dedupe {
+        /// Specific package names to deduplicate
+        packages: Vec<String>,
+
+        /// Report deduplication actions without modifying files or lockfile
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Find duplicate packages across nesting levels (equivalent to dedupe --dry-run)
+    FindDupes {
+        /// Specific package names to inspect
+        packages: Vec<String>,
+    },
+
+    /// Re-run compilation and lifecycle build scripts for installed packages
+    #[command(alias = "rb")]
+    Rebuild {
+        /// Specific packages to rebuild
+        packages: Vec<String>,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
     },
 
     /// Manage package.json properties
@@ -1115,6 +1183,8 @@ async fn execute_run(
     scope: Vec<String>,
     if_present: bool,
     ignore_scripts: bool,
+    foreground_scripts: bool,
+    strict_sandbox: bool,
 ) -> anyhow::Result<()> {
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
@@ -1208,6 +1278,8 @@ async fn execute_run(
             script,
             args,
             ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
             if_present,
             filter_members: filter_opt,
         };
@@ -1251,6 +1323,13 @@ async fn execute_run(
         let pkg_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
         let mut ctx = LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
         ctx.package_version = manifest.version.clone();
+        ctx.foreground_scripts = foreground_scripts;
+        if foreground_scripts {
+            ctx.capture_output = false;
+        }
+        if strict_sandbox {
+            ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted();
+        }
 
         if !ignore_scripts {
             let status = execute_lifecycle_script(&ctx)?;
@@ -1958,6 +2037,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
             ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
             save_dev,
             save_exact,
             save_prod,
@@ -1970,6 +2051,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_peer_deps,
             global,
         } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let effective_ignore = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+            let effective_strict = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let target_dir = if global {
                 rnpm_config::find_global_prefix()
@@ -1982,7 +2068,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
-                ignore_scripts,
+                ignore_scripts: effective_ignore,
+                foreground_scripts: effective_foreground,
+                strict_sandbox: effective_strict,
                 omit_dev,
                 omit_optional,
                 omit_peer,
@@ -2011,18 +2099,27 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
             ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
             omit,
             legacy_peer_deps,
             strict_peer_deps,
             package_lock_only,
         } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let effective_ignore = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+            let effective_strict = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+
             let (omit_dev, omit_optional, omit_peer) = parse_omit_options(&omit);
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
-                ignore_scripts,
+                ignore_scripts: effective_ignore,
+                foreground_scripts: effective_foreground,
+                strict_sandbox: effective_strict,
                 omit_dev,
                 omit_optional,
                 omit_peer,
@@ -2051,6 +2148,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 false,
                 false,
+                false,
+                false,
             ).await?;
         }
         Commands::Start { args } => {
@@ -2062,6 +2161,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                false,
+                false,
                 false,
                 false,
             ).await?;
@@ -2077,6 +2178,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 false,
                 false,
+                false,
+                false,
             ).await?;
         }
         Commands::Stop { args } => {
@@ -2090,6 +2193,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 Vec::new(),
                 false,
                 false,
+                false,
+                false,
             ).await?;
         }
         Commands::Run {
@@ -2101,7 +2206,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             scope,
             if_present,
             ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
         } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let effective_ignore = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+            let effective_strict = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+
             execute_run(
                 current_dir,
                 script,
@@ -2111,7 +2223,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 filter,
                 scope,
                 if_present,
-                ignore_scripts,
+                effective_ignore,
+                effective_foreground,
+                effective_strict,
             ).await?;
         }
         Commands::Exec {
@@ -2268,15 +2382,24 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
             ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
         } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let effective_ignore = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+            let effective_strict = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
                 cache_dir: cache,
                 offline,
-                ignore_scripts,
+                ignore_scripts: effective_ignore,
+                foreground_scripts: effective_foreground,
+                strict_sandbox: effective_strict,
                 legacy_peer_deps,
                 strict_peer_deps,
                 ..Default::default()
@@ -2351,6 +2474,108 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         summary.removed_packages.len()
                     );
                 }
+            }
+        }
+        Commands::Dedupe { packages, dry_run } => {
+            let dedupe_options = rnpm_install::DedupeOptions {
+                project_dir: current_dir.clone(),
+                dry_run,
+                packages,
+            };
+            let installer = Installer::new(InstallOptions {
+                project_dir: current_dir,
+                ..Default::default()
+            })?;
+            let summary = installer.dedupe(&dedupe_options)?;
+
+            if dry_run {
+                if summary.actions.is_empty() {
+                    println!("rnpm: dedupe dry-run: tree is already deduplicated, no duplicates found");
+                } else {
+                    for action in &summary.actions {
+                        match action.action_type {
+                            rnpm_install::DedupeActionType::DeleteDuplicate => {
+                                println!("rnpm: dedupe: would remove {} ({})", action.original_path, action.reason);
+                            }
+                            rnpm_install::DedupeActionType::HoistAndDedupe => {
+                                println!("rnpm: dedupe: would hoist {} -> {} ({})", action.original_path, action.target_path, action.reason);
+                            }
+                        }
+                    }
+                    println!("rnpm: dedupe dry-run: {} action(s) would be performed", summary.actions.len());
+                }
+            } else if summary.actions.is_empty() {
+                println!("rnpm: tree is already deduplicated");
+            } else {
+                for action in &summary.actions {
+                    match action.action_type {
+                        rnpm_install::DedupeActionType::DeleteDuplicate => {
+                            println!("rnpm: dedupe: removed {}", action.original_path);
+                        }
+                        rnpm_install::DedupeActionType::HoistAndDedupe => {
+                            println!("rnpm: dedupe: hoisted {} -> {}", action.original_path, action.target_path);
+                        }
+                    }
+                }
+                println!("rnpm: successfully deduplicated {} package(s)", summary.actions.len());
+            }
+        }
+        Commands::FindDupes { packages } => {
+            let dedupe_options = rnpm_install::DedupeOptions {
+                project_dir: current_dir.clone(),
+                dry_run: true,
+                packages,
+            };
+            let installer = Installer::new(InstallOptions {
+                project_dir: current_dir,
+                ..Default::default()
+            })?;
+            let summary = installer.find_dupes(&dedupe_options)?;
+
+            if summary.actions.is_empty() {
+                println!("rnpm: find-dupes: no duplicate packages found");
+            } else {
+                for action in &summary.actions {
+                    println!("rnpm: find-dupes: duplicate found: {} ({})", action.original_path, action.reason);
+                }
+                println!("rnpm: find-dupes: {} duplicate package(s) detected", summary.actions.len());
+            }
+        }
+        Commands::Rebuild {
+            packages,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+        } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let effective_ignore = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+            let effective_strict = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+
+            let rebuild_options = rnpm_install::RebuildOptions {
+                project_dir: current_dir.clone(),
+                packages,
+                ignore_scripts: effective_ignore,
+                foreground_scripts: effective_foreground,
+                strict_sandbox: effective_strict,
+            };
+
+            let installer = Installer::new(InstallOptions {
+                project_dir: current_dir,
+                ignore_scripts: effective_ignore,
+                foreground_scripts: effective_foreground,
+                strict_sandbox: effective_strict,
+                ..Default::default()
+            })?;
+
+            let summary = installer.rebuild(&rebuild_options).await?;
+            if summary.rebuilt_packages.is_empty() {
+                println!("rnpm: rebuild: no packages required rebuilding");
+            } else {
+                for pkg in &summary.rebuilt_packages {
+                    println!("rnpm: rebuilt {pkg}");
+                }
+                println!("rnpm: successfully rebuilt {} package(s)", summary.rebuilt_packages.len());
             }
         }
         Commands::Pkg {

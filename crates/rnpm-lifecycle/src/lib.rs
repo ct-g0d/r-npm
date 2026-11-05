@@ -272,6 +272,7 @@ pub struct LifecycleOptions {
     pub init_cwd: PathBuf,
     pub ignore_scripts: bool,
     pub capture_output: bool,
+    pub foreground_scripts: bool,
     pub timeout: Option<std::time::Duration>,
     pub sandbox_policy: ScriptSandboxPolicy,
 }
@@ -283,6 +284,7 @@ impl Default for LifecycleOptions {
             init_cwd: PathBuf::new(),
             ignore_scripts: false,
             capture_output: true,
+            foreground_scripts: false,
             timeout: None,
             sandbox_policy: ScriptSandboxPolicy::default(),
         }
@@ -297,6 +299,7 @@ impl LifecycleOptions {
             root_dir: root,
             ignore_scripts: false,
             capture_output: true,
+            foreground_scripts: false,
             timeout: None,
             sandbox_policy: ScriptSandboxPolicy::default(),
         }
@@ -309,6 +312,19 @@ impl LifecycleOptions {
 
     pub fn with_sandbox_policy(mut self, policy: ScriptSandboxPolicy) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    pub fn with_foreground_scripts(mut self, foreground: bool) -> Self {
+        self.foreground_scripts = foreground;
+        if foreground {
+            self.capture_output = false;
+        }
+        self
+    }
+
+    pub fn with_ignore_scripts(mut self, ignore: bool) -> Self {
+        self.ignore_scripts = ignore;
         self
     }
 }
@@ -345,6 +361,7 @@ pub struct LifecycleContext {
     pub extra_env: HashMap<String, String>,
     pub timeout: Option<std::time::Duration>,
     pub capture_output: bool,
+    pub foreground_scripts: bool,
     pub captured_output: std::sync::Arc<std::sync::Mutex<Option<ScriptOutput>>>,
     pub sandbox_policy: ScriptSandboxPolicy,
 }
@@ -369,6 +386,7 @@ impl LifecycleContext {
             extra_env: HashMap::new(),
             timeout: None,
             capture_output: false,
+            foreground_scripts: false,
             captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sandbox_policy: ScriptSandboxPolicy::default(),
         }
@@ -381,6 +399,14 @@ impl LifecycleContext {
 
     pub fn with_capture_output(mut self, capture: bool) -> Self {
         self.capture_output = capture;
+        self
+    }
+
+    pub fn with_foreground_scripts(mut self, foreground: bool) -> Self {
+        self.foreground_scripts = foreground;
+        if foreground {
+            self.capture_output = false;
+        }
         self
     }
 
@@ -815,7 +841,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     cmd.envs(env);
     cmd.stdin(std::process::Stdio::inherit());
 
-    if ctx.capture_output {
+    if ctx.capture_output && !ctx.foreground_scripts {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
     } else {
@@ -957,7 +983,7 @@ where
     cmd.envs(env);
     cmd.stdin(std::process::Stdio::inherit());
 
-    if ctx.capture_output {
+    if ctx.capture_output && !ctx.foreground_scripts {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
     } else {
@@ -1850,6 +1876,10 @@ pub async fn execute_topological_with_abort(
                 ctx.package_version = node.manifest.version.clone();
                 ctx.timeout = opts.timeout;
                 ctx.sandbox_policy = opts.sandbox_policy.clone();
+                ctx.foreground_scripts = opts.foreground_scripts;
+                if opts.foreground_scripts {
+                    ctx.capture_output = false;
+                }
 
                 let abort_fut = {
                     let mut rx_opt = abort_rx.clone();
@@ -1933,7 +1963,11 @@ pub async fn execute_topological_with_abort(
             );
             ctx.package_version = root_manifest.version.clone();
             ctx.timeout = opts.timeout;
-                ctx.sandbox_policy = opts.sandbox_policy.clone();
+            ctx.sandbox_policy = opts.sandbox_policy.clone();
+            ctx.foreground_scripts = opts.foreground_scripts;
+            if opts.foreground_scripts {
+                ctx.capture_output = false;
+            }
 
             let abort_fut = {
                 let mut rx_opt = abort_rx.clone();
@@ -1981,8 +2015,24 @@ pub struct WorkspaceRunOptions {
     pub script: String,
     pub args: Vec<String>,
     pub ignore_scripts: bool,
+    pub foreground_scripts: bool,
+    pub strict_sandbox: bool,
     pub if_present: bool,
     pub filter_members: Option<Vec<String>>,
+}
+
+impl Default for WorkspaceRunOptions {
+    fn default() -> Self {
+        Self {
+            script: String::new(),
+            args: Vec::new(),
+            ignore_scripts: false,
+            foreground_scripts: false,
+            strict_sandbox: false,
+            if_present: false,
+            filter_members: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2239,6 +2289,13 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                 &full_cmd,
             );
             ctx.package_version = member.manifest.version.clone();
+            ctx.foreground_scripts = opts.foreground_scripts;
+            if opts.foreground_scripts {
+                ctx.capture_output = false;
+            }
+            if opts.strict_sandbox {
+                ctx.sandbox_policy = ScriptSandboxPolicy::restricted();
+            }
 
             let abort_fut = {
                 let mut rx_opt = abort_rx.clone();
