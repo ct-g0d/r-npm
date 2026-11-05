@@ -670,17 +670,6 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub(crate) enum TokenAction {
-    /// List active authentication tokens
-    List,
-    /// Revoke an authentication token
-    #[command(alias = "delete")]
-    Revoke {
-        token_id: String,
-    },
 
     /// Manage npm configuration
     #[command(alias = "c")]
@@ -721,6 +710,17 @@ pub(crate) enum TokenAction {
         /// Display global bin directory
         #[arg(short = 'g', long = "global")]
         global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TokenAction {
+    /// List active authentication tokens
+    List,
+    /// Revoke an authentication token
+    #[command(alias = "delete")]
+    Revoke {
+        token_id: String,
     },
 }
 
