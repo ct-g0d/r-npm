@@ -28,15 +28,15 @@ fn test_deferred_commands_cli_execution_matrix() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     let cases = [
-        ("list", vec!["list"]),
-        ("ls", vec!["ls"]),
-        ("la", vec!["la"]),
-        ("ll", vec!["ll"]),
-        ("outdated", vec!["outdated"]),
-        ("view", vec!["view", "lodash"]),
-        ("info", vec!["info", "react"]),
-        ("v", vec!["v", "express"]),
         ("publish", vec!["publish"]),
+        ("login", vec!["login"]),
+        ("adduser", vec!["adduser"]),
+        ("logout", vec!["logout"]),
+        ("token", vec!["token"]),
+        ("search", vec!["search", "lodash"]),
+        ("star", vec!["star", "express"]),
+        ("ping", vec!["ping"]),
+        ("whoami", vec!["whoami"]),
     ];
 
     for (cmd_name, args) in cases {
@@ -302,16 +302,16 @@ fn test_additional_aliases_and_flag_routing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--offline"));
 
-    // View alias 'show' is caught as deferred command
+    // Search is caught as unsupported command
     let output = Command::new(rnpm_bin)
-        .arg("show")
+        .arg("search")
         .arg("lodash")
         .output()
         .expect("Failed to execute rnpm");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("npm error code ERR_UNSUPPORTED_COMMAND"));
-    assert!(stderr.contains("show"));
+    assert!(stderr.contains("search"));
 
     // Additional unsupported flags --production on install
     let flag_args = ["install", "--production"];

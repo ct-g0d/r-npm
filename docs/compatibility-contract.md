@@ -41,6 +41,10 @@
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
+- `list` / `ls` (aliases: `la`, `ll`): Inspect installed `node_modules` dependency tree (or lockfile with `--package-lock-only`). Formats hierarchical tree matching npm (`+-- `, `` `-- ``, `|   `) with markers (`extraneous`, `invalid`, `UNMET DEPENDENCY`, `deduped`). Supports `--depth=<n>`, `--all` (`-a`), `--json`, `--long` (`-l`, and aliases `la`/`ll`), `--parseable` (`-p`), `--package-lock-only`, `--omit`, and package name filters. Exits with code `1` and `ELSPROBLEMS` diagnostic if problems exist.
+- `view` / `info` (aliases: `v`, `show`): Query package metadata from the npm registry for `<pkg>[@<version_or_tag>] [<field>[.<subfield>]...]`. Resolves dist-tags, exact versions, and semver ranges. Supports nested dot notation field extraction, multi-field output, full manifest display, and `--json`.
+- `outdated`: Inspect declared vs installed dependency versions and query registry packuments to determine `wanted` (max satisfying version) and `latest` (`dist-tags.latest`). Tabular output with columns `Package`, `Current`, `Wanted`, `Latest`, `Location`, `Depended by`. Supports `--long` (`-l`), `--json`, `--parseable` (`-p`), and package filters. Exits with code `1` if any outdated packages are found, `0` if up to date.
+- `query`: Execute CSS-like selector queries on the dependency tree (`:root`, `[name=<pkg>]`, `[version^=<v>]`, `:outdated`, `:extraneous`, `:missing`, `:invalid`, `:dev`, `:prod`, `:optional`, `:peer`, child `>`, descendant space, union `,`). Emits matching package nodes as structured JSON array matching npm query schema.
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
@@ -69,9 +73,6 @@ npm error See docs/compatibility-contract.md for supported options.
 
 ### Unsupported & Deferred Commands
 - `publish`: Package publishing (deferred).
-- `list` / `ls` / `la` / `ll`: Dependency tree inspection (deferred).
-- `outdated`: Dependency update checking (deferred).
-- `view` / `info` / `v` / `show`: Registry metadata inspection (deferred).
 - `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
 - `fix`: Vulnerability automated remediation.
 - `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
