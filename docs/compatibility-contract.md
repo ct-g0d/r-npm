@@ -41,6 +41,11 @@
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
+- `init` (aliases: `create`, `innit`): Interactive and non-interactive (`-y` / `--yes` / `-f` / `--force`) `package.json` generation with npm default fields (name, version, description, main, scripts, author, license), preserving existing manifest values, `--scope` support, and initializer delegation to `create-<name>` via dynamic `exec`.
+- `version`: Inspect or bump package versions in `package.json` and `package-lock.json` (`major`, `minor`, `patch`, `premajor`, `preminor`, `prepatch`, `prerelease`, `from-git`, or explicit semver), execute lifecycle scripts (`preversion`, `version`, `postversion`), and integrate with Git (clean working tree checks, commit, and annotated `v<version>` tag creation unless `--no-git-tag-version`).
+- `diff`: Standard unified diff generation comparing package versions, registry tarballs, local directories, or arbitrary tarball archives. Supports `--diff=<spec>`, `--diff-name-only`, `--diff-unified=<lines>`, `--diff-ignore-all-space`, `--diff-no-prefix`, and custom prefixes.
+- `sbom`: Software Bill of Materials generation in SPDX 2.3 (`--sbom-format=spdx`) or CycloneDX 1.5 (`--sbom-format=cyclonedx`) JSON formats, with purl identifiers, SHA-512 integrity hashes, license expressions, and complete dependency relationships.
+- `pkg`: Package manifest inspection and mutation (`get <key>`, `set <key>=<val>`, `delete <key>`) supporting primitive coercion, array indexing and appending, bracket notation, and workspace targeting via `--workspace` (`-w`) and `--workspaces` (`-ws`).
 - `list` / `ls` (aliases: `la`, `ll`): Inspect installed `node_modules` dependency tree (or lockfile with `--package-lock-only`). Formats hierarchical tree matching npm (`+-- `, `` `-- ``, `|   `) with markers (`extraneous`, `invalid`, `UNMET DEPENDENCY`, `deduped`). Supports `--depth=<n>`, `--all` (`-a`), `--json`, `--long` (`-l`, and aliases `la`/`ll`), `--parseable` (`-p`), `--package-lock-only`, `--omit`, and package name filters. Exits with code `1` and `ELSPROBLEMS` diagnostic if problems exist.
 - `view` / `info` (aliases: `v`, `show`): Query package metadata from the npm registry for `<pkg>[@<version_or_tag>] [<field>[.<subfield>]...]`. Resolves dist-tags, exact versions, and semver ranges. Supports nested dot notation field extraction, multi-field output, full manifest display, and `--json`.
 - `outdated`: Inspect declared vs installed dependency versions and query registry packuments to determine `wanted` (max satisfying version) and `latest` (`dist-tags.latest`). Tabular output with columns `Package`, `Current`, `Wanted`, `Latest`, `Location`, `Depended by`. Supports `--long` (`-l`), `--json`, `--parseable` (`-p`), and package filters. Exits with code `1` if any outdated packages are found, `0` if up to date.
@@ -75,7 +80,7 @@ npm error See docs/compatibility-contract.md for supported options.
 - `publish`: Package publishing (deferred).
 - `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
 - `fix`: Vulnerability automated remediation.
-- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
+- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`.
 - Writing legacy lockfile formats (v1 or v2).
 
 ### Drop-in Compatibility Target & Unsupported Command Handling (DEC-004)

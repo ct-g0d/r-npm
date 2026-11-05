@@ -599,9 +599,9 @@ pub fn resolve_manifest_path(manifest_path: &Path) -> PathBuf {
 /// - If single field:
 ///   - If resolved value is a primitive string and `json` is `false`, returns raw string (without quotes).
 ///   - Otherwise, returns resolved value formatted as pretty-printed JSON.
+///   - If the field does not exist, returns `{}`.
 /// - If multiple fields:
 ///   - Returns a JSON object with `{ field_path: resolved_value, ... }` formatted as pretty-printed JSON.
-/// - Returns an error if any requested field does not exist.
 pub fn pkg_get(
     manifest_path: &Path,
     field_paths: &[String],
@@ -622,8 +622,10 @@ pub fn pkg_get(
     if field_paths.len() == 1 {
         let path_str = &field_paths[0];
         let segments = parse_path(path_str)?;
-        let value = get_value_at_path(&manifest_val, &segments)
-            .ok_or_else(|| anyhow!("Field '{}' not found in package manifest", path_str))?;
+        let value = match get_value_at_path(&manifest_val, &segments) {
+            Some(v) => v,
+            None => return Ok("{}".to_string()),
+        };
 
         if let Value::String(s) = value {
             if !json {
@@ -636,12 +638,67 @@ pub fn pkg_get(
     let mut result_map = serde_json::Map::new();
     for path_str in field_paths {
         let segments = parse_path(path_str)?;
-        let value = get_value_at_path(&manifest_val, &segments)
-            .ok_or_else(|| anyhow!("Field '{}' not found in package manifest", path_str))?;
-        result_map.insert(path_str.clone(), value.clone());
+        if let Some(value) = get_value_at_path(&manifest_val, &segments) {
+            result_map.insert(path_str.clone(), value.clone());
+        }
     }
 
     Ok(serde_json::to_string_pretty(&Value::Object(result_map))?)
+}
+
+/// Retrieves package manifest values as a [`serde_json::Value`].
+///
+/// - If `field_paths` is empty: returns the full manifest value.
+/// - If single field: returns that field's value or `{}` if not found.
+/// - If multiple fields: returns a JSON object `{ field: value, ... }` of found fields.
+pub fn pkg_get_value(
+    manifest_path: &Path,
+    field_paths: &[String],
+) -> Result<Value> {
+    let resolved_path = resolve_manifest_path(manifest_path);
+    let content = std::fs::read_to_string(&resolved_path)
+        .with_context(|| format!("Failed to read package manifest at '{}'", resolved_path.display()))?;
+    let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
+
+    let manifest_val: Value = serde_json::from_str(clean_str)
+        .with_context(|| format!("Failed to parse JSON in package manifest at '{}'", resolved_path.display()))?;
+
+    if field_paths.is_empty() {
+        return Ok(manifest_val);
+    }
+
+    if field_paths.len() == 1 {
+        let path_str = &field_paths[0];
+        let segments = parse_path(path_str)?;
+        let val = get_value_at_path(&manifest_val, &segments)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        return Ok(val);
+    }
+
+    let mut result_map = serde_json::Map::new();
+    for path_str in field_paths {
+        let segments = parse_path(path_str)?;
+        if let Some(value) = get_value_at_path(&manifest_val, &segments) {
+            result_map.insert(path_str.clone(), value.clone());
+        }
+    }
+
+    Ok(Value::Object(result_map))
+}
+
+/// Retrieves properties across workspace members formatted as pretty-printed JSON:
+/// `{ "<workspace-name>": <extracted-value>, ... }`.
+pub fn pkg_get_workspaces(
+    members: &[(&str, &Path)],
+    field_paths: &[String],
+) -> Result<String> {
+    let mut root_map = serde_json::Map::new();
+    for (name, path) in members {
+        let val = pkg_get_value(path, field_paths)?;
+        root_map.insert((*name).to_string(), val);
+    }
+    Ok(serde_json::to_string_pretty(&Value::Object(root_map))?)
 }
 
 /// Sets properties in `package.json` at `manifest_path` based on `<path>=<value>` assignments.

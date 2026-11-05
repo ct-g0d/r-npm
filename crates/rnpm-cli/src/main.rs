@@ -2,14 +2,18 @@
 
 mod audit;
 pub mod diagnostics;
+pub mod diff;
+pub mod init;
 pub mod inspect_tree;
 pub mod list;
 pub mod outdated;
 pub mod query;
+pub mod sbom;
+pub mod version;
 pub mod view;
 
 use reqwest::Url;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use rnpm_core::manifest::Manifest;
@@ -328,6 +332,43 @@ pub(crate) enum Commands {
         /// Force JSON output format
         #[arg(long, global = true)]
         json: bool,
+        /// Target specific workspace package(s)
+        #[arg(short = 'w', long = "workspace", global = true)]
+        workspace: Vec<String>,
+        /// Target all workspace packages
+        #[arg(long = "workspaces", alias = "ws", global = true)]
+        workspaces: bool,
+    },
+
+    /// Create a package.json file or run an initializer
+    #[command(alias = "create", alias = "innit")]
+    Init {
+        /// Initializer package or template (e.g. react-app, @scope/pkg, vite)
+        initializer: Option<String>,
+
+        /// Arguments forwarded to initializer binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Generate package.json with defaults without prompting
+        #[arg(short = 'y', long = "yes", short_alias = 'f', alias = "force")]
+        yes: bool,
+
+        /// Scope to prefix package name with (e.g. @myorg or myorg)
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Offline mode (only use cache)
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Manage the package cache
@@ -338,6 +379,130 @@ pub(crate) enum Commands {
         /// Custom cache directory path
         #[arg(long)]
         cache: Option<PathBuf>,
+    },
+
+    /// Create a package.json file or run an initializer
+    #[command(alias = "create", alias = "innit")]
+    Init {
+        /// Initializer package or template (e.g. react-app, @scope/pkg, vite)
+        initializer: Option<String>,
+
+        /// Arguments forwarded to initializer binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Generate package.json with defaults without prompting
+        #[arg(short = 'y', long = "yes", short_alias = 'f', alias = "force")]
+        yes: bool,
+
+        /// Scope to prefix package name with (e.g. @myorg or myorg)
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Offline mode (only use cache)
+        #[arg(long)]
+        offline: bool,
+    },
+
+    /// Compare package versions, tarballs, or directories
+    Diff {
+        /// Specs to compare (positional arguments, 0 to 2)
+        specs: Vec<String>,
+
+        /// Arguments passed via --diff=<spec>
+        #[arg(long = "diff", action = clap::ArgAction::Append)]
+        diff_specs: Vec<String>,
+
+        /// Output list of changed file names only
+        #[arg(long = "diff-name-only")]
+        diff_name_only: bool,
+
+        /// Context lines in unified diff (default 3)
+        #[arg(long = "diff-unified", default_value = "3")]
+        diff_unified: usize,
+
+        /// Ignore whitespace
+        #[arg(long = "diff-ignore-all-space")]
+        diff_ignore_all_space: bool,
+
+        /// Don't include a/ and b/ prefixes
+        #[arg(long = "diff-no-prefix")]
+        diff_no_prefix: bool,
+
+        /// Custom source prefix (default a/)
+        #[arg(long = "diff-src-prefix")]
+        diff_src_prefix: Option<String>,
+
+        /// Custom destination prefix (default b/)
+        #[arg(long = "diff-dst-prefix")]
+        diff_dst_prefix: Option<String>,
+
+        /// Custom npm registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Generate Software Bill of Materials (SBOM)
+    Sbom {
+        /// SBOM specification format (spdx, cyclonedx)
+        #[arg(long = "sbom-format", default_value = "spdx")]
+        sbom_format: String,
+
+        /// CycloneDX component type (library, application, framework)
+        #[arg(long = "sbom-type", default_value = "application")]
+        sbom_type: String,
+
+        /// Inspect only package-lock.json without requiring node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
+    },
+
+    /// Bump a package version or view version details
+    Version {
+        newversion: Option<String>,
+
+        #[arg(long)]
+        preid: Option<String>,
+
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+
+        #[arg(long = "allow-same-version")]
+        allow_same_version: bool,
+
+        #[arg(long = "no-git-tag-version")]
+        no_git_tag_version: bool,
+
+        #[arg(long = "no-commit-hooks")]
+        no_commit_hooks: bool,
+
+        #[arg(short = 's', long = "sign-git-tag")]
+        sign_git_tag: bool,
+
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+
+        #[arg(long = "ignore-scripts")]
+        ignore_scripts: bool,
+
+        #[arg(long = "json")]
+        json: bool,
     },
 
     /// List installed packages
@@ -502,7 +667,7 @@ where
         "fix", "deprecate",
         "access", "profile", "org", "doctor", "fund", "explain",
         "search", "stars", "star", "unstar",
-        "ping", "whoami", "version", "init", "create",
+        "ping", "whoami",
     ];
 
     if unsupported_commands.contains(&first.as_str()) {
@@ -561,8 +726,9 @@ where
             }
             idx += 1;
         }
-    } else if first == "test" || first == "t" || first == "tst" || first == "start" || first == "restart" || first == "stop" {
-        // Trailing arguments for script shortcuts are forwarded payloads to the script
+    } else if first == "test" || first == "t" || first == "tst" || first == "start" || first == "restart" || first == "stop"
+        || first == "init" || first == "create" || first == "innit" {
+        // Trailing arguments for script shortcuts and initializers are forwarded payloads to the script
     } else {
         args_to_scan.extend_from_slice(pre_dash_dash);
     }
@@ -946,6 +1112,198 @@ async fn execute_run(
     Ok(())
 }
 
+pub(crate) fn normalize_cli_args<I, T>(raw_args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .map(|a| a.into().to_string_lossy().to_string())
+        .collect();
+
+    let mut result = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-ws" {
+            result.push("--workspaces".to_string());
+        } else if let Some(rest) = arg.strip_prefix("-ws=") {
+            result.push(format!("--workspaces={rest}"));
+        } else if arg == "--git-tag-version=false" || arg == "--git-tag-version=0" {
+            result.push("--no-git-tag-version".to_string());
+        } else if arg == "--git-tag-version" && i + 1 < args.len() && (args[i + 1] == "false" || args[i + 1] == "0") {
+            result.push("--no-git-tag-version".to_string());
+            i += 1;
+        } else if arg == "--git-tag-version" || arg == "--git-tag-version=true" || arg == "--git-tag-version=1" {
+            // default is true, ignore flag
+        } else if arg == "--git-tag-version" && i + 1 < args.len() && (args[i + 1] == "true" || args[i + 1] == "1") {
+            i += 1;
+        } else if arg == "--commit-hooks=false" || arg == "--commit-hooks=0" {
+            result.push("--no-commit-hooks".to_string());
+        } else if arg == "--commit-hooks" && i + 1 < args.len() && (args[i + 1] == "false" || args[i + 1] == "0") {
+            result.push("--no-commit-hooks".to_string());
+            i += 1;
+        } else if arg == "--commit-hooks" || arg == "--commit-hooks=true" || arg == "--commit-hooks=1" {
+            // default is true, ignore flag
+        } else if arg == "--commit-hooks" && i + 1 < args.len() && (args[i + 1] == "true" || args[i + 1] == "1") {
+            i += 1;
+        } else {
+            result.push(arg.clone());
+        }
+        i += 1;
+    }
+    result
+}
+
+pub(crate) async fn execute_exec(
+    current_dir: &std::path::Path,
+    package: &str,
+    args: &[String],
+    registry: Option<String>,
+    cache: Option<PathBuf>,
+    offline: bool,
+) -> anyhow::Result<()> {
+    // Parse package and version/range
+    let (pkg_name, version_req) = if let Some(stripped) = package.strip_prefix('@') {
+        if let Some(idx) = stripped.find('@') {
+            (format!("@{}", &stripped[..idx]), stripped[idx + 1..].to_string())
+        } else {
+            (package.to_string(), "*".to_string())
+        }
+    } else if let Some(idx) = package.find('@') {
+        (package[..idx].to_string(), package[idx + 1..].to_string())
+    } else {
+        (package.to_string(), "*".to_string())
+    };
+
+    let bin_name = if let Some(slash) = pkg_name.find('/') {
+        &pkg_name[slash + 1..]
+    } else {
+        &pkg_name
+    };
+
+    // 1. Check local node_modules/.bin first
+    let local_bin = rnpm_lifecycle::find_local_binary(current_dir, &pkg_name)
+        .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, bin_name))
+        .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, package));
+
+    let binary_to_run = if let Some(bin_path) = local_bin {
+        bin_path
+    } else {
+        // Not found locally: resolve and install into ephemeral _npx cache
+        let cache_path = cache.clone().unwrap_or_else(|| {
+            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(appdata).join("rnpm").join("cache")
+            } else {
+                std::env::temp_dir().join(".rnpm-cache")
+            }
+        });
+
+        let safe_spec: String = package
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+
+        let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+        let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name)
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, bin_name))
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, package));
+
+        if let Some(target) = bin_target {
+            target
+        } else {
+            if offline {
+                return Err(anyhow::anyhow!(
+                    "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
+                    package
+                ));
+            }
+
+            std::fs::create_dir_all(&npx_env_dir)?;
+
+            let minimal_manifest = serde_json::json!({
+                "name": "rnpm-exec-env",
+                "version": "1.0.0",
+                "dependencies": {
+                    pkg_name.clone(): version_req
+                }
+            });
+
+            std::fs::write(
+                npx_env_dir.join("package.json"),
+                serde_json::to_string_pretty(&minimal_manifest)?,
+            )?;
+
+            let install_options = InstallOptions {
+                project_dir: npx_env_dir.clone(),
+                registry_url: registry,
+                cache_dir: Some(cache_path.clone()),
+                offline: false,
+                ignore_scripts: false,
+                ..Default::default()
+            };
+
+            let mut installer = Installer::new(install_options)?;
+            installer.run().await?;
+
+            // Now locate binary in npx_env_dir
+            if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name) {
+                target
+            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, bin_name) {
+                target
+            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, package) {
+                target
+            } else {
+                // Scan .bin folder in npx_env_dir for any executable
+                let bin_dir = npx_env_dir.join("node_modules").join(".bin");
+                let mut found = None;
+                if bin_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() {
+                                found = Some(p);
+                                break;
+                            }
+                        }
+                    }
+                }
+                found.ok_or_else(|| anyhow::anyhow!(
+                    "Could not determine binary to run for package '{}'",
+                    package
+                ))?
+            }
+        }
+    };
+
+    // Execute the resolved binary with ancestor bin directories prepended to PATH
+    let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(current_dir);
+    if let Some(parent_bin) = binary_to_run.parent() {
+        if !path_entries.contains(&parent_bin.to_path_buf()) {
+            path_entries.insert(0, parent_bin.to_path_buf());
+        }
+    }
+
+    let status = rnpm_lifecycle::execute_binary_async(
+        &binary_to_run,
+        args,
+        current_dir,
+        &path_entries,
+        &std::collections::HashMap::new(),
+    ).await?;
+
+    if !status.success() {
+        let code = rnpm_lifecycle::extract_exit_status_code(&status);
+        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+            exit_code: code,
+            message: format!("Process exited with status code: {}", code),
+        }));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let current_dir = match dir {
         Some(d) => d,
@@ -1116,128 +1474,45 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
         } => {
-            // 1. Check local node_modules/.bin first
-            let local_bin = rnpm_lifecycle::find_local_binary(&current_dir, &package);
-            let binary_to_run = if let Some(bin_path) = local_bin {
-                bin_path
-            } else {
-                // Not found locally: resolve and install into ephemeral _npx cache
-                let cache_path = cache.clone().unwrap_or_else(|| {
-                    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-                        PathBuf::from(appdata).join("rnpm").join("cache")
-                    } else {
-                        std::env::temp_dir().join(".rnpm-cache")
-                    }
-                });
-
-                let safe_spec: String = package
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-                    .collect();
-
-                let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
-                let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &package);
-
-                if let Some(target) = bin_target {
-                    target
-                } else {
-                    if offline {
-                        return Err(anyhow::anyhow!(
-                            "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
-                            package
-                        ));
-                    }
-
-                    std::fs::create_dir_all(&npx_env_dir)?;
-
-                    // Parse package and version/range
-                    let (pkg_name, version_req) = if let Some(stripped) = package.strip_prefix('@') {
-                        if let Some(idx) = stripped.find('@') {
-                            (format!("@{}", &stripped[..idx]), stripped[idx + 1..].to_string())
-                        } else {
-                            (package.clone(), "*".to_string())
-                        }
-                    } else if let Some(idx) = package.find('@') {
-                        (package[..idx].to_string(), package[idx + 1..].to_string())
-                    } else {
-                        (package.clone(), "*".to_string())
-                    };
-
-                    let minimal_manifest = serde_json::json!({
-                        "name": "rnpm-exec-env",
-                        "version": "1.0.0",
-                        "dependencies": {
-                            pkg_name.clone(): version_req
-                        }
-                    });
-
-                    std::fs::write(
-                        npx_env_dir.join("package.json"),
-                        serde_json::to_string_pretty(&minimal_manifest)?,
-                    )?;
-
-                    let install_options = InstallOptions {
-                        project_dir: npx_env_dir.clone(),
-                        registry_url: registry,
-                        cache_dir: Some(cache_path.clone()),
-                        offline: false,
-                        ignore_scripts: false,
-                        ..Default::default()
-                    };
-
-                    let mut installer = Installer::new(install_options)?;
-                    installer.run().await?;
-
-                    // Now locate binary in npx_env_dir
-                    if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &package) {
-                        target
-                    } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name) {
-                        target
-                    } else {
-                        // Scan .bin folder in npx_env_dir for any executable
-                        let bin_dir = npx_env_dir.join("node_modules").join(".bin");
-                        let mut found = None;
-                        if bin_dir.is_dir() {
-                            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                                for entry in entries.flatten() {
-                                    let p = entry.path();
-                                    if p.is_file() {
-                                        found = Some(p);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        found.ok_or_else(|| anyhow::anyhow!(
-                            "Could not determine binary to run for package '{}'",
-                            package
-                        ))?
-                    }
-                }
-            };
-
-            // Execute the resolved binary with ancestor bin directories prepended to PATH
-            let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(&current_dir);
-            if let Some(parent_bin) = binary_to_run.parent() {
-                if !path_entries.contains(&parent_bin.to_path_buf()) {
-                    path_entries.insert(0, parent_bin.to_path_buf());
-                }
-            }
-
-            let status = rnpm_lifecycle::execute_binary_async(
-                &binary_to_run,
-                &args,
+            execute_exec(
                 &current_dir,
-                &path_entries,
-                &std::collections::HashMap::new(),
+                &package,
+                &args,
+                registry,
+                cache,
+                offline,
             ).await?;
-
-            if !status.success() {
-                let code = rnpm_lifecycle::extract_exit_status_code(&status);
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: format!("Process exited with status code: {}", code),
-                }));
+        }
+        Commands::Init {
+            initializer,
+            args,
+            yes,
+            scope,
+            registry,
+            cache,
+            offline,
+        } => {
+            if let Some(init_pkg) = initializer {
+                let transformed = init::transform_initializer(&init_pkg);
+                execute_exec(
+                    &current_dir,
+                    &transformed,
+                    &args,
+                    registry,
+                    cache,
+                    offline,
+                ).await?;
+            } else {
+                let init_opts = init::InitOptions {
+                    yes,
+                    scope,
+                    directory: current_dir,
+                };
+                let stdin = std::io::stdin();
+                let mut stdin_lock = stdin.lock();
+                let stdout = std::io::stdout();
+                let mut stdout_lock = stdout.lock();
+                init::run_init(&init_opts, &mut stdin_lock, &mut stdout_lock)?;
             }
         }
         Commands::Pack {
@@ -1427,35 +1702,100 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             action,
             prefix,
             json,
+            workspace,
+            workspaces,
         } => {
             let base_path = if prefix.is_absolute() {
                 prefix
             } else {
                 current_dir.join(&prefix)
             };
-            let manifest_path = if base_path.file_name().is_some_and(|f| f == "package.json") {
-                base_path
+            let root_manifest_path = if base_path.file_name().map_or(false, |f| f == "package.json") {
+                base_path.clone()
             } else {
                 base_path.join("package.json")
             };
-
-            if !manifest_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "code ENOENT: package.json not found in {}",
-                    manifest_path.parent().unwrap_or(&manifest_path).display()
-                ));
+            let project_root = if base_path.file_name().map_or(false, |f| f == "package.json") {
+                base_path.parent().unwrap_or(&base_path).to_path_buf()
+            } else {
+                base_path.clone()
             };
 
-            match action {
-                PkgAction::Get { fields } => {
-                    let output = rnpm_core::pkg::pkg_get(&manifest_path, &fields, json)?;
-                    println!("{output}");
+            if !root_manifest_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "code ENOENT: package.json not found in {}",
+                    project_root.display()
+                ));
+            }
+
+            let is_workspace_mode = workspaces || !workspace.is_empty();
+            if is_workspace_mode {
+                let discovered = rnpm_core::workspace::discover_workspaces(&project_root)
+                    .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
+
+                if discovered.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "npm error code ENOWORKSPACES\nnpm error No workspaces found in {}",
+                        project_root.display()
+                    ));
                 }
-                PkgAction::Set { assignments } => {
-                    rnpm_core::pkg::pkg_set(&manifest_path, &assignments)?;
+
+                let matched_members: Vec<rnpm_core::workspace::WorkspaceMember> = if workspaces && workspace.is_empty() {
+                    discovered
+                } else {
+                    let mut matched = Vec::new();
+                    for ws_filter in &workspace {
+                        let matches: Vec<_> = discovered
+                            .iter()
+                            .filter(|m| rnpm_lifecycle::matches_filter(ws_filter, &m.name, &m.path, &project_root))
+                            .cloned()
+                            .collect();
+                        if matches.is_empty() {
+                            return Err(anyhow::anyhow!(
+                                "npm error code ENOWORKSPACE\nnpm error No workspaces found for: {ws_filter}"
+                            ));
+                        }
+                        for m in matches {
+                            if !matched.iter().any(|existing: &rnpm_core::workspace::WorkspaceMember| existing.name == m.name) {
+                                matched.push(m);
+                            }
+                        }
+                    }
+                    matched
+                };
+
+                match action {
+                    PkgAction::Get { fields } => {
+                        let member_refs: Vec<(&str, &Path)> = matched_members
+                            .iter()
+                            .map(|m| (m.name.as_str(), m.path.as_path()))
+                            .collect();
+                        let output = rnpm_core::pkg::pkg_get_workspaces(&member_refs, &fields)?;
+                        println!("{output}");
+                    }
+                    PkgAction::Set { assignments } => {
+                        for m in &matched_members {
+                            rnpm_core::pkg::pkg_set(&m.manifest_path(), &assignments)?;
+                        }
+                    }
+                    PkgAction::Delete { fields } => {
+                        for m in &matched_members {
+                            rnpm_core::pkg::pkg_delete(&m.manifest_path(), &fields)?;
+                        }
+                    }
                 }
-                PkgAction::Delete { fields } => {
-                    rnpm_core::pkg::pkg_delete(&manifest_path, &fields)?;
+            } else {
+                match action {
+                    PkgAction::Get { fields } => {
+                        let output = rnpm_core::pkg::pkg_get(&root_manifest_path, &fields, json)?;
+                        println!("{output}");
+                    }
+                    PkgAction::Set { assignments } => {
+                        rnpm_core::pkg::pkg_set(&root_manifest_path, &assignments)?;
+                    }
+                    PkgAction::Delete { fields } => {
+                        rnpm_core::pkg::pkg_delete(&root_manifest_path, &fields)?;
+                    }
                 }
             }
         }
@@ -1516,6 +1856,69 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     println!("Finished in {:.3}s", elapsed);
                 }
             }
+        }
+        Commands::Diff {
+            specs,
+            diff_specs,
+            diff_name_only,
+            diff_unified,
+            diff_ignore_all_space,
+            diff_no_prefix,
+            diff_src_prefix,
+            diff_dst_prefix,
+            registry,
+            cache: _,
+        } => {
+            let options = diff::DiffOptions {
+                name_only: diff_name_only,
+                unified: diff_unified,
+                ignore_all_space: diff_ignore_all_space,
+                no_prefix: diff_no_prefix,
+                src_prefix: diff_src_prefix,
+                dst_prefix: diff_dst_prefix,
+            };
+            diff::run_diff(&current_dir, specs, diff_specs, options, registry).await?;
+        }
+        Commands::Sbom {
+            sbom_format,
+            sbom_type,
+            package_lock_only: _,
+            omit,
+        } => {
+            let options = sbom::SbomOptions {
+                format: sbom_format,
+                sbom_type,
+                package_lock_only: false,
+                omit,
+            };
+            sbom::run_sbom(&current_dir, options).await?;
+        }
+        Commands::Version {
+            newversion,
+            preid,
+            message,
+            allow_same_version,
+            no_git_tag_version,
+            no_commit_hooks,
+            sign_git_tag,
+            force,
+            ignore_scripts,
+            json,
+        } => {
+            let options = version::VersionOptions {
+                newversion,
+                preid,
+                message,
+                allow_same_version,
+                git_tag_version: !no_git_tag_version,
+                commit_hooks: !no_commit_hooks,
+                sign_git_tag,
+                force,
+                ignore_scripts,
+                json,
+            };
+
+            version::execute_version(&current_dir, options).await?;
         }
         Commands::List {
             packages,
@@ -1668,6 +2071,7 @@ async fn main() {
         .init();
 
     let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
+    let filtered_args = normalize_cli_args(filtered_args);
 
     if let Some((_, msg)) = check_unsupported_cli_invocation(&filtered_args) {
         eprintln!("{msg}");
@@ -1700,7 +2104,7 @@ async fn main() {
         }
     }
 
-    if let Err(err) = run_cli(cli, None).await {
+    if let Err(err) = Box::pin(run_cli(cli, None)).await {
         if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
             std::process::exit(exit_err.exit_code);
         }

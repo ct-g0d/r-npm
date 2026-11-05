@@ -220,6 +220,131 @@ impl Version {
     pub fn is_prerelease(&self) -> bool {
         !self.prerelease.is_empty()
     }
+
+    /// Bumps this version according to node-semver `inc(release, identifier)` rules.
+    pub fn inc(&self, release: &str, identifier: Option<&str>) -> Result<Self, SemverError> {
+        let mut v = self.clone();
+        v.build.clear(); // Incrementing drops build metadata in semver
+        match release {
+            "major" => {
+                if v.minor != 0 || v.patch != 0 || v.prerelease.is_empty() {
+                    v.major += 1;
+                }
+                v.minor = 0;
+                v.patch = 0;
+                v.prerelease.clear();
+            }
+            "minor" => {
+                if v.patch != 0 || v.prerelease.is_empty() {
+                    v.minor += 1;
+                }
+                v.patch = 0;
+                v.prerelease.clear();
+            }
+            "patch" => {
+                if v.prerelease.is_empty() {
+                    v.patch += 1;
+                }
+                v.prerelease.clear();
+            }
+            "premajor" => {
+                v.prerelease.clear();
+                v.patch = 0;
+                v.minor = 0;
+                v.major += 1;
+                v.inc_pre(identifier);
+            }
+            "preminor" => {
+                v.prerelease.clear();
+                v.patch = 0;
+                v.minor += 1;
+                v.inc_pre(identifier);
+            }
+            "prepatch" => {
+                v.prerelease.clear();
+                v.patch += 1;
+                v.inc_pre(identifier);
+            }
+            "prerelease" => {
+                if v.prerelease.is_empty() {
+                    v.patch += 1;
+                }
+                v.inc_pre(identifier);
+            }
+            _ => {
+                return Err(SemverError::InvalidVersion(format!(
+                    "Invalid release type: {release}"
+                )))
+            }
+        }
+        Ok(v)
+    }
+
+    fn inc_pre(&mut self, identifier: Option<&str>) {
+        let base: u64 = 0;
+        if self.prerelease.is_empty() {
+            self.prerelease = vec![PrereleaseId::Numeric(base)];
+        } else {
+            let mut incremented = false;
+            let mut i = self.prerelease.len();
+            while i > 0 {
+                i -= 1;
+                if let PrereleaseId::Numeric(n) = &mut self.prerelease[i] {
+                    *n += 1;
+                    incremented = true;
+                    break;
+                }
+            }
+            if !incremented {
+                self.prerelease.push(PrereleaseId::Numeric(base));
+            }
+        }
+
+        if let Some(id) = identifier {
+            let id_parts: Vec<&str> = id.split('.').collect();
+            // Check if current prerelease starts with id_parts
+            let mut matches = self.prerelease.len() >= id_parts.len();
+            if matches {
+                for (idx, part) in id_parts.iter().enumerate() {
+                    let matches_part = match &self.prerelease[idx] {
+                        PrereleaseId::Alpha(s) => s == *part,
+                        PrereleaseId::Numeric(n) => n.to_string() == *part,
+                    };
+                    if !matches_part {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if matches {
+                let next_idx = id_parts.len();
+                if next_idx < self.prerelease.len() {
+                    if let PrereleaseId::Numeric(_) = self.prerelease[next_idx] {
+                        // Keep current incremented number
+                    } else {
+                        self.set_prerelease_id_base(id_parts, base);
+                    }
+                } else {
+                    self.set_prerelease_id_base(id_parts, base);
+                }
+            } else {
+                self.set_prerelease_id_base(id_parts, base);
+            }
+        }
+    }
+
+    fn set_prerelease_id_base(&mut self, id_parts: Vec<&str>, base: u64) {
+        let mut new_pres = Vec::new();
+        for p in id_parts {
+            if let Ok(n) = p.parse::<u64>() {
+                new_pres.push(PrereleaseId::Numeric(n));
+            } else {
+                new_pres.push(PrereleaseId::Alpha(p.to_string()));
+            }
+        }
+        new_pres.push(PrereleaseId::Numeric(base));
+        self.prerelease = new_pres;
+    }
 }
 
 impl PartialOrd for Version {

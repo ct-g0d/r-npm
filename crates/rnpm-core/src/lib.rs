@@ -14,8 +14,8 @@ pub use manifest::{
     BundledDependencies, Manifest, PackageBin, PackageWorkspaces, PeerDependencyMeta,
 };
 pub use pkg::{
-    get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_set, resolve_manifest_path,
-    PathSegment,
+    coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_get_value,
+    pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
 };
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};
 pub use spec::{PackageSpec, PackageTarget};
