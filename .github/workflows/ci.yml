@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    name: Workspace Verification & Lint Gate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Pinned Rust Toolchain (1.99.1)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+          components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Node.js Oracle
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+
+      - name: Verify Toolchain Version (rust-toolchain.toml check)
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Cargo Check Workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy Gate (Zero Warnings Enforced)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Tests Gate (100% Pass Required)
+        run: cargo test --workspace
+
+      - name: Build Release Binary
+        run: cargo build --release --bin rnpm

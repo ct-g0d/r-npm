@@ -1,17 +1,17 @@
 {
     "version":  "checkpoint.v1",
     "metadata":  {
-                     "timestamp":  "2026-11-02T09:55:17Z",
+                     "timestamp":  "2026-11-05T09:50:03Z",
                      "git":  {
-                                 "revision":  "cdd858410c601203c20434cbe64669c7c7c7d666",
-                                 "dirty":  false
+                                 "revision":  "4a2a8f8d6b6b18c1c2f25d2e598aeec64c65345e",
+                                 "dirty":  true
                              },
                      "tool":  {
                                   "name":  "npm",
-                                  "version":  "11.19.0",
+                                  "version":  "11.20.0",
                                   "commit":  null
                               },
-                     "node_version":  "v24.21.0",
+                     "node_version":  "v26.13.0",
                      "rust_version":  null,
                      "cargo_profile":  null,
                      "target_triple":  null,
@@ -42,14 +42,14 @@
                     "trials_raw":  [
                                        {
                                            "trial_index":  0,
-                                           "wall_time_ms":  1353.73,
-                                           "user_cpu_ms":  781.25,
-                                           "system_cpu_ms":  531.25,
-                                           "peak_working_set_bytes":  94093312,
-                                           "peak_commit_charge_bytes":  101498880,
-                                           "disk_read_bytes":  4673780,
-                                           "disk_write_bytes":  3245,
-                                           "disk_read_ops":  3263,
+                                           "wall_time_ms":  1167.05,
+                                           "user_cpu_ms":  625,
+                                           "system_cpu_ms":  312.5,
+                                           "peak_working_set_bytes":  89956352,
+                                           "peak_commit_charge_bytes":  98131968,
+                                           "disk_read_bytes":  4765946,
+                                           "disk_write_bytes":  3111,
+                                           "disk_read_ops":  3266,
                                            "disk_write_ops":  38,
                                            "network_bytes_read":  958,
                                            "network_bytes_written":  0,
@@ -58,14 +58,14 @@
                                        },
                                        {
                                            "trial_index":  1,
-                                           "wall_time_ms":  1194.87,
-                                           "user_cpu_ms":  734.38,
-                                           "system_cpu_ms":  500,
-                                           "peak_working_set_bytes":  94179328,
-                                           "peak_commit_charge_bytes":  102428672,
-                                           "disk_read_bytes":  4683204,
-                                           "disk_write_bytes":  3246,
-                                           "disk_read_ops":  3264,
+                                           "wall_time_ms":  1113.79,
+                                           "user_cpu_ms":  640.62,
+                                           "system_cpu_ms":  359.38,
+                                           "peak_working_set_bytes":  90099712,
+                                           "peak_commit_charge_bytes":  98267136,
+                                           "disk_read_bytes":  4697049,
+                                           "disk_write_bytes":  3110,
+                                           "disk_read_ops":  3261,
                                            "disk_write_ops":  38,
                                            "network_bytes_read":  958,
                                            "network_bytes_written":  0,
@@ -74,14 +74,14 @@
                                        },
                                        {
                                            "trial_index":  2,
-                                           "wall_time_ms":  1231.58,
-                                           "user_cpu_ms":  750,
-                                           "system_cpu_ms":  437.5,
-                                           "peak_working_set_bytes":  93511680,
-                                           "peak_commit_charge_bytes":  101756928,
-                                           "disk_read_bytes":  4669571,
-                                           "disk_write_bytes":  3245,
-                                           "disk_read_ops":  3262,
+                                           "wall_time_ms":  1094.05,
+                                           "user_cpu_ms":  593.75,
+                                           "system_cpu_ms":  265.62,
+                                           "peak_working_set_bytes":  89186304,
+                                           "peak_commit_charge_bytes":  97361920,
+                                           "disk_read_bytes":  4697049,
+                                           "disk_write_bytes":  3111,
+                                           "disk_read_ops":  3261,
                                            "disk_write_ops":  38,
                                            "network_bytes_read":  958,
                                            "network_bytes_written":  0,
@@ -90,14 +90,14 @@
                                        },
                                        {
                                            "trial_index":  3,
-                                           "wall_time_ms":  1161.81,
-                                           "user_cpu_ms":  921.88,
-                                           "system_cpu_ms":  359.38,
-                                           "peak_working_set_bytes":  93528064,
-                                           "peak_commit_charge_bytes":  100675584,
-                                           "disk_read_bytes":  4669571,
-                                           "disk_write_bytes":  3244,
-                                           "disk_read_ops":  3262,
+                                           "wall_time_ms":  1060.29,
+                                           "user_cpu_ms":  593.75,
+                                           "system_cpu_ms":  343.75,
+                                           "peak_working_set_bytes":  89247744,
+                                           "peak_commit_charge_bytes":  97431552,
+                                           "disk_read_bytes":  4697049,
+                                           "disk_write_bytes":  3111,
+                                           "disk_read_ops":  3261,
                                            "disk_write_ops":  38,
                                            "network_bytes_read":  958,
                                            "network_bytes_written":  0,
@@ -106,14 +106,14 @@
                                        },
                                        {
                                            "trial_index":  4,
-                                           "wall_time_ms":  1192.62,
-                                           "user_cpu_ms":  562.5,
-                                           "system_cpu_ms":  234.38,
-                                           "peak_working_set_bytes":  94310400,
-                                           "peak_commit_charge_bytes":  102637568,
-                                           "disk_read_bytes":  4686552,
-                                           "disk_write_bytes":  3248,
-                                           "disk_read_ops":  3265,
+                                           "wall_time_ms":  1120.56,
+                                           "user_cpu_ms":  625,
+                                           "system_cpu_ms":  281.25,
+                                           "peak_working_set_bytes":  90284032,
+                                           "peak_commit_charge_bytes":  98435072,
+                                           "disk_read_bytes":  4697049,
+                                           "disk_write_bytes":  3111,
+                                           "disk_read_ops":  3261,
                                            "disk_write_ops":  38,
                                            "network_bytes_read":  958,
                                            "network_bytes_written":  0,
@@ -123,52 +123,52 @@
                                    ],
                     "summary":  {
                                     "wall_time":  {
-                                                      "median":  1194.87,
-                                                      "min":  1161.81,
-                                                      "max":  1353.73,
-                                                      "iqr":  38.96,
-                                                      "mean":  1226.92,
-                                                      "rsd_pct":  6.12
+                                                      "median":  1113.79,
+                                                      "min":  1060.29,
+                                                      "max":  1167.05,
+                                                      "iqr":  26.51,
+                                                      "mean":  1111.15,
+                                                      "rsd_pct":  3.51
                                                   },
                                     "user_cpu":  {
-                                                     "median":  750,
-                                                     "min":  562.5,
-                                                     "max":  921.88,
-                                                     "iqr":  46.87
+                                                     "median":  625,
+                                                     "min":  593.75,
+                                                     "max":  640.62,
+                                                     "iqr":  31.25
                                                  },
                                     "system_cpu":  {
-                                                       "median":  437.5,
-                                                       "min":  234.38,
-                                                       "max":  531.25,
-                                                       "iqr":  140.62
+                                                       "median":  312.5,
+                                                       "min":  265.62,
+                                                       "max":  359.38,
+                                                       "iqr":  62.5
                                                    },
                                     "peak_working_set":  {
-                                                             "median":  94093312,
-                                                             "min":  93511680,
-                                                             "max":  94310400,
-                                                             "iqr":  651264
+                                                             "median":  89956352,
+                                                             "min":  89186304,
+                                                             "max":  90284032,
+                                                             "iqr":  851968
                                                          },
                                     "peak_commit_charge":  {
-                                                               "median":  101756928,
-                                                               "min":  100675584,
-                                                               "max":  102637568,
-                                                               "iqr":  929792
+                                                               "median":  98131968,
+                                                               "min":  97361920,
+                                                               "max":  98435072,
+                                                               "iqr":  835584
                                                            },
                                     "disk_write_bytes":  {
-                                                             "median":  3245,
-                                                             "min":  3244,
-                                                             "max":  3248,
-                                                             "iqr":  1
+                                                             "median":  3111,
+                                                             "min":  3110,
+                                                             "max":  3111,
+                                                             "iqr":  0
                                                          },
                                     "disk_read_bytes":  {
-                                                            "median":  4673780,
-                                                            "min":  4669571,
-                                                            "max":  4686552,
-                                                            "iqr":  13633
+                                                            "median":  4697049,
+                                                            "min":  4697049,
+                                                            "max":  4765946,
+                                                            "iqr":  0
                                                         },
                                     "write_amplification":  {
-                                                                "median":  13.927,
-                                                                "ratio":  13.927
+                                                                "median":  13.352,
+                                                                "ratio":  13.352
                                                             },
                                     "uncompressed_package_bytes":  233,
                                     "outliers_replaced":  1

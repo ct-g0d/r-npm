@@ -213,7 +213,13 @@ impl DependencyGraph {
                     if let Some(bin) = &node.bin {
                         root_pkg.bin = Some(bin.clone());
                     }
-                    root_pkg.extra = node.extra.clone();
+                    let mut filtered_extra = std::collections::BTreeMap::new();
+                    for (k, v) in &node.extra {
+                        if k == "overrides" || k == "workspaces" {
+                            filtered_extra.insert(k.clone(), v.clone());
+                        }
+                    }
+                    root_pkg.extra = filtered_extra;
                 }
             } else {
                 let is_dev_and_opt = node.flags.dev && node.flags.optional;
