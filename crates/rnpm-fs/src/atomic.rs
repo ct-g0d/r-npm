@@ -42,10 +42,9 @@ pub fn extract_and_replace<R: Read>(
 
     // Extract into staging directory.
     // If extraction fails or a tar-bomb limit is violated, staging_temp is dropped and cleaned up.
-    let summary = extract_tar_gz(reader, staging_path, limits).map_err(|err| {
+    let summary = extract_tar_gz(reader, staging_path, limits).inspect_err(|_err| {
         // Explicitly clean up staging directory on error
         let _ = fs::remove_dir_all(staging_path);
-        err
     })?;
 
     // Staging succeeded: replace destination with staging directory

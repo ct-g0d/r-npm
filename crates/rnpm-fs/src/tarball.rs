@@ -513,11 +513,10 @@ pub fn extract_tar_gz<R: Read>(
 
                     unlink_target_path(&target_path);
 
-                    if fs::hard_link(&source_full, &target_path).is_err() {
-                        if source_full.is_file() {
+                    if fs::hard_link(&source_full, &target_path).is_err()
+                        && source_full.is_file() {
                             let _ = fs::copy(&source_full, &target_path);
                         }
-                    }
 
                     hardlink_targets.insert(relative_path.clone(), cleaned_target);
                     extracted_regular_files.insert(relative_path.clone());
@@ -1183,12 +1182,11 @@ fn walk_bundled_dependency_dir(
 
         if file_type.is_dir() {
             walk_bundled_dependency_dir(&path, root_dir, out, existing)?;
-        } else if file_type.is_file() {
-            if !existing.contains(&rel_path) {
+        } else if file_type.is_file()
+            && !existing.contains(&rel_path) {
                 existing.insert(rel_path.clone());
                 out.push((rel_path, path));
             }
-        }
     }
 
     Ok(())
@@ -1217,15 +1215,13 @@ fn collect_strictly_required_files(package_dir: &Path, manifest: &Manifest) -> V
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let upper = name.to_ascii_uppercase();
-            if upper.starts_with("README")
+            if (upper.starts_with("README")
                 || upper.starts_with("LICENSE")
                 || upper.starts_with("LICENCE")
-                || upper.starts_with("COPYING")
-            {
-                if entry.path().is_file() {
+                || upper.starts_with("COPYING"))
+                && entry.path().is_file() {
                     required.push(name);
                 }
-            }
         }
     }
 
@@ -1285,7 +1281,7 @@ fn walk_dir_collect(
 }
 
 fn is_strictly_excluded(rel_path: &str, is_dir: bool) -> bool {
-    let filename = rel_path.split('/').last().unwrap_or(rel_path);
+    let filename = rel_path.split('/').next_back().unwrap_or(rel_path);
 
     // Hard exclusions matching npm
     if rel_path == ".git"
@@ -1448,7 +1444,7 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
         }
     } else {
         // Pattern matches basename or any segment
-        let basename = target_path.split('/').last().unwrap_or(target_path);
+        let basename = target_path.split('/').next_back().unwrap_or(target_path);
         if match_glob(clean_pat, basename) {
             return true;
         }

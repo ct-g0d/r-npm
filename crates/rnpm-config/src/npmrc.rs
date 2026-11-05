@@ -313,7 +313,7 @@ impl Npmrc {
         for (scope, url) in &self.scoped_registries {
             out.push_str(&format!("{scope}:registry={url}\n"));
         }
-        for (prefix, _) in &self.auth_tokens {
+        for prefix in self.auth_tokens.keys() {
             out.push_str(&format!("{prefix}:_authToken=[REDACTED]\n"));
         }
         for (k, v) in &self.settings {
@@ -450,7 +450,7 @@ pub fn validate_package_name(name: &str) -> Result<(), ConfigError> {
     }
 
     // Reject non-ASCII characters (e.g. Cyrillic homoglyphs, zero-width spaces, fullwidth characters, RTL overrides)
-    if trimmed.chars().any(|c| !c.is_ascii()) {
+    if !trimmed.is_ascii() {
         return Err(ConfigError::InvalidLine(format!(
             "Package name contains forbidden non-ASCII or spoofed characters: '{trimmed}'"
         )));
@@ -544,7 +544,7 @@ where
                         let expr = &rest[..close_rel];
                         // Advance iterator past '}'
                         while let Some((c_idx, _)) = chars.peek() {
-                            if *c_idx >= idx + 2 + close_rel + 1 {
+                            if *c_idx > idx + 2 + close_rel {
                                 break;
                             }
                             chars.next();

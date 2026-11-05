@@ -1,4 +1,6 @@
-﻿use std::collections::{HashMap, HashSet};
+﻿#![allow(clippy::upper_case_acronyms, clippy::field_reassign_with_default)]
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::collections::BinaryHeap;
 use std::process::{Command, ExitStatus};
@@ -622,7 +624,7 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
 
                 if combined.len() > 512 {
                     let split_candidate = combined.len() - 256;
-                    let split_pos = match combined[..split_candidate].rfind(|c: char| c == '\n' || c == '\r' || c == ' ' || c == ';') {
+                    let split_pos = match combined[..split_candidate].rfind(['\n', '\r', ' ', ';']) {
                         Some(pos) => pos + 1,
                         None => split_candidate,
                     };
@@ -844,17 +846,9 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let stdout_handle = if let Some(mut r) = child_stdout {
-        Some(std::thread::spawn(move || drain_and_scrub_reader(&mut r)))
-    } else {
-        None
-    };
+    let stdout_handle = child_stdout.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
 
-    let stderr_handle = if let Some(mut r) = child_stderr {
-        Some(std::thread::spawn(move || drain_and_scrub_reader(&mut r)))
-    } else {
-        None
-    };
+    let stderr_handle = child_stderr.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
 
     let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
     let status = if let Some(timeout) = effective_timeout {
@@ -1295,19 +1289,17 @@ pub fn matches_filter(filter: &str, member_name: &str, member_path: &Path, root_
             if member_name.starts_with(scope_name) && member_name[scope_name.len()..].starts_with('/') {
                 return true;
             }
-        } else if !filter.contains('/') {
-            if member_name.starts_with(filter) && member_name[filter.len()..].starts_with('/') {
+        } else if !filter.contains('/')
+            && member_name.starts_with(filter) && member_name[filter.len()..].starts_with('/') {
                 return true;
             }
-        }
     }
 
     // 3. Glob wildcard matching
-    if filter.contains('*') || filter.contains('?') {
-        if glob_match(filter, member_name) {
+    if (filter.contains('*') || filter.contains('?'))
+        && glob_match(filter, member_name) {
             return true;
         }
-    }
 
     // 4. Path matching relative to root_dir
     let norm_filter = filter.replace('\\', "/").trim_start_matches("./").to_string();

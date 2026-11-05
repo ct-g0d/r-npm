@@ -2,7 +2,7 @@
 
 ## 1. Guiding Rules & Compatibility Philosophy
 
-1. **Behavioral Oracle:** `npm` (specifically `npm v11.x` running on Node.js `v24.x`) is the definitive behavioral ground truth for this project.
+1. **Behavioral Oracle:** `npm` (specifically `npm v11.x` running on Node.js `v24.x` / `v26.x`) is the definitive behavioral ground truth for this project.
 2. **Normalized Parity:** The project is successful when it produces an installed `node_modules` dependency tree and `package-lock.json` file whose normalized digests match npm with **zero diff**.
 3. **Correctness Before Speed:** Never trade correctness or compatibility for performance. A faster installer that computes a divergent dependency tree is a failed installer.
 4. **Isolated Contracts:** Each subsystem operates under an explicit frozen contract. Cross-subsystem interactions must adhere to documented boundaries.
@@ -13,15 +13,34 @@
 ## 2. Command Surface & Scope Boundaries
 
 ### Active Command Matrix & Aliases
-- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3. Supports `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`.
+- `install` (aliases: `i`, `add`, `isntall`): Resolve, fetch, verify, unpack, link, run lifecycle scripts, and write lockfile v3.
+  - Flags: `--save-dev` (`-D`), `--save-exact` (`-E`), `--save-prod` (`-P`, `-S`, `--save`), `--save-optional` (`-O`), `--save-peer`, `--no-save`, `--package-lock-only`, `--omit` (`dev`, `optional`, `peer`), `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--registry`, `--cache`, scoped registries (`--@scope:registry=...`, `@scope:registry=...`).
 - `ci` / `clean-install` (aliases: `clean-install`, `ic`): Clean install strictly from lockfile v3 (or v1/v2 migrated in memory). Rejects manifest/lockfile drift with immediate termination (`ELOCKFILE_DRIFT`) and zero network/filesystem side effects.
-- `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls. Supports `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
+  - Flags: `--omit` (`dev`, `optional`, `peer`), `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--package-lock-only`, `--registry`, `--cache`.
+- `test` (aliases: `t`, `tst`): Dedicated shortcut to execute package `test` script defined in `package.json`, passing arbitrary trailing arguments through to the underlying runner.
+- `start`: Dedicated shortcut to execute package `start` script, forwarding arbitrary trailing arguments.
+- `restart`: Dedicated shortcut to execute package `restart` script, forwarding arbitrary trailing arguments.
+- `stop`: Dedicated shortcut to execute package `stop` script, forwarding arbitrary trailing arguments.
+- `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls.
+  - When invoked without arguments (`rnpm run`), lists all available lifecycle scripts and custom user scripts alongside package ID.
+  - Flags: `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
 - `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance.
-- `pack`: Package project files into a canonical npm-compatible `.tgz` archive. Supports `--dry-run`, `--json`, and `--pack-destination`.
-- `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile. Supports `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`).
-- `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies and update package.json/lockfile.
+  - Flags: `--registry`, `--cache`, `--offline`.
+- `pack`: Package project files into a canonical npm-compatible `.tgz` archive with npm ignore/files filtering.
+  - Flags: `--dry-run`, `--json`, `--pack-destination`.
+- `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile, and clean empty scope directories.
+  - Flags: `--save-dev` (`-D`), `--save-optional` (`-O`), `--save-prod` (`-P`, `--save`).
+- `update` (alias: `up`): Fetch latest versions matching declared semver ranges for registry dependencies, clean superseded packages, and update package.json/lockfile.
+  - Flags: `--registry`, `--cache`, `--offline`, `--ignore-scripts`, `--legacy-peer-deps`.
+- `prune`: Remove extraneous packages from `node_modules` not reachable from `package.json` manifest declarations or pruned by omit flags.
+  - Flags: `--omit` (`dev`, `optional`, `peer`), `--production` (`-p`), `--dry-run`, `--json`.
+- `pkg`: Programmatically inspect, mutate, or delete properties in `package.json` with dot-notated field path expressions.
+  - Subcommands: `get <field...>`, `set <key>=<val...>`, `delete <field...>`.
+  - Flags: `--prefix`, `--json`.
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
+  - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
+  - Flags: `--cache`.
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
@@ -40,25 +59,27 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--legacy-peer-deps`, `--global`, `-g`, `--save-bundle`, `--production`) terminate immediately with exit code `1` and a structured diagnostic:
+Flags not supported or outside the active scope of `rnpm` (e.g., `--global`, `-g`, `--save-bundle`, `--production` on install) terminate immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_FLAG
 npm error The flag '<flag>' is not supported by rnpm.
 npm error See docs/compatibility-contract.md for supported options.
 ```
+*(Note: `--legacy-peer-deps` is fully supported on `install`, `ci`, and `update` commands).*
 
 ### Unsupported & Deferred Commands
 - `publish`: Package publishing (deferred).
 - `list` / `ls` / `la` / `ll`: Dependency tree inspection (deferred).
 - `outdated`: Dependency update checking (deferred).
-- `view` / `info` / `v`: Registry metadata inspection (deferred).
+- `view` / `info` / `v` / `show`: Registry metadata inspection (deferred).
 - `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
 - `fix`: Vulnerability automated remediation.
 - `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
 - Writing legacy lockfile formats (v1 or v2).
 
-### Unsupported Command Handling (DEC-004)
-When a user invokes an unsupported or deferred command, `rnpm` terminates immediately with exit code `1` and a structured diagnostic:
+### Drop-in Compatibility Target & Unsupported Command Handling (DEC-004)
+DEC-004 formalizes the complete drop-in target for `npm 11.x`: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility.
+When a user invokes an unsupported or deferred command during the transition, `rnpm` terminates immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_COMMAND
 npm error The command '<command>' is not currently implemented in rnpm.
@@ -74,7 +95,8 @@ npm error See docs/compatibility-contract.md for the active compatibility surfac
 | **DEC-001** | Semver Implementation | Accepted | Custom `node-semver`-compatible parser. The standard Rust `semver` crate grammar is incompatible with npm (diverges on loose versions, `x` ranges, hyphen ranges, prerelease precedence, and `0.x` caret rules). |
 | **DEC-002** | Performance Registry | Accepted | Performance checkpoints (Gates A, D, F) exclusively use a pinned loopback registry (`http://127.0.0.1:4873/`). Public upstream (`npmjs.org`) is reserved for smoke tests and functional fixtures. |
 | **DEC-003** | Windows Process Accounting | Accepted | Benchmark instrumentation uses Windows Job Objects (`QueryInformationJobObject`) to aggregate CPU time, peak working set, commit charge, and I/O across the entire process tree. |
-| **DEC-004** | Unsupported Command Handling | Accepted | Terminate with structured `ERR_UNSUPPORTED_COMMAND` error and non-zero exit code. |
+| **DEC-004** | Full npm 11.x Drop-in Target | Accepted | Define exact npm 11.x drop-in target: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility. Active command matrix and flag surface expanded. Deferred commands terminate with structured `ERR_UNSUPPORTED_COMMAND` error and non-zero exit code during parallel transition. |
+| **DEC-005** | Core code isolation & Worktrees | Accepted | Mandatory rule: Any modifications to core crates (`crates/rnpm-*`) must be performed within dedicated git worktrees. This directive applies to all successor threads in the lineage. |
 
 ---
 

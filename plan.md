@@ -34,6 +34,7 @@ Update the checklist and the changelog whenever a task, review pass, benchmark c
 
 | Date | Status | Change | Evidence |
 |---|---|---|---|
+| 2026-11-05 | `[x]` | Formalized DEC-004 Closure, Toolchain Pinning (Blocker 5), Benchmark Reconciliation & Full Workspace Gate Verification (Thread 8): marked DEC-004 as Accepted in plan.md and docs/compatibility-contract.md; formalized exact npm 11.x drop-in target across package management, inspection, publishing, lifecycle, linking, and query workflows; documented pinned Rust toolchain (1.99.1) in README.md and .github/workflows/ci.yml; verified rust-toolchain.toml is honored; reconciled benchmark discrepancy between baseline checkpoint (78.09 ms median) and phase5 report (50.74 ms draft/single-trial figure), re-running full differential benchmark sweeps on clean working tree with exact Node v26.13.0 and npm 11.20.0 metrics; resolved all workspace clippy warnings to 0 and verified 100% test pass rate across 441 workspace unit/integration tests with zero failures. | `plan.md`, `docs/compatibility-contract.md`, `docs/phase5-benchmark-report.md`, `README.md`, `.github/workflows/ci.yml`, `docs/verdict-blockers-resolution-report.md` |
 | 2026-11-03 | `[x]` | Delivered CHUNK 3 CLI Surface, Audit Architecture, Structured Diagnostics & Lifecycle Deduplication: normalized CLI command matrix in `rnpm-cli` supporting `clean-install`/`ci`/`ic` aliases and deferred subcommands (`list`/`ls`/`la`/`ll`, `outdated`, `view`/`info`/`v`, `publish`) returning consistent `ERR_UNSUPPORTED_COMMAND` diagnostics; rebuilt `audit` engine with shared `rnpm-config` and `rnpm-registry` stacks, eliminated hardcoded localhost URLs, added `dev`, `optional`, `peer`, `peerOptional`, and `prod` dependency classifications, and supported npm severity levels (`info`, `low`, `moderate`, `high`, `critical`, `none`); centralized structured error diagnostics (`rnpm-cli::diagnostics`) with stable npm error codes (`ERESOLVE`, `ETARGET`, `EINTEGRITY`, `ELOCKFILE_DRIFT`, `E404`, `E401`, `E403`, `E429`, `EUNSUPPORTEDPROTOCOL`, `ETARBOMB`, `ESECURITY`, `EJSONPARSE`, `ENOLOCK`, `ENOENT`, `ENOWORKSPACES`); eliminated dead duplicate `crates/rnpm-lifecycle/src/topo.rs`; added command-level integration tests (`cli_matrix_and_diagnostics_test.rs`) and synchronized `docs/compatibility-contract.md`. 100% test pass rate across `rnpm-cli` and `rnpm-lifecycle`. | `crates/rnpm-cli/`, `crates/rnpm-lifecycle/`, `crates/rnpm-lockfile/`, `docs/compatibility-contract.md`, `plan.md` |
 | 2026-11-02 | `[x]` | Delivered CHUNK 6 Production Hardening, Extreme Bipartite Peer Webs, Multi-Process Cache Contention & Real-World Ecosystem Benchmarks (AGY 6): implemented adversarial bipartite peer dependency meshes ($K_{2,3}$ / multi-core multi-plugin) mixing optional and strict peer constraints; deep transitive 5-level nested & arrow syntax overrides; circular workspace `devDependencies` with transitive peer satisfaction; hardened `rnpm-registry` with transient error classification (`is_transient()`), socket stream drop recovery, and exponential backoff retry; multi-process file locking resilience in `rnpm-cache` with zero corruption under 16 concurrent workers; created production-grade full-stack fixture `real-world-ecosystem-app` (Express, React 18, React-DOM, Chalk, Lodash, TypeScript 5.3, Prettier 3.2); verified 100% normalized tree & lockfile v3 parity across 312+ differential assertions; executed Windows Job Object performance sweeps demonstrating 2.6x-3.3x speedups on full-stack apps and 14x-17x on standard workloads, with 80-92% RAM reduction. All 280+ workspace unit & integration tests passing cleanly. | Branch `t3/feat-chunk6-production-hardening-chaos-bench` (commit `e35c160`), `benchmarks/test-differential-tier3-stress.ps1`, `benchmarks/test-differential-real-world-ecosystem.ps1`, `benchmarks/test-stress-multiprocess-cache.ps1`, `crates/rnpm-solver/`, `crates/rnpm-registry/`, `crates/rnpm-cache/`, `crates/rnpm-fs/`, `crates/rnpm-lifecycle/` |
 | 2026-11-02 | `[x]` | Delivered CHUNK 3 & Graph Resolution Hardening: Extreme/Adversarial Graph Resolution, Combinatorial Peer Cliques, Pathological Version Constraints, Circular devDependencies & Lockfile Fast-Path Drift (AGY 4): hardened `rnpm-solver` against dense N-node peer cliques ($K_5$ with 20 directed peer edges) and multi-tier diamond peer webs; eliminated cross-branch peer cycle contamination with path-scoped ancestry tracking; enforced strict SemVer compatibility during peer cycle-breaking (`ERESOLVE` on conflict); eliminated invalid global node lookup fallback in peer resolution; prevented direct production dependencies from being overridden by peer dependencies; fixed version selection tie-breaking bug (SemVer-aware max rather than ASCII lexicographical string sort); hardened `rnpm-core` against integer overflow DoS panics (`u64::MAX.0.0`) in range calculations; fixed wildcard operators with `=` and `<=` (`=*`, `<= *`); strictly rejected standalone operators (`>`, `<`, `=`, `~`, `^`) and malformed tokens (`1.0.0-`, `1.2.3.4`); supported circular inter-workspace `devDependencies` by partitioning runtime dependencies from devDependencies and gracefully breaking dev cycles; enhanced cross-workspace hoisting to isolate conflicting external dependencies into member-nested scopes; hardened `rnpm-install` and `rnpm-lockfile` with comprehensive bidirectional drift detection across dependencies, devDependencies, and optionalDependencies in `run_ci`; added adversarial `file:` path traversal defense and strict package integrity enforcement; connected hidden lockfile (`node_modules/.package-lock.json`) persistence. Verified 260+ tests passing cleanly across workspace, and 100% differential parity against npm oracle across 49/49 lifecycle-shim and 40/40 Phase 6 assertions. | Branch `t3/feat-agy4-adversarial-graph-resolution`, `crates/rnpm-core/`, `crates/rnpm-solver/`, `crates/rnpm-install/`, `crates/rnpm-lockfile/`, `benchmarks/test-differential-lifecycle-shim.ps1`, `benchmarks/test-differential-phase6-corpus.ps1` |
@@ -75,41 +76,37 @@ Do not mark a phase complete because the prose is complete. Mark it complete onl
 | DEC-001 | 2026-10-31 | Semver implementation | `[x]` Accepted | Implement node-semver-compatible behavior rather than assuming the standard Rust grammar is sufficient. |
 | DEC-002 | 2026-10-31 | Performance registry | `[x]` Accepted | Performance checkpoints use a pinned loopback registry; public registry runs are smoke tests only. |
 | DEC-003 | 2026-10-31 | Windows process accounting | `[x]` Accepted | Use Job Object process-tree accounting plus sampled working set. |
-| DEC-004 | 2026-10-31 | Full npm surface | `[!]` Open | Decide when unsupported commands move into the compatibility target based on fixture evidence. |
+| DEC-004 | 2026-11-05 | Full npm 11.x drop-in surface | `[x]` Accepted | Define exact npm 11.x drop-in target: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility. Active command matrix and flag surface expanded. |
 | DEC-005 | 2026-11-02 | Core code isolation & Worktrees | `[x]` Accepted | Mandatory rule: Any modifications to core crates (`crates/rnpm-*`) must be performed within dedicated git worktrees. This directive applies to all successor threads in the lineage. |
 
 ## Scope definition
 
-The target is a practical npm-compatible package manager, not an immediate rewrite of every npm command.
+The target is an exact, drop-in replacement for npm 11.x: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility.
 
-### Initial target
+### Formal Drop-In Target (DEC-004 Accepted)
 
-- `install`
-- `ci`
-- `run`
-- `uninstall`
-- `update` for ordinary registry dependencies
-- `pack` for ordinary packages
-- project and user `.npmrc` configuration, including scoped registries and auth tokens
-- public and scoped registries
-- lockfile v3 read/write, read-only migration from v1/v2, and maintaining the hidden tree lockfile
-- integrity verification
-- local cache
-- lifecycle scripts
-- Windows and Unix command shims
-- local `file:` dependencies
-- ordinary workspaces after the single-project path is stable
+- **Package Management:** `install` (`i`, `add`, `isntall`), `ci` / `clean-install` (`ic`), `uninstall` (`remove`, `rm`, `r`, `un`), `update` (`up`), `prune` (`--omit`, `--production`, `-p`).
+- **Inspection & Manifest Query:** `pkg` (`get`, `set`, `delete`), `audit` (bulk security advisories, `--audit-level`, `--json`), `cache` (`clean`, `verify`).
+- **Lifecycle & Execution:** `run` / `run-script` (custom and topological workspace scripts), bare `run` (script enumeration), dedicated script shortcuts (`test`/`t`/`tst`, `start`, `restart`, `stop`), `exec` / `npx` (`x`).
+- **Distribution & Archives:** `pack` (tarball archive generation, `--dry-run`, `--json`, `--pack-destination`).
+- **Protocols & Linking:** Public/scoped registry packages, local directory dependencies (`file:../dir` via unprivileged NTFS junctions / symlinks), local archives (`file:./pkg.tgz`), multi-tier monorepo workspaces (`workspace:*`, `workspace:^`, `workspace:~`), Git repositories (`github:`, `gitlab:`, `bitbucket:`, `git+https:`, `git+ssh:`), and direct tarball URLs.
+- **Configuration & Auth:** Project and user `.npmrc` configuration, scoped registry routing (`--@scope:registry=...`), environment variable token expansion (`${NPM_TOKEN}`, `${CI_AUTH_KEY}`), credential scrubbing.
+- **Lockfile & Integrity:** Deterministic lockfile v3 serialization, read-only migration from v1/v2, hidden tree lockfile (`node_modules/.package-lock.json`), SSRI multi-hash integrity verification (SHA-512, SHA-384, SHA-256, SHA-1).
+- **Execution Sandboxing & Containment:** Windows Job Object process-tree containment, hierarchical `PATH`, credential scrubbing, timeout termination (code 124), signal forwarding (SIGINT 130, SIGTERM 143).
+- **Executable Shims:** Cross-platform trio generation (`<name>`, `<name>.cmd`, `<name>.ps1`, Unix shell) with argument escaping and shebang normalization.
 
-### Deferred until the core is reliable
+### Deferred Command Matrix (Phase Transition)
 
-- publishing and account management
-- `exec` / `npx` dynamic ephemeral package execution
-- Git and hosted-tarball dependencies
-- audit and vulnerability auditing
-- unusual registry authentication schemes
-- writing legacy lockfile formats
-- undocumented npm quirks without a compatibility test
-- replacing Node, TypeScript, Vite, Webpack, or other build tools
+- `publish`: Package publishing (deferred).
+- `list` / `ls` / `la` / `ll`: Dependency tree inspection (deferred).
+- `outdated`: Dependency update checking (deferred).
+- `view` / `info` / `v` / `show`: Registry metadata inspection (deferred).
+- `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
+- `fix`: Vulnerability automated remediation.
+- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`, `version`, `init`, `create`.
+- Writing legacy lockfile formats (v1 or v2).
+
+*Note:* All deferred subcommands terminate deterministically with exit code 1 and structured `ERR_UNSUPPORTED_COMMAND` diagnostics per DEC-004 while under active implementation.
 
 ## Guiding rules
 

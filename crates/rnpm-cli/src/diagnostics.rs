@@ -234,28 +234,18 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         }
         }
 
-        if let Some(manifest_err) = cause.downcast_ref::<ManifestError>() {
-            match manifest_err {
-                ManifestError::MalformedJson { message, line, column } => {
-                    return Diagnostic::new(
-                        "EJSONPARSE",
-                        format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
-                    );
-                }
-                _ => {}
-            }
+        if let Some(ManifestError::MalformedJson { message, line, column }) = cause.downcast_ref::<ManifestError>() {
+            return Diagnostic::new(
+                "EJSONPARSE",
+                format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
+            );
         }
 
-        if let Some(lockfile_err) = cause.downcast_ref::<LockfileError>() {
-            match lockfile_err {
-                LockfileError::Json(e) => {
-                    return Diagnostic::new(
-                        "EJSONPARSE",
-                        format!("Failed to parse package-lock.json: {e}"),
-                    );
-                }
-                _ => {}
-            }
+        if let Some(LockfileError::Json(e)) = cause.downcast_ref::<LockfileError>() {
+            return Diagnostic::new(
+                "EJSONPARSE",
+                format!("Failed to parse package-lock.json: {e}"),
+            );
         }
 
         if let Some(core_err) = cause.downcast_ref::<CoreError>() {

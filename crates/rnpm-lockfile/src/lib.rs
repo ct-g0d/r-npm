@@ -4,6 +4,8 @@
 //! POSIX forward-slash path keys, flag preservation (dev, optional, inBundle, hasInstallScript),
 //! and full migration support for legacy lockfile v1 and v2 formats.
 
+#![allow(clippy::too_many_arguments, clippy::collapsible_match, clippy::field_reassign_with_default)]
+
 pub mod error;
 pub mod integrity;
 pub mod migration;

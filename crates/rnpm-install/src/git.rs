@@ -407,11 +407,10 @@ impl GitFetcher {
         let archive_bytes = run_git_archive(remote_dir, commit_sha).await;
         if let Ok(bytes) = archive_bytes {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-            if archive.unpack(&checkout_dir).is_ok() {
-                if checkout_dir.join("package.json").exists() {
+            if archive.unpack(&checkout_dir).is_ok()
+                && checkout_dir.join("package.json").exists() {
                     return Ok(checkout_dir);
                 }
-            }
         }
 
         // 2. Fallback method: work-tree checkout
@@ -468,13 +467,6 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
                 format!("git+https://bitbucket.org/{repo}.git#{commit_sha}")
             } else if url.starts_with("git+") {
                 format!("{url}#{commit_sha}")
-            } else if url.starts_with("git://") {
-                format!("git+{url}#{commit_sha}")
-            } else if url.starts_with("https://")
-                || url.starts_with("http://")
-                || url.starts_with("file://")
-            {
-                format!("git+{url}#{commit_sha}")
             } else {
                 format!("git+{url}#{commit_sha}")
             }
@@ -545,7 +537,7 @@ pub fn safe_remove_dir_all(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    if let Err(_) = std::fs::remove_dir_all(path) {
+    if std::fs::remove_dir_all(path).is_err() {
         clear_readonly_recursive(path);
         std::fs::remove_dir_all(path)?;
     }

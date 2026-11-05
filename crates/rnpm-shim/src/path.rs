@@ -18,15 +18,15 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 /// Checks if two Windows path prefixes are equivalent (case-insensitive for drive letters).
 fn prefixes_equal(a: &Prefix, b: &Prefix) -> bool {
     match (a, b) {
-        (Prefix::Disk(d1), Prefix::Disk(d2)) => d1.to_ascii_uppercase() == d2.to_ascii_uppercase(),
+        (Prefix::Disk(d1), Prefix::Disk(d2)) => d1.eq_ignore_ascii_case(d2),
         (Prefix::VerbatimDisk(d1), Prefix::VerbatimDisk(d2)) => {
-            d1.to_ascii_uppercase() == d2.to_ascii_uppercase()
+            d1.eq_ignore_ascii_case(d2)
         }
         (Prefix::Disk(d1), Prefix::VerbatimDisk(d2)) => {
-            d1.to_ascii_uppercase() == d2.to_ascii_uppercase()
+            d1.eq_ignore_ascii_case(d2)
         }
         (Prefix::VerbatimDisk(d1), Prefix::Disk(d2)) => {
-            d1.to_ascii_uppercase() == d2.to_ascii_uppercase()
+            d1.eq_ignore_ascii_case(d2)
         }
         (Prefix::UNC(s1, p1), Prefix::UNC(s2, p2))
         | (Prefix::VerbatimUNC(s1, p1), Prefix::VerbatimUNC(s2, p2))
@@ -77,8 +77,8 @@ pub fn compute_relative_path(from: &Path, to: &Path) -> Result<String, ShimError
         (from.to_path_buf(), to.to_path_buf())
     };
 
-    let from_clean = clean(&strip_verbatim_prefix(&from_resolved));
-    let to_clean = clean(&strip_verbatim_prefix(&to_resolved));
+    let from_clean = clean(strip_verbatim_prefix(&from_resolved));
+    let to_clean = clean(strip_verbatim_prefix(&to_resolved));
 
     let from_components: Vec<Component> = from_clean
         .components()

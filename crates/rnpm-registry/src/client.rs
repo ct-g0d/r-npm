@@ -2074,7 +2074,7 @@ mod tests {
         let http_date = format_http_date(future_time);
         let parsed_secs = parse_retry_after_str(&http_date).expect("should parse future HTTP-date");
         assert!(
-            parsed_secs >= 28 && parsed_secs <= 31,
+            (28..=31).contains(&parsed_secs),
             "Expected ~30s, got {parsed_secs}"
         );
     }

@@ -1,3 +1,5 @@
+#![allow(clippy::permissions_set_readonly_false, clippy::manual_strip, clippy::match_like_matches_macro)]
+
 pub mod atomic;
 pub mod error;
 pub mod junction;

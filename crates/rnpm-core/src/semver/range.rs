@@ -101,7 +101,7 @@ fn is_wildcard(s: &str) -> bool {
 }
 
 fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
-    let s = input.trim().trim_start_matches(|c| c == 'v' || c == 'V' || c == '=' || c == ' ');
+    let s = input.trim().trim_start_matches(['v', 'V', '=', ' ']);
     let s = s.trim();
     if s.is_empty() {
         return Err(SemverError::InvalidRange(input.to_string()));

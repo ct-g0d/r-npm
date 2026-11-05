@@ -581,7 +581,7 @@ pub fn resolve_manifest_path(manifest_path: &Path) -> PathBuf {
         manifest_path.to_path_buf()
     } else if manifest_path.is_dir() {
         manifest_path.join("package.json")
-    } else if manifest_path.file_name().map_or(false, |f| f == "package.json") {
+    } else if manifest_path.file_name().is_some_and(|f| f == "package.json") {
         manifest_path.to_path_buf()
     } else {
         let candidate = manifest_path.join("package.json");

@@ -2869,19 +2869,19 @@ fn test_workspace_protocol_resolution_stress_50_plus_packages() {
         };
         manifest.version = Some(ver.to_string());
 
-        if i >= 10 && i < 20 {
+        if (10..20).contains(&i) {
             // workspace:* dependency on Tier 0
             let dep = format!("pkg-{:02}", i - 10);
             manifest.dependencies.insert(dep, "workspace:*".to_string());
-        } else if i >= 20 && i < 30 {
+        } else if (20..30).contains(&i) {
             // workspace:^ dependency on Tier 1
             let dep = format!("pkg-{:02}", i - 10);
             manifest.dependencies.insert(dep, "workspace:^".to_string());
-        } else if i >= 30 && i < 40 {
+        } else if (30..40).contains(&i) {
             // workspace:~ dependency on Tier 2
             let dep = format!("pkg-{:02}", i - 10);
             manifest.dependencies.insert(dep, "workspace:~".to_string());
-        } else if i >= 40 && i < 50 {
+        } else if (40..50).contains(&i) {
             // Diamond: depends on Tier 3 via workspace:* and Tier 2 via workspace:^
             let dep1 = format!("pkg-{:02}", i - 10);
             let dep2 = format!("pkg-{:02}", i - 20);

@@ -102,7 +102,7 @@ fn test_source_map_04_arborist_tree() {
     assert_eq!(manifest.name.as_deref(), Some("fixture-arborist-tree"));
     assert_eq!(manifest.dependencies.get("dep-a").map(|s| s.as_str()), Some("^1.0.0"));
     assert_eq!(manifest.dev_dependencies.get("tool-dev").map(|s| s.as_str()), Some("^3.0.0"));
-    assert!(manifest.extra.get("overrides").is_some());
+    assert!(manifest.extra.contains_key("overrides"));
 }
 
 #[test]
@@ -239,11 +239,11 @@ fn test_source_map_13_workspaces() {
     let root_manifest = Manifest::from_file(&root_json).unwrap();
     assert!(matches!(root_manifest.workspaces, Some(PackageWorkspaces::List(ref l)) if l == &vec!["packages/*"]));
 
-    let pkg_a = Manifest::from_file(&fixtures_root().join("13-workspaces/packages/pkg-a/package.json")).unwrap();
+    let pkg_a = Manifest::from_file(fixtures_root().join("13-workspaces/packages/pkg-a/package.json")).unwrap();
     assert_eq!(pkg_a.name.as_deref(), Some("pkg-a"));
     assert_eq!(pkg_a.dependencies.get("pkg-b").map(|s| s.as_str()), Some("workspace:*"));
 
-    let pkg_b = Manifest::from_file(&fixtures_root().join("13-workspaces/packages/pkg-b/package.json")).unwrap();
+    let pkg_b = Manifest::from_file(fixtures_root().join("13-workspaces/packages/pkg-b/package.json")).unwrap();
     assert_eq!(pkg_b.name.as_deref(), Some("pkg-b"));
     assert!(pkg_b.scripts.contains_key("build"));
 }

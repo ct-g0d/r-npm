@@ -84,7 +84,7 @@ pub fn check_dangerous_command_patterns(cmd: &str) -> Option<String> {
 /// and checks if any executed command token is a disallowed utility.
 fn detect_disallowed_command_token(lower_cmd: &str) -> Option<&'static str> {
     // Split by shell command boundaries and pipes
-    for segment in lower_cmd.split(|c: char| c == ';' || c == '&' || c == '|' || c == '\n' || c == '\r' || c == '`' || c == '(' || c == ')') {
+    for segment in lower_cmd.split([';', '&', '|', '\n', '\r', '`', '(', ')']) {
         let trimmed = segment.trim();
         if trimmed.is_empty() {
             continue;
@@ -120,7 +120,7 @@ fn clean_command_token(raw: &str) -> &str {
     s = s.trim_matches(|c: char| c == '"' || c == '\'' || c == '(' || c == ')' || c == '$');
 
     // Strip path prefixes: e.g. /usr/bin/curl -> curl, C:\curl.exe -> curl
-    if let Some(pos) = s.rfind(|c: char| c == '/' || c == '\\') {
+    if let Some(pos) = s.rfind(['/', '\\']) {
         s = &s[pos + 1..];
     }
 

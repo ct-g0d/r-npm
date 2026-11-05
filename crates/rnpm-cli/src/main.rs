@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 mod audit;
 pub mod diagnostics;
 
@@ -1344,7 +1346,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 current_dir.join(&prefix)
             };
-            let manifest_path = if base_path.file_name().map_or(false, |f| f == "package.json") {
+            let manifest_path = if base_path.file_name().is_some_and(|f| f == "package.json") {
                 base_path
             } else {
                 base_path.join("package.json")

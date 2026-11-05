@@ -475,7 +475,7 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
     save-exact = true
     "#;
 
-    let npmrc = Npmrc::parse_with_env(content, &lookup).unwrap();
+    let npmrc = Npmrc::parse_with_env(content, lookup).unwrap();
 
     // 1. Verify NPM_TOKEN was expanded correctly
     let npmjs_url = Url::parse("https://registry.npmjs.org/@scope/pkg").unwrap();

@@ -48,8 +48,7 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
         let abs_str = abs_path.to_string_lossy().replace('/', "\\");
 
         // Check if UNC path (e.g. \\server\share\...)
-        if abs_str.starts_with(r"\\") {
-            let unc_tail = &abs_str[2..];
+        if let Some(unc_tail) = abs_str.strip_prefix(r"\\") {
             let cleaned = clean_windows_components(unc_tail);
             PathBuf::from(format!(r"\\?\UNC\{cleaned}"))
         } else {
