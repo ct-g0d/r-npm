@@ -584,3 +584,71 @@ fn print_human_audit_report(report: &AuditReport) {
         if report.metadata.vulnerabilities.total == 1 { "vulnerability" } else { "vulnerabilities" }
     );
 }
+
+/// Runs a post-install vulnerability audit check.
+pub async fn run_post_install_audit(
+    project_dir: &Path,
+    registry_url: Option<String>,
+) -> anyhow::Result<()> {
+    let lock_path = project_dir.join("package-lock.json");
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let _ = run_audit(project_dir, registry_url, false, "none").await;
+    Ok(())
+}
+
+/// Counts installed packages that declare funding notices.
+pub fn count_funding_packages(project_dir: &Path) -> usize {
+    let lock_path = project_dir.join("package-lock.json");
+    if lock_path.exists() {
+        if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+            let count = lockfile
+                .packages
+                .iter()
+                .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
+                .count();
+            if count > 0 {
+                return count;
+            }
+        }
+    }
+    let nm_dir = project_dir.join("node_modules");
+    if !nm_dir.exists() {
+        return 0;
+    }
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(&nm_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('@') {
+                    if let Ok(sub_entries) = std::fs::read_dir(&p) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_p = sub_entry.path();
+                            let manifest_p = sub_p.join("package.json");
+                            if manifest_p.exists() {
+                                if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&manifest_p) {
+                                    if manifest.extra.contains_key("funding") {
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if !name.starts_with('.') {
+                    let manifest_p = p.join("package.json");
+                    if manifest_p.exists() {
+                        if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&manifest_p) {
+                            if manifest.extra.contains_key("funding") {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}

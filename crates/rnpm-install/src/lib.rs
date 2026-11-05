@@ -376,6 +376,40 @@ pub struct InstallOptions {
     pub legacy_peer_deps: bool,
     pub strict_peer_deps: bool,
     pub is_global: bool,
+    pub include: Vec<String>,
+    pub package_lock: bool,
+    pub no_package_lock: bool,
+    pub dry_run: bool,
+    pub os: Option<String>,
+    pub cpu: Option<String>,
+    pub libc: Option<String>,
+    pub audit: bool,
+    pub fund: bool,
+    pub workspace_root: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
+}
+
+impl InstallOptions {
+    /// Evaluates if package-lock reading and writing is enabled.
+    pub fn package_lock_enabled(&self) -> bool {
+        self.package_lock && !self.no_package_lock
+    }
+
+    /// Evaluates target platform using CLI overrides for os, cpu, and libc if provided.
+    pub fn platform(&self) -> Platform {
+        let mut p = Platform::current();
+        if let Some(ref os) = self.os {
+            p.os = os.clone();
+        }
+        if let Some(ref cpu) = self.cpu {
+            p.cpu = cpu.clone();
+        }
+        if let Some(ref libc) = self.libc {
+            p.libc = Some(libc.clone());
+        }
+        p
+    }
 }
 
 impl Default for InstallOptions {
@@ -402,6 +436,18 @@ impl Default for InstallOptions {
             legacy_peer_deps: false,
             strict_peer_deps: false,
             is_global: false,
+            include: Vec::new(),
+            package_lock: true,
+            no_package_lock: false,
+            dry_run: false,
+            os: None,
+            cpu: None,
+            libc: None,
+            audit: true,
+            fund: true,
+            workspace_root: false,
+            workspace: Vec::new(),
+            workspaces: false,
         }
     }
 }
@@ -763,6 +809,24 @@ impl Installer {
             &manifest,
         ).map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
 
+        if !self.options.workspace.is_empty() {
+            workspace_members.retain(|m| {
+                self.options.workspace.iter().any(|target| {
+                    target == &m.name
+                        || target == &m.relative_path
+                        || m.relative_path.ends_with(target)
+                        || target.trim_start_matches("./") == m.relative_path
+                })
+            });
+
+            if !self.options.workspace_root {
+                manifest.dependencies.clear();
+                manifest.dev_dependencies.clear();
+                manifest.optional_dependencies.clear();
+                manifest.peer_dependencies.clear();
+            }
+        }
+
         if self.options.omit_dev {
             manifest.dev_dependencies.clear();
             for member in &mut workspace_members {
@@ -801,7 +865,9 @@ impl Installer {
         };
 
         let lockfile_path = self.options.project_dir.join("package-lock.json");
-        let existing_lockfile = if lockfile_path.exists() {
+        let existing_lockfile = if !self.options.package_lock_enabled() {
+            None
+        } else if lockfile_path.exists() {
             std::fs::read_to_string(&lockfile_path)
                 .ok()
                 .and_then(|s| rnpm_lockfile::parse_and_migrate(&s).ok())
@@ -811,7 +877,7 @@ impl Installer {
         };
 
         let resolver_options = ResolverOptions {
-            platform: Platform::current(),
+            platform: self.options.platform(),
             dev: !self.options.omit_dev,
             legacy_peer_deps: self.options.legacy_peer_deps,
             strict_peers: !self.options.legacy_peer_deps,
@@ -911,9 +977,13 @@ impl Installer {
             }
 
             // Save package.json unless --no-save was passed
-            if !self.options.no_save {
+            if !self.options.no_save && !self.options.dry_run {
                 manifest.save_to_file(&manifest_path)
                     .context("Failed to save updated package.json")?;
+            } else if self.options.dry_run {
+                for added in &added_pkgs {
+                    println!("rnpm: would add {} to package.json", added.name);
+                }
             }
         }
 
@@ -972,11 +1042,47 @@ impl Installer {
             }
 
             let lockfile_path = self.options.project_dir.join("package-lock.json");
-            lockfile.save_to_file(&lockfile_path)
-                .context("Failed to save package-lock.json")?;
+            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save {
+                lockfile.save_to_file(&lockfile_path)
+                    .context("Failed to save package-lock.json")?;
+            }
 
             return Ok(InstallSummary {
                 packages_installed: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path,
+            });
+        }
+
+        // 3b. For --dry-run, simulate installation and report what would be installed
+        if self.options.dry_run {
+            let mut packages_installed = 0;
+            for (loc, node) in &graph.nodes {
+                if loc.is_empty() {
+                    continue;
+                }
+                if self.options.omit_dev && node.flags.dev {
+                    continue;
+                }
+                if self.options.omit_optional && node.flags.optional {
+                    continue;
+                }
+                if self.options.omit_peer && node.flags.peer {
+                    continue;
+                }
+                if workspace_members.iter().any(|m| &m.relative_path == loc) {
+                    continue;
+                }
+                if node.flags.skipped {
+                    continue;
+                }
+                println!("rnpm: would install {}@{} at {}", node.name, node.version, loc);
+                packages_installed += 1;
+            }
+
+            return Ok(InstallSummary {
+                packages_installed,
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
@@ -1519,7 +1625,7 @@ impl Installer {
         }
 
         let lockfile_path = self.options.project_dir.join("package-lock.json");
-        if !self.options.no_save {
+        if !self.options.no_save && self.options.package_lock_enabled() {
             // 4. Write deterministic package-lock.json
             lockfile.save_to_file(&lockfile_path)
                 .context("Failed to save package-lock.json")?;
@@ -1695,6 +1801,51 @@ impl Installer {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and package-lock.json are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)"
             ));
+        }
+
+        if self.options.dry_run {
+            let host_platform = self.options.platform();
+            let mut packages_installed = 0;
+            for (pkg_key, pkg_info) in &lockfile.packages {
+                if pkg_key.is_empty() {
+                    continue;
+                }
+                let is_dev = pkg_info.dev.unwrap_or(false);
+                let is_optional = pkg_info.optional.unwrap_or(false);
+                let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
+                let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
+
+                if self.options.omit_dev && (is_dev || is_dev_optional) {
+                    continue;
+                }
+                if self.options.omit_optional && (is_optional || is_dev_optional) {
+                    continue;
+                }
+                if self.options.omit_peer && is_peer {
+                    continue;
+                }
+                if is_optional {
+                    let os_match = host_platform.matches_with_libc(
+                        pkg_info.os.as_deref(),
+                        pkg_info.cpu.as_deref(),
+                        pkg_info.libc.as_deref(),
+                    );
+                    if !os_match {
+                        continue;
+                    }
+                }
+                if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
+                    continue;
+                }
+                println!("rnpm: would install {}", pkg_key);
+                packages_installed += 1;
+            }
+            return Ok(InstallSummary {
+                packages_installed,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path,
+            });
         }
 
         // Clean-slate: remove node_modules completely using junction-safe removal
@@ -1933,7 +2084,7 @@ impl Installer {
 
             // Filter optional dependencies by platform: os, cpu, libc
             if is_optional {
-                let host_platform = Platform::current();
+                let host_platform = self.options.platform();
                 let os_match = host_platform.matches_with_libc(
                     pkg_info.os.as_deref(),
                     pkg_info.cpu.as_deref(),
@@ -2332,9 +2483,11 @@ impl Installer {
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
-        // Persist hidden lockfile to node_modules/.package-lock.json
-        lockfile.save_hidden(&self.options.project_dir)
-            .context("Failed to save hidden package-lock.json")?;
+        // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
+        if self.options.package_lock_enabled() && !self.options.dry_run {
+            lockfile.save_hidden(&self.options.project_dir)
+                .context("Failed to save hidden package-lock.json")?;
+        }
 
         Ok(InstallSummary {
             packages_installed,
@@ -2807,7 +2960,7 @@ impl Installer {
         let cpu_list = if ver_info.cpu.is_empty() { None } else { Some(ver_info.cpu.as_slice()) };
         let libc_list = if ver_info.libc.is_empty() { None } else { Some(ver_info.libc.as_slice()) };
 
-        let host_platform = Platform::current();
+        let host_platform = self.options.platform();
         let compatible = host_platform.matches_with_libc(os_list, cpu_list, libc_list);
         if !compatible && !is_optional {
             return Err(anyhow!(

@@ -298,6 +298,7 @@ use tokio::net::TcpListener;
                 ignore_scripts: false,
                 foreground_scripts: false,
                 strict_sandbox: false,
+                workspace_root: false,
             },
         };
 
@@ -424,6 +425,7 @@ use tokio::net::TcpListener;
                 ignore_scripts: false,
                 foreground_scripts: false,
                 strict_sandbox: false,
+                workspace_root: false,
             },
         };
 
@@ -726,6 +728,7 @@ use tokio::net::TcpListener;
                 ignore_scripts: false,
                 foreground_scripts: false,
                 strict_sandbox: false,
+                workspace_root: false,
             },
         };
 
@@ -883,6 +886,20 @@ use tokio::net::TcpListener;
                 legacy_peer_deps: false,
                 strict_peer_deps: false,
                 omit: vec![],
+                include: vec![],
+                no_package_lock: false,
+                package_lock: None,
+                dry_run: false,
+                os: None,
+                cpu: None,
+                libc: None,
+                no_audit: false,
+                audit: None,
+                no_fund: false,
+                fund: None,
+                workspace_root: false,
+                workspace: vec![],
+                workspaces: false,
                 save_dev: false,
                 save_exact: false,
                 save_prod: false,
@@ -1149,6 +1166,7 @@ use tokio::net::TcpListener;
                 ignore_scripts: false,
                 foreground_scripts: false,
                 strict_sandbox: false,
+                workspace_root: false,
             },
         };
 
@@ -1172,6 +1190,7 @@ use tokio::net::TcpListener;
                 ignore_scripts: false,
                 foreground_scripts: false,
                 strict_sandbox: false,
+                workspace_root: false,
             },
         };
 
@@ -1346,6 +1365,287 @@ use tokio::net::TcpListener;
                 assert!(d, "-p sets omit_dev");
             }
             _ => panic!("Expected Commands::Prune"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_include_and_omit_precedence() {
+        // --include=dev overrides --omit=dev
+        assert_eq!(
+            parse_omit_and_include_options(&["dev".to_string()], &["dev".to_string()]),
+            (false, false, false)
+        );
+
+        // Order invariance: include specified with omit
+        assert_eq!(
+            parse_omit_and_include_options(&["dev,optional".to_string()], &["dev".to_string()]),
+            (false, true, false)
+        );
+
+        // --include=optional overrides --omit=optional
+        assert_eq!(
+            parse_omit_and_include_options(&["optional".to_string()], &["optional".to_string()]),
+            (false, false, false)
+        );
+
+        // --include=peer overrides --omit=peer
+        assert_eq!(
+            parse_omit_and_include_options(&["peer".to_string()], &["peer".to_string()]),
+            (false, false, false)
+        );
+
+        // --include=prod does not omit dev, optional, or peer
+        assert_eq!(
+            parse_omit_and_include_options(&[], &["prod".to_string()]),
+            (false, false, false)
+        );
+        assert_eq!(
+            parse_omit_and_include_options(&[], &["production".to_string()]),
+            (false, false, false)
+        );
+
+        // CLI parsing for install with --include and --omit
+        let parsed = Cli::try_parse_from(["rnpm", "install", "--omit=dev", "--include=dev"]).unwrap();
+        match parsed.command {
+            Commands::Install { omit, include, .. } => {
+                let (d, o, p) = parse_omit_and_include_options(&omit, &include);
+                assert!(!d, "include=dev must override omit=dev");
+                assert!(!o);
+                assert!(!p);
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Reverse argument order on CLI: --include=dev --omit=dev
+        let parsed_rev = Cli::try_parse_from(["rnpm", "install", "--include=dev", "--omit=dev"]).unwrap();
+        match parsed_rev.command {
+            Commands::Install { omit, include, .. } => {
+                let (d, _, _) = parse_omit_and_include_options(&omit, &include);
+                assert!(!d, "include=dev must override omit=dev regardless of command line order");
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Prune with --production and --include=dev
+        let parsed_prune = Cli::try_parse_from(["rnpm", "prune", "--production", "--include=dev"]).unwrap();
+        match parsed_prune.command {
+            Commands::Prune { production, omit, include, .. } => {
+                let (mut d, _, _) = parse_omit_and_include_options(&omit, &include);
+                if production && !include.iter().any(|v| v == "dev") {
+                    d = true;
+                }
+                assert!(!d, "include=dev must override --production in prune");
+            }
+            _ => panic!("Expected Commands::Prune"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_no_package_lock_and_package_lock_flags() {
+        // --no-package-lock on install
+        let parsed1 = Cli::try_parse_from(["rnpm", "install", "--no-package-lock"]).unwrap();
+        match parsed1.command {
+            Commands::Install { no_package_lock, package_lock, .. } => {
+                assert!(no_package_lock);
+                assert!(package_lock.is_none());
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // --package-lock=false on install
+        let parsed2 = Cli::try_parse_from(["rnpm", "install", "--package-lock=false"]).unwrap();
+        match parsed2.command {
+            Commands::Install { no_package_lock, package_lock, .. } => {
+                assert!(!no_package_lock);
+                assert_eq!(package_lock, Some(false));
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // --package-lock=true on install
+        let parsed3 = Cli::try_parse_from(["rnpm", "install", "--package-lock=true"]).unwrap();
+        match parsed3.command {
+            Commands::Install { package_lock, .. } => {
+                assert_eq!(package_lock, Some(true));
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // Bare --package-lock
+        let parsed4 = Cli::try_parse_from(["rnpm", "install", "--package-lock"]).unwrap();
+        match parsed4.command {
+            Commands::Install { package_lock, .. } => {
+                assert_eq!(package_lock, Some(true));
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // CI with --no-package-lock
+        let parsed5 = Cli::try_parse_from(["rnpm", "ci", "--no-package-lock"]).unwrap();
+        match parsed5.command {
+            Commands::Ci { no_package_lock, .. } => {
+                assert!(no_package_lock);
+            }
+            _ => panic!("Expected Commands::Ci"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_dry_run_flag() {
+        let parsed_install = Cli::try_parse_from(["rnpm", "install", "--dry-run"]).unwrap();
+        match parsed_install.command {
+            Commands::Install { dry_run, .. } => {
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        let parsed_ci = Cli::try_parse_from(["rnpm", "ci", "--dry-run"]).unwrap();
+        match parsed_ci.command {
+            Commands::Ci { dry_run, .. } => {
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Commands::Ci"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_platform_overrides() {
+        let parsed = Cli::try_parse_from([
+            "rnpm", "install",
+            "--os=darwin",
+            "--cpu=arm64",
+            "--libc=glibc",
+        ]).unwrap();
+
+        match parsed.command {
+            Commands::Install { os, cpu, libc, .. } => {
+                assert_eq!(os.as_deref(), Some("darwin"));
+                assert_eq!(cpu.as_deref(), Some("arm64"));
+                assert_eq!(libc.as_deref(), Some("glibc"));
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        let parsed_ci = Cli::try_parse_from([
+            "rnpm", "ci",
+            "--os=linux",
+            "--cpu=x64",
+            "--libc=musl",
+        ]).unwrap();
+
+        match parsed_ci.command {
+            Commands::Ci { os, cpu, libc, .. } => {
+                assert_eq!(os.as_deref(), Some("linux"));
+                assert_eq!(cpu.as_deref(), Some("x64"));
+                assert_eq!(libc.as_deref(), Some("musl"));
+            }
+            _ => panic!("Expected Commands::Ci"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_audit_and_fund_controls() {
+        let parsed1 = Cli::try_parse_from(["rnpm", "install", "--no-audit", "--no-fund"]).unwrap();
+        match parsed1.command {
+            Commands::Install { no_audit, no_fund, .. } => {
+                assert!(no_audit);
+                assert!(no_fund);
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        let parsed2 = Cli::try_parse_from(["rnpm", "install", "--audit=false", "--fund=false"]).unwrap();
+        match parsed2.command {
+            Commands::Install { audit, fund, .. } => {
+                assert_eq!(audit, Some(false));
+                assert_eq!(fund, Some(false));
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        let parsed3 = Cli::try_parse_from(["rnpm", "ci", "--audit=true", "--fund=true"]).unwrap();
+        match parsed3.command {
+            Commands::Ci { audit, fund, .. } => {
+                assert_eq!(audit, Some(true));
+                assert_eq!(fund, Some(true));
+            }
+            _ => panic!("Expected Commands::Ci"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_workspace_root_options() {
+        // --workspace-root on install
+        let parsed1 = Cli::try_parse_from(["rnpm", "install", "--workspace-root"]).unwrap();
+        match parsed1.command {
+            Commands::Install { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // --include-workspace-root alias on install
+        let parsed2 = Cli::try_parse_from(["rnpm", "install", "--include-workspace-root"]).unwrap();
+        match parsed2.command {
+            Commands::Install { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("Expected Commands::Install"),
+        }
+
+        // --workspace-root on run
+        let parsed3 = Cli::try_parse_from(["rnpm", "run", "test", "--workspace-root"]).unwrap();
+        match parsed3.command {
+            Commands::Run { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("Expected Commands::Run"),
+        }
+
+        // --include-workspace-root alias on run
+        let parsed4 = Cli::try_parse_from(["rnpm", "run", "test", "--include-workspace-root"]).unwrap();
+        match parsed4.command {
+            Commands::Run { workspace_root, .. } => {
+                assert!(workspace_root);
+            }
+            _ => panic!("Expected Commands::Run"),
+        }
+    }
+
+    #[test]
+    fn test_check_unsupported_cli_invocation_parity_flags_not_blocked() {
+        let parity_flags = [
+            "--include=dev",
+            "--include=prod",
+            "--include=optional",
+            "--include=peer",
+            "--no-package-lock",
+            "--package-lock=false",
+            "--package-lock=true",
+            "--package-lock",
+            "--dry-run",
+            "--os=darwin",
+            "--cpu=arm64",
+            "--libc=glibc",
+            "--no-audit",
+            "--audit=false",
+            "--audit=true",
+            "--no-fund",
+            "--fund=false",
+            "--fund=true",
+            "--workspace-root",
+            "--include-workspace-root",
+            "--workspace=pkg-a",
+            "--workspaces",
+        ];
+
+        for flag in parity_flags {
+            let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+            assert!(
+                res.is_none(),
+                "Flag '{flag}' must NOT be blocked by check_unsupported_cli_invocation"
+            );
         }
     }
 
