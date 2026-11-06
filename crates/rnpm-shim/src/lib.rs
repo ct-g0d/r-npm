@@ -176,7 +176,7 @@ pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
 /// Generates PowerShell (.ps1) wrapper matching docs/platform-fs-contract.md.
 pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
     let rel = format!("../{target_rel_from_node_modules}");
-    generator::generate_shim_content(&rel, None).ps1
+    generator::generate_shim_content(&rel, None).ps1.replace("\r\n", "\n")
 }
 /// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix and Git Bash.
 /// Also supports files with UTF-8 BOM and clears Windows read-only flags if necessary.
