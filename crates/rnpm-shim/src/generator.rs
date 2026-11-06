@@ -48,13 +48,13 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
 
     // 1. Unix POSIX Shell Script (<name>)
     let sh_args_str = if info.args.is_empty() {
-        " ".to_string()
+        "  ".to_string()
     } else {
         let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_posix_arg(arg)).collect();
         format!("{} ", escaped.join(" "))
     };
     let sh_rel_path = crate::escape_posix_path(rel_path);
-    let sh = format!(
+    let mut sh = format!(
         "#!/bin/sh\n\
          basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\,/,g')\")\n\
          \n\
@@ -72,6 +72,10 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
            exec {prog} {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
          fi\n"
     );
+    // Match npm's cmd-shim output exactly: its sed expression contains two
+    // literal backslashes in the generated script, and its node invocation
+    // keeps the double-space argument separator.
+    sh = sh.replace("s,\\\\\\\\,/,g", "s,\\\\,/,g");
 
     // 2. Windows Batch Wrapper (<name>.cmd)
     let cmd_args_str = if info.args.is_empty() {
@@ -103,7 +107,7 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
 
     // 3. Windows PowerShell Wrapper (<name>.ps1)
     let ps1_args_str = if info.args.is_empty() {
-        " ".to_string()
+        "  ".to_string()
     } else {
         let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_ps1_arg(arg)).collect();
         format!("{} ", escaped.join(" "))
@@ -137,7 +141,10 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
            $ret=$LASTEXITCODE\r\n\
          }}\r\n\
          exit $ret\r\n"
-    );
+    )
+    .replace("$basedir =", "$basedir=")
+    .replace("$exe =", "$exe=")
+    .replace("$ret =", "$ret=");
 
     ShimContent { sh, cmd, ps1 }
 }
