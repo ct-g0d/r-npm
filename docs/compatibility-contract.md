@@ -60,8 +60,9 @@
 - `outdated`: Inspect declared vs installed dependency versions and query registry packuments to determine `wanted` (max satisfying version) and `latest` (`dist-tags.latest`). Tabular output with columns `Package`, `Current`, `Wanted`, `Latest`, `Location`, `Depended by`. Supports `--long` (`-l`), `--json`, `--parseable` (`-p`), and package filters. Exits with code `1` if any outdated packages are found, `0` if up to date.
 - `query`: Execute CSS-like selector queries on the dependency tree (`:root`, `[name=<pkg>]`, `[version^=<v>]`, `:outdated`, `:extraneous`, `:missing`, `:invalid`, `:dev`, `:prod`, `:optional`, `:peer`, child `>`, descendant space, union `,`). Emits matching package nodes as structured JSON array matching npm query schema.
 - Registry administration: `dist-tag`, `owner`, `deprecate`, `undeprecate`, `access`, and `unpublish` use the configured registry and preserve npm-style auth/error routing. `search` uses the registry search API; `token`, `whoami`, `login`, and `logout` cover token persistence and cleanup.
-- Local/package workflows: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, and `install-test` are available. `bugs`, `docs`, `edit`, `explore`, and `help-search` emit npm resource URLs suitable for the host environment.
-- `trust list` and `trust revoke` use the registry trust API without exposing credentials or lifecycle secrets. Provider-specific trust creation (`github`, `gitlab`, and `circleci`) remains explicitly unsupported until a provider configuration schema is added.
+- Local/package workflows: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, and `install-test` are available. `bugs`, `docs`, `repo`, `edit`, `explore`, and registry-backed `help-search` resolve package metadata and perform the requested local action.
+- `trust github`, `trust gitlab`, and `trust circleci` create provider claim configurations with explicit publish/stage permissions; `trust list` and `trust revoke` manage existing relationships without exposing credentials.
+- `stage list`, `stage view`, `stage approve`, and `stage reject` manage staged package versions through the registry governance API.
 - Account command surface: `profile`, `org`, `team`, `star`, `stars`, and `unstar` use npm-compatible registry endpoints where the target registry exposes them; unsupported registry operations return structured errors.
 
 ### Supported Protocol Surface
@@ -91,9 +92,8 @@ npm error See docs/compatibility-contract.md for supported options.
 
 ### Remaining Gaps
 - Registry-specific organization, team, profile, and star APIs vary across compatible registries; rnpm exposes the command surface and reports when the target registry does not implement an endpoint.
-- `install-scripts ls` and `install-scripts prune` currently inspect and maintain the root `allowScripts` policy but do not yet perform npm Arborist's full installed-tree script classification.
-- Provider-specific `trust` creation is not implemented; list and revoke are supported.
-- Writing legacy lockfile formats (v1 or v2) remains unsupported; v1/v2 lockfiles are migrated in memory for installs.
+- Registry trust and staged-publishing writes require a registry that implements npm's governance endpoints and valid authentication/2FA.
+- Legacy lockfile output is supported through `--lockfile-version=1|2`; hidden lockfiles remain v3 as in npm.
 
 ### Drop-in Compatibility Target & Unsupported Command Handling (DEC-004)
 DEC-004 formalizes the complete drop-in target for `npm 11.x`: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility.

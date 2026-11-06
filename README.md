@@ -90,7 +90,7 @@ $env:PATH = "D:\AppData\user2\.cargo\bin;" + $env:PATH
 - **Package operations**: `dedupe`/`find-dupes`, `rebuild`, `init`/`create`, `diff`, `sbom`, and `version`.
 - **Registry and environment**: `publish`, `whoami`, `ping`, `login`, `logout`, `token`, `config`, top-level `get`/`set`, `link`, `unlink`, `prefix`, `root`, and `bin`.
 - **Registry administration**: `dist-tag`, `owner`, `deprecate`, `undeprecate`, `access`, `unpublish`, and `search`, using the configured registry and scoped credentials.
-- **Workflow and convenience commands**: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `trust list`, `trust revoke`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, `install-test`, `bugs`, `docs`, `edit`, `explore`, and `help-search`. Provider-specific trust creation remains unsupported.
+- **Workflow and convenience commands**: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `trust` (GitHub, GitLab, CircleCI, list, revoke), `stage`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, `install-test`, `bugs`, `docs`, `repo`, `edit`, `explore`, and registry-backed `help-search`.
 - **Account surface**: `profile`, `org`, `team`, `star`, `stars`, and `unstar` are exposed; endpoint support depends on the target registry.
 
 ---

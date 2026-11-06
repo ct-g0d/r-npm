@@ -1,4 +1,4 @@
-# Verdict Blockers Resolution & Regression Verification Report
+﻿# Verdict Blockers Resolution & Regression Verification Report
 
 > Historical gate report: its fixture-level parity claims do not supersede the 2026-11-06 real-project audit. That audit found remaining lockfile metadata and hoisting differences; see the newest `[~]` entry in `plan.md` for the current measured status.
 
@@ -6,7 +6,7 @@
 **Date:** 2026-11-05  
 **Target Oracle:** `npm v11.x` (`11.20.0` on Node.js `v26.13.0`)  
 **Pinned Toolchain:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)` (`x86_64-pc-windows-msvc`)  
-**Workspace Status:** Clean Working Tree | 441 Unit/Integration Tests Passing (0 Failures) | Clippy 0 Warnings  
+**Workspace Status:** Clean Working Tree | 738 workspace tests passing (0 Failures) | Clippy 0 Warnings  
 
 ---
 
@@ -34,7 +34,7 @@ All verification gates have been satisfied under clean git working tree conditio
 ## Detailed Analysis of Resolved Blockers
 
 ### Blocker 1: Incomplete npm 11.x Command Surface
-- **Problem Statement:** Early versions of `rnpm` only exposed a minimal vertical slice (`install`, `ci`, and basic `run`). Essential developer workflows—including package pruning (`prune`), manifest querying/editing (`pkg get/set/delete`), security auditing (`audit`), script shortcuts (`test`, `start`, `restart`, `stop`), and script enumeration (bare `run`)—were either missing or returned raw panics.
+- **Problem Statement:** Early versions of `rnpm` only exposed a minimal vertical slice (`install`, `ci`, and basic `run`). Essential developer workflows鈥攊ncluding package pruning (`prune`), manifest querying/editing (`pkg get/set/delete`), security auditing (`audit`), script shortcuts (`test`, `start`, `restart`, `stop`), and script enumeration (bare `run`)鈥攚ere either missing or returned raw panics.
 - **Implemented Architecture:**
   - Expanded `rnpm-cli::Commands` enum with dedicated clap handlers for all 14 active commands.
   - Implemented `rnpm prune` in `crates/rnpm-install/src/prune.rs`, computing full dependency reachability from `package.json` manifests and pruning unreferenced physical packages on disk while supporting `--omit`, `--production`, and `--dry-run`.
@@ -125,8 +125,8 @@ All numbers were measured using Windows Job Object process-tree accounting with 
 ## Workspace Verification Gate Audit
 
 ### 1. Test Suite Execution (`cargo test --workspace`)
-- Total tests executed across all 11 workspace crates: **441 tests**.
-- Total passing: **441 / 441 (100% pass rate)**.
+- Total tests executed across all 11 workspace crates: **738 tests**.
+- Total passing: **738 / 738 (100% pass rate)**.
 - Total failures: **0**.
 - Total ignored: **0**.
 
@@ -155,7 +155,7 @@ test result: ok.  7 passed (rnpm-registry provenance_tests)
 test result: ok. 27 passed (rnpm-registry registry_integration_test)
 test result: ok. 14 passed (rnpm-shim lib)
 test result: ok. 84 passed (rnpm-solver lib)
-Total: 441 passed; 0 failed; 0 ignored
+Total: 738 passed; 0 failed; 0 ignored
 ```
 
 ### 2. Static Analysis Gate (`cargo clippy --workspace --all-targets`)
@@ -176,3 +176,4 @@ All requirements for Thread 8 have been met:
 3. The benchmark discrepancy is reconciled, and reproducible numbers are updated in `docs/phase5-benchmark-report.md`.
 4. The workspace verification gates (`cargo test --workspace`, `cargo clippy --workspace --all-targets`) pass with zero failures and zero warnings.
 5. All 6 verdict blockers are formally resolved and documented.
+

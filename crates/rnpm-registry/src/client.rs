@@ -2815,12 +2815,61 @@ impl RegistryClient {
         self.admin_json_request(Method::GET, target, None, None).await
     }
 
+    /// Create one trusted publishing relationship for a package. The payload
+    /// is an array because npm's registry API accepts the same shape for
+    /// provider-specific configurations and bulk automation.
+    pub async fn trust_create(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        config: serde_json::Value,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/trust", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, Some(config), otp).await
+    }
+
     /// Revoke one trusted publishing relationship by its registry id.
     pub async fn trust_revoke(&self, registry: Option<&Url>, package_name: &str, trust_id: &str, otp: Option<&str>) -> Result<(), RegistryError> {
         validate_admin_token(trust_id)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
         let target = Url::parse(&format!("{}/-/package/{}/trust/{}", reg_url.as_str().trim_end_matches('/'), encoded, encode_path_segment(trust_id)))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        Ok(())
+    }
+
+    pub async fn stage_list(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/stage", reg_url.as_str().trim_end_matches('/')))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    pub async fn stage_view(&self, registry: Option<&Url>, stage_id: &str) -> Result<serde_json::Value, RegistryError> {
+        validate_admin_token(stage_id)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/stage/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    pub async fn stage_approve(&self, registry: Option<&Url>, stage_id: &str, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        validate_admin_token(stage_id)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/stage/{}/approve", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, None, otp).await
+    }
+
+    pub async fn stage_reject(&self, registry: Option<&Url>, stage_id: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        validate_admin_token(stage_id)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/stage/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
             .map_err(RegistryError::UrlParse)?;
         self.admin_json_request(Method::DELETE, target, None, otp).await?;
         Ok(())
@@ -2842,6 +2891,8 @@ impl RegistryClient {
                 otp,
                 serde_json::to_vec(&body)?,
             ).await?
+        } else if otp.is_some() {
+            self.execute_with_body_permit(method, target.clone(), Some("application/json"), Some("application/json"), otp, Vec::new()).await?
         } else {
             self.execute_with_permit(method, target.clone(), Some("application/json"), None).await?
         };

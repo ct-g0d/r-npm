@@ -14,6 +14,7 @@ pub mod version;
 pub mod view;
 
 use reqwest::Url;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -83,6 +84,10 @@ pub(crate) enum Commands {
         /// Do not read or write package-lock.json
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
+
+        /// Write package-lock.json using npm's legacy format (1, 2, or 3)
+        #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
+        lockfile_version: Option<u32>,
 
         /// Ignore or enable package-lock.json
         #[arg(long = "package-lock", num_args = 0..=1, default_missing_value = "true")]
@@ -211,6 +216,10 @@ pub(crate) enum Commands {
         /// Do not read or write package-lock.json
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
+
+        /// Select package-lock.json serialization format (1, 2, or 3)
+        #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
+        lockfile_version: Option<u32>,
 
         /// Ignore or enable package-lock.json
         #[arg(long = "package-lock", num_args = 0..=1, default_missing_value = "true")]
@@ -979,17 +988,27 @@ pub(crate) enum Commands {
     /// Open or print package documentation URL.
     #[command(alias = "home")]
     Docs { packages: Vec<String>, #[arg(long)] registry: Option<String> },
+    /// Show the source repository URL for a package.
+    Repo { packages: Vec<String>, #[arg(long)] registry: Option<String> },
     /// Edit a package in the configured editor.
     Edit { package: String, #[arg(long)] editor: Option<String> },
     /// Explore a package in a shell.
     Explore { package: String, #[arg(long)] shell: Option<String> },
     /// Search npm help topics.
-    HelpSearch { terms: Vec<String>, #[arg(short = 'l', long)] long: bool },
+    HelpSearch { terms: Vec<String>, #[arg(short = 'l', long)] long: bool, #[arg(long)] registry: Option<String>, #[arg(long)] json: bool },
+    /// Manage staged package versions.
+    Stage { action: Option<String>, args: Vec<String>, #[arg(long)] registry: Option<String>, #[arg(long)] otp: Option<String>, #[arg(long)] json: bool },
     /// Install dependencies and run the CI test script.
     #[command(alias = "cit", alias = "clean-install-test", alias = "sit")]
     InstallCiTest { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Install dependencies and run install scripts.
-    InstallScripts { action: Option<String>, packages: Vec<String>, #[arg(long)] all: bool, #[arg(long)] json: bool },
+    InstallScripts {
+        action: Option<String>,
+        packages: Vec<String>,
+        #[arg(long)] all: bool,
+        #[arg(long)] json: bool,
+        #[arg(long)] dry_run: bool,
+    },
     /// Install dependencies and run the test script.
     InstallTest { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
     /// Create npm-shrinkwrap.json from package-lock.json.
@@ -1001,6 +1020,24 @@ pub(crate) enum Commands {
         #[arg(long)] registry: Option<String>,
         #[arg(long)] id: Option<String>,
         #[arg(long)] otp: Option<String>,
+        #[arg(long = "file")]
+        workflow_file: Option<String>,
+        #[arg(long = "repo", alias = "repository")]
+        repository: Option<String>,
+        #[arg(long = "env", alias = "environment")]
+        environment: Option<String>,
+        #[arg(long)] project: Option<String>,
+        #[arg(long)] org_id: Option<String>,
+        #[arg(long)] project_id: Option<String>,
+        #[arg(long)] pipeline_definition_id: Option<String>,
+        #[arg(long)] vcs_origin: Option<String>,
+        #[arg(long = "context-id")]
+        context_id: Vec<String>,
+        #[arg(long = "allow-publish")]
+        allow_publish: bool,
+        #[arg(long = "allow-stage-publish", alias = "allow-staged-publish")]
+        allow_stage_publish: bool,
+        #[arg(long)] json: bool,
         #[arg(short = 'y', long = "yes")] yes: bool,
     },
 
@@ -2539,16 +2576,142 @@ fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a name"))
 }
 
+fn resolve_local_package_dir(current_dir: &Path, package: &str) -> anyhow::Result<PathBuf> {
+    let path = if package == "." || package.is_empty() { current_dir.to_path_buf() } else { current_dir.join("node_modules").join(package) };
+    if path.join("package.json").is_file() { Ok(path) }
+    else { Err(anyhow::anyhow!("npm error code ENOENT\nnpm error package '{}' is not installed", package)) }
+}
+
+fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path.join("package.json"))?)?)
+}
+
+/// Return installed dependency identities that can execute install-time code.
+/// The walk follows the actual node_modules tree, so nested and multi-version
+/// dependencies are classified independently just like Arborist's actual tree.
+fn installed_install_script_packages(current_dir: &Path) -> anyhow::Result<BTreeMap<String, PathBuf>> {
+    let node_modules = current_dir.join("node_modules");
+    let lock = current_dir.join("package-lock.json");
+    let lock_value = std::fs::read_to_string(lock).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let mut found = BTreeMap::new();
+
+    fn walk(dir: &Path, root: &Path, lock: Option<&serde_json::Value>, found: &mut BTreeMap<String, PathBuf>) -> anyhow::Result<()> {
+        if !dir.is_dir() { return Ok(()); }
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            if !path.is_dir() { continue; }
+            if path.file_name().and_then(|n| n.to_str()) == Some(".bin") { continue; }
+            let manifest_path = path.join("package.json");
+            if manifest_path.is_file() {
+                let manifest: serde_json::Value = match std::fs::read_to_string(&manifest_path)
+                    .ok().and_then(|s| serde_json::from_str(&s).ok()) { Some(v) => v, None => continue };
+                let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or_default();
+                if name.is_empty() || version.is_empty() { continue; }
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                let lock_entry = lock.and_then(|v| v.get("packages")).and_then(|p| p.get(&rel));
+                let resolved = lock_entry.and_then(|v| v.get("resolved")).and_then(|v| v.as_str()).unwrap_or_default();
+                let scripts = manifest.get("scripts").and_then(|v| v.as_object());
+                let declared = scripts.map(|s| ["preinstall", "install", "postinstall"].iter().any(|k| s.contains_key(*k))).unwrap_or(false);
+                let prepare = scripts.map(|s| s.contains_key("prepare") && (resolved.starts_with("git") || resolved.starts_with("file:"))).unwrap_or(false);
+                let implicit_node_gyp = path.join("binding.gyp").is_file();
+                if declared || prepare || implicit_node_gyp {
+                    found.insert(format!("{name}@{version}"), path.clone());
+                }
+                let nested = path.join("node_modules");
+                if nested.is_dir() { walk(&nested, root, lock, found)?; }
+            } else {
+                // Scoped package directories and node_modules containers.
+                walk(&path, root, lock, found)?;
+            }
+        }
+        Ok(())
+    }
+
+    walk(&node_modules, &current_dir.join("node_modules"), lock_value.as_ref(), &mut found)?;
+    Ok(found)
+}
+
+fn allow_scripts_matches(entry: &str, identity: &str, value: &serde_json::Value) -> bool {
+    if entry == "*" { return value.as_bool() == Some(true); }
+    let name = identity.rsplit_once('@').map(|(name, _)| name).unwrap_or(identity);
+    (entry == identity || entry == name) && value.as_bool() == Some(true)
+}
+
+fn list_pending_install_scripts(current_dir: &Path, json: bool) -> anyhow::Result<()> {
+    let installed = installed_install_script_packages(current_dir)?;
+    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(current_dir.join("package.json"))?)?;
+    let allow = document.get("allowScripts").and_then(|v| v.as_object());
+    let pending: Vec<String> = installed.keys().filter(|identity| {
+        !allow.map(|entries| entries.iter().any(|(key, value)| allow_scripts_matches(key, identity, value))).unwrap_or(false)
+    }).cloned().collect();
+    if json { println!("{}", serde_json::json!({"pending": pending})); }
+    else { for item in pending { println!("{item}"); } }
+    Ok(())
+}
+
+fn prune_install_scripts_policy(current_dir: &Path, json: bool, dry_run: bool) -> anyhow::Result<()> {
+    let installed = installed_install_script_packages(current_dir)?;
+    let path = current_dir.join("package.json");
+    let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let allow = document.get_mut("allowScripts").and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("npm error code ENOENT\nnpm error package.json has no allowScripts entries"))?;
+    let before = allow.clone();
+    let keys: Vec<String> = allow.keys().cloned().collect();
+    for key in keys {
+        // Preserve malformed / compound selectors exactly as npm does.
+        if key.is_empty() || key.contains("||") || key.contains(' ') { continue; }
+        let keep = if key == "*" {
+            !installed.is_empty()
+        } else if key.contains('@') && !key.starts_with('@') {
+            installed.contains_key(&key)
+        } else if key.starts_with('@') {
+            // Scoped names have a second '@' only when pinned; otherwise match by name.
+            installed.keys().any(|identity| identity.starts_with(&format!("{key}@")))
+        } else {
+            installed.keys().any(|identity| identity.starts_with(&format!("{key}@")))
+        };
+        if !keep { allow.remove(&key); }
+    }
+    let removed: Vec<String> = before.keys().filter(|k| !allow.contains_key(*k)).cloned().collect();
+    if !dry_run { std::fs::write(&path, serde_json::to_string_pretty(&document)? + "\n")?; }
+    if json { println!("{}", serde_json::json!({"removed": removed, "dryRun": dry_run})); }
+    else { for item in removed { println!("removed {item}"); } }
+    Ok(())
+}
+
 fn update_allow_scripts_policy(current_dir: &Path, packages: &[String], approved: bool, all: bool, json: bool) -> anyhow::Result<()> {
     let path = current_dir.join("package.json");
     let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let names: Vec<String> = if all { vec!["*".to_string()] } else { packages.to_vec() };
+    let installed = installed_install_script_packages(current_dir)?;
+    let mut names: Vec<String> = if all {
+        installed.keys().cloned().collect()
+    } else {
+        packages.iter().flat_map(|requested| {
+            let matched: Vec<String> = installed.keys().filter(|identity| {
+                *identity == requested || identity.rsplit_once('@').map(|(name, _)| name == requested).unwrap_or(false)
+            }).cloned().collect();
+            if matched.is_empty() { vec![requested.clone()] } else { matched }
+        }).collect()
+    };
+    names.sort(); names.dedup();
     if names.is_empty() { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error specify at least one package or --all")); }
     let policy = {
         let map = document.as_object_mut().ok_or_else(|| anyhow::anyhow!("npm error code EJSONPARSE\nnpm error package.json must contain an object"))?;
         let allow = map.entry("allowScripts").or_insert_with(|| serde_json::json!({}));
         let allow = allow.as_object_mut().ok_or_else(|| anyhow::anyhow!("npm error code EJSONPARSE\nnpm error package.json allowScripts must be an object"))?;
-        for name in &names { allow.insert(name.clone(), serde_json::Value::Bool(approved)); }
+        for name in &names {
+            if approved {
+                // An explicit denial always wins over blanket approval.
+                let package_name = name.rsplit_once('@').map(|(n, _)| n).unwrap_or(name);
+                if allow.get(package_name).and_then(|v| v.as_bool()) == Some(false) || allow.get(name).and_then(|v| v.as_bool()) == Some(false) { continue; }
+                allow.insert(name.clone(), serde_json::Value::Bool(true));
+            } else {
+                let package_name = name.rsplit_once('@').map(|(n, _)| n).unwrap_or(name);
+                allow.insert(package_name.to_string(), serde_json::Value::Bool(false));
+            }
+        }
         serde_json::Value::Object(allow.clone())
     };
     std::fs::write(&path, serde_json::to_string_pretty(&document)? + "\n")?;
@@ -2677,6 +2840,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include,
             no_package_lock,
             package_lock,
+            lockfile_version,
             dry_run,
             os,
             cpu,
@@ -2750,6 +2914,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
+                lockfile_version: lockfile_version.unwrap_or_else(|| config.get("lockfile-version").and_then(|v| v.parse().ok()).unwrap_or(3)),
             };
 
             let mut installer = Installer::new(options)?;
@@ -2795,6 +2960,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include,
             no_package_lock,
             package_lock,
+            lockfile_version,
             dry_run,
             os,
             cpu,
@@ -2854,6 +3020,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
+                lockfile_version: lockfile_version.unwrap_or_else(|| config.get("lockfile-version").and_then(|v| v.parse().ok()).unwrap_or(3)),
                 ..Default::default()
             };
 
@@ -3815,26 +3982,82 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::Bugs { packages, .. } => for package in packages { println!("https://www.npmjs.com/package/{package}?activeTab=issues"); },
-        Commands::Docs { packages, .. } => for package in packages { println!("https://www.npmjs.com/package/{package}?activeTab=readme"); },
-        Commands::Edit { package, editor } => println!("{} {}", editor.unwrap_or_else(|| "$EDITOR".into()), package),
-        Commands::Explore { package, shell } => println!("{} {}", shell.unwrap_or_else(|| "$SHELL".into()), package),
-        Commands::HelpSearch { terms, long: _ } => println!("https://docs.npmjs.com/search?q={}", terms.join("+")),
+        Commands::Bugs { packages, .. } => for package in packages {
+            let dir = resolve_local_package_dir(&current_dir, &package)?;
+            let value = package_manifest_value(&dir)?;
+            let url = value.get("bugs").and_then(|v| v.get("url")).and_then(|v| v.as_str()).or_else(|| value.get("bugs").and_then(|v| v.as_str())).unwrap_or("");
+            if url.is_empty() { println!("https://www.npmjs.com/package/{package}?activeTab=issues"); } else { println!("{url}"); }
+        },
+        Commands::Docs { packages, .. } => for package in packages {
+            let dir = resolve_local_package_dir(&current_dir, &package)?;
+            let value = package_manifest_value(&dir)?;
+            let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
+            if url.is_empty() { println!("https://www.npmjs.com/package/{package}?activeTab=readme"); } else { println!("{url}"); }
+        },
+        Commands::Repo { packages, registry } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            for package in packages {
+                let local = current_dir.join("node_modules").join(&package).join("package.json");
+                if let Ok(value) = std::fs::read_to_string(&local).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).ok_or(()) {
+                    if let Some(repo) = value.get("repository").and_then(|v| v.get("url")).and_then(|v| v.as_str()).or_else(|| value.get("repository").and_then(|v| v.as_str())) { println!("{repo}"); continue; }
+                }
+                let metadata = client.get_package_metadata_full(&package).await?;
+                let latest = metadata.dist_tags.get("latest").and_then(|v| metadata.versions.get(v));
+                let repo = latest.and_then(|v| v.extra.get("repository")).and_then(|v| v.get("url")).and_then(|v| v.as_str()).or_else(|| latest.and_then(|v| v.extra.get("repository")).and_then(|v| v.as_str()));
+                println!("{}", repo.unwrap_or("https://www.npmjs.com/package/"));
+                let _ = registry_url;
+            }
+        },
+        Commands::Edit { package, editor } => {
+            let dir = resolve_local_package_dir(&current_dir, &package)?;
+            let editor = editor.or_else(|| std::env::var("npm_config_editor").ok()).or_else(|| std::env::var("VISUAL").ok()).or_else(|| std::env::var("EDITOR").ok()).ok_or_else(|| anyhow::anyhow!("npm error code ENOENT\nnpm error no editor configured"))?;
+            let status = std::process::Command::new(&editor).current_dir(dir).status()?;
+            if !status.success() { return Err(anyhow::anyhow!("npm error code ELIFECYCLE\nnpm error editor exited with {status}")); }
+        }
+        Commands::Explore { package, shell } => {
+            let dir = resolve_local_package_dir(&current_dir, &package)?;
+            #[cfg(windows)]
+            let (program, args): (String, Vec<String>) = (shell.or_else(|| std::env::var("ComSpec").ok()).unwrap_or_else(|| "cmd.exe".into()), vec!["/K".into()]);
+            #[cfg(not(windows))]
+            let (program, args): (String, Vec<String>) = (shell.or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/sh".into()), Vec::new());
+            let status = std::process::Command::new(program).args(args).current_dir(dir).status()?;
+            if !status.success() { return Err(anyhow::anyhow!("npm error code ELIFECYCLE\nnpm error explore shell exited with {status}")); }
+        }
+        Commands::HelpSearch { terms, long, registry, json } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            let value = client.search(Some(&registry_url), &terms.join(" "), if long { 50 } else { 20 }, 0).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+            else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
+                for object in objects {
+                    let package = object.get("package").unwrap_or(object);
+                    let name = package.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let description = package.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("{name}\t{description}");
+                }
+            }
+        },
+        Commands::Stage { action, args, registry, otp, json: _ } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            let value = match action.as_deref().unwrap_or("list") {
+                "list" | "ls" => client.stage_list(Some(&registry_url)).await?,
+                "view" | "show" => client.stage_view(Some(&registry_url), args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error stage view <stage-id>"))?).await?,
+                "approve" => client.stage_approve(Some(&registry_url), args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error stage approve <stage-id>"))?, otp.as_deref()).await?,
+                "reject" | "delete" => { client.stage_reject(Some(&registry_url), args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error stage reject <stage-id>"))?, otp.as_deref()).await?; serde_json::Value::Null },
+                other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error unknown stage command: {other}")),
+            };
+            if !value.is_null() { println!("{}", serde_json::to_string_pretty(&value)?); }
+        },
         Commands::InstallCiTest { args } => {
             let mut installer = Installer::new(InstallOptions { project_dir: current_dir.clone(), ..Default::default() })?;
             installer.run_ci().await?;
             execute_run(current_dir, Some("test".into()), args, false, Vec::new(), Vec::new(), Vec::new(), false, false, false, false, false).await?;
         }
-        Commands::InstallScripts { action, packages, all, json } => {
+        Commands::InstallScripts { action, packages, all, json, dry_run } => {
             match action.as_deref().unwrap_or("") {
                 "approve" => update_allow_scripts_policy(&current_dir, &packages, true, all, json)?,
                 "deny" => update_allow_scripts_policy(&current_dir, &packages, false, all, json)?,
-                "ls" | "list" | "prune" => {
-                    let path = current_dir.join("package.json");
-                    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-                    let value = document.get("allowScripts").cloned().unwrap_or_else(|| serde_json::json!({}));
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                }
+                "ls" | "list" => list_pending_install_scripts(&current_dir, json)?,
+                "prune" => prune_install_scripts_policy(&current_dir, json, dry_run)?,
                 _ => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error install-scripts approve|deny|ls|prune")),
             }
         }
@@ -3857,7 +4080,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let summary = installer.update(&[]).await?;
             println!("rnpm: fixed {} package(s)", summary.packages_updated);
         }
-        Commands::Trust { action, args, yes: _, registry, id, otp } => {
+        Commands::Trust { action, args, yes: _, registry, id, otp, workflow_file, repository, environment, project, org_id, project_id, pipeline_definition_id, vcs_origin, context_id, allow_publish, allow_stage_publish, json } => {
             let action = action.unwrap_or_else(|| "list".into());
             let package = args.first().cloned().or_else(|| package_name_from_manifest(&current_dir).ok())
                 .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package name must be specified"))?;
@@ -3873,7 +4096,46 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     println!("revoked trusted configuration {id} for {package}");
                 }
                 "github" | "gitlab" | "circleci" => {
-                    return Err(anyhow::anyhow!("npm error code ENOTSUP\nrnpm trust {action} requires provider-specific trust configuration, which is not supported by this registry client"));
+                    if !allow_publish && !allow_stage_publish {
+                        return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error trust {action} requires --allow-publish or --allow-stage-publish"));
+                    }
+                    let claims = match action.as_str() {
+                        "github" => {
+                            let file = workflow_file.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust github requires --file"))?;
+                            if !file.ends_with(".yml") && !file.ends_with(".yaml") { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error workflow file must end in .yml or .yaml")); }
+                            let mut claims = serde_json::Map::new();
+                            if let Some(repo) = repository { claims.insert("repository".into(), serde_json::Value::String(repo)); }
+                            let mut workflow = serde_json::Map::new(); workflow.insert("file".into(), serde_json::Value::String(file));
+                            claims.insert("workflow_ref".into(), serde_json::Value::Object(workflow));
+                            if let Some(env) = environment { claims.insert("environment".into(), serde_json::Value::String(env)); }
+                            serde_json::Value::Object(claims)
+                        }
+                        "gitlab" => {
+                            let file = workflow_file.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust gitlab requires --file"))?;
+                            let mut claims = serde_json::Map::new();
+                            if let Some(project) = project.or(repository) { claims.insert("project_path".into(), serde_json::Value::String(project)); }
+                            claims.insert("ref_path".into(), serde_json::Value::String(file));
+                            if let Some(env) = environment { claims.insert("environment".into(), serde_json::Value::String(env)); }
+                            serde_json::Value::Object(claims)
+                        }
+                        _ => {
+                            let org = org_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --org-id"))?;
+                            let project_id = project_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --project-id"))?;
+                            let pipeline = pipeline_definition_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --pipeline-definition-id"))?;
+                            let origin = vcs_origin.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --vcs-origin"))?;
+                            let mut claims = serde_json::Map::new();
+                            for (key, value) in [("organization_id", org), ("project_id", project_id), ("pipeline_definition_id", pipeline), ("vcs_origin", origin)] { claims.insert(key.into(), serde_json::Value::String(value)); }
+                            if !context_id.is_empty() { claims.insert("context_id".into(), serde_json::Value::Array(context_id.into_iter().map(serde_json::Value::String).collect())); }
+                            serde_json::Value::Object(claims)
+                        }
+                    };
+                    let mut permissions = Vec::new();
+                    if allow_publish { permissions.push(serde_json::Value::String("createPackage".into())); }
+                    if allow_stage_publish { permissions.push(serde_json::Value::String("createStagedPackage".into())); }
+                    let config = serde_json::json!([{"type": action, "claims": claims, "permissions": permissions}]);
+                    let value = client.trust_create(Some(&registry_url), &package, config, otp.as_deref()).await?;
+                    if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+                    else { println!("trusted {package} with {action}"); }
                 }
                 other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Unknown trust command: {other}")),
             }

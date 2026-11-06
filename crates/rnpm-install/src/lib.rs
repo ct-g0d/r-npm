@@ -408,6 +408,8 @@ pub struct InstallOptions {
     pub workspace_root: bool,
     pub workspace: Vec<String>,
     pub workspaces: bool,
+    /// Public package-lock serialization version (1, 2, or 3). Hidden lockfiles remain v3.
+    pub lockfile_version: u32,
 }
 
 impl InstallOptions {
@@ -468,6 +470,7 @@ impl Default for InstallOptions {
             workspace_root: false,
             workspace: Vec::new(),
             workspaces: false,
+            lockfile_version: 3,
         }
     }
 }
@@ -1064,7 +1067,7 @@ impl Installer {
 
             let lockfile_path = self.options.project_dir.join("package-lock.json");
             if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save {
-                lockfile.save_to_file(&lockfile_path)
+                lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
                     .context("Failed to save package-lock.json")?;
             }
 
@@ -1649,7 +1652,7 @@ impl Installer {
         if !self.options.no_save && self.options.package_lock_enabled() {
             enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
             // 4. Write deterministic package-lock.json
-            lockfile.save_to_file(&lockfile_path)
+            lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
                 .context("Failed to save package-lock.json")?;
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
@@ -3629,7 +3632,7 @@ impl Installer {
         }
 
         // 6. Rewrite package-lock.json deterministically
-        lockfile.save_to_file(&lockfile_path)
+        lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
             .context("Failed to save package-lock.json")?;
 
         // 7. Persist hidden lockfile to node_modules/.package-lock.json
@@ -3762,7 +3765,7 @@ impl Installer {
             pruned_nodes.extend(graph_pruned);
 
             // Write updated deterministic package-lock.json
-            lockfile.save_to_file(&lockfile_path)
+            lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
                 .context("Failed to save updated package-lock.json")?;
 
             // Persist hidden lockfile to node_modules/.package-lock.json

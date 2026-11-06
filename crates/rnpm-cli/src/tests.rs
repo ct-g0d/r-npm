@@ -880,6 +880,7 @@ use tokio::net::TcpListener;
                 include: vec![],
                 no_package_lock: false,
                 package_lock: None,
+                lockfile_version: None,
                 dry_run: false,
                 os: None,
                 cpu: None,
