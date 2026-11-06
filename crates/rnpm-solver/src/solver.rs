@@ -777,6 +777,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 };
 
                 self.graph.nodes.insert(target_loc.clone(), node);
+                if target_loc == root_slot {
+                    self.dedupe_nested_compatible_nodes(
+                        &root_slot,
+                        &dep_spec.package_name,
+                        &dep_spec.install_name,
+                        &dep_spec.target,
+                    );
+                }
 
                 if platform_skipped || parent_skipped {
                     self.graph.skipped.insert(dep_spec.package_name.clone());
@@ -910,6 +918,36 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             if keep_nested { edge.to_location = nested.clone(); }
         }
         true
+    }
+
+    fn dedupe_nested_compatible_nodes(
+        &mut self,
+        root_location: &str,
+        package_name: &str,
+        install_name: &str,
+        target: &PackageTarget,
+    ) {
+        let candidates: Vec<String> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|(location, node)| {
+                *location != root_location
+                    && location.ends_with(&format!("/node_modules/{install_name}"))
+                    && node.name == package_name
+                    && crate::hoisting::node_satisfies_target(node, target)
+                    && !self.graph.nodes.keys().any(|child| {
+                        child.starts_with(&format!("{location}/node_modules/"))
+                    })
+            })
+            .map(|(location, _)| location.clone())
+            .collect();
+        for candidate in candidates {
+            self.graph.edges.iter_mut().for_each(|edge| {
+                if edge.to_location == candidate { edge.to_location = root_location.to_string(); }
+            });
+            self.graph.nodes.remove(&candidate);
+        }
     }
 
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
