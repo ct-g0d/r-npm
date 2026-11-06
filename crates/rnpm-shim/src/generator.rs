@@ -119,7 +119,8 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
          \r\n\
          $exe=\"\"\r\n\
          if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\r\n\
-           # Fix case when both the Windows and Linux builds of Node are installed in the same directory\r\n\
+         # Fix case when both the Windows and Linux builds of Node\r\n\
+         # are installed in the same directory\r\n\
            $exe=\".exe\"\r\n\
          }}\r\n\
          $ret=0\r\n\
@@ -148,8 +149,8 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     .replace("\r\nif ($MyInvocation", "\r\n  if ($MyInvocation")
     .replace("\r\n$input |", "\r\n    $input |")
     .replace("\r\n& \"", "\r\n    & \"")
-    .replace("\r\n}\r\n$ret=$LASTEXITCODE", "\r\n  }\r\n  $ret=$LASTEXITCODE")
-    .replace("\r\n} else {\r\n  # Support", "\r\n  } else {\r\n  # Support")
+    .replace("\n}\n$ret=$LASTEXITCODE", "\n  }\n  $ret=$LASTEXITCODE")
+    .replacen("\n} else {\n  # Support", "\n  } else {\n  # Support", 1)
     .replace("\"   \"$basedir", "\"  \"$basedir")
     .replace("\"   \"$basedir", "\"  \"$basedir")
     .replace("$basedir =", "$basedir=")
