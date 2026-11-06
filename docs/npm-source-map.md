@@ -193,7 +193,7 @@ Fetches package manifests, packuments, and tarballs from diverse sources (npm re
 - `EINTEGRITY`: Tarball integrity hash mismatch.
 
 ### Filesystem Effects
-- Extracts tarballs into `node_modules/<pkg>`. Strips the standard `package/` top-level directory prefix.
+- Extracts tarballs into `node_modules/<pkg>`. Strips one top-level archive directory, including generated roots used by some published tarballs.
 - Writes downloaded blobs to `cacache`.
 
 ### Network Effects

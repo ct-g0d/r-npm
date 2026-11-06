@@ -236,7 +236,15 @@ fn test_platform_filters_optional_dependencies() {
     let win_graph = resolve_dependency_graph(&manifest, &provider, &win_options).unwrap();
     assert!(win_graph.nodes.contains_key("node_modules/win32-native"));
     assert!(win_graph.nodes.contains_key("node_modules/x64-native"));
-    assert!(!win_graph.nodes.contains_key("node_modules/darwin-native"));
+    assert!(win_graph.nodes.contains_key("node_modules/darwin-native"));
+    assert!(win_graph.is_skipped("darwin-native"));
+    let win_lockfile = win_graph.to_lockfile_v3("platform-test", Some("1.0.0"));
+    let darwin_lock_entry = win_lockfile
+        .packages
+        .get("node_modules/darwin-native")
+        .expect("incompatible optional package must remain in lockfile");
+    assert_eq!(darwin_lock_entry.os.as_deref(), Some(&["darwin".to_string()][..]));
+    assert_eq!(darwin_lock_entry.optional, Some(true));
 
     // Scenario B: simulated macOS arm64 host
     let mac_options = ResolverOptions {
@@ -245,8 +253,10 @@ fn test_platform_filters_optional_dependencies() {
     };
     let mac_graph = resolve_dependency_graph(&manifest, &provider, &mac_options).unwrap();
     assert!(mac_graph.nodes.contains_key("node_modules/darwin-native"));
-    assert!(!mac_graph.nodes.contains_key("node_modules/win32-native"));
-    assert!(!mac_graph.nodes.contains_key("node_modules/x64-native"));
+    assert!(mac_graph.nodes.contains_key("node_modules/win32-native"));
+    assert!(mac_graph.nodes.contains_key("node_modules/x64-native"));
+    assert!(mac_graph.is_skipped("win32-native"));
+    assert!(mac_graph.is_skipped("x64-native"));
 }
 
 #[test]
@@ -359,7 +369,7 @@ fn test_platform_libc_filtering_optional_dependencies() {
     let graph1 = resolve_dependency_graph(&manifest, &provider, &glibc_opts).unwrap();
     assert!(graph1.nodes.contains_key("node_modules/glibc-pkg"));
     assert!(graph1.nodes.contains_key("node_modules/not-musl-pkg"));
-    assert!(!graph1.nodes.contains_key("node_modules/musl-pkg"));
+    assert!(graph1.nodes.contains_key("node_modules/musl-pkg"));
     assert!(graph1.is_skipped("musl-pkg"));
 
     // Host 2: Linux with musl (Alpine)
@@ -369,8 +379,8 @@ fn test_platform_libc_filtering_optional_dependencies() {
     };
     let graph2 = resolve_dependency_graph(&manifest, &provider, &musl_opts).unwrap();
     assert!(graph2.nodes.contains_key("node_modules/musl-pkg"));
-    assert!(!graph2.nodes.contains_key("node_modules/glibc-pkg"));
-    assert!(!graph2.nodes.contains_key("node_modules/not-musl-pkg"));
+    assert!(graph2.nodes.contains_key("node_modules/glibc-pkg"));
+    assert!(graph2.nodes.contains_key("node_modules/not-musl-pkg"));
     assert!(graph2.is_skipped("glibc-pkg"));
     assert!(graph2.is_skipped("not-musl-pkg"));
 
@@ -380,8 +390,8 @@ fn test_platform_libc_filtering_optional_dependencies() {
         ..Default::default()
     };
     let graph3 = resolve_dependency_graph(&manifest, &provider, &win_opts).unwrap();
-    assert!(!graph3.nodes.contains_key("node_modules/glibc-pkg"));
-    assert!(!graph3.nodes.contains_key("node_modules/musl-pkg"));
+    assert!(graph3.nodes.contains_key("node_modules/glibc-pkg"));
+    assert!(graph3.nodes.contains_key("node_modules/musl-pkg"));
     assert!(graph3.nodes.contains_key("node_modules/not-musl-pkg"));
     assert!(graph3.is_skipped("glibc-pkg"));
     assert!(graph3.is_skipped("musl-pkg"));
@@ -409,10 +419,12 @@ fn test_transitive_optional_dependency_platform_skipping() {
     };
     let graph = resolve_dependency_graph(&manifest, &provider, &win_opts).unwrap();
 
-    // Neither darwin-parent NOR its child-pkg should be placed in node_modules!
-    assert!(!graph.nodes.contains_key("node_modules/darwin-parent"));
-    assert!(!graph.nodes.contains_key("node_modules/child-pkg"));
+    // The incompatible optional subtree remains in the graph for lockfile
+    // parity, and descendants inherit skipped/optional reachability.
+    assert!(graph.nodes.contains_key("node_modules/darwin-parent"));
+    assert!(graph.nodes.contains_key("node_modules/child-pkg"));
     assert!(graph.is_skipped("darwin-parent"));
+    assert!(graph.is_skipped("child-pkg"));
 }
 
 #[test]
@@ -1079,6 +1091,36 @@ fn test_hidden_tree_metadata_preservation_in_graph() {
 }
 
 #[test]
+fn test_lockfile_preserves_package_metadata_and_normalizes_bins() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("meta-pkg", "1.0.0", |version| {
+        version.license = Some("MIT".to_string());
+        version.engines.insert("node".to_string(), ">=18".to_string());
+        version.bin = Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([
+            ("meta".to_string(), "./bin/meta.js".to_string()),
+        ])));
+        version.extra.insert(
+            "funding".to_string(),
+            serde_json::json!({ "type": "github", "url": "https://github.com/sponsors/example" }),
+        );
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("metadata-app".to_string());
+    manifest.dependencies.insert("meta-pkg".to_string(), "1.0.0".to_string());
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let lockfile = graph.to_lockfile_v3("metadata-app", Some("1.0.0"));
+    let package = lockfile.packages.get("node_modules/meta-pkg").unwrap();
+
+    assert_eq!(package.license.as_deref(), Some("MIT"));
+    assert_eq!(package.engines.as_ref().and_then(|m| m.get("node")).map(String::as_str), Some(">=18"));
+    assert_eq!(package.bin, Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([
+        ("meta".to_string(), "bin/meta.js".to_string()),
+    ]))));
+    assert!(package.extra.contains_key("funding"));
+}
+
+#[test]
 fn test_fast_path_detects_lockfile_drift_missing_transitive_dep() {
     use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::solver::resolve_fast_path;
@@ -1490,10 +1532,13 @@ fn test_platform_filtering_isolation_before_download() {
 
     // Verify complete isolation: linux-bundle is marked skipped
     assert!(graph.is_skipped("linux-bundle"));
-    // Neither linux-bundle NOR its transitive dependencies exist in graph
-    assert!(!graph.nodes.contains_key("node_modules/linux-bundle"));
-    assert!(!graph.nodes.contains_key("node_modules/cuda-driver"));
-    assert!(!graph.nodes.contains_key("node_modules/large-weights"));
+    // linux-bundle and its transitive dependencies remain in the graph for
+    // cross-platform lockfile parity, but are skipped on this host.
+    assert!(graph.nodes.contains_key("node_modules/linux-bundle"));
+    assert!(graph.nodes.contains_key("node_modules/cuda-driver"));
+    assert!(graph.nodes.contains_key("node_modules/large-weights"));
+    assert!(graph.is_skipped("cuda-driver"));
+    assert!(graph.is_skipped("large-weights"));
 }
 
 #[test]
@@ -2364,10 +2409,11 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     assert!(graph1.nodes.contains_key("node_modules/addon-linux-glibc"));
     assert!(graph1.nodes.contains_key("node_modules/cuda-core"));
     assert!(graph1.nodes.contains_key("node_modules/blas"));
-    assert!(!graph1.nodes.contains_key("node_modules/addon-linux-musl"));
-    assert!(!graph1.nodes.contains_key("node_modules/musl-shim"));
-    assert!(!graph1.nodes.contains_key("node_modules/addon-darwin-arm64"));
-    assert!(!graph1.nodes.contains_key("node_modules/addon-win32-x64"));
+    assert!(graph1.nodes.contains_key("node_modules/addon-linux-musl"));
+    assert!(graph1.nodes.contains_key("node_modules/musl-shim"));
+    assert!(graph1.is_skipped("musl-shim"));
+    assert!(graph1.nodes.contains_key("node_modules/addon-darwin-arm64"));
+    assert!(graph1.nodes.contains_key("node_modules/addon-win32-x64"));
     assert!(graph1.is_skipped("addon-linux-musl"));
     assert!(graph1.is_skipped("addon-darwin-arm64"));
     assert!(graph1.is_skipped("addon-win32-x64"));
@@ -2380,9 +2426,11 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     let graph2 = resolve_dependency_graph(&manifest, &provider, &opts_musl).unwrap();
     assert!(graph2.nodes.contains_key("node_modules/addon-linux-musl"));
     assert!(graph2.nodes.contains_key("node_modules/musl-shim"));
-    assert!(!graph2.nodes.contains_key("node_modules/addon-linux-glibc"));
-    assert!(!graph2.nodes.contains_key("node_modules/cuda-core"));
-    assert!(!graph2.nodes.contains_key("node_modules/blas"));
+    assert!(graph2.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(graph2.nodes.contains_key("node_modules/cuda-core"));
+    assert!(graph2.nodes.contains_key("node_modules/blas"));
+    assert!(graph2.is_skipped("cuda-core"));
+    assert!(graph2.is_skipped("blas"));
     assert!(graph2.is_skipped("addon-linux-glibc"));
 
     // Host 3: macOS arm64 (Apple Silicon)
@@ -2393,9 +2441,9 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     let graph3 = resolve_dependency_graph(&manifest, &provider, &opts_mac).unwrap();
     assert!(graph3.nodes.contains_key("node_modules/addon-darwin-arm64"));
     assert!(graph3.nodes.contains_key("node_modules/metal-framework"));
-    assert!(!graph3.nodes.contains_key("node_modules/addon-darwin-x64"));
-    assert!(!graph3.nodes.contains_key("node_modules/addon-linux-glibc"));
-    assert!(!graph3.nodes.contains_key("node_modules/addon-win32-x64"));
+    assert!(graph3.nodes.contains_key("node_modules/addon-darwin-x64"));
+    assert!(graph3.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(graph3.nodes.contains_key("node_modules/addon-win32-x64"));
     assert!(graph3.is_skipped("addon-darwin-x64"));
     assert!(graph3.is_skipped("addon-linux-glibc"));
     assert!(graph3.is_skipped("addon-win32-x64"));
@@ -2408,9 +2456,9 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     let graph4 = resolve_dependency_graph(&manifest, &provider, &opts_win).unwrap();
     assert!(graph4.nodes.contains_key("node_modules/addon-win32-x64"));
     assert!(graph4.nodes.contains_key("node_modules/directx-helper"));
-    assert!(!graph4.nodes.contains_key("node_modules/addon-linux-glibc"));
-    assert!(!graph4.nodes.contains_key("node_modules/addon-linux-musl"));
-    assert!(!graph4.nodes.contains_key("node_modules/addon-darwin-arm64"));
+    assert!(graph4.nodes.contains_key("node_modules/addon-linux-glibc"));
+    assert!(graph4.nodes.contains_key("node_modules/addon-linux-musl"));
+    assert!(graph4.nodes.contains_key("node_modules/addon-darwin-arm64"));
     assert!(graph4.is_skipped("addon-linux-glibc"));
     assert!(graph4.is_skipped("addon-linux-musl"));
     assert!(graph4.is_skipped("addon-darwin-arm64"));
@@ -2671,6 +2719,39 @@ fn test_adversarial_select_version_semver_not_lexicographical() {
         node.version, "10.0.0",
         "SemVer-aware selection must pick 10.0.0 over 9.0.0"
     );
+}
+
+#[test]
+fn test_registry_latest_tag_wins_when_range_allows_it() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("tagged-pkg", "1.3.0", |_| {});
+    provider.add_version("tagged-pkg", "1.3.1", |_| {});
+    provider.set_dist_tag("tagged-pkg", "latest", "1.3.0");
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("tagged-app".to_string());
+    manifest.dependencies.insert("tagged-pkg".to_string(), "^1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert_eq!(graph.nodes["node_modules/tagged-pkg"].version, "1.3.0");
+}
+
+#[test]
+fn test_dev_reachability_marks_transitive_lockfile_entries() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("dev-tool", "1.0.0", |v| {
+        v.dependencies.insert("dev-helper".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("dev-helper", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-flags-app".to_string());
+    manifest.dev_dependencies.insert("dev-tool".to_string(), "^1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let lockfile = graph.to_lockfile_v3("dev-flags-app", Some("1.0.0"));
+    assert_eq!(lockfile.packages["node_modules/dev-tool"].dev, Some(true));
+    assert_eq!(lockfile.packages["node_modules/dev-helper"].dev, Some(true));
 }
 
 #[test]

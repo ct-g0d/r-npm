@@ -439,3 +439,116 @@ async fn test_token_list_and_revoke() {
 
     server.stop();
 }
+
+#[tokio::test]
+async fn test_registry_administration_commands() {
+    let server = PublishMockServer::start(|req| {
+        if req.method == "GET" && req.path == "/-/package/demo/dist-tags" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"latest":"1.0.0"}"#.to_vec())
+        } else if req.method == "PUT" && req.path == "/-/package/demo/dist-tags/next" {
+            assert_eq!(req.json_body(), serde_json::json!("1.1.0"));
+            (201, vec![], Vec::new())
+        } else if req.method == "DELETE" && req.path == "/-/package/demo/dist-tags/next" {
+            (204, vec![], Vec::new())
+        } else if req.method == "GET" && req.path.starts_with("/-/v1/search?") {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"objects":[]}"#.to_vec())
+        } else if req.method == "DELETE" && req.path == "/demo/1.0.0" {
+            (204, vec![], Vec::new())
+        } else if req.method == "GET" && req.path == "/-/package/demo/access" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"access":"public"}"#.to_vec())
+        } else if req.method == "PUT" && req.path == "/-/package/demo/access" {
+            assert_eq!(req.header("npm-otp"), Some("123456"));
+            assert_eq!(req.json_body(), serde_json::json!({"access":"restricted"}));
+            (200, vec![("Content-Type", "application/json".into())], br#"{"access":"restricted"}"#.to_vec())
+        } else if req.method == "GET" && req.path == "/-/whoami" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"username":"alice"}"#.to_vec())
+        } else if req.method == "GET" && req.path == "/demo" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"_id":"demo","_rev":"1-x","users":{}}"#.to_vec())
+        } else if req.method == "PUT" && req.path == "/demo" {
+            assert!(req.json_body().get("users").is_some());
+            (201, vec![], Vec::new())
+        } else if req.method == "GET" && req.path.starts_with("/-/_view/starredByUser?") {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"rows":[{"value":"demo"}]}"#.to_vec())
+        } else if req.method == "GET" && req.path == "/-/npm/v1/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"name":"alice","email":"alice@example.test"}"#.to_vec())
+        } else if req.method == "POST" && req.path == "/-/npm/v1/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"name":"alice","email":"new@example.test"}"#.to_vec())
+        } else if req.method == "GET" && req.path == "/-/org/acme/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"alice":"admin"}"#.to_vec())
+        } else if req.method == "PUT" && req.path == "/-/org/acme/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"user":"bob","role":"developer"}"#.to_vec())
+        } else if req.method == "DELETE" && req.path == "/-/org/acme/user" {
+            (204, vec![], Vec::new())
+        } else if req.method == "PUT" && req.path == "/-/org/acme/team" {
+            (201, vec![("Content-Type", "application/json".into())], br#"{"name":"core"}"#.to_vec())
+        } else if req.method == "GET" && req.path == "/-/org/acme/team" {
+            (200, vec![("Content-Type", "application/json".into())], br#"["core"]"#.to_vec())
+        } else if req.method == "DELETE" && req.path == "/-/team/acme/core" {
+            (204, vec![], Vec::new())
+        } else if req.method == "GET" && req.path == "/-/team/acme/core/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"["alice"]"#.to_vec())
+        } else if req.method == "PUT" && req.path == "/-/team/acme/core/user" {
+            (200, vec![("Content-Type", "application/json".into())], br#"{"user":"bob"}"#.to_vec())
+        } else if req.method == "DELETE" && req.path == "/-/team/acme/core/user" {
+            (204, vec![], Vec::new())
+        } else if req.method == "GET" && req.path == "/-/package/demo/trust" {
+            (200, vec![("Content-Type", "application/json".into())], br#"[{"id":"trust-1","type":"github","permissions":["createPackage"]}]"#.to_vec())
+        } else if req.method == "DELETE" && req.path == "/-/package/demo/trust/trust-1" {
+            (204, vec![], Vec::new())
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    }).await;
+
+    let server_url = server.url();
+    let mut config = RegistryClientConfig::default();
+    config.default_registry = server_url.clone();
+    config.auth_token = Some("test-token".into());
+    config.trusted_hosts.insert(server_url.host_str().unwrap().to_ascii_lowercase());
+    let client = RegistryClient::with_config(config).unwrap();
+
+    assert_eq!(client.dist_tags(Some(&server_url), "demo").await.unwrap()["latest"], "1.0.0");
+    client.dist_tag_add(Some(&server_url), "demo", "next", "1.1.0", Some("123456")).await.unwrap();
+    client.dist_tag_remove(Some(&server_url), "demo", "next", Some("123456")).await.unwrap();
+    client.search(Some(&server_url), "demo", 10, 0).await.unwrap();
+    client.unpublish(Some(&server_url), "demo", Some("1.0.0"), Some("123456")).await.unwrap();
+    assert_eq!(client.package_access(Some(&server_url), "demo", None, None).await.unwrap()["access"], "public");
+    assert_eq!(client.package_access(Some(&server_url), "demo", Some("restricted"), Some("123456")).await.unwrap()["access"], "restricted");
+    client.star_package(Some(&server_url), "demo", Some("123456")).await.unwrap();
+    client.unstar_package(Some(&server_url), "demo", Some("123456")).await.unwrap();
+    assert_eq!(client.starred_packages(Some(&server_url), None).await.unwrap()["rows"][0]["value"], "demo");
+    assert_eq!(client.profile_get(Some(&server_url)).await.unwrap()["name"], "alice");
+    assert_eq!(client.profile_set(Some(&server_url), serde_json::json!({"email":"new@example.test"}), Some("123456")).await.unwrap()["email"], "new@example.test");
+    assert_eq!(client.org_members(Some(&server_url), "acme").await.unwrap()["alice"], "admin");
+    client.org_member_set(Some(&server_url), "acme", "bob", Some("developer")).await.unwrap();
+    client.org_member_remove(Some(&server_url), "acme", "bob").await.unwrap();
+    assert_eq!(client.team_create(Some(&server_url), "acme", "core", None).await.unwrap()["name"], "core");
+    assert_eq!(client.teams(Some(&server_url), "acme").await.unwrap()[0], "core");
+    assert_eq!(client.team_users(Some(&server_url), "acme", "core").await.unwrap()[0], "alice");
+    client.team_add_user(Some(&server_url), "acme", "core", "bob").await.unwrap();
+    client.team_remove_user(Some(&server_url), "acme", "core", "bob").await.unwrap();
+    client.team_destroy(Some(&server_url), "acme", "core").await.unwrap();
+    assert_eq!(client.trust_list(Some(&server_url), "demo").await.unwrap()[0]["id"], "trust-1");
+    client.trust_revoke(Some(&server_url), "demo", "trust-1", Some("123456")).await.unwrap();
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_registry_legacy_login_exchange() {
+    let server = PublishMockServer::start(|req| {
+        if req.method == "PUT" && req.path == "/-/user/org.couchdb.user:alice" {
+            assert_eq!(req.json_body()["name"], "alice");
+            assert_eq!(req.json_body()["password"], "secret");
+            (201, vec![("Content-Type", "application/json".into())], br#"{"token":"npm_legacy_token"}"#.to_vec())
+        } else {
+            (404, vec![], b"Not Found".to_vec())
+        }
+    }).await;
+
+    let server_url = server.url();
+    let config = RegistryClientConfig { default_registry: server_url.clone(), ..Default::default() };
+    let client = RegistryClient::with_config(config).unwrap();
+    let response = client.login_legacy(Some(&server_url), "alice", "secret", Some("123456")).await.unwrap();
+    assert_eq!(response["token"], "npm_legacy_token");
+    server.stop();
+}

@@ -83,6 +83,29 @@ pub fn determine_placement(
     package_name: &str,
     target: &PackageTarget,
 ) -> PlacementDecision {
+    determine_placement_with_peers(
+        graph,
+        parent_location,
+        install_name,
+        package_name,
+        target,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// Determines placement while preserving peer visibility. A candidate scope
+/// that already exposes an incompatible peer must not claim the package: npm
+/// nests the package so its parent or a nearer scope can provide the peer.
+pub fn determine_placement_with_peers(
+    graph: &DependencyGraph,
+    parent_location: &str,
+    install_name: &str,
+    package_name: &str,
+    target: &PackageTarget,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
+) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
     root_target.push_str(install_name);
@@ -90,7 +113,15 @@ pub fn determine_placement(
     // If parent is root (""), location is directly under root
     if parent_location.is_empty() {
         if let Some(existing) = graph.nodes.get(&root_target) {
-            if existing.name == package_name && node_satisfies_target(existing, target) {
+            if existing.name == package_name
+                && node_satisfies_target(existing, target)
+                && !candidate_has_incompatible_peer(
+                    graph,
+                    &root_target,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                )
+            {
                 return PlacementDecision::Reuse(root_target);
             }
         }
@@ -99,7 +130,15 @@ pub fn determine_placement(
 
     // Attempt 1: Check root node_modules
     if let Some(existing) = graph.nodes.get(&root_target) {
-        if existing.name == package_name && node_satisfies_target(existing, target) {
+        if existing.name == package_name
+            && node_satisfies_target(existing, target)
+            && !candidate_has_incompatible_peer(
+                graph,
+                &root_target,
+                peer_dependencies,
+                peer_dependencies_meta,
+            )
+        {
             // Check if there is an intermediate shadowing conflict between parent and root
             if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target) {
                 return PlacementDecision::Reuse(root_target);
@@ -108,7 +147,14 @@ pub fn determine_placement(
         // Root is occupied and either incompatible or shadowed -> conflict!
     } else {
         // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
-        if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target) {
+        if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target)
+            && !candidate_has_incompatible_peer(
+                graph,
+                &root_target,
+                peer_dependencies,
+                peer_dependencies_meta,
+            )
+        {
             return PlacementDecision::PlaceNew(root_target);
         }
     }
@@ -131,10 +177,23 @@ pub fn determine_placement(
 
         if let Some(existing) = graph.nodes.get(&candidate) {
             if existing.name == package_name && node_satisfies_target(existing, target)
+                && !candidate_has_incompatible_peer(
+                    graph,
+                    &candidate,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                )
                 && !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
                     return PlacementDecision::Reuse(candidate);
                 }
-        } else if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
+        } else if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target)
+            && !candidate_has_incompatible_peer(
+                graph,
+                &candidate,
+                peer_dependencies,
+                peer_dependencies_meta,
+            )
+        {
             return PlacementDecision::PlaceNew(candidate);
         }
     }
@@ -152,6 +211,33 @@ pub fn determine_placement(
     }
 
     PlacementDecision::PlaceNew(nested_target)
+}
+
+fn candidate_has_incompatible_peer(
+    graph: &DependencyGraph,
+    candidate_location: &str,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
+) -> bool {
+    peer_dependencies.iter().any(|(peer_name, peer_spec)| {
+        let Some(existing) = find_visible_peer_node(graph, candidate_location, peer_name, peer_name) else {
+            return false;
+        };
+        let Ok(target) = PackageTarget::parse(peer_spec) else {
+            return false;
+        };
+        if node_satisfies_target(existing, &target) {
+            return false;
+        }
+        // Optional peers constrain placement when an incompatible visible
+        // version exists. Required peers retain the existing conflict
+        // diagnostics and resolution path.
+        let optional = peer_dependencies_meta
+            .get(peer_name)
+            .map(|meta| meta.optional)
+            .unwrap_or(false);
+        optional
+    })
 }
 
 /// Checks if any intermediate scope between `from_scope` and `to_ancestor` has a node for `install_name`

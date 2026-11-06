@@ -1,6 +1,18 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
+
+fn normalize_bin_paths(bin: Option<PackageBin>) -> Option<PackageBin> {
+    bin.map(|bin| match bin {
+        PackageBin::Single(path) => PackageBin::Single(path.strip_prefix("./").unwrap_or(&path).to_string()),
+        PackageBin::Map(paths) => PackageBin::Map(
+            paths
+                .into_iter()
+                .map(|(name, path)| (name, path.strip_prefix("./").unwrap_or(&path).to_string()))
+                .collect(),
+        ),
+    })
+}
 
 /// Type classification for dependency relationships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +82,10 @@ pub struct Node {
     pub libc: Option<Vec<String>>,
     /// Executable binaries.
     pub bin: Option<PackageBin>,
+    /// Package license copied into lockfile metadata.
+    pub license: Option<String>,
+    /// Package engine constraints copied into lockfile metadata.
+    pub engines: BTreeMap<String, String>,
     /// Cached parsed semver for fast zero-allocation evaluation.
     #[serde(skip, default)]
     pub parsed_version: Option<rnpm_core::semver::Version>,
@@ -115,6 +131,105 @@ impl DependencyGraph {
             .iter()
             .filter(|e| e.from_location == from_location)
             .collect()
+    }
+
+    /// Recomputes dev/optional reachability from the root dependency edges.
+    ///
+    /// A package is marked `dev` only when every path from the root reaches it
+    /// through a dev dependency. This matters for shared transitive packages:
+    /// a package first discovered through a dev branch must lose its dev flag
+    /// when a production branch also reaches the same node. The same rule is
+    /// applied to optional reachability so dependencies below an optional
+    /// platform package remain optional in the lockfile.
+    pub fn normalize_dependency_flags(&mut self) {
+        const NON_DEV: u8 = 0b01;
+        const DEV_ONLY: u8 = 0b10;
+        const NON_OPTIONAL: u8 = 0b01;
+        const OPTIONAL_ONLY: u8 = 0b10;
+
+        let mut dev_states: HashMap<String, u8> = HashMap::new();
+        let mut optional_states: HashMap<String, u8> = HashMap::new();
+        let mut skipped_states: HashMap<String, u8> = HashMap::new();
+        let initially_skipped: HashSet<String> = self
+            .nodes
+            .iter()
+            .filter_map(|(location, node)| node.flags.skipped.then_some(location.clone()))
+            .collect();
+        dev_states.insert(self.root_location.clone(), NON_DEV);
+        optional_states.insert(self.root_location.clone(), NON_OPTIONAL);
+        skipped_states.insert(self.root_location.clone(), NON_DEV);
+
+        let mut queue = VecDeque::from([self.root_location.clone()]);
+        let mut outgoing: HashMap<String, Vec<DependencyEdge>> = HashMap::new();
+        for edge in &self.edges {
+            outgoing.entry(edge.from_location.clone()).or_default().push(edge.clone());
+        }
+        while let Some(location) = queue.pop_front() {
+            let dev_state = dev_states.get(&location).copied().unwrap_or(0);
+            let optional_state = optional_states.get(&location).copied().unwrap_or(0);
+            let skipped_state = skipped_states.get(&location).copied().unwrap_or(0);
+            let Some(edges) = outgoing.get(&location) else { continue };
+
+            for edge in edges {
+                let mut next_dev = 0;
+                if dev_state & DEV_ONLY != 0 {
+                    next_dev |= DEV_ONLY;
+                }
+                if dev_state & NON_DEV != 0 {
+                    next_dev |= if edge.dep_type == DependencyType::Dev { DEV_ONLY } else { NON_DEV };
+                }
+
+                let mut next_optional = 0;
+                if optional_state & OPTIONAL_ONLY != 0 {
+                    next_optional |= OPTIONAL_ONLY;
+                }
+                if optional_state & NON_OPTIONAL != 0 {
+                    next_optional |= if matches!(edge.dep_type, DependencyType::Optional) {
+                        OPTIONAL_ONLY
+                    } else {
+                        NON_OPTIONAL
+                    };
+                }
+
+                let next_skipped = if skipped_state & DEV_ONLY != 0
+                    || (initially_skipped.contains(&edge.to_location)
+                        && edge.dep_type == DependencyType::Optional)
+                {
+                    DEV_ONLY
+                } else {
+                    NON_DEV
+                };
+
+                let dev_entry = dev_states.entry(edge.to_location.clone()).or_default();
+                let optional_entry = optional_states.entry(edge.to_location.clone()).or_default();
+                let skipped_entry = skipped_states.entry(edge.to_location.clone()).or_default();
+                let changed = (*dev_entry | next_dev) != *dev_entry
+                    || (*optional_entry | next_optional) != *optional_entry
+                    || (*skipped_entry | next_skipped) != *skipped_entry;
+                *dev_entry |= next_dev;
+                *optional_entry |= next_optional;
+                *skipped_entry |= next_skipped;
+                if changed {
+                    queue.push_back(edge.to_location.clone());
+                }
+            }
+        }
+
+        for (location, node) in &mut self.nodes {
+            if location == &self.root_location {
+                continue;
+            }
+            let dev_state = dev_states.get(location).copied().unwrap_or(0);
+            let optional_state = optional_states.get(location).copied().unwrap_or(0);
+            let skipped_state = skipped_states.get(location).copied().unwrap_or(0);
+            node.flags.dev = dev_state == DEV_ONLY;
+            node.flags.optional = optional_state == OPTIONAL_ONLY;
+            node.flags.skipped = skipped_state == DEV_ONLY;
+            if node.flags.skipped {
+                self.skipped.insert(node.name.clone());
+                self.skipped.insert(node.install_name.clone());
+            }
+        }
     }
 
     /// Removes a direct dependency from root node by package name and removes the corresponding edge.
@@ -211,19 +326,40 @@ impl DependencyGraph {
                         root_pkg.optional_dependencies = Some(node.optional_dependencies.clone());
                     }
                     if let Some(bin) = &node.bin {
-                        root_pkg.bin = Some(bin.clone());
+                    root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
                     }
+                    root_pkg.license = node.license.clone();
+                    root_pkg.engines = if node.engines.is_empty() { None } else { Some(node.engines.clone()) };
                     let mut filtered_extra = std::collections::BTreeMap::new();
                     for (k, v) in &node.extra {
-                        if k == "overrides" || k == "workspaces" {
+                        if matches!(k.as_str(), "overrides" | "workspaces" | "funding" | "deprecated" | "directories") {
                             filtered_extra.insert(k.clone(), v.clone());
                         }
                     }
                     root_pkg.extra = filtered_extra;
                 }
             } else {
-                let is_dev_and_opt = node.flags.dev && node.flags.optional;
+                // npm represents workspace and file links as a lightweight
+                // entry containing only the target and the link marker.  The
+                // package metadata belongs to the physical target entry (for
+                // example `packages/foo`), rather than being duplicated at
+                // `node_modules/foo`.  Keeping link entries minimal is also
+                // important for lockfile parity because npm omits version,
+                // dependencies, and flags from these nodes.
+                if node.flags.link {
+                    lockfile.insert_package(
+                        loc,
+                        LockfilePackage {
+                            resolved: node.resolved.clone(),
+                            link: Some(true),
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+
                 let pkg = LockfilePackage {
+                    preserve_dev_optional_split: true,
                     name: if node.install_name != node.name {
                         Some(node.name.clone())
                     } else {
@@ -232,10 +368,15 @@ impl DependencyGraph {
                     version: Some(node.version.clone()),
                     resolved: node.resolved.clone(),
                     integrity: node.integrity.clone(),
-                    link: if node.flags.link { Some(true) } else { None },
-                    dev: if node.flags.dev && !is_dev_and_opt { Some(true) } else { None },
-                    optional: if node.flags.optional && !is_dev_and_opt { Some(true) } else { None },
-                    dev_optional: if is_dev_and_opt { Some(true) } else { None },
+                    link: None,
+                    // npm 11 emits the individual reachability flags for
+                    // packages that are both dev-only and optional (for
+                    // example fsevents under a dev watcher). Keep the
+                    // legacy devOptional field readable for migrated
+                    // lockfiles, but do not generate it for fresh v3 trees.
+                    dev: if node.flags.dev { Some(true) } else { None },
+                    optional: if node.flags.optional { Some(true) } else { None },
+                    dev_optional: None,
                     peer: if node.flags.peer { Some(true) } else { None },
                     in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
@@ -271,7 +412,9 @@ impl DependencyGraph {
                     os: node.os.clone(),
                     cpu: node.cpu.clone(),
                     libc: node.libc.clone(),
-                    bin: node.bin.clone(),
+                    bin: normalize_bin_paths(node.bin.clone()),
+                    license: node.license.clone(),
+                    engines: if node.engines.is_empty() { None } else { Some(node.engines.clone()) },
                     extra: node.extra.clone(),
                     ..Default::default()
                 };
@@ -343,6 +486,8 @@ impl DependencyGraph {
                 cpu: pkg.cpu.clone(),
                 libc: pkg.libc.clone(),
                 bin: pkg.bin.clone(),
+                license: pkg.license.clone(),
+                engines: pkg.engines.clone().unwrap_or_default(),
                 extra: pkg.extra.clone(),
             };
             graph.nodes.insert(loc.clone(), node);

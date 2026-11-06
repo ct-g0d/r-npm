@@ -4,6 +4,7 @@ use serde::{
     Deserialize, Serialize,
 };
 use std::collections::{BTreeMap, HashMap};
+use indexmap::IndexMap;
 use url::Url;
 
 pub fn deserialize_unique_versions<'de, D>(
@@ -125,6 +126,25 @@ where
     deserializer.deserialize_any(VecOrStringVisitor)
 }
 
+/// npm has published a small number of legacy packuments with `engines` as an
+/// array instead of the usual string map. Engines are advisory metadata, so a
+/// malformed legacy shape must not prevent installing an otherwise valid
+/// package. Preserve normal maps and ignore unsupported array/scalar forms.
+pub fn deserialize_engines<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(object)) = value else {
+        return Ok(HashMap::new());
+    };
+
+    Ok(object
+        .into_iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
+        .collect())
+}
+
 
 /// Represents either a single string binary path or a map of command names to paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,20 +219,22 @@ pub struct AbbreviatedVersion {
     pub version: String,
     pub dist: DistInfo,
     #[serde(default)]
-    pub dependencies: HashMap<String, String>,
+    pub dependencies: IndexMap<String, String>,
     #[serde(rename = "devDependencies", default)]
-    pub dev_dependencies: HashMap<String, String>,
+    pub dev_dependencies: IndexMap<String, String>,
     #[serde(rename = "peerDependencies", default)]
-    pub peer_dependencies: HashMap<String, String>,
+    pub peer_dependencies: IndexMap<String, String>,
     #[serde(rename = "peerDependenciesMeta", default)]
     pub peer_dependencies_meta: HashMap<String, rnpm_core::manifest::PeerDependencyMeta>,
     #[serde(rename = "optionalDependencies", default)]
-    pub optional_dependencies: HashMap<String, String>,
+    pub optional_dependencies: IndexMap<String, String>,
     #[serde(rename = "bundleDependencies", alias = "bundledDependencies", default)]
     pub bundle_dependencies: Vec<String>,
     #[serde(default)]
     pub bin: Option<PackageBin>,
     #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: HashMap<String, String>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub os: Vec<String>,
@@ -224,6 +246,11 @@ pub struct AbbreviatedVersion {
     pub has_install_script: bool,
     #[serde(default)]
     pub deprecated: Option<String>,
+    /// Preserve package metadata that npm copies into package-lock entries
+    /// (for example `funding`) even when it is not part of the abbreviated
+    /// resolver schema.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Abbreviated package metadata document from the npm registry.
@@ -381,6 +408,9 @@ mod tests {
                         "dep-a": "^1.0.0"
                     },
                     "bin": "./bin/cli.js",
+                    "license": "MIT",
+                    "funding": { "type": "github", "url": "https://github.com/sponsors/example" },
+                    "libc": ["glibc"],
                     "hasInstallScript": true
                 }
             }
@@ -392,10 +422,31 @@ mod tests {
         let v = meta.versions.get("1.0.0").unwrap();
         assert_eq!(v.version, "1.0.0");
         assert!(v.has_install_script);
+        assert_eq!(v.license.as_deref(), Some("MIT"));
+        assert_eq!(v.libc, vec!["glibc"]);
+        assert!(v.extra.contains_key("funding"));
         assert_eq!(v.dependencies.get("dep-a"), Some(&"^1.0.0".to_string()));
 
         let bin_map = v.bin.clone().unwrap().into_map(&v.name);
         assert_eq!(bin_map.get("example"), Some(&"./bin/cli.js".to_string()));
+        meta.validate().unwrap();
+    }
+
+    #[test]
+    fn test_legacy_array_engines_are_tolerated() {
+        let json = r#"{
+            "name": "legacy-engines",
+            "versions": {
+                "1.0.0": {
+                    "name": "legacy-engines",
+                    "version": "1.0.0",
+                    "engines": ["node >=0.10.0"],
+                    "dist": { "tarball": "https://registry.npmjs.org/legacy-engines/-/legacy-engines-1.0.0.tgz" }
+                }
+            }
+        }"#;
+        let meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.versions["1.0.0"].engines.is_empty());
         meta.validate().unwrap();
     }
 

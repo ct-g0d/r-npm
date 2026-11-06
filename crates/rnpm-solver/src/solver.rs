@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::aliases::DependencySpec;
 use crate::error::SolverError;
 use crate::graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
-use crate::hoisting::{determine_placement, PlacementDecision};
+use crate::hoisting::{determine_placement_with_peers, PlacementDecision};
 use crate::overrides::Overrides;
 use crate::peer::PeerContext;
 use crate::platform::Platform;
@@ -59,6 +59,7 @@ struct ResolveTask {
     install_name: String,
     raw_spec: String,
     dep_type: DependencyType,
+    dev_path: bool,
     ancestors: std::sync::Arc<Vec<String>>,
 }
 
@@ -120,8 +121,32 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             install_name,
             raw_spec,
             dep_type,
+            dev_path: dep_type == DependencyType::Dev,
             ancestors,
         });
+    }
+
+    fn push_task(&mut self, task: ResolveTask) {
+        if task.dev_path {
+            self.queue.push_back(task);
+            return;
+        }
+        if task.parent_location.is_empty() {
+            let insert_at = self
+                .queue
+                .iter()
+                .position(|queued| queued.dev_path)
+                .unwrap_or(self.queue.len());
+            self.queue.insert(insert_at, task);
+            return;
+        }
+
+        // Arborist resolves a package's dependency branch before moving to
+        // the next root sibling. Keeping descendants at the front of the
+        // queue lets the first compatible version claim the shared hoisted
+        // slot (for example picomatch@2 from Jest before Vite's picomatch@4),
+        // while the explicit root ordering above remains stable.
+        self.queue.push_front(task);
     }
 
     /// Processes all queued dependency resolution tasks until completion.
@@ -134,7 +159,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
     /// Extracts the resolved dependency graph.
     pub fn into_graph(self) -> DependencyGraph {
-        self.graph
+        let mut graph = self.graph;
+        graph.normalize_dependency_flags();
+        graph
     }
 
     /// Resolves the dependency graph starting from a root manifest.
@@ -181,12 +208,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
+            license: root_manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            engines: root_manifest.engines.clone(),
             parsed_version: None,
             extra: root_manifest.extra.clone(),
         };
         self.graph.nodes.insert(String::new(), root_node);
 
-        // Collect and sort root dependencies deterministically
+        // Collect root dependencies with npm's precedence order. npm walks
+        // production dependencies before dev-only branches, so a compatible
+        // package first reached through a production dependency gets the
+        // highest hoisting priority. Keep the BTreeMap for deterministic
+        // fallback ordering and duplicate/override semantics, then enqueue
+        // the effective entries by dependency class.
         let mut root_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
 
         // 1. devDependencies (if enabled)
@@ -226,15 +260,46 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
-        for (install_name, (raw_spec, dep_type)) in root_deps {
-            self.queue.push_back(ResolveTask {
-                parent_location: String::new(),
-                parent_package_name: root_name.clone(),
-                install_name,
-                raw_spec,
-                dep_type,
-                ancestors: root_ancestors.clone(),
-            });
+        let mut queued = std::collections::HashSet::new();
+        let enqueue_root = |install_name: &str,
+                            this: &mut Solver<'a, P>,
+                            queued: &mut std::collections::HashSet<String>| {
+            if !queued.insert(install_name.to_string()) {
+                return;
+            }
+            if let Some((raw_spec, dep_type)) = root_deps.get(install_name).cloned() {
+                this.push_task(ResolveTask {
+                    parent_location: String::new(),
+                    parent_package_name: root_name.clone(),
+                    install_name: install_name.to_string(),
+                    raw_spec,
+                    dep_type,
+                    dev_path: dep_type == DependencyType::Dev,
+                    ancestors: root_ancestors.clone(),
+                });
+            }
+        };
+
+        // npm's Arborist normalizes dependency keys lexicographically before
+        // walking the root tree. Using the manifest's insertion order here
+        // lets an arbitrary package.json edit change which version claims a
+        // shared hoisted slot.
+        for install_name in root_manifest.dependencies.keys() {
+            enqueue_root(install_name, &mut self, &mut queued);
+        }
+        for install_name in root_manifest.optional_dependencies.keys() {
+            enqueue_root(install_name, &mut self, &mut queued);
+        }
+        if !self.options.legacy_peer_deps {
+            for install_name in root_manifest.peer_dependencies.keys() {
+                enqueue_root(install_name, &mut self, &mut queued);
+            }
+        }
+        for install_name in root_manifest.dev_dependencies.keys() {
+            enqueue_root(install_name, &mut self, &mut queued);
+        }
+        for install_name in root_deps.keys() {
+            enqueue_root(install_name, &mut self, &mut queued);
         }
 
         // Process resolution queue
@@ -242,6 +307,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             self.process_task(task)?;
         }
 
+        self.graph.normalize_dependency_flags();
         Ok(self.graph)
     }
 
@@ -310,6 +376,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // 3. Check for cyclic peer dependencies and existing peer instances
         let is_peer = task.dep_type == DependencyType::Peer
             || task.dep_type == DependencyType::PeerOptional;
+        if is_peer
+            && self
+                .queue
+                .iter()
+                .any(|queued| {
+                    queued.parent_location.is_empty()
+                        && (queued.install_name == task.install_name
+                            || queued.install_name == dep_spec.package_name)
+                })
+        {
+            // A depth-first subtree can encounter a peer before the root's
+            // direct dependency that is meant to satisfy it.  Defer that
+            // peer until the pending root task has been resolved so strict
+            // diagnostics and alias satisfaction see the same visible node
+            // npm would use.
+            self.queue.push_back(task);
+            return Ok(());
+        }
         if is_peer {
             let dep_alias = if task.install_name != dep_spec.package_name {
                 Some(task.install_name.as_str())
@@ -527,16 +611,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             chosen_version.cpu.as_deref(),
             chosen_version.libc.as_deref(),
         );
-        if !compatible {
-            if task.dep_type == DependencyType::Optional {
-                debug!(
-                    "Optional package '{}@{}' filtered out by platform ({:?})",
-                    dep_spec.package_name, chosen_version.version, self.options.platform
-                );
-                self.graph.skipped.insert(dep_spec.package_name.clone());
-                self.graph.skipped.insert(task.install_name.clone());
-                return Ok(());
-            } else {
+        let platform_skipped = !compatible && task.dep_type == DependencyType::Optional;
+        if !compatible && !platform_skipped {
                 let wanted = format!(
                     "os: {:?}, cpu: {:?}, libc: {:?}",
                     chosen_version.os.as_deref().unwrap_or(&[]),
@@ -557,17 +633,30 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     (*task.ancestors).clone(),
                     format!("Package '{}@{}' is incompatible with the current platform", dep_spec.package_name, chosen_version.version),
                 ));
-            }
+        }
+        if platform_skipped {
+            debug!(
+                "Optional package '{}@{}' retained in lockfile but skipped on platform ({:?})",
+                dep_spec.package_name, chosen_version.version, self.options.platform
+            );
         }
 
         // 6. Hoisting & Tree Placement
-        let placement = determine_placement(
+        let placement = determine_placement_with_peers(
             &self.graph,
             &task.parent_location,
             &dep_spec.install_name,
             &dep_spec.package_name,
             &dep_spec.target,
+            &chosen_version.peer_dependencies,
+            &chosen_version.peer_dependencies_meta,
         );
+        let parent_skipped = self
+            .graph
+            .nodes
+            .get(&task.parent_location)
+            .map(|node| node.flags.skipped)
+            .unwrap_or(false);
 
         match placement {
             PlacementDecision::Reuse(existing_loc) => {
@@ -575,6 +664,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     "Deduplicated '{}': reusing existing node at '{}'",
                     dep_spec.install_name, existing_loc
                 );
+                if parent_skipped {
+                    if let Some(existing) = self.graph.nodes.get_mut(&existing_loc) {
+                        existing.flags.skipped = true;
+                    }
+                    self.graph.skipped.insert(dep_spec.package_name.clone());
+                    self.graph.skipped.insert(task.install_name.clone());
+                }
                 self.graph.edges.push(DependencyEdge {
                     from_location: task.parent_location,
                     to_location: existing_loc,
@@ -599,7 +695,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     peer: is_peer,
                     bundled: false,
                     has_install_script: chosen_version.has_install_script,
-                    skipped: false,
+                    skipped: platform_skipped || parent_skipped,
                     link: false,
                 };
 
@@ -622,10 +718,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     cpu: chosen_version.cpu.clone(),
                     libc: chosen_version.libc.clone(),
                     bin: chosen_version.bin.clone(),
-                    extra: BTreeMap::new(),
+                    license: chosen_version.license.clone(),
+                    engines: chosen_version.engines.clone(),
+                    extra: {
+                        let mut extra = chosen_version.extra.clone();
+                        if let Some(deprecated) = &chosen_version.deprecated {
+                            extra.insert("deprecated".to_string(), serde_json::Value::String(deprecated.clone()));
+                        }
+                        extra
+                    },
                 };
 
                 self.graph.nodes.insert(target_loc.clone(), node);
+
+                if platform_skipped || parent_skipped {
+                    self.graph.skipped.insert(dep_spec.package_name.clone());
+                    self.graph.skipped.insert(task.install_name.clone());
+                }
 
                 self.graph.edges.push(DependencyEdge {
                     from_location: task.parent_location,
@@ -636,7 +745,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     dep_type: task.dep_type,
                 });
 
-                // Enqueue child dependencies with Arc ancestors to avoid vector clones
+                // Enqueue child dependencies with Arc ancestors to avoid vector clones.
+                // A platform-skipped optional package is retained as a lockfile
+                // record together with its dependency metadata. Descendants inherit
+                // optional/skipped reachability and therefore remain out of the
+                // physical install while preserving cross-platform lockfile parity.
+
                 let mut child_ancestors = (*task.ancestors).clone();
                 child_ancestors.push(dep_spec.package_name.clone());
                 let child_ancestors = std::sync::Arc::new(child_ancestors);
@@ -671,15 +785,28 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                 }
 
-                for (c_name, (c_spec, c_type)) in child_deps {
-                    self.queue.push_back(ResolveTask {
+                // npm's Arborist walks package dependency names in sorted
+                // order.  Registry packuments preserve insertion order, but
+                // using that order here changes which compatible version wins
+                // a shared hoisted slot (for example Express's `ms`).  The
+                // BTreeMap keeps traversal deterministic and matches npm's
+                // lockfile dependency ordering.
+                let child_tasks = child_deps.into_iter().map(|(c_name, (c_spec, c_type))| ResolveTask {
                         parent_location: target_loc.clone(),
                         parent_package_name: dep_spec.package_name.clone(),
                         install_name: c_name,
                         raw_spec: c_spec,
                         dep_type: c_type,
+                        dev_path: task.dev_path || c_type == DependencyType::Dev,
                         ancestors: child_ancestors.clone(),
-                    });
+                    }).collect::<Vec<_>>();
+                // Keep a package's direct dependencies ahead of their
+                // descendants. This matches Arborist's breadth-first
+                // placement pass and lets a later direct dependency claim a
+                // compatible root slot before an earlier sibling's nested
+                // subtree is expanded.
+                for child_task in child_tasks {
+                    self.push_task(child_task);
                 }
             }
         }
@@ -714,6 +841,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 meta.versions.get(tagged_version)
             }
             PackageTarget::Range(range) => {
+                // npm resolves registry ranges through the `latest` dist-tag
+                // when that tagged version satisfies the requested range. This
+                // matters when a registry intentionally keeps a newer version
+                // outside the default channel or leaves `latest` on an older
+                // compatible release.
+                if let Some(latest_version) = meta.dist_tags.get("latest") {
+                    if let Some(latest) = meta.versions.get(latest_version) {
+                        if Version::parse(&latest.version).ok().is_some_and(|v| range.satisfies(&v)) {
+                            return Some(latest);
+                        }
+                    }
+                }
                 let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {

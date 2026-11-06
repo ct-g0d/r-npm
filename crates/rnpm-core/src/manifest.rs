@@ -115,17 +115,33 @@ pub struct Manifest {
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
 
+    /// Dependency key order as it appeared in package.json. npm's resolver
+    /// uses manifest order when deciding which compatible package claims a
+    /// shared hoisted slot; the sorted maps above remain the canonical data
+    /// representation for deterministic serialization.
+    #[serde(skip)]
+    pub dependency_order: Vec<String>,
+
     #[serde(default)]
     pub dev_dependencies: BTreeMap<String, String>,
 
+    #[serde(skip)]
+    pub dev_dependency_order: Vec<String>,
+
     #[serde(default)]
     pub peer_dependencies: BTreeMap<String, String>,
+
+    #[serde(skip)]
+    pub peer_dependency_order: Vec<String>,
 
     #[serde(default)]
     pub peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
 
     #[serde(default)]
     pub optional_dependencies: BTreeMap<String, String>,
+
+    #[serde(skip)]
+    pub optional_dependency_order: Vec<String>,
 
     #[serde(default, alias = "bundleDependencies")]
     pub bundled_dependencies: Option<BundledDependencies>,
@@ -159,21 +175,35 @@ impl Manifest {
             bytes
         };
 
-        serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
+        let mut manifest: Self = serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
             message: err.to_string(),
             line: err.line(),
             column: err.column(),
-        })
+        })?;
+        let value: serde_json::Value = serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
+            message: err.to_string(),
+            line: err.line(),
+            column: err.column(),
+        })?;
+        manifest.capture_dependency_order(&value);
+        Ok(manifest)
     }
 
     /// Parse manifest from string, with tolerance for UTF-8 BOM.
     pub fn from_str(s: &str) -> Result<Self, ManifestError> {
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
-        serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+        let mut manifest: Self = serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
             message: err.to_string(),
             line: err.line(),
             column: err.column(),
-        })
+        })?;
+        let value: serde_json::Value = serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+            message: err.to_string(),
+            line: err.line(),
+            column: err.column(),
+        })?;
+        manifest.capture_dependency_order(&value);
+        Ok(manifest)
     }
 
     /// Read and parse a package.json file from disk.
@@ -184,6 +214,21 @@ impl Manifest {
             source: err,
         })?;
         Self::from_slice(&bytes)
+    }
+
+    fn capture_dependency_order(&mut self, value: &serde_json::Value) {
+        let Some(object) = value.as_object() else { return };
+        let collect = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_object)
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        self.dependency_order = collect("dependencies");
+        self.dev_dependency_order = collect("devDependencies");
+        self.peer_dependency_order = collect("peerDependencies");
+        self.optional_dependency_order = collect("optionalDependencies");
     }
 
     /// Returns list of (binary_name, script_path) defined in manifest.

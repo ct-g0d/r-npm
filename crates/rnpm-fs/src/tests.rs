@@ -54,6 +54,17 @@ fn test_safe_tarball_extraction_and_package_prefix_stripping() {
 
     let pkg_content = fs::read_to_string(dest.join("package.json")).unwrap();
     assert!(pkg_content.contains("test-pkg"));
+
+    // Published tarballs may use a generated top-level folder instead of
+    // npm's conventional `package/` name. npm still strips that one folder.
+    let generated_dest = dir.path().join("generated");
+    let generated_tar = create_test_tarball(&[
+        ("mscdex-busboy-9aadb7a/package.json", br#"{"name":"busboy","version":"1.0.0"}"#, 0o644),
+        ("mscdex-busboy-9aadb7a/index.js", b"module.exports = {}", 0o644),
+    ]);
+    extract_tar_gz(Cursor::new(&generated_tar), &generated_dest, None).unwrap();
+    assert!(generated_dest.join("package.json").exists());
+    assert!(generated_dest.join("index.js").exists());
 }
 
 #[test]

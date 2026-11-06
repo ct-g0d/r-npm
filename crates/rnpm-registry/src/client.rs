@@ -57,8 +57,12 @@ pub const DEFAULT_MAX_RETRY_BACKOFF_SECS: u64 = 5;
 /// Default maximum package size allowed for tarball downloads (512 MB).
 pub const DEFAULT_MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
 
-/// Default maximum metadata size allowed for packument JSON (16 MB).
-pub const DEFAULT_MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
+/// Default maximum metadata size allowed for packument JSON (64 MB).
+///
+/// Large real-world packuments such as Next.js exceed 16 MB. Keep a bounded
+/// streaming limit for denial-of-service protection while matching npm's
+/// ability to consume large registry metadata documents.
+pub const DEFAULT_MAX_METADATA_SIZE: usize = 64 * 1024 * 1024;
 
 /// Default chunk idle timeout for streaming sockets (10 seconds).
 pub const DEFAULT_CHUNK_IDLE_TIMEOUT_SECS: u64 = 10;
@@ -1456,6 +1460,44 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
+        self.get_package_metadata_from_url_conditional_with_accept(
+            package_name,
+            url,
+            if_none_match,
+            NPM_INSTALL_V1_JSON,
+        ).await
+    }
+
+    /// Fetch the full npm packument when lockfile metadata omitted by the
+    /// abbreviated install representation is required (license/libc/etc.).
+    pub async fn get_package_metadata_full(
+        &self,
+        package_name: &str,
+    ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        match self
+            .get_package_metadata_from_url_conditional_with_accept(
+                package_name,
+                url,
+                None,
+                "application/json",
+            )
+            .await?
+        {
+            MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
+            MetadataFetchResult::NotModified { .. } => Err(RegistryError::Other(
+                "Unexpected 304 Not Modified response for full metadata request".into(),
+            )),
+        }
+    }
+
+    async fn get_package_metadata_from_url_conditional_with_accept(
+        &self,
+        package_name: &str,
+        url: Url,
+        if_none_match: Option<&str>,
+        accept_header: &str,
+    ) -> Result<MetadataFetchResult, RegistryError> {
         let host_key = if let Some(port) = url.port() {
             format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
@@ -1468,7 +1510,7 @@ impl RegistryClient {
             .execute_with_permit(
                 Method::GET,
                 url.clone(),
-                Some(NPM_INSTALL_V1_JSON),
+                Some(accept_header),
                 if_none_match,
             )
             .await?;
@@ -2477,6 +2519,358 @@ impl RegistryClient {
             })
         }
     }
+
+    /// Perform npm's legacy/basic login exchange and return the registry response.
+    pub async fn login_legacy(
+        &self,
+        registry: Option<&Url>,
+        username: &str,
+        password: &str,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
+        validate_admin_token(username)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/user/org.couchdb.user:{}", reg_url.as_str().trim_end_matches('/'), username))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(
+            Method::PUT,
+            target,
+            Some(serde_json::json!({
+                "_id": format!("org.couchdb.user:{username}"),
+                "name": username,
+                "password": password,
+                "type": "user",
+                "roles": [],
+            })),
+            otp,
+        ).await
+    }
+
+    /// List dist-tags for a package using npm's registry administration API.
+    pub async fn dist_tags(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/dist-tags", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// Add or replace one dist-tag.
+    pub async fn dist_tag_add(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        tag: &str,
+        version: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        validate_admin_token(tag)?;
+        validate_admin_token(version)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/dist-tags/{}", reg_url.as_str().trim_end_matches('/'), encoded, tag))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!(version)), otp).await?;
+        Ok(())
+    }
+
+    /// Remove one dist-tag.
+    pub async fn dist_tag_remove(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        tag: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        validate_admin_token(tag)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/dist-tags/{}", reg_url.as_str().trim_end_matches('/'), encoded, tag))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        Ok(())
+    }
+
+    /// List package owners/collaborators.
+    pub async fn package_owners(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/collaborators?format=cli", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// Add a package owner/collaborator.
+    pub async fn package_owner_add(&self, registry: Option<&Url>, package_name: &str, user: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        validate_admin_token(user)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/collaborators/{}", reg_url.as_str().trim_end_matches('/'), encoded, user))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({})), otp).await?;
+        Ok(())
+    }
+
+    /// Remove a package owner/collaborator.
+    pub async fn package_owner_remove(&self, registry: Option<&Url>, package_name: &str, user: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        validate_admin_token(user)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/collaborators/{}", reg_url.as_str().trim_end_matches('/'), encoded, user))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        Ok(())
+    }
+
+    /// Unpublish a package or one version.
+    pub async fn unpublish(&self, registry: Option<&Url>, package_name: &str, version: Option<&str>, otp: Option<&str>) -> Result<(), RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let suffix = version.map(|v| format!("/{}", v)).unwrap_or_default();
+        if let Some(v) = version { validate_admin_token(v)?; }
+        let target = Url::parse(&format!("{}/{encoded}{suffix}", reg_url.as_str().trim_end_matches('/')))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        Ok(())
+    }
+
+    /// Set or clear a deprecation message on one version.
+    pub async fn deprecate(&self, registry: Option<&Url>, package_name: &str, version: &str, message: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        validate_admin_token(version)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let package_url = Url::parse(&format!("{}/{}", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        let mut document = self.admin_json_request(Method::GET, package_url.clone(), None, None).await?;
+        let versions = document.get_mut("versions").and_then(|v| v.as_object_mut())
+            .ok_or_else(|| RegistryError::MalformedMetadata("registry package response has no versions object".into()))?;
+        let version_doc = versions.get_mut(version)
+            .ok_or_else(|| RegistryError::ServerError { status: 404, body: format!("version {version} not found") })?;
+        if message.is_empty() {
+            if let Some(obj) = version_doc.as_object_mut() { obj.remove("deprecated"); }
+        } else if let Some(obj) = version_doc.as_object_mut() {
+            obj.insert("deprecated".into(), serde_json::Value::String(message.into()));
+        }
+        self.admin_json_request(Method::PUT, package_url, Some(document), otp).await?;
+        Ok(())
+    }
+
+    /// Read or change a package's access level.
+    pub async fn package_access(&self, registry: Option<&Url>, package_name: &str, access: Option<&str>, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/access", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        match access {
+            Some(level) if level == "public" || level == "restricted" => {
+                self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"access": level})), otp).await
+            }
+            Some(_) => Err(RegistryError::MalformedMetadata("access must be public or restricted".into())),
+            None => self.admin_json_request(Method::GET, target, None, None).await,
+        }
+    }
+
+    /// Star a package for the authenticated user using npm's package document API.
+    pub async fn star_package(&self, registry: Option<&Url>, package_name: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        self.update_package_star(registry, package_name, true, otp).await
+    }
+
+    /// Remove a package star for the authenticated user.
+    pub async fn unstar_package(&self, registry: Option<&Url>, package_name: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        self.update_package_star(registry, package_name, false, otp).await
+    }
+
+    async fn update_package_star(&self, registry: Option<&Url>, package_name: &str, starred: bool, otp: Option<&str>) -> Result<(), RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let package_url = Url::parse(&format!("{}/{}", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        let username = self.whoami(Some(reg_url)).await?;
+        let mut document = self.admin_json_request(Method::GET, package_url.clone(), None, None).await?;
+        let users = document.as_object_mut()
+            .ok_or_else(|| RegistryError::MalformedMetadata("package response is not an object".into()))?
+            .entry("users")
+            .or_insert_with(|| serde_json::json!({}));
+        let users = users.as_object_mut()
+            .ok_or_else(|| RegistryError::MalformedMetadata("package users field is not an object".into()))?;
+        if starred { users.insert(username, serde_json::Value::Bool(true)); }
+        else { users.remove(&username); }
+        self.admin_json_request(Method::PUT, package_url, Some(document), otp).await?;
+        Ok(())
+    }
+
+    /// List packages starred by a user using npm's CouchDB starredByUser view.
+    pub async fn starred_packages(&self, registry: Option<&Url>, user: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let username = match user {
+            Some(user) => { validate_admin_token(user)?; user.to_string() },
+            None => self.whoami(Some(reg_url)).await?,
+        };
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("key", &format!("\"{username}\""));
+        let target = Url::parse(&format!("{}/-/_view/starredByUser?{}", reg_url.as_str().trim_end_matches('/'), query.finish()))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// Retrieve the authenticated user's npm profile.
+    pub async fn profile_get(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/npm/v1/user", reg_url.as_str().trim_end_matches('/')))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// Update selected fields in the authenticated user's npm profile.
+    pub async fn profile_set(&self, registry: Option<&Url>, profile: serde_json::Value, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let target = Url::parse(&format!("{}/-/npm/v1/user", reg_url.as_str().trim_end_matches('/')))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, Some(profile), otp).await
+    }
+
+    /// List organization members or change one member's role.
+    pub async fn org_members(&self, registry: Option<&Url>, org: &str) -> Result<serde_json::Value, RegistryError> {
+        let target = self.org_url(registry, org, "user")?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    pub async fn org_member_set(&self, registry: Option<&Url>, org: &str, user: &str, role: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        let target = self.org_url(registry, org, "user")?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"user": user, "role": role})), None).await
+    }
+
+    pub async fn org_member_remove(&self, registry: Option<&Url>, org: &str, user: &str) -> Result<(), RegistryError> {
+        let target = self.org_url(registry, org, "user")?;
+        self.admin_json_request(Method::DELETE, target, Some(serde_json::json!({"user": user})), None).await?;
+        Ok(())
+    }
+
+    pub async fn team_create(&self, registry: Option<&Url>, scope: &str, team: &str, description: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+        let target = self.org_url(registry, scope, "team")?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"name": team, "description": description})), None).await
+    }
+
+    pub async fn team_destroy(&self, registry: Option<&Url>, scope: &str, team: &str) -> Result<(), RegistryError> {
+        let target = self.team_url(registry, scope, team, "")?;
+        self.admin_json_request(Method::DELETE, target, None, None).await?;
+        Ok(())
+    }
+
+    pub async fn team_users(&self, registry: Option<&Url>, scope: &str, team: &str) -> Result<serde_json::Value, RegistryError> {
+        let target = self.team_url(registry, scope, team, "user")?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    pub async fn teams(&self, registry: Option<&Url>, scope: &str) -> Result<serde_json::Value, RegistryError> {
+        let target = self.org_url(registry, scope, "team")?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    pub async fn team_add_user(&self, registry: Option<&Url>, scope: &str, team: &str, user: &str) -> Result<serde_json::Value, RegistryError> {
+        let target = self.team_url(registry, scope, team, "user")?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"user": user})), None).await
+    }
+
+    pub async fn team_remove_user(&self, registry: Option<&Url>, scope: &str, team: &str, user: &str) -> Result<(), RegistryError> {
+        let target = self.team_url(registry, scope, team, "user")?;
+        self.admin_json_request(Method::DELETE, target, Some(serde_json::json!({"user": user})), None).await?;
+        Ok(())
+    }
+
+    fn org_url(&self, registry: Option<&Url>, org: &str, resource: &str) -> Result<Url, RegistryError> {
+        validate_admin_token(org)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        Url::parse(&format!("{}/-/org/{}/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(org.trim_start_matches('@')), resource))
+            .map_err(RegistryError::UrlParse)
+    }
+
+    fn team_url(&self, registry: Option<&Url>, scope: &str, team: &str, resource: &str) -> Result<Url, RegistryError> {
+        validate_admin_token(scope)?;
+        validate_admin_token(team)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let suffix = if resource.is_empty() { String::new() } else { format!("/{resource}") };
+        Url::parse(&format!("{}/-/team/{}/{}{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(scope.trim_start_matches('@')), encode_path_segment(team), suffix))
+            .map_err(RegistryError::UrlParse)
+    }
+
+    /// Search the registry using npm's search API.
+    pub async fn search(&self, registry: Option<&Url>, text: &str, size: usize, from: usize) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("text", text);
+        query.append_pair("size", &size.to_string());
+        query.append_pair("from", &from.to_string());
+        let target = Url::parse(&format!("{}/-/v1/search?{}", reg_url.as_str().trim_end_matches('/'), query.finish()))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// List trusted publishing relationships for a package.
+    pub async fn trust_list(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/trust", reg_url.as_str().trim_end_matches('/'), encoded))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None).await
+    }
+
+    /// Revoke one trusted publishing relationship by its registry id.
+    pub async fn trust_revoke(&self, registry: Option<&Url>, package_name: &str, trust_id: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+        validate_admin_token(trust_id)?;
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let encoded = encode_package_name(package_name);
+        let target = Url::parse(&format!("{}/-/package/{}/trust/{}", reg_url.as_str().trim_end_matches('/'), encoded, encode_path_segment(trust_id)))
+            .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        Ok(())
+    }
+
+    async fn admin_json_request(
+        &self,
+        method: Method,
+        target: Url,
+        body: Option<serde_json::Value>,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
+        let result = if let Some(body) = body {
+            self.execute_with_body_permit(
+                method,
+                target.clone(),
+                Some("application/json"),
+                Some("application/json"),
+                otp,
+                serde_json::to_vec(&body)?,
+            ).await?
+        } else {
+            self.execute_with_permit(method, target.clone(), Some("application/json"), None).await?
+        };
+        let (response, _permit) = result;
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::UNAUTHORIZED => RegistryError::Unauthorized { url: target.to_string(), status: 401, message: body_text },
+                StatusCode::FORBIDDEN => RegistryError::Forbidden { url: target.to_string(), status: 403, message: body_text },
+                _ => RegistryError::ServerError { status: status.as_u16(), body: body_text },
+            });
+        }
+        if body_text.trim().is_empty() { return Ok(serde_json::Value::Null); }
+        serde_json::from_str(&body_text).map_err(|e| RegistryError::MalformedMetadata(format!("Invalid registry JSON response: {e}")))
+    }
+}
+
+fn validate_admin_token(value: &str) -> Result<(), RegistryError> {
+    if value.is_empty() || value.contains('\r') || value.contains('\n') || value.contains('/') || value.contains('\\') {
+        return Err(RegistryError::SecurityViolation("registry administration argument contains forbidden characters".into()));
+    }
+    Ok(())
+}
+
+fn encode_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
 #[cfg(test)]

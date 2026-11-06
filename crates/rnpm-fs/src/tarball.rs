@@ -88,7 +88,7 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-/// Extract a .tar.gz stream into destination, stripping the standard "package/" prefix
+/// Extract a .tar.gz stream into destination, stripping the archive's first root component
 /// and enforcing all security and tar-bomb defenses.
 pub fn extract_tar_gz<R: Read>(
     reader: R,
@@ -183,7 +183,7 @@ pub fn extract_tar_gz<R: Read>(
         // Security check raw path before stripping prefix
         validate_entry_path(&raw_path)?;
 
-        // Strip standard "package/" prefix
+        // Strip the archive root component (usually "package/").
         let relative_path = match strip_package_prefix(&raw_path) {
             Some(p) => p,
             None => {
@@ -800,9 +800,13 @@ pub fn ensure_no_symlink_ancestors(
     Ok(())
 }
 
-/// Strips the standard "package/" prefix from tar entry path.
-/// Handles leading "./" components (e.g. "./package/index.js").
-/// If path is exactly "package" or "./package", returns None.
+/// Strips the first archive-root component from a tar entry path.
+///
+/// npm packages are normally packed below `package/`, but published tarballs
+/// also use generated roots such as `mscdex-busboy-<sha>/`. npm strips one
+/// component regardless of its name, so extraction must do the same. Leading
+/// `./` components are ignored; a path consisting only of the root component
+/// returns `None` because it has no extracted payload.
 pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
     let mut components = path.components().peekable();
     while let Some(Component::CurDir) = components.peek() {
@@ -810,17 +814,16 @@ pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
     }
 
     let first = components.next()?;
-    if let Component::Normal(os_str) = first {
-        if os_str.to_string_lossy().eq_ignore_ascii_case("package") {
-            let remainder: PathBuf = components.collect();
-            if remainder.as_os_str().is_empty() {
-                return None;
-            }
-            return Some(remainder);
+    if matches!(first, Component::Normal(_)) {
+        let remainder: PathBuf = components.collect();
+        if remainder.as_os_str().is_empty() {
+            return None;
         }
+        return Some(remainder);
     }
 
-    // Tarballs without package/ prefix are returned as is
+    // Preserve paths beginning with a parent/prefix component. They are
+    // validated by the caller and must not be normalized before validation.
     Some(path.to_path_buf())
 }
 

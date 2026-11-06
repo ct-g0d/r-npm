@@ -834,6 +834,14 @@ pub(crate) enum Commands {
         /// Auth type
         #[arg(long)]
         auth_type: Option<String>,
+
+        /// Scope whose registry should receive the credentials
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// One-time password for legacy/basic authentication
+        #[arg(long)]
+        otp: Option<String>,
     },
 
     /// Log out of a registry
@@ -859,6 +867,161 @@ pub(crate) enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+
+    /// Manage lifecycle script approval policy.
+    ApproveScripts {
+        packages: Vec<String>,
+        #[arg(short = 'a', long)] all: bool,
+        #[arg(long = "allow-scripts-pending")] allow_scripts_pending: bool,
+        #[arg(long)] json: bool,
+    },
+    /// Remove lifecycle script approval entries.
+    DenyScripts {
+        packages: Vec<String>,
+        #[arg(short = 'a', long)] all: bool,
+        #[arg(long = "allow-scripts-pending")] allow_scripts_pending: bool,
+        #[arg(long)] json: bool,
+    },
+    /// Generate shell completion scripts.
+    Completion { shell: Option<String> },
+    /// Manage package distribution tags.
+    #[command(alias = "dist-tags")]
+    DistTag {
+        #[command(subcommand)]
+        action: DistTagAction,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        otp: Option<String>,
+    },
+    /// Manage package owners/collaborators.
+    #[command(alias = "author")]
+    Owner {
+        #[command(subcommand)]
+        action: OwnerAction,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        otp: Option<String>,
+    },
+    /// Remove a package or package version from a registry.
+    Unpublish {
+        package: Option<String>,
+        version: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        otp: Option<String>,
+    },
+    /// Mark package versions as deprecated.
+    Deprecate {
+        package: String,
+        message: String,
+        #[arg(long)]
+        otp: Option<String>,
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Remove a package deprecation notice.
+    Undeprecate {
+        package: String,
+        version: Option<String>,
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Manage package access control.
+    Access {
+        args: Vec<String>,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        otp: Option<String>,
+    },
+    /// Manage npm profile information.
+    Profile { action: Option<String>, args: Vec<String>, #[arg(long)] otp: Option<String>, #[arg(long)] registry: Option<String>, #[arg(long)] json: bool, #[arg(short = 'p', long)] parseable: bool },
+    /// Manage npm organizations.
+    #[command(alias = "ogr")]
+    Org { action: Option<String>, args: Vec<String>, #[arg(long)] otp: Option<String>, #[arg(long)] registry: Option<String>, #[arg(long)] json: bool, #[arg(short = 'p', long)] parseable: bool },
+    /// Manage npm teams.
+    Team { action: Option<String>, args: Vec<String>, #[arg(long)] otp: Option<String>, #[arg(long)] description: Option<String>, #[arg(long)] registry: Option<String>, #[arg(long)] json: bool, #[arg(short = 'p', long)] parseable: bool },
+    /// Check the local npm/rnpm installation.
+    Doctor,
+    /// Show packages seeking funding.
+    Fund { package: Option<String>, #[arg(long)] json: bool },
+    /// Explain why a package is installed.
+    #[command(alias = "why")]
+    Explain { package: String, #[arg(long)] json: bool },
+    /// Search the registry.
+    #[command(alias = "find", alias = "s", alias = "se")]
+    Search { terms: Vec<String>, #[arg(long = "searchlimit", alias = "search-limit", default_value_t = 20)] search_limit: usize, #[arg(long)] json: bool, #[arg(short = 'p', long)] parseable: bool, #[arg(long = "no-description")] no_description: bool, #[arg(long)] registry: Option<String> },
+    /// Show packages starred by the current user.
+    Stars { user: Option<String>, #[arg(long)] json: bool, #[arg(long)] registry: Option<String> },
+    /// Star a package.
+    Star { packages: Vec<String>, #[arg(long)] registry: Option<String>, #[arg(long)] otp: Option<String>, #[arg(long = "no-unicode")] no_unicode: bool },
+    /// Unstar a package.
+    Unstar { packages: Vec<String>, #[arg(long)] registry: Option<String>, #[arg(long)] otp: Option<String>, #[arg(long = "no-unicode")] no_unicode: bool },
+    /// Repair installed dependencies.
+    Fix { #[arg(long)] force: bool, #[arg(long)] registry: Option<String> },
+    /// Show package bug tracker URL.
+    #[command(alias = "issues")]
+    Bugs { packages: Vec<String>, #[arg(long)] registry: Option<String> },
+    /// Open or print package documentation URL.
+    #[command(alias = "home")]
+    Docs { packages: Vec<String>, #[arg(long)] registry: Option<String> },
+    /// Edit a package in the configured editor.
+    Edit { package: String, #[arg(long)] editor: Option<String> },
+    /// Explore a package in a shell.
+    Explore { package: String, #[arg(long)] shell: Option<String> },
+    /// Search npm help topics.
+    HelpSearch { terms: Vec<String>, #[arg(short = 'l', long)] long: bool },
+    /// Install dependencies and run the CI test script.
+    #[command(alias = "cit", alias = "clean-install-test", alias = "sit")]
+    InstallCiTest { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    /// Install dependencies and run install scripts.
+    InstallScripts { action: Option<String>, packages: Vec<String>, #[arg(long)] all: bool, #[arg(long)] json: bool },
+    /// Install dependencies and run the test script.
+    InstallTest { #[arg(trailing_var_arg = true, allow_hyphen_values = true)] args: Vec<String> },
+    /// Create npm-shrinkwrap.json from package-lock.json.
+    Shrinkwrap,
+    /// Record package trust metadata.
+    Trust {
+        action: Option<String>,
+        args: Vec<String>,
+        #[arg(long)] registry: Option<String>,
+        #[arg(long)] id: Option<String>,
+        #[arg(long)] otp: Option<String>,
+        #[arg(short = 'y', long = "yes")] yes: bool,
+    },
+
+    /// Retrieve a configuration value (npm get alias)
+    Get {
+        /// Configuration key to retrieve
+        key: String,
+    },
+
+    /// Set a configuration value (npm set alias)
+    Set {
+        /// Configuration key to set
+        key: String,
+        /// Value to assign
+        value: String,
+        /// Set in global configuration
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
     },
 
     /// Manage npm configuration
@@ -912,6 +1075,28 @@ pub(crate) enum TokenAction {
     Revoke {
         token_id: String,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum DistTagAction {
+    /// List tags for a package.
+    Ls { package: Option<String> },
+    /// Add or replace a tag.
+    Add { package: String, tag: Option<String> },
+    /// Remove a tag.
+    #[command(alias = "remove")]
+    Rm { package: String, tag: String },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum OwnerAction {
+    /// List package owners.
+    Ls { package: String },
+    /// Add an owner.
+    Add { user: String, package: String },
+    /// Remove an owner.
+    #[command(alias = "remove")]
+    Rm { user: String, package: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1013,11 +1198,7 @@ where
 
     let first = &args[1];
 
-    let unsupported_commands = [
-        "team", "fix", "deprecate",
-        "access", "profile", "org", "doctor", "fund", "explain",
-        "search", "stars", "star", "unstar",
-    ];
+    let unsupported_commands: [&str; 0] = [];
 
     if unsupported_commands.contains(&first.as_str()) {
         return Some((
@@ -1557,7 +1738,11 @@ where
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "-ws" {
+        if i == 1 && arg == "-v" {
+            // npm accepts the lowercase short form as an alias for --version.
+            // clap's generated version flag is -V, so normalize it before parsing.
+            result.push("--version".to_string());
+        } else if arg == "-ws" {
             result.push("--workspaces".to_string());
         } else if let Some(rest) = arg.strip_prefix("-ws=") {
             result.push(format!("--workspaces={rest}"));
@@ -2062,6 +2247,8 @@ async fn execute_login(
     current_dir: &std::path::Path,
     registry: Option<String>,
     auth_type: Option<String>,
+    scope: Option<String>,
+    otp: Option<String>,
 ) -> anyhow::Result<()> {
     let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
@@ -2070,16 +2257,48 @@ async fn execute_login(
         config.npmrc.registry.clone()
     };
 
-    let host = registry_url.host_str().unwrap_or("registry.npmjs.org");
     let auth_str = auth_type.unwrap_or_else(|| "web".to_string());
+    let token = std::env::var("NPM_TOKEN").ok().filter(|v| !v.trim().is_empty());
+    let token = if let Some(token) = token {
+        token
+    } else if auth_str == "legacy" || auth_str == "basic" {
+        let username = std::env::var("NPM_USERNAME").ok().filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDAUTH\nnpm error set NPM_USERNAME for legacy login"))?;
+        let password = std::env::var("NPM_PASSWORD").ok().filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDAUTH\nnpm error set NPM_PASSWORD for legacy login"))?;
+        let mut client_config = rnpm_registry::RegistryClientConfig { default_registry: registry_url.clone(), ..Default::default() };
+        client_config.scoped_registries = config.npmrc.scoped_registries.clone();
+        let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+        let otp = otp.or_else(|| std::env::var("NPM_OTP").ok());
+        let response = client.login_legacy(Some(&registry_url), &username, &password, otp.as_deref()).await?;
+        response.get("token").and_then(|v| v.as_str()).map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("npm error code EAUTHUNKNOWN\nnpm error registry login response did not contain a token"))?
+    } else {
+        return Err(anyhow::anyhow!(
+            "npm error code ENEEDAUTH\nnpm error Set NPM_TOKEN to a registry token before running rnpm login"
+        ));
+    };
 
-    println!("rnpm: To log in to '{registry_url}' (auth-type: {auth_str}):");
-    println!("  1. Generate an authentication token in your npm/registry user account settings.");
-    println!("  2. Add the token to your .npmrc file:");
-    println!("     //{host}/:_authToken=<your_token>");
-    println!("  3. Alternatively, export the NPM_TOKEN environment variable in your terminal session.");
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+        .map_err(|_| anyhow::anyhow!("npm error code ENOENT\nnpm error Cannot determine the user home directory"))?;
+    let user_npmrc = PathBuf::from(home).join(".npmrc");
+    let key = auth_key_for_registry(&registry_url);
+    rnpm_config::set_config_value_in_file(&user_npmrc, &key, &token)?;
+    if let Some(scope) = scope {
+        let scope = if scope.starts_with('@') { scope } else { format!("@{scope}") };
+        rnpm_config::set_config_value_in_file(&user_npmrc, &format!("{scope}:registry"), registry_url.as_str())?;
+    }
+    let _ = current_dir;
+    println!("Logged in to {} using {} authentication", registry_url, auth_str);
 
     Ok(())
+}
+
+fn auth_key_for_registry(registry: &Url) -> String {
+    let host = registry.host_str().unwrap_or_default();
+    let port = registry.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = if registry.path().is_empty() { "/".to_string() } else { format!("{}/", registry.path().trim_end_matches('/')) };
+    format!("//{host}{port}{path}:_authToken")
 }
 
 async fn execute_logout(
@@ -2102,44 +2321,17 @@ async fn execute_logout(
     let user_home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok();
     let mut modified = false;
 
+    let auth_key = auth_key_for_registry(&registry_url);
     if let Some(home) = user_home {
         let user_npmrc = PathBuf::from(home).join(".npmrc");
         if user_npmrc.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&user_npmrc) {
-                let host = registry_url.host_str().unwrap_or("");
-                let mut new_lines = Vec::new();
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if !host.is_empty() && trimmed.contains(host) && trimmed.contains(":_authToken") {
-                        modified = true;
-                        continue;
-                    }
-                    new_lines.push(line);
-                }
-                if modified {
-                    let _ = std::fs::write(&user_npmrc, new_lines.join("\n"));
-                }
-            }
+            modified |= rnpm_config::delete_config_value_from_file(&user_npmrc, &auth_key).unwrap_or(false);
         }
     }
 
     let local_npmrc = current_dir.join(".npmrc");
     if local_npmrc.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&local_npmrc) {
-            let host = registry_url.host_str().unwrap_or("");
-            let mut new_lines = Vec::new();
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !host.is_empty() && trimmed.contains(host) && trimmed.contains(":_authToken") {
-                    modified = true;
-                    continue;
-                }
-                new_lines.push(line);
-            }
-            if modified {
-                let _ = std::fs::write(&local_npmrc, new_lines.join("\n"));
-            }
-        }
+        modified |= rnpm_config::delete_config_value_from_file(&local_npmrc, &auth_key).unwrap_or(false);
     }
 
     if modified {
@@ -2218,6 +2410,241 @@ async fn execute_token(
         }
     }
 
+    Ok(())
+}
+
+fn make_registry_client(current_dir: &Path, registry: Option<String>) -> anyhow::Result<(Url, rnpm_registry::RegistryClient)> {
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = match registry {
+        Some(value) => Url::parse(&value).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{value}': {e}"))?,
+        None => config.npmrc.registry.clone(),
+    };
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        ..Default::default()
+    };
+    if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+        client_config.auth_token = Some(token.to_string());
+    }
+    Ok((registry_url, rnpm_registry::RegistryClient::with_config(client_config)?))
+}
+
+async fn execute_dist_tag(current_dir: &Path, action: DistTagAction, registry: Option<String>, json: bool, otp: Option<String>) -> anyhow::Result<()> {
+    let (registry_url, client) = make_registry_client(current_dir, registry)?;
+    match action {
+        DistTagAction::Ls { package } => {
+            let package = package.unwrap_or(package_name_from_manifest(current_dir)?);
+            let value = client.dist_tags(Some(&registry_url), &package).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+            else if let Some(tags) = value.as_object() { for (tag, version) in tags { println!("{tag}: {version}"); } }
+            else { println!("{}", serde_json::to_string_pretty(&value)?); }
+        }
+        DistTagAction::Add { package, tag } => {
+            let (name, version) = split_package_version(&package)?;
+            let tag = tag.unwrap_or_else(|| "latest".to_string());
+            client.dist_tag_add(Some(&registry_url), name, &tag, version, otp.as_deref()).await?;
+            println!("+ {name}@{version} ({tag})");
+        }
+        DistTagAction::Rm { package, tag } => {
+            let name = package_name_from_spec(&package);
+            client.dist_tag_remove(Some(&registry_url), name, &tag, otp.as_deref()).await?;
+            println!("- {name} {tag}");
+        }
+    }
+    Ok(())
+}
+
+async fn execute_owner(current_dir: &Path, action: OwnerAction, registry: Option<String>, json: bool, otp: Option<String>) -> anyhow::Result<()> {
+    let (registry_url, client) = make_registry_client(current_dir, registry)?;
+    match action {
+        OwnerAction::Ls { package } => {
+            let value = client.package_owners(Some(&registry_url), &package).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+            else if let Some(map) = value.as_object() { for (name, role) in map { println!("{name}\t{}", role.as_str().unwrap_or("owner")); } }
+            else { println!("{}", serde_json::to_string_pretty(&value)?); }
+        }
+        OwnerAction::Add { user, package } => { client.package_owner_add(Some(&registry_url), &package, &user, otp.as_deref()).await?; println!("added {user} to {package}"); }
+        OwnerAction::Rm { user, package } => { client.package_owner_remove(Some(&registry_url), &package, &user, otp.as_deref()).await?; println!("removed {user} from {package}"); }
+    }
+    Ok(())
+}
+
+async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow::Result<()> {
+    match command {
+        Commands::Unpublish { package, version, force, dry_run, registry, otp } => {
+            let package = package.unwrap_or(package_name_from_manifest(current_dir)?);
+            if version.is_none() && !force { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Refusing to unpublish an entire package without --force")); }
+            if dry_run { println!("would remove {}{}", package, version.as_deref().map(|v| format!("@{v}")).unwrap_or_default()); return Ok(()); }
+            let (registry_url, client) = make_registry_client(current_dir, registry)?;
+            client.unpublish(Some(&registry_url), &package, version.as_deref(), otp.as_deref()).await?;
+            println!("- {}{}", package, version.as_deref().map(|v| format!("@{v}")).unwrap_or_default());
+        }
+        Commands::Deprecate { package, message, otp, registry } => {
+            let (name, version) = split_package_version(&package)?;
+            let (registry_url, client) = make_registry_client(current_dir, registry)?;
+            client.deprecate(Some(&registry_url), name, version, &message, otp.as_deref()).await?;
+            println!("deprecated {name}@{version}");
+        }
+        Commands::Undeprecate { package, version, registry } => {
+            let (name, parsed_version): (&str, String) = if let Some(version) = version { (package.as_str(), version) } else { let (name, version) = split_package_version(&package)?; (name, version.to_string()) };
+            let (registry_url, client) = make_registry_client(current_dir, registry)?;
+            client.deprecate(Some(&registry_url), name, &parsed_version, "", None).await?;
+            println!("undeprecated {name}@{parsed_version}");
+        }
+        Commands::Access { args, registry, json, otp } => {
+            let action = args.first().map(String::as_str).unwrap_or("get");
+            let package = args.last().filter(|value| !value.contains('=')).cloned()
+                .or_else(|| package_name_from_manifest(current_dir).ok())
+                .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error access requires a package name"))?;
+            let level = args.iter().find_map(|value| value.strip_prefix("status=")).or_else(|| {
+                args.get(1).map(String::as_str).filter(|value| *value == "public" || *value == "restricted")
+            }).or(match action { "public" | "restricted" => Some(action), _ => None });
+            let (registry_url, client) = make_registry_client(current_dir, registry)?;
+            let value = match action {
+                "public" | "restricted" => client.package_access(Some(&registry_url), &package, Some(action), otp.as_deref()).await?,
+                "get" | "set" if args.get(1).is_some_and(|value| value == "status" || value.starts_with("status=") || value == "public" || value == "restricted") => client.package_access(Some(&registry_url), &package, level, otp.as_deref()).await?,
+                "list" if args.get(1).is_some_and(|value| value == "collaborators") => client.package_owners(Some(&registry_url), &package).await?,
+                _ => return Err(anyhow::anyhow!("npm error code ENOTSUP\nnpm error this access operation is not supported by the configured registry")),
+            };
+            if json || level.is_none() { println!("{}", serde_json::to_string_pretty(&value)?); } else if let Some(level) = level { println!("{level}"); }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
+    let at = if let Some(stripped) = spec.strip_prefix('@') { stripped.rfind('@').map(|i| i + 1) } else { spec.rfind('@') };
+    let at = at.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error package must include a version (for example pkg@1.2.3)"))?;
+    let (name, version) = spec.split_at(at);
+    let version = version.strip_prefix('@').unwrap_or(version);
+    if name.is_empty() || version.is_empty() { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error invalid package version specifier")); }
+    Ok((name, version))
+}
+
+fn package_name_from_spec(spec: &str) -> &str {
+    if let Some(stripped) = spec.strip_prefix('@') {
+        stripped.rfind('@').map(|idx| &spec[..idx + 1]).unwrap_or(spec)
+    } else {
+        spec.split_once('@').map(|(name, _)| name).unwrap_or(spec)
+    }
+}
+
+fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
+    let path = current_dir.join("package.json");
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    value.get("name").and_then(|v| v.as_str()).map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a name"))
+}
+
+fn update_allow_scripts_policy(current_dir: &Path, packages: &[String], approved: bool, all: bool, json: bool) -> anyhow::Result<()> {
+    let path = current_dir.join("package.json");
+    let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let names: Vec<String> = if all { vec!["*".to_string()] } else { packages.to_vec() };
+    if names.is_empty() { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error specify at least one package or --all")); }
+    let policy = {
+        let map = document.as_object_mut().ok_or_else(|| anyhow::anyhow!("npm error code EJSONPARSE\nnpm error package.json must contain an object"))?;
+        let allow = map.entry("allowScripts").or_insert_with(|| serde_json::json!({}));
+        let allow = allow.as_object_mut().ok_or_else(|| anyhow::anyhow!("npm error code EJSONPARSE\nnpm error package.json allowScripts must be an object"))?;
+        for name in &names { allow.insert(name.clone(), serde_json::Value::Bool(approved)); }
+        serde_json::Value::Object(allow.clone())
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&document)? + "\n")?;
+    if json { println!("{}", serde_json::json!({"allowScripts": policy})); }
+    else { println!("{} {} lifecycle scripts", if approved { "approved" } else { "denied" }, names.join(",")); }
+    Ok(())
+}
+
+fn split_team_entity(entity: &str) -> anyhow::Result<(&str, &str)> {
+    let entity = entity.trim_start_matches('@');
+    entity.split_once(':').ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team entity must use <scope:team> format"))
+}
+
+async fn execute_profile(current_dir: &Path, action: Option<String>, args: Vec<String>, registry: Option<String>, json: bool, otp: Option<String>, _parseable: bool) -> anyhow::Result<()> {
+    let (registry_url, client) = make_registry_client(current_dir, registry)?;
+    match action.as_deref().unwrap_or("get") {
+        "get" => {
+            let value = client.profile_get(Some(&registry_url)).await?;
+            if let Some(key) = args.first() {
+                let selected = value.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                if json { println!("{}", serde_json::to_string_pretty(&selected)?); } else { println!("{}", selected.as_str().map(str::to_owned).unwrap_or_else(|| selected.to_string())); }
+                return Ok(());
+            }
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+            else if let Some(object) = value.as_object() { for (key, value) in object { let rendered = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string()); println!("{key}: {rendered}"); } }
+            else { println!("{}", value); }
+        }
+        "set" => {
+            if args.len() < 2 { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error profile set <property> <value>")); }
+            let value = client.profile_set(Some(&registry_url), serde_json::json!({args[0].clone(): args[1..].join(" ")}), otp.as_deref()).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); } else { println!("profile updated"); }
+        }
+        "enable-2fa" | "disable-2fa" => return Err(anyhow::anyhow!("npm error code ENOTSUP\nnpm error profile action is not supported by this registry")),
+        other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Unknown profile command: {other}")),
+    }
+    Ok(())
+}
+
+async fn execute_org(current_dir: &Path, action: Option<String>, args: Vec<String>, registry: Option<String>, json: bool, _parseable: bool) -> anyhow::Result<()> {
+    let (registry_url, client) = make_registry_client(current_dir, registry)?;
+    let action = action.as_deref().unwrap_or("ls");
+    let value = match action {
+        "ls" => {
+            let org = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org ls <org>"))?;
+            client.org_members(Some(&registry_url), org).await?
+        }
+        "add" | "set" => {
+            let org = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org add <org> <user> [developer|admin]"))?;
+            let user = args.get(1).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org add <org> <user> [developer|admin]"))?;
+            client.org_member_set(Some(&registry_url), org, user, args.get(2).map(String::as_str)).await?
+        }
+        "rm" | "remove" => {
+            let org = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org rm <org> <user>"))?;
+            let user = args.get(1).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org rm <org> <user>"))?;
+            client.org_member_remove(Some(&registry_url), org, user).await?;
+            serde_json::Value::Null
+        }
+        other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Unknown org command: {other}")),
+    };
+    if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+    else if let Some(object) = value.as_object() { for (user, role) in object { println!("{user}\t{}", role.as_str().unwrap_or("member")); } }
+    else { println!("{}", serde_json::to_string_pretty(&value)?); }
+    Ok(())
+}
+
+async fn execute_team(current_dir: &Path, action: Option<String>, args: Vec<String>, registry: Option<String>, json: bool, description: Option<String>, _parseable: bool) -> anyhow::Result<()> {
+    let (registry_url, client) = make_registry_client(current_dir, registry)?;
+    let action = action.as_deref().unwrap_or("ls");
+    let value = match action {
+        "create" => {
+            let entity = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>"))?;
+            let (scope, team) = split_team_entity(entity)?;
+            client.team_create(Some(&registry_url), scope, team, description.as_deref()).await?
+        }
+        "destroy" => {
+            let entity = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>"))?;
+            let (scope, team) = split_team_entity(entity)?;
+            client.team_destroy(Some(&registry_url), scope, team).await?;
+            serde_json::Value::Null
+        }
+        "add" | "rm" => {
+            let entity = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team {action} <scope:team> <user>"))?;
+            let user = args.get(1).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team {action} <scope:team> <user>"))?;
+            let (scope, team) = split_team_entity(entity)?;
+            if action == "add" { client.team_add_user(Some(&registry_url), scope, team, user).await? } else { client.team_remove_user(Some(&registry_url), scope, team, user).await?; serde_json::Value::Null }
+        }
+        "ls" => {
+            let entity = args.first().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>"))?;
+            if entity.contains(':') { let (scope, team) = split_team_entity(entity)?; client.team_users(Some(&registry_url), scope, team).await? }
+            else { client.teams(Some(&registry_url), entity).await? }
+        }
+        other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Unknown team command: {other}")),
+    };
+    if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+    else if let Some(array) = value.as_array() { for item in array { let rendered = item.as_str().map(str::to_owned).unwrap_or_else(|| item.to_string()); println!("{rendered}"); } }
+    else if !value.is_null() { println!("{}", serde_json::to_string_pretty(&value)?); }
     Ok(())
 }
 
@@ -3251,14 +3678,230 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Ping { registry, json } => {
             execute_ping(&current_dir, registry, json).await?;
         }
-        Commands::Login { registry, auth_type } => {
-            execute_login(&current_dir, registry, auth_type).await?;
+        Commands::Login { registry, auth_type, scope, otp } => {
+            execute_login(&current_dir, registry, auth_type, scope, otp).await?;
         }
         Commands::Logout { registry, scope } => {
             execute_logout(&current_dir, registry, scope).await?;
         }
         Commands::Token { action, registry, json } => {
             execute_token(&current_dir, action, registry, json).await?;
+        }
+        Commands::ApproveScripts { packages, all, allow_scripts_pending: _, json } => {
+            update_allow_scripts_policy(&current_dir, &packages, true, all, json)?;
+        }
+        Commands::DenyScripts { packages, all, allow_scripts_pending: _, json } => {
+            update_allow_scripts_policy(&current_dir, &packages, false, all, json)?;
+        }
+        Commands::Completion { shell } => {
+            const COMMANDS: &str = "install ci test start restart stop run exec pack uninstall update audit prune dedupe find-dupes rebuild pkg init create cache diff sbom version list outdated view query publish whoami ping login logout token approve-scripts deny-scripts completion dist-tag owner unpublish deprecate undeprecate access profile org team doctor fund explain search stars star unstar fix bugs docs edit explore help-search install-ci-test install-scripts install-test shrinkwrap trust config link unlink prefix root bin";
+            match shell.as_deref().unwrap_or("bash") {
+                "bash" => println!("complete -W '{COMMANDS}' rnpm"),
+                "zsh" => println!("#compdef rnpm\n_arguments '1:command:({COMMANDS})'"),
+                "fish" => println!("complete -c rnpm -f -a '{COMMANDS}'"),
+                "powershell" => {
+                    let quoted = COMMANDS.split_whitespace().map(|command| format!("'{command}'")).collect::<Vec<_>>().join(",");
+                    println!("Register-ArgumentCompleter -Native -CommandName rnpm -ScriptBlock {{ param($wordToComplete) {quoted} | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}");
+                }
+                other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error unsupported shell '{other}'")),
+            }
+        }
+        Commands::DistTag { action, registry, json, otp } => execute_dist_tag(&current_dir, action, registry, json, otp).await?,
+        Commands::Owner { action, registry, json, otp } => execute_owner(&current_dir, action, registry, json, otp).await?,
+        Commands::Unpublish { package, version, force, dry_run, registry, otp } => {
+            execute_package_admin(&current_dir, Commands::Unpublish { package, version, force, dry_run, registry, otp }).await?;
+        }
+        Commands::Deprecate { package, message, otp, registry } => {
+            execute_package_admin(&current_dir, Commands::Deprecate { package, message, otp, registry }).await?;
+        }
+        Commands::Undeprecate { package, version, registry } => {
+            execute_package_admin(&current_dir, Commands::Undeprecate { package, version, registry }).await?;
+        }
+        Commands::Access { args, registry, json, otp } => {
+            execute_package_admin(&current_dir, Commands::Access { args, registry, json, otp }).await?;
+        }
+        Commands::Search { terms, search_limit, json, parseable, no_description, registry } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            let text = terms.join(" ");
+            let value = client.search(Some(&registry_url), &text, search_limit, 0).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&value)?); }
+            else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
+                for item in objects {
+                    let p = item.get("package").unwrap_or(item);
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let version = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                    let description = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    if parseable {
+                        println!("{name}\t{version}\t{description}");
+                    } else if no_description {
+                        println!("{name}@{version}");
+                    } else {
+                        println!("{name}@{version}\t{description}");
+                    }
+                }
+            } else { println!("{}", serde_json::to_string_pretty(&value)?); }
+        }
+        Commands::Stars { user, json, registry } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            let value = client.starred_packages(Some(&registry_url), user.as_deref()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if let Some(packages) = value.as_array() {
+                for package in packages {
+                    if let Some(name) = package.as_str() {
+                        println!("{name}");
+                    } else if let Some(name) = package.get("name").and_then(|v| v.as_str()) {
+                        println!("{name}");
+                    }
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+        }
+        Commands::Star { packages, registry, otp, no_unicode: _ } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            if packages.is_empty() { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error star requires at least one package")); }
+            for package in packages { client.star_package(Some(&registry_url), &package, otp.as_deref()).await?; println!("starred {package}"); }
+        }
+        Commands::Unstar { packages, registry, otp, no_unicode: _ } => {
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            if packages.is_empty() { return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error unstar requires at least one package")); }
+            for package in packages { client.unstar_package(Some(&registry_url), &package, otp.as_deref()).await?; println!("unstarred {package}"); }
+        }
+        Commands::Profile { action, args, otp, registry, json, parseable } => execute_profile(&current_dir, action, args, registry, json, otp, parseable).await?,
+        Commands::Org { action, args, otp: _, registry, json, parseable } => execute_org(&current_dir, action, args, registry, json, parseable).await?,
+        Commands::Team { action, args, otp: _, description, registry, json, parseable } => execute_team(&current_dir, action, args, registry, json, description, parseable).await?,
+        Commands::Doctor => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            println!("rnpm doctor");
+            println!("registry: {}", config.npmrc.registry);
+            println!("node_modules: {}", current_dir.join("node_modules").exists());
+            println!("package-lock: {}", current_dir.join("package-lock.json").exists());
+        }
+        Commands::Fund { package, json } => {
+            let count = audit::count_funding_packages(&current_dir);
+            if json { println!("{}", serde_json::json!({"package": package, "packages": count})); }
+            else if let Some(package) = package { println!("{package}: funding metadata is available in package.json"); } else { println!("{} packages are looking for funding", count); }
+        }
+        Commands::Explain { package, json } => {
+            let lock = current_dir.join("package-lock.json");
+            let value = std::fs::read_to_string(lock).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let result = value
+                .as_ref()
+                .and_then(|v| v.get("packages"))
+                .and_then(|p| p.get(format!("node_modules/{package}")))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if result.is_null() {
+                return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error No dependencies found matching {package}"));
+            } else {
+                let version = result.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let location = format!("node_modules/{package}");
+                println!("{package}@{version}");
+                println!("{location}");
+                let root_spec = value
+                    .as_ref()
+                    .and_then(|v| v.get("packages"))
+                    .and_then(|p| p.get(""))
+                    .and_then(|root| {
+                        ["dependencies", "optionalDependencies", "devDependencies", "peerDependencies"]
+                            .iter()
+                            .find_map(|field| root.get(*field).and_then(|deps| deps.get(&package)).and_then(|spec| spec.as_str()))
+                    });
+                if let Some(spec) = root_spec {
+                    println!("  {package}@\"{spec}\" from the root project");
+                }
+            }
+        }
+        Commands::Bugs { packages, .. } => for package in packages { println!("https://www.npmjs.com/package/{package}?activeTab=issues"); },
+        Commands::Docs { packages, .. } => for package in packages { println!("https://www.npmjs.com/package/{package}?activeTab=readme"); },
+        Commands::Edit { package, editor } => println!("{} {}", editor.unwrap_or_else(|| "$EDITOR".into()), package),
+        Commands::Explore { package, shell } => println!("{} {}", shell.unwrap_or_else(|| "$SHELL".into()), package),
+        Commands::HelpSearch { terms, long: _ } => println!("https://docs.npmjs.com/search?q={}", terms.join("+")),
+        Commands::InstallCiTest { args } => {
+            let mut installer = Installer::new(InstallOptions { project_dir: current_dir.clone(), ..Default::default() })?;
+            installer.run_ci().await?;
+            execute_run(current_dir, Some("test".into()), args, false, Vec::new(), Vec::new(), Vec::new(), false, false, false, false, false).await?;
+        }
+        Commands::InstallScripts { action, packages, all, json } => {
+            match action.as_deref().unwrap_or("") {
+                "approve" => update_allow_scripts_policy(&current_dir, &packages, true, all, json)?,
+                "deny" => update_allow_scripts_policy(&current_dir, &packages, false, all, json)?,
+                "ls" | "list" | "prune" => {
+                    let path = current_dir.join("package.json");
+                    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+                    let value = document.get("allowScripts").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                }
+                _ => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error install-scripts approve|deny|ls|prune")),
+            }
+        }
+        Commands::InstallTest { args } => {
+            let mut installer = Installer::new(InstallOptions { project_dir: current_dir.clone(), ..Default::default() })?;
+            installer.run().await?;
+            execute_run(current_dir, Some("test".into()), args, false, Vec::new(), Vec::new(), Vec::new(), false, false, false, false, false).await?;
+        }
+        Commands::Shrinkwrap => {
+            let src = current_dir.join("package-lock.json");
+            let dst = current_dir.join("npm-shrinkwrap.json");
+            if dst.exists() { println!("npm-shrinkwrap.json up to date"); }
+            else if src.exists() {
+                if std::fs::rename(&src, &dst).is_err() { std::fs::copy(&src, &dst)?; std::fs::remove_file(&src)?; }
+                println!("package-lock.json has been renamed to npm-shrinkwrap.json");
+            } else { return Err(anyhow::anyhow!("npm error code ENOENT\nnpm error package-lock.json not found")); }
+        }
+        Commands::Fix { registry, .. } => {
+            let mut installer = Installer::new(InstallOptions { project_dir: current_dir.clone(), registry_url: registry, ..Default::default() })?;
+            let summary = installer.update(&[]).await?;
+            println!("rnpm: fixed {} package(s)", summary.packages_updated);
+        }
+        Commands::Trust { action, args, yes: _, registry, id, otp } => {
+            let action = action.unwrap_or_else(|| "list".into());
+            let package = args.first().cloned().or_else(|| package_name_from_manifest(&current_dir).ok())
+                .ok_or_else(|| anyhow::anyhow!("npm error code ENEEDPACKAGE\nnpm error package name must be specified"))?;
+            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
+            match action.as_str() {
+                "list" => {
+                    let value = client.trust_list(Some(&registry_url), &package).await?;
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                }
+                "revoke" => {
+                    let id = id.or_else(|| args.get(1).cloned()).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust revoke requires --id=<trust-id>"))?;
+                    client.trust_revoke(Some(&registry_url), &package, &id, otp.as_deref()).await?;
+                    println!("revoked trusted configuration {id} for {package}");
+                }
+                "github" | "gitlab" | "circleci" => {
+                    return Err(anyhow::anyhow!("npm error code ENOTSUP\nrnpm trust {action} requires provider-specific trust configuration, which is not supported by this registry client"));
+                }
+                other => return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Unknown trust command: {other}")),
+            }
+        }
+        Commands::Get { key } => {
+            let config = rnpm_config::Config::load(Some(&current_dir))?;
+            if let Some(val) = config.get(&key) {
+                println!("{val}");
+            } else {
+                println!("undefined");
+            }
+        }
+        Commands::Set { key, value, global, location } => {
+            let target_path = if global || location.as_deref() == Some("global") {
+                rnpm_config::find_global_npmrc().unwrap_or_else(|| {
+                    rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
+                })
+            } else if location.as_deref() == Some("project") {
+                current_dir.join(".npmrc")
+            } else if location.as_deref() == Some("user") {
+                rnpm_config::get_default_user_npmrc()
+            } else if current_dir.join(".npmrc").exists() {
+                current_dir.join(".npmrc")
+            } else {
+                rnpm_config::get_default_user_npmrc()
+            };
+
+            rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
         }
         Commands::Config { action } => {
             match action {

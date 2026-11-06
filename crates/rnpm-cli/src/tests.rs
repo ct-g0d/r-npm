@@ -153,12 +153,7 @@ use tokio::net::TcpListener;
         let commands = ["team", "fix", "deprecate", "doctor", "fund"];
         for cmd in commands {
             let res = check_unsupported_cli_invocation(vec!["rnpm", cmd]);
-            assert!(res.is_some(), "Expected diagnostic for command: {cmd}");
-            let (code, msg) = res.unwrap();
-            assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
-            assert!(msg.contains("npm error code ERR_UNSUPPORTED_COMMAND"));
-            assert!(msg.contains(&format!("The command '{cmd}' is not currently implemented in rnpm.")));
-            assert!(msg.contains("docs/compatibility-contract.md"));
+            assert!(res.is_none(), "implemented command was blocked: {cmd}");
         }
 
         // Verify exec, npx, publish, whoami, ping, login, logout, token, init, create, version, diff, sbom are recognized and not blocked as unsupported commands
@@ -774,13 +769,9 @@ use tokio::net::TcpListener;
         let check = check_unsupported_cli_invocation(vec!["rnpm", "audit"]);
         assert!(check.is_none(), "rnpm audit must be a supported command");
 
-        // Commands still deferred should still trigger ERR_UNSUPPORTED_COMMAND
+        // The remediation command is now parsed and dispatched.
         let check_fix = check_unsupported_cli_invocation(vec!["rnpm", "fix"]);
-        assert!(check_fix.is_some());
-        let (code, msg) = check_fix.unwrap();
-        assert_eq!(code, "ERR_UNSUPPORTED_COMMAND");
-        assert!(msg.contains("ERR_UNSUPPORTED_COMMAND"));
-        assert!(msg.contains("fix"));
+        assert!(check_fix.is_none());
     }
 
     #[tokio::test]
@@ -1024,14 +1015,12 @@ use tokio::net::TcpListener;
     }
 
     #[tokio::test]
-    async fn test_run_cli_deferred_commands_matrix_diagnostics() {
+    async fn test_run_cli_extended_commands_not_gated() {
         let res = check_unsupported_cli_invocation(vec!["rnpm", "team"]);
-        assert!(res.is_some());
-        assert!(res.unwrap().1.contains("ERR_UNSUPPORTED_COMMAND"));
+        assert!(res.is_none());
 
         let res = check_unsupported_cli_invocation(vec!["rnpm", "search"]);
-        assert!(res.is_some());
-        assert!(res.unwrap().1.contains("ERR_UNSUPPORTED_COMMAND"));
+        assert!(res.is_none());
     }
 
     #[test]
@@ -1788,7 +1777,7 @@ use tokio::net::TcpListener;
         // login / adduser alias
         let parsed_login = Cli::try_parse_from(["rnpm", "login", "--registry", "https://reg.org/", "--auth-type", "web"]).unwrap();
         match parsed_login.command {
-            Commands::Login { registry, auth_type } => {
+            Commands::Login { registry, auth_type, .. } => {
                 assert_eq!(registry, Some("https://reg.org/".to_string()));
                 assert_eq!(auth_type, Some("web".to_string()));
             }
@@ -1976,3 +1965,9 @@ use tokio::net::TcpListener;
             _ => panic!("Expected Uninstall -g"),
         }
     }
+
+#[test]
+fn test_lowercase_v_is_normalized_to_version_flag() {
+    assert_eq!(normalize_cli_args(["rnpm", "-v"]), vec!["rnpm", "--version"]);
+    assert_eq!(normalize_cli_args(["rnpm", "install", "-v"]), vec!["rnpm", "install", "-v"]);
+}

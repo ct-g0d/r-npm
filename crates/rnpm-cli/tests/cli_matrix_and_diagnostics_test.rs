@@ -24,7 +24,7 @@ fn test_clean_install_aliases_invocation() {
 }
 
 #[test]
-fn test_deferred_commands_cli_execution_matrix() {
+fn test_extended_commands_cli_help_matrix() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     let cases = [
@@ -35,26 +35,15 @@ fn test_deferred_commands_cli_execution_matrix() {
     ];
 
     for (cmd_name, args) in cases {
+        let mut help_args = args.clone();
+        help_args.push("--help");
         let output = Command::new(rnpm_bin)
-            .args(&args)
+            .args(&help_args)
             .output()
             .expect("Failed to execute rnpm command");
 
-        assert!(
-            !output.status.success(),
-            "Deferred command '{cmd_name}' must exit non-zero"
-        );
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("npm error code ERR_UNSUPPORTED_COMMAND"),
-            "Expected ERR_UNSUPPORTED_COMMAND for '{cmd_name}', got: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!("The command '{cmd_name}' is not currently implemented in rnpm.")),
-            "Expected message to name command '{cmd_name}', got: {stderr}"
-        );
-        assert!(stderr.contains("docs/compatibility-contract.md"));
+        assert!(output.status.success(), "Implemented command '{cmd_name} --help' must succeed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(!output.stdout.is_empty(), "Implemented command '{cmd_name}' should emit help text");
     }
 }
 
@@ -297,16 +286,14 @@ fn test_additional_aliases_and_flag_routing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--offline"));
 
-    // Search is caught as unsupported command
+    // Search is parsed as an implemented command.
     let output = Command::new(rnpm_bin)
         .arg("search")
-        .arg("lodash")
+        .arg("--help")
         .output()
         .expect("Failed to execute rnpm");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("npm error code ERR_UNSUPPORTED_COMMAND"));
-    assert!(stderr.contains("search"));
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Search the registry"));
 
     // Additional unsupported flags --production on install
     let flag_args = ["install", "--production"];

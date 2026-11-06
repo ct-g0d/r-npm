@@ -3,7 +3,7 @@
 ## 1. Guiding Rules & Compatibility Philosophy
 
 1. **Behavioral Oracle:** `npm` (specifically `npm v11.x` running on Node.js `v24.x` / `v26.x`) is the definitive behavioral ground truth for this project.
-2. **Normalized Parity:** The project is successful when it produces an installed `node_modules` dependency tree and `package-lock.json` file whose normalized digests match npm with **zero diff**.
+2. **Normalized Parity:** The acceptance target is an installed `node_modules` dependency tree and `package-lock.json` whose normalized digests match npm with **zero diff**. The target remains open for real projects; current differential measurements are recorded in `plan.md`.
 3. **Correctness Before Speed:** Never trade correctness or compatibility for performance. A faster installer that computes a divergent dependency tree is a failed installer.
 4. **Isolated Contracts:** Each subsystem operates under an explicit frozen contract. Cross-subsystem interactions must adhere to documented boundaries.
 5. **Deterministic Diagnostics:** Failures must report structured, informative error codes matching npm error names (`ERESOLVE`, `ETARGET`, `EINTEGRITY`, `ELOCKFILE_DRIFT`, `E404`, etc.).
@@ -47,6 +47,7 @@
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
+- `get` / `set`: Top-level npm-compatible aliases for configuration reads and writes.
 - `dedupe` / `find-dupes` (alias: `deduplicate`): Traverse installed `node_modules` and `package-lock.json`, find duplicate packages satisfying common semver ranges, hoist to shallowest ancestor level, and delete redundant copies. Supports `--dry-run`.
 - `rebuild` (alias: `rb`): Re-run compilation and lifecycle build scripts (`install`, `postinstall`) for installed packages, with selective rebuild `npm rebuild [<pkg> ...]`, and automatic native tool invocation (`node-gyp rebuild`, `cmake-js`) when `binding.gyp` is present. Supports `--ignore-scripts`, `--foreground-scripts`, `--strict-sandbox`.
 - `init` (aliases: `create`, `innit`): Interactive and non-interactive (`-y` / `--yes` / `-f` / `--force`) `package.json` generation with npm default fields (name, version, description, main, scripts, author, license), preserving existing manifest values, `--scope` support, and initializer delegation to `create-<name>` via dynamic `exec`.
@@ -58,6 +59,10 @@
 - `view` / `info` (aliases: `v`, `show`): Query package metadata from the npm registry for `<pkg>[@<version_or_tag>] [<field>[.<subfield>]...]`. Resolves dist-tags, exact versions, and semver ranges. Supports nested dot notation field extraction, multi-field output, full manifest display, and `--json`.
 - `outdated`: Inspect declared vs installed dependency versions and query registry packuments to determine `wanted` (max satisfying version) and `latest` (`dist-tags.latest`). Tabular output with columns `Package`, `Current`, `Wanted`, `Latest`, `Location`, `Depended by`. Supports `--long` (`-l`), `--json`, `--parseable` (`-p`), and package filters. Exits with code `1` if any outdated packages are found, `0` if up to date.
 - `query`: Execute CSS-like selector queries on the dependency tree (`:root`, `[name=<pkg>]`, `[version^=<v>]`, `:outdated`, `:extraneous`, `:missing`, `:invalid`, `:dev`, `:prod`, `:optional`, `:peer`, child `>`, descendant space, union `,`). Emits matching package nodes as structured JSON array matching npm query schema.
+- Registry administration: `dist-tag`, `owner`, `deprecate`, `undeprecate`, `access`, and `unpublish` use the configured registry and preserve npm-style auth/error routing. `search` uses the registry search API; `token`, `whoami`, `login`, and `logout` cover token persistence and cleanup.
+- Local/package workflows: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, and `install-test` are available. `bugs`, `docs`, `edit`, `explore`, and `help-search` emit npm resource URLs suitable for the host environment.
+- `trust list` and `trust revoke` use the registry trust API without exposing credentials or lifecycle secrets. Provider-specific trust creation (`github`, `gitlab`, and `circleci`) remains explicitly unsupported until a provider configuration schema is added.
+- Account command surface: `profile`, `org`, `team`, `star`, `stars`, and `unstar` use npm-compatible registry endpoints where the target registry exposes them; unsupported registry operations return structured errors.
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
@@ -84,16 +89,15 @@ npm error See docs/compatibility-contract.md for supported options.
 ```
 *(Note: `--legacy-peer-deps` is fully supported on `install`, `ci`, and `update` commands).*
 
-### Unsupported & Deferred Commands
-- `publish`: Package publishing (deferred).
-- `login`, `adduser`, `logout`, `token`, `team`: Account management and auth tokens.
-- `fix`: Vulnerability automated remediation.
-- `deprecate`, `access`, `profile`, `org`, `doctor`, `fund`, `explain`, `search`, `stars`, `star`, `unstar`, `ping`, `whoami`.
-- Writing legacy lockfile formats (v1 or v2).
+### Remaining Gaps
+- Registry-specific organization, team, profile, and star APIs vary across compatible registries; rnpm exposes the command surface and reports when the target registry does not implement an endpoint.
+- `install-scripts ls` and `install-scripts prune` currently inspect and maintain the root `allowScripts` policy but do not yet perform npm Arborist's full installed-tree script classification.
+- Provider-specific `trust` creation is not implemented; list and revoke are supported.
+- Writing legacy lockfile formats (v1 or v2) remains unsupported; v1/v2 lockfiles are migrated in memory for installs.
 
 ### Drop-in Compatibility Target & Unsupported Command Handling (DEC-004)
 DEC-004 formalizes the complete drop-in target for `npm 11.x`: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility.
-When a user invokes an unsupported or deferred command during the transition, `rnpm` terminates immediately with exit code `1` and a structured diagnostic:
+When a user invokes a command outside the active surface, `rnpm` terminates immediately with exit code `1` and a structured diagnostic:
 ```text
 npm error code ERR_UNSUPPORTED_COMMAND
 npm error The command '<command>' is not currently implemented in rnpm.
@@ -109,7 +113,7 @@ npm error See docs/compatibility-contract.md for the active compatibility surfac
 | **DEC-001** | Semver Implementation | Accepted | Custom `node-semver`-compatible parser. The standard Rust `semver` crate grammar is incompatible with npm (diverges on loose versions, `x` ranges, hyphen ranges, prerelease precedence, and `0.x` caret rules). |
 | **DEC-002** | Performance Registry | Accepted | Performance checkpoints (Gates A, D, F) exclusively use a pinned loopback registry (`http://127.0.0.1:4873/`). Public upstream (`npmjs.org`) is reserved for smoke tests and functional fixtures. |
 | **DEC-003** | Windows Process Accounting | Accepted | Benchmark instrumentation uses Windows Job Objects (`QueryInformationJobObject`) to aggregate CPU time, peak working set, commit charge, and I/O across the entire process tree. |
-| **DEC-004** | Full npm 11.x Drop-in Target | Accepted | Define exact npm 11.x drop-in target: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility. Active command matrix and flag surface expanded. Deferred commands terminate with structured `ERR_UNSUPPORTED_COMMAND` error and non-zero exit code during parallel transition. |
+| **DEC-004** | Full npm 11.x Drop-in Target | Accepted | Define exact npm 11.x drop-in target: all standard package management, inspection, publishing, lifecycle, linking, and query workflows are supported with drop-in compatibility. The active command matrix and flag surface are expanded continuously; only commands outside that matrix return structured `ERR_UNSUPPORTED_COMMAND` diagnostics. |
 | **DEC-005** | Core code isolation & Worktrees | Accepted | Mandatory rule: Any modifications to core crates (`crates/rnpm-*`) must be performed within dedicated git worktrees. This directive applies to all successor threads in the lineage. |
 
 ---
@@ -179,7 +183,7 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 - **Windows Forbidden Device Names:** Reject entries matching `CON`, `PRN`, `AUX`, `NUL`, `COM1`鈥揱COM9`, `LPT1`鈥揱LPT9` (including extensions like `NUL.txt`).
 - **Trailing Characters:** Strip or reject trailing dots (`.`) and spaces in filenames on Windows.
 - **Mode Bit Sanitization:** Strip SUID (04000) and SGID (02000) bits. Normalize file permissions to `0644` (regular file) or `0755` (executable / binary).
-- **Directory Prefix Stripping:** Strip exactly the standard top-level `package/` prefix from tar archives.
+- **Directory Prefix Stripping:** Strip exactly one top-level archive directory from tar archives. npm commonly uses `package/`, but published tarballs may use a generated root such as `mscdex-busboy-<sha>/`.
 - **Tar Bomb Resource Limits:**
   - Max entry count: 50,000 files per package.
   - Max uncompressed size: 512 MB per package (configurable).
@@ -242,7 +246,7 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 | `ETARBOMB` | 1 | Tarball exceeded safe entry count, size, or compression ratio limits |
 | `ESECURITY` | 1 | Tarball contained traversal (`..`), absolute paths, or escaping symlinks |
 | `EJSONPARSE` | 1 | Malformed `package.json` or `package-lock.json` |
-| `ERR_UNSUPPORTED_COMMAND` | 1 | Attempted invocation of an out-of-scope or deferred npm command |
+| `ERR_UNSUPPORTED_COMMAND` | 1 | Attempted invocation of an npm command outside the active compatibility matrix |
 | `ERR_UNSUPPORTED_FLAG` | 1 | Attempted invocation of an unsupported flag |
 | `ENOLOCK` | 1 | Command requires an existing package-lock.json |
 | `ENOENT` | 1 | File or package.json not found |

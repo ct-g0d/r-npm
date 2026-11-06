@@ -1,5 +1,7 @@
 # Verdict Blockers Resolution & Regression Verification Report
 
+> Historical gate report: its fixture-level parity claims do not supersede the 2026-11-06 real-project audit. That audit found remaining lockfile metadata and hoisting differences; see the newest `[~]` entry in `plan.md` for the current measured status.
+
 **Thread 8 (T8): Verification, Benchmarks, DEC-004 Closure & Contract Documentation**  
 **Date:** 2026-11-05  
 **Target Oracle:** `npm v11.x` (`11.20.0` on Node.js `v26.13.0`)  

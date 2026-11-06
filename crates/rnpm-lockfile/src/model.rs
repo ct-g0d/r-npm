@@ -39,6 +39,13 @@ pub enum PackageBin {
 /// Metadata for a package node in lockfile v3 `packages`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LockfilePackage {
+    /// Internal marker used for freshly generated npm 11 lockfiles. npm 11
+    /// writes `dev` and `optional` separately for a package reachable only
+    /// through a dev optional branch; older lockfiles may still use the
+    /// combined `devOptional` field.
+    #[serde(skip)]
+    pub preserve_dev_optional_split: bool,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
 
@@ -315,7 +322,7 @@ impl LockfilePackage {
         if self.dev_optional == Some(true) {
             self.dev = None;
             self.optional = None;
-        } else if self.dev == Some(true) && self.optional == Some(true) {
+        } else if !self.preserve_dev_optional_split && self.dev == Some(true) && self.optional == Some(true) {
             self.dev_optional = Some(true);
             self.dev = None;
             self.optional = None;

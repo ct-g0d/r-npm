@@ -48,7 +48,7 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
 
     // 1. Unix POSIX Shell Script (<name>)
     let sh_args_str = if info.args.is_empty() {
-        String::new()
+        " ".to_string()
     } else {
         let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_posix_arg(arg)).collect();
         format!("{} ", escaped.join(" "))
@@ -56,7 +56,7 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let sh_rel_path = crate::escape_posix_path(rel_path);
     let sh = format!(
         "#!/bin/sh\n\
-         basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\
+         basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\,/,g')\")\n\
          \n\
          case `uname` in\n\
              *CYGWIN*|*MINGW*|*MSYS*)\n\
@@ -68,14 +68,14 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
          \n\
          if [ -x \"$basedir/{prog}\" ]; then\n\
            exec \"$basedir/{prog}\" {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
-         else\n\
+         else \n\
            exec {prog} {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
          fi\n"
     );
 
     // 2. Windows Batch Wrapper (<name>.cmd)
     let cmd_args_str = if info.args.is_empty() {
-        String::new()
+        " ".to_string()
     } else {
         let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_cmd_arg(arg)).collect();
         format!("{} ", escaped.join(" "))
@@ -103,7 +103,7 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
 
     // 3. Windows PowerShell Wrapper (<name>.ps1)
     let ps1_args_str = if info.args.is_empty() {
-        String::new()
+        " ".to_string()
     } else {
         let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_ps1_arg(arg)).collect();
         format!("{} ", escaped.join(" "))
@@ -111,42 +111,30 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let ps1_rel_path = crate::escape_ps1_path(rel_path);
     let ps1 = format!(
         "#!/usr/bin/env pwsh\r\n\
-         $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\
+         $basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\
          \r\n\
-         $exe = \"\"\r\n\
+         $exe=\"\"\r\n\
          if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\r\n\
-           # Windows\r\n\
-           if (Test-Path \"$basedir/{prog}.exe\") {{\r\n\
-             $exe = \"$basedir/{prog}.exe\"\r\n\
-           }} else {{\r\n\
-             $exe = \"{prog}\"\r\n\
-           }}\r\n\
-         }} else {{\r\n\
-           # Linux/macOS\r\n\
-           if (Test-Path \"$basedir/{prog}\") {{\r\n\
-             $exe = \"$basedir/{prog}\"\r\n\
-           }} else {{\r\n\
-             $exe = \"{prog}\"\r\n\
-           }}\r\n\
+           # Fix case when both the Windows and Linux builds of Node are installed in the same directory\r\n\
+           $exe=\".exe\"\r\n\
          }}\r\n\
-         \r\n\
-         $ret = 0\r\n\
-         if (Test-Path \"$basedir/{ps1_rel_path}\") {{\r\n\
+         $ret=0\r\n\
+         if (Test-Path \"$basedir/{prog}$exe\") {{\r\n\
            # Support pipeline input\r\n\
            if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
+             $input | & \"$basedir/{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }} else {{\r\n\
-             & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
+             & \"$basedir/{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }}\r\n\
-           $ret = $LASTEXITCODE\r\n\
+           $ret=$LASTEXITCODE\r\n\
          }} else {{\r\n\
            # Support pipeline input\r\n\
            if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
+             $input | & \"{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }} else {{\r\n\
-             & \"$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
+             & \"{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
            }}\r\n\
-           $ret = $LASTEXITCODE\r\n\
+           $ret=$LASTEXITCODE\r\n\
          }}\r\n\
          exit $ret\r\n"
     );

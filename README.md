@@ -2,7 +2,7 @@
 
 High-performance, drop-in Rust implementation of npm 11.x workflows.
 
-`rnpm` is designed to install and operate ordinary Node.js projects reliably, reproducing exact `node_modules` trees and `package-lock.json` v3 lockfiles with zero diff against npm 11.x, while using materially less wall-clock time, CPU, and RAM.
+`rnpm` is designed to install and operate ordinary Node.js projects reliably, with npm 11.x-compatible commands, lockfile v3 output, and a measurable path toward matching npm's tree and performance behavior. Real-project parity is tracked by the differential benchmarks rather than treated as a completed guarantee.
 
 ---
 
@@ -69,7 +69,7 @@ $env:PATH = "D:\AppData\user2\.cargo\bin;" + $env:PATH
 
 ## Active Command Matrix & Flags
 
-`rnpm` provides drop-in compatibility for all standard npm 11.x package management, inspection, query, and lifecycle commands (DEC-004 Accepted):
+`rnpm` provides a broad npm 11.x-compatible package-management, inspection, query, publishing, and lifecycle surface. The remaining commands are listed explicitly in the compatibility contract.
 
 - **`install`** (aliases: `i`, `add`, `isntall`): Full resolution, fetch, verify, unpack, link, lifecycle execution, lockfile v3 serialization.
   - Flags: `-D`/`--save-dev`, `-E`/`--save-exact`, `-P`/`-S`/`--save-prod`/`--save`, `-O`/`--save-optional`, `--save-peer`, `--no-save`, `--package-lock-only`, `--omit=<types>`, `--offline`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--registry`, `--cache`.
@@ -86,6 +86,12 @@ $env:PATH = "D:\AppData\user2\.cargo\bin;" + $env:PATH
 - **`pkg`**: Manifest inspection and manipulation (`get`, `set`, `delete`, `--prefix`, `--json`).
 - **`audit`**: Security advisory audit queries against registry endpoint with threshold exit codes (`--audit-level`, `--json`, `--dry-run`).
 - **`cache`**: Content-addressable cache verification and purge (`clean [--force]`, `verify`).
+- **Inspection and metadata**: `list`/`ls`/`ll`, `outdated`, `view`/`info`/`show`, and CSS-like `query` selectors.
+- **Package operations**: `dedupe`/`find-dupes`, `rebuild`, `init`/`create`, `diff`, `sbom`, and `version`.
+- **Registry and environment**: `publish`, `whoami`, `ping`, `login`, `logout`, `token`, `config`, top-level `get`/`set`, `link`, `unlink`, `prefix`, `root`, and `bin`.
+- **Registry administration**: `dist-tag`, `owner`, `deprecate`, `undeprecate`, `access`, `unpublish`, and `search`, using the configured registry and scoped credentials.
+- **Workflow and convenience commands**: `approve-scripts`, `deny-scripts`, `completion`, `shrinkwrap`, `trust list`, `trust revoke`, `fix`, `doctor`, `fund`, `explain`, `install-ci-test`, `install-scripts`, `install-test`, `bugs`, `docs`, `edit`, `explore`, and `help-search`. Provider-specific trust creation remains unsupported.
+- **Account surface**: `profile`, `org`, `team`, `star`, `stars`, and `unstar` are exposed; endpoint support depends on the target registry.
 
 ---
 
@@ -101,7 +107,7 @@ The resulting binary is located at `target/release/rnpm.exe`.
 
 ### Running Tests
 
-Execute the full workspace test suite (441+ unit and integration tests):
+Run the workspace test suite (the exact count varies as integration coverage changes):
 
 ```powershell
 cargo test --workspace

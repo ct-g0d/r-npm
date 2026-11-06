@@ -38,7 +38,7 @@ fn test_source_map_01_cli_dispatch() {
     assert!(stdout.contains("High performance Rust implementation of npm workflows"));
 
     // Test unsupported command
-    let out = Command::new(rnpm_bin).arg("deprecate").output().unwrap();
+    let out = Command::new(rnpm_bin).arg("definitely-unknown-command").output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ERR_UNSUPPORTED_COMMAND"));

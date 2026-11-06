@@ -281,6 +281,11 @@ fn test_platform_overrides() {
         !temp2.path().join("node_modules").join("pkg-opt").exists(),
         "pkg-opt must be skipped when target platform is incompatible (--os=linux --cpu=x64)"
     );
+    let lockfile2 = fs::read_to_string(temp2.path().join("package-lock.json")).unwrap();
+    assert!(
+        lockfile2.contains("pkg-opt"),
+        "Incompatible optional packages must remain in the lockfile for cross-platform parity"
+    );
 
     // 3. Cross-platform lockfile generation with --package-lock-only
     let temp3 = tempdir().unwrap();

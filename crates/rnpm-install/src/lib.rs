@@ -82,6 +82,12 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
         for (k, v) in &ver_info.optional_dependencies {
             opt_deps.insert(k.clone(), v.clone());
         }
+        // npm serializes an overlapping optional dependency only under
+        // `optionalDependencies`; the optional declaration supersedes the
+        // same key in `dependencies`.
+        for k in opt_deps.keys() {
+            deps.remove(k);
+        }
 
         let bin = ver_info.bin.as_ref().map(|b| match b {
             rnpm_registry::metadata::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
@@ -96,6 +102,7 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                 dist_tarball: Some(ver_info.dist.tarball.clone()),
                 dist_integrity: ver_info.dist.integrity.clone(),
                 dependencies: deps,
+                dependency_order: ver_info.dependencies.keys().cloned().collect(),
                 dev_dependencies: dev_deps,
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_meta,
@@ -104,8 +111,11 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                 cpu: if ver_info.cpu.is_empty() { None } else { Some(ver_info.cpu.clone()) },
                 libc: if ver_info.libc.is_empty() { None } else { Some(ver_info.libc.clone()) },
                 bin,
+                license: ver_info.license.clone(),
+                engines: ver_info.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 has_install_script: ver_info.has_install_script,
                 deprecated: ver_info.deprecated.clone(),
+                extra: ver_info.extra.clone(),
             },
         );
     }
@@ -169,6 +179,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             dist_tarball: Some(resolved.resolved_url.clone()),
                             dist_integrity: None,
                             dependencies: m.dependencies.clone(),
+                            dependency_order: m.dependencies.keys().cloned().collect(),
                             dev_dependencies: m.dev_dependencies.clone(),
                             peer_dependencies: m.peer_dependencies.clone(),
                             peer_dependencies_meta: m.peer_dependencies_meta.clone(),
@@ -177,10 +188,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             cpu: m.cpu.clone(),
                             libc: m.libc.clone(),
                             bin,
+                            license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                            engines: m.engines.clone(),
                             has_install_script: m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
                                 || m.scripts.contains_key("preinstall"),
                             deprecated: None,
+                            extra: m.extra.clone(),
                         };
 
                         let mut dist_tags = BTreeMap::new();
@@ -221,6 +235,12 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         });
         match res {
             Ok(abbrev) => {
+                // Persist the abbreviated packument under the package name so
+                // a later invocation can resolve from disk without repeating
+                // metadata requests. Tarballs remain keyed by their URL.
+                if let Ok(bytes) = serde_json::to_vec(&abbrev) {
+                    let _ = self.cache.put(name, &bytes, None);
+                }
                 let meta = abbreviated_to_package_metadata(&abbrev);
                 if let Ok(mut cache) = self.metadata_cache.lock() {
                     cache.insert(name.to_string(), meta.clone());
@@ -1016,6 +1036,7 @@ impl Installer {
 
         // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
         if self.options.package_lock_only {
+            self.enrich_lockfile_from_registry(&mut lockfile).await?;
             for (loc, node) in &graph.nodes {
                 if let Some(ref res) = node.resolved {
                     if let Some(rel_file) = res.strip_prefix("file:") {
@@ -1626,6 +1647,7 @@ impl Installer {
 
         let lockfile_path = self.options.project_dir.join("package-lock.json");
         if !self.options.no_save && self.options.package_lock_enabled() {
+            enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
             // 4. Write deterministic package-lock.json
             lockfile.save_to_file(&lockfile_path)
                 .context("Failed to save package-lock.json")?;
@@ -1659,6 +1681,7 @@ impl Installer {
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
         let lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
             .context("Failed to parse package-lock.json")?;
+        let platform_skipped_packages = lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
 
         // 0. Discover workspace members (if any)
         let workspace_members = discover_workspaces_from_manifest(
@@ -1824,6 +1847,9 @@ impl Installer {
                 if self.options.omit_peer && is_peer {
                     continue;
                 }
+                if platform_skipped_packages.contains(pkg_key) {
+                    continue;
+                }
                 if is_optional {
                     let os_match = host_platform.matches_with_libc(
                         pkg_info.os.as_deref(),
@@ -1930,7 +1956,7 @@ impl Installer {
 
             // Omit filtering
             let is_dev = pkg_info.dev.unwrap_or(false);
-            let is_optional = pkg_info.optional.unwrap_or(false);
+            let is_optional = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
             let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
             let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
 
@@ -1972,6 +1998,11 @@ impl Installer {
                             continue;
                         }
                 }
+            }
+
+            if platform_skipped_packages.contains(pkg_key) {
+                debug!("Skipping lockfile package {pkg_key} because its optional platform ancestor is incompatible");
+                continue;
             }
 
             // Handle workspace links
@@ -2080,7 +2111,7 @@ impl Installer {
                 return Err(anyhow!("Package path '{cleaned:?}' escapes node_modules boundary"));
             }
 
-            let is_optional = pkg_info.optional.unwrap_or(false);
+            let is_optional = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
 
             // Filter optional dependencies by platform: os, cpu, libc
             if is_optional {
@@ -2497,6 +2528,85 @@ impl Installer {
         })
     }
 
+    /// Fill lockfile metadata that the abbreviated install packument omits.
+    /// Requests are deduplicated and run concurrently; offline installs keep
+    /// the metadata already available in the lockfile/cache.
+    async fn enrich_lockfile_from_registry(&mut self, lockfile: &mut LockfileV3) -> Result<()> {
+        if self.options.offline {
+            return Ok(());
+        }
+
+        let mut names = std::collections::BTreeSet::new();
+        for (location, package) in &lockfile.packages {
+            if location.is_empty() || (package.license.is_some() && package.libc.is_some()) {
+                continue;
+            }
+            let name = package.name.clone().or_else(|| {
+                let leaf = location.rsplit("/node_modules/").next().unwrap_or(location);
+                location
+                    .strip_prefix("node_modules/")
+                    .map(|_| leaf.to_string())
+            });
+            if let Some(name) = name {
+                names.insert(name);
+            }
+        }
+
+        let client = self.registry_client.clone();
+        let mut jobs = tokio::task::JoinSet::new();
+        for name in names {
+            let client = client.clone();
+            jobs.spawn(async move {
+                let result = client.get_package_metadata_full(&name).await;
+                (name, result)
+            });
+        }
+
+        while let Some(result) = jobs.join_next().await {
+            let (name, metadata) = result.map_err(|e| anyhow!("metadata enrichment task failed: {e}"))?;
+            if let Ok(metadata) = metadata {
+                self.metadata_cache.insert(name, metadata);
+            }
+        }
+
+        for (location, package) in &mut lockfile.packages {
+            if location.is_empty() {
+                continue;
+            }
+            let Some(name) = package.name.clone().or_else(|| {
+                location.strip_prefix("node_modules/").map(|leaf| {
+                    leaf.rsplit("/node_modules/").next().unwrap_or(leaf).to_string()
+                })
+            }) else { continue };
+            let Some(version) = package.version.as_deref() else { continue };
+            let Some(metadata) = self.metadata_cache.get(&name) else { continue };
+            let Some(version_meta) = metadata.versions.get(version) else { continue };
+
+            if package.license.is_none() {
+                package.license = version_meta.license.clone();
+            }
+            if package.engines.is_none() && !version_meta.engines.is_empty() {
+                package.engines = Some(version_meta.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+            }
+            if package.os.is_none() && !version_meta.os.is_empty() {
+                package.os = Some(version_meta.os.clone());
+            }
+            if package.cpu.is_none() && !version_meta.cpu.is_empty() {
+                package.cpu = Some(version_meta.cpu.clone());
+            }
+            if package.libc.is_none() && !version_meta.libc.is_empty() {
+                package.libc = Some(version_meta.libc.clone());
+            }
+            for key in ["funding", "deprecated", "directories"] {
+                if let Some(value) = version_meta.extra.get(key) {
+                    package.extra.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn populate_custom_target_metadata(
         &self,
         manifest: &Manifest,
@@ -2554,6 +2664,7 @@ impl Installer {
                     dist_tarball: Some(resolved.resolved_url.clone()),
                     dist_integrity: None,
                     dependencies: m.dependencies.clone(),
+                    dependency_order: m.dependencies.keys().cloned().collect(),
                     dev_dependencies: m.dev_dependencies.clone(),
                     peer_dependencies: m.peer_dependencies.clone(),
                     peer_dependencies_meta: m.peer_dependencies_meta.clone(),
@@ -2562,10 +2673,13 @@ impl Installer {
                     cpu: m.cpu.clone(),
                     libc: m.libc.clone(),
                     bin,
+                    license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                    engines: m.engines.clone(),
                     has_install_script: m.scripts.contains_key("install")
                         || m.scripts.contains_key("postinstall")
                         || m.scripts.contains_key("preinstall"),
                     deprecated: None,
+                    extra: m.extra.clone(),
                 };
 
                 let mut dist_tags = BTreeMap::new();
@@ -2622,6 +2736,7 @@ impl Installer {
                                 dist_tarball: Some(resolved_url),
                                 dist_integrity: Some(integrity),
                                 dependencies: m.dependencies.clone(),
+                                dependency_order: m.dependencies.keys().cloned().collect(),
                                 dev_dependencies: m.dev_dependencies.clone(),
                                 peer_dependencies: m.peer_dependencies.clone(),
                                 peer_dependencies_meta: m.peer_dependencies_meta.clone(),
@@ -2630,10 +2745,13 @@ impl Installer {
                                 cpu: m.cpu.clone(),
                                 libc: m.libc.clone(),
                                 bin,
+                                license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                                engines: m.engines.clone(),
                                 has_install_script: m.scripts.contains_key("install")
                                     || m.scripts.contains_key("postinstall")
                                     || m.scripts.contains_key("preinstall"),
                                 deprecated: None,
+                                extra: m.extra.clone(),
                             };
 
                             let mut dist_tags = BTreeMap::new();
@@ -2674,6 +2792,7 @@ impl Installer {
                             dist_tarball: Some(resolved_url),
                             dist_integrity: None,
                             dependencies: m.dependencies.clone(),
+                            dependency_order: m.dependencies.keys().cloned().collect(),
                             dev_dependencies: m.dev_dependencies.clone(),
                             peer_dependencies: m.peer_dependencies.clone(),
                             peer_dependencies_meta: m.peer_dependencies_meta.clone(),
@@ -2682,10 +2801,13 @@ impl Installer {
                             cpu: m.cpu.clone(),
                             libc: m.libc.clone(),
                             bin,
+                            license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                            engines: m.engines.clone(),
                             has_install_script: m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
                                 || m.scripts.contains_key("preinstall"),
                             deprecated: None,
+                            extra: m.extra.clone(),
                         };
 
                         let mut dist_tags = BTreeMap::new();
@@ -2712,6 +2834,7 @@ impl Installer {
                         dist_tarball: Some(url.to_string()),
                         dist_integrity: None,
                         dependencies: BTreeMap::new(),
+                        dependency_order: Vec::new(),
                         dev_dependencies: BTreeMap::new(),
                         peer_dependencies: BTreeMap::new(),
                         peer_dependencies_meta: BTreeMap::new(),
@@ -2720,8 +2843,11 @@ impl Installer {
                         cpu: None,
                         libc: None,
                         bin: None,
+                        license: None,
+                        engines: BTreeMap::new(),
                         has_install_script: false,
                         deprecated: None,
+                        extra: BTreeMap::new(),
                     };
                     let mut dist_tags = BTreeMap::new();
                     dist_tags.insert("latest".to_string(), version.clone());
@@ -2915,19 +3041,28 @@ impl Installer {
                 }
             }
             PackageTarget::Range(range) => {
-                let mut matching: Vec<(Version, String)> = Vec::new();
-                for ver_str in metadata.versions.keys() {
-                    if let Ok(ver) = ver_str.parse::<Version>() {
-                        if range.satisfies(&ver) {
-                            matching.push((ver, ver_str.clone()));
+                let latest_match = metadata.dist_tags.get("latest").and_then(|latest_version| {
+                    metadata.versions.get(latest_version).and_then(|latest| {
+                        latest.version.parse::<Version>().ok().filter(|v| range.satisfies(v)).map(|_| latest_version.clone())
+                    })
+                });
+                if let Some(latest) = latest_match {
+                    latest
+                } else {
+                    let mut matching: Vec<(Version, String)> = Vec::new();
+                    for ver_str in metadata.versions.keys() {
+                        if let Ok(ver) = ver_str.parse::<Version>() {
+                            if range.satisfies(&ver) {
+                                matching.push((ver, ver_str.clone()));
+                            }
                         }
                     }
+                    if matching.is_empty() {
+                        return Err(anyhow!("No matching version found for {}@{}", lookup_name, range));
+                    }
+                    matching.sort_by(|a, b| a.0.cmp(&b.0));
+                    matching.last().unwrap().1.clone()
                 }
-                if matching.is_empty() {
-                    return Err(anyhow!("No matching version found for {}@{}", lookup_name, range));
-                }
-                matching.sort_by(|a, b| a.0.cmp(&b.0));
-                matching.last().unwrap().1.clone()
             }
             _ => {
                 if let Some(latest) = metadata.dist_tags.get("latest") {
@@ -3765,6 +3900,40 @@ impl Installer {
 
 }
 
+/// npm copies selected package.json metadata into every package-lock v3 entry.
+/// The abbreviated install packument intentionally omits some of that data
+/// (notably `license`), so read the manifests after extraction and fill the
+/// lockfile before serialization. This also preserves object-shaped funding
+/// metadata exactly as published.
+fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_dir: &Path) {
+    for (location, package) in &mut lockfile.packages {
+        let manifest_path = if location.is_empty() {
+            project_dir.join("package.json")
+        } else {
+            project_dir.join(location).join("package.json")
+        };
+        let Ok(manifest) = Manifest::from_file(&manifest_path) else { continue };
+
+        package.license = manifest
+            .extra
+            .get("license")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .or_else(|| package.license.clone());
+        if !manifest.engines.is_empty() {
+            package.engines = Some(manifest.engines.clone());
+        }
+        if let Some(libc) = &manifest.libc {
+            package.libc = Some(libc.clone());
+        }
+        for key in ["funding", "deprecated", "directories"] {
+            if let Some(value) = manifest.extra.get(key) {
+                package.extra.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
 /// Options for running rnpm uninstall.
 #[derive(Debug, Clone, Default)]
 pub struct UninstallOptions {
@@ -3781,6 +3950,98 @@ pub struct UninstallSummary {
     pub removed_packages: Vec<String>,
     pub pruned_dependencies: Vec<String>,
     pub lockfile_path: PathBuf,
+}
+
+/// Computes lockfile entries that must be skipped because they are reachable
+/// only below an incompatible optional platform package. npm retains these
+/// records for cross-platform lockfile parity but does not extract their
+/// tarballs on the current host.
+fn lockfile_platform_skipped_packages(lockfile: &LockfileV3, platform: &Platform) -> HashSet<String> {
+    const ACTIVE: u8 = 0b01;
+    const SKIPPED: u8 = 0b10;
+
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (parent_key, parent_pkg) in &lockfile.packages {
+        let mut dependency_names = Vec::new();
+        if let Some(deps) = &parent_pkg.dependencies {
+            dependency_names.extend(deps.keys().cloned());
+        }
+        if let Some(deps) = &parent_pkg.optional_dependencies {
+            dependency_names.extend(deps.keys().cloned());
+        }
+        if let Some(deps) = &parent_pkg.dev_dependencies {
+            dependency_names.extend(deps.keys().cloned());
+        }
+        for dependency_name in dependency_names {
+            if let Some(child_key) = resolve_lockfile_dependency_path(lockfile, parent_key, &dependency_name) {
+                children.entry(parent_key.clone()).or_default().push(child_key);
+            }
+        }
+    }
+
+    let mut states: HashMap<String, u8> = HashMap::new();
+    states.insert(String::new(), ACTIVE);
+    for (key, pkg) in &lockfile.packages {
+        if key.is_empty() || !pkg.is_effective_optional() && !pkg.is_peer_optional() {
+            continue;
+        }
+        let compatible = platform.matches_with_libc(pkg.os.as_deref(), pkg.cpu.as_deref(), pkg.libc.as_deref());
+        if !compatible {
+            *states.entry(key.clone()).or_default() |= SKIPPED;
+        }
+    }
+
+    let mut queue: VecDeque<String> = states.keys().cloned().collect();
+    while let Some(parent_key) = queue.pop_front() {
+        let parent_state = states.get(&parent_key).copied().unwrap_or(0);
+        let Some(dependent_keys) = children.get(&parent_key) else { continue };
+        for child_key in dependent_keys {
+            let child_state = states.entry(child_key.clone()).or_default();
+            let mut next = 0;
+            if parent_state & ACTIVE != 0 {
+                next |= ACTIVE;
+            }
+            if parent_state & SKIPPED != 0 {
+                next |= SKIPPED;
+            }
+            let changed = (*child_state | next) != *child_state;
+            *child_state |= next;
+            if changed {
+                queue.push_back(child_key.clone());
+            }
+        }
+    }
+
+    states
+        .into_iter()
+        .filter_map(|(key, state)| (state == SKIPPED).then_some(key))
+        .collect()
+}
+
+fn resolve_lockfile_dependency_path(lockfile: &LockfileV3, parent_key: &str, dependency_name: &str) -> Option<String> {
+    let mut scope = parent_key.to_string();
+    loop {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{dependency_name}")
+        } else {
+            format!("{scope}/node_modules/{dependency_name}")
+        };
+        if lockfile.packages.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        if scope.is_empty() {
+            return None;
+        }
+        if let Some(index) = scope.rfind("/node_modules/") {
+            scope.truncate(index);
+        } else if scope.starts_with("node_modules/") {
+            scope.clear();
+        } else if let Some(index) = scope.rfind('/') {
+            scope.truncate(index);
+        } else {
+            scope.clear();
+        }
+    }
 }
 
 /// Prunes unreferenced packages from lockfile based on reachability from manifest direct dependencies.

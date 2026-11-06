@@ -143,6 +143,35 @@ fn test_config_cli_set_get_delete_list() {
 }
 
 #[test]
+fn test_top_level_get_set_aliases() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let proj_dir = tmp.path().join("proj");
+    fs::create_dir_all(&proj_dir).unwrap();
+    let user_home = tmp.path().join("userhome");
+    fs::create_dir_all(&user_home).unwrap();
+
+    let set = Command::new(rnpm_bin)
+        .current_dir(&proj_dir)
+        .env("USERPROFILE", &user_home)
+        .env("HOME", &user_home)
+        .args(["set", "alias-key", "alias-value", "--location", "project"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "set failed: {}", String::from_utf8_lossy(&set.stderr));
+
+    let get = Command::new(rnpm_bin)
+        .current_dir(&proj_dir)
+        .env("USERPROFILE", &user_home)
+        .env("HOME", &user_home)
+        .args(["get", "alias-key"])
+        .output()
+        .unwrap();
+    assert!(get.status.success(), "get failed: {}", String::from_utf8_lossy(&get.stderr));
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "alias-value");
+}
+
+#[test]
 fn test_prefix_root_bin_cli() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();

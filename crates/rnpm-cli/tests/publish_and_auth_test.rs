@@ -221,6 +221,31 @@ fn test_cli_publish_dry_run() {
     assert!(parsed["integrity"].is_string());
 }
 
+#[test]
+fn test_cli_login_persists_registry_token_without_echoing_secret() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let output = Command::new(rnpm_bin())
+        .args(["login", "--registry", "https://registry.example.test/", "--scope", "@acme"])
+        .current_dir(&project)
+        .env("USERPROFILE", &home)
+        .env("HOME", &home)
+        .env("NPM_TOKEN", "secret-login-token")
+        .output()
+        .expect("failed to run rnpm login");
+
+    assert!(output.status.success(), "login failed: {}", String::from_utf8_lossy(&output.stderr));
+    let npmrc = std::fs::read_to_string(home.join(".npmrc")).unwrap();
+    assert!(npmrc.contains("//registry.example.test/:_authToken=secret-login-token"));
+    assert!(npmrc.contains("@acme:registry=https://registry.example.test/"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-login-token"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-login-token"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cli_publish_lifecycle_hooks_sequence() {
     let server = TestMockRegistry::start(|req| {
@@ -622,17 +647,16 @@ async fn test_cli_whoami_and_ping() {
 fn test_cli_auth_helpers_login_and_logout() {
     let tmp = tempdir().unwrap();
 
-    // 1. login output
+    // 1. Non-interactive login requires an explicit credential source.
     let login_out = Command::new(rnpm_bin())
         .arg("login")
         .current_dir(tmp.path())
         .output()
         .unwrap();
 
-    assert!(login_out.status.success());
-    let login_str = String::from_utf8_lossy(&login_out.stdout);
-    assert!(login_str.contains("rnpm: To log in"));
-    assert!(login_str.contains("_authToken"));
+    assert!(!login_out.status.success());
+    let login_err = String::from_utf8_lossy(&login_out.stderr);
+    assert!(login_err.contains("npm error code ENEEDAUTH"));
 
     // 2. logout with existing token removes token from .npmrc
     let local_npmrc = tmp.path().join(".npmrc");

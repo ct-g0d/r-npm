@@ -580,6 +580,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
             rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
         }),
+        license: root_manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+        engines: root_manifest.engines.clone(),
         parsed_version: parsed_root_version,
         extra: root_manifest.extra.clone(),
     };
@@ -613,6 +615,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
+            license: member.manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            engines: member.manifest.engines.clone(),
             ..Default::default()
         };
         graph.nodes.insert(member_loc.clone(), member_node);

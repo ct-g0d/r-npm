@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use rnpm_core::manifest::PeerDependencyMeta;
+use rnpm_core::semver::Version;
 use rnpm_lockfile::PackageBin;
 use serde::{Deserialize, Serialize};
 use crate::error::SolverError;
@@ -13,6 +14,8 @@ pub struct PackageVersionMetadata {
     pub dist_integrity: Option<String>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    pub dependency_order: Vec<String>,
     #[serde(default)]
     pub dev_dependencies: BTreeMap<String, String>,
     #[serde(default)]
@@ -30,24 +33,41 @@ pub struct PackageVersionMetadata {
     #[serde(default)]
     pub bin: Option<PackageBin>,
     #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub engines: BTreeMap<String, String>,
+    #[serde(default)]
     pub has_install_script: bool,
     #[serde(default)]
     pub deprecated: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl PackageVersionMetadata {
     /// Parse PackageVersionMetadata from a package manifest (package.json).
     pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Self {
+        // npm treats optionalDependencies as the authoritative declaration
+        // when a package lists the same name in both maps.  Keep the entry in
+        // the optional map so lockfiles and reachability flags retain the
+        // optional edge, but do not duplicate it in `dependencies`.
+        let optional_dependencies = manifest.optional_dependencies.clone();
+        let mut dependencies = manifest.dependencies.clone();
+        for name in optional_dependencies.keys() {
+            dependencies.remove(name);
+        }
+
         Self {
             name: manifest.name.clone().unwrap_or_default(),
             version: manifest.version.clone().unwrap_or_default(),
             dist_tarball: None,
             dist_integrity: None,
-            dependencies: manifest.dependencies.clone(),
+            dependency_order: dependencies.keys().cloned().collect(),
+            dependencies,
             dev_dependencies: manifest.dev_dependencies.clone(),
             peer_dependencies: manifest.peer_dependencies.clone(),
             peer_dependencies_meta: manifest.peer_dependencies_meta.clone(),
-            optional_dependencies: manifest.optional_dependencies.clone(),
+            optional_dependencies,
             os: manifest.os.clone(),
             cpu: manifest.cpu.clone(),
             libc: manifest.libc.clone(),
@@ -55,10 +75,13 @@ impl PackageVersionMetadata {
                 rnpm_core::manifest::PackageBin::Single(s) => PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => PackageBin::Map(m),
             }),
+            license: manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            engines: manifest.engines.clone(),
             has_install_script: manifest.scripts.contains_key("preinstall")
                 || manifest.scripts.contains_key("install")
                 || manifest.scripts.contains_key("postinstall"),
             deprecated: None,
+            extra: manifest.extra.clone(),
         }
     }
 
@@ -88,6 +111,7 @@ pub trait PackageMetadataProvider: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryPackageProvider {
     packages: BTreeMap<String, PackageMetadata>,
+    explicit_latest: BTreeSet<String>,
 }
 
 impl InMemoryPackageProvider {
@@ -118,9 +142,21 @@ impl InMemoryPackageProvider {
                 }
             });
 
-        // Update latest dist-tag if none or default
+        // Keep the synthetic provider's implicit latest tag aligned with the
+        // highest version, while preserving an explicitly assigned tag.
         if !pkg.dist_tags.contains_key("latest") {
             pkg.dist_tags.insert("latest".to_string(), version_str.clone());
+        } else if !self.explicit_latest.contains(&name_str) {
+            let should_update = pkg
+                .dist_tags
+                .get("latest")
+                .and_then(|current| Version::parse(current).ok())
+                .zip(Version::parse(&version_str).ok())
+                .map(|(current, next)| next > current)
+                .unwrap_or(false);
+            if should_update {
+                pkg.dist_tags.insert("latest".to_string(), version_str.clone());
+            }
         }
 
         let mut v_meta = PackageVersionMetadata {
@@ -136,6 +172,9 @@ impl InMemoryPackageProvider {
     pub fn set_dist_tag(&mut self, pkg_name: &str, tag: &str, version: &str) {
         if let Some(pkg) = self.packages.get_mut(pkg_name) {
             pkg.dist_tags.insert(tag.to_string(), version.to_string());
+            if tag == "latest" {
+                self.explicit_latest.insert(pkg_name.to_string());
+            }
         }
     }
 }

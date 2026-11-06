@@ -633,6 +633,8 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
     });
 
     // Incompatible platform optional package in lockfile
+    let mut skipped_child_deps = std::collections::BTreeMap::new();
+    skipped_child_deps.insert("other-os-child".to_string(), "1.0.0".to_string());
     lockfile.insert_package("node_modules/other-os-pkg", LockfilePackage {
         version: Some("1.0.0".to_string()),
         resolved: Some("http://invalid-url-should-never-be-called.local/other.tgz".to_string()),
@@ -640,6 +642,14 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
         optional: Some(true),
         os: Some(vec!["non_existent_os_xyz".to_string()]),
         cpu: Some(vec!["non_existent_cpu_xyz".to_string()]),
+        dependencies: Some(skipped_child_deps),
+        ..Default::default()
+    });
+    lockfile.insert_package("node_modules/other-os-pkg/node_modules/other-os-child", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("http://invalid-url-should-never-be-called.local/child.tgz".to_string()),
+        integrity: Some("sha512-dummy-child".to_string()),
+        optional: Some(true),
         ..Default::default()
     });
 
@@ -658,6 +668,7 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
     assert!(res.is_ok(), "CI install must succeed and skip incompatible optional dependency");
     assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
     assert!(!temp_proj.path().join("node_modules").join("other-os-pkg").exists());
+    assert!(!temp_proj.path().join("node_modules").join("other-os-pkg").join("node_modules").join("other-os-child").exists());
 }
 
 #[tokio::test]

@@ -169,7 +169,7 @@ pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
           SET \"_prog=node\"\r\n  \
           SET PATHEXT=%PATHEXT:;.JS;=;%\r\n\
         )\r\n\r\n\
-        endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" \"%dp0%\\..\\{target_win}\" %*\r\n"
+        endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\..\\{target_win}\" %*\r\n"
     )
 }
 
