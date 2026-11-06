@@ -142,6 +142,16 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
          }}\r\n\
          exit $ret\r\n"
     )
+    .replace("\r\n# Fix", "\r\n  # Fix")
+    .replace("\r\n$exe=\".exe\"", "\r\n  $exe=\".exe\"")
+    .replace("\r\n# Support", "\r\n  # Support")
+    .replace("\r\nif ($MyInvocation", "\r\n  if ($MyInvocation")
+    .replace("\r\n$input |", "\r\n    $input |")
+    .replace("\r\n& \"", "\r\n    & \"")
+    .replace("\r\n}\r\n$ret=$LASTEXITCODE", "\r\n  }\r\n  $ret=$LASTEXITCODE")
+    .replace("\r\n} else {\r\n  # Support", "\r\n  } else {\r\n  # Support")
+    .replace("\"   \"$basedir", "\"  \"$basedir")
+    .replace("\"   \"$basedir", "\"  \"$basedir")
     .replace("$basedir =", "$basedir=")
     .replace("$exe =", "$exe=")
     .replace("$ret =", "$ret=");
