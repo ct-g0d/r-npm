@@ -917,14 +917,100 @@ impl LockfileV3 {
         Ok(lf_json)
     }
 
-    /// Save the lockfile deterministically to disk.
-    pub fn save_to_file(&self, path: &Path) -> Result<(), LockfileError> {
-        let content = self.to_json_string()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    /// Serialize using npm's requested lockfile format.  The resolver keeps a
+    /// single v3 graph internally, then projects it to the legacy v1/v2
+    /// representations only at the filesystem boundary.
+    pub fn to_json_string_version(&self, version: u32) -> Result<String, LockfileError> {
+        match version {
+            3 => self.to_json_string(),
+            1 | 2 => {
+                let mut root = serde_json::Map::new();
+                root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+                if let Some(v) = &self.version {
+                    root.insert("version".into(), serde_json::Value::String(v.clone()));
+                }
+                root.insert("lockfileVersion".into(), serde_json::Value::Number(version.into()));
+                root.insert("requires".into(), serde_json::Value::Bool(true));
+
+                let legacy = self.to_legacy_dependencies();
+                if version == 1 {
+                    root.insert("dependencies".into(), legacy);
+                } else {
+                    let packages = self.to_v3_packages_value()?;
+                    root.insert("packages".into(), packages);
+                    root.insert("dependencies".into(), legacy);
+                }
+                let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+                if !out.ends_with('\n') { out.push('\n'); }
+                Ok(out)
+            }
+            other => Err(LockfileError::UnsupportedVersion(other)),
         }
+    }
+
+    /// Save using npm lockfile-version semantics (1, 2, or 3).
+    pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
+        let content = self.to_json_string_version(version)?;
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
         fs::write(path, content)?;
         Ok(())
+    }
+
+    fn to_v3_packages_value(&self) -> Result<serde_json::Value, LockfileError> {
+        let mut packages = serde_json::Map::new();
+        for (key, package) in &self.packages {
+            packages.insert(to_posix_path(key), serde_json::to_value(package)?);
+        }
+        Ok(serde_json::Value::Object(packages))
+    }
+
+    fn to_legacy_dependencies(&self) -> serde_json::Value {
+        fn package_value(package: &LockfilePackage) -> serde_json::Value {
+            let mut value = serde_json::Map::new();
+            if let Some(v) = &package.version { value.insert("version".into(), serde_json::Value::String(v.clone())); }
+            if let Some(v) = &package.resolved { value.insert("resolved".into(), serde_json::Value::String(v.clone())); }
+            if let Some(v) = &package.integrity { value.insert("integrity".into(), serde_json::Value::String(v.clone())); }
+            if package.dev == Some(true) { value.insert("dev".into(), serde_json::Value::Bool(true)); }
+            if package.optional == Some(true) { value.insert("optional".into(), serde_json::Value::Bool(true)); }
+            if package.dev_optional == Some(true) { value.insert("devOptional".into(), serde_json::Value::Bool(true)); }
+            if package.peer == Some(true) { value.insert("peer".into(), serde_json::Value::Bool(true)); }
+            if package.peer_optional == Some(true) { value.insert("peerOptional".into(), serde_json::Value::Bool(true)); }
+            if package.in_bundle == Some(true) { value.insert("bundled".into(), serde_json::Value::Bool(true)); }
+            if package.has_install_script == Some(true) { value.insert("hasInstallScript".into(), serde_json::Value::Bool(true)); }
+            if package.has_shrinkwrap == Some(true) { value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true)); }
+            if let Some(deps) = &package.dependencies { value.insert("requires".into(), serde_json::to_value(deps).unwrap_or_default()); }
+            serde_json::Value::Object(value)
+        }
+
+        fn insert_node(root: &mut serde_json::Map<String, serde_json::Value>, segments: &[&str], package: &LockfilePackage) {
+            if segments.is_empty() { return; }
+            let name = segments[0];
+            if segments.len() == 1 {
+                root.insert(name.to_string(), package_value(package));
+                return;
+            }
+            let entry = root.entry(name.to_string()).or_insert_with(|| serde_json::json!({}));
+            let object = entry.as_object_mut().expect("legacy dependency entry must be an object");
+            let nested = object.entry("dependencies").or_insert_with(|| serde_json::json!({}));
+            insert_node(nested.as_object_mut().expect("legacy dependencies must be an object"), &segments[1..], package);
+        }
+
+        let mut root = serde_json::Map::new();
+        let mut keys: Vec<_> = self.packages.keys().filter(|k| !k.is_empty()).collect();
+        keys.sort_by_key(|k| k.matches("/node_modules/").count());
+        for key in keys {
+            let path = key.trim_start_matches("node_modules/");
+            let segments: Vec<_> = path.split("/node_modules/").collect();
+            if let Some(package) = self.packages.get(key) {
+                insert_node(&mut root, &segments, package);
+            }
+        }
+        serde_json::Value::Object(root)
+    }
+
+    /// Save the lockfile deterministically to disk.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), LockfileError> {
+        self.save_to_file_version(path, 3)
     }
 
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
