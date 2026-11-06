@@ -160,6 +160,31 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     .replace("$exe =", "$exe=")
     .replace("$ret =", "$ret=");
 
+    let ps1 = {
+        let mut close_count = 0usize;
+        let mut else_count = 0usize;
+        let mut ret_count = 0usize;
+        ps1
+            .split("\r\n")
+            .map(|line| {
+                if line == "}" {
+                    close_count += 1;
+                    if close_count <= 2 { return "  }".to_string(); }
+                }
+                if line == "} else {" {
+                    else_count += 1;
+                    if else_count == 2 { return "  } else {".to_string(); }
+                }
+                if line == "$ret=$LASTEXITCODE" {
+                    ret_count += 1;
+                    if ret_count <= 2 { return "  $ret=$LASTEXITCODE".to_string(); }
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    };
+
     ShimContent { sh, cmd, ps1 }
 }
 
