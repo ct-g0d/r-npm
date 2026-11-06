@@ -175,7 +175,7 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
                 }
                 if bare == "} else {" {
                     else_count += 1;
-                    if else_count == 2 { return "  } else {".to_string(); }
+                    if else_count == 1 || else_count == 3 { return "  } else {".to_string(); }
                     return "} else {".to_string();
                 }
                 if bare == "$ret=$LASTEXITCODE" {
