@@ -642,7 +642,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         // 6. Hoisting & Tree Placement
-        let placement = determine_placement_with_peers(
+        let mut placement = determine_placement_with_peers(
             &self.graph,
             &task.parent_location,
             &dep_spec.install_name,
@@ -651,6 +651,40 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
         );
+        let root_slot = format!("node_modules/{}", dep_spec.install_name);
+        let potential_consumers = self
+            .graph
+            .nodes
+            .values()
+            .filter(|node| {
+                [&node.dependencies, &node.optional_dependencies, &node.peer_dependencies]
+                    .iter()
+                    .filter_map(|deps| deps.get(&dep_spec.install_name))
+                    .filter_map(|spec| PackageTarget::parse(spec).ok())
+                    .any(|target| crate::hoisting::node_satisfies_target(
+                        &Node { version: chosen_version.version.clone(), parsed_version: Version::parse(&chosen_version.version).ok(), ..Node::default() },
+                        &target,
+                    ))
+            })
+            .count();
+        if !task.parent_location.is_empty()
+            && self.graph.nodes.get(&root_slot).is_some_and(|existing| {
+                existing.name == dep_spec.package_name
+                    && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
+            })
+            && potential_consumers > 1
+            && self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name)
+        {
+            placement = determine_placement_with_peers(
+                &self.graph,
+                &task.parent_location,
+                &dep_spec.install_name,
+                &dep_spec.package_name,
+                &dep_spec.target,
+                &chosen_version.peer_dependencies,
+                &chosen_version.peer_dependencies_meta,
+            );
+        }
         let parent_skipped = self
             .graph
             .nodes
@@ -686,7 +720,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // slot. Without this repair, traversal order leaves the
                 // lower version at the root and nests the higher-priority
                 // package, producing the common Jest p-limit mismatch.
-                if target_loc == format!("node_modules/{}", dep_spec.install_name)
+                if target_loc == root_slot
                     && self.graph.nodes.get(&target_loc).is_some_and(|existing| {
                         existing.name == dep_spec.package_name
                             && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
