@@ -167,17 +167,21 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
         ps1
             .split("\r\n")
             .map(|line| {
-                if line == "}" {
+                let bare = line.trim_start();
+                if bare == "}" {
                     close_count += 1;
-                    if close_count <= 2 { return "  }".to_string(); }
+                    if close_count == 2 || close_count == 3 { return "  }".to_string(); }
+                    return "}".to_string();
                 }
-                if line == "} else {" {
+                if bare == "} else {" {
                     else_count += 1;
                     if else_count == 2 { return "  } else {".to_string(); }
+                    return "} else {".to_string();
                 }
-                if line == "$ret=$LASTEXITCODE" {
+                if bare == "$ret=$LASTEXITCODE" {
                     ret_count += 1;
                     if ret_count <= 2 { return "  $ret=$LASTEXITCODE".to_string(); }
+                    return "$ret=$LASTEXITCODE".to_string();
                 }
                 line.to_string()
             })
