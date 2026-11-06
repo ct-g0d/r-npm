@@ -1,4 +1,4 @@
-#![allow(clippy::permissions_set_readonly_false)]
+﻿#![allow(clippy::permissions_set_readonly_false)]
 
 use std::fs;
 use std::path::Path;
@@ -135,7 +135,7 @@ pub fn generate_posix_shim(target_rel_from_node_modules: &str) -> String {
     let target = escape_posix_path(target_rel_from_node_modules);
     format!(
         "#!/bin/sh\n\
-        basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\\\\\,/,g')\")\n\n\
+        basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\n\
         case `uname` in\n    \
             *CYGWIN*|*MINGW*|*MSYS*)\n        \
                 if command -v cygpath > /dev/null 2>&1; then\n            \
@@ -144,9 +144,9 @@ pub fn generate_posix_shim(target_rel_from_node_modules: &str) -> String {
             ;;\n\
         esac\n\n\
         if [ -x \"$basedir/node\" ]; then\n  \
-          exec \"$basedir/node\" \"$basedir/../{target}\" \"$@\"\n\
+          exec \"$basedir/node\"  \"$basedir/../{target}\" \"$@\"\n\
         else\n  \
-          exec node \"$basedir/../{target}\" \"$@\"\n\
+          exec node  \"$basedir/../{target}\" \"$@\"\n\
         fi\n"
     )
 }
@@ -178,45 +178,33 @@ pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
     let target = escape_ps1_path(target_rel_from_node_modules);
     format!(
         "#!/usr/bin/env pwsh\r\n\
-        $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\r\n\
-        $exe = \"\"\r\n\
-        if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\r\n  \
-          # Windows\r\n  \
-          if (Test-Path \"$basedir/node.exe\") {{\r\n    \
-            $exe = \"$basedir/node.exe\"\r\n  \
-          }} else {{\r\n    \
-            $exe = \"node\"\r\n  \
-          }}\r\n\
-        }} else {{\r\n  \
-          # Linux/macOS\r\n  \
-          if (Test-Path \"$basedir/node\") {{\r\n    \
-            $exe = \"$basedir/node\"\r\n  \
-          }} else {{\r\n    \
-            $exe = \"node\"\r\n  \
-          }}\r\n\
-        }}\r\n\r\n\
-        $ret = 0\r\n\
-        if (Test-Path \"$basedir/../{target}\") {{\r\n  \
-          # Support pipeline input\r\n  \
-          if ($MyInvocation.ExpectingInput) {{\r\n    \
-            $input | & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
-          }} else {{\r\n    \
-            & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
-          }}\r\n  \
-          $ret = $LASTEXITCODE\r\n\
-        }} else {{\r\n  \
-          # Support pipeline input\r\n  \
-          if ($MyInvocation.ExpectingInput) {{\r\n    \
-            $input | & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
-          }} else {{\r\n    \
-            & \"$exe\" \"$basedir/../{target}\" $args\r\n  \
-          }}\r\n  \
-          $ret = $LASTEXITCODE\r\n\
-        }}\r\n\
-        exit $ret\r\n"
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\r\n\
+$exe=\"\"\r\n\
+if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\r\n\
+  # Fix case when both the Windows and Linux builds of Node are installed in the same directory\r\n\
+  $exe=\".exe\"\r\n\
+}}\r\n\
+$ret=0\r\n\
+if (Test-Path \"$basedir/node$exe\") {{\r\n\
+  # Support pipeline input\r\n\
+  if ($MyInvocation.ExpectingInput) {{\r\n\
+    $input | & \"$basedir/node$exe\"  \"$basedir/../{target}\" $args\r\n\
+  }} else {{\r\n\
+    & \"$basedir/node$exe\"  \"$basedir/../{target}\" $args\r\n\
+  }}\r\n\
+  $ret=$LASTEXITCODE\r\n\
+}} else {{\r\n\
+  # Support pipeline input\r\n\
+  if ($MyInvocation.ExpectingInput) {{\r\n\
+    $input | & \"node$exe\"  \"$basedir/../{target}\" $args\r\n\
+  }} else {{\r\n\
+    & \"node$exe\"  \"$basedir/../{target}\" $args\r\n\
+  }}\r\n\
+  $ret=$LASTEXITCODE\r\n\
+}}\r\n\
+exit $ret\r\n"
     )
 }
-
 /// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix and Git Bash.
 /// Also supports files with UTF-8 BOM and clears Windows read-only flags if necessary.
 pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
@@ -353,3 +341,5 @@ pub fn create_package_shims(
     }
     Ok(())
 }
+
+
