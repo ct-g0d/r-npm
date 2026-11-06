@@ -838,10 +838,27 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .iter()
             .filter(|edge| edge.to_location == root_location)
             .collect();
-        if incoming.len() != 1 || incoming[0].from_location.is_empty() {
+        if incoming.is_empty() || incoming.iter().any(|edge| edge.from_location.is_empty()) {
             return false;
         }
-        let parent = incoming[0].from_location.clone();
+        let Some(existing_node) = self.graph.nodes.get(root_location).cloned() else {
+            return false;
+        };
+        let compatible_edges: Vec<_> = incoming
+            .iter()
+            .filter(|edge| {
+                PackageTarget::parse(&edge.spec)
+                    .map(|target| crate::hoisting::node_satisfies_target(&existing_node, &target))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if compatible_edges.is_empty() {
+            return false;
+        }
+        let parent = compatible_edges[0].from_location.clone();
+        if compatible_edges.iter().any(|edge| edge.from_location != parent) {
+            return false;
+        }
         let nested = format!("{parent}/node_modules/{install_name}");
         if self.graph.nodes.contains_key(&nested) {
             return false;
@@ -852,9 +869,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         node.location = nested.clone();
         self.graph.nodes.insert(nested.clone(), node);
         for edge in &mut self.graph.edges {
-            if edge.to_location == root_location {
-                edge.to_location = nested.clone();
-            }
+            if edge.to_location != root_location { continue; }
+            let keep_nested = PackageTarget::parse(&edge.spec)
+                .map(|target| crate::hoisting::node_satisfies_target(&existing_node, &target))
+                .unwrap_or(false);
+            if keep_nested { edge.to_location = nested.clone(); }
         }
         true
     }
