@@ -681,6 +681,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 });
             }
             PlacementDecision::PlaceNew(target_loc) => {
+                // Arborist can rehome an earlier transitive occupant when a
+                // later branch needs a different version in the shared root
+                // slot. Without this repair, traversal order leaves the
+                // lower version at the root and nests the higher-priority
+                // package, producing the common Jest p-limit mismatch.
+                if target_loc == format!("node_modules/{}", dep_spec.install_name)
+                    && self.graph.nodes.get(&target_loc).is_some_and(|existing| {
+                        existing.name == dep_spec.package_name
+                            && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
+                    })
+                {
+                    let _ = self.rehome_transitive_root_node(&target_loc, &dep_spec.install_name);
+                }
                 debug!(
                     "Placing package '{}' (install: '{}', version: '{}') at '{}'",
                     dep_spec.package_name,
@@ -812,6 +825,38 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         Ok(())
+    }
+
+    /// Move a transitive root occupant beneath the sole package that still
+    /// requires its version. Direct root dependencies are never moved, and
+    /// ambiguous multi-parent occupants are left untouched for the normal
+    /// conflict-nesting path.
+    fn rehome_transitive_root_node(&mut self, root_location: &str, install_name: &str) -> bool {
+        let incoming: Vec<_> = self
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to_location == root_location)
+            .collect();
+        if incoming.len() != 1 || incoming[0].from_location.is_empty() {
+            return false;
+        }
+        let parent = incoming[0].from_location.clone();
+        let nested = format!("{parent}/node_modules/{install_name}");
+        if self.graph.nodes.contains_key(&nested) {
+            return false;
+        }
+        let Some(mut node) = self.graph.nodes.remove(root_location) else {
+            return false;
+        };
+        node.location = nested.clone();
+        self.graph.nodes.insert(nested.clone(), node);
+        for edge in &mut self.graph.edges {
+            if edge.to_location == root_location {
+                edge.to_location = nested.clone();
+            }
+        }
+        true
     }
 
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
