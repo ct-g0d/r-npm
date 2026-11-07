@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use tar::Archive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +336,7 @@ pub fn write_file_fast(
     path: &Path,
     data: &[u8],
     mode: u32,
-    prealloc_threshold: usize,
+    _prealloc_threshold: usize,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -362,13 +361,6 @@ pub fn write_file_fast(
                 lpOverlapped: *mut std::ffi::c_void,
             ) -> i32;
 
-            fn SetFileInformationByHandle(
-                hFile: *mut std::ffi::c_void,
-                FileInformationClass: i32,
-                lpFileInformation: *const std::ffi::c_void,
-                dwBufferSize: u32,
-            ) -> i32;
-
             fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
 
             fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
@@ -379,27 +371,23 @@ pub fn write_file_fast(
         const CREATE_ALWAYS: u32 = 2;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-        const FILE_ALLOCATION_INFO_CLASS: i32 = 5;
         const ERROR_ACCESS_DENIED: u32 = 5;
-
-        const WRITE_CHUNK_SIZE: usize = 128 * 1024; // 128 KiB optimal write chunk
-
-        #[repr(C)]
-        struct FILE_ALLOCATION_INFO {
-            allocation_size: i64,
-        }
 
         const FILE_SHARE_READ: u32 = 1;
         const FILE_SHARE_WRITE: u32 = 2;
         const FILE_SHARE_DELETE: u32 = 4;
         const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
-        let verbatim_path = crate::path::to_verbatim_path(path);
-        let path_wide: Vec<u16> = verbatim_path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let path_wide: Vec<u16> = {
+            let s = path.as_os_str();
+            let bytes = s.as_encoded_bytes();
+            if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\") {
+                s.encode_wide().chain(Some(0)).collect()
+            } else {
+                let verb = crate::path::to_verbatim_path(path);
+                verb.as_os_str().encode_wide().chain(Some(0)).collect()
+            }
+        };
 
         let mut handle = unsafe {
             CreateFileW(
@@ -455,24 +443,9 @@ pub fn write_file_fast(
             }
         }
 
-        // Preallocation for files >= threshold (default 64 KiB)
-        if data.len() >= prealloc_threshold {
-            let alloc_info = FILE_ALLOCATION_INFO {
-                allocation_size: data.len() as i64,
-            };
-            unsafe {
-                let _ = SetFileInformationByHandle(
-                    handle,
-                    FILE_ALLOCATION_INFO_CLASS,
-                    &alloc_info as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
-                );
-            }
-        }
-
         let data_len = data.len();
 
-        if data_len <= WRITE_CHUNK_SIZE {
+        if data_len > 0 {
             let mut written = 0u32;
             let ok = unsafe {
                 WriteFile(
@@ -489,38 +462,6 @@ pub fn write_file_fast(
                     CloseHandle(handle);
                 }
                 return Err(std::io::Error::from_raw_os_error(err as i32));
-            }
-        } else {
-            let mut total_written = 0usize;
-            while total_written < data_len {
-                let to_write = (data_len - total_written).min(WRITE_CHUNK_SIZE) as u32;
-                let mut written = 0u32;
-                let ok = unsafe {
-                    WriteFile(
-                        handle,
-                        data[total_written..].as_ptr() as *const std::ffi::c_void,
-                        to_write,
-                        &mut written,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    let err = unsafe { GetLastError() };
-                    unsafe {
-                        CloseHandle(handle);
-                    }
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-                if written == 0 {
-                    unsafe {
-                        CloseHandle(handle);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write whole buffer (WriteFile returned 0 bytes written)",
-                    ));
-                }
-                total_written += written as usize;
             }
         }
 
@@ -580,6 +521,7 @@ pub struct MaterializeFile {
 ///
 /// Files >= 64 KiB or ending with `.node`, `.wasm`, `.exe`, `.dll` receive top priority
 /// to ensure heavy files and native binaries start writing and scanning first.
+#[allow(dead_code)]
 fn file_lpt_priority(file: &MaterializeFile) -> u64 {
     let size = file.data.len() as u64;
     let path_str = file.path.to_string_lossy();
@@ -596,6 +538,110 @@ fn file_lpt_priority(file: &MaterializeFile) -> u64 {
     }
 }
 
+/// A borrowed reference to a file to be materialized into place.
+#[derive(Debug, Clone)]
+pub struct MaterializeFileRef<'a> {
+    pub path: PathBuf,
+    pub data: &'a [u8],
+    pub mode: u32,
+    pub package_id: Option<&'a str>,
+}
+
+fn file_ref_lpt_priority(file: &MaterializeFileRef<'_>) -> u64 {
+    let size = file.data.len() as u64;
+    let path_str = file.path.to_string_lossy();
+    let is_heavy = size >= 64 * 1024
+        || path_str.ends_with(".node")
+        || path_str.ends_with(".wasm")
+        || path_str.ends_with(".exe")
+        || path_str.ends_with(".dll");
+
+    if is_heavy {
+        (1u64 << 62) | size
+    } else {
+        size
+    }
+}
+
+/// Writes a batch of borrowed file references in parallel according to the optimal disk policy:
+/// - SSD: 24-48 threads, global LPT scheduling across all packages with lock-free atomic chunking.
+/// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
+pub fn materialize_files_parallel_refs<'a>(
+    files: Vec<MaterializeFileRef<'a>>,
+    config: &ParallelWriterConfig,
+) -> Result<(), FsError> {
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let prealloc_thresh = config.preallocate_threshold;
+
+    // Group files by package to maintain directory locality and eliminate cross-thread directory contention
+    let mut package_groups: BTreeMap<String, Vec<MaterializeFileRef<'a>>> = BTreeMap::new();
+    let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
+
+    for file in files {
+        if let Some(pkg) = file.package_id {
+            package_groups
+                .entry(pkg.to_string())
+                .or_default()
+                .push(file);
+        } else {
+            ungrouped.push(file);
+        }
+    }
+
+    // Each package group sorted internally by LPT
+    for group in package_groups.values_mut() {
+        group.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+    }
+
+    let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
+    batches.sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
+
+    if !ungrouped.is_empty() {
+        ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+        batches.push(ungrouped);
+    }
+
+    let total_batches = batches.len();
+    let next_pkg = std::sync::atomic::AtomicUsize::new(0);
+    let num_threads = if config.is_hdd {
+        config.worker_threads.clamp(1, 4)
+    } else {
+        config.worker_threads.clamp(32, 48).max(32)
+    };
+    let batches_slice = &batches[..];
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for _ in 0..num_threads {
+            handles.push(scope.spawn(|| -> Result<(), FsError> {
+                loop {
+                    let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= total_batches {
+                        break;
+                    }
+                    for file in &batches_slice[idx] {
+                        write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
+                            .map_err(FsError::Io)?;
+                    }
+                }
+                Ok(())
+            }));
+        }
+
+        for handle in handles {
+            handle.join().map_err(|_| {
+                FsError::Io(std::io::Error::other("Materialization worker panicked"))
+            })??;
+        }
+
+        Ok(())
+    })
+}
+
 /// Writes a batch of files in parallel according to the optimal disk policy:
 /// - SSD: 24-32 threads, global LPT scheduling across all packages.
 /// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
@@ -603,142 +649,16 @@ pub fn materialize_files_parallel(
     files: Vec<MaterializeFile>,
     config: &ParallelWriterConfig,
 ) -> Result<(), FsError> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    // Deduplicate files by path before scheduling writes: later entries win
-    let mut dedup_map: HashMap<PathBuf, MaterializeFile> = HashMap::with_capacity(files.len());
-    let mut file_order: Vec<PathBuf> = Vec::with_capacity(files.len());
-    for file in files {
-        let path = clean(&file.path);
-        if dedup_map.insert(path.clone(), file).is_none() {
-            file_order.push(path);
-        }
-    }
-    let files: Vec<MaterializeFile> = file_order
-        .into_iter()
-        .filter_map(|p| dedup_map.remove(&p))
+    let refs: Vec<MaterializeFileRef<'_>> = files
+        .iter()
+        .map(|f| MaterializeFileRef {
+            path: f.path.clone(),
+            data: &f.data,
+            mode: f.mode,
+            package_id: f.package_id.as_deref(),
+        })
         .collect();
-
-    let prealloc_thresh = config.preallocate_threshold;
-
-    if config.is_hdd {
-        // HDD mode: 4 worker threads, group files by package to keep disk writes sequential
-        let mut package_groups: BTreeMap<String, Vec<MaterializeFile>> = BTreeMap::new();
-        let mut ungrouped: Vec<MaterializeFile> = Vec::new();
-
-        for file in files {
-            if let Some(ref pkg) = file.package_id {
-                package_groups.entry(pkg.clone()).or_default().push(file);
-            } else {
-                ungrouped.push(file);
-            }
-        }
-
-        // Each package group sorted internally by LPT
-        for group in package_groups.values_mut() {
-            group.sort_by_key(|a| std::cmp::Reverse(file_lpt_priority(a)));
-        }
-
-        let mut batches: Vec<Vec<MaterializeFile>> = package_groups.into_values().collect();
-        // Sort package batches by total byte size descending (heavier packages first)
-        batches
-            .sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
-
-        if !ungrouped.is_empty() {
-            ungrouped.sort_by_key(|a| std::cmp::Reverse(file_lpt_priority(a)));
-            batches.push(ungrouped);
-        }
-
-        let queue = Arc::new(Mutex::new(batches));
-        let num_threads = config.worker_threads.clamp(1, 4);
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-
-            for _ in 0..num_threads {
-                let q = Arc::clone(&queue);
-                handles.push(scope.spawn(move || -> Result<(), FsError> {
-                    loop {
-                        let batch = {
-                            let mut guard = q.lock().unwrap();
-                            guard.pop()
-                        };
-                        match batch {
-                            Some(pkg_files) => {
-                                for file in pkg_files {
-                                    write_file_fast(
-                                        &file.path,
-                                        &file.data,
-                                        file.mode,
-                                        prealloc_thresh,
-                                    )
-                                    .map_err(FsError::Io)?;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    Ok(())
-                }));
-            }
-
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    FsError::Io(std::io::Error::other("HDD materialization worker panicked"))
-                })??;
-            }
-
-            Ok(())
-        })
-    } else {
-        // SSD / NVMe mode: 24-32 threads, global LPT queue
-        let mut sorted_files = files;
-        sorted_files.sort_by_key(|a| std::cmp::Reverse(file_lpt_priority(a)));
-
-        let queue = Arc::new(Mutex::new(sorted_files));
-        let num_threads = config.worker_threads.clamp(1, 32);
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-
-            for _ in 0..num_threads {
-                let q = Arc::clone(&queue);
-                handles.push(scope.spawn(move || -> Result<(), FsError> {
-                    let mut local_batch = Vec::with_capacity(8);
-                    loop {
-                        {
-                            let mut guard = q.lock().unwrap();
-                            let remaining = guard.len();
-                            if remaining == 0 {
-                                break;
-                            }
-                            let chunk_size = (remaining / (num_threads * 2)).clamp(1, 16);
-                            let start = remaining.saturating_sub(chunk_size);
-                            local_batch.extend(guard.split_off(start));
-                        }
-
-                        while let Some(file) = local_batch.pop() {
-                            write_file_fast(&file.path, &file.data, file.mode, prealloc_thresh)
-                                .map_err(FsError::Io)?;
-                        }
-                    }
-                    Ok(())
-                }));
-            }
-
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    FsError::Io(std::io::Error::other(
-                        "Parallel materialization worker panicked",
-                    ))
-                })??;
-            }
-
-            Ok(())
-        })
-    }
+    materialize_files_parallel_refs(refs, config)
 }
 
 /// A package tarball decoded in memory, ready for parallel materialization.

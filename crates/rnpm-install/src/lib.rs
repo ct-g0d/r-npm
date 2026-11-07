@@ -3730,192 +3730,336 @@ impl Installer {
             }
         }
 
-        // Pre-create all package directories and all internal pack directories in one single pass before file writes
-        {
+        let ci_writer_cfg = Arc::clone(&self.writer_cfg);
+
+        let all_packs_available = !packages_to_process.is_empty()
+            && packages_to_process
+                .iter()
+                .all(|(_, _, integrity_str, _, _, _)| {
+                    !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
+                });
+
+        let mut used_fast_path = false;
+
+        if all_packs_available {
+            let mut loaded_packs = Vec::with_capacity(packages_to_process.len());
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
             all_dirs.insert(bin_dir.clone());
 
+            let mut load_success = true;
+
             for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
                 let pkg_target = loc_base_dir.join(pkg_key);
+                if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&pkg_target);
+                }
                 all_dirs.insert(pkg_target.clone());
                 if let Some(parent) = pkg_target.parent() {
                     all_dirs.insert(parent.to_path_buf());
                 }
 
-                if !integrity_str.is_empty() {
-                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
-                        for entry in &pack.index.files {
-                            let p = Path::new(&entry.path);
-                            if let Some(sub_parent) = p.parent() {
-                                if !sub_parent.as_os_str().is_empty() {
-                                    all_dirs.insert(pkg_target.join(sub_parent));
-                                }
-                            }
-                        }
+                match self.pack_store.get_package_pack(integrity_str) {
+                    Ok(Some(pack)) => {
+                        loaded_packs.push((pkg_key.clone(), pkg_target, pack));
+                    }
+                    Err(e) => {
+                        eprintln!("[DEBUG_CI] get_package_pack error for {pkg_key}: {e}");
+                        load_success = false;
+                        break;
+                    }
+                    Ok(None) => {
+                        eprintln!("[DEBUG_CI] get_package_pack None for {pkg_key}");
+                        load_success = false;
+                        break;
                     }
                 }
             }
 
-            let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
-            let _ = precreate_directories(dir_refs);
+            if load_success {
+                let mut all_file_refs = Vec::with_capacity(16384);
+                let mut all_symlinks = Vec::new();
+
+                for (pkg_key, pkg_target, pack) in &loaded_packs {
+                    for entry in &pack.index.files {
+                        let full_path = pkg_target.join(&entry.path);
+                        if let Some(parent) = full_path.parent() {
+                            all_dirs.insert(parent.to_path_buf());
+                        }
+                        if let Some(slice) = pack.get_file_slice(&entry.path) {
+                            all_file_refs.push(rnpm_fs::MaterializeFileRef {
+                                path: full_path,
+                                data: slice,
+                                mode: entry.mode,
+                                package_id: Some(pkg_key.as_str()),
+                            });
+                        }
+                    }
+                    for (link_rel, target_rel) in &pack.index.symlinks {
+                        all_symlinks.push((pkg_target.join(link_rel), pkg_target.join(target_rel)));
+                    }
+                }
+
+                used_fast_path = true;
+
+                // 1. Precreate all directories breadth-first in a single pass
+                let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+                let _ = precreate_directories(dir_refs);
+
+                // 2. Materialize all files globally parallel across threads
+                let t_mat = std::time::Instant::now();
+                rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
+                    .map_err(|e| anyhow!("{e}"))?;
+                collector.record_phase(Phase::Materialize, t_mat.elapsed());
+
+                // 3. Recreate symlinks
+                for (link_path, target_path) in all_symlinks {
+                    let _ = rnpm_fs::create_junction(&link_path, &target_path);
+                }
+
+                // 4. Process bin shims and lifecycle scripts
+                for (
+                    pkg_key,
+                    resolved_url,
+                    _,
+                    is_optional,
+                    declared_dependencies,
+                    has_bins_or_scripts,
+                ) in &packages_to_process
+                {
+                    let target_path = loc_base_dir.join(pkg_key);
+                    let pkg_bin_dir =
+                        find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
+                    if *has_bins_or_scripts {
+                        if let Some(l_node) = process_installed_pkg_manifest(
+                            &target_path,
+                            &pkg_bin_dir,
+                            pkg_key,
+                            resolved_url,
+                            declared_dependencies,
+                            *is_optional,
+                            &collector,
+                        ) {
+                            lifecycle_nodes.push(l_node);
+                        }
+                    }
+                    packages_installed += 1;
+                    cache_hits += 1;
+                    collector.record_cache_hit();
+                }
+            }
         }
 
-        let ci_writer_cfg = Arc::clone(&self.writer_cfg);
-        let semaphore = Arc::clone(&self.io_semaphore);
-        let mut join_set = tokio::task::JoinSet::new();
+        if !used_fast_path {
+            let semaphore = Arc::clone(&self.io_semaphore);
+            let mut join_set = tokio::task::JoinSet::new();
 
-        for (
-            pkg_key,
-            resolved_url,
-            integrity_str,
-            is_optional,
-            declared_dependencies,
-            has_bins_or_scripts,
-        ) in packages_to_process
-        {
-            let sem = Arc::clone(&semaphore);
-            let cache = self.cache.clone();
-            let pack_store = Arc::clone(&self.pack_store);
-            let registry_client = self.registry_client.clone();
-            let project_dir = loc_base_dir.clone();
-            let root_bin = bin_dir.clone();
-            let root_nm = node_modules_dir.clone();
-            let offline = self.options.offline;
-            let worker_collector = collector.clone();
-            let pkg_writer_cfg = Arc::clone(&ci_writer_cfg);
+            for (
+                pkg_key,
+                resolved_url,
+                integrity_str,
+                is_optional,
+                declared_dependencies,
+                has_bins_or_scripts,
+            ) in packages_to_process
+            {
+                let sem = Arc::clone(&semaphore);
+                let cache = self.cache.clone();
+                let pack_store = Arc::clone(&self.pack_store);
+                let registry_client = self.registry_client.clone();
+                let project_dir = loc_base_dir.clone();
+                let root_bin = bin_dir.clone();
+                let root_nm = node_modules_dir.clone();
+                let offline = self.options.offline;
+                let worker_collector = collector.clone();
+                let pkg_writer_cfg = Arc::clone(&ci_writer_cfg);
 
-            join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
-                let target_path = project_dir.join(&pkg_key);
-                let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &root_bin, &root_nm);
+                    let target_path = project_dir.join(&pkg_key);
+                    let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &root_bin, &root_nm);
 
-                if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
-                    let _ = rnpm_fs::remove_junction(&target_path);
-                }
+                    if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_junction(&target_path);
+                    }
 
-                // 1. Warm CI Pack Store check: if pack exists, materialize directly from pack!
-                if !integrity_str.is_empty() && pack_store.has_package_pack(&integrity_str) {
-                    let t_mat = std::time::Instant::now();
-                    let target_clone = target_path.clone();
-                    let ps_clone = Arc::clone(&pack_store);
-                    let integ_clone = integrity_str.clone();
-                    let cfg_clone = Arc::clone(&pkg_writer_cfg);
-                    let key_clone = pkg_key.clone();
+                    // 1. Warm CI Pack Store check: if pack exists, materialize directly from pack!
+                    if !integrity_str.is_empty() && pack_store.has_package_pack(&integrity_str) {
+                        let t_mat = std::time::Instant::now();
+                        let target_clone = target_path.clone();
+                        let ps_clone = Arc::clone(&pack_store);
+                        let integ_clone = integrity_str.clone();
+                        let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                        let key_clone = pkg_key.clone();
 
-                    let mat_res = tokio::task::spawn_blocking(move || {
-                        let _mat_span = tracing::info_span!("materialize", package = %key_clone).entered();
-                        let res = ps_clone.materialize_pack_opt(&integ_clone, &target_clone, Some(&cfg_clone), true);
-                        drop(_mat_span);
-                        res
-                    }).await?;
-                    worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                        let mat_res = tokio::task::spawn_blocking(move || {
+                            let _mat_span =
+                                tracing::info_span!("materialize", package = %key_clone).entered();
+                            let res = ps_clone.materialize_pack_opt(
+                                &integ_clone,
+                                &target_clone,
+                                Some(&cfg_clone),
+                                true,
+                            );
+                            drop(_mat_span);
+                            res
+                        })
+                        .await?;
+                        worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
-                    match mat_res {
-                        Ok(_) => {
-                            let lifecycle_node = if has_bins_or_scripts {
-                                process_installed_pkg_manifest(
-                                    &target_path,
-                                    &pkg_bin_dir,
-                                    &pkg_key,
-                                    &resolved_url,
-                                    &declared_dependencies,
-                                    is_optional,
-                                    &worker_collector,
-                                )
-                            } else {
-                                None
-                            };
-                            return Ok(Some((true, lifecycle_node)));
-                        }
-                        Err(e) => {
-                            if e.is_pack_corruption() {
-                                warn!("Warm CI materialize_pack failed for {pkg_key}: {e}. Purging pack and falling back to tarball fetch.");
-                                let _ = pack_store.purge(&integrity_str);
-                                let _ = std::fs::remove_dir_all(&target_path);
-                            } else {
-                                return Err(anyhow!("Warm CI materialize_pack failed for {pkg_key}: {e}"));
+                        match mat_res {
+                            Ok(_) => {
+                                let lifecycle_node = if has_bins_or_scripts {
+                                    process_installed_pkg_manifest(
+                                        &target_path,
+                                        &pkg_bin_dir,
+                                        &pkg_key,
+                                        &resolved_url,
+                                        &declared_dependencies,
+                                        is_optional,
+                                        &worker_collector,
+                                    )
+                                } else {
+                                    None
+                                };
+                                return Ok(Some((true, lifecycle_node)));
+                            }
+                            Err(e) => {
+                                if e.is_pack_corruption() {
+                                    warn!("Warm CI materialize_pack failed for {pkg_key}: {e}. Purging pack and falling back to tarball fetch.");
+                                    let _ = pack_store.purge(&integrity_str);
+                                    let _ = std::fs::remove_dir_all(&target_path);
+                                } else {
+                                    return Err(anyhow!(
+                                        "Warm CI materialize_pack failed for {pkg_key}: {e}"
+                                    ));
+                                }
                             }
                         }
                     }
-                }
 
-                // 2. Local archive or registry download
-                let (bytes, was_hit) = if resolved_url.starts_with("file:") {
-                    let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
-                    if file_path.contains('\0') {
-                        return Err(anyhow!("Resolved file URL contains null bytes: {resolved_url}"));
-                    }
-                    let clean_project_dir = path_clean::clean(&project_dir);
-                    let candidate_path = if Path::new(file_path).is_absolute() {
-                        PathBuf::from(file_path)
-                    } else {
-                        clean_project_dir.join(file_path)
-                    };
-                    let clean_file_path = path_clean::clean(&candidate_path);
-                    if !clean_file_path.starts_with(&clean_project_dir) {
-                        return Err(anyhow!(
-                            "Security error: resolved file URL '{}' escapes project directory '{}'",
-                            resolved_url,
-                            clean_project_dir.display()
-                        ));
-                    }
-                    if let (Ok(canon_proj), Ok(canon_file)) = (clean_project_dir.canonicalize(), clean_file_path.canonicalize()) {
-                        if !canon_file.starts_with(&canon_proj) {
+                    // 2. Local archive or registry download
+                    let (bytes, was_hit) = if resolved_url.starts_with("file:") {
+                        let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
+                        if file_path.contains('\0') {
                             return Err(anyhow!(
-                                "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
-                                resolved_url,
-                                canon_file.display(),
-                                canon_proj.display()
+                                "Resolved file URL contains null bytes: {resolved_url}"
                             ));
                         }
-                    }
-                    if !clean_file_path.exists() {
-                        if is_optional {
-                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", clean_file_path.display());
-                            return Ok(None);
+                        let clean_project_dir = path_clean::clean(&project_dir);
+                        let candidate_path = if Path::new(file_path).is_absolute() {
+                            PathBuf::from(file_path)
                         } else {
-                            return Err(anyhow!("Archive file not found: {}", clean_file_path.display()));
+                            clean_project_dir.join(file_path)
+                        };
+                        let clean_file_path = path_clean::clean(&candidate_path);
+                        if !clean_file_path.starts_with(&clean_project_dir) {
+                            return Err(anyhow!(
+                                "Security error: resolved file URL '{}' escapes project directory '{}'",
+                                resolved_url,
+                                clean_project_dir.display()
+                            ));
                         }
-                    }
-                    let bytes = std::fs::read(&clean_file_path)
-                        .with_context(|| format!("Failed to read local archive file '{}'", clean_file_path.display()))?;
-
-                    let expected_integrity: Integrity = integrity_str
-                        .parse()
-                        .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
-                    if let Err(e) = expected_integrity.verify(&bytes) {
-                        if is_optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(anyhow!("Integrity verification failed for local archive {pkg_key}: {e}"));
-                        }
-                    }
-                    (bytes, true)
-                } else {
-                    let expected_integrity: Integrity = integrity_str
-                        .parse()
-                        .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
-
-                    let t_fetch = std::time::Instant::now();
-                    let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
-                        if expected_integrity.verify(&data).is_ok() {
-                            Ok((data, true))
-                        } else {
-                            debug!("Cached blob for {pkg_key} failed integrity, purging and re-fetching");
-                            let _ = cache.purge_key(&resolved_url);
-                            if offline {
-                                if is_optional {
-                                    return Ok(None);
-                                }
+                        if let (Ok(canon_proj), Ok(canon_file)) = (
+                            clean_project_dir.canonicalize(),
+                            clean_file_path.canonicalize(),
+                        ) {
+                            if !canon_file.starts_with(&canon_proj) {
                                 return Err(anyhow!(
-                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}"
+                                    "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
+                                    resolved_url,
+                                    canon_file.display(),
+                                    canon_proj.display()
                                 ));
                             }
+                        }
+                        if !clean_file_path.exists() {
+                            if is_optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found",
+                                    clean_file_path.display()
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!(
+                                    "Archive file not found: {}",
+                                    clean_file_path.display()
+                                ));
+                            }
+                        }
+                        let bytes = std::fs::read(&clean_file_path).with_context(|| {
+                            format!(
+                                "Failed to read local archive file '{}'",
+                                clean_file_path.display()
+                            )
+                        })?;
+
+                        let expected_integrity: Integrity = integrity_str
+                            .parse()
+                            .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+                        if let Err(e) = expected_integrity.verify(&bytes) {
+                            if is_optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!(
+                                    "Integrity verification failed for local archive {pkg_key}: {e}"
+                                ));
+                            }
+                        }
+                        (bytes, true)
+                    } else {
+                        let expected_integrity: Integrity = integrity_str
+                            .parse()
+                            .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+
+                        let t_fetch = std::time::Instant::now();
+                        let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                            if expected_integrity.verify(&data).is_ok() {
+                                Ok((data, true))
+                            } else {
+                                debug!("Cached blob for {pkg_key} failed integrity, purging and re-fetching");
+                                let _ = cache.purge_key(&resolved_url);
+                                if offline {
+                                    if is_optional {
+                                        return Ok(None);
+                                    }
+                                    return Err(anyhow!(
+                                        "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}"
+                                    ));
+                                }
+                                match registry_client.download_tarball_bytes(&resolved_url).await {
+                                    Ok(fresh_bytes) => {
+                                        if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                            if is_optional {
+                                                warn!(
+                                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                                );
+                                                return Ok(None);
+                                            } else {
+                                                return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                            }
+                                        }
+                                        let t_sw = std::time::Instant::now();
+                                        let _ = cache.put_with_integrity(&resolved_url, &fresh_bytes, Some(&expected_integrity), None);
+                                        worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                        Ok((fresh_bytes, false))
+                                    }
+                                    Err(e) => Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                                }
+                            }
+                        } else if offline {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {pkg_key} not found in local cache (--offline)");
+                                return Ok(None);
+                            }
+                            return Err(anyhow!(
+                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            ));
+                        } else {
                             match registry_client.download_tarball_bytes(&resolved_url).await {
                                 Ok(fresh_bytes) => {
                                     if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
@@ -3935,122 +4079,94 @@ impl Installer {
                                 }
                                 Err(e) => Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
                             }
-                        }
-                    } else if offline {
-                        if is_optional {
-                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {pkg_key} not found in local cache (--offline)");
-                            return Ok(None);
-                        }
-                        return Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
-                        ));
-                    } else {
-                        match registry_client.download_tarball_bytes(&resolved_url).await {
-                            Ok(fresh_bytes) => {
-                                if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
-                                    if is_optional {
-                                        warn!(
-                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
-                                        );
-                                        return Ok(None);
-                                    } else {
-                                        return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
-                                    }
+                        };
+                        worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
+
+                        match fetch_res {
+                            Ok(res) => res,
+                            Err(err) => {
+                                if is_optional {
+                                    warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {pkg_key}: {err}");
+                                    return Ok(None);
+                                } else {
+                                    return Err(err);
                                 }
-                                let t_sw = std::time::Instant::now();
-                                let _ = cache.put_with_integrity(&resolved_url, &fresh_bytes, Some(&expected_integrity), None);
-                                worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                                Ok((fresh_bytes, false))
                             }
-                            Err(e) => Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
                         }
                     };
-                    worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
-                    match fetch_res {
-                        Ok(res) => res,
-                        Err(err) => {
-                            if is_optional {
-                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {pkg_key}: {err}");
-                                return Ok(None);
-                            } else {
-                                return Err(err);
-                            }
-                        }
+                    // Construct pack in pack store if not present
+                    if !integrity_str.is_empty() && !pack_store.has_package_pack(&integrity_str) {
+                        let t_sw = std::time::Instant::now();
+                        let _ = pack_store.put_package_from_tarball(&integrity_str, &bytes);
+                        worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
                     }
-                };
 
-                // Construct pack in pack store if not present
-                if !integrity_str.is_empty() && !pack_store.has_package_pack(&integrity_str) {
-                    let t_sw = std::time::Instant::now();
-                    let _ = pack_store.put_package_from_tarball(&integrity_str, &bytes);
-                    worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                }
+                    // Materialize via spawn_blocking
+                    let target_clone = target_path.clone();
+                    let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                    let ps_clone = Arc::clone(&pack_store);
+                    let integ_clone = integrity_str.clone();
+                    let key_clone = pkg_key.clone();
 
-                // Materialize via spawn_blocking
-                let target_clone = target_path.clone();
-                let cfg_clone = Arc::clone(&pkg_writer_cfg);
-                let ps_clone = Arc::clone(&pack_store);
-                let integ_clone = integrity_str.clone();
-                let key_clone = pkg_key.clone();
-
-                let extract_res = tokio::task::spawn_blocking(move || {
-                    if !integ_clone.is_empty() && ps_clone.has_package_pack(&integ_clone) {
-                        match ps_clone.materialize_pack(&integ_clone, &target_clone, Some(&cfg_clone)) {
-                            Ok(sum) => Ok(sum),
-                            Err(e) => {
-                                if e.is_pack_corruption() {
-                                    warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
-                                    let _ = ps_clone.purge(&integ_clone);
-                                    let _ = std::fs::remove_dir_all(&target_clone);
-                                    extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
-                                        .map_err(|e| anyhow!("{e}"))
-                                } else {
-                                    Err(anyhow!("Failed to materialize package {key_clone}: {e}"))
+                    let extract_res = tokio::task::spawn_blocking(move || {
+                        if !integ_clone.is_empty() && ps_clone.has_package_pack(&integ_clone) {
+                            match ps_clone.materialize_pack(&integ_clone, &target_clone, Some(&cfg_clone)) {
+                                Ok(sum) => Ok(sum),
+                                Err(e) => {
+                                    if e.is_pack_corruption() {
+                                        warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
+                                        let _ = ps_clone.purge(&integ_clone);
+                                        let _ = std::fs::remove_dir_all(&target_clone);
+                                        extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
+                                            .map_err(|e| anyhow!("{e}"))
+                                    } else {
+                                        Err(anyhow!("Failed to materialize package {key_clone}: {e}"))
+                                    }
                                 }
                             }
+                        } else {
+                            extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
+                                .map_err(|e| anyhow!("{e}"))
                         }
+                    }).await??;
+
+                    worker_collector.record_phase(Phase::Materialize, extract_res.materialize_duration);
+                    worker_collector.record_phase(Phase::Inflate, extract_res.inflate_duration);
+
+                    let lifecycle_node = if has_bins_or_scripts {
+                        process_installed_pkg_manifest(
+                            &target_path,
+                            &pkg_bin_dir,
+                            &pkg_key,
+                            &resolved_url,
+                            &declared_dependencies,
+                            is_optional,
+                            &worker_collector,
+                        )
                     } else {
-                        extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
-                            .map_err(|e| anyhow!("{e}"))
+                        None
+                    };
+
+                    Ok(Some((was_hit, lifecycle_node)))
+                });
+            }
+
+            while let Some(join_res) = join_set.join_next().await {
+                let item_opt =
+                    join_res.map_err(|e| anyhow!("CI reification worker panicked: {e}"))??;
+                if let Some((was_hit, lifecycle_node)) = item_opt {
+                    if was_hit {
+                        cache_hits += 1;
+                        collector.record_cache_hit();
+                    } else {
+                        cache_misses += 1;
+                        collector.record_cache_miss();
                     }
-                }).await??;
-
-                worker_collector.record_phase(Phase::Materialize, extract_res.materialize_duration);
-                worker_collector.record_phase(Phase::Inflate, extract_res.inflate_duration);
-
-                let lifecycle_node = if has_bins_or_scripts {
-                    process_installed_pkg_manifest(
-                        &target_path,
-                        &pkg_bin_dir,
-                        &pkg_key,
-                        &resolved_url,
-                        &declared_dependencies,
-                        is_optional,
-                        &worker_collector,
-                    )
-                } else {
-                    None
-                };
-
-                Ok(Some((was_hit, lifecycle_node)))
-            });
-        }
-
-        while let Some(join_res) = join_set.join_next().await {
-            let item_opt =
-                join_res.map_err(|e| anyhow!("CI reification worker panicked: {e}"))??;
-            if let Some((was_hit, lifecycle_node)) = item_opt {
-                if was_hit {
-                    cache_hits += 1;
-                    collector.record_cache_hit();
-                } else {
-                    cache_misses += 1;
-                    collector.record_cache_miss();
-                }
-                packages_installed += 1;
-                if let Some(l_node) = lifecycle_node {
-                    lifecycle_nodes.push(l_node);
+                    packages_installed += 1;
+                    if let Some(l_node) = lifecycle_node {
+                        lifecycle_nodes.push(l_node);
+                    }
                 }
             }
         }
