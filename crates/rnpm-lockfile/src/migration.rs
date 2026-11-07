@@ -334,6 +334,9 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
 /// Parse a lockfile JSON string of any version (1, 2, or 3) and migrate to v3.
 pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
     let raw: AnyLockfile = serde_json::from_str(json_str)?;
+    if raw.lockfile_version == 3 {
+        return LockfileV3::from_json_str(json_str);
+    }
     migrate_to_v3(raw)
 }
 

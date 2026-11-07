@@ -329,6 +329,10 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
     let mut actions = Vec::new();
     let mut already_removed: HashSet<String> = HashSet::new();
 
+    let dep_graph = lockfile
+        .as_ref()
+        .map(rnpm_solver::graph::DependencyGraph::from_lockfile_v3);
+
     // 5. Evaluate deduplication opportunities for duplicated packages
     for (pkg_name, mut instances) in by_name {
         if instances.len() <= 1 {
@@ -343,9 +347,12 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
         if let Some(root_pkg) = root_instance_opt {
             let root_ver = root_pkg.version.clone().unwrap_or_default();
+            if root_ver.is_empty() {
+                continue;
+            }
 
             // Scenario 1: Root node_modules/<pkg> is occupied.
-            // Check each nested duplicate. If root version satisfies the parent's declared range,
+            // Check each nested duplicate. If root version satisfies all consumers' declared ranges,
             // the nested copy is redundant and can be deleted!
             for nested in &instances {
                 if nested.path == root_install_path {
@@ -355,16 +362,33 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                     continue;
                 }
 
-                // Look up range required by nested.parent_path
-                let req_range = requirements_map
-                    .get(&(nested.parent_path.clone(), pkg_name.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| "*".to_string());
+                let satisfies = if let Some(ref graph) = dep_graph {
+                    let incoming: Vec<&rnpm_solver::graph::DependencyEdge> = graph
+                        .edges
+                        .iter()
+                        .filter(|e| e.to_location == nested.path)
+                        .collect();
 
-                let satisfies = if !root_ver.is_empty() {
-                    version_matches_range(&root_ver, &req_range)
+                    if incoming.is_empty() {
+                        // If there are no incoming edges in the lockfile graph, verify with requirements_map
+                        if let Some(req_range) =
+                            requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
+                        {
+                            version_matches_range(&root_ver, req_range)
+                        } else {
+                            false
+                        }
+                    } else {
+                        incoming
+                            .iter()
+                            .all(|e| version_matches_range(&root_ver, &e.spec))
+                    }
+                } else if let Some(req_range) =
+                    requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
+                {
+                    version_matches_range(&root_ver, req_range)
                 } else {
-                    nested.version.as_deref() == Some(&root_ver)
+                    false
                 };
 
                 if satisfies {
@@ -375,8 +399,8 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                         version: root_ver.clone(),
                         action_type: DedupeActionType::DeleteDuplicate,
                         reason: format!(
-                            "Existing {}@{} at {} satisfies parent requirement '{}'",
-                            pkg_name, root_ver, root_install_path, req_range
+                            "Existing {}@{} at {} satisfies consumers of {}",
+                            pkg_name, root_ver, root_install_path, nested.path
                         ),
                     });
                     already_removed.insert(nested.path.clone());
@@ -415,15 +439,43 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
             if let Some(best_candidate) = candidates.first() {
                 let best_ver = best_candidate.version.clone().unwrap_or_default();
+                if best_ver.is_empty() {
+                    continue;
+                }
 
-                // Check if best_ver satisfies all other nested instances' parent requirements
-                let all_satisfied = instances.iter().all(|nested| {
-                    let req_range = requirements_map
-                        .get(&(nested.parent_path.clone(), pkg_name.clone()))
-                        .cloned()
-                        .unwrap_or_else(|| "*".to_string());
-                    version_matches_range(&best_ver, &req_range)
-                });
+                // Check if best_ver satisfies all other nested instances' consumers
+                let all_satisfied = if let Some(ref graph) = dep_graph {
+                    instances.iter().all(|nested| {
+                        let incoming: Vec<&rnpm_solver::graph::DependencyEdge> = graph
+                            .edges
+                            .iter()
+                            .filter(|e| e.to_location == nested.path)
+                            .collect();
+                        if incoming.is_empty() {
+                            if let Some(req_range) = requirements_map
+                                .get(&(nested.parent_path.clone(), pkg_name.clone()))
+                            {
+                                version_matches_range(&best_ver, req_range)
+                            } else {
+                                false
+                            }
+                        } else {
+                            incoming
+                                .iter()
+                                .all(|e| version_matches_range(&best_ver, &e.spec))
+                        }
+                    })
+                } else {
+                    instances.iter().all(|nested| {
+                        if let Some(req_range) =
+                            requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
+                        {
+                            version_matches_range(&best_ver, req_range)
+                        } else {
+                            false
+                        }
+                    })
+                };
 
                 if all_satisfied {
                     // Hoist best_candidate to root

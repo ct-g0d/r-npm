@@ -449,7 +449,10 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
         PackageTarget::Git { url, .. } => {
             if let Some(rest) = url.strip_prefix("github:") {
                 let repo = rest.trim_end_matches(".git");
-                format!("git+https://github.com/{repo}.git#{commit_sha}")
+                format!("git+ssh://git@github.com/{repo}.git#{commit_sha}")
+            } else if let Some(idx) = url.find("github.com/") {
+                let repo = url[idx + "github.com/".len()..].trim_end_matches(".git");
+                format!("git+ssh://git@github.com/{repo}.git#{commit_sha}")
             } else if let Some(rest) = url.strip_prefix("gitlab:") {
                 let repo = rest.trim_end_matches(".git");
                 format!("git+https://gitlab.com/{repo}.git#{commit_sha}")
@@ -468,6 +471,12 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
 
 /// Normalizes clone URL for git command execution on current platform.
 pub fn normalize_clone_url_for_git(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        return format!("https://github.com/{rest}");
+    }
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        return format!("https://github.com/{rest}");
+    }
     if let Some(rest) = url.strip_prefix("file://") {
         let rest_trimmed = rest.trim_start_matches('/');
         // If it starts with Windows drive letter (e.g. C: or D:)
@@ -488,10 +497,33 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
     url.to_string()
 }
 
-/// Recursively copies directory tree from `src` to `dst`, skipping `.git`.
+/// Recursively copies directory tree from `src` to `dst`, respecting npm packaging rules when package.json is present.
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
+
+    let manifest_path = src.join("package.json");
+    if manifest_path.is_file() {
+        if let Ok(manifest) = Manifest::from_file(&manifest_path) {
+            if let Ok(files) = rnpm_fs::collect_pack_files(src, &manifest) {
+                for (rel, file_path) in files {
+                    let to = dst.join(&rel);
+                    if let Some(p) = to.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    std::fs::copy(&file_path, &to).with_context(|| {
+                        format!(
+                            "Failed to copy '{}' -> '{}'",
+                            file_path.display(),
+                            to.display()
+                        )
+                    })?;
+                }
+                return Ok(());
+            }
+        }
+    }
+
     for entry in std::fs::read_dir(src)
         .with_context(|| format!("Failed to read directory '{}'", src.display()))?
     {
@@ -620,7 +652,7 @@ mod tests {
         let t1 = PackageTarget::parse("github:user/repo#tag").unwrap();
         assert_eq!(
             format_git_resolved_url(&t1, "1234567890abcdef1234567890abcdef12345678"),
-            "git+https://github.com/user/repo.git#1234567890abcdef1234567890abcdef12345678"
+            "git+ssh://git@github.com/user/repo.git#1234567890abcdef1234567890abcdef12345678"
         );
 
         let t2 = PackageTarget::parse("gitlab:group/project").unwrap();

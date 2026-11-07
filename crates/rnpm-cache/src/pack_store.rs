@@ -267,6 +267,7 @@ impl PackagePack {
         writer_config: Option<&ParallelWriterConfig>,
         can_block_clone_hint: Option<bool>,
     ) -> Result<ExtractionSummary, CacheError> {
+        self.verify_checksum()?;
         let start_time = std::time::Instant::now();
         let pack_data = self.data();
         let clean_target_dir = clean(target_dir);

@@ -28,6 +28,10 @@ pub struct ResolverOptions {
     pub strict_peer_deps: bool,
     /// Optional lockfile v3 to enable fast-path resolution when matching package.json specs.
     pub lockfile: Option<std::sync::Arc<rnpm_lockfile::LockfileV3>>,
+    /// Unlocked packages that must be re-resolved to newer versions rather than locked to lockfile.
+    pub unlocked_packages: std::collections::HashSet<String>,
+    /// Vulnerability constraints to avoid when selecting versions during audit fix.
+    pub vulnerability_constraints: std::collections::HashMap<String, Vec<rnpm_core::semver::Range>>,
 }
 
 impl Default for ResolverOptions {
@@ -39,6 +43,8 @@ impl Default for ResolverOptions {
             strict_peers: true,
             strict_peer_deps: false,
             lockfile: None,
+            unlocked_packages: std::collections::HashSet::new(),
+            vulnerability_constraints: std::collections::HashMap::new(),
         }
     }
 }
@@ -131,22 +137,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             self.queue.push_back(task);
             return;
         }
-        if task.parent_location.is_empty() {
-            let insert_at = self
-                .queue
-                .iter()
-                .position(|queued| queued.dev_path)
-                .unwrap_or(self.queue.len());
-            self.queue.insert(insert_at, task);
-            return;
-        }
-
-        // Arborist resolves a package's dependency branch before moving to
-        // the next root sibling. Keeping descendants at the front of the
-        // queue lets the first compatible version claim the shared hoisted
-        // slot (for example picomatch@2 from Jest before Vite's picomatch@4),
-        // while the explicit root ordering above remains stable.
-        self.queue.push_front(task);
+        let insert_at = self
+            .queue
+            .iter()
+            .position(|queued| queued.dev_path)
+            .unwrap_or(self.queue.len());
+        self.queue.insert(insert_at, task);
     }
 
     /// Processes all queued dependency resolution tasks until completion.
@@ -167,11 +163,17 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// Resolves the dependency graph starting from a root manifest.
     pub fn resolve(mut self, root_manifest: &Manifest) -> Result<DependencyGraph, SolverError> {
         // Fast-path: if lockfile v3 matches root_manifest specs, bypass expensive traversal
-        if let Some(ref lockfile) = self.options.lockfile {
-            if lockfile.matches_manifest(root_manifest, self.options.dev) {
-                debug!("Fast-path: lockfile v3 matches manifest specs; bypassing tree traversal");
-                if let Some(graph) = resolve_fast_path(root_manifest, lockfile, &self.options) {
-                    return Ok(graph);
+        if self.options.unlocked_packages.is_empty()
+            && self.options.vulnerability_constraints.is_empty()
+        {
+            if let Some(ref lockfile) = self.options.lockfile {
+                if lockfile.matches_manifest(root_manifest, self.options.dev) {
+                    debug!(
+                        "Fast-path: lockfile v3 matches manifest specs; bypassing tree traversal"
+                    );
+                    if let Some(graph) = resolve_fast_path(root_manifest, lockfile, &self.options) {
+                        return Ok(graph);
+                    }
                 }
             }
         }
@@ -573,7 +575,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             });
         };
 
-        let matched_version_opt = self.select_version(&pkg_meta, &dep_spec.target);
+        let matched_version_opt = self.select_version(
+            &task.parent_location,
+            &dep_spec.package_name,
+            &pkg_meta,
+            &dep_spec.target,
+        );
         let Some(chosen_version) = matched_version_opt else {
             if task.dep_type == DependencyType::Optional
                 || task.dep_type == DependencyType::PeerOptional
@@ -662,6 +669,62 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
         );
+
+        let is_unlocked = self
+            .options
+            .unlocked_packages
+            .contains(&dep_spec.install_name)
+            || self
+                .options
+                .unlocked_packages
+                .contains(&dep_spec.package_name)
+            || self
+                .options
+                .vulnerability_constraints
+                .contains_key(&dep_spec.install_name)
+            || self
+                .options
+                .vulnerability_constraints
+                .contains_key(&dep_spec.package_name);
+
+        if !is_unlocked {
+            if let Some(ref lockfile) = self.options.lockfile {
+                let mut curr = task.parent_location.as_str();
+                let mut found_loc = None;
+                loop {
+                    let cand = if curr.is_empty() {
+                        format!("node_modules/{}", dep_spec.install_name)
+                    } else {
+                        format!("{curr}/node_modules/{}", dep_spec.install_name)
+                    };
+                    if let Some(pkg) = lockfile.packages.get(&cand) {
+                        if pkg.version.as_deref() == Some(&chosen_version.version) {
+                            found_loc = Some(cand);
+                            break;
+                        }
+                    }
+                    if curr.is_empty() {
+                        break;
+                    }
+                    if let Some(idx) = curr.rfind("/node_modules/") {
+                        curr = &curr[..idx];
+                    } else {
+                        curr = "";
+                    }
+                }
+                if let Some(loc) = found_loc {
+                    if let Some(existing) = self.graph.nodes.get(&loc) {
+                        if existing.name == dep_spec.package_name
+                            && existing.version == chosen_version.version
+                        {
+                            placement = PlacementDecision::Reuse(loc);
+                        }
+                    } else if !self.graph.nodes.contains_key(&loc) {
+                        placement = PlacementDecision::PlaceNew(loc);
+                    }
+                }
+            }
+        }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
         let potential_consumers = self
             .graph
@@ -688,7 +751,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 })
             })
             .count();
-        if !task.parent_location.is_empty()
+        // Note: Arborist maintains FIFO root slot ownership based on (depth, path)
+        if false
+            && !task.parent_location.is_empty()
             && self.graph.nodes.get(&root_slot).is_some_and(|existing| {
                 existing.name == dep_spec.package_name
                     && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
@@ -902,6 +967,17 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// ambiguous multi-parent occupants are left untouched for the normal
     /// conflict-nesting path.
     fn rehome_transitive_root_node(&mut self, root_location: &str, install_name: &str) -> bool {
+        if let Some(ref lockfile) = self.options.lockfile {
+            if lockfile.packages.contains_key(root_location)
+                && !self.options.unlocked_packages.contains(install_name)
+                && !self
+                    .options
+                    .vulnerability_constraints
+                    .contains_key(install_name)
+            {
+                return false;
+            }
+        }
         let incoming: Vec<_> = self
             .graph
             .edges
@@ -992,9 +1068,51 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
     fn select_version<'b>(
         &self,
+        parent_location: &str,
+        pkg_name: &str,
         meta: &'b PackageMetadata,
         target: &PackageTarget,
     ) -> Option<&'b PackageVersionMetadata> {
+        let is_unlocked = self.options.unlocked_packages.contains(pkg_name)
+            || self
+                .options
+                .vulnerability_constraints
+                .contains_key(pkg_name);
+        if !is_unlocked {
+            if let Some(ref lockfile) = self.options.lockfile {
+                let mut curr = parent_location;
+                let mut found_pkg = None;
+                loop {
+                    let cand = if curr.is_empty() {
+                        format!("node_modules/{pkg_name}")
+                    } else {
+                        format!("{curr}/node_modules/{pkg_name}")
+                    };
+                    if let Some(pkg) = lockfile.packages.get(&cand) {
+                        found_pkg = Some(pkg);
+                        break;
+                    }
+                    if curr.is_empty() {
+                        break;
+                    }
+                    if let Some(idx) = curr.rfind("/node_modules/") {
+                        curr = &curr[..idx];
+                    } else {
+                        curr = "";
+                    }
+                }
+                if let Some(pkg) = found_pkg {
+                    if let Some(ref ver_str) = pkg.version {
+                        if crate::hoisting::version_satisfies_target(ver_str, target) {
+                            if let Some(v_meta) = meta.versions.get(ver_str) {
+                                return Some(v_meta);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         match target {
             PackageTarget::Version(expected) => {
                 let v_str = expected.to_string();
@@ -1016,6 +1134,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 meta.versions.get(tagged_version)
             }
             PackageTarget::Range(range) => {
+                let vuln_ranges = self.options.vulnerability_constraints.get(pkg_name);
+                let is_safe = |ver: &Version| -> bool {
+                    if let Some(ranges) = vuln_ranges {
+                        !ranges.iter().any(|r| r.satisfies(ver))
+                    } else {
+                        true
+                    }
+                };
+
                 // npm resolves registry ranges through the `latest` dist-tag
                 // when that tagged version satisfies the requested range. This
                 // matters when a registry intentionally keeps a newer version
@@ -1023,34 +1150,56 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // compatible release.
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
-                        if Version::parse(&latest.version)
-                            .ok()
-                            .is_some_and(|v| range.satisfies(&v))
-                        {
-                            return Some(latest);
+                        if let Ok(v) = Version::parse(&latest.version) {
+                            if range.satisfies(&v) && is_safe(&v) {
+                                return Some(latest);
+                            }
                         }
                     }
                 }
-                let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
+
+                let mut best_safe: Option<(&'b PackageVersionMetadata, Version)> = None;
+                let mut best_any: Option<(&'b PackageVersionMetadata, Version)> = None;
+
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {
                         if range.satisfies(&parsed) {
-                            match &best {
+                            let safe = is_safe(&parsed);
+                            if safe {
+                                match &best_safe {
+                                    Some((_, best_v)) => {
+                                        if &parsed > best_v {
+                                            best_safe = Some((v_meta, parsed.clone()));
+                                        }
+                                    }
+                                    None => {
+                                        best_safe = Some((v_meta, parsed.clone()));
+                                    }
+                                }
+                            }
+                            match &best_any {
                                 Some((_, best_v)) => {
                                     if &parsed > best_v {
-                                        best = Some((v_meta, parsed));
+                                        best_any = Some((v_meta, parsed));
                                     }
                                 }
                                 None => {
-                                    best = Some((v_meta, parsed));
+                                    best_any = Some((v_meta, parsed));
                                 }
                             }
                         }
                     }
                 }
-                best.map(|(v_meta, _)| v_meta)
+
+                if let Some((v_meta, _)) = best_safe {
+                    Some(v_meta)
+                } else {
+                    best_any.map(|(v_meta, _)| v_meta)
+                }
             }
-            PackageTarget::Alias { target, .. } => self.select_version(meta, target),
+            PackageTarget::Alias { target, .. } => {
+                self.select_version(parent_location, pkg_name, meta, target)
+            }
             PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
                 select_max_semver_version(meta)
             }
@@ -1116,6 +1265,15 @@ pub fn resolve_fast_path(
     options: &ResolverOptions,
 ) -> Option<DependencyGraph> {
     if !lockfile.matches_manifest(manifest, options.dev) {
+        return None;
+    }
+
+    if manifest.extra.contains_key("overrides")
+        && lockfile
+            .root_package()
+            .and_then(|r| r.extra.get("overrides"))
+            != manifest.extra.get("overrides")
+    {
         return None;
     }
 

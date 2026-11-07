@@ -99,24 +99,91 @@ pub struct PeerDependencyMeta {
     pub optional: bool,
 }
 
+pub fn deserialize_opt_string_or_bool<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptStringOrBoolVisitor;
+
+    impl<'de> Visitor<'de> for OptStringOrBoolVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, boolean, or null")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value.to_string()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    deserializer.deserialize_any(OptStringOrBoolVisitor)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_string_or_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub main: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<PackageBin>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scripts: BTreeMap<String, String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, String>,
 
     /// Dependency key order as it appeared in package.json. npm's resolver
@@ -126,43 +193,59 @@ pub struct Manifest {
     #[serde(skip)]
     pub dependency_order: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dev_dependencies: BTreeMap<String, String>,
 
     #[serde(skip)]
     pub dev_dependency_order: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_dependencies: BTreeMap<String, String>,
 
     #[serde(skip)]
     pub peer_dependency_order: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub optional_dependencies: BTreeMap<String, String>,
 
     #[serde(skip)]
     pub optional_dependency_order: Vec<String>,
 
-    #[serde(default, alias = "bundleDependencies")]
+    #[serde(
+        default,
+        alias = "bundleDependencies",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bundled_dependencies: Option<BundledDependencies>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PackageWorkspaces>,
 
-    #[serde(default, deserialize_with = "deserialize_opt_vec_or_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_or_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub os: Option<Vec<String>>,
 
-    #[serde(default, deserialize_with = "deserialize_opt_vec_or_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_or_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cpu: Option<Vec<String>>,
 
-    #[serde(default, deserialize_with = "deserialize_opt_vec_or_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_or_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub libc: Option<Vec<String>>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub engines: BTreeMap<String, String>,
 
     #[serde(flatten)]

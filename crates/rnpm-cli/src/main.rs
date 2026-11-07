@@ -3979,8 +3979,25 @@ async fn run_audit_fix(
         ..Default::default()
     };
 
+    let mut vulnerability_constraints: std::collections::HashMap<
+        String,
+        Vec<rnpm_core::semver::Range>,
+    > = std::collections::HashMap::new();
+    for (pkg_name, pkg_advs) in &advs_by_pkg {
+        for adv in pkg_advs {
+            if let Ok(r) = rnpm_core::semver::Range::parse(&adv.vulnerable_versions) {
+                vulnerability_constraints
+                    .entry(pkg_name.clone())
+                    .or_default()
+                    .push(r);
+            }
+        }
+    }
+
     let mut installer = Installer::new(options)?;
-    let update_summary = installer.update(&targets_to_update).await?;
+    let _update_summary = installer
+        .update_with_constraints(&targets_to_update, &vulnerability_constraints)
+        .await?;
 
     // 3. Re-run audit to count actual remaining vs fixed vulnerabilities
     let (post_report, _, _) = audit::build_audit_report_with_advisories(project_dir, registry)
@@ -3990,7 +4007,7 @@ async fn run_audit_fix(
     let actual_fixed = initial_vulns.saturating_sub(remaining_vulns);
 
     if actual_fixed > 0 {
-        print_fixed_summary(actual_fixed, &fixed_counts, update_summary.packages_updated);
+        print_fixed_summary(actual_fixed, &fixed_counts, packages_to_upgrade.len());
     }
 
     if remaining_vulns > 0 {

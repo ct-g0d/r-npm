@@ -269,10 +269,21 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     }
 
     // Target must exist for a junction
-    let target_canonical = target.canonicalize().map_err(FsError::Io)?;
+    if !target.exists() {
+        return Err(FsError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("junction target does not exist: {}", target.display()),
+        )));
+    }
+
+    let target_abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(FsError::Io)?.join(target)
+    };
 
     // Primary: direct Win32 FSCTL_SET_REPARSE_POINT (immune to shell escaping & space/metacharacter issues)
-    match create_junction_win32(link, &target_canonical) {
+    match create_junction_win32(link, &target_abs) {
         Ok(()) => return Ok(()),
         Err(e) => {
             tracing::debug!("Direct Win32 junction creation failed ({e:?}), attempting fallback");
@@ -280,7 +291,7 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     }
 
     // Fallback: hardened cmd.exe mklink /J with safe quoting and escaping
-    create_junction_cmd_fallback(link, &target_canonical)
+    create_junction_cmd_fallback(link, &target_abs)
 }
 
 #[cfg(windows)]

@@ -425,10 +425,14 @@ impl DependencyGraph {
                 // important for lockfile parity because npm omits version,
                 // dependencies, and flags from these nodes.
                 if node.flags.link {
+                    let clean_resolved = node
+                        .resolved
+                        .as_ref()
+                        .map(|r| r.strip_prefix("./").unwrap_or(r).to_string());
                     lockfile.insert_package(
                         loc,
                         LockfilePackage {
-                            resolved: node.resolved.clone(),
+                            resolved: clean_resolved,
                             link: Some(true),
                             ..Default::default()
                         },
@@ -499,14 +503,15 @@ impl DependencyGraph {
                 let os = node.os.as_ref().filter(|v| !v.is_empty()).cloned();
                 let cpu = node.cpu.as_ref().filter(|v| !v.is_empty()).cloned();
 
-                let mut extra = node.extra.clone();
-                extra.remove("directories");
-                extra.remove("overrides");
-                extra.remove("license");
-                extra.remove("libc");
-                if let Some(v) = extra.get("deprecated") {
-                    if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
-                        extra.remove("deprecated");
+                let mut extra = BTreeMap::new();
+                for key in ["funding", "deprecated"] {
+                    if let Some(v) = node.extra.get(key) {
+                        if key == "deprecated"
+                            && (v == &serde_json::Value::Bool(false) || v.is_null() || v == "")
+                        {
+                            continue;
+                        }
+                        extra.insert(key.to_string(), v.clone());
                     }
                 }
 

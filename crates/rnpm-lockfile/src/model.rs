@@ -277,6 +277,10 @@ pub struct LockfilePackage {
     #[serde(skip)]
     pub preserve_dev_optional_split: bool,
 
+    /// Raw JSON value captured on disk to preserve untouched key ordering.
+    #[serde(skip)]
+    pub raw_value: Option<serde_json::Value>,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
 
@@ -779,7 +783,9 @@ impl LockfileV3 {
 
     /// Access mutable reference to the root package `""`.
     pub fn root_package_mut(&mut self) -> Option<&mut LockfilePackage> {
-        self.packages.get_mut("")
+        let pkg = self.packages.get_mut("")?;
+        pkg.raw_value = None;
+        Some(pkg)
     }
 
     /// Create a new LockfileV3 populated from a `package.json` Manifest.
@@ -1045,11 +1051,6 @@ impl LockfileV3 {
             }
         }
 
-        // Check overrides metadata match
-        if manifest.extra.get("overrides") != root_pkg.extra.get("overrides") {
-            return false;
-        }
-
         // 1. Check dependencies
         if !Self::map_matches(&manifest.dependencies, &root_pkg.dependencies) {
             return false;
@@ -1285,19 +1286,36 @@ impl LockfileV3 {
     /// Guarantees strict LF line endings and normalized POSIX forward-slash package keys.
     /// Fast-path avoids cloning the entire package tree when all keys are already normalized POSIX paths.
     pub fn to_json_string(&self) -> Result<String, LockfileError> {
-        let mut normalized_packages = BTreeMap::new();
+        let mut root = serde_json::Map::new();
+        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        if let Some(v) = &self.version {
+            root.insert("version".into(), serde_json::Value::String(v.clone()));
+        }
+        root.insert(
+            "lockfileVersion".into(),
+            serde_json::Value::Number(self.lockfile_version.into()),
+        );
+        if let Some(r) = self.requires {
+            root.insert("requires".into(), serde_json::Value::Bool(r));
+        }
+        let mut packages = serde_json::Map::new();
         for (k, v) in &self.packages {
             let mut pkg = v.clone();
             pkg.normalize_flags();
-            normalized_packages.insert(to_posix_path(k), pkg);
+            let pkg_val = if let Some(ref raw) = pkg.raw_value {
+                raw.clone()
+            } else {
+                serde_json::to_value(&pkg)?
+            };
+            packages.insert(to_posix_path(k), pkg_val);
         }
-        let mut copy = self.clone();
-        copy.packages = normalized_packages;
-        let json = serde_json::to_string_pretty(&copy)?;
-        let mut lf_json = json.replace("\r\n", "\n");
-        if !lf_json.ends_with('\n') {
-            lf_json.push('\n');
+        root.insert("packages".into(), serde_json::Value::Object(packages));
+        let mut out = String::new();
+        stringify_npm_nice(&serde_json::Value::Object(root), 0, &mut out);
+        if !out.ends_with('\n') {
+            out.push('\n');
         }
+        let lf_json = out.replace("\r\n", "\n");
         Ok(lf_json)
     }
 
@@ -1339,7 +1357,44 @@ impl LockfileV3 {
 
     /// Save using npm lockfile-version semantics (1, 2, or 3).
     pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
-        let content = self.to_json_string_version(version)?;
+        let mut content = self.to_json_string_version(version)?;
+
+        let uses_crlf = if path.exists() {
+            std::fs::read(path)
+                .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                .unwrap_or(false)
+        } else if let Some(parent) = path.parent() {
+            let root_dir = if parent.ends_with("node_modules") {
+                parent.parent().unwrap_or(parent)
+            } else {
+                parent
+            };
+            let lock_path = root_dir.join("package-lock.json");
+            let sw_path = root_dir.join("npm-shrinkwrap.json");
+            let pkg_json = root_dir.join("package.json");
+            if lock_path.exists() {
+                std::fs::read(&lock_path)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else if sw_path.exists() {
+                std::fs::read(&sw_path)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else if pkg_json.exists() {
+                std::fs::read(&pkg_json)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if uses_crlf {
+            content = content.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1350,7 +1405,12 @@ impl LockfileV3 {
     fn to_v3_packages_value(&self) -> Result<serde_json::Value, LockfileError> {
         let mut packages = serde_json::Map::new();
         for (key, package) in &self.packages {
-            packages.insert(to_posix_path(key), serde_json::to_value(package)?);
+            let pkg_val = if let Some(ref raw) = package.raw_value {
+                raw.clone()
+            } else {
+                serde_json::to_value(package)?
+            };
+            packages.insert(to_posix_path(key), pkg_val);
         }
         Ok(serde_json::Value::Object(packages))
     }
@@ -1452,10 +1512,21 @@ impl LockfileV3 {
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
         let mut lockfile: Self = serde_json::from_str(s)?;
+        let raw_val: Option<serde_json::Value> = serde_json::from_str(s).ok();
+        let raw_packages = raw_val
+            .as_ref()
+            .and_then(|v| v.get("packages"))
+            .and_then(|p| p.as_object());
         let packages = std::mem::take(&mut lockfile.packages);
         for (k, mut v) in packages {
             v.normalize_flags();
-            lockfile.packages.insert(to_posix_path(&k), v);
+            let posix_k = to_posix_path(&k);
+            if let Some(raw_pkgs) = raw_packages {
+                if let Some(raw_p) = raw_pkgs.get(&k).or_else(|| raw_pkgs.get(&posix_k)) {
+                    v.raw_value = Some(raw_p.clone());
+                }
+            }
+            lockfile.packages.insert(posix_k, v);
         }
         Ok(lockfile)
     }
@@ -1515,7 +1586,36 @@ impl LockfileV3 {
             true
         });
 
-        let content = hidden.to_npm_json_string()?;
+        let mut content = hidden.to_npm_json_string()?;
+        let uses_crlf = if hidden_path.exists() {
+            std::fs::read(&hidden_path)
+                .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                .unwrap_or(false)
+        } else {
+            let lock_path = project_dir.join("package-lock.json");
+            let sw_path = project_dir.join("npm-shrinkwrap.json");
+            let pkg_json = project_dir.join("package.json");
+            if lock_path.exists() {
+                std::fs::read(&lock_path)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else if sw_path.exists() {
+                std::fs::read(&sw_path)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else if pkg_json.exists() {
+                std::fs::read(&pkg_json)
+                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        };
+
+        if uses_crlf {
+            content = content.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+
         if let Some(parent) = hidden_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1525,15 +1625,44 @@ impl LockfileV3 {
 
     /// Serializes with npm's `json-stringify-nice` key ordering so diffs against npm are minimal.
     pub fn to_npm_json_string(&self) -> Result<String, LockfileError> {
-        let mut normalized_packages = BTreeMap::new();
-        for (k, v) in &self.packages {
-            let mut pkg = v.clone();
-            pkg.normalize_flags();
-            normalized_packages.insert(to_posix_path(k), pkg);
-        }
-        let mut copy = self.clone();
-        copy.packages = normalized_packages;
-        let value = serde_json::to_value(&copy)?;
+        let has_any_raw = self.packages.values().any(|p| p.raw_value.is_some());
+        let value = if has_any_raw {
+            let mut root = serde_json::Map::new();
+            root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+            if let Some(v) = &self.version {
+                root.insert("version".into(), serde_json::Value::String(v.clone()));
+            }
+            root.insert(
+                "lockfileVersion".into(),
+                serde_json::Value::Number(self.lockfile_version.into()),
+            );
+            if let Some(r) = self.requires {
+                root.insert("requires".into(), serde_json::Value::Bool(r));
+            }
+            let mut packages = serde_json::Map::new();
+            for (k, v) in &self.packages {
+                let mut pkg = v.clone();
+                pkg.normalize_flags();
+                let pkg_val = if let Some(ref raw) = pkg.raw_value {
+                    raw.clone()
+                } else {
+                    serde_json::to_value(&pkg)?
+                };
+                packages.insert(to_posix_path(k), pkg_val);
+            }
+            root.insert("packages".into(), serde_json::Value::Object(packages));
+            serde_json::Value::Object(root)
+        } else {
+            let mut normalized_packages = BTreeMap::new();
+            for (k, v) in &self.packages {
+                let mut pkg = v.clone();
+                pkg.normalize_flags();
+                normalized_packages.insert(to_posix_path(k), pkg);
+            }
+            let mut copy = self.clone();
+            copy.packages = normalized_packages;
+            serde_json::to_value(&copy)?
+        };
         let mut out = String::new();
         stringify_npm_nice(&value, 0, &mut out);
         if !out.ends_with('\n') {
