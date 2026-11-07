@@ -3788,7 +3788,7 @@ async fn run_audit_fix(
                 old_ver_str = adv.installed_version.clone();
             }
         }
-        let installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
+        let _installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
             .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
 
         let mut in_range_candidates: Vec<rnpm_core::semver::Version> = Vec::new();
@@ -3832,47 +3832,58 @@ async fn run_audit_fix(
                 packages_needing_force += 1;
             }
         } else {
-            // 2. Transitive dependency: must strictly respect what ALL parent packages require
-            let mut parent_ranges: Vec<(String, rnpm_core::semver::Range)> = Vec::new();
-            for parent in existing_lockfile.packages.values() {
-                let empty = BTreeMap::new();
-                let deps = parent.dependencies.as_ref().unwrap_or(&empty);
-                if let Some(r_str) = deps.get(pkg_name) {
-                    if let Ok(r) = rnpm_core::semver::Range::parse(r_str) {
-                        parent_ranges.push((r_str.clone(), r));
-                    }
-                }
-                let opt_deps = parent.optional_dependencies.as_ref().unwrap_or(&empty);
-                if let Some(r_str) = opt_deps.get(pkg_name) {
-                    if let Ok(r) = rnpm_core::semver::Range::parse(r_str) {
-                        parent_ranges.push((r_str.clone(), r));
-                    }
-                }
-            }
-
-            if parent_ranges.is_empty() {
-                continue;
-            }
-
+            // 2. Transitive dependency: evaluate each vulnerable node_path against its enclosing parent package
+            let mut any_fixed = false;
             for adv in pkg_advs {
+                let parent_loc = if let Some(idx) = adv.node_path.rfind("/node_modules/") {
+                    &adv.node_path[..idx]
+                } else {
+                    ""
+                };
+
+                let parent_range_opt = if parent_loc.is_empty() {
+                    declared_direct
+                        .get(pkg_name)
+                        .and_then(|r| rnpm_core::semver::Range::parse(r).ok())
+                } else {
+                    existing_lockfile.packages.get(parent_loc).and_then(|p| {
+                        let empty = BTreeMap::new();
+                        let deps = p.dependencies.as_ref().unwrap_or(&empty);
+                        deps.get(pkg_name)
+                            .or_else(|| {
+                                p.optional_dependencies
+                                    .as_ref()
+                                    .unwrap_or(&empty)
+                                    .get(pkg_name)
+                            })
+                            .and_then(|r| rnpm_core::semver::Range::parse(r).ok())
+                    })
+                };
+
+                let cur_ver = rnpm_core::semver::Version::parse(&adv.installed_version)
+                    .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
+
                 if let Some(target) = audit::resolve_target_patched_version(
                     adv.patched_versions.as_deref(),
                     &adv.vulnerable_versions,
                 ) {
-                    let all_parents_allow = parent_ranges.iter().all(|(_, r)| r.satisfies(&target));
-                    if all_parents_allow && target > installed_ver {
-                        in_range_candidates.push(target);
-                    } else {
-                        out_of_range_candidates.push(target);
+                    let parent_allows = parent_range_opt
+                        .as_ref()
+                        .map(|r| r.satisfies(&target))
+                        .unwrap_or(false);
+
+                    if parent_allows && target > cur_ver {
+                        packages_to_upgrade.insert(
+                            pkg_name.clone(),
+                            (target.clone(), adv.installed_version.clone()),
+                        );
+                        targets_to_update.push(format!("{}@{}", adv.node_path, target));
+                        any_fixed = true;
                     }
                 }
             }
 
-            if let Some(best_in_range) = in_range_candidates.into_iter().max() {
-                packages_to_upgrade.insert(pkg_name.clone(), (best_in_range, old_ver_str.clone()));
-                let allowed_spec = &parent_ranges[0].0;
-                targets_to_update.push(format!("{pkg_name}@{allowed_spec}"));
-            } else {
+            if !any_fixed {
                 packages_needing_force += 1;
             }
         }

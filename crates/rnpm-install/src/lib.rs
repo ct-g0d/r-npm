@@ -4724,6 +4724,9 @@ impl Installer {
                 "Package installation path '{cleaned_dest:?}' escapes node_modules"
             ));
         }
+        if dest_dir.is_dir() {
+            clean_stale_package_dir(&dest_dir, &format!("node_modules/{}", node.name), None);
+        }
         let writer_cfg = Arc::clone(&self.writer_cfg);
         if !self.pack_store.has_package_pack(&node.integrity) {
             let _ = self
@@ -4836,6 +4839,61 @@ impl Installer {
         self.reify_package_with_bytes(node, &bytes, was_hit, node_modules_dir, bin_dir)
     }
 
+    fn determine_update_target_loc(
+        sub_name: &str,
+        sub_range: &str,
+        parent_loc: &str,
+        lockfile: &LockfileV3,
+        planned: &BTreeMap<String, (String, ResolvedNode)>,
+        is_targeted: bool,
+    ) -> (String, bool) {
+        let root_loc = format!("node_modules/{sub_name}");
+        let nested_loc = format!("{parent_loc}/node_modules/{sub_name}");
+
+        // 1. If lockfile ALREADY has this dependency placed nested under parent, respect existing tree structure!
+        if let Some(existing_nested) = lockfile.get_package(&nested_loc) {
+            if let Some(ref ver_str) = existing_nested.version {
+                if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range))
+                {
+                    if range.satisfies(&ver) && is_targeted {
+                        return (nested_loc, false);
+                    }
+                }
+            }
+            return (nested_loc, true);
+        }
+
+        // 2. Check if root node_modules has a compatible package (either already planned or in existing lockfile)
+        if let Some((_, planned_root)) = planned.get(&root_loc) {
+            if let (Ok(ver), Ok(range)) = (
+                planned_root.version.parse::<Version>(),
+                Range::parse(sub_range),
+            ) {
+                if range.satisfies(&ver) {
+                    return (root_loc, false);
+                }
+            }
+            // Conflict at root! Must place nested under parent
+            return (nested_loc, true);
+        }
+
+        if let Some(existing_root) = lockfile.get_package(&root_loc) {
+            if let Some(ref ver_str) = existing_root.version {
+                if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range))
+                {
+                    if range.satisfies(&ver) {
+                        return (root_loc, false);
+                    }
+                }
+            }
+            // Conflict at root! Must place nested under parent
+            return (nested_loc, true);
+        }
+
+        // 3. No conflict at root, hoist to root
+        (root_loc, true)
+    }
+
     /// Run package update workflow.
     /// If `targets` is non-empty, only update those specified packages.
     /// Otherwise, update all top-level dependencies declared in `package.json`.
@@ -4876,20 +4934,20 @@ impl Installer {
             }
         }
 
-        // Determine which packages to update
-        let mut deps_to_update: BTreeMap<String, String> = BTreeMap::new();
+        // Determine which packages to update: target_loc -> (pkg_name, range)
+        let mut deps_to_update: BTreeMap<String, (String, String)> = BTreeMap::new();
         if targets.is_empty() {
             // Update all top-level dependencies
             for (k, v) in &manifest.dependencies {
-                deps_to_update.insert(k.clone(), v.clone());
+                deps_to_update.insert(format!("node_modules/{k}"), (k.clone(), v.clone()));
             }
             for (k, v) in &manifest.dev_dependencies {
-                deps_to_update.insert(k.clone(), v.clone());
+                deps_to_update.insert(format!("node_modules/{k}"), (k.clone(), v.clone()));
             }
         } else {
             for target in targets {
-                let (target_name, explicit_range) = if let Some(at_idx) = target.rfind('@') {
-                    let slash_idx = target.find('/').unwrap_or(0);
+                let (target_raw, explicit_range) = if let Some(at_idx) = target.rfind('@') {
+                    let slash_idx = target.rfind('/').unwrap_or(0);
                     if at_idx > slash_idx && at_idx > 0 {
                         (
                             target[..at_idx].to_string(),
@@ -4902,28 +4960,50 @@ impl Installer {
                     (target.clone(), None)
                 };
 
-                if let Some(spec) = explicit_range {
-                    deps_to_update.insert(target_name, spec);
-                } else if let Some(range) = manifest.dependencies.get(&target_name) {
-                    deps_to_update.insert(target_name, range.clone());
-                } else if let Some(range) = manifest.dev_dependencies.get(&target_name) {
-                    deps_to_update.insert(target_name, range.clone());
-                } else if let Some(range) = manifest.optional_dependencies.get(&target_name) {
-                    deps_to_update.insert(target_name, range.clone());
-                } else if let Some(pkg) =
-                    lockfile.get_package(&format!("node_modules/{target_name}"))
-                {
-                    let range = pkg
-                        .version
-                        .as_deref()
-                        .map(|v| format!("^{v}"))
-                        .unwrap_or_else(|| "*".to_string());
-                    deps_to_update.insert(target_name, range);
+                if target_raw.starts_with("node_modules/") {
+                    let pkg_name = if let Some(idx) = target_raw.rfind("/node_modules/") {
+                        target_raw[idx + "/node_modules/".len()..].to_string()
+                    } else if let Some(stripped) = target_raw.strip_prefix("node_modules/") {
+                        stripped.to_string()
+                    } else {
+                        target_raw.clone()
+                    };
+
+                    let range = if let Some(spec) = explicit_range {
+                        spec
+                    } else if let Some(pkg) = lockfile.get_package(&target_raw) {
+                        pkg.version
+                            .as_deref()
+                            .map(|v| format!("^{v}"))
+                            .unwrap_or_else(|| "*".to_string())
+                    } else {
+                        "*".to_string()
+                    };
+                    deps_to_update.insert(target_raw, (pkg_name, range));
                 } else {
-                    return Err(anyhow!(
-                        "Package '{}' is not a dependency in package.json or lockfile",
-                        target
-                    ));
+                    let target_name = target_raw;
+                    let target_loc = format!("node_modules/{target_name}");
+                    if let Some(spec) = explicit_range {
+                        deps_to_update.insert(target_loc, (target_name, spec));
+                    } else if let Some(range) = manifest.dependencies.get(&target_name) {
+                        deps_to_update.insert(target_loc, (target_name, range.clone()));
+                    } else if let Some(range) = manifest.dev_dependencies.get(&target_name) {
+                        deps_to_update.insert(target_loc, (target_name, range.clone()));
+                    } else if let Some(range) = manifest.optional_dependencies.get(&target_name) {
+                        deps_to_update.insert(target_loc, (target_name, range.clone()));
+                    } else if let Some(pkg) = lockfile.get_package(&target_loc) {
+                        let range = pkg
+                            .version
+                            .as_deref()
+                            .map(|v| format!("^{v}"))
+                            .unwrap_or_else(|| "*".to_string());
+                        deps_to_update.insert(target_loc, (target_name, range));
+                    } else {
+                        return Err(anyhow!(
+                            "Package '{}' is not a dependency in package.json or lockfile",
+                            target
+                        ));
+                    }
                 }
             }
         }
@@ -4934,30 +5014,32 @@ impl Installer {
         let mut new_versions: HashMap<String, String> = HashMap::new();
 
         // 1. Check for newer versions satisfying ranges (prefetch metadata first)
-        let target_names: Vec<&str> = deps_to_update.keys().map(|s| s.as_str()).collect();
+        let target_names: Vec<&str> = deps_to_update
+            .values()
+            .map(|(pkg, _)| pkg.as_str())
+            .collect();
         let _ = self.prefetch_metadata(&target_names).await;
 
-        let mut newly_resolved_roots: BTreeMap<String, ResolvedNode> = BTreeMap::new();
-        for (pkg_name, range_str) in &deps_to_update {
-            let lock_key = format!("node_modules/{pkg_name}");
+        let mut newly_resolved_roots: BTreeMap<String, (String, ResolvedNode)> = BTreeMap::new();
+        for (target_loc, (pkg_name, range_str)) in &deps_to_update {
             let current_locked_ver = lockfile
-                .get_package(&lock_key)
+                .get_package(target_loc)
                 .and_then(|p| p.version.clone());
 
             let resolved = self.resolve_package(pkg_name, range_str, false).await?;
 
-            if let Some(ref cur_ver) = current_locked_ver {
-                if cur_ver != &resolved.version {
-                    updated_packages.push(pkg_name.clone());
-                    old_versions.insert(pkg_name.clone(), cur_ver.clone());
-                    new_versions.insert(pkg_name.clone(), resolved.version.clone());
-                    newly_resolved_roots.insert(pkg_name.clone(), resolved);
-                }
-            } else {
-                // Not in lockfile yet
+            let ver_changed = match &current_locked_ver {
+                Some(cur) => cur != &resolved.version,
+                None => true,
+            };
+
+            if ver_changed {
                 updated_packages.push(pkg_name.clone());
+                if let Some(ref cur) = current_locked_ver {
+                    old_versions.insert(pkg_name.clone(), cur.clone());
+                }
                 new_versions.insert(pkg_name.clone(), resolved.version.clone());
-                newly_resolved_roots.insert(pkg_name.clone(), resolved);
+                newly_resolved_roots.insert(target_loc.clone(), (pkg_name.clone(), resolved));
             }
         }
 
@@ -4986,99 +5068,98 @@ impl Installer {
             // 2. Resolve transitive dependencies for newly updated packages.
             // When targeted, do not modify unrelated dependencies or dependencies
             // whose existing locked version already satisfies the required range.
-            let mut full_subgraph: BTreeMap<String, ResolvedNode> = BTreeMap::new();
-            let mut queue: VecDeque<(String, String)> = VecDeque::new();
+            let mut full_subgraph: BTreeMap<String, (String, ResolvedNode)> = BTreeMap::new();
+            struct UpdateWorkItem {
+                dep_name: String,
+                dep_range: String,
+                target_loc: String,
+            }
+            let mut queue: VecDeque<UpdateWorkItem> = VecDeque::new();
 
-            for (name, node) in newly_resolved_roots {
+            for (target_loc, (name, node)) in newly_resolved_roots {
                 for (sub_name, sub_range) in &node.dependencies {
-                    let should_enqueue = if is_targeted {
-                        let lock_key = format!("node_modules/{sub_name}");
-                        if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
-                            if let Some(ref ver_str) = existing_pkg.version {
-                                if let (Ok(ver), Ok(range)) =
-                                    (ver_str.parse::<Version>(), Range::parse(sub_range))
-                                {
-                                    !range.satisfies(&ver)
-                                } else {
-                                    true
-                                }
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    };
-
+                    let (sub_loc, should_enqueue) = Self::determine_update_target_loc(
+                        sub_name,
+                        sub_range,
+                        &target_loc,
+                        &lockfile,
+                        &full_subgraph,
+                        is_targeted,
+                    );
                     if should_enqueue {
-                        queue.push_back((sub_name.clone(), sub_range.clone()));
+                        queue.push_back(UpdateWorkItem {
+                            dep_name: sub_name.clone(),
+                            dep_range: sub_range.clone(),
+                            target_loc: sub_loc,
+                        });
                     }
                 }
-                full_subgraph.insert(name, node);
+                full_subgraph.insert(target_loc, (name, node));
             }
 
-            while let Some((dep_name, dep_range)) = queue.pop_front() {
-                if full_subgraph.contains_key(&dep_name) {
+            while let Some(item) = queue.pop_front() {
+                if full_subgraph.contains_key(&item.target_loc) {
                     continue;
                 }
-                let node = self.resolve_package(&dep_name, &dep_range, false).await?;
+                let node = self
+                    .resolve_package(&item.dep_name, &item.dep_range, false)
+                    .await?;
                 for (sub_name, sub_range) in &node.dependencies {
-                    if !full_subgraph.contains_key(sub_name) {
-                        let should_enqueue = if is_targeted {
-                            let lock_key = format!("node_modules/{sub_name}");
-                            if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
-                                if let Some(ref ver_str) = existing_pkg.version {
-                                    if let (Ok(ver), Ok(range)) =
-                                        (ver_str.parse::<Version>(), Range::parse(sub_range))
-                                    {
-                                        !range.satisfies(&ver)
-                                    } else {
-                                        true
-                                    }
-                                } else {
-                                    true
-                                }
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        };
-
-                        if should_enqueue {
-                            queue.push_back((sub_name.clone(), sub_range.clone()));
-                        }
+                    let (sub_loc, should_enqueue) = Self::determine_update_target_loc(
+                        sub_name,
+                        sub_range,
+                        &item.target_loc,
+                        &lockfile,
+                        &full_subgraph,
+                        is_targeted,
+                    );
+                    if should_enqueue && !full_subgraph.contains_key(&sub_loc) {
+                        queue.push_back(UpdateWorkItem {
+                            dep_name: sub_name.clone(),
+                            dep_range: sub_range.clone(),
+                            target_loc: sub_loc,
+                        });
                     }
                 }
-                full_subgraph.insert(dep_name, node);
+                full_subgraph.insert(item.target_loc, (item.dep_name, node));
             }
 
             // 3. Reify newly resolved packages into node_modules and update lockfile concurrently
-            let mut packages_to_download: Vec<(&String, &ResolvedNode)> = Vec::new();
-            for (pkg_name, node) in &full_subgraph {
+            let mut packages_to_download: Vec<(&String, &String, &ResolvedNode)> = Vec::new();
+            for (loc, (pkg_name, node)) in &full_subgraph {
                 if !node.skipped {
-                    packages_to_download.push((pkg_name, node));
+                    packages_to_download.push((loc, pkg_name, node));
                 }
             }
 
             let download_urls: Vec<&str> = packages_to_download
                 .iter()
-                .map(|(_, n)| n.resolved_url.as_str())
+                .map(|(_, _, n)| n.resolved_url.as_str())
                 .collect();
             let download_results = self.fetch_tarballs_concurrent(&download_urls).await;
 
-            for ((pkg_name, node), fetch_res) in
+            for ((loc, _pkg_name, node), fetch_res) in
                 packages_to_download.into_iter().zip(download_results)
             {
                 let (bytes, was_hit) = fetch_res?;
+                let dest_dir = self.options.project_dir.join(loc);
+
+                let enclosing_rel = if let Some(stripped) = loc.strip_suffix(&node.name) {
+                    stripped.trim_end_matches('/')
+                } else {
+                    "node_modules"
+                };
+                let enclosing_nm = self.options.project_dir.join(enclosing_rel);
+                std::fs::create_dir_all(&enclosing_nm)?;
+
+                let enclosing_bin = find_enclosing_bin_dir(&dest_dir, &bin_dir, &node_modules_dir);
+
                 let (hits, misses, lock_entry, l_node) = self.reify_package_with_bytes(
                     node,
                     &bytes,
                     was_hit,
-                    &node_modules_dir,
-                    &bin_dir,
+                    &enclosing_nm,
+                    &enclosing_bin,
                 )?;
                 cache_hits += hits;
                 cache_misses += misses;
@@ -5086,8 +5167,17 @@ impl Installer {
                     lifecycle_nodes.push(ln);
                 }
 
-                let lockfile_key = format!("node_modules/{pkg_name}");
-                lockfile.insert_package(&lockfile_key, lock_entry);
+                // Preserve existing lockfile metadata on updated entries
+                let final_entry = if let Some(mut existing) = lockfile.packages.remove(loc) {
+                    existing.version = lock_entry.version;
+                    existing.resolved = lock_entry.resolved;
+                    existing.integrity = lock_entry.integrity;
+                    existing.dependencies = lock_entry.dependencies;
+                    existing
+                } else {
+                    lock_entry
+                };
+                lockfile.insert_package(loc, final_entry);
             }
 
             // 4. Garbage collection / cleanup of superseded orphaned transitive dependencies
@@ -5210,12 +5300,15 @@ impl Installer {
             }
         }
 
-        // 6. Rewrite lockfile deterministically
+        // 6. Enrich lockfile metadata from newly installed manifests
+        enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
+
+        // 7. Rewrite lockfile deterministically
         lockfile
             .save_to_file_version(&lockfile_path, self.options.lockfile_version)
             .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
 
-        // 7. Persist hidden lockfile to node_modules/.package-lock.json
+        // 8. Persist hidden lockfile to node_modules/.package-lock.json
         lockfile
             .save_hidden(&self.options.project_dir)
             .context("Failed to save hidden package-lock.json")?;
@@ -5522,11 +5615,51 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
         package.license = manifest
             .extra
             .get("license")
-            .and_then(|value| value.as_str())
-            .map(str::to_owned)
+            .and_then(|value| {
+                if let Some(s) = value.as_str() {
+                    Some(s.to_string())
+                } else if let Some(obj) = value.as_object() {
+                    obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                manifest.extra.get("licenses").and_then(|v| {
+                    v.as_array().and_then(|arr| {
+                        arr.first().and_then(|item| {
+                            if let Some(s) = item.as_str() {
+                                Some(s.to_string())
+                            } else if let Some(obj) = item.as_object() {
+                                obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
+            })
             .or_else(|| package.license.clone());
+
         if !manifest.engines.is_empty() {
             package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+        }
+        if let Some(bin) = &manifest.bin {
+            let lock_bin = match bin {
+                rnpm_core::manifest::PackageBin::Single(s) => {
+                    rnpm_lockfile::PackageBin::Single(s.clone())
+                }
+                rnpm_core::manifest::PackageBin::Map(m) => {
+                    rnpm_lockfile::PackageBin::Map(m.clone())
+                }
+            };
+            package.bin = Some(lock_bin);
+        }
+        if let Some(os) = &manifest.os {
+            package.os = Some(os.clone());
+        }
+        if let Some(cpu) = &manifest.cpu {
+            package.cpu = Some(cpu.clone());
         }
         if let Some(libc) = &manifest.libc {
             package.libc = Some(libc.clone());

@@ -640,6 +640,40 @@ pub async fn build_audit_report_with_advisories(
         }
     }
 
+    // Propagate severity from dependencies to dependents (matching npm's rule:
+    // a package's severity is the highest of its own advisories and the vulnerable dependencies it pulls in)
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (_node_path, pkg_name, _ver_str, _is_direct) in &installed_packages {
+            let node_key = format!("node_modules/{pkg_name}");
+            let empty_deps = BTreeMap::new();
+            let deps = lockfile
+                .packages
+                .get(&node_key)
+                .and_then(|p| p.dependencies.as_ref())
+                .unwrap_or(&empty_deps);
+
+            for dep_name in deps.keys() {
+                let dep_sev_opt = vulnerabilities.get(dep_name).map(|v| {
+                    (
+                        Severity::from_str(&v.severity).unwrap_or(Severity::Low),
+                        v.severity.clone(),
+                    )
+                });
+                if let Some((dep_sev, dep_sev_str)) = dep_sev_opt {
+                    if let Some(entry) = vulnerabilities.get_mut(pkg_name) {
+                        let cur_sev = Severity::from_str(&entry.severity).unwrap_or(Severity::Low);
+                        if dep_sev > cur_sev {
+                            entry.severity = dep_sev_str;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // npm 11 counts vulnerable packages using each package's highest severity
     let mut pkg_vuln_counts = VulnerabilitiesCount::default();
     for pkg_vuln in vulnerabilities.values() {

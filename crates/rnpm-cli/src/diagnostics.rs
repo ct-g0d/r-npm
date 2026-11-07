@@ -63,6 +63,7 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENEEDAUTH" => "ENEEDAUTH",
                 "EINTEGRITY" => "EINTEGRITY",
                 "ELOCKFILE_DRIFT" => "ELOCKFILE_DRIFT",
+                "EUSAGE" => "EUSAGE",
                 "EUNSUPPORTEDPROTOCOL" => "EUNSUPPORTEDPROTOCOL",
                 "ETARBOMB" => "ETARBOMB",
                 "ESECURITY" => "ESECURITY",
@@ -408,6 +409,8 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 || (err_str.contains("line ") && err_str.contains("column "))))
     {
         Diagnostic::new("EJSONPARSE", err_str)
+    } else if err_str.contains("EUSAGE") || err_str.contains("Missing: ") {
+        Diagnostic::new("EUSAGE", err_str)
     } else if err_str.contains("ENOLOCK")
         || err_str.contains("requires an existing lockfile")
         || err_str.contains("requires a committed lockfile")
