@@ -19,8 +19,11 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
             return PathBuf::new();
         }
 
-        // If it already has verbatim prefix, just normalize separators
+        // If it already has verbatim prefix, check if already clean
         if path_str.starts_with(r"\\?\") || path_str.starts_with(r"\??\") {
+            if !path_str.contains('/') && !path_str.contains("..") && !path_str.contains(r"\.\") {
+                return path.to_path_buf();
+            }
             let normalized = path_str.replace('/', "\\");
             if normalized.starts_with(r"\\?\UNC\") || normalized.starts_with(r"\??\UNC\") {
                 let unc_tail = &normalized[8..];
@@ -31,6 +34,18 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
                 let cleaned = clean_windows_components(tail);
                 return PathBuf::from(format!(r"\\?\{cleaned}"));
             }
+        }
+
+        // Fast path for clean absolute drive paths (e.g. C:\foo\bar)
+        let bytes = path_str.as_bytes();
+        if bytes.len() >= 3
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+            && !path_str.contains('/')
+            && !path_str.contains("..")
+            && !path_str.contains(r"\.\")
+        {
+            return PathBuf::from(format!(r"\\?\{path_str}"));
         }
 
         // Make path absolute if relative so verbatim path has a valid root

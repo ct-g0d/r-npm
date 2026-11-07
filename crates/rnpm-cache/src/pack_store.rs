@@ -267,56 +267,68 @@ impl PackagePack {
         writer_config: Option<&ParallelWriterConfig>,
         can_block_clone_hint: Option<bool>,
     ) -> Result<ExtractionSummary, CacheError> {
-        self.verify_checksum()?;
+        self.materialize_to_opt(target_dir, writer_config, can_block_clone_hint, false)
+    }
+
+    /// Fast materialization option with precreated directories support.
+    pub fn materialize_to_opt(
+        &self,
+        target_dir: &Path,
+        writer_config: Option<&ParallelWriterConfig>,
+        can_block_clone_hint: Option<bool>,
+        dirs_precreated: bool,
+    ) -> Result<ExtractionSummary, CacheError> {
         let start_time = std::time::Instant::now();
         let pack_data = self.data();
-        let clean_target_dir = clean(target_dir);
 
-        // Security check: re-validate every entry path and ensure strict containment within target_dir
-        for entry in &self.index.files {
-            let p = Path::new(&entry.path);
-            rnpm_fs::validate_entry_path(p).map_err(CacheError::Fs)?;
-            let full_path = clean(target_dir.join(&entry.path));
-            if !full_path.starts_with(&clean_target_dir) {
-                return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
-                    path: PathBuf::from(&entry.path),
-                }));
+        if !dirs_precreated {
+            let clean_target_dir = clean(target_dir);
+            // Security check: re-validate every entry path and ensure strict containment within target_dir
+            for entry in &self.index.files {
+                let p = Path::new(&entry.path);
+                rnpm_fs::validate_entry_path(p).map_err(CacheError::Fs)?;
+                let full_path = clean(target_dir.join(&entry.path));
+                if !full_path.starts_with(&clean_target_dir) {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
+                        path: PathBuf::from(&entry.path),
+                    }));
+                }
             }
-        }
-        for (link_rel, target_rel) in &self.index.symlinks {
-            let p_link = Path::new(link_rel);
-            let p_target = Path::new(target_rel);
-            rnpm_fs::validate_entry_path(p_link).map_err(CacheError::Fs)?;
-            rnpm_fs::validate_entry_path(p_target).map_err(CacheError::Fs)?;
-            let full_link = clean(target_dir.join(link_rel));
-            let full_target = clean(target_dir.join(target_rel));
-            if !full_link.starts_with(&clean_target_dir)
-                || !full_target.starts_with(&clean_target_dir)
-            {
-                return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
-                    path: PathBuf::from(link_rel),
-                }));
+            for (link_rel, target_rel) in &self.index.symlinks {
+                let p_link = Path::new(link_rel);
+                let p_target = Path::new(target_rel);
+                rnpm_fs::validate_entry_path(p_link).map_err(CacheError::Fs)?;
+                rnpm_fs::validate_entry_path(p_target).map_err(CacheError::Fs)?;
+                let full_link = clean(target_dir.join(link_rel));
+                let full_target = clean(target_dir.join(target_rel));
+                if !full_link.starts_with(&clean_target_dir)
+                    || !full_target.starts_with(&clean_target_dir)
+                {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
+                        path: PathBuf::from(link_rel),
+                    }));
+                }
             }
-        }
 
-        // 1. Directories first: collect all unique parent directory paths for the package entries
-        // and create them all up-front in one batch using std::fs::create_dir_all
-        let mut parent_dirs = std::collections::HashSet::new();
-        parent_dirs.insert(target_dir.to_path_buf());
-        for entry in &self.index.files {
-            let full_path = target_dir.join(&entry.path);
-            if let Some(parent) = full_path.parent() {
-                parent_dirs.insert(parent.to_path_buf());
+            // 1. Directories first: collect all unique parent directory paths for the package entries
+            // and create them all up-front in one batch using std::fs::create_dir_all
+            let mut parent_dirs = std::collections::HashSet::new();
+            parent_dirs.insert(target_dir.to_path_buf());
+            for entry in &self.index.files {
+                let full_path = target_dir.join(&entry.path);
+                if let Some(parent) = full_path.parent() {
+                    parent_dirs.insert(parent.to_path_buf());
+                }
             }
-        }
-        for (link_rel, _) in &self.index.symlinks {
-            let full_path = target_dir.join(link_rel);
-            if let Some(parent) = full_path.parent() {
-                parent_dirs.insert(parent.to_path_buf());
+            for (link_rel, _) in &self.index.symlinks {
+                let full_path = target_dir.join(link_rel);
+                if let Some(parent) = full_path.parent() {
+                    parent_dirs.insert(parent.to_path_buf());
+                }
             }
-        }
-        for dir in &parent_dirs {
-            std::fs::create_dir_all(dir)?;
+            for dir in &parent_dirs {
+                std::fs::create_dir_all(dir)?;
+            }
         }
 
         let default_cfg = ParallelWriterConfig::default();
@@ -716,8 +728,14 @@ impl PackStore {
         let buffer = if pack_len == 0 {
             Arc::new(PackBuffer::Empty)
         } else {
-            let bytes = fs::read(&pack_path)?;
-            Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
+            let file = std::fs::File::open(&pack_path)?;
+            match unsafe { memmap2::Mmap::map(&file) } {
+                Ok(mmap) => Arc::new(PackBuffer::Mmap(Arc::new(mmap))),
+                Err(_) => {
+                    let bytes = fs::read(&pack_path)?;
+                    Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
+                }
+            }
         };
 
         let pack = PackagePack {
@@ -726,6 +744,12 @@ impl PackStore {
             pack_path,
             idx_path,
         };
+
+        // Verify checksum once upon loading into memory
+        if let Err(e) = pack.verify_checksum() {
+            let _ = self.purge(integrity);
+            return Err(e);
+        }
 
         // 5. Store in cache across process lifetime
         {
@@ -1173,11 +1197,27 @@ impl PackStore {
         target_dir: &Path,
         writer_config: Option<&ParallelWriterConfig>,
     ) -> Result<ExtractionSummary, CacheError> {
+        self.materialize_pack_opt(integrity, target_dir, writer_config, false)
+    }
+
+    /// Fast materialization option with precreated directories support.
+    pub fn materialize_pack_opt(
+        &self,
+        integrity: &str,
+        target_dir: &Path,
+        writer_config: Option<&ParallelWriterConfig>,
+        dirs_precreated: bool,
+    ) -> Result<ExtractionSummary, CacheError> {
         let pack = self
             .get_package_pack(integrity)?
             .ok_or_else(|| CacheError::PackNotFound(integrity.to_string()))?;
         let can_block_clone = self.is_block_cloning_eligible(target_dir);
-        match pack.materialize_to_with_hint(target_dir, writer_config, Some(can_block_clone)) {
+        match pack.materialize_to_opt(
+            target_dir,
+            writer_config,
+            Some(can_block_clone),
+            dirs_precreated,
+        ) {
             Ok(summary) => Ok(summary),
             Err(e) => {
                 if e.is_pack_corruption() {

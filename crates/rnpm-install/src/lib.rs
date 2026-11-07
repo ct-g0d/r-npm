@@ -1103,11 +1103,7 @@ impl Installer {
             .context("Failed to initialize registry client")?;
 
         let writer_cfg = Arc::new(determine_writer_config(&options.project_dir, concurrency));
-        let io_concurrency = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            * 2)
-        .clamp(16, 64);
+        let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
 
         Ok(Self {
@@ -1141,11 +1137,7 @@ impl Installer {
             &self.options.project_dir,
             Some(concurrency),
         ));
-        let io_concurrency = (std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            * 2)
-        .clamp(16, 64);
+        let io_concurrency = concurrency.clamp(32, 128);
         self.io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
         Ok(self)
     }
@@ -3320,7 +3312,8 @@ impl Installer {
             }
         }
 
-        let mut packages_to_process: Vec<(String, String, String, bool, Vec<String>)> = Vec::new();
+        let mut packages_to_process: Vec<(String, String, String, bool, Vec<String>, bool)> =
+            Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
@@ -3679,17 +3672,26 @@ impl Installer {
                 .map(|d| d.keys().cloned().collect())
                 .unwrap_or_default();
 
+            let has_bin = match &pkg_info.bin {
+                Some(rnpm_lockfile::PackageBin::Single(_)) => true,
+                Some(rnpm_lockfile::PackageBin::Map(m)) => !m.is_empty(),
+                None => false,
+            };
+            let has_scripts = pkg_info.has_install_script.unwrap_or(false);
+            let has_bins_or_scripts = has_bin || has_scripts;
+
             packages_to_process.push((
                 pkg_key.clone(),
                 resolved_url.clone(),
                 integrity_str.to_string(),
                 is_optional,
                 deps,
+                has_bins_or_scripts,
             ));
         }
 
         if self.options.offline {
-            for (pkg_key, resolved_url, integrity_str, is_optional, _) in &packages_to_process {
+            for (pkg_key, resolved_url, integrity_str, is_optional, _, _) in &packages_to_process {
                 if resolved_url.starts_with("file:") {
                     continue;
                 }
@@ -3728,12 +3730,49 @@ impl Installer {
             }
         }
 
+        // Pre-create all package directories and all internal pack directories in one single pass before file writes
+        {
+            let mut all_dirs = std::collections::BTreeSet::new();
+            all_dirs.insert(node_modules_dir.clone());
+            all_dirs.insert(bin_dir.clone());
+
+            for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
+                let pkg_target = loc_base_dir.join(pkg_key);
+                all_dirs.insert(pkg_target.clone());
+                if let Some(parent) = pkg_target.parent() {
+                    all_dirs.insert(parent.to_path_buf());
+                }
+
+                if !integrity_str.is_empty() {
+                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                        for entry in &pack.index.files {
+                            let p = Path::new(&entry.path);
+                            if let Some(sub_parent) = p.parent() {
+                                if !sub_parent.as_os_str().is_empty() {
+                                    all_dirs.insert(pkg_target.join(sub_parent));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+            let _ = precreate_directories(dir_refs);
+        }
+
         let ci_writer_cfg = Arc::clone(&self.writer_cfg);
         let semaphore = Arc::clone(&self.io_semaphore);
         let mut join_set = tokio::task::JoinSet::new();
 
-        for (pkg_key, resolved_url, integrity_str, is_optional, declared_dependencies) in
-            packages_to_process
+        for (
+            pkg_key,
+            resolved_url,
+            integrity_str,
+            is_optional,
+            declared_dependencies,
+            has_bins_or_scripts,
+        ) in packages_to_process
         {
             let sem = Arc::clone(&semaphore);
             let cache = self.cache.clone();
@@ -3767,7 +3806,7 @@ impl Installer {
 
                     let mat_res = tokio::task::spawn_blocking(move || {
                         let _mat_span = tracing::info_span!("materialize", package = %key_clone).entered();
-                        let res = ps_clone.materialize_pack(&integ_clone, &target_clone, Some(&cfg_clone));
+                        let res = ps_clone.materialize_pack_opt(&integ_clone, &target_clone, Some(&cfg_clone), true);
                         drop(_mat_span);
                         res
                     }).await?;
@@ -3775,15 +3814,19 @@ impl Installer {
 
                     match mat_res {
                         Ok(_) => {
-                            let lifecycle_node = process_installed_pkg_manifest(
-                                &target_path,
-                                &pkg_bin_dir,
-                                &pkg_key,
-                                &resolved_url,
-                                &declared_dependencies,
-                                is_optional,
-                                &worker_collector,
-                            );
+                            let lifecycle_node = if has_bins_or_scripts {
+                                process_installed_pkg_manifest(
+                                    &target_path,
+                                    &pkg_bin_dir,
+                                    &pkg_key,
+                                    &resolved_url,
+                                    &declared_dependencies,
+                                    is_optional,
+                                    &worker_collector,
+                                )
+                            } else {
+                                None
+                            };
                             return Ok(Some((true, lifecycle_node)));
                         }
                         Err(e) => {
@@ -3976,15 +4019,19 @@ impl Installer {
                 worker_collector.record_phase(Phase::Materialize, extract_res.materialize_duration);
                 worker_collector.record_phase(Phase::Inflate, extract_res.inflate_duration);
 
-                let lifecycle_node = process_installed_pkg_manifest(
-                    &target_path,
-                    &pkg_bin_dir,
-                    &pkg_key,
-                    &resolved_url,
-                    &declared_dependencies,
-                    is_optional,
-                    &worker_collector,
-                );
+                let lifecycle_node = if has_bins_or_scripts {
+                    process_installed_pkg_manifest(
+                        &target_path,
+                        &pkg_bin_dir,
+                        &pkg_key,
+                        &resolved_url,
+                        &declared_dependencies,
+                        is_optional,
+                        &worker_collector,
+                    )
+                } else {
+                    None
+                };
 
                 Ok(Some((was_hit, lifecycle_node)))
             });

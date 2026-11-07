@@ -376,20 +376,23 @@ pub fn write_file_fast(
         }
 
         const GENERIC_WRITE: u32 = 0x40000000;
-        const FILE_SHARE_READ: u32 = 1;
         const CREATE_ALWAYS: u32 = 2;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
         const FILE_ALLOCATION_INFO_CLASS: i32 = 5;
         const ERROR_ACCESS_DENIED: u32 = 5;
 
-        const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
         const WRITE_CHUNK_SIZE: usize = 128 * 1024; // 128 KiB optimal write chunk
 
         #[repr(C)]
         struct FILE_ALLOCATION_INFO {
             allocation_size: i64,
         }
+
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const FILE_SHARE_DELETE: u32 = 4;
+        const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
         let verbatim_path = crate::path::to_verbatim_path(path);
         let path_wide: Vec<u16> = verbatim_path
@@ -402,17 +405,34 @@ pub fn write_file_fast(
             CreateFileW(
                 path_wide.as_ptr(),
                 GENERIC_WRITE,
-                FILE_SHARE_READ,
+                FILE_SHARE_ALL,
                 std::ptr::null_mut(),
                 CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                FILE_ATTRIBUTE_NORMAL,
                 std::ptr::null_mut(),
             )
         };
 
+        const ERROR_PATH_NOT_FOUND: u32 = 3;
+
         if handle == INVALID_HANDLE_VALUE {
             let err = unsafe { GetLastError() };
-            if err == ERROR_ACCESS_DENIED {
+            if err == ERROR_PATH_NOT_FOUND {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                handle = unsafe {
+                    CreateFileW(
+                        path_wide.as_ptr(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_ALL,
+                        std::ptr::null_mut(),
+                        CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                };
+            } else if err == ERROR_ACCESS_DENIED {
                 unlink_target_path(path);
                 unsafe {
                     SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
@@ -421,10 +441,10 @@ pub fn write_file_fast(
                     CreateFileW(
                         path_wide.as_ptr(),
                         GENERIC_WRITE,
-                        FILE_SHARE_READ,
+                        FILE_SHARE_ALL,
                         std::ptr::null_mut(),
                         CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                        FILE_ATTRIBUTE_NORMAL,
                         std::ptr::null_mut(),
                     )
                 };
