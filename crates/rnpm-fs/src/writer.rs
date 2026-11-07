@@ -450,17 +450,15 @@ pub fn write_file_fast(
             }
         }
 
-        let mut total_written = 0usize;
         let data_len = data.len();
 
-        while total_written < data_len {
-            let to_write = (data_len - total_written).min(WRITE_CHUNK_SIZE) as u32;
+        if data_len <= WRITE_CHUNK_SIZE {
             let mut written = 0u32;
             let ok = unsafe {
                 WriteFile(
                     handle,
-                    data[total_written..].as_ptr() as *const std::ffi::c_void,
-                    to_write,
+                    data.as_ptr() as *const std::ffi::c_void,
+                    data_len as u32,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -472,16 +470,38 @@ pub fn write_file_fast(
                 }
                 return Err(std::io::Error::from_raw_os_error(err as i32));
             }
-            if written == 0 {
-                unsafe {
-                    CloseHandle(handle);
+        } else {
+            let mut total_written = 0usize;
+            while total_written < data_len {
+                let to_write = (data_len - total_written).min(WRITE_CHUNK_SIZE) as u32;
+                let mut written = 0u32;
+                let ok = unsafe {
+                    WriteFile(
+                        handle,
+                        data[total_written..].as_ptr() as *const std::ffi::c_void,
+                        to_write,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    unsafe {
+                        CloseHandle(handle);
+                    }
+                    return Err(std::io::Error::from_raw_os_error(err as i32));
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write whole buffer (WriteFile returned 0 bytes written)",
-                ));
+                if written == 0 {
+                    unsafe {
+                        CloseHandle(handle);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write whole buffer (WriteFile returned 0 bytes written)",
+                    ));
+                }
+                total_written += written as usize;
             }
-            total_written += written as usize;
         }
 
         unsafe {

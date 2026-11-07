@@ -761,7 +761,7 @@ fn print_human_audit_report(report: &AuditReport) {
         for via in &vuln.via {
             println!("{} - {}", via.title, via.url);
         }
-        println!("fix available via `rnpm update`");
+        println!("fix available via `npm audit fix`");
         for node in &vuln.nodes {
             println!("{node}");
         }
@@ -792,7 +792,7 @@ fn print_human_audit_report(report: &AuditReport) {
     }
 
     println!(
-        "{} severity {}\n\nTo address issues, run:\n  rnpm update",
+        "{} severity {}\n\nTo address issues, run:\n  npm audit fix",
         summary_parts.join(", "),
         if report.metadata.vulnerabilities.total == 1 {
             "vulnerability"

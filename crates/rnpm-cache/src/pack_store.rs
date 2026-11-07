@@ -266,7 +266,6 @@ impl PackagePack {
         writer_config: Option<&ParallelWriterConfig>,
         can_block_clone_hint: Option<bool>,
     ) -> Result<ExtractionSummary, CacheError> {
-        self.verify_checksum()?;
         let start_time = std::time::Instant::now();
         let pack_data = self.data();
         let clean_target_dir = clean(target_dir);
@@ -350,93 +349,40 @@ impl PackagePack {
         let raw_pack_handle: Option<usize> = None;
         let _ = can_block_clone;
 
-        // 2. Parallel materialization straight from memory mapping (or ReFS block cloning)
-        let num_threads = cfg.worker_threads.clamp(1, 32).min(self.index.files.len());
-        if num_threads > 1 && self.index.files.len() > 1 {
-            let queue = Mutex::new(self.index.files.clone());
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(num_threads);
-                for _ in 0..num_threads {
-                    let q = &queue;
-                    handles.push(scope.spawn(move || -> Result<(), CacheError> {
-                        loop {
-                            let entry = {
-                                let mut guard = q.lock().unwrap();
-                                guard.pop()
-                            };
-                            let entry = match entry {
-                                Some(e) => e,
-                                None => break,
-                            };
-                            let full_path = target_dir.join(&entry.path);
-                            let start = entry.offset as usize;
-                            let end = start + entry.size as usize;
-                            if end > pack_data.len() {
-                                return Err(CacheError::InvalidPack(format!(
-                                    "Pack entry '{}' exceeds pack size (offset {} + size {} > total {})",
-                                    entry.path, entry.offset, entry.size, pack_data.len()
-                                )));
-                            }
-                            let slice = &pack_data[start..end];
-
-                            #[cfg(windows)]
-                            let src_h = raw_pack_handle.map(|h| h as RawFileHandle);
-                            #[cfg(not(windows))]
-                            let src_h = None;
-
-                            clone_or_write_pack_file(
-                                src_h,
-                                &full_path,
-                                slice,
-                                entry.offset,
-                                entry.size,
-                                entry.mode,
-                                prealloc_thresh,
-                            )
-                            .map_err(CacheError::Io)?;
-                        }
-                        Ok(())
-                    }));
-                }
-                for handle in handles {
-                    handle.join().map_err(|_| {
-                        CacheError::Other("Pack materialization worker panicked".to_string())
-                    })??;
-                }
-                Ok::<(), CacheError>(())
-            })?;
-        } else {
-            for entry in &self.index.files {
-                let full_path = target_dir.join(&entry.path);
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                if end > pack_data.len() {
-                    return Err(CacheError::InvalidPack(format!(
-                        "Pack entry '{}' exceeds pack size (offset {} + size {} > total {})",
-                        entry.path,
-                        entry.offset,
-                        entry.size,
-                        pack_data.len()
-                    )));
-                }
-                let slice = &pack_data[start..end];
-
-                #[cfg(windows)]
-                let src_h = raw_pack_handle.map(|h| h as RawFileHandle);
-                #[cfg(not(windows))]
-                let src_h = None;
-
-                clone_or_write_pack_file(
-                    src_h,
-                    &full_path,
-                    slice,
+        // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
+        // Since packages are already parallelized across CPU cores at the installer level,
+        // sequentially writing package files avoids OS thread churn, context switching,
+        // and mutex contention across thousands of files.
+        for entry in &self.index.files {
+            let full_path = target_dir.join(&entry.path);
+            let start = entry.offset as usize;
+            let end = start + entry.size as usize;
+            if end > pack_data.len() {
+                return Err(CacheError::InvalidPack(format!(
+                    "Pack entry '{}' exceeds pack size (offset {} + size {} > total {})",
+                    entry.path,
                     entry.offset,
                     entry.size,
-                    entry.mode,
-                    prealloc_thresh,
-                )
-                .map_err(CacheError::Io)?;
+                    pack_data.len()
+                )));
             }
+            let slice = &pack_data[start..end];
+
+            #[cfg(windows)]
+            let src_h = raw_pack_handle.map(|h| h as RawFileHandle);
+            #[cfg(not(windows))]
+            let src_h = None;
+
+            clone_or_write_pack_file(
+                src_h,
+                &full_path,
+                slice,
+                entry.offset,
+                entry.size,
+                entry.mode,
+                prealloc_thresh,
+            )
+            .map_err(CacheError::Io)?;
         }
 
         // 3. Recreate symlinks if any

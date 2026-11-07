@@ -4822,13 +4822,40 @@ impl Installer {
             }
         } else {
             for target in targets {
-                if let Some(range) = manifest.dependencies.get(target) {
-                    deps_to_update.insert(target.clone(), range.clone());
-                } else if let Some(range) = manifest.dev_dependencies.get(target) {
-                    deps_to_update.insert(target.clone(), range.clone());
+                let (target_name, explicit_range) = if let Some(at_idx) = target.rfind('@') {
+                    let slash_idx = target.find('/').unwrap_or(0);
+                    if at_idx > slash_idx && at_idx > 0 {
+                        (
+                            target[..at_idx].to_string(),
+                            Some(target[at_idx + 1..].trim().to_string()),
+                        )
+                    } else {
+                        (target.clone(), None)
+                    }
+                } else {
+                    (target.clone(), None)
+                };
+
+                if let Some(spec) = explicit_range {
+                    deps_to_update.insert(target_name, spec);
+                } else if let Some(range) = manifest.dependencies.get(&target_name) {
+                    deps_to_update.insert(target_name, range.clone());
+                } else if let Some(range) = manifest.dev_dependencies.get(&target_name) {
+                    deps_to_update.insert(target_name, range.clone());
+                } else if let Some(range) = manifest.optional_dependencies.get(&target_name) {
+                    deps_to_update.insert(target_name, range.clone());
+                } else if let Some(pkg) =
+                    lockfile.get_package(&format!("node_modules/{target_name}"))
+                {
+                    let range = pkg
+                        .version
+                        .as_deref()
+                        .map(|v| format!("^{v}"))
+                        .unwrap_or_else(|| "*".to_string());
+                    deps_to_update.insert(target_name, range);
                 } else {
                     return Err(anyhow!(
-                        "Package '{}' is not a dependency in package.json",
+                        "Package '{}' is not a dependency in package.json or lockfile",
                         target
                     ));
                 }

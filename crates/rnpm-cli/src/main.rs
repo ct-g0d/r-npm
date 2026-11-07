@@ -3676,37 +3676,23 @@ async fn execute_team(
     Ok(())
 }
 
-fn replace_version_in_url(url: &str, pkg_name: &str, new_ver: &str) -> String {
-    let simple_name = pkg_name.split('/').next_back().unwrap_or(pkg_name);
-    let pattern = format!("{simple_name}-");
-    if let Some(pos) = url.rfind(&pattern) {
-        let prefix = &url[..pos + pattern.len()];
-        let after_pattern = &url[pos + pattern.len()..];
-        if let Some(end) = after_pattern.find(".tgz") {
-            let remainder = &after_pattern[end..];
-            return format!("{prefix}{new_ver}{remainder}");
-        }
-    }
-    url.to_string()
-}
-
 fn print_fixed_summary(
     fixed_vulns: usize,
     fixed_counts: &audit::VulnerabilitiesCount,
     pkg_count: usize,
 ) {
     let mut parts = Vec::new();
-    if fixed_counts.low > 0 {
-        parts.push(format!("{} low", fixed_counts.low));
-    }
-    if fixed_counts.moderate > 0 {
-        parts.push(format!("{} moderate", fixed_counts.moderate));
+    if fixed_counts.critical > 0 {
+        parts.push(format!("{} critical", fixed_counts.critical));
     }
     if fixed_counts.high > 0 {
         parts.push(format!("{} high", fixed_counts.high));
     }
-    if fixed_counts.critical > 0 {
-        parts.push(format!("{} critical", fixed_counts.critical));
+    if fixed_counts.moderate > 0 {
+        parts.push(format!("{} moderate", fixed_counts.moderate));
+    }
+    if fixed_counts.low > 0 {
+        parts.push(format!("{} low", fixed_counts.low));
     }
     if fixed_counts.info > 0 {
         parts.push(format!("{} info", fixed_counts.info));
@@ -3767,7 +3753,7 @@ async fn run_audit_fix(
 
     // Parse package.json to identify declared dependency ranges
     let manifest_content = std::fs::read_to_string(&manifest_path)?;
-    let mut manifest_val: serde_json::Value = serde_json::from_str(&manifest_content)?;
+    let manifest_val: serde_json::Value = serde_json::from_str(&manifest_content)?;
 
     let mut declared_direct: BTreeMap<String, String> = BTreeMap::new();
     for sec_name in ["dependencies", "devDependencies", "optionalDependencies"] {
@@ -3786,11 +3772,14 @@ async fn run_audit_fix(
         advs_by_pkg.entry(adv.name.clone()).or_default().push(adv);
     }
 
+    let mut targets_to_update: Vec<String> = Vec::new();
     let mut packages_to_upgrade: BTreeMap<String, (rnpm_core::semver::Version, String)> =
         BTreeMap::new();
     let mut fixed_advisory_ids: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     let mut fixed_counts = audit::VulnerabilitiesCount::default();
+    let mut packages_needing_force = 0usize;
+    let mut manifest_updates: Vec<(String, String)> = Vec::new();
 
     for (pkg_name, pkg_advs) in &advs_by_pkg {
         let mut highest_target_ver: Option<rnpm_core::semver::Version> = None;
@@ -3814,23 +3803,28 @@ async fn run_audit_fix(
 
         let target_ver = match highest_target_ver {
             Some(v) => v,
-            None => continue,
+            None => {
+                packages_needing_force += 1;
+                continue;
+            }
         };
 
-        let installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
-            .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
-
-        // Semver compatibility check
+        // Semver compatibility check against declared range
         let is_compatible = if let Some(declared_range_str) = declared_direct.get(pkg_name) {
             if let Ok(declared_range) = rnpm_core::semver::Range::parse(declared_range_str) {
                 declared_range.satisfies(&target_ver)
             } else {
                 false
             }
-        } else if installed_ver.major == 0 {
-            target_ver.major == 0 && target_ver.minor == installed_ver.minor
         } else {
-            target_ver.major == installed_ver.major
+            // Transitive dependency: compatible if not major bump
+            let installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
+                .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
+            if installed_ver.major == 0 {
+                target_ver.major == 0 && target_ver.minor == installed_ver.minor
+            } else {
+                target_ver.major == installed_ver.major
+            }
         };
 
         if is_compatible || force {
@@ -3855,16 +3849,27 @@ async fn run_audit_fix(
                     }
                 }
             }
+
+            if is_compatible {
+                // Compatible fix within current range: install target version
+                // (package.json declared range already allows target_ver, so package.json remains unchanged)
+                targets_to_update.push(pkg_name.clone());
+            } else {
+                // Incompatible fix with --force: upgrade package.json dependency and install
+                let new_range = format!("^{target_ver}");
+                manifest_updates.push((pkg_name.clone(), new_range));
+                targets_to_update.push(format!("{pkg_name}@^{target_ver}"));
+            }
+        } else {
+            packages_needing_force += 1;
         }
     }
 
-    let fixed_vulns = fixed_counts.total;
-
-    if packages_to_upgrade.is_empty() || fixed_vulns == 0 {
+    if targets_to_update.is_empty() {
         println!("found 0 vulnerabilities to fix");
         audit::print_concise_audit_summary(&initial_report);
-        if !force {
-            eprintln!("npm warn audit Semver-major updates or transitive dependencies may require `rnpm audit fix --force`");
+        if packages_needing_force > 0 {
+            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
         }
         return Ok(());
     }
@@ -3873,133 +3878,71 @@ async fn run_audit_fix(
         for (pkg_name, (target_ver, old_ver)) in &packages_to_upgrade {
             println!("would update {pkg_name} from {old_ver} to {target_ver}");
         }
-        print_fixed_summary(fixed_vulns, &fixed_counts, packages_to_upgrade.len());
+        print_fixed_summary(fixed_counts.total, &fixed_counts, packages_to_upgrade.len());
         return Ok(());
     }
 
-    // 1. Rewrite package.json
-    let mut modified_manifest = false;
-    for (pkg_name, (target_ver, _)) in &packages_to_upgrade {
-        let new_range = format!("^{target_ver}");
-        for section in ["dependencies", "devDependencies", "optionalDependencies"] {
-            if let Some(sec) = manifest_val
-                .get_mut(section)
-                .and_then(|s| s.as_object_mut())
-            {
-                if sec.contains_key(pkg_name) {
-                    sec.insert(
-                        pkg_name.clone(),
-                        serde_json::Value::String(new_range.clone()),
-                    );
-                    modified_manifest = true;
-                }
-            }
-        }
-    }
-    if modified_manifest {
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest_val)? + "\n",
-        )?;
-    }
-
-    // 2. Rewrite package-lock.json
-    let lock_content = std::fs::read_to_string(&lock_path)?;
-    let mut lock_val: serde_json::Value = serde_json::from_str(&lock_content)?;
-
-    if let Some(packages) = lock_val.get_mut("packages").and_then(|p| p.as_object_mut()) {
-        for (pkg_name, (target_ver, _)) in &packages_to_upgrade {
-            let target_str = target_ver.to_string();
-            if let Some(root_pkg) = packages.get_mut("").and_then(|r| r.as_object_mut()) {
-                let new_range = format!("^{target_str}");
-                for sec_name in ["dependencies", "devDependencies", "optionalDependencies"] {
-                    if let Some(sec) = root_pkg.get_mut(sec_name).and_then(|s| s.as_object_mut()) {
-                        if sec.contains_key(pkg_name) {
-                            sec.insert(
-                                pkg_name.clone(),
-                                serde_json::Value::String(new_range.clone()),
-                            );
-                        }
-                    }
-                }
-            }
-
-            for (key, node_val) in packages.iter_mut() {
-                if key.is_empty() {
-                    continue;
-                }
-                let is_match = key == &format!("node_modules/{pkg_name}")
-                    || key.ends_with(&format!("/node_modules/{pkg_name}"))
-                    || node_val.get("name").and_then(|n| n.as_str()) == Some(pkg_name.as_str());
-                if is_match {
-                    if let Some(obj) = node_val.as_object_mut() {
-                        obj.insert(
-                            "version".to_string(),
-                            serde_json::Value::String(target_str.clone()),
-                        );
-                        if let Some(resolved) = obj.get("resolved").and_then(|r| r.as_str()) {
-                            let updated_url =
-                                replace_version_in_url(resolved, pkg_name, &target_str);
-                            obj.insert(
-                                "resolved".to_string(),
-                                serde_json::Value::String(updated_url),
-                            );
+    // 1. If --force updated declared ranges, update package.json PRESERVING key order and formatting!
+    if !manifest_updates.is_empty() {
+        let content = std::fs::read_to_string(&manifest_path)?;
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        for (pkg_name, new_range) in &manifest_updates {
+            let key_str = format!("\"{pkg_name}\"");
+            for line in lines.iter_mut() {
+                if let Some(pos) = line.find(&key_str) {
+                    if let Some(colon_pos) = line[pos..].find(':') {
+                        let actual_colon = pos + colon_pos;
+                        if let Some(first_quote) = line[actual_colon..].find('"') {
+                            let val_start = actual_colon + first_quote + 1;
+                            if let Some(second_quote) = line[val_start..].find('"') {
+                                let val_end = val_start + second_quote;
+                                let mut new_line = line[..val_start].to_string();
+                                new_line.push_str(new_range);
+                                new_line.push_str(&line[val_end..]);
+                                *line = new_line;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
-    }
-
-    if let Some(v1_deps) = lock_val
-        .get_mut("dependencies")
-        .and_then(|d| d.as_object_mut())
-    {
-        for (pkg_name, (target_ver, _)) in &packages_to_upgrade {
-            let target_str = target_ver.to_string();
-            if let Some(pkg_obj) = v1_deps.get_mut(pkg_name).and_then(|p| p.as_object_mut()) {
-                pkg_obj.insert("version".to_string(), serde_json::Value::String(target_str));
-            }
+        let mut new_content = lines.join("\n");
+        if content.ends_with('\n') {
+            new_content.push('\n');
         }
+        std::fs::write(&manifest_path, new_content)?;
     }
 
-    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock_val)? + "\n")?;
+    // 2. Perform real package resolution, tarball extraction, and lockfile updates via Installer!
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    let options = InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        registry_url: registry.clone(),
+        ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
+        foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
+        strict_sandbox: config.get_bool("strict-sandbox").unwrap_or(false),
+        ..Default::default()
+    };
 
-    // 3. Update node_modules package.json if present
-    let nm_dir = project_dir.join("node_modules");
-    if nm_dir.exists() {
-        for (pkg_name, (target_ver, _)) in &packages_to_upgrade {
-            let pkg_nm = nm_dir.join(pkg_name).join("package.json");
-            if pkg_nm.exists() {
-                if let Ok(content) = std::fs::read_to_string(&pkg_nm) {
-                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(obj) = val.as_object_mut() {
-                            obj.insert(
-                                "version".to_string(),
-                                serde_json::Value::String(target_ver.to_string()),
-                            );
-                            let _ = std::fs::write(
-                                &pkg_nm,
-                                serde_json::to_string_pretty(&val).unwrap_or_default() + "\n",
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut installer = Installer::new(options)?;
+    let update_summary = installer.update(&targets_to_update).await?;
 
-    print_fixed_summary(fixed_vulns, &fixed_counts, packages_to_upgrade.len());
-
-    let (post_report, _) = audit::build_audit_report(project_dir, registry)
+    // 3. Re-run audit to count actual remaining vs fixed vulnerabilities
+    let (post_report, _, _) = audit::build_audit_report_with_advisories(project_dir, registry)
         .await
-        .unwrap_or((initial_report.clone(), None));
+        .unwrap_or((initial_report.clone(), None, Vec::new()));
     let remaining_vulns = post_report.metadata.vulnerabilities.total;
+    let actual_fixed = initial_vulns.saturating_sub(remaining_vulns);
+
+    if actual_fixed > 0 {
+        print_fixed_summary(actual_fixed, &fixed_counts, update_summary.packages_updated);
+    }
 
     if remaining_vulns > 0 {
         audit::print_concise_audit_summary(&post_report);
-        if !force {
-            eprintln!("npm warn audit Semver-major updates or transitive dependencies may require `rnpm audit fix --force`");
+        if !force && packages_needing_force > 0 {
+            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
         }
     } else {
         println!("found 0 vulnerabilities");
