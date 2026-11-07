@@ -1,15 +1,15 @@
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use crate::error::FsError;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use path_clean::clean;
-use tar::{Archive, Builder, Header};
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::Manifest;
-use crate::error::FsError;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use tar::{Archive, Builder, Header};
 
 /// Normalized POSIX timestamp for tarball reproducibility:
 /// 1985-10-26 08:15:00 UTC (499162500 seconds) - standard npm pack epoch.
@@ -45,10 +45,45 @@ impl Default for TarLimits {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExtractionSummary {
     pub entries_extracted: usize,
     pub total_uncompressed_bytes: u64,
+    pub inflate_duration: std::time::Duration,
+    pub materialize_duration: std::time::Duration,
+}
+
+static FILES_CREATED: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Record a batch of files created and bytes written.
+pub fn record_files_created_batch(count: u64, bytes: u64) {
+    FILES_CREATED.fetch_add(count, Ordering::Relaxed);
+    BYTES_WRITTEN.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record a single file created and bytes written.
+pub fn record_file_created(bytes: u64) {
+    FILES_CREATED.fetch_add(1, Ordering::Relaxed);
+    BYTES_WRITTEN.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Returns the total count of files created.
+pub fn files_created() -> u64 {
+    FILES_CREATED.load(Ordering::Relaxed)
+}
+
+/// Returns the total bytes written to disk.
+pub fn bytes_written() -> u64 {
+    BYTES_WRITTEN.load(Ordering::Relaxed)
+}
+
+/// Reset all filesystem counters (files created, bytes written, junctions created, block clones).
+pub fn reset_fs_counters() {
+    FILES_CREATED.store(0, Ordering::Relaxed);
+    BYTES_WRITTEN.store(0, Ordering::Relaxed);
+    crate::junction::reset_junctions_created();
+    crate::block_clone::reset_block_clones();
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,6 +130,8 @@ pub fn extract_tar_gz<R: Read>(
     destination: &Path,
     limits: Option<TarLimits>,
 ) -> Result<ExtractionSummary, FsError> {
+    let start_extract = std::time::Instant::now();
+    let mut inflate_nanos = 0u64;
     let limits = limits.unwrap_or_default();
     let verbatim_dest = crate::path::to_verbatim_path(destination);
     fs::create_dir_all(&verbatim_dest)?;
@@ -110,10 +147,11 @@ pub fn extract_tar_gz<R: Read>(
     let mut total_uncompressed = 0u64;
     let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
     let mut extracted_regular_files: HashSet<PathBuf> = HashSet::new();
-    let mut seen_paths_lower: HashSet<String> = HashSet::new();
+    let mut seen_paths: HashMap<String, String> = HashMap::new();
     let mut seen_dirs_lower: HashSet<String> = HashSet::new();
     let mut seen_files_lower: HashSet<String> = HashSet::new();
-    let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+    let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
     let mut copy_buf = vec![0u8; 128 * 1024];
 
     let entries = archive.entries().map_err(FsError::Io)?;
@@ -132,7 +170,10 @@ pub fn extract_tar_gz<R: Read>(
         if entry_count > limits.max_entries {
             return Err(FsError::TarBombLimitExceeded {
                 limit_type: "entry count".to_string(),
-                detail: format!("Tarball exceeded maximum allowed entries: {}", limits.max_entries),
+                detail: format!(
+                    "Tarball exceeded maximum allowed entries: {}",
+                    limits.max_entries
+                ),
             });
         }
 
@@ -168,16 +209,16 @@ pub fn extract_tar_gz<R: Read>(
         let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
         let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
             extensions.filter_map(|e| e.ok()).any(|ext| {
-                ext.key().map(|k| k.starts_with("GNU.sparse.")).unwrap_or(false)
+                ext.key()
+                    .map(|k| k.starts_with("GNU.sparse."))
+                    .unwrap_or(false)
                     || ext.key_bytes().starts_with(b"GNU.sparse.")
             })
         } else {
             false
         };
         if is_sparse || has_pax_sparse {
-            return Err(FsError::ForbiddenSparseFile {
-                path: raw_path,
-            });
+            return Err(FsError::ForbiddenSparseFile { path: raw_path });
         }
 
         // Security check raw path before stripping prefix
@@ -185,7 +226,16 @@ pub fn extract_tar_gz<R: Read>(
 
         // Strip the archive root component (usually "package/").
         let relative_path = match strip_package_prefix(&raw_path) {
-            Some(p) => p,
+            Some(p) => {
+                let cleaned: PathBuf = p
+                    .components()
+                    .filter(|c| !matches!(c, Component::CurDir))
+                    .collect();
+                if cleaned.as_os_str().is_empty() {
+                    continue;
+                }
+                cleaned
+            }
             None => {
                 // If this is the directory entry for "package" itself, skip it
                 continue;
@@ -196,13 +246,18 @@ pub fn extract_tar_gz<R: Read>(
         validate_entry_path(&relative_path)?;
 
         // Check path depth: count components; if deeper than limits.max_path_depth
-        let path_depth = relative_path.components().filter(|c| matches!(c, Component::Normal(_))).count();
+        let path_depth = relative_path
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
         if path_depth > limits.max_path_depth {
             return Err(FsError::TarBombLimitExceeded {
                 limit_type: "path depth".to_string(),
                 detail: format!(
                     "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
-                    path_depth, limits.max_path_depth, relative_path.display()
+                    path_depth,
+                    limits.max_path_depth,
+                    relative_path.display()
                 ),
             });
         }
@@ -222,10 +277,11 @@ pub fn extract_tar_gz<R: Read>(
         }
 
         // Check special entry types: FIFOs, block/character devices
-        if entry_type.is_block_special() || entry_type.is_character_special() || entry_type.is_fifo() {
-            return Err(FsError::ForbiddenSpecialEntry {
-                path: raw_path,
-            });
+        if entry_type.is_block_special()
+            || entry_type.is_character_special()
+            || entry_type.is_fifo()
+        {
+            return Err(FsError::ForbiddenSpecialEntry { path: raw_path });
         }
 
         let target_path = verbatim_dest.join(&relative_path);
@@ -243,29 +299,36 @@ pub fn extract_tar_gz<R: Read>(
                 path: relative_path.clone(),
             });
         }
+        let target_path = clean_target;
 
         // Security check against Symlink Slip:
         // Ensure neither target_path nor any intermediate ancestor directory is a symlink or junction
         // pointing outside destination or created by an earlier tarball entry.
         ensure_no_symlink_ancestors(&target_path, &verbatim_dest, &symlink_paths, &relative_path)?;
 
-        // Track lowercase paths: maintain seen_paths_lower: HashSet<String>.
-        // Before extracting a file, symlink, or directory, check if relative_path.to_string_lossy().to_ascii_lowercase()
-        // is already present. If so, return FsError::CaseCollision.
-        let norm_lower = relative_path
+        // Track case-preserved normalized paths: maintain seen_paths: HashMap<String, String>
+        // mapping lowercase normalized path -> exact case-preserved normalized path.
+        // Node-tar and npm rule: same path (case preserved) = later entry wins.
+        // Only raise FsError::CaseCollision when two extracted paths differ only by case (e.g. foo.js vs FOO.JS).
+        let norm_exact = relative_path
             .components()
             .filter_map(|c| match c {
-                Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+                Component::Normal(s) => Some(s.to_string_lossy().to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("/");
-        let raw_lower = relative_path.to_string_lossy().to_ascii_lowercase();
+        if norm_exact.is_empty() {
+            continue;
+        }
+        let norm_lower = norm_exact.to_ascii_lowercase();
 
-        if seen_paths_lower.contains(&norm_lower) || seen_paths_lower.contains(&raw_lower) {
-            return Err(FsError::CaseCollision {
-                path: relative_path.clone(),
-            });
+        if let Some(existing_exact) = seen_paths.get(&norm_lower) {
+            if existing_exact != &norm_exact {
+                return Err(FsError::CaseCollision {
+                    path: relative_path.clone(),
+                });
+            }
         }
 
         // Case collision check between files and directory ancestors
@@ -312,8 +375,7 @@ pub fn extract_tar_gz<R: Read>(
             }
         }
 
-        seen_paths_lower.insert(norm_lower);
-        seen_paths_lower.insert(raw_lower);
+        seen_paths.insert(norm_lower, norm_exact);
 
         // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -338,11 +400,12 @@ pub fn extract_tar_gz<R: Read>(
 
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
                 // For hardlinks, the target is often archived as package/...
-                let normalized_target = strip_package_prefix(&link_target)
-                    .unwrap_or_else(|| link_target.to_path_buf());
+                let normalized_target =
+                    strip_package_prefix(&link_target).unwrap_or_else(|| link_target.to_path_buf());
 
                 if entry_type.is_symlink() {
-                    let cleaned_rel = validate_link_target(&relative_path, &normalized_target, destination)?;
+                    let cleaned_rel =
+                        validate_link_target(&relative_path, &normalized_target, destination)?;
 
                     if let Some(parent) = target_path.parent() {
                         fs::create_dir_all(parent)?;
@@ -351,6 +414,8 @@ pub fn extract_tar_gz<R: Read>(
                     // If target_path exists, safely unlink it (handling Windows junctions) before creating link
                     unlink_target_path(&target_path);
 
+                    extracted_regular_files.remove(&relative_path);
+                    extracted_regular_files.remove(&normalize_rel_path(&relative_path));
                     symlink_paths.insert(relative_path.clone());
                     symlink_paths.insert(normalize_rel_path(&relative_path));
                     #[cfg(unix)]
@@ -406,7 +471,10 @@ pub fn extract_tar_gz<R: Read>(
                     let cleaned_target = clean(&normalized_target);
 
                     // If cleaned target starts with '..' or is root/absolute, it escapes destination
-                    if cleaned_target.starts_with("..") || cleaned_target.is_absolute() || cleaned_target.has_root() {
+                    if cleaned_target.starts_with("..")
+                        || cleaned_target.is_absolute()
+                        || cleaned_target.has_root()
+                    {
                         return Err(FsError::EscapingSymlink {
                             link: relative_path.clone(),
                             target: normalized_target,
@@ -438,7 +506,8 @@ pub fn extract_tar_gz<R: Read>(
 
                     if !has_symlink_ancestor {
                         for ancestor in norm_cleaned.ancestors() {
-                            if !ancestor.as_os_str().is_empty() && symlink_paths.contains(ancestor) {
+                            if !ancestor.as_os_str().is_empty() && symlink_paths.contains(ancestor)
+                            {
                                 has_symlink_ancestor = true;
                                 break;
                             }
@@ -497,7 +566,8 @@ pub fn extract_tar_gz<R: Read>(
                     }
 
                     // Reject dangling hardlinks: hardlinks can only point to previously extracted regular files
-                    if (!extracted_regular_files.contains(&cleaned_target) && !extracted_regular_files.contains(&norm_cleaned))
+                    if (!extracted_regular_files.contains(&cleaned_target)
+                        && !extracted_regular_files.contains(&norm_cleaned))
                         || !source_full.exists()
                         || !source_full.is_file()
                     {
@@ -513,10 +583,9 @@ pub fn extract_tar_gz<R: Read>(
 
                     unlink_target_path(&target_path);
 
-                    if fs::hard_link(&source_full, &target_path).is_err()
-                        && source_full.is_file() {
-                            let _ = fs::copy(&source_full, &target_path);
-                        }
+                    if fs::hard_link(&source_full, &target_path).is_err() && source_full.is_file() {
+                        let _ = fs::copy(&source_full, &target_path);
+                    }
 
                     hardlink_targets.insert(relative_path.clone(), cleaned_target);
                     extracted_regular_files.insert(relative_path.clone());
@@ -625,7 +694,9 @@ pub fn extract_tar_gz<R: Read>(
             };
             let mut out_file = BufWriter::with_capacity(128 * 1024, raw_file);
             loop {
+                let t_read = std::time::Instant::now();
                 let n = entry.read(&mut copy_buf).map_err(FsError::Io)?;
+                inflate_nanos += t_read.elapsed().as_nanos() as u64;
                 if n == 0 {
                     break;
                 }
@@ -664,6 +735,8 @@ pub fn extract_tar_gz<R: Read>(
             }
             out_file.flush()?;
             drop(out_file);
+            symlink_paths.remove(&relative_path);
+            symlink_paths.remove(&normalize_rel_path(&relative_path));
             extracted_regular_files.insert(relative_path.clone());
             extracted_regular_files.insert(normalize_rel_path(&relative_path));
         }
@@ -688,27 +761,42 @@ pub fn extract_tar_gz<R: Read>(
         }
     }
 
+    record_files_created_batch(entry_count as u64, total_uncompressed);
+    let total_elapsed = start_extract.elapsed();
+    let inflate_duration = std::time::Duration::from_nanos(inflate_nanos);
+    let materialize_duration = total_elapsed.saturating_sub(inflate_duration);
+
     Ok(ExtractionSummary {
         entries_extracted: entry_count,
         total_uncompressed_bytes: total_uncompressed,
+        inflate_duration,
+        materialize_duration,
     })
 }
 
 /// Safely unlinks a pre-existing target path before creating a new entry.
 /// On Windows, directory junctions are safely unlinked using `remove_junction` or `fs::remove_dir`
 /// to prevent `fs::remove_file` failures and avoid deleting target contents.
-fn unlink_target_path(path: &Path) {
+pub(crate) fn unlink_target_path(path: &Path) {
     #[cfg(windows)]
     if crate::junction::is_junction(path).unwrap_or(false) {
         let _ = crate::junction::remove_junction(path);
         return;
     }
     if path.is_symlink() || path.is_file() {
+        #[cfg(windows)]
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
         let _ = fs::remove_file(path);
     }
 }
 
-fn normalize_rel_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_rel_path(path: &Path) -> PathBuf {
     PathBuf::from(path.to_string_lossy().replace('\\', "/"))
 }
 
@@ -753,7 +841,10 @@ pub fn ensure_no_symlink_ancestors(
     // 1. Check if any intermediate ancestor directory was created as a symlink/junction by an earlier entry
     let norm_rel = normalize_rel_path(relative_path);
     for ancestor in norm_rel.ancestors() {
-        if !ancestor.as_os_str().is_empty() && ancestor != norm_rel && symlink_paths.contains(ancestor) {
+        if !ancestor.as_os_str().is_empty()
+            && ancestor != norm_rel
+            && symlink_paths.contains(ancestor)
+        {
             return Err(FsError::EscapingSymlink {
                 link: destination.join(ancestor),
                 target: target.to_path_buf(),
@@ -815,6 +906,9 @@ pub fn strip_package_prefix(path: &Path) -> Option<PathBuf> {
 
     let first = components.next()?;
     if matches!(first, Component::Normal(_)) {
+        while let Some(Component::CurDir) = components.peek() {
+            components.next();
+        }
         let remainder: PathBuf = components.collect();
         if remainder.as_os_str().is_empty() {
             return None;
@@ -903,7 +997,10 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
                 }
 
                 // Reject Windows invalid characters: *, ?, ", <, >, |
-                if name.chars().any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|')) {
+                if name
+                    .chars()
+                    .any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|'))
+                {
                     return Err(FsError::PathTraversal {
                         path: path.to_path_buf(),
                     });
@@ -957,8 +1054,12 @@ pub fn is_windows_reserved_name(name: &str) -> bool {
 
     match upper.as_str() {
         "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$" => true,
-        "COM0" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => true,
-        "LPT0" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => true,
+        "COM0" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => {
+            true
+        }
+        "LPT0" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
+            true
+        }
         "COM\u{00B9}" | "COM\u{00B2}" | "COM\u{00B3}" => true,
         "LPT\u{00B9}" | "LPT\u{00B2}" | "LPT\u{00B3}" => true,
         _ => false,
@@ -1139,7 +1240,12 @@ pub fn collect_pack_files(
     for bundled_name in manifest.bundled_package_names() {
         let bundled_dir = package_dir.join("node_modules").join(&bundled_name);
         if bundled_dir.is_dir() {
-            walk_bundled_dependency_dir(&bundled_dir, package_dir, &mut files_to_pack, &mut existing_set)?;
+            walk_bundled_dependency_dir(
+                &bundled_dir,
+                package_dir,
+                &mut files_to_pack,
+                &mut existing_set,
+            )?;
         }
     }
 
@@ -1185,11 +1291,10 @@ fn walk_bundled_dependency_dir(
 
         if file_type.is_dir() {
             walk_bundled_dependency_dir(&path, root_dir, out, existing)?;
-        } else if file_type.is_file()
-            && !existing.contains(&rel_path) {
-                existing.insert(rel_path.clone());
-                out.push((rel_path, path));
-            }
+        } else if file_type.is_file() && !existing.contains(&rel_path) {
+            existing.insert(rel_path.clone());
+            out.push((rel_path, path));
+        }
     }
 
     Ok(())
@@ -1222,9 +1327,10 @@ fn collect_strictly_required_files(package_dir: &Path, manifest: &Manifest) -> V
                 || upper.starts_with("LICENSE")
                 || upper.starts_with("LICENCE")
                 || upper.starts_with("COPYING"))
-                && entry.path().is_file() {
-                    required.push(name);
-                }
+                && entry.path().is_file()
+            {
+                required.push(name);
+            }
         }
     }
 
@@ -1271,7 +1377,14 @@ fn walk_dir_collect(
             if is_path_ignored(&format!("{rel_path}/"), ignore_patterns) {
                 continue;
             }
-            walk_dir_collect(&path, root_dir, files_filter, ignore_patterns, manifest, out)?;
+            walk_dir_collect(
+                &path,
+                root_dir,
+                files_filter,
+                ignore_patterns,
+                manifest,
+                out,
+            )?;
         } else if file_type.is_file() {
             // Check if file is included
             if should_include_file(&rel_path, files_filter, ignore_patterns, manifest) {
@@ -1436,7 +1549,8 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
     // If pattern ends with '/', it only matches directories or contents
     if clean_pat.ends_with('/') {
         let dir_prefix = clean_pat;
-        if target_path.starts_with(dir_prefix) || format!("{target_path}/").starts_with(dir_prefix) {
+        if target_path.starts_with(dir_prefix) || format!("{target_path}/").starts_with(dir_prefix)
+        {
             return true;
         }
     }
@@ -1513,12 +1627,17 @@ pub fn pack_directory(
         )));
     }
 
-    let manifest = Manifest::from_file(&manifest_path).map_err(|e| {
-        FsError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
-    })?;
+    let manifest = Manifest::from_file(&manifest_path)
+        .map_err(|e| FsError::Io(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))?;
 
-    let name = manifest.name.clone().unwrap_or_else(|| "package".to_string());
-    let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+    let name = manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| "package".to_string());
+    let version = manifest
+        .version
+        .clone()
+        .unwrap_or_else(|| "1.0.0".to_string());
     let filename = compute_tarball_filename(&name, &version);
 
     let files_to_pack = collect_pack_files(package_dir, &manifest)?;
@@ -1625,7 +1744,8 @@ fn is_file_executable(path: &Path) -> bool {
     {
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             let ext_lower = ext.to_ascii_lowercase();
-            if ext_lower == "cmd" || ext_lower == "bat" || ext_lower == "ps1" || ext_lower == "exe" {
+            if ext_lower == "cmd" || ext_lower == "bat" || ext_lower == "ps1" || ext_lower == "exe"
+            {
                 return true;
             }
         }

@@ -48,10 +48,7 @@ pub enum SpecError {
     InvalidFormat(String),
 
     #[error("Unsupported URL Type \"{protocol}\": {spec}")]
-    UnsupportedProtocol {
-        protocol: String,
-        spec: String,
-    },
+    UnsupportedProtocol { protocol: String, spec: String },
 
     #[error("Invalid semver in specifier: {0}")]
     Semver(String),
@@ -96,10 +93,7 @@ pub enum ManifestError {
     },
 
     #[error("Invalid manifest field '{field}': {detail}")]
-    InvalidField {
-        field: String,
-        detail: String,
-    },
+    InvalidField { field: String, detail: String },
 }
 
 #[derive(Debug, Error)]

@@ -4,15 +4,15 @@
 //! node_modules filesystem scanning (including scopes and nested node_modules),
 //! and detection of extraneous package directories on disk.
 
+use anyhow::{anyhow, Context, Result};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info};
 
 use rnpm_core::manifest::Manifest;
 use rnpm_core::to_posix_path;
 use rnpm_core::workspace::discover_workspaces_from_manifest;
-use rnpm_fs::junction::{is_junction, remove_dir_all_safe, remove_junction};
+use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_lockfile::LockfileV3;
 
 /// Options controlling reachability analysis and dependency pruning.
@@ -118,7 +118,10 @@ impl PruneAnalysis {
 
     /// Returns the list of extraneous POSIX paths.
     pub fn extraneous_paths(&self) -> Vec<String> {
-        self.extraneous_packages.iter().map(|p| p.path.clone()).collect()
+        self.extraneous_packages
+            .iter()
+            .map(|p| p.path.clone())
+            .collect()
     }
 }
 
@@ -184,7 +187,10 @@ pub fn resolve_dependency_path(
     }
 
     // Fall back to hoisted root candidate
-    candidates.last().cloned().unwrap_or_else(|| format!("node_modules/{dep_name}"))
+    candidates
+        .last()
+        .cloned()
+        .unwrap_or_else(|| format!("node_modules/{dep_name}"))
 }
 
 /// Collects required dependencies for a transitive package node.
@@ -343,12 +349,8 @@ pub fn analyze_reachability(
         );
 
         for child_dep in deps {
-            let child_pkg_path = resolve_dependency_path(
-                project_dir,
-                &current_pkg_path,
-                &child_dep,
-                lockfile,
-            );
+            let child_pkg_path =
+                resolve_dependency_path(project_dir, &current_pkg_path, &child_dep, lockfile);
             if reachable_packages.insert(child_pkg_path.clone()) {
                 queue.push_back(child_pkg_path);
             }
@@ -456,7 +458,10 @@ pub fn discover_extraneous_packages(
     project_dir: &Path,
     options: &PruneOptions,
 ) -> Result<PruneAnalysis> {
-    debug!("Discovering extraneous packages in {}", project_dir.display());
+    debug!(
+        "Discovering extraneous packages in {}",
+        project_dir.display()
+    );
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.is_file() {
         return Err(anyhow!(
@@ -464,14 +469,19 @@ pub fn discover_extraneous_packages(
             manifest_path.display()
         ));
     }
-    let manifest = Manifest::from_file(&manifest_path)
-        .with_context(|| format!("Failed to read root manifest at {}", manifest_path.display()))?;
+    let manifest = Manifest::from_file(&manifest_path).with_context(|| {
+        format!(
+            "Failed to read root manifest at {}",
+            manifest_path.display()
+        )
+    })?;
 
     // Attempt to load lockfile if present
     let lockfile = load_lockfile_if_exists(project_dir);
 
     // 1. Compute reachable set
-    let reachable_packages = analyze_reachability(project_dir, &manifest, options, lockfile.as_ref())?;
+    let reachable_packages =
+        analyze_reachability(project_dir, &manifest, options, lockfile.as_ref())?;
 
     // 2. Scan node_modules on disk
     let discovered_packages = scan_node_modules(project_dir)?;
@@ -485,7 +495,9 @@ pub fn discover_extraneous_packages(
             let full_path = project_dir.join(&normalized_path);
             let manifest_file = full_path.join("package.json");
             let (name, version) = if let Ok(m) = Manifest::from_file(&manifest_file) {
-                let pkg_name = m.name.unwrap_or_else(|| extract_package_name_from_path(&normalized_path));
+                let pkg_name = m
+                    .name
+                    .unwrap_or_else(|| extract_package_name_from_path(&normalized_path));
                 (pkg_name, m.version)
             } else {
                 let pkg_name = extract_package_name_from_path(&normalized_path);
@@ -502,7 +514,7 @@ pub fn discover_extraneous_packages(
     }
 
     // Sort extraneous packages descending by path depth/length so nested are listed before parents
-        let depth = |p: &str| p.matches('/').count();
+    let depth = |p: &str| p.matches('/').count();
     extraneous_packages.sort_by(|a, b| {
         depth(&b.path)
             .cmp(&depth(&a.path))
@@ -518,9 +530,9 @@ pub fn discover_extraneous_packages(
     })
 }
 
-/// Helper to load package-lock.json if it exists at root or in node_modules/.package-lock.json.
+/// Helper to load package-lock.json or npm-shrinkwrap.json if it exists at root or in node_modules/.package-lock.json.
 pub fn load_lockfile_if_exists(project_dir: &Path) -> Option<LockfileV3> {
-    let lockfile_path = project_dir.join("package-lock.json");
+    let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
     if lockfile_path.is_file() {
         if let Ok(lock) = LockfileV3::load_from_file(&lockfile_path) {
             return Some(lock);
@@ -544,10 +556,7 @@ pub fn extract_package_name_from_path(posix_path: &str) -> String {
 
 /// Executes pruning: removes all extraneous packages from disk, cleans shims from `.bin`,
 /// cleans empty scope folders, and updates `package-lock.json` if present.
-pub fn execute_prune(
-    project_dir: &Path,
-    extraneous: &[ExtraneousPackage],
-) -> Result<PruneSummary> {
+pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Result<PruneSummary> {
     let node_modules_dir = project_dir.join("node_modules");
     let bin_dir = node_modules_dir.join(".bin");
     let mut removed_packages = Vec::new();
@@ -561,9 +570,16 @@ pub fn execute_prune(
             let pkg_manifest = pkg.full_path.join("package.json");
             if let Ok(m) = Manifest::from_file(&pkg_manifest) {
                 let enclosing_bin_dir = if let Some(parent) = pkg.full_path.parent() {
-                    let maybe_scoped = parent.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('@')).unwrap_or(false);
+                    let maybe_scoped = parent
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with('@'))
+                        .unwrap_or(false);
                     if maybe_scoped {
-                        parent.parent().map(|p| p.join(".bin")).unwrap_or_else(|| bin_dir.clone())
+                        parent
+                            .parent()
+                            .map(|p| p.join(".bin"))
+                            .unwrap_or_else(|| bin_dir.clone())
                     } else {
                         parent.join(".bin")
                     }
@@ -576,17 +592,20 @@ pub fn execute_prune(
                     let _ = std::fs::remove_file(&shim_path);
                     #[cfg(windows)]
                     {
-                        let _ = std::fs::remove_file(enclosing_bin_dir.join(format!("{bin_name}.cmd")));
-                        let _ = std::fs::remove_file(enclosing_bin_dir.join(format!("{bin_name}.ps1")));
+                        let _ =
+                            std::fs::remove_file(enclosing_bin_dir.join(format!("{bin_name}.cmd")));
+                        let _ =
+                            std::fs::remove_file(enclosing_bin_dir.join(format!("{bin_name}.ps1")));
                     }
                 }
             }
 
-            // Remove junction or directory safely
+            // Remove junction or directory safely with fast background trash deletion
             let removed = if is_junc {
                 remove_junction(&pkg.full_path).is_ok()
             } else if pkg.full_path.is_dir() {
-                remove_dir_all_safe(&pkg.full_path).is_ok()
+                let nm_dir = project_dir.join("node_modules");
+                crate::trash::fast_trash_delete(&pkg.full_path, &nm_dir).is_ok()
             } else {
                 std::fs::remove_file(&pkg.full_path).is_ok()
             };
@@ -610,13 +629,21 @@ pub fn execute_prune(
 
             // Clean up empty enclosing nested node_modules if empty
             if let Some(parent) = pkg.full_path.parent() {
-                let parent_dir = if parent.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('@')).unwrap_or(false) {
+                let parent_dir = if parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with('@'))
+                    .unwrap_or(false)
+                {
                     parent.parent()
                 } else {
                     Some(parent)
                 };
                 if let Some(nm_dir) = parent_dir {
-                    if nm_dir != node_modules_dir && nm_dir.file_name().and_then(|n| n.to_str()) == Some("node_modules") && nm_dir.is_dir() {
+                    if nm_dir != node_modules_dir
+                        && nm_dir.file_name().and_then(|n| n.to_str()) == Some("node_modules")
+                        && nm_dir.is_dir()
+                    {
                         if let Ok(mut entries) = std::fs::read_dir(nm_dir) {
                             if entries.next().is_none() {
                                 let _ = std::fs::remove_dir(nm_dir);
@@ -637,8 +664,8 @@ pub fn execute_prune(
         }
     }
 
-    // Update package-lock.json if present
-    let lockfile_path = project_dir.join("package-lock.json");
+    // Update lockfile if present
+    let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
     let updated_lockfile_path = if lockfile_path.is_file() {
         if let Ok(mut lockfile) = LockfileV3::load_from_file(&lockfile_path) {
             let manifest_path = project_dir.join("package.json");
@@ -777,11 +804,31 @@ mod tests {
             }
         }"#;
         fs::write(nm.join("prod-a/package.json"), prod_a_manifest).unwrap();
-        fs::write(nm.join("dev-b/package.json"), r#"{"name": "dev-b", "version": "1.0.0"}"#).unwrap();
-        fs::write(nm.join("opt-c/package.json"), r#"{"name": "opt-c", "version": "1.0.0"}"#).unwrap();
-        fs::write(nm.join("trans-d/package.json"), r#"{"name": "trans-d", "version": "1.0.0"}"#).unwrap();
-        fs::write(nm.join("extraneous-x/package.json"), r#"{"name": "extraneous-x", "version": "0.1.0"}"#).unwrap();
-        fs::write(nm.join("@scope/extraneous-y/package.json"), r#"{"name": "@scope/extraneous-y", "version": "0.2.0"}"#).unwrap();
+        fs::write(
+            nm.join("dev-b/package.json"),
+            r#"{"name": "dev-b", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            nm.join("opt-c/package.json"),
+            r#"{"name": "opt-c", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            nm.join("trans-d/package.json"),
+            r#"{"name": "trans-d", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            nm.join("extraneous-x/package.json"),
+            r#"{"name": "extraneous-x", "version": "0.1.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            nm.join("@scope/extraneous-y/package.json"),
+            r#"{"name": "@scope/extraneous-y", "version": "0.2.0"}"#,
+        )
+        .unwrap();
 
         // Standard analysis (keep dev, optional, peer)
         let opts = PruneOptions::default();
@@ -817,8 +864,12 @@ mod tests {
 
         // Test execution: pruning extraneous packages
         let summary = execute_prune(root, &analysis.extraneous_packages).unwrap();
-        assert!(summary.removed_packages.contains(&"node_modules/extraneous-x".to_string()));
-        assert!(summary.removed_packages.contains(&"node_modules/@scope/extraneous-y".to_string()));
+        assert!(summary
+            .removed_packages
+            .contains(&"node_modules/extraneous-x".to_string()));
+        assert!(summary
+            .removed_packages
+            .contains(&"node_modules/@scope/extraneous-y".to_string()));
         assert!(!nm.join("extraneous-x").exists());
         assert!(!nm.join("@scope").exists()); // Empty scope cleaned up
         assert!(nm.join("prod-a").exists());
@@ -853,7 +904,9 @@ mod tests {
         .unwrap();
 
         let analysis = discover_extraneous_packages(root, &PruneOptions::default()).unwrap();
-        assert!(analysis.reachable_packages.contains("node_modules/parent-pkg"));
+        assert!(analysis
+            .reachable_packages
+            .contains("node_modules/parent-pkg"));
         assert!(analysis
             .extraneous_paths()
             .contains(&"node_modules/parent-pkg/node_modules/nested-unused".to_string()));

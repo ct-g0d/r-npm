@@ -1,12 +1,12 @@
-use rnpm_core::semver::{Range, Version};
+use crate::error::LockfileError;
 use rnpm_core::manifest::BundledDependencies;
+use rnpm_core::semver::{Range, Version};
 use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use crate::error::LockfileError;
 
 /// Helper function to omit booleans during serialization if false or None.
 fn is_false_or_none(v: &Option<bool>) -> bool {
@@ -25,6 +25,237 @@ fn is_empty_bundle_deps(v: &Option<BundledDependencies>) -> bool {
         Some(BundledDependencies::Boolean(false)) => true,
         Some(BundledDependencies::List(list)) => list.is_empty(),
         _ => false,
+    }
+}
+
+/// Helper function to omit empty engines or None during serialization.
+fn is_none_or_empty_engines(v: &Option<PackageEngines>) -> bool {
+    v.as_ref().map(|e| e.is_empty()).unwrap_or(true)
+}
+
+/// Helper function to omit empty vectors or None during serialization.
+fn is_none_or_empty_vec<T>(v: &Option<Vec<T>>) -> bool {
+    v.as_ref().map(|l| l.is_empty()).unwrap_or(true)
+}
+
+/// Package supported engine constraints.
+///
+/// In npm package-lock files, `engines` is usually a map of engine names to semver constraints,
+/// but npm has also published and tolerated array, string, and arbitrary JSON representations.
+/// Uninterpreted representations are preserved during deserialization and serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PackageEngines {
+    Map(BTreeMap<String, String>),
+    List(Vec<serde_json::Value>),
+    String(String),
+    Other(serde_json::Value),
+}
+
+impl PackageEngines {
+    /// Returns the engines map if this is a map, or attempts to parse string/list entries if possible.
+    pub fn as_map(&self) -> Option<BTreeMap<String, String>> {
+        match self {
+            PackageEngines::Map(map) => Some(map.clone()),
+            PackageEngines::List(list) => {
+                let mut map = BTreeMap::new();
+                for item in list {
+                    if let Some(s) = item.as_str() {
+                        if let Some((name, range)) = parse_engine_entry(s) {
+                            map.insert(name, range);
+                        }
+                    }
+                }
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(map)
+                }
+            }
+            PackageEngines::String(s) => {
+                if let Some((name, range)) = parse_engine_entry(s) {
+                    let mut map = BTreeMap::new();
+                    map.insert(name, range);
+                    Some(map)
+                } else {
+                    None
+                }
+            }
+            PackageEngines::Other(serde_json::Value::Object(obj)) => {
+                let mut map = BTreeMap::new();
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        map.insert(k.clone(), s.to_string());
+                    }
+                }
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(map)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the map if this engines representation is a `Map`.
+    pub fn map_ref(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            PackageEngines::Map(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Looks up an engine constraint by engine name.
+    /// Handles map, list, string, and arbitrary JSON object/array representations.
+    pub fn get(&self, engine: &str) -> Option<String> {
+        self.get_str(engine).map(str::to_string)
+    }
+
+    /// Looks up an engine constraint by engine name, returning a borrowed slice if possible.
+    pub fn get_str<'a>(&'a self, engine: &str) -> Option<&'a str> {
+        match self {
+            PackageEngines::Map(map) => map.get(engine).map(|s| s.as_str()),
+            PackageEngines::List(list) => {
+                for item in list {
+                    if let Some(s) = item.as_str() {
+                        for (name, range) in parse_engine_entries_from_str(s) {
+                            if name == engine {
+                                return Some(range);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            PackageEngines::String(s) => {
+                for (name, range) in parse_engine_entries_from_str(s) {
+                    if name == engine {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            PackageEngines::Other(serde_json::Value::Object(obj)) => {
+                obj.get(engine).and_then(|v| v.as_str())
+            }
+            PackageEngines::Other(serde_json::Value::Array(arr)) => {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        for (name, range) in parse_engine_entries_from_str(s) {
+                            if name == engine {
+                                return Some(range);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            PackageEngines::Other(serde_json::Value::String(s)) => {
+                for (name, range) in parse_engine_entries_from_str(s) {
+                    if name == engine {
+                        return Some(range);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if this engines representation contains no constraints.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PackageEngines::Map(map) => map.is_empty(),
+            PackageEngines::List(list) => list.is_empty(),
+            PackageEngines::String(s) => s.trim().is_empty(),
+            PackageEngines::Other(serde_json::Value::Null) => true,
+            PackageEngines::Other(serde_json::Value::Object(obj)) => obj.is_empty(),
+            PackageEngines::Other(serde_json::Value::Array(arr)) => arr.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+fn parse_engine_entries_from_str(s: &str) -> Vec<(&str, &str)> {
+    let mut res = Vec::new();
+    if s.contains(',') {
+        for part in s.split(',') {
+            if let Some(pair) = parse_engine_entry_str(part) {
+                res.push(pair);
+            }
+        }
+    } else if let Some(pair) = parse_engine_entry_str(s) {
+        res.push(pair);
+    }
+    res
+}
+
+fn parse_engine_entry_str(entry: &str) -> Option<(&str, &str)> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(idx) = trimmed.find(|c: char| c.is_whitespace() || c == '@') {
+        let name = trimmed[..idx].trim();
+        let range = trimmed[idx + 1..].trim();
+        if !name.is_empty() && !range.is_empty() {
+            return Some((name, range));
+        }
+    }
+    if let Some(idx) = trimmed.find(['>', '<', '=', '~', '^']) {
+        let name = trimmed[..idx].trim();
+        let range = trimmed[idx..].trim();
+        if !name.is_empty() && !range.is_empty() {
+            return Some((name, range));
+        }
+    }
+    None
+}
+
+fn parse_engine_entry(entry: &str) -> Option<(String, String)> {
+    parse_engine_entry_str(entry).map(|(n, r)| (n.to_string(), r.to_string()))
+}
+
+impl Default for PackageEngines {
+    fn default() -> Self {
+        PackageEngines::Map(BTreeMap::new())
+    }
+}
+
+impl From<BTreeMap<String, String>> for PackageEngines {
+    fn from(map: BTreeMap<String, String>) -> Self {
+        PackageEngines::Map(map)
+    }
+}
+
+impl From<std::collections::HashMap<String, String>> for PackageEngines {
+    fn from(map: std::collections::HashMap<String, String>) -> Self {
+        PackageEngines::Map(map.into_iter().collect())
+    }
+}
+
+impl FromIterator<(String, String)> for PackageEngines {
+    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+        PackageEngines::Map(iter.into_iter().collect())
+    }
+}
+
+impl From<Vec<String>> for PackageEngines {
+    fn from(list: Vec<String>) -> Self {
+        PackageEngines::List(list.into_iter().map(serde_json::Value::String).collect())
+    }
+}
+
+impl From<String> for PackageEngines {
+    fn from(s: String) -> Self {
+        PackageEngines::String(s)
+    }
+}
+
+impl From<&str> for PackageEngines {
+    fn from(s: &str) -> Self {
+        PackageEngines::String(s.to_string())
     }
 }
 
@@ -67,56 +298,93 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "is_false_or_none", default)]
     pub optional: Option<bool>,
 
-    #[serde(rename = "devOptional", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(
+        rename = "devOptional",
+        skip_serializing_if = "is_false_or_none",
+        default
+    )]
     pub dev_optional: Option<bool>,
 
     #[serde(skip_serializing_if = "is_false_or_none", default)]
     pub peer: Option<bool>,
 
-    #[serde(rename = "peerOptional", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(
+        rename = "peerOptional",
+        skip_serializing_if = "is_false_or_none",
+        default
+    )]
     pub peer_optional: Option<bool>,
 
-    #[serde(rename = "inBundle", alias = "bundled", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(
+        rename = "inBundle",
+        alias = "bundled",
+        skip_serializing_if = "is_false_or_none",
+        default
+    )]
     pub in_bundle: Option<bool>,
 
-    #[serde(rename = "hasInstallScript", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(
+        rename = "hasInstallScript",
+        skip_serializing_if = "is_false_or_none",
+        default
+    )]
     pub has_install_script: Option<bool>,
 
-    #[serde(rename = "hasShrinkwrap", skip_serializing_if = "is_false_or_none", default)]
+    #[serde(
+        rename = "hasShrinkwrap",
+        skip_serializing_if = "is_false_or_none",
+        default
+    )]
     pub has_shrinkwrap: Option<bool>,
-
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub bin: Option<PackageBin>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub license: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub engines: Option<BTreeMap<String, String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
     pub os: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
     pub cpu: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
     pub libc: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
     pub dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "devDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bin: Option<PackageBin>,
+
+    #[serde(
+        rename = "devDependencies",
+        skip_serializing_if = "is_none_or_empty_map",
+        default
+    )]
     pub dev_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "peerDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_engines", default)]
+    pub engines: Option<PackageEngines>,
+
+    #[serde(
+        rename = "optionalDependencies",
+        skip_serializing_if = "is_none_or_empty_map",
+        default
+    )]
+    pub optional_dependencies: Option<BTreeMap<String, String>>,
+
+    #[serde(
+        rename = "peerDependencies",
+        skip_serializing_if = "is_none_or_empty_map",
+        default
+    )]
     pub peer_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(rename = "peerDependenciesMeta", skip_serializing_if = "is_none_or_empty_map", default)]
+    #[serde(
+        rename = "peerDependenciesMeta",
+        skip_serializing_if = "is_none_or_empty_map",
+        default
+    )]
     pub peer_dependencies_meta: Option<BTreeMap<String, serde_json::Value>>,
-
-    #[serde(rename = "optionalDependencies", skip_serializing_if = "is_none_or_empty_map", default)]
-    pub optional_dependencies: Option<BTreeMap<String, String>>,
 
     #[serde(
         rename = "bundleDependencies",
@@ -280,16 +548,16 @@ impl LockfilePackage {
         self
     }
 
-    /// Sets npm v9/v10 dependency relationship rules:
-    /// - If both `is_dev` and `is_optional` are true, sets `devOptional: true` and clears `dev` and `optional`.
+    /// Sets npm dependency relationship rules:
+    /// - If both `is_dev` and `is_optional` are true, sets `dev: true` and `optional: true` (npm 11 / lockfile v3 parity).
     /// - If only `is_dev` is true, sets `dev: true`.
     /// - If only `is_optional` is true, sets `optional: true`.
     /// - If neither, clears all three flags.
     pub fn set_dependency_types(&mut self, is_dev: bool, is_optional: bool) {
         if is_dev && is_optional {
-            self.dev_optional = Some(true);
-            self.dev = None;
-            self.optional = None;
+            self.dev = Some(true);
+            self.optional = Some(true);
+            self.dev_optional = None;
         } else if is_dev {
             self.dev = Some(true);
             self.dev_optional = None;
@@ -305,27 +573,75 @@ impl LockfilePackage {
         }
     }
 
-    /// Normalizes boolean flags to ensure npm v9/v10 lockfile v3 fidelity:
-    /// - `devOptional` is set when both `dev` and `optional` are true, clearing `dev` and `optional`.
+    /// Returns the engines map if available, converting from map/list/string formats.
+    pub fn engines_map(&self) -> Option<BTreeMap<String, String>> {
+        self.engines.as_ref().and_then(|e| e.as_map())
+    }
+
+    /// Normalizes boolean flags to ensure npm lockfile v3 fidelity:
+    /// - If legacy `devOptional: true` is set, clears `dev` and `optional`.
+    /// - For npm 11 / lockfile v3, packages reachable via dev and optional branches retain `dev: true, optional: true`.
     /// - Any `false` boolean flags are normalized to `None`.
     pub fn normalize_flags(&mut self) {
-        if self.dev == Some(false) { self.dev = None; }
-        if self.optional == Some(false) { self.optional = None; }
-        if self.dev_optional == Some(false) { self.dev_optional = None; }
-        if self.peer == Some(false) { self.peer = None; }
-        if self.peer_optional == Some(false) { self.peer_optional = None; }
-        if self.in_bundle == Some(false) { self.in_bundle = None; }
-        if self.has_install_script == Some(false) { self.has_install_script = None; }
-        if self.has_shrinkwrap == Some(false) { self.has_shrinkwrap = None; }
-        if self.link == Some(false) { self.link = None; }
+        if self.dev == Some(false) {
+            self.dev = None;
+        }
+        if self.optional == Some(false) {
+            self.optional = None;
+        }
+        if self.dev_optional == Some(false) {
+            self.dev_optional = None;
+        }
+        if self.peer == Some(false) {
+            self.peer = None;
+        }
+        if self.peer_optional == Some(false) {
+            self.peer_optional = None;
+        }
+        if self.in_bundle == Some(false) {
+            self.in_bundle = None;
+        }
+        if self.has_install_script == Some(false) {
+            self.has_install_script = None;
+        }
+        if self.has_shrinkwrap == Some(false) {
+            self.has_shrinkwrap = None;
+        }
+        if self.link == Some(false) {
+            self.link = None;
+        }
 
         if self.dev_optional == Some(true) {
             self.dev = None;
             self.optional = None;
-        } else if !self.preserve_dev_optional_split && self.dev == Some(true) && self.optional == Some(true) {
-            self.dev_optional = Some(true);
-            self.dev = None;
-            self.optional = None;
+        }
+
+        if let Some(os) = &self.os {
+            if os.is_empty() {
+                self.os = None;
+            }
+        }
+        if let Some(cpu) = &self.cpu {
+            if cpu.is_empty() {
+                self.cpu = None;
+            }
+        }
+        if let Some(libc) = &self.libc {
+            if libc.is_empty() {
+                self.libc = None;
+            }
+        }
+        if let Some(e) = &self.engines {
+            if e.is_empty() {
+                self.engines = None;
+            }
+        }
+
+        self.extra.remove("directories");
+        if let Some(v) = self.extra.get("deprecated") {
+            if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
+                self.extra.remove("deprecated");
+            }
         }
     }
 
@@ -333,23 +649,33 @@ impl LockfilePackage {
     pub fn bundled_package_names(&self) -> Vec<String> {
         match &self.bundle_dependencies {
             None => {
-                if let Some(extra_val) = self.extra.get("bundleDependencies").or_else(|| self.extra.get("bundledDependencies")) {
+                if let Some(extra_val) = self
+                    .extra
+                    .get("bundleDependencies")
+                    .or_else(|| self.extra.get("bundledDependencies"))
+                {
                     if let Some(list) = extra_val.as_array() {
-                        return list.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                        return list
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
                     } else if let Some(b) = extra_val.as_bool() {
                         if b {
-                            return self.dependencies.as_ref().map(|d| d.keys().cloned().collect()).unwrap_or_default();
+                            return self
+                                .dependencies
+                                .as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_default();
                         }
                     }
                 }
                 Vec::new()
             }
-            Some(BundledDependencies::Boolean(true)) => {
-                self.dependencies
-                    .as_ref()
-                    .map(|d| d.keys().cloned().collect())
-                    .unwrap_or_default()
-            }
+            Some(BundledDependencies::Boolean(true)) => self
+                .dependencies
+                .as_ref()
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default(),
             Some(BundledDependencies::Boolean(false)) => Vec::new(),
             Some(BundledDependencies::List(list)) => list.clone(),
         }
@@ -363,14 +689,18 @@ impl LockfilePackage {
         let Some(val) = meta_map.get(dep_name) else {
             return false;
         };
-        val.get("optional").and_then(|v| v.as_bool()).unwrap_or(false)
+        val.get("optional")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// Sets or unsets `optional: true` for a peer dependency in `peerDependenciesMeta`.
     pub fn set_peer_dep_optional(&mut self, dep_name: impl Into<String>, optional: bool) {
         let name = dep_name.into();
         if optional {
-            let map = self.peer_dependencies_meta.get_or_insert_with(BTreeMap::new);
+            let map = self
+                .peer_dependencies_meta
+                .get_or_insert_with(BTreeMap::new);
             map.insert(name, serde_json::json!({ "optional": true }));
         } else if let Some(map) = &mut self.peer_dependencies_meta {
             map.remove(&name);
@@ -501,7 +831,17 @@ impl LockfileV3 {
                     Some(manifest.optional_dependencies.clone())
                 },
                 bundle_dependencies: manifest.bundled_dependencies.clone(),
-                extra: manifest.extra.clone(),
+                extra: {
+                    let mut extra = manifest.extra.clone();
+                    extra.remove("overrides");
+                    extra.remove("directories");
+                    if let Some(v) = extra.get("deprecated") {
+                        if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
+                            extra.remove("deprecated");
+                        }
+                    }
+                    extra
+                },
                 ..Default::default()
             },
         );
@@ -562,7 +902,21 @@ impl LockfileV3 {
         };
         root.bundle_dependencies = manifest.bundled_dependencies.clone();
         for (k, v) in &manifest.extra {
+            if k == "overrides" || k == "directories" {
+                continue;
+            }
+            if k == "deprecated" && (v == &serde_json::Value::Bool(false) || v.is_null() || v == "")
+            {
+                continue;
+            }
             root.extra.insert(k.clone(), v.clone());
+        }
+        root.extra.remove("overrides");
+        root.extra.remove("directories");
+        if let Some(v) = root.extra.get("deprecated") {
+            if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
+                root.extra.remove("deprecated");
+            }
         }
     }
 
@@ -589,13 +943,27 @@ impl LockfileV3 {
     ) -> bool {
         let key = to_posix_path(path);
         if let Some(pkg) = self.packages.get_mut(&key) {
-            if let Some(v) = dev { pkg.set_dev(v); }
-            if let Some(v) = optional { pkg.set_optional(v); }
-            if let Some(v) = dev_optional { pkg.set_dev_optional(v); }
-            if let Some(v) = peer { pkg.set_peer(v); }
-            if let Some(v) = peer_optional { pkg.set_peer_optional(v); }
-            if let Some(v) = in_bundle { pkg.set_in_bundle(v); }
-            if let Some(v) = has_install_script { pkg.set_has_install_script(v); }
+            if let Some(v) = dev {
+                pkg.set_dev(v);
+            }
+            if let Some(v) = optional {
+                pkg.set_optional(v);
+            }
+            if let Some(v) = dev_optional {
+                pkg.set_dev_optional(v);
+            }
+            if let Some(v) = peer {
+                pkg.set_peer(v);
+            }
+            if let Some(v) = peer_optional {
+                pkg.set_peer_optional(v);
+            }
+            if let Some(v) = in_bundle {
+                pkg.set_in_bundle(v);
+            }
+            if let Some(v) = has_install_script {
+                pkg.set_has_install_script(v);
+            }
             pkg.normalize_flags();
             true
         } else {
@@ -615,7 +983,9 @@ impl LockfileV3 {
 
     /// Iterator over packages that have `devOptional: true`.
     pub fn dev_optional_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
-        self.packages.iter().filter(|(_, pkg)| pkg.is_dev_optional())
+        self.packages
+            .iter()
+            .filter(|(_, pkg)| pkg.is_dev_optional())
     }
 
     /// Iterator over packages that have `peer: true`.
@@ -625,7 +995,9 @@ impl LockfileV3 {
 
     /// Iterator over packages that have `peerOptional: true`.
     pub fn peer_optional_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
-        self.packages.iter().filter(|(_, pkg)| pkg.is_peer_optional())
+        self.packages
+            .iter()
+            .filter(|(_, pkg)| pkg.is_peer_optional())
     }
 
     /// Iterator over packages that have `inBundle: true`.
@@ -635,7 +1007,9 @@ impl LockfileV3 {
 
     /// Iterator over packages that have `hasInstallScript: true`.
     pub fn script_packages(&self) -> impl Iterator<Item = (&String, &LockfilePackage)> {
-        self.packages.iter().filter(|(_, pkg)| pkg.has_install_script())
+        self.packages
+            .iter()
+            .filter(|(_, pkg)| pkg.has_install_script())
     }
 
     /// Standard relative path to the hidden lockfile inside `node_modules`.
@@ -644,7 +1018,11 @@ impl LockfileV3 {
     /// Checks if this lockfile v3 matches the given package.json manifest.
     /// Returns true if all direct dependencies in the manifest match the root package descriptor,
     /// overrides match, and every required package exists in the lockfile `packages` map satisfying its spec.
-    pub fn matches_manifest(&self, manifest: &rnpm_core::manifest::Manifest, include_dev: bool) -> bool {
+    pub fn matches_manifest(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+    ) -> bool {
         let Some(root_pkg) = self.root_package() else {
             return false;
         };
@@ -678,13 +1056,16 @@ impl LockfileV3 {
         }
 
         // 2. Check devDependencies
-        if include_dev
-            && !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies) {
-                return false;
-            }
+        if include_dev && !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies)
+        {
+            return false;
+        }
 
         // 3. Check optionalDependencies
-        if !Self::map_matches(&manifest.optional_dependencies, &root_pkg.optional_dependencies) {
+        if !Self::map_matches(
+            &manifest.optional_dependencies,
+            &root_pkg.optional_dependencies,
+        ) {
             return false;
         }
 
@@ -694,7 +1075,10 @@ impl LockfileV3 {
         }
 
         // 5. Check peerDependenciesMeta
-        if !Self::peer_meta_matches(&manifest.peer_dependencies_meta, &root_pkg.peer_dependencies_meta) {
+        if !Self::peer_meta_matches(
+            &manifest.peer_dependencies_meta,
+            &root_pkg.peer_dependencies_meta,
+        ) {
             return false;
         }
 
@@ -929,7 +1313,10 @@ impl LockfileV3 {
                 if let Some(v) = &self.version {
                     root.insert("version".into(), serde_json::Value::String(v.clone()));
                 }
-                root.insert("lockfileVersion".into(), serde_json::Value::Number(version.into()));
+                root.insert(
+                    "lockfileVersion".into(),
+                    serde_json::Value::Number(version.into()),
+                );
                 root.insert("requires".into(), serde_json::Value::Bool(true));
 
                 let legacy = self.to_legacy_dependencies();
@@ -941,7 +1328,9 @@ impl LockfileV3 {
                     root.insert("dependencies".into(), legacy);
                 }
                 let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
-                if !out.ends_with('\n') { out.push('\n'); }
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
                 Ok(out)
             }
             other => Err(LockfileError::UnsupportedVersion(other)),
@@ -951,7 +1340,9 @@ impl LockfileV3 {
     /// Save using npm lockfile-version semantics (1, 2, or 3).
     pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
         let content = self.to_json_string_version(version)?;
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, content)?;
         Ok(())
     }
@@ -967,32 +1358,77 @@ impl LockfileV3 {
     fn to_legacy_dependencies(&self) -> serde_json::Value {
         fn package_value(package: &LockfilePackage) -> serde_json::Value {
             let mut value = serde_json::Map::new();
-            if let Some(v) = &package.version { value.insert("version".into(), serde_json::Value::String(v.clone())); }
-            if let Some(v) = &package.resolved { value.insert("resolved".into(), serde_json::Value::String(v.clone())); }
-            if let Some(v) = &package.integrity { value.insert("integrity".into(), serde_json::Value::String(v.clone())); }
-            if package.dev == Some(true) { value.insert("dev".into(), serde_json::Value::Bool(true)); }
-            if package.optional == Some(true) { value.insert("optional".into(), serde_json::Value::Bool(true)); }
-            if package.dev_optional == Some(true) { value.insert("devOptional".into(), serde_json::Value::Bool(true)); }
-            if package.peer == Some(true) { value.insert("peer".into(), serde_json::Value::Bool(true)); }
-            if package.peer_optional == Some(true) { value.insert("peerOptional".into(), serde_json::Value::Bool(true)); }
-            if package.in_bundle == Some(true) { value.insert("bundled".into(), serde_json::Value::Bool(true)); }
-            if package.has_install_script == Some(true) { value.insert("hasInstallScript".into(), serde_json::Value::Bool(true)); }
-            if package.has_shrinkwrap == Some(true) { value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true)); }
-            if let Some(deps) = &package.dependencies { value.insert("requires".into(), serde_json::to_value(deps).unwrap_or_default()); }
+            if let Some(v) = &package.version {
+                value.insert("version".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(v) = &package.resolved {
+                value.insert("resolved".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(v) = &package.integrity {
+                value.insert("integrity".into(), serde_json::Value::String(v.clone()));
+            }
+            if package.dev == Some(true) {
+                value.insert("dev".into(), serde_json::Value::Bool(true));
+            }
+            if package.optional == Some(true) {
+                value.insert("optional".into(), serde_json::Value::Bool(true));
+            }
+            if package.dev_optional == Some(true) {
+                value.insert("devOptional".into(), serde_json::Value::Bool(true));
+            }
+            if package.peer == Some(true) {
+                value.insert("peer".into(), serde_json::Value::Bool(true));
+            }
+            if package.peer_optional == Some(true) {
+                value.insert("peerOptional".into(), serde_json::Value::Bool(true));
+            }
+            if package.in_bundle == Some(true) {
+                value.insert("bundled".into(), serde_json::Value::Bool(true));
+            }
+            if package.has_install_script == Some(true) {
+                value.insert("hasInstallScript".into(), serde_json::Value::Bool(true));
+            }
+            if package.has_shrinkwrap == Some(true) {
+                value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true));
+            }
+            if let Some(deps) = &package.dependencies {
+                value.insert(
+                    "requires".into(),
+                    serde_json::to_value(deps).unwrap_or_default(),
+                );
+            }
             serde_json::Value::Object(value)
         }
 
-        fn insert_node(root: &mut serde_json::Map<String, serde_json::Value>, segments: &[&str], package: &LockfilePackage) {
-            if segments.is_empty() { return; }
+        fn insert_node(
+            root: &mut serde_json::Map<String, serde_json::Value>,
+            segments: &[&str],
+            package: &LockfilePackage,
+        ) {
+            if segments.is_empty() {
+                return;
+            }
             let name = segments[0];
             if segments.len() == 1 {
                 root.insert(name.to_string(), package_value(package));
                 return;
             }
-            let entry = root.entry(name.to_string()).or_insert_with(|| serde_json::json!({}));
-            let object = entry.as_object_mut().expect("legacy dependency entry must be an object");
-            let nested = object.entry("dependencies").or_insert_with(|| serde_json::json!({}));
-            insert_node(nested.as_object_mut().expect("legacy dependencies must be an object"), &segments[1..], package);
+            let entry = root
+                .entry(name.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let object = entry
+                .as_object_mut()
+                .expect("legacy dependency entry must be an object");
+            let nested = object
+                .entry("dependencies")
+                .or_insert_with(|| serde_json::json!({}));
+            insert_node(
+                nested
+                    .as_object_mut()
+                    .expect("legacy dependencies must be an object"),
+                &segments[1..],
+                package,
+            );
         }
 
         let mut root = serde_json::Map::new();
@@ -1037,8 +1473,250 @@ impl LockfileV3 {
     }
 
     /// Save this lockfile as the hidden lockfile at `<project_dir>/node_modules/.package-lock.json`.
+    ///
+    /// Per npm Arborist parity (`Shrinkwrap` with `hiddenLockfile: true`):
+    /// - Lockfile version is always forced to 3 (packages-only, no legacy dependencies).
+    /// - Root `""` entry is omitted from `packages`.
+    /// - Package entries retain installed metadata (`version`, `resolved`, `integrity`, `engines`, etc.)
+    ///   while omitting extraneous fields like `directories`.
+    /// - Platform-skipped optional packages (e.g. `fsevents` on Windows) are omitted because
+    ///   npm's hidden lockfile lists only what is physically on disk.
+    /// - Fields are ordered in npm's `json-stringify-nice` order so diffs against npm are minimal.
     pub fn save_hidden(&self, project_dir: &Path) -> Result<(), LockfileError> {
         let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
-        self.save_to_file(&hidden_path)
+        let mut hidden = self.clone();
+        hidden.lockfile_version = 3;
+        hidden.packages.remove("");
+        for pkg in hidden.packages.values_mut() {
+            pkg.normalize_flags();
+        }
+
+        // Per npm Arborist parity: hidden lockfile lists only what is physically on disk!
+        // Do NOT include platform-skipped optional packages (like `fsevents` on Windows).
+        hidden.packages.retain(|pkg_key, pkg| {
+            if pkg_key.is_empty() {
+                return false;
+            }
+            let disk_path = project_dir.join(pkg_key);
+            let exists_on_disk =
+                disk_path.exists() || std::fs::symlink_metadata(&disk_path).is_ok();
+            if exists_on_disk {
+                return true;
+            }
+            let is_optional = pkg.optional.unwrap_or(false)
+                || pkg.dev_optional.unwrap_or(false)
+                || pkg.is_effective_optional();
+            if is_optional && is_platform_incompatible(pkg) {
+                return false;
+            }
+            if is_optional && project_dir.join("node_modules").is_dir() {
+                return false;
+            }
+            true
+        });
+
+        let content = hidden.to_npm_json_string()?;
+        if let Some(parent) = hidden_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&hidden_path, content)?;
+        Ok(())
     }
+
+    /// Serializes with npm's `json-stringify-nice` key ordering so diffs against npm are minimal.
+    pub fn to_npm_json_string(&self) -> Result<String, LockfileError> {
+        let mut normalized_packages = BTreeMap::new();
+        for (k, v) in &self.packages {
+            let mut pkg = v.clone();
+            pkg.normalize_flags();
+            normalized_packages.insert(to_posix_path(k), pkg);
+        }
+        let mut copy = self.clone();
+        copy.packages = normalized_packages;
+        let value = serde_json::to_value(&copy)?;
+        let mut out = String::new();
+        stringify_npm_nice(&value, 0, &mut out);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        Ok(out)
+    }
+}
+
+const SW_KEY_ORDER: &[&str] = &[
+    "name",
+    "version",
+    "lockfileVersion",
+    "resolved",
+    "integrity",
+    "requires",
+    "packages",
+    "dependencies",
+];
+
+fn indent_spaces(out: &mut String, level: usize) {
+    for _ in 0..level {
+        out.push_str("  ");
+    }
+}
+
+pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
+    match val {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_default());
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+            } else {
+                out.push_str("[\n");
+                for (i, item) in arr.iter().enumerate() {
+                    indent_spaces(out, indent_level + 1);
+                    stringify_npm_nice(item, indent_level + 1, out);
+                    if i + 1 < arr.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                indent_spaces(out, indent_level);
+                out.push(']');
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+            } else {
+                out.push_str("{\n");
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+
+                let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
+
+                let key_priority =
+                    |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
+
+                entries.sort_by(|(ak, av), (bk, bv)| {
+                    let a_obj = is_obj(av);
+                    let b_obj = is_obj(bv);
+                    if a_obj != b_obj {
+                        if a_obj {
+                            return std::cmp::Ordering::Greater;
+                        } else {
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                    match (key_priority(ak), key_priority(bk)) {
+                        (Some(pa), Some(pb)) => pa.cmp(&pb),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => ak.cmp(bk),
+                    }
+                });
+
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    indent_spaces(out, indent_level + 1);
+                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                    out.push_str(": ");
+                    stringify_npm_nice(v, indent_level + 1, out);
+                    if i + 1 < entries.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                indent_spaces(out, indent_level);
+                out.push('}');
+            }
+        }
+    }
+}
+
+pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
+    let is_optional = pkg.optional.unwrap_or(false)
+        || pkg.dev_optional.unwrap_or(false)
+        || pkg.is_effective_optional();
+    if !is_optional {
+        return false;
+    }
+
+    let current_os = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        std::env::consts::OS
+    };
+
+    let current_cpu = if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86") {
+        "ia32"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else if cfg!(target_arch = "wasm32") {
+        "wasm32"
+    } else {
+        std::env::consts::ARCH
+    };
+
+    let current_libc = if cfg!(target_os = "linux") {
+        if cfg!(target_env = "musl") {
+            Some("musl")
+        } else {
+            Some("glibc")
+        }
+    } else {
+        None
+    };
+
+    fn matches_list(current: &str, list_opt: Option<&[String]>) -> bool {
+        let list = match list_opt {
+            Some(l) if !l.is_empty() => l,
+            _ => return true,
+        };
+        let mut has_positive = false;
+        let mut positive_match = false;
+        for item in list {
+            if let Some(negated) = item.strip_prefix('!') {
+                if negated == current {
+                    return false;
+                }
+            } else {
+                has_positive = true;
+                if item == current {
+                    positive_match = true;
+                }
+            }
+        }
+        if has_positive {
+            positive_match
+        } else {
+            true
+        }
+    }
+
+    let os_ok = matches_list(current_os, pkg.os.as_deref());
+    let cpu_ok = matches_list(current_cpu, pkg.cpu.as_deref());
+    let libc_ok = match (&pkg.libc, current_libc) {
+        (Some(libc_list), Some(curr)) if !libc_list.is_empty() => {
+            matches_list(curr, Some(libc_list))
+        }
+        (Some(libc_list), None) if !libc_list.is_empty() => {
+            !libc_list.iter().any(|s| !s.starts_with('!'))
+        }
+        _ => true,
+    };
+
+    !(os_ok && cpu_ok && libc_ok)
 }

@@ -17,9 +17,15 @@ fn test_cli_dedupe_removes_nested_duplicate() {
     let mut manifest = Manifest::default();
     manifest.name = Some("dedupe-cli-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("parent".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("dep".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("parent".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     // Create root package-lock.json
     let mut lock = LockfileV3::new("dedupe-cli-app", Some("1.0.0".to_string()));
@@ -45,12 +51,17 @@ fn test_cli_dedupe_removes_nested_duplicate() {
             ..Default::default()
         },
     );
-    lock.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     // Create directories
     let root_dep = project_dir.join("node_modules").join("dep");
     fs::create_dir_all(&root_dep).unwrap();
-    fs::write(root_dep.join("package.json"), r#"{"name": "dep", "version": "1.5.0"}"#).unwrap();
+    fs::write(
+        root_dep.join("package.json"),
+        r#"{"name": "dep", "version": "1.5.0"}"#,
+    )
+    .unwrap();
 
     let parent_dir = project_dir.join("node_modules").join("parent");
     let nested_dep = parent_dir.join("node_modules").join("dep");
@@ -58,8 +69,13 @@ fn test_cli_dedupe_removes_nested_duplicate() {
     fs::write(
         parent_dir.join("package.json"),
         r#"{"name": "parent", "version": "1.0.0", "dependencies": {"dep": "^1.0.0"}}"#,
-    ).unwrap();
-    fs::write(nested_dep.join("package.json"), r#"{"name": "dep", "version": "1.0.0"}"#).unwrap();
+    )
+    .unwrap();
+    fs::write(
+        nested_dep.join("package.json"),
+        r#"{"name": "dep", "version": "1.0.0"}"#,
+    )
+    .unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
@@ -69,9 +85,16 @@ fn test_cli_dedupe_removes_nested_duplicate() {
         .output()
         .expect("Failed to execute rnpm dedupe");
 
-    assert!(output.status.success(), "dedupe failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "dedupe failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("dedupe: removed node_modules/parent/node_modules/dep") || stdout.contains("successfully deduplicated"));
+    assert!(
+        stdout.contains("dedupe: removed node_modules/parent/node_modules/dep")
+            || stdout.contains("successfully deduplicated")
+    );
 
     // Check disk
     assert!(!nested_dep.exists(), "Nested duplicate must be deleted");
@@ -79,7 +102,9 @@ fn test_cli_dedupe_removes_nested_duplicate() {
 
     // Check lockfile
     let updated_lock = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
-    assert!(updated_lock.get_package("node_modules/parent/node_modules/dep").is_none());
+    assert!(updated_lock
+        .get_package("node_modules/parent/node_modules/dep")
+        .is_none());
     assert!(updated_lock.get_package("node_modules/dep").is_some());
 }
 
@@ -95,13 +120,25 @@ fn test_cli_dedupe_dry_run() {
 
     let root_d = project_dir.join("node_modules").join("d");
     fs::create_dir_all(&root_d).unwrap();
-    fs::write(root_d.join("package.json"), r#"{"name": "d", "version": "2.0.0"}"#).unwrap();
+    fs::write(
+        root_d.join("package.json"),
+        r#"{"name": "d", "version": "2.0.0"}"#,
+    )
+    .unwrap();
 
     let p = project_dir.join("node_modules").join("p");
     let nested_d = p.join("node_modules").join("d");
     fs::create_dir_all(&nested_d).unwrap();
-    fs::write(p.join("package.json"), r#"{"name": "p", "version": "1.0.0", "dependencies": {"d": "^2.0.0"}}"#).unwrap();
-    fs::write(nested_d.join("package.json"), r#"{"name": "d", "version": "2.0.0"}"#).unwrap();
+    fs::write(
+        p.join("package.json"),
+        r#"{"name": "p", "version": "1.0.0", "dependencies": {"d": "^2.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        nested_d.join("package.json"),
+        r#"{"name": "d", "version": "2.0.0"}"#,
+    )
+    .unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
@@ -132,13 +169,25 @@ fn test_cli_find_dupes() {
 
     let root_d = project_dir.join("node_modules").join("d");
     fs::create_dir_all(&root_d).unwrap();
-    fs::write(root_d.join("package.json"), r#"{"name": "d", "version": "2.0.0"}"#).unwrap();
+    fs::write(
+        root_d.join("package.json"),
+        r#"{"name": "d", "version": "2.0.0"}"#,
+    )
+    .unwrap();
 
     let p = project_dir.join("node_modules").join("p");
     let nested_d = p.join("node_modules").join("d");
     fs::create_dir_all(&nested_d).unwrap();
-    fs::write(p.join("package.json"), r#"{"name": "p", "version": "1.0.0", "dependencies": {"d": "^2.0.0"}}"#).unwrap();
-    fs::write(nested_d.join("package.json"), r#"{"name": "d", "version": "2.0.0"}"#).unwrap();
+    fs::write(
+        p.join("package.json"),
+        r#"{"name": "p", "version": "1.0.0", "dependencies": {"d": "^2.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        nested_d.join("package.json"),
+        r#"{"name": "d", "version": "2.0.0"}"#,
+    )
+    .unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
@@ -150,7 +199,10 @@ fn test_cli_find_dupes() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("find-dupes: duplicate found") || stdout.contains("duplicate package(s) detected"));
+    assert!(
+        stdout.contains("find-dupes: duplicate found")
+            || stdout.contains("duplicate package(s) detected")
+    );
     assert!(nested_d.exists());
 }
 
@@ -179,9 +231,15 @@ fn test_cli_rebuild_runs_scripts() {
         .output()
         .expect("Failed to execute rnpm rebuild");
 
-    assert!(output.status.success(), "rebuild failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "rebuild failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rnpm: rebuilt built-pkg@1.0.0") || stdout.contains("successfully rebuilt"));
+    assert!(
+        stdout.contains("rnpm: rebuilt built-pkg@1.0.0") || stdout.contains("successfully rebuilt")
+    );
     assert!(marker_file.exists());
 }
 

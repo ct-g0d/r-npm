@@ -1,4 +1,8 @@
-#![allow(clippy::unnecessary_unwrap, clippy::manual_strip, clippy::should_implement_trait)]
+#![allow(
+    clippy::unnecessary_unwrap,
+    clippy::manual_strip,
+    clippy::should_implement_trait
+)]
 
 pub mod error;
 pub mod integrity;

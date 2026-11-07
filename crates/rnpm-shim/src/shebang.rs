@@ -1,5 +1,5 @@
-use std::path::Path;
 use crate::error::ShimError;
+use std::path::Path;
 
 /// Parsed shebang information from a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,10 +177,7 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
         .unwrap_or(raw_prog)
         .to_string();
 
-    let args: Vec<String> = tokens[idx + 1..]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let args: Vec<String> = tokens[idx + 1..].iter().map(|s| s.to_string()).collect();
 
     Some(ShebangInfo {
         program: prog_name,

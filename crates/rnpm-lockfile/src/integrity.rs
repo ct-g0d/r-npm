@@ -1,7 +1,7 @@
+use rnpm_core::integrity::{Algorithm, Integrity};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
-use rnpm_core::integrity::{Algorithm, Integrity};
 use url::Url;
 
 use crate::error::LockfileError;
@@ -208,9 +208,9 @@ fn audit_integrity(
             })?;
 
             if let Some(min_algo) = policy.min_algorithm {
-                let strongest = integrity.strongest_algorithm().ok_or_else(|| {
-                    LockfileError::MissingIntegrity(pkg_path.to_string())
-                })?;
+                let strongest = integrity
+                    .strongest_algorithm()
+                    .ok_or_else(|| LockfileError::MissingIntegrity(pkg_path.to_string()))?;
 
                 if strongest < min_algo {
                     return Err(LockfileError::WeakIntegrity {
@@ -332,7 +332,8 @@ fn audit_resolved_url(
             if reg_lower.starts_with("http://") || reg_lower.starts_with("https://") {
                 if let Ok(reg_url) = Url::parse(&reg_lower) {
                     if let Some(reg_host) = reg_url.host_str() {
-                        return host_lower == reg_host || host_lower.ends_with(&format!(".{reg_host}"));
+                        return host_lower == reg_host
+                            || host_lower.ends_with(&format!(".{reg_host}"));
                     }
                 }
             }

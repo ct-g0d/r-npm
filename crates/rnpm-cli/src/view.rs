@@ -1,7 +1,7 @@
-use std::collections::HashSet;
-use std::path::Path;
 use reqwest::{Method, StatusCode, Url};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::path::Path;
 
 use rnpm_config::Config;
 use rnpm_core::semver::{Range, Version};
@@ -146,7 +146,12 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
     let packument_url = Url::parse(&format!("{base_str}/{encoded_name}"))?;
 
     let (resp, _permit) = match client
-        .execute_with_permit(Method::GET, packument_url.clone(), Some("application/json"), None)
+        .execute_with_permit(
+            Method::GET,
+            packument_url.clone(),
+            Some("application/json"),
+            None,
+        )
         .await
     {
         Ok(r) => r,
@@ -185,7 +190,9 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
         Err(spec_str) => {
             eprintln!("npm error code ETARGET");
             eprintln!("npm error notarget No matching version found for {pkg_name}@{spec_str}.");
-            eprintln!("npm error notarget In most cases you or one of your dependencies are requesting");
+            eprintln!(
+                "npm error notarget In most cases you or one of your dependencies are requesting"
+            );
             eprintln!("npm error notarget a package version that doesn't exist.");
             return Ok(1);
         }
@@ -201,7 +208,8 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
         if json_mode {
             println!("{}", serde_json::to_string_pretty(&version_doc)?);
         } else {
-            let summary = format_npm_summary(&pkg_name, &resolved_version, &version_doc, &packument);
+            let summary =
+                format_npm_summary(&pkg_name, &resolved_version, &version_doc, &packument);
             println!("{summary}");
         }
     } else if fields.len() == 1 {
@@ -233,7 +241,10 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
         }
 
         if json_mode {
-            println!("{}", serde_json::to_string_pretty(&Value::Object(json_map))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&Value::Object(json_map))?
+            );
         } else {
             println!("{}", format_multi_fields_text(&entries));
         }
@@ -312,7 +323,11 @@ pub fn resolve_packument_version(packument: &Value, spec: Option<&str>) -> Resul
 }
 
 /// Extract a field value using dot notation, checking version doc first, then root packument.
-pub fn extract_field_value(field_path: &str, version_doc: &Value, packument: &Value) -> Option<Value> {
+pub fn extract_field_value(
+    field_path: &str,
+    version_doc: &Value,
+    packument: &Value,
+) -> Option<Value> {
     let trimmed_path = field_path.trim();
     if trimmed_path.is_empty() {
         return None;
@@ -458,7 +473,9 @@ pub fn format_npm_summary(name: &str, version: &str, doc: &Value, packument: &Va
             if let Some(s) = v.as_str() {
                 Some(s.to_string())
             } else if let Some(obj) = v.as_object() {
-                obj.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+                obj.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
             } else {
                 None
             }
@@ -672,7 +689,10 @@ mod tests {
     impl MockServer {
         async fn start<F>(handler: F) -> Self
         where
-            F: Fn(&str, &str) -> (u16, Vec<(&'static str, String)>, Vec<u8>) + Send + Sync + 'static,
+            F: Fn(&str, &str) -> (u16, Vec<(&'static str, String)>, Vec<u8>)
+                + Send
+                + Sync
+                + 'static,
         {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -814,7 +834,10 @@ mod tests {
             }
         });
 
-        assert_eq!(resolve_packument_version(&packument, None).unwrap(), "4.1.2");
+        assert_eq!(
+            resolve_packument_version(&packument, None).unwrap(),
+            "4.1.2"
+        );
         assert_eq!(
             resolve_packument_version(&packument, Some("latest")).unwrap(),
             "4.1.2"
@@ -963,7 +986,9 @@ mod tests {
         assert!(summary.contains("- sindresorhus <sindresorhus@gmail.com>"));
         assert!(summary.contains("dist-tags:"));
         assert!(summary.contains("latest: 2.4.2"));
-        assert!(summary.contains("published 2018-12-14T10:00:00.000Z by sindresorhus <sindresorhus@gmail.com>"));
+        assert!(summary.contains(
+            "published 2018-12-14T10:00:00.000Z by sindresorhus <sindresorhus@gmail.com>"
+        ));
     }
 
     #[tokio::test]
@@ -1161,7 +1186,11 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let npmrc_path = temp_dir.path().join(".npmrc");
-        std::fs::write(&npmrc_path, format!("@scoped:registry = {}\n", server.url())).unwrap();
+        std::fs::write(
+            &npmrc_path,
+            format!("@scoped:registry = {}\n", server.url()),
+        )
+        .unwrap();
 
         let opts = ViewOptions {
             args: vec!["@scoped/my-lib".to_string(), "version".to_string()],

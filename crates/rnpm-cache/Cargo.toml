@@ -8,6 +8,10 @@ license.workspace = true
 
 [dependencies]
 rnpm-core = { workspace = true }
+rnpm-fs = { workspace = true }
+memmap2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 data-encoding = { workspace = true }
@@ -18,3 +22,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+path-clean = { workspace = true }

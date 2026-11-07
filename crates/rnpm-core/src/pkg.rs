@@ -1,6 +1,6 @@
-﻿use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// Represents a single segment in a package manifest property path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +116,10 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                     i += 1;
                 }
                 if i >= len || chars[i] != ']' {
-                    bail!("Expected ']' after quoted string in path expression: '{}'", path);
+                    bail!(
+                        "Expected ']' after quoted string in path expression: '{}'",
+                        path
+                    );
                 }
                 i += 1; // consume ']'
                 segments.push(PathSegment::Key(key));
@@ -183,10 +186,7 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
 /// Traverses a JSON [`Value`] using the provided [`PathSegment`]s.
 ///
 /// Returns `Some(&Value)` if the path exists, or `None` if any segment cannot be resolved.
-pub fn get_value_at_path<'a>(
-    root: &'a Value,
-    segments: &[PathSegment],
-) -> Option<&'a Value> {
+pub fn get_value_at_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Option<&'a Value> {
     if segments.is_empty() {
         return Some(root);
     }
@@ -330,7 +330,10 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
         }
 
         // Intermediate segment
-        let next_is_array = matches!(&segments[i + 1], PathSegment::Index(_) | PathSegment::Append);
+        let next_is_array = matches!(
+            &segments[i + 1],
+            PathSegment::Index(_) | PathSegment::Append
+        );
 
         match segment {
             PathSegment::Key(key) => match current {
@@ -581,7 +584,10 @@ pub fn resolve_manifest_path(manifest_path: &Path) -> PathBuf {
         manifest_path.to_path_buf()
     } else if manifest_path.is_dir() {
         manifest_path.join("package.json")
-    } else if manifest_path.file_name().is_some_and(|f| f == "package.json") {
+    } else if manifest_path
+        .file_name()
+        .is_some_and(|f| f == "package.json")
+    {
         manifest_path.to_path_buf()
     } else {
         let candidate = manifest_path.join("package.json");
@@ -602,18 +608,22 @@ pub fn resolve_manifest_path(manifest_path: &Path) -> PathBuf {
 ///   - If the field does not exist, returns `{}`.
 /// - If multiple fields:
 ///   - Returns a JSON object with `{ field_path: resolved_value, ... }` formatted as pretty-printed JSON.
-pub fn pkg_get(
-    manifest_path: &Path,
-    field_paths: &[String],
-    json: bool,
-) -> Result<String> {
+pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Result<String> {
     let resolved_path = resolve_manifest_path(manifest_path);
-    let content = std::fs::read_to_string(&resolved_path)
-        .with_context(|| format!("Failed to read package manifest at '{}'", resolved_path.display()))?;
+    let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+        format!(
+            "Failed to read package manifest at '{}'",
+            resolved_path.display()
+        )
+    })?;
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
-    let manifest_val: Value = serde_json::from_str(clean_str)
-        .with_context(|| format!("Failed to parse JSON in package manifest at '{}'", resolved_path.display()))?;
+    let manifest_val: Value = serde_json::from_str(clean_str).with_context(|| {
+        format!(
+            "Failed to parse JSON in package manifest at '{}'",
+            resolved_path.display()
+        )
+    })?;
 
     if field_paths.is_empty() {
         return Ok(serde_json::to_string_pretty(&manifest_val)?);
@@ -651,17 +661,22 @@ pub fn pkg_get(
 /// - If `field_paths` is empty: returns the full manifest value.
 /// - If single field: returns that field's value or `{}` if not found.
 /// - If multiple fields: returns a JSON object `{ field: value, ... }` of found fields.
-pub fn pkg_get_value(
-    manifest_path: &Path,
-    field_paths: &[String],
-) -> Result<Value> {
+pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Value> {
     let resolved_path = resolve_manifest_path(manifest_path);
-    let content = std::fs::read_to_string(&resolved_path)
-        .with_context(|| format!("Failed to read package manifest at '{}'", resolved_path.display()))?;
+    let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+        format!(
+            "Failed to read package manifest at '{}'",
+            resolved_path.display()
+        )
+    })?;
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
-    let manifest_val: Value = serde_json::from_str(clean_str)
-        .with_context(|| format!("Failed to parse JSON in package manifest at '{}'", resolved_path.display()))?;
+    let manifest_val: Value = serde_json::from_str(clean_str).with_context(|| {
+        format!(
+            "Failed to parse JSON in package manifest at '{}'",
+            resolved_path.display()
+        )
+    })?;
 
     if field_paths.is_empty() {
         return Ok(manifest_val);
@@ -689,10 +704,7 @@ pub fn pkg_get_value(
 
 /// Retrieves properties across workspace members formatted as pretty-printed JSON:
 /// `{ "<workspace-name>": <extracted-value>, ... }`.
-pub fn pkg_get_workspaces(
-    members: &[(&str, &Path)],
-    field_paths: &[String],
-) -> Result<String> {
+pub fn pkg_get_workspaces(members: &[(&str, &Path)], field_paths: &[String]) -> Result<String> {
     let mut root_map = serde_json::Map::new();
     for (name, path) in members {
         let val = pkg_get_value(path, field_paths)?;
@@ -708,20 +720,33 @@ pub fn pkg_get_workspaces(
 /// with 2 spaces indentation and a trailing newline (`\n`).
 pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     let resolved_path = resolve_manifest_path(manifest_path);
-    let content = std::fs::read_to_string(&resolved_path)
-        .map_err(|e| anyhow!("Failed to read manifest at '{}': {}", resolved_path.display(), e))?;
+    let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
+        anyhow!(
+            "Failed to read manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    let mut root: Value = serde_json::from_str(clean_str)
-        .map_err(|e| anyhow!("Failed to parse JSON in manifest at '{}': {}", resolved_path.display(), e))?;
+    let mut root: Value = serde_json::from_str(clean_str).map_err(|e| {
+        anyhow!(
+            "Failed to parse JSON in manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
 
     if !root.is_object() {
         root = Value::Object(serde_json::Map::new());
     }
 
     for assignment in assignments {
-        let (path_str, raw_val) = assignment
-            .split_once('=')
-            .ok_or_else(|| anyhow!("Invalid assignment '{}': expected <path>=<value>", assignment))?;
+        let (path_str, raw_val) = assignment.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "Invalid assignment '{}': expected <path>=<value>",
+                assignment
+            )
+        })?;
         let path_str = path_str.trim();
         if path_str.is_empty() {
             bail!("Assignment path cannot be empty: '{}'", assignment);
@@ -734,8 +759,13 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     let mut formatted = serde_json::to_string_pretty(&root)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
     formatted.push('\n');
-    std::fs::write(&resolved_path, formatted)
-        .map_err(|e| anyhow!("Failed to write manifest at '{}': {}", resolved_path.display(), e))?;
+    std::fs::write(&resolved_path, formatted).map_err(|e| {
+        anyhow!(
+            "Failed to write manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
 
     Ok(())
 }
@@ -747,11 +777,21 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
 /// The resulting JSON is persisted with 2 spaces indentation and a trailing newline (`\n`).
 pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
     let resolved_path = resolve_manifest_path(manifest_path);
-    let content = std::fs::read_to_string(&resolved_path)
-        .map_err(|e| anyhow!("Failed to read manifest at '{}': {}", resolved_path.display(), e))?;
+    let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
+        anyhow!(
+            "Failed to read manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    let mut root: Value = serde_json::from_str(clean_str)
-        .map_err(|e| anyhow!("Failed to parse JSON in manifest at '{}': {}", resolved_path.display(), e))?;
+    let mut root: Value = serde_json::from_str(clean_str).map_err(|e| {
+        anyhow!(
+            "Failed to parse JSON in manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
 
     let mut parsed_fields: Vec<(String, Vec<PathSegment>)> = Vec::new();
     for field in fields {
@@ -787,8 +827,13 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
     let mut formatted = serde_json::to_string_pretty(&root)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
     formatted.push('\n');
-    std::fs::write(&resolved_path, formatted)
-        .map_err(|e| anyhow!("Failed to write manifest at '{}': {}", resolved_path.display(), e))?;
+    std::fs::write(&resolved_path, formatted).map_err(|e| {
+        anyhow!(
+            "Failed to write manifest at '{}': {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
 
     Ok(())
 }

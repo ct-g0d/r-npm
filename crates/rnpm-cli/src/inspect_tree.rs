@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
@@ -155,14 +155,15 @@ impl InspectedNode {
             map.insert("repository".to_string(), repo.clone());
         }
         if let Some(eng) = &self.engines {
-            map.insert("engines".to_string(), serde_json::to_value(eng).unwrap_or(Value::Null));
+            map.insert(
+                "engines".to_string(),
+                serde_json::to_value(eng).unwrap_or(Value::Null),
+            );
         }
 
-        let pkgid = self.pkgid.clone().unwrap_or_else(|| {
-            match &self.version {
-                Some(v) => format!("{}@{}", self.name, v),
-                None => self.name.clone(),
-            }
+        let pkgid = self.pkgid.clone().unwrap_or_else(|| match &self.version {
+            Some(v) => format!("{}@{}", self.name, v),
+            None => self.name.clone(),
         });
         map.insert("_id".to_string(), Value::String(pkgid.clone()));
         map.insert("pkgid".to_string(), Value::String(pkgid));
@@ -190,8 +191,14 @@ impl InspectedNode {
             },
         );
 
-        map.insert("from".to_string(), serde_json::to_value(&self.from).unwrap_or_default());
-        map.insert("to".to_string(), serde_json::to_value(&self.to).unwrap_or_default());
+        map.insert(
+            "from".to_string(),
+            serde_json::to_value(&self.from).unwrap_or_default(),
+        );
+        map.insert(
+            "to".to_string(),
+            serde_json::to_value(&self.to).unwrap_or_default(),
+        );
 
         map.insert("dev".to_string(), Value::Bool(self.dev));
         map.insert("inBundle".to_string(), Value::Bool(self.in_bundle));
@@ -202,7 +209,10 @@ impl InspectedNode {
         if self.missing {
             query_ctx.insert("missing".to_string(), Value::Bool(true));
         }
-        map.insert("queryContext".to_string(), serde_json::to_value(query_ctx).unwrap_or_default());
+        map.insert(
+            "queryContext".to_string(),
+            serde_json::to_value(query_ctx).unwrap_or_default(),
+        );
 
         Value::Object(map)
     }
@@ -287,7 +297,10 @@ fn scan_nm_dir(project_dir: &Path, nm_rel: &str, result: &mut HashMap<String, Di
                         DiskPackage {
                             location: loc.clone(),
                             dir_path: sub_path.clone(),
-                            name: manifest.as_ref().and_then(|m| m.name.clone()).unwrap_or(pkg_name),
+                            name: manifest
+                                .as_ref()
+                                .and_then(|m| m.name.clone())
+                                .unwrap_or(pkg_name),
                             version,
                             manifest,
                             raw_json,
@@ -313,7 +326,10 @@ fn scan_nm_dir(project_dir: &Path, nm_rel: &str, result: &mut HashMap<String, Di
                 DiskPackage {
                     location: loc.clone(),
                     dir_path: entry_path.clone(),
-                    name: manifest.as_ref().and_then(|m| m.name.clone()).unwrap_or(pkg_name),
+                    name: manifest
+                        .as_ref()
+                        .and_then(|m| m.name.clone())
+                        .unwrap_or(pkg_name),
                     version,
                     manifest,
                     raw_json,
@@ -373,7 +389,10 @@ pub fn candidate_locations(current_loc: &str, dep_name: &str) -> Vec<String> {
 }
 
 /// Builds the complete inspected dependency tree.
-pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyhow::Result<InspectedNode> {
+pub fn build_dependency_tree(
+    project_dir: &Path,
+    options: &TreeOptions,
+) -> anyhow::Result<InspectedNode> {
     let manifest_path = project_dir.join("package.json");
     let (root_manifest, root_raw) = if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)?;
@@ -400,8 +419,14 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
         root.description = m.description.clone();
     }
     if let Some(r) = &root_raw {
-        root.license = r.get("license").and_then(|v| v.as_str()).map(|s| s.to_string());
-        root.homepage = r.get("homepage").and_then(|v| v.as_str()).map(|s| s.to_string());
+        root.license = r
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        root.homepage = r
+            .get("homepage")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         root.repository = r.get("repository").cloned();
         root.raw_manifest = Some(r.clone());
     }
@@ -435,17 +460,23 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
         }
         if !options.omit_dev {
             for (name, req) in &m.dev_dependencies {
-                direct_deps.entry(name.clone()).or_insert((req.clone(), "dev"));
+                direct_deps
+                    .entry(name.clone())
+                    .or_insert((req.clone(), "dev"));
             }
         }
         if !options.omit_optional {
             for (name, req) in &m.optional_dependencies {
-                direct_deps.entry(name.clone()).or_insert((req.clone(), "optional"));
+                direct_deps
+                    .entry(name.clone())
+                    .or_insert((req.clone(), "optional"));
             }
         }
         if !options.omit_peer {
             for (name, req) in &m.peer_dependencies {
-                direct_deps.entry(name.clone()).or_insert((req.clone(), "peer"));
+                direct_deps
+                    .entry(name.clone())
+                    .or_insert((req.clone(), "peer"));
             }
         }
     }
@@ -478,7 +509,10 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
                             "invalid: {}@{} {}",
                             node.name,
                             v_str,
-                            node.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                            node.path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
                         );
                         node.problems.push(prob.clone());
                         root.problems.push(prob);
@@ -490,12 +524,7 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
             queue.push_back(expected_loc);
         } else {
             // Missing package
-            let mut missing_node = create_missing_node(
-                dep_name,
-                dep_req,
-                &expected_loc,
-                dep_type,
-            );
+            let mut missing_node = create_missing_node(dep_name, dep_req, &expected_loc, dep_type);
             missing_node.from.push(String::new());
             let prob = format!(
                 "missing: {}@{}, required by {}@{}",
@@ -525,12 +554,16 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
             }
             if !options.omit_optional {
                 for (name, req) in &m.optional_dependencies {
-                    child_deps.entry(name.clone()).or_insert((req.clone(), "optional"));
+                    child_deps
+                        .entry(name.clone())
+                        .or_insert((req.clone(), "optional"));
                 }
             }
             if !options.omit_peer {
                 for (name, req) in &m.peer_dependencies {
-                    child_deps.entry(name.clone()).or_insert((req.clone(), "peer"));
+                    child_deps
+                        .entry(name.clone())
+                        .or_insert((req.clone(), "peer"));
                 }
             }
         }
@@ -567,9 +600,12 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
 
                     // Check version validity
                     if let Some(v_str) = &node.version {
-                        if let (Ok(ver), Ok(range)) = (Version::parse(v_str), Range::parse(child_req)) {
+                        if let (Ok(ver), Ok(range)) =
+                            (Version::parse(v_str), Range::parse(child_req))
+                        {
                             if !range.satisfies(&ver) {
-                                let err_str = format!("\"{}\" from {}", child_req, current_disk.name);
+                                let err_str =
+                                    format!("\"{}\" from {}", child_req, current_disk.name);
                                 node.invalid = Some(err_str);
                             }
                         }
@@ -588,12 +624,8 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
                 if let Some(curr_node) = resolved_nodes_by_loc.get_mut(&current_loc) {
                     curr_node.to.push(expected_loc.clone());
                 }
-                let mut missing_node = create_missing_node(
-                    child_name,
-                    child_req,
-                    &expected_loc,
-                    child_type,
-                );
+                let mut missing_node =
+                    create_missing_node(child_name, child_req, &expected_loc, child_type);
                 missing_node.from.push(current_loc.clone());
                 let prob = format!(
                     "missing: {}@{}, required by {}@{}",
@@ -606,7 +638,9 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
                 root.problems.push(prob);
 
                 if let Some(curr_node) = resolved_nodes_by_loc.get_mut(&current_loc) {
-                    curr_node.dependencies.insert(child_name.clone(), missing_node);
+                    curr_node
+                        .dependencies
+                        .insert(child_name.clone(), missing_node);
                 }
             }
         }
@@ -634,7 +668,10 @@ pub fn build_dependency_tree(project_dir: &Path, options: &TreeOptions) -> anyho
             "extraneous: {}@{} {}",
             node.name,
             node.version.as_deref().unwrap_or(""),
-            node.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            node.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         );
         node.problems.push(prob.clone());
         root.problems.push(prob);
@@ -665,12 +702,14 @@ fn attach_nested_dependencies(
         let _parent_loc = &node.location;
         for to_loc in &node.to {
             if let Some(child_node) = resolved_by_loc.remove(to_loc) {
-                node.dependencies.insert(child_node.name.clone(), child_node);
+                node.dependencies
+                    .insert(child_node.name.clone(), child_node);
             } else if let Some(existing) = resolved_by_loc.get(to_loc) {
                 // Deduped / hoisted elsewhere
                 let mut deduped_node = existing.clone();
                 deduped_node.deduped = true;
-                node.dependencies.insert(deduped_node.name.clone(), deduped_node);
+                node.dependencies
+                    .insert(deduped_node.name.clone(), deduped_node);
             }
         }
         if !node.dependencies.is_empty() {
@@ -695,17 +734,38 @@ fn create_node_from_disk(
 
     let resolved = lock_pkg.and_then(|p| p.resolved.clone());
     let integrity = lock_pkg.and_then(|p| p.integrity.clone());
-    let overridden = lock_pkg.and_then(|p| p.extra.get("overridden").and_then(|v| v.as_bool())).unwrap_or(false);
+    let overridden = lock_pkg
+        .and_then(|p| p.extra.get("overridden").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
 
-    let desc = disk_pkg.manifest.as_ref().and_then(|m| m.description.clone());
-    let license = disk_pkg.raw_json.as_ref().and_then(|j| j.get("license").and_then(|v| v.as_str()).map(|s| s.to_string()));
-    let homepage = disk_pkg.raw_json.as_ref().and_then(|j| j.get("homepage").and_then(|v| v.as_str()).map(|s| s.to_string()));
-    let repo = disk_pkg.raw_json.as_ref().and_then(|j| j.get("repository").cloned());
+    let desc = disk_pkg
+        .manifest
+        .as_ref()
+        .and_then(|m| m.description.clone());
+    let license = disk_pkg.raw_json.as_ref().and_then(|j| {
+        j.get("license")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let homepage = disk_pkg.raw_json.as_ref().and_then(|j| {
+        j.get("homepage")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let repo = disk_pkg
+        .raw_json
+        .as_ref()
+        .and_then(|j| j.get("repository").cloned());
     let engines = disk_pkg.manifest.as_ref().and_then(|m| {
         if m.engines.is_empty() {
             None
         } else {
-            Some(m.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            Some(
+                m.engines
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
         }
     });
 
@@ -864,7 +924,7 @@ fn create_node_from_lock(
         license: pkg.license.clone(),
         homepage: None,
         repository: None,
-        engines: pkg.engines.clone(),
+        engines: pkg.engines_map(),
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
         location: location.to_string(),

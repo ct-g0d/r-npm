@@ -37,10 +37,7 @@ struct TestMockRegistry {
 impl TestMockRegistry {
     async fn start<F>(handler: F) -> Self
     where
-        F: Fn(&RecordedReq) -> (u16, Vec<(&'static str, String)>, Vec<u8>)
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&RecordedReq) -> (u16, Vec<(&'static str, String)>, Vec<u8>) + Send + Sync + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -179,8 +176,10 @@ fn test_cli_publish_dry_run() {
             "version": "1.2.3",
             "description": "Test dry run publication",
             "main": "index.js"
-        })).unwrap(),
-    ).unwrap();
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     std::fs::write(pkg_dir.join("index.js"), "console.log('hello');").unwrap();
 
@@ -192,14 +191,30 @@ fn test_cli_publish_dry_run() {
         .output()
         .expect("failed to run rnpm publish");
 
-    assert!(output.status.success(), "Dry run publish must succeed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "Dry run publish must succeed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(stdout.contains("+ dry-run-pkg@1.2.3"), "Expected package name and version in stdout: {stdout}");
-    assert!(stderr.contains("npm notice package: dry-run-pkg@1.2.3"), "Expected package notice: {stderr}");
-    assert!(stderr.contains("npm notice shasum:"), "Expected shasum notice: {stderr}");
-    assert!(stderr.contains("npm notice integrity:"), "Expected integrity notice: {stderr}");
+    assert!(
+        stdout.contains("+ dry-run-pkg@1.2.3"),
+        "Expected package name and version in stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("npm notice package: dry-run-pkg@1.2.3"),
+        "Expected package notice: {stderr}"
+    );
+    assert!(
+        stderr.contains("npm notice shasum:"),
+        "Expected shasum notice: {stderr}"
+    );
+    assert!(
+        stderr.contains("npm notice integrity:"),
+        "Expected integrity notice: {stderr}"
+    );
 
     // 2. JSON mode output
     let json_output = Command::new(rnpm_bin())
@@ -230,7 +245,13 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
     std::fs::create_dir_all(&project).unwrap();
 
     let output = Command::new(rnpm_bin())
-        .args(["login", "--registry", "https://registry.example.test/", "--scope", "@acme"])
+        .args([
+            "login",
+            "--registry",
+            "https://registry.example.test/",
+            "--scope",
+            "@acme",
+        ])
         .current_dir(&project)
         .env("USERPROFILE", &home)
         .env("HOME", &home)
@@ -238,7 +259,11 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
         .output()
         .expect("failed to run rnpm login");
 
-    assert!(output.status.success(), "login failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "login failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let npmrc = std::fs::read_to_string(home.join(".npmrc")).unwrap();
     assert!(npmrc.contains("//registry.example.test/:_authToken=secret-login-token"));
     assert!(npmrc.contains("@acme:registry=https://registry.example.test/"));
@@ -250,11 +275,16 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
 async fn test_cli_publish_lifecycle_hooks_sequence() {
     let server = TestMockRegistry::start(|req| {
         if req.method == "PUT" && req.path == "/lifecycle-test-pkg" {
-            (200, vec![("Content-Type", "application/json".into())], b"{\"ok\":true}".to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                b"{\"ok\":true}".to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let server_url = server.url();
     let tmp = tempdir().unwrap();
@@ -276,7 +306,11 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
         }
     });
 
-    std::fs::write(pkg_dir.join("package.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     // Create .npmrc with auth token
     let host = server.addr.to_string();
@@ -291,17 +325,26 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
         .output()
         .expect("failed to run rnpm publish");
 
-    assert!(output.status.success(), "Publish must succeed: stdout: {}\nstderr: {}",
+    assert!(
+        output.status.success(),
+        "Publish must succeed: stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let log_content = std::fs::read_to_string(pkg_dir.join("lifecycle.log")).expect("lifecycle.log must exist");
+    let log_content =
+        std::fs::read_to_string(pkg_dir.join("lifecycle.log")).expect("lifecycle.log must exist");
     let recorded_lines: Vec<&str> = log_content.lines().collect();
 
     assert_eq!(
         recorded_lines,
-        vec!["prepublishOnly", "prepack", "postpack", "publish", "postpublish"],
+        vec![
+            "prepublishOnly",
+            "prepack",
+            "postpack",
+            "publish",
+            "postpublish"
+        ],
         "Lifecycle hooks must execute in exact npm sequence!"
     );
 
@@ -310,7 +353,10 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].method, "PUT");
     assert_eq!(reqs[0].path, "/lifecycle-test-pkg");
-    assert_eq!(reqs[0].header("authorization"), Some("Bearer secret-lifecycle-token"));
+    assert_eq!(
+        reqs[0].header("authorization"),
+        Some("Bearer secret-lifecycle-token")
+    );
     drop(reqs);
 
     server.stop();
@@ -318,9 +364,7 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cli_publish_prepack_failure_halts_before_packaging() {
-    let server = TestMockRegistry::start(|_| {
-        (200, vec![], b"{\"ok\":true}".to_vec())
-    }).await;
+    let server = TestMockRegistry::start(|_| (200, vec![], b"{\"ok\":true}".to_vec())).await;
 
     let tmp = tempdir().unwrap();
     let pkg_dir = tmp.path();
@@ -332,7 +376,11 @@ async fn test_cli_publish_prepack_failure_halts_before_packaging() {
             "prepack": "node -e \"process.exit(42)\""
         }
     });
-    std::fs::write(pkg_dir.join("package.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin())
         .arg("publish")
@@ -347,7 +395,11 @@ async fn test_cli_publish_prepack_failure_halts_before_packaging() {
 
     // Verify server received 0 PUT requests
     let reqs = server.requests.lock().await;
-    assert_eq!(reqs.len(), 0, "No network request should occur if prepack fails");
+    assert_eq!(
+        reqs.len(),
+        0,
+        "No network request should occur if prepack fails"
+    );
     drop(reqs);
 
     server.stop();
@@ -366,7 +418,11 @@ fn test_cli_publish_ignore_scripts_bypasses_failing_hooks() {
             "prepack": "node -e \"process.exit(1)\""
         }
     });
-    std::fs::write(pkg_dir.join("package.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin())
         .arg("publish")
@@ -376,7 +432,10 @@ fn test_cli_publish_ignore_scripts_bypasses_failing_hooks() {
         .output()
         .expect("failed to execute publish");
 
-    assert!(output.status.success(), "ignore-scripts must bypass failing lifecycle scripts");
+    assert!(
+        output.status.success(),
+        "ignore-scripts must bypass failing lifecycle scripts"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("+ ignore-scripts-pkg@1.0.0"));
 }
@@ -385,11 +444,16 @@ fn test_cli_publish_ignore_scripts_bypasses_failing_hooks() {
 async fn test_cli_publish_http_put_payload_headers_and_auth() {
     let server = TestMockRegistry::start(|req| {
         if req.method == "PUT" && req.path == "/@cool%2fawesome-lib" {
-            (200, vec![("Content-Type", "application/json".into())], b"{\"ok\":true}".to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                b"{\"ok\":true}".to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let server_url = server.url();
     let tmp = tempdir().unwrap();
@@ -402,15 +466,18 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
             "version": "3.5.0",
             "description": "An awesome scoped library",
             "main": "lib.js"
-        })).unwrap(),
-    ).unwrap();
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     std::fs::write(pkg_dir.join("lib.js"), "module.exports = 42;").unwrap();
 
     let host = server.addr.to_string();
     std::fs::write(
         pkg_dir.join(".npmrc"),
         format!("//{host}/:_authToken=npm_super_token_999\n"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin())
         .arg("publish")
@@ -425,14 +492,21 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         .output()
         .expect("failed to run publish");
 
-    assert!(output.status.success(), "Publish must succeed: stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Publish must succeed: stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);
     let req = &reqs[0];
     assert_eq!(req.method, "PUT");
     assert_eq!(req.path, "/@cool%2fawesome-lib");
-    assert_eq!(req.header("authorization"), Some("Bearer npm_super_token_999"));
+    assert_eq!(
+        req.header("authorization"),
+        Some("Bearer npm_super_token_999")
+    );
     assert_eq!(req.header("npm-otp"), Some("654321"));
     assert_eq!(req.header("content-type"), Some("application/json"));
 
@@ -447,7 +521,10 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
     assert_eq!(version_entry["name"], "@cool/awesome-lib");
     assert_eq!(version_entry["version"], "3.5.0");
     assert!(version_entry["dist"]["shasum"].is_string());
-    assert!(version_entry["dist"]["integrity"].as_str().unwrap().starts_with("sha512-"));
+    assert!(version_entry["dist"]["integrity"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha512-"));
     assert_eq!(
         version_entry["dist"]["tarball"],
         format!("{server_url}@cool%2fawesome-lib/-/cool-awesome-lib-3.5.0.tgz")
@@ -457,7 +534,10 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
     assert_eq!(attachment["content_type"], "application/octet-stream");
     assert!(attachment["data"].as_str().unwrap().len() > 10);
     assert!(attachment["shasum"].is_string());
-    assert!(attachment["integrity"].as_str().unwrap().starts_with("sha512-"));
+    assert!(attachment["integrity"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha512-"));
     drop(reqs);
 
     server.stop();
@@ -467,7 +547,11 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
 async fn test_cli_publish_error_codes_diagnostics() {
     let server = TestMockRegistry::start(|req| {
         if req.path == "/conflict-pkg" {
-            (409, vec![], b"cannot publish over existing version".to_vec())
+            (
+                409,
+                vec![],
+                b"cannot publish over existing version".to_vec(),
+            )
         } else if req.path == "/unauth-pkg" {
             (401, vec![], b"authorization required".to_vec())
         } else if req.path == "/forbidden-pkg" {
@@ -475,7 +559,8 @@ async fn test_cli_publish_error_codes_diagnostics() {
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let server_url = server.url();
     let host = server.addr.to_string();
@@ -484,9 +569,15 @@ async fn test_cli_publish_error_codes_diagnostics() {
     let tmp1 = tempdir().unwrap();
     std::fs::write(
         tmp1.path().join("package.json"),
-        serde_json::to_string(&serde_json::json!({ "name": "conflict-pkg", "version": "1.0.0" })).unwrap(),
-    ).unwrap();
-    std::fs::write(tmp1.path().join(".npmrc"), format!("//{host}/:_authToken=tok\n")).unwrap();
+        serde_json::to_string(&serde_json::json!({ "name": "conflict-pkg", "version": "1.0.0" }))
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp1.path().join(".npmrc"),
+        format!("//{host}/:_authToken=tok\n"),
+    )
+    .unwrap();
 
     let out1 = Command::new(rnpm_bin())
         .arg("publish")
@@ -498,16 +589,25 @@ async fn test_cli_publish_error_codes_diagnostics() {
 
     assert!(!out1.status.success());
     let err1 = String::from_utf8_lossy(&out1.stderr);
-    assert!(err1.contains("npm error code EPUBLISHCONFLICT"), "Expected EPUBLISHCONFLICT in: {err1}");
+    assert!(
+        err1.contains("npm error code EPUBLISHCONFLICT"),
+        "Expected EPUBLISHCONFLICT in: {err1}"
+    );
     assert!(err1.contains("Cannot publish over existing version."));
 
     // 2. Unauthorized 401 -> ENEEDAUTH
     let tmp2 = tempdir().unwrap();
     std::fs::write(
         tmp2.path().join("package.json"),
-        serde_json::to_string(&serde_json::json!({ "name": "unauth-pkg", "version": "1.0.0" })).unwrap(),
-    ).unwrap();
-    std::fs::write(tmp2.path().join(".npmrc"), format!("//{host}/:_authToken=bad-tok\n")).unwrap();
+        serde_json::to_string(&serde_json::json!({ "name": "unauth-pkg", "version": "1.0.0" }))
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp2.path().join(".npmrc"),
+        format!("//{host}/:_authToken=bad-tok\n"),
+    )
+    .unwrap();
 
     let out2 = Command::new(rnpm_bin())
         .arg("publish")
@@ -519,15 +619,24 @@ async fn test_cli_publish_error_codes_diagnostics() {
 
     assert!(!out2.status.success());
     let err2 = String::from_utf8_lossy(&out2.stderr);
-    assert!(err2.contains("npm error code ENEEDAUTH"), "Expected ENEEDAUTH in: {err2}");
+    assert!(
+        err2.contains("npm error code ENEEDAUTH"),
+        "Expected ENEEDAUTH in: {err2}"
+    );
 
     // 3. Forbidden 403 -> E403
     let tmp3 = tempdir().unwrap();
     std::fs::write(
         tmp3.path().join("package.json"),
-        serde_json::to_string(&serde_json::json!({ "name": "forbidden-pkg", "version": "1.0.0" })).unwrap(),
-    ).unwrap();
-    std::fs::write(tmp3.path().join(".npmrc"), format!("//{host}/:_authToken=tok\n")).unwrap();
+        serde_json::to_string(&serde_json::json!({ "name": "forbidden-pkg", "version": "1.0.0" }))
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp3.path().join(".npmrc"),
+        format!("//{host}/:_authToken=tok\n"),
+    )
+    .unwrap();
 
     let out3 = Command::new(rnpm_bin())
         .arg("publish")
@@ -539,7 +648,10 @@ async fn test_cli_publish_error_codes_diagnostics() {
 
     assert!(!out3.status.success());
     let err3 = String::from_utf8_lossy(&out3.stderr);
-    assert!(err3.contains("npm error code E403"), "Expected E403 in: {err3}");
+    assert!(
+        err3.contains("npm error code E403"),
+        "Expected E403 in: {err3}"
+    );
 
     server.stop();
 }
@@ -549,16 +661,25 @@ async fn test_cli_whoami_and_ping() {
     let server = TestMockRegistry::start(|req| {
         if req.path == "/-/whoami" {
             if req.header("authorization") == Some("Bearer test-token-whoami") {
-                (200, vec![("Content-Type", "application/json".into())], b"{\"username\":\"ferris_rustacean\"}".to_vec())
+                (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    b"{\"username\":\"ferris_rustacean\"}".to_vec(),
+                )
             } else {
                 (401, vec![], b"unauthorized".to_vec())
             }
         } else if req.path == "/-/ping" {
-            (200, vec![("Content-Type", "application/json".into())], b"{}".to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                b"{}".to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let server_url = server.url();
     let host = server.addr.to_string();
@@ -567,7 +688,8 @@ async fn test_cli_whoami_and_ping() {
     std::fs::write(
         tmp.path().join(".npmrc"),
         format!("//{host}/:_authToken=test-token-whoami\n"),
-    ).unwrap();
+    )
+    .unwrap();
 
     // 1. whoami text
     let whoami_out = Command::new(rnpm_bin())
@@ -578,7 +700,11 @@ async fn test_cli_whoami_and_ping() {
         .output()
         .unwrap();
 
-    assert!(whoami_out.status.success(), "whoami must succeed: {}", String::from_utf8_lossy(&whoami_out.stderr));
+    assert!(
+        whoami_out.status.success(),
+        "whoami must succeed: {}",
+        String::from_utf8_lossy(&whoami_out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&whoami_out.stdout);
     assert_eq!(stdout.trim(), "ferris_rustacean");
 
@@ -608,7 +734,10 @@ async fn test_cli_whoami_and_ping() {
 
     assert!(!unauth_whoami.status.success());
     let unauth_err = String::from_utf8_lossy(&unauth_whoami.stderr);
-    assert!(unauth_err.contains("npm error code ENEEDAUTH"), "Missing token must emit ENEEDAUTH: {unauth_err}");
+    assert!(
+        unauth_err.contains("npm error code ENEEDAUTH"),
+        "Missing token must emit ENEEDAUTH: {unauth_err}"
+    );
 
     // 4. ping
     let ping_out = Command::new(rnpm_bin())
@@ -663,7 +792,8 @@ fn test_cli_auth_helpers_login_and_logout() {
     std::fs::write(
         &local_npmrc,
         "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm_sample123\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let logout_out = Command::new(rnpm_bin())
         .arg("logout")

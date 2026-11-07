@@ -1,21 +1,45 @@
+use crate::error::FsError;
 use std::fs;
 use std::path::Path;
-use crate::error::FsError;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static JUNCTIONS_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// Record that a junction was created.
+pub fn record_junction_created() {
+    JUNCTIONS_CREATED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Returns the total number of junctions created.
+pub fn junctions_created() -> u64 {
+    JUNCTIONS_CREATED.load(Ordering::Relaxed)
+}
+
+/// Resets the junctions created counter.
+pub fn reset_junctions_created() {
+    JUNCTIONS_CREATED.store(0, Ordering::Relaxed);
+}
 
 /// Create a non-admin directory junction on Windows, or a symlink on Unix.
 pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     let link_v = crate::path::to_verbatim_path(link);
     let target_v = crate::path::to_verbatim_path(target);
 
-    #[cfg(windows)]
-    {
-        create_windows_junction(&link_v, &target_v)
-    }
+    let res = {
+        #[cfg(windows)]
+        {
+            create_windows_junction(&link_v, &target_v)
+        }
 
-    #[cfg(not(windows))]
-    {
-        std::os::unix::fs::symlink(&target_v, &link_v).map_err(FsError::Io)
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(&target_v, &link_v).map_err(FsError::Io)
+        }
+    };
+    if res.is_ok() {
+        record_junction_created();
     }
+    res
 }
 
 /// Safely remove a junction or symlink.
@@ -30,7 +54,8 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
     if !is_reparse_point_or_symlink(&path_v)? {
         return Err(FsError::JunctionError {
             path: path.to_path_buf(),
-            detail: "Refusing to remove path: target exists but is not a junction or symlink".to_string(),
+            detail: "Refusing to remove path: target exists but is not a junction or symlink"
+                .to_string(),
         });
     }
 
@@ -58,12 +83,16 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
                     if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::JunctionError {
                             path: path.to_path_buf(),
-                            detail: format!("Failed to remove junction after {attempts} attempts: {err}"),
+                            detail: format!(
+                                "Failed to remove junction after {attempts} attempts: {err}"
+                            ),
                         });
                     }
                     let jitter_ms = (attempts as u64 * 3) % 7;
                     std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
-                    delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(250));
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_millis(250));
                 }
             }
         }
@@ -156,7 +185,9 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                     }
                     let jitter_ms = (attempts as u64 * 3) % 7;
                     std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
-                    delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(250));
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_millis(250));
                 }
             }
         }
@@ -193,7 +224,9 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                     }
                     let jitter_ms = (attempts as u64 * 3) % 7;
                     std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
-                    delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(250));
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_millis(250));
                 }
             }
         }
@@ -264,7 +297,9 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
     };
     let print_name = clean_str.to_string();
 
-    let sub_w: Vec<u16> = std::ffi::OsStr::new(&substitute_name).encode_wide().collect();
+    let sub_w: Vec<u16> = std::ffi::OsStr::new(&substitute_name)
+        .encode_wide()
+        .collect();
     let print_w: Vec<u16> = std::ffi::OsStr::new(&print_name).encode_wide().collect();
 
     let sub_len_bytes = (sub_w.len() * 2) as u16;
@@ -288,28 +323,29 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
     buffer[14..16].copy_from_slice(&print_len_bytes.to_le_bytes());
 
     let path_buf_start = 16;
-    let sub_byte_slice: &[u8] = unsafe {
-        std::slice::from_raw_parts(sub_w.as_ptr() as *const u8, sub_len_bytes as usize)
-    };
+    let sub_byte_slice: &[u8] =
+        unsafe { std::slice::from_raw_parts(sub_w.as_ptr() as *const u8, sub_len_bytes as usize) };
     buffer[path_buf_start..path_buf_start + sub_len_bytes as usize].copy_from_slice(sub_byte_slice);
 
     let print_byte_start = path_buf_start + print_offset as usize;
     let print_byte_slice: &[u8] = unsafe {
         std::slice::from_raw_parts(print_w.as_ptr() as *const u8, print_len_bytes as usize)
     };
-    buffer[print_byte_start..print_byte_start + print_len_bytes as usize].copy_from_slice(print_byte_slice);
+    buffer[print_byte_start..print_byte_start + print_len_bytes as usize]
+        .copy_from_slice(print_byte_slice);
 
     let link_v = crate::path::to_verbatim_path(link);
     match fs::create_dir(&link_v) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if !is_reparse_point_or_symlink(&link_v)?
-                && fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some() {
-                    return Err(FsError::JunctionError {
-                        path: link.to_path_buf(),
-                        detail: "Destination directory already exists and is not empty".to_string(),
-                    });
-                }
+                && fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some()
+            {
+                return Err(FsError::JunctionError {
+                    path: link.to_path_buf(),
+                    detail: "Destination directory already exists and is not empty".to_string(),
+                });
+            }
         }
         Err(e) => return Err(FsError::Io(e)),
     }
@@ -395,7 +431,9 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
         let _ = fs::remove_dir(&link_v);
         return Err(FsError::JunctionError {
             path: link.to_path_buf(),
-            detail: format!("DeviceIoControl(FSCTL_SET_REPARSE_POINT) failed with error code {err}"),
+            detail: format!(
+                "DeviceIoControl(FSCTL_SET_REPARSE_POINT) failed with error code {err}"
+            ),
         });
     }
 
@@ -404,11 +442,15 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
 
 #[cfg(windows)]
 fn create_junction_cmd_fallback(link: &Path, target: &Path) -> Result<(), FsError> {
-    use std::process::Command;
     use std::os::windows::process::CommandExt;
+    use std::process::Command;
 
-    let clean_link = crate::path::strip_verbatim_prefix(link).to_string_lossy().to_string();
-    let clean_target = crate::path::strip_verbatim_prefix(target).to_string_lossy().to_string();
+    let clean_link = crate::path::strip_verbatim_prefix(link)
+        .to_string_lossy()
+        .to_string();
+    let clean_target = crate::path::strip_verbatim_prefix(target)
+        .to_string_lossy()
+        .to_string();
 
     let escaped_link = clean_link.replace('%', "%%");
     let escaped_target = clean_target.replace('%', "%%");
@@ -428,9 +470,62 @@ fn create_junction_cmd_fallback(link: &Path, target: &Path) -> Result<(), FsErro
         let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(FsError::JunctionError {
             path: link.to_path_buf(),
-            detail: format!("mklink /J fallback failed: stdout='{}' stderr='{}'", stdout.trim(), stderr.trim()),
+            detail: format!(
+                "mklink /J fallback failed: stdout='{}' stderr='{}'",
+                stdout.trim(),
+                stderr.trim()
+            ),
         });
     }
 
     Ok(())
+}
+
+/// Reads the target path of a junction or symlink.
+pub fn read_junction_target(path: &Path) -> Result<std::path::PathBuf, FsError> {
+    let path_v = crate::path::to_verbatim_path(path);
+    let target = fs::read_link(&path_v).map_err(FsError::Io)?;
+    Ok(crate::path::strip_verbatim_prefix(&target))
+}
+
+/// Checks whether an existing junction points to the expected target.
+/// Returns false if `link` is not a junction or does not point to `expected_target`.
+pub fn junction_points_to(link: &Path, expected_target: &Path) -> bool {
+    if !is_junction(link).unwrap_or(false) {
+        return false;
+    }
+    let actual = match read_junction_target(link) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let clean_expected = crate::path::strip_verbatim_prefix(expected_target);
+
+    #[cfg(windows)]
+    if actual
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&clean_expected.as_os_str().to_string_lossy())
+    {
+        return true;
+    }
+    #[cfg(not(windows))]
+    if actual == clean_expected {
+        return true;
+    }
+
+    if let (Ok(canon_actual), Ok(canon_exp)) =
+        (actual.canonicalize(), clean_expected.canonicalize())
+    {
+        let clean_ca = crate::path::strip_verbatim_prefix(&canon_actual);
+        let clean_ce = crate::path::strip_verbatim_prefix(&canon_exp);
+        #[cfg(windows)]
+        return clean_ca
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&clean_ce.as_os_str().to_string_lossy());
+        #[cfg(not(windows))]
+        return clean_ca == clean_ce;
+    }
+
+    false
 }

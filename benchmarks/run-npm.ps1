@@ -47,7 +47,8 @@ param(
     [switch]$PurgeOsCache,
     [switch]$SimulateLoad,
     [int]$InjectOutlierTrial = -1,
-    [double]$InjectOutlierDelayMs = 350.0
+    [double]$InjectOutlierDelayMs = 350.0,
+    [switch]$FailOnStabilityRegression
 )
 
 $ErrorActionPreference = "Stop"
@@ -166,94 +167,98 @@ public class JobTracker {
 
     public static RunResult Execute(string fileName, string arguments, string workingDir) {
         IntPtr hJob = CreateJobObject(IntPtr.Zero, null);
-        var result = new RunResult();
-        var sw = Stopwatch.StartNew();
+        try {
+            var result = new RunResult();
+            var sw = Stopwatch.StartNew();
 
-        var psi = new ProcessStartInfo {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workingDir,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
+            var psi = new ProcessStartInfo {
+                FileName = fileName,
+                Arguments = arguments,
+                WorkingDirectory = workingDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
 
-        using (var proc = new Process { StartInfo = psi }) {
-            proc.Start();
-            if (hJob != IntPtr.Zero) {
-                try {
-                    AssignProcessToJobObject(hJob, proc.Handle);
-                } catch { }
-            }
+            using (var proc = new Process { StartInfo = psi }) {
+                proc.Start();
+                if (hJob != IntPtr.Zero) {
+                    try {
+                        AssignProcessToJobObject(hJob, proc.Handle);
+                    } catch { }
+                }
 
-            ulong peakWorkingSet = 0;
-            // Read streams asynchronously to prevent deadlock
-            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
-            var stderrTask = proc.StandardError.ReadToEndAsync();
+                ulong peakWorkingSet = 0;
+                // Read streams asynchronously to prevent deadlock
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
 
-            while (!proc.WaitForExit(15)) {
+                while (!proc.WaitForExit(15)) {
+                    try {
+                        proc.Refresh();
+                        if ((ulong)proc.WorkingSet64 > peakWorkingSet) {
+                            peakWorkingSet = (ulong)proc.WorkingSet64;
+                        }
+                    } catch { }
+                }
+                sw.Stop();
+
+                result.ExitCode = proc.ExitCode;
+                result.WallTimeMs = sw.Elapsed.TotalMilliseconds;
+                result.StdOut = stdoutTask.Result;
+                result.StdErr = stderrTask.Result;
+
                 try {
                     proc.Refresh();
-                    if ((ulong)proc.WorkingSet64 > peakWorkingSet) {
-                        peakWorkingSet = (ulong)proc.WorkingSet64;
+                    if ((ulong)proc.PeakWorkingSet64 > peakWorkingSet) {
+                        peakWorkingSet = (ulong)proc.PeakWorkingSet64;
                     }
                 } catch { }
+                result.PeakWorkingSetBytes = peakWorkingSet;
             }
-            sw.Stop();
 
-            result.ExitCode = proc.ExitCode;
-            result.WallTimeMs = sw.Elapsed.TotalMilliseconds;
-            result.StdOut = stdoutTask.Result;
-            result.StdErr = stderrTask.Result;
-
-            try {
-                proc.Refresh();
-                if ((ulong)proc.PeakWorkingSet64 > peakWorkingSet) {
-                    peakWorkingSet = (ulong)proc.PeakWorkingSet64;
-                }
-            } catch { }
-            result.PeakWorkingSetBytes = peakWorkingSet;
-        }
-
-        if (hJob != IntPtr.Zero) {
-            int sizeExt = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
-            IntPtr ptrExt = Marshal.AllocHGlobal(sizeExt);
-            try {
-                uint retLen;
-                if (QueryInformationJobObject(hJob, 9, ptrExt, (uint)sizeExt, out retLen)) {
-                    var ext = (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(ptrExt, typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
-                    result.PeakCommitBytes = (ulong)ext.PeakJobMemoryLimit.ToUInt64();
-                    if ((ulong)ext.PeakProcessMemoryLimit.ToUInt64() > result.PeakWorkingSetBytes) {
-                        result.PeakWorkingSetBytes = (ulong)ext.PeakProcessMemoryLimit.ToUInt64();
+            if (hJob != IntPtr.Zero) {
+                int sizeExt = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                IntPtr ptrExt = Marshal.AllocHGlobal(sizeExt);
+                try {
+                    uint retLen;
+                    if (QueryInformationJobObject(hJob, 9, ptrExt, (uint)sizeExt, out retLen)) {
+                        var ext = (JOBOBJECT_EXTENDED_LIMIT_INFORMATION)Marshal.PtrToStructure(ptrExt, typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+                        result.PeakCommitBytes = (ulong)ext.PeakJobMemoryLimit.ToUInt64();
+                        if ((ulong)ext.PeakProcessMemoryLimit.ToUInt64() > result.PeakWorkingSetBytes) {
+                            result.PeakWorkingSetBytes = (ulong)ext.PeakProcessMemoryLimit.ToUInt64();
+                        }
                     }
+                } finally {
+                    Marshal.FreeHGlobal(ptrExt);
                 }
-            } finally {
-                Marshal.FreeHGlobal(ptrExt);
+
+                int sizeBasic = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION));
+                IntPtr ptrBasic = Marshal.AllocHGlobal(sizeBasic);
+                try {
+                    uint retLen;
+                    if (QueryInformationJobObject(hJob, 8, ptrBasic, (uint)sizeBasic, out retLen)) {
+                        var basic = (JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(ptrBasic, typeof(JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION));
+                        result.UserCpuMs = basic.TotalUserTime * 0.0001;
+                        result.SystemCpuMs = basic.TotalKernelTime * 0.0001;
+                        result.TotalProcesses = basic.TotalProcesses;
+                        result.DiskReadBytes = basic.BasicInfo.ReadTransferCount;
+                        result.DiskWriteBytes = basic.BasicInfo.WriteTransferCount;
+                        result.DiskReadOps = basic.BasicInfo.ReadOperationCount;
+                        result.DiskWriteOps = basic.BasicInfo.WriteOperationCount;
+                    }
+                } finally {
+                    Marshal.FreeHGlobal(ptrBasic);
+                }
             }
 
-            int sizeBasic = Marshal.SizeOf(typeof(JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION));
-            IntPtr ptrBasic = Marshal.AllocHGlobal(sizeBasic);
-            try {
-                uint retLen;
-                if (QueryInformationJobObject(hJob, 8, ptrBasic, (uint)sizeBasic, out retLen)) {
-                    var basic = (JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION)Marshal.PtrToStructure(ptrBasic, typeof(JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION));
-                    result.UserCpuMs = basic.TotalUserTime * 0.0001;
-                    result.SystemCpuMs = basic.TotalKernelTime * 0.0001;
-                    result.TotalProcesses = basic.TotalProcesses;
-                    result.DiskReadBytes = basic.BasicInfo.ReadTransferCount;
-                    result.DiskWriteBytes = basic.BasicInfo.WriteTransferCount;
-                    result.DiskReadOps = basic.BasicInfo.ReadOperationCount;
-                    result.DiskWriteOps = basic.BasicInfo.WriteOperationCount;
-                }
-            } finally {
-                Marshal.FreeHGlobal(ptrBasic);
+            return result;
+        } finally {
+            if (hJob != IntPtr.Zero) {
+                CloseHandle(hJob);
             }
-
-            CloseHandle(hJob);
         }
-
-        return result;
     }
 }
 "@
@@ -495,7 +500,10 @@ function Run-Scenario {
         }
 
         foreach ($lp in $loadProcs) {
-            if (-not $lp.HasExited) { Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue }
+            if (-not $lp.HasExited) {
+                Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue
+                $lp.WaitForExit(1000)
+            }
         }
 
         # Query request count from mock registry
@@ -603,9 +611,12 @@ function Run-Scenario {
         $wallSummary.median, $wallSummary.min, $wallSummary.max, $wallSummary.iqr, $wallSummary.mean, $wallSummary.rsd_pct)
     Write-Host ("  User CPU:  Median: {0:N1}ms | Sys CPU: Median: {1:N1}ms" -f $userCpuSummary.median, $sysCpuSummary.median)
     Write-Host ("  Peak RAM:  WorkingSet: {0:N1}MB | Commit: {1:N1}MB" -f ($peakWsSummary.median / 1MB), ($peakCommitSummary.median / 1MB))
-    $statusColor = "Yellow"
-    if ($isStableGateA) { $statusColor = "Green" }
+    $statusColor = if ($isStableGateA) { "Green" } elseif ($wallSummary.rsd_pct -gt 15.0) { "Red" } else { "Yellow" }
     Write-Host ("  Gate A Stability: $stabilityStatus") -ForegroundColor $statusColor
+
+    if ($FailOnStabilityRegression -and (-not $isStableGateA -or $wallSummary.rsd_pct -gt 15.0)) {
+        throw "Gate A stability check failed ($stabilityStatus, RSD=$($wallSummary.rsd_pct)%)"
+    }
 
     # Verify Correctness Against Reference
     $refLockfile = Join-Path $FixturePath "package-lock.json"

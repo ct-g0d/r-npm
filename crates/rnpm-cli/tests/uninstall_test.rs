@@ -12,10 +12,18 @@ fn setup_cli_test_fixture(dir: &std::path::Path) {
     let mut manifest = Manifest::default();
     manifest.name = Some("cli-fixture-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("chalk".to_string(), "^4.1.2".to_string());
-    manifest.dependencies.insert("express".to_string(), "^4.18.2".to_string());
-    manifest.dev_dependencies.insert("jest".to_string(), "^29.0.0".to_string());
-    manifest.optional_dependencies.insert("fsevents".to_string(), "^2.3.2".to_string());
+    manifest
+        .dependencies
+        .insert("chalk".to_string(), "^4.1.2".to_string());
+    manifest
+        .dependencies
+        .insert("express".to_string(), "^4.18.2".to_string());
+    manifest
+        .dev_dependencies
+        .insert("jest".to_string(), "^29.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("fsevents".to_string(), "^2.3.2".to_string());
     manifest.save_to_file(dir.join("package.json")).unwrap();
 
     let mut lockfile = LockfileV3::new("cli-fixture-app", Some("1.0.0".to_string()));
@@ -39,7 +47,9 @@ fn setup_cli_test_fixture(dir: &std::path::Path) {
 
     let ansi_pkg = LockfilePackage {
         version: Some("4.3.0".to_string()),
-        resolved: Some("https://registry.npmjs.org/ansi-styles/-/ansi-styles-4.3.0.tgz".to_string()),
+        resolved: Some(
+            "https://registry.npmjs.org/ansi-styles/-/ansi-styles-4.3.0.tgz".to_string(),
+        ),
         integrity: Some("sha512-ansi".to_string()),
         ..Default::default()
     };
@@ -71,7 +81,9 @@ fn setup_cli_test_fixture(dir: &std::path::Path) {
     };
     lockfile.insert_package("node_modules/fsevents", fsevents_pkg);
 
-    lockfile.save_to_file(&dir.join("package-lock.json")).unwrap();
+    lockfile
+        .save_to_file(&dir.join("package-lock.json"))
+        .unwrap();
 
     let nm = dir.join("node_modules");
     fs::create_dir_all(nm.join("chalk")).unwrap();
@@ -96,7 +108,11 @@ fn test_cli_uninstall_single_package_and_transitive_pruning() {
         .output()
         .expect("Failed to execute rnpm uninstall");
 
-    assert!(output.status.success(), "Command failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("rnpm: removed 1 package(s)"));
@@ -114,7 +130,10 @@ fn test_cli_uninstall_single_package_and_transitive_pruning() {
 
     // Verify node_modules deletion
     assert!(!project_dir.join("node_modules").join("chalk").exists());
-    assert!(!project_dir.join("node_modules").join("ansi-styles").exists());
+    assert!(!project_dir
+        .join("node_modules")
+        .join("ansi-styles")
+        .exists());
     assert!(project_dir.join("node_modules").join("express").exists());
 }
 
@@ -198,5 +217,8 @@ fn test_cli_uninstall_requires_package_argument() {
         .output()
         .expect("Failed to execute rnpm uninstall without arguments");
 
-    assert!(!output.status.success(), "Uninstall without arguments must exit with error");
+    assert!(
+        !output.status.success(),
+        "Uninstall without arguments must exit with error"
+    );
 }

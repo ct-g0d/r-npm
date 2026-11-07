@@ -112,8 +112,14 @@ async fn test_byzantine_malformed_json_syntax() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("malformed-pkg").await.unwrap_err();
-    assert!(matches!(err, RegistryError::Json(_)), "Expected JSON error, got: {err:?}");
+    let err = client
+        .get_package_metadata("malformed-pkg")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::Json(_)),
+        "Expected JSON error, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -143,8 +149,14 @@ async fn test_byzantine_corrupted_surrogates() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("corrupt-pkg").await.unwrap_err();
-    assert!(matches!(err, RegistryError::Json(_)), "Expected JSON parse error for corrupted surrogate, got: {err:?}");
+    let err = client
+        .get_package_metadata("corrupt-pkg")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::Json(_)),
+        "Expected JSON parse error for corrupted surrogate, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -189,9 +201,15 @@ async fn test_byzantine_duplicate_version_keys() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let err = client.get_package_metadata("dup-pkg").await.unwrap_err();
-    assert!(matches!(err, RegistryError::Json(_)), "Duplicate version keys must be rejected during JSON deserialization: {err:?}");
+    assert!(
+        matches!(err, RegistryError::Json(_)),
+        "Duplicate version keys must be rejected during JSON deserialization: {err:?}"
+    );
     let err_str = err.to_string();
-    assert!(err_str.contains("duplicate version key '1.0.0'"), "Error string was: {err_str}");
+    assert!(
+        err_str.contains("duplicate version key '1.0.0'"),
+        "Error string was: {err_str}"
+    );
 }
 
 #[tokio::test]
@@ -230,9 +248,17 @@ async fn test_byzantine_spoofed_dist_tags() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("spoofed-pkg").await.unwrap_err();
-    assert!(err.is_malformed_metadata(), "Expected MalformedMetadata for spoofed dist-tags, got: {err:?}");
-    assert!(err.to_string().contains("points to non-existent version '9.9.9'"));
+    let err = client
+        .get_package_metadata("spoofed-pkg")
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_malformed_metadata(),
+        "Expected MalformedMetadata for spoofed dist-tags, got: {err:?}"
+    );
+    assert!(err
+        .to_string()
+        .contains("points to non-existent version '9.9.9'"));
 }
 
 #[tokio::test]
@@ -292,7 +318,10 @@ async fn test_byzantine_malicious_tarball_schemes() {
         // Direct file download must reject scheme
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("out.tgz");
-        let err_file = client.download_tarball_to_file(url, &dest).await.unwrap_err();
+        let err_file = client
+            .download_tarball_to_file(url, &dest)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err_file, RegistryError::SecurityViolation(_)),
             "Expected SecurityViolation for to_file with '{url}', got: {err_file:?}"
@@ -306,7 +335,8 @@ async fn test_byzantine_malicious_tarball_schemes() {
         );
 
         // Metadata validation must reject scheme
-        let json = format!(r#"{{
+        let json = format!(
+            r#"{{
             "name": "scheme-test",
             "versions": {{
                 "1.0.0": {{
@@ -315,7 +345,8 @@ async fn test_byzantine_malicious_tarball_schemes() {
                     "dist": {{ "tarball": "{url}" }}
                 }}
             }}
-        }}"#);
+        }}"#
+        );
         let meta: AbbreviatedPackageMetadata = serde_json::from_str(&json).unwrap();
         let err_meta = meta.validate().unwrap_err();
         assert!(err_meta.is_malformed_metadata());
@@ -436,7 +467,10 @@ async fn test_byzantine_auth_token_leak_prevention_cross_origin_tarball() {
     let client = RegistryClient::with_config(config).unwrap();
 
     // 1. Fetch metadata from registry (should send auth token to registry)
-    let meta = client.get_package_metadata("remote-tarball-pkg").await.unwrap();
+    let meta = client
+        .get_package_metadata("remote-tarball-pkg")
+        .await
+        .unwrap();
     let tarball_target = &meta.versions.get("1.0.0").unwrap().dist.tarball;
     assert_eq!(tarball_target, &cdn_url);
 
@@ -445,14 +479,19 @@ async fn test_byzantine_auth_token_leak_prevention_cross_origin_tarball() {
         let reg_reqs = registry_server.received_requests.lock().await;
         assert_eq!(reg_reqs.len(), 1);
         assert!(
-            reg_reqs[0].to_lowercase().contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
+            reg_reqs[0]
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
             "Registry request must include authorization header"
         );
     }
 
     // 2. Download tarball from cross-origin CDN host
     let tarball_bytes = client.download_tarball_bytes(tarball_target).await.unwrap();
-    assert_eq!(tarball_bytes, b"legitimate-tarball-bytes-on-cross-origin-cdn");
+    assert_eq!(
+        tarball_bytes,
+        b"legitimate-tarball-bytes-on-cross-origin-cdn"
+    );
 
     // CRITICAL SECURITY ASSERTION:
     // Untrusted CDN server must NEVER receive registry auth token!
@@ -469,7 +508,10 @@ async fn test_byzantine_auth_token_leak_prevention_cross_origin_tarball() {
     // 3. Download tarball to file
     let temp_dir = tempfile::tempdir().unwrap();
     let dest_file = temp_dir.path().join("pkg-1.0.0.tgz");
-    let written = client.download_tarball_to_file(tarball_target, &dest_file).await.unwrap();
+    let written = client
+        .download_tarball_to_file(tarball_target, &dest_file)
+        .await
+        .unwrap();
     assert_eq!(written, tarball_bytes.len() as u64);
     assert_eq!(std::fs::read(&dest_file).unwrap(), tarball_bytes);
 
@@ -523,7 +565,10 @@ async fn test_slowloris_metadata_chunk_idle_timeout() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let err = client.get_package_metadata("slow-pkg").await.unwrap_err();
-    assert!(err.is_slowloris_timeout() || err.is_timeout(), "Expected SlowlorisTimeout, got: {err:?}");
+    assert!(
+        err.is_slowloris_timeout() || err.is_timeout(),
+        "Expected SlowlorisTimeout, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -559,7 +604,10 @@ async fn test_slowloris_tarball_bytes_drip_feed_timeout() {
 
     let tar_url = format!("{}slow-tarball.tgz", server.url());
     let err = client.download_tarball_bytes(&tar_url).await.unwrap_err();
-    assert!(err.is_slowloris_timeout() || err.is_timeout(), "Expected SlowlorisTimeout, got: {err:?}");
+    assert!(
+        err.is_slowloris_timeout() || err.is_timeout(),
+        "Expected SlowlorisTimeout, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -597,12 +645,24 @@ async fn test_slowloris_tarball_to_file_drip_feed_timeout_and_temp_cleanup() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let tar_url = format!("{}drip.tgz", server.url());
-    let err = client.download_tarball_to_file(&tar_url, &dest_path).await.unwrap_err();
-    assert!(err.is_slowloris_timeout() || err.is_timeout(), "Expected SlowlorisTimeout, got: {err:?}");
+    let err = client
+        .download_tarball_to_file(&tar_url, &dest_path)
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_slowloris_timeout() || err.is_timeout(),
+        "Expected SlowlorisTimeout, got: {err:?}"
+    );
 
     // Atomic write assertion: Neither dest_path nor temp .part file should remain on failure!
-    assert!(!dest_path.exists(), "Destination file must NOT exist after failed download");
-    assert!(!part_path.exists(), "Temporary .part file must be cleaned up after failed download");
+    assert!(
+        !dest_path.exists(),
+        "Destination file must NOT exist after failed download"
+    );
+    assert!(
+        !part_path.exists(),
+        "Temporary .part file must be cleaned up after failed download"
+    );
 }
 
 #[tokio::test]
@@ -611,7 +671,8 @@ async fn test_slowloris_metadata_size_limit_exceeded_header() {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf).await;
 
-        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{}";
+        let resp =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{}";
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
     })
@@ -627,7 +688,10 @@ async fn test_slowloris_metadata_size_limit_exceeded_header() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let err = client.get_package_metadata("huge-pkg").await.unwrap_err();
-    assert!(err.is_size_limit_exceeded(), "Expected SizeLimitExceeded from Content-Length header, got: {err:?}");
+    assert!(
+        err.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded from Content-Length header, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -662,8 +726,14 @@ async fn test_slowloris_metadata_size_limit_exceeded_streaming() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("stream-flood-pkg").await.unwrap_err();
-    assert!(err.is_size_limit_exceeded(), "Expected SizeLimitExceeded from stream chunk accumulation, got: {err:?}");
+    let err = client
+        .get_package_metadata("stream-flood-pkg")
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded from stream chunk accumulation, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -689,12 +759,21 @@ async fn test_slowloris_tarball_size_limit_exceeded_header() {
 
     let tar_url = format!("{}huge.tgz", server.url());
     let err_bytes = client.download_tarball_bytes(&tar_url).await.unwrap_err();
-    assert!(err_bytes.is_size_limit_exceeded(), "Expected SizeLimitExceeded for download_tarball_bytes, got: {err_bytes:?}");
+    assert!(
+        err_bytes.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded for download_tarball_bytes, got: {err_bytes:?}"
+    );
 
     let temp_dir = tempfile::tempdir().unwrap();
     let dest_file = temp_dir.path().join("huge.tgz");
-    let err_file = client.download_tarball_to_file(&tar_url, &dest_file).await.unwrap_err();
-    assert!(err_file.is_size_limit_exceeded(), "Expected SizeLimitExceeded for download_tarball_to_file, got: {err_file:?}");
+    let err_file = client
+        .download_tarball_to_file(&tar_url, &dest_file)
+        .await
+        .unwrap_err();
+    assert!(
+        err_file.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded for download_tarball_to_file, got: {err_file:?}"
+    );
     assert!(!dest_file.exists());
 }
 
@@ -739,17 +818,29 @@ async fn test_slowloris_tarball_endless_stream_exceeded_aborts() {
 
     // 1. download_tarball_bytes aborts
     let err_bytes = client.download_tarball_bytes(&tar_url).await.unwrap_err();
-    assert!(err_bytes.is_size_limit_exceeded(), "Expected SizeLimitExceeded on endless stream bytes, got: {err_bytes:?}");
+    assert!(
+        err_bytes.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded on endless stream bytes, got: {err_bytes:?}"
+    );
 
     // 2. download_tarball_to_file aborts and cleans up temp .part file
     let temp_dir = tempfile::tempdir().unwrap();
     let dest_file = temp_dir.path().join("endless.tgz");
     let part_file = temp_dir.path().join("endless.tgz.part");
 
-    let err_file = client.download_tarball_to_file(&tar_url, &dest_file).await.unwrap_err();
-    assert!(err_file.is_size_limit_exceeded(), "Expected SizeLimitExceeded on endless stream to file, got: {err_file:?}");
+    let err_file = client
+        .download_tarball_to_file(&tar_url, &dest_file)
+        .await
+        .unwrap_err();
+    assert!(
+        err_file.is_size_limit_exceeded(),
+        "Expected SizeLimitExceeded on endless stream to file, got: {err_file:?}"
+    );
     assert!(!dest_file.exists(), "Target file must not exist");
-    assert!(!part_file.exists(), "Temporary .part file must be cleaned up");
+    assert!(
+        !part_file.exists(),
+        "Temporary .part file must be cleaned up"
+    );
 }
 
 #[tokio::test]
@@ -791,7 +882,10 @@ async fn test_slowloris_content_length_mismatch_tarball() {
     let dest_file = temp_dir.path().join("short.tgz");
     let part_file = temp_dir.path().join("short.tgz.part");
 
-    let err_file = client.download_tarball_to_file(&tar_url, &dest_file).await.unwrap_err();
+    let err_file = client
+        .download_tarball_to_file(&tar_url, &dest_file)
+        .await
+        .unwrap_err();
     assert!(
         err_file.is_content_length_mismatch() || matches!(err_file, RegistryError::Http(_)),
         "Expected ContentLengthMismatch or Http EOF error, got: {err_file:?}"
@@ -834,7 +928,11 @@ async fn test_tarball_stream_concurrency_permit_retention() {
     let mut tar_stream: TarballStream = client.download_tarball_stream(&tar_url).await.unwrap();
 
     // While stream is alive, permit MUST remain held (available permits == 0)
-    assert_eq!(client.semaphore().available_permits(), 0, "Permit must be held by active TarballStream");
+    assert_eq!(
+        client.semaphore().available_permits(),
+        0,
+        "Permit must be held by active TarballStream"
+    );
 
     // Read chunk through TarballStream
     let chunk = tar_stream.chunk().await.unwrap().unwrap();
@@ -847,7 +945,11 @@ async fn test_tarball_stream_concurrency_permit_retention() {
     drop(tar_stream);
 
     // Permit is now released back to semaphore!
-    assert_eq!(client.semaphore().available_permits(), 1, "Permit must be released when TarballStream is dropped");
+    assert_eq!(
+        client.semaphore().available_permits(),
+        1,
+        "Permit must be released when TarballStream is dropped"
+    );
 }
 
 #[tokio::test]
@@ -871,10 +973,16 @@ async fn test_security_redirect_loop_detected() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.download_tarball_bytes(&format!("{}loop", server.url())).await.unwrap_err();
+    let err = client
+        .download_tarball_bytes(&format!("{}loop", server.url()))
+        .await
+        .unwrap_err();
     match err {
         RegistryError::SecurityViolation(msg) => {
-            assert!(msg.contains("Redirect loop detected"), "Expected 'Redirect loop detected', got: {msg}");
+            assert!(
+                msg.contains("Redirect loop detected"),
+                "Expected 'Redirect loop detected', got: {msg}"
+            );
         }
         other => panic!("Expected RegistryError::SecurityViolation, got: {other:?}"),
     }
@@ -886,7 +994,8 @@ async fn test_security_redirect_to_unsupported_scheme() {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf).await;
 
-        let resp = "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nConnection: close\r\n\r\n";
+        let resp =
+            "HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nConnection: close\r\n\r\n";
         let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
     })
@@ -900,10 +1009,16 @@ async fn test_security_redirect_to_unsupported_scheme() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.download_tarball_bytes(&format!("{}leak", server.url())).await.unwrap_err();
+    let err = client
+        .download_tarball_bytes(&format!("{}leak", server.url()))
+        .await
+        .unwrap_err();
     match err {
         RegistryError::SecurityViolation(msg) => {
-            assert!(msg.contains("Redirect to unsupported scheme"), "Expected 'Redirect to unsupported scheme', got: {msg}");
+            assert!(
+                msg.contains("Redirect to unsupported scheme"),
+                "Expected 'Redirect to unsupported scheme', got: {msg}"
+            );
         }
         other => panic!("Expected RegistryError::SecurityViolation, got: {other:?}"),
     }
@@ -930,11 +1045,16 @@ async fn test_security_redirect_crlf_injection() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.download_tarball_bytes(&format!("{}crlf", server.url())).await.unwrap_err();
+    let err = client
+        .download_tarball_bytes(&format!("{}crlf", server.url()))
+        .await
+        .unwrap_err();
     match err {
         RegistryError::SecurityViolation(_) | RegistryError::Http(_) => {
             // Expected either security violation or reqwest parser rejection of invalid header
         }
-        other => panic!("Expected SecurityViolation or Http error on CRLF in Location, got: {other:?}"),
+        other => {
+            panic!("Expected SecurityViolation or Http error on CRLF in Location, got: {other:?}")
+        }
     }
 }

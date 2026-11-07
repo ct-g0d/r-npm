@@ -67,10 +67,7 @@ pub enum RegistryError {
     SlowlorisTimeout(std::time::Duration),
 
     #[error("Content-Length mismatch: expected {expected} bytes, got {actual} bytes")]
-    ContentLengthMismatch {
-        expected: u64,
-        actual: u64,
-    },
+    ContentLengthMismatch { expected: u64, actual: u64 },
 
     #[error("Provenance verification failed: {0}")]
     ProvenanceVerificationFailed(String),
@@ -83,10 +80,7 @@ pub enum RegistryError {
     },
 
     #[error("Untrusted source repository: expected '{expected}', found '{actual}'")]
-    UntrustedSourceRepository {
-        expected: String,
-        actual: String,
-    },
+    UntrustedSourceRepository { expected: String, actual: String },
 
     #[error("Invalid Sigstore bundle: {0}")]
     InvalidSigstoreBundle(String),
@@ -212,7 +206,8 @@ impl RegistryError {
                         return true;
                     }
                 }
-                let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+                let mut source: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(e);
                 while let Some(err) = source {
                     if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
                         match io_err.kind() {
@@ -385,4 +380,3 @@ mod tests {
         assert!(!size_err.is_transient());
     }
 }
-

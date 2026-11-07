@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use crate::graph::DependencyType;
 use crate::platform::Platform;
 use crate::solver::{resolve_dependency_graph, ResolverOptions};
 use crate::types::{InMemoryPackageProvider, PackageVersionMetadata};
+use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
+use std::collections::BTreeMap;
 
 #[test]
 fn test_hoisting_and_deduplication() {
@@ -11,12 +11,14 @@ fn test_hoisting_and_deduplication() {
 
     // Package A@1.0.0 depends on Shared@^1.0.0
     provider.add_version("pkg-a", "1.0.0", |v| {
-        v.dependencies.insert("shared-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-pkg".to_string(), "^1.0.0".to_string());
     });
 
     // Package B@1.0.0 depends on Shared@~1.2.0
     provider.add_version("pkg-b", "1.0.0", |v| {
-        v.dependencies.insert("shared-pkg".to_string(), "~1.2.0".to_string());
+        v.dependencies
+            .insert("shared-pkg".to_string(), "~1.2.0".to_string());
     });
 
     // Shared package versions
@@ -26,8 +28,12 @@ fn test_hoisting_and_deduplication() {
     // Root project depends on pkg-a and pkg-b
     let mut manifest = Manifest::default();
     manifest.name = Some("test-project".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "^1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -43,8 +49,12 @@ fn test_hoisting_and_deduplication() {
     assert_eq!(shared_node.version, "1.2.3");
 
     // Deduplication check: no nested shared-pkg exists!
-    assert!(!graph.nodes.contains_key("node_modules/pkg-a/node_modules/shared-pkg"));
-    assert!(!graph.nodes.contains_key("node_modules/pkg-b/node_modules/shared-pkg"));
+    assert!(!graph
+        .nodes
+        .contains_key("node_modules/pkg-a/node_modules/shared-pkg"));
+    assert!(!graph
+        .nodes
+        .contains_key("node_modules/pkg-b/node_modules/shared-pkg"));
 
     // Check edges
     let pkg_a_edges = graph.get_outgoing_edges("node_modules/pkg-a");
@@ -62,12 +72,14 @@ fn test_conflict_nesting() {
 
     // Package A requires dep@^1.0.0
     provider.add_version("pkg-a", "1.0.0", |v| {
-        v.dependencies.insert("conflict-dep".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("conflict-dep".to_string(), "^1.0.0".to_string());
     });
 
     // Package B requires dep@^2.0.0
     provider.add_version("pkg-b", "1.0.0", |v| {
-        v.dependencies.insert("conflict-dep".to_string(), "^2.0.0".to_string());
+        v.dependencies
+            .insert("conflict-dep".to_string(), "^2.0.0".to_string());
     });
 
     provider.add_version("conflict-dep", "1.5.0", |_| {});
@@ -75,8 +87,12 @@ fn test_conflict_nesting() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("test-project".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "^1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -119,10 +135,9 @@ fn test_npm_aliases() {
     // Root project defines alias "my-chalk": "npm:chalk@^5.0.0"
     let mut manifest = Manifest::default();
     manifest.name = Some("alias-project".to_string());
-    manifest.dependencies.insert(
-        "my-chalk".to_string(),
-        "npm:chalk@^5.0.0".to_string(),
-    );
+    manifest
+        .dependencies
+        .insert("my-chalk".to_string(), "npm:chalk@^5.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -150,16 +165,20 @@ fn test_package_overrides() {
     let mut provider = InMemoryPackageProvider::new();
 
     provider.add_version("pkg-a", "1.0.0", |v| {
-        v.dependencies.insert("semver".to_string(), "^6.0.0".to_string());
-        v.dependencies.insert("sub-dep".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("semver".to_string(), "^6.0.0".to_string());
+        v.dependencies
+            .insert("sub-dep".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("sub-dep", "1.0.0", |v| {
-        v.dependencies.insert("deep-target".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("deep-target".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("other-pkg", "1.0.0", |v| {
-        v.dependencies.insert("deep-target".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("deep-target".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("semver", "6.3.0", |_| {});
@@ -169,8 +188,12 @@ fn test_package_overrides() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("overrides-project".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("other-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("other-pkg".to_string(), "1.0.0".to_string());
 
     // Configure overrides:
     // 1. Global: semver -> 7.5.4
@@ -181,7 +204,9 @@ fn test_package_overrides() {
             "deep-target": "2.0.0"
         }
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -193,12 +218,18 @@ fn test_package_overrides() {
     // 2. Check nested override: deep-target under pkg-a is overridden to 2.0.0
     // while other-pkg uses 1.0.0
     let other_edges = graph.get_outgoing_edges("node_modules/other-pkg");
-    let other_target_edge = other_edges.iter().find(|e| e.install_name == "deep-target").unwrap();
+    let other_target_edge = other_edges
+        .iter()
+        .find(|e| e.install_name == "deep-target")
+        .unwrap();
     let other_target_node = graph.nodes.get(&other_target_edge.to_location).unwrap();
     assert_eq!(other_target_node.version, "1.0.0");
 
     let sub_edges = graph.get_outgoing_edges("node_modules/sub-dep");
-    let pkg_a_target_edge = sub_edges.iter().find(|e| e.install_name == "deep-target").unwrap();
+    let pkg_a_target_edge = sub_edges
+        .iter()
+        .find(|e| e.install_name == "deep-target")
+        .unwrap();
     let pkg_a_target_node = graph.nodes.get(&pkg_a_target_edge.to_location).unwrap();
     assert_eq!(pkg_a_target_node.version, "2.0.0");
 }
@@ -224,9 +255,15 @@ fn test_platform_filters_optional_dependencies() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("platform-test".to_string());
-    manifest.optional_dependencies.insert("darwin-native".to_string(), "^1.0.0".to_string());
-    manifest.optional_dependencies.insert("win32-native".to_string(), "^1.0.0".to_string());
-    manifest.optional_dependencies.insert("x64-native".to_string(), "^1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("darwin-native".to_string(), "^1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("win32-native".to_string(), "^1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("x64-native".to_string(), "^1.0.0".to_string());
 
     // Scenario A: simulated Windows x64 host
     let win_options = ResolverOptions {
@@ -243,7 +280,10 @@ fn test_platform_filters_optional_dependencies() {
         .packages
         .get("node_modules/darwin-native")
         .expect("incompatible optional package must remain in lockfile");
-    assert_eq!(darwin_lock_entry.os.as_deref(), Some(&["darwin".to_string()][..]));
+    assert_eq!(
+        darwin_lock_entry.os.as_deref(),
+        Some(&["darwin".to_string()][..])
+    );
     assert_eq!(darwin_lock_entry.optional, Some(true));
 
     // Scenario B: simulated macOS arm64 host
@@ -265,16 +305,19 @@ fn test_peer_dependencies_and_cycles() {
 
     // Cyclic peer dependencies: react peers react-dom, react-dom peers react
     provider.add_version("react", "18.2.0", |v| {
-        v.peer_dependencies.insert("react-dom".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies
+            .insert("react-dom".to_string(), "^18.0.0".to_string());
     });
 
     provider.add_version("react-dom", "18.2.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
     });
 
     // Optional peer dependency: canvas
     provider.add_version("chart-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("canvas".to_string(), "^2.0.0".to_string());
         let mut meta = BTreeMap::new();
         meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
         v.peer_dependencies_meta = meta;
@@ -282,8 +325,12 @@ fn test_peer_dependencies_and_cycles() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-test".to_string());
-    manifest.dependencies.insert("react".to_string(), "18.2.0".to_string());
-    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("react".to_string(), "18.2.0".to_string());
+    manifest
+        .dependencies
+        .insert("chart-pkg".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     // Must resolve cleanly without infinite loop or stack overflow!
@@ -309,8 +356,14 @@ fn test_manifest_platform_parsing() {
     let meta_arr = PackageVersionMetadata::from_manifest_slice(json_array.as_bytes()).unwrap();
     assert_eq!(meta_arr.name, "array-pkg");
     assert_eq!(meta_arr.version, "1.0.0");
-    assert_eq!(meta_arr.os.as_deref(), Some(&["darwin".to_string(), "linux".to_string()][..]));
-    assert_eq!(meta_arr.cpu.as_deref(), Some(&["x64".to_string(), "arm64".to_string()][..]));
+    assert_eq!(
+        meta_arr.os.as_deref(),
+        Some(&["darwin".to_string(), "linux".to_string()][..])
+    );
+    assert_eq!(
+        meta_arr.cpu.as_deref(),
+        Some(&["x64".to_string(), "arm64".to_string()][..])
+    );
     assert_eq!(meta_arr.libc.as_deref(), Some(&["glibc".to_string()][..]));
 
     // 2. Single string representation (e.g. "os": "darwin")
@@ -357,9 +410,15 @@ fn test_platform_libc_filtering_optional_dependencies() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("libc-test".to_string());
-    manifest.optional_dependencies.insert("glibc-pkg".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("musl-pkg".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("not-musl-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("glibc-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("musl-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("not-musl-pkg".to_string(), "1.0.0".to_string());
 
     // Host 1: Linux with glibc
     let glibc_opts = ResolverOptions {
@@ -404,14 +463,17 @@ fn test_transitive_optional_dependency_platform_skipping() {
     // Incompatible optional parent depends on child-pkg
     provider.add_version("darwin-parent", "1.0.0", |v| {
         v.os = Some(vec!["darwin".to_string()]);
-        v.dependencies.insert("child-pkg".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("child-pkg".to_string(), "1.0.0".to_string());
     });
 
     provider.add_version("child-pkg", "1.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("transitive-opt".to_string());
-    manifest.optional_dependencies.insert("darwin-parent".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("darwin-parent".to_string(), "1.0.0".to_string());
 
     let win_opts = ResolverOptions {
         platform: Platform::new("win32", "x64"),
@@ -433,17 +495,21 @@ fn test_circular_dependencies_termination() {
 
     // Package A depends on Package B
     provider.add_version("pkg-circ-a", "1.0.0", |v| {
-        v.dependencies.insert("pkg-circ-b".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("pkg-circ-b".to_string(), "1.0.0".to_string());
     });
 
     // Package B depends on Package A (direct cycle)
     provider.add_version("pkg-circ-b", "1.0.0", |v| {
-        v.dependencies.insert("pkg-circ-a".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("pkg-circ-a".to_string(), "1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("circ-test".to_string());
-    manifest.dependencies.insert("pkg-circ-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-circ-a".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -459,7 +525,9 @@ fn test_missing_optional_dependency_isolation() {
     let mut manifest = Manifest::default();
     manifest.name = Some("opt-missing".to_string());
     // "nonexistent-pkg" does not exist in provider
-    manifest.optional_dependencies.insert("nonexistent-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("nonexistent-pkg".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -488,11 +556,13 @@ fn test_dependency_graph_prune_unreferenced() {
 
     // Package A requires B
     provider.add_version("pkg-a", "1.0.0", |v| {
-        v.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("pkg-b".to_string(), "^1.0.0".to_string());
     });
     // Package B requires C
     provider.add_version("pkg-b", "1.0.0", |v| {
-        v.dependencies.insert("pkg-c".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("pkg-c".to_string(), "^1.0.0".to_string());
     });
     // Package C
     provider.add_version("pkg-c", "1.0.0", |_| {});
@@ -502,8 +572,12 @@ fn test_dependency_graph_prune_unreferenced() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("prune-test".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("pkg-d".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-d".to_string(), "^1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let mut graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -531,8 +605,8 @@ fn test_dependency_graph_prune_unreferenced() {
 
 #[test]
 fn test_workspace_protocol_dependencies_and_topo_sort() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Member A: leaf package (1.0.0)
@@ -551,7 +625,9 @@ fn test_workspace_protocol_dependencies_and_topo_sort() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("2.0.0".to_string());
-    manifest_b.dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("2.0.0".to_string()),
@@ -564,8 +640,12 @@ fn test_workspace_protocol_dependencies_and_topo_sort() {
     let mut manifest_c = Manifest::default();
     manifest_c.name = Some("pkg-c".to_string());
     manifest_c.version = Some("3.0.0".to_string());
-    manifest_c.dependencies.insert("pkg-b".to_string(), "workspace:^".to_string());
-    manifest_c.dependencies.insert("pkg-a".to_string(), "workspace:~".to_string());
+    manifest_c
+        .dependencies
+        .insert("pkg-b".to_string(), "workspace:^".to_string());
+    manifest_c
+        .dependencies
+        .insert("pkg-a".to_string(), "workspace:~".to_string());
     let member_c = WorkspaceMember {
         name: "pkg-c".to_string(),
         version: Some("3.0.0".to_string()),
@@ -580,22 +660,28 @@ fn test_workspace_protocol_dependencies_and_topo_sort() {
     // Verify topological order: leaf pkg-a must be first, then pkg-b, then pkg-c
     assert_eq!(
         ws_graph.topological_order,
-        vec!["pkg-a".to_string(), "pkg-b".to_string(), "pkg-c".to_string()]
+        vec![
+            "pkg-a".to_string(),
+            "pkg-b".to_string(),
+            "pkg-c".to_string()
+        ]
     );
 }
 
 #[test]
 fn test_workspace_circular_dependencies_detected() {
-    use rnpm_core::workspace::WorkspaceMember;
-    use crate::workspace::WorkspaceDependencyGraph;
     use crate::error::SolverError;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // A -> B and B -> A cycle
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    manifest_a
+        .dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -607,7 +693,9 @@ fn test_workspace_circular_dependencies_detected() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -631,7 +719,8 @@ fn test_workspace_circular_dependencies_detected() {
     // 3-node cycle: A -> B -> C -> A
     let mut m_a = Manifest::default();
     m_a.name = Some("a".to_string());
-    m_a.dependencies.insert("b".to_string(), "workspace:*".to_string());
+    m_a.dependencies
+        .insert("b".to_string(), "workspace:*".to_string());
     let member_a3 = WorkspaceMember {
         name: "a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -642,7 +731,8 @@ fn test_workspace_circular_dependencies_detected() {
 
     let mut m_b = Manifest::default();
     m_b.name = Some("b".to_string());
-    m_b.dependencies.insert("c".to_string(), "workspace:*".to_string());
+    m_b.dependencies
+        .insert("c".to_string(), "workspace:*".to_string());
     let member_b3 = WorkspaceMember {
         name: "b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -653,7 +743,8 @@ fn test_workspace_circular_dependencies_detected() {
 
     let mut m_c = Manifest::default();
     m_c.name = Some("c".to_string());
-    m_c.dependencies.insert("a".to_string(), "workspace:*".to_string());
+    m_c.dependencies
+        .insert("a".to_string(), "workspace:*".to_string());
     let member_c3 = WorkspaceMember {
         name: "c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -672,7 +763,9 @@ fn test_workspace_circular_dependencies_detected() {
     // Self cycle: A -> A
     let mut m_self = Manifest::default();
     m_self.name = Some("self-pkg".to_string());
-    m_self.dependencies.insert("self-pkg".to_string(), "workspace:*".to_string());
+    m_self
+        .dependencies
+        .insert("self-pkg".to_string(), "workspace:*".to_string());
     let member_self = WorkspaceMember {
         name: "self-pkg".to_string(),
         version: Some("1.0.0".to_string()),
@@ -691,15 +784,17 @@ fn test_workspace_circular_dependencies_detected() {
 
 #[test]
 fn test_workspace_protocol_edge_cases() {
-    use rnpm_core::workspace::WorkspaceMember;
-    use crate::workspace::WorkspaceDependencyGraph;
     use crate::error::SolverError;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Missing sibling workspace member
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
-    manifest_a.dependencies.insert("ghost-pkg".to_string(), "workspace:*".to_string());
+    manifest_a
+        .dependencies
+        .insert("ghost-pkg".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -726,7 +821,9 @@ fn test_workspace_protocol_edge_cases() {
     let mut manifest_c = Manifest::default();
     manifest_c.name = Some("pkg-c".to_string());
     manifest_c.version = Some("1.0.0".to_string());
-    manifest_c.dependencies.insert("pkg-b".to_string(), "workspace:^2.0.0".to_string());
+    manifest_c
+        .dependencies
+        .insert("pkg-b".to_string(), "workspace:^2.0.0".to_string());
     let member_c = WorkspaceMember {
         name: "pkg-c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -741,8 +838,8 @@ fn test_workspace_protocol_edge_cases() {
 
 #[test]
 fn test_workspace_graph_resolution_with_hoisting() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     let mut provider = InMemoryPackageProvider::new();
@@ -755,7 +852,9 @@ fn test_workspace_graph_resolution_with_hoisting() {
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dependencies.insert("shared-lib".to_string(), "^4.0.0".to_string());
+    manifest_a
+        .dependencies
+        .insert("shared-lib".to_string(), "^4.0.0".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -768,7 +867,9 @@ fn test_workspace_graph_resolution_with_hoisting() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -778,12 +879,8 @@ fn test_workspace_graph_resolution_with_hoisting() {
     };
 
     let options = ResolverOptions::default();
-    let graph = resolve_workspace_graph(
-        &root_manifest,
-        &[member_a, member_b],
-        &provider,
-        &options,
-    ).unwrap();
+    let graph = resolve_workspace_graph(&root_manifest, &[member_a, member_b], &provider, &options)
+        .unwrap();
 
     // Sibling workspace packages linked under root node_modules
     assert!(graph.nodes.contains_key("node_modules/pkg-a"));
@@ -810,8 +907,8 @@ fn test_workspace_graph_resolution_with_hoisting() {
 
 #[test]
 fn test_workspace_diamond_dependency() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Diamond structure:
@@ -837,7 +934,8 @@ fn test_workspace_diamond_dependency() {
     let mut m_b = Manifest::default();
     m_b.name = Some("pkg-b".to_string());
     m_b.version = Some("1.0.0".to_string());
-    m_b.dependencies.insert("pkg-d".to_string(), "workspace:*".to_string());
+    m_b.dependencies
+        .insert("pkg-d".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -850,7 +948,8 @@ fn test_workspace_diamond_dependency() {
     let mut m_c = Manifest::default();
     m_c.name = Some("pkg-c".to_string());
     m_c.version = Some("1.0.0".to_string());
-    m_c.dependencies.insert("pkg-d".to_string(), "workspace:*".to_string());
+    m_c.dependencies
+        .insert("pkg-d".to_string(), "workspace:*".to_string());
     let member_c = WorkspaceMember {
         name: "pkg-c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -863,8 +962,10 @@ fn test_workspace_diamond_dependency() {
     let mut m_a = Manifest::default();
     m_a.name = Some("pkg-a".to_string());
     m_a.version = Some("1.0.0".to_string());
-    m_a.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
-    m_a.dependencies.insert("pkg-c".to_string(), "workspace:*".to_string());
+    m_a.dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
+    m_a.dependencies
+        .insert("pkg-c".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -873,7 +974,8 @@ fn test_workspace_diamond_dependency() {
         manifest: m_a,
     };
 
-    let ws_graph = WorkspaceDependencyGraph::construct(&[member_a, member_c, member_b, member_d]).unwrap();
+    let ws_graph =
+        WorkspaceDependencyGraph::construct(&[member_a, member_c, member_b, member_d]).unwrap();
 
     let order = &ws_graph.topological_order;
     let pos_d = order.iter().position(|x| x == "pkg-d").unwrap();
@@ -891,8 +993,8 @@ fn test_workspace_diamond_dependency() {
 
 #[test]
 fn test_workspace_disconnected_components() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Component 1: A -> B
@@ -908,7 +1010,8 @@ fn test_workspace_disconnected_components() {
 
     let mut m_a = Manifest::default();
     m_a.name = Some("comp1-a".to_string());
-    m_a.dependencies.insert("comp1-b".to_string(), "workspace:*".to_string());
+    m_a.dependencies
+        .insert("comp1-b".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "comp1-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -939,13 +1042,17 @@ fn test_workspace_disconnected_components() {
 
 #[test]
 fn test_fast_path_resolution_matching_lockfile() {
-    use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::solver::{resolve_dependency_graph_with_lockfile, resolve_fast_path};
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
     let mut manifest = Manifest::default();
     manifest.name = Some("fast-app".to_string());
-    manifest.dependencies.insert("chalk".to_string(), "^5.0.0".to_string());
-    manifest.dev_dependencies.insert("typescript".to_string(), "^5.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("chalk".to_string(), "^5.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("typescript".to_string(), "^5.0.0".to_string());
 
     let mut lockfile = LockfileV3::new("fast-app", Some("1.0.0".to_string()));
     let mut lock_deps = BTreeMap::new();
@@ -957,25 +1064,35 @@ fn test_fast_path_resolution_matching_lockfile() {
         root.dependencies = Some(lock_deps);
         root.dev_dependencies = Some(lock_dev_deps);
     }
-    lockfile.insert_package("node_modules/chalk", LockfilePackage {
-        version: Some("5.3.0".to_string()),
-        resolved: Some("https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz".to_string()),
-        integrity: Some("sha512-chalk123".to_string()),
-        ..Default::default()
-    });
-    lockfile.insert_package("node_modules/typescript", LockfilePackage {
-        version: Some("5.4.2".to_string()),
-        dev: Some(true),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/chalk",
+        LockfilePackage {
+            version: Some("5.3.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/chalk/-/chalk-5.3.0.tgz".to_string()),
+            integrity: Some("sha512-chalk123".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/typescript",
+        LockfilePackage {
+            version: Some("5.4.2".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
 
     let options = ResolverOptions::default();
 
     // 1. Direct resolve_fast_path test
-    let fast_graph = resolve_fast_path(&manifest, &lockfile, &options).expect("Fast path should succeed");
+    let fast_graph =
+        resolve_fast_path(&manifest, &lockfile, &options).expect("Fast path should succeed");
     assert!(fast_graph.nodes.contains_key("node_modules/chalk"));
     assert!(fast_graph.nodes.contains_key("node_modules/typescript"));
-    assert_eq!(fast_graph.nodes.get("node_modules/chalk").unwrap().version, "5.3.0");
+    assert_eq!(
+        fast_graph.nodes.get("node_modules/chalk").unwrap().version,
+        "5.3.0"
+    );
 
     // 2. resolve_dependency_graph_with_lockfile using EMPTY provider (would fail if provider was queried!)
     let empty_provider = InMemoryPackageProvider::new();
@@ -984,14 +1101,17 @@ fn test_fast_path_resolution_matching_lockfile() {
         &empty_provider,
         &options,
         Some(&lockfile),
-    ).expect("Resolution must succeed via fast-path without querying provider");
+    )
+    .expect("Resolution must succeed via fast-path without querying provider");
 
     assert!(graph.nodes.contains_key("node_modules/chalk"));
     assert!(graph.nodes.contains_key("node_modules/typescript"));
 
     // 3. When manifest changes (spec drift), fast-path returns None and solver queries provider (fails on empty)
     let mut drifted_manifest = manifest.clone();
-    drifted_manifest.dependencies.insert("chalk".to_string(), "^6.0.0".to_string());
+    drifted_manifest
+        .dependencies
+        .insert("chalk".to_string(), "^6.0.0".to_string());
     assert!(resolve_fast_path(&drifted_manifest, &lockfile, &options).is_none());
 
     let drifted_res = resolve_dependency_graph_with_lockfile(
@@ -1000,7 +1120,10 @@ fn test_fast_path_resolution_matching_lockfile() {
         &options,
         Some(&lockfile),
     );
-    assert!(drifted_res.is_err(), "Must fall back to provider and fail on missing metadata");
+    assert!(
+        drifted_res.is_err(),
+        "Must fall back to provider and fail on missing metadata"
+    );
 }
 
 #[test]
@@ -1012,13 +1135,18 @@ fn test_peer_dependency_conflict_diagnostic_error() {
 
     // Plugin requires react peer ^16.0.0 || ^17.0.0
     provider.add_version("legacy-plugin", "1.0.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^17.0.0".to_string());
+        v.peer_dependencies
+            .insert("react".to_string(), "^17.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-conflict-app".to_string());
-    manifest.dependencies.insert("react".to_string(), "18.2.0".to_string());
-    manifest.dependencies.insert("legacy-plugin".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("react".to_string(), "18.2.0".to_string());
+    manifest
+        .dependencies
+        .insert("legacy-plugin".to_string(), "1.0.0".to_string());
 
     // Scenario A: Strict mode (default) -> ERESOLVE peer conflict error
     let options = ResolverOptions {
@@ -1028,11 +1156,14 @@ fn test_peer_dependency_conflict_diagnostic_error() {
     let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
 
     let err_msg = err.to_string();
-    assert!(err_msg.contains("ERESOLVE: Conflicting peer dependency 'react' required by 'legacy-plugin'"));
+    assert!(err_msg
+        .contains("ERESOLVE: Conflicting peer dependency 'react' required by 'legacy-plugin'"));
     assert!(err_msg.contains("peer react@\"^17.0.0\" from legacy-plugin"));
     assert!(err_msg.contains("Found: react@18.2.0 at node_modules/react"));
     assert!(err_msg.contains("Suggested resolutions:"));
-    assert!(err_msg.contains("Add an override in package.json: \"overrides\": { \"react\": \"...\" }"));
+    assert!(
+        err_msg.contains("Add an override in package.json: \"overrides\": { \"react\": \"...\" }")
+    );
     assert!(err_msg.contains("--legacy-peer-deps"));
 
     let suggestions = err.suggested_resolutions();
@@ -1058,34 +1189,51 @@ fn test_peer_dependency_conflict_diagnostic_error() {
     let legacy_graph = resolve_dependency_graph(&manifest, &provider, &legacy_options)
         .expect("legacy_peer_deps should completely ignore peer dependencies");
     assert!(legacy_graph.nodes.contains_key("node_modules/react"));
-    assert!(legacy_graph.nodes.contains_key("node_modules/legacy-plugin"));
+    assert!(legacy_graph
+        .nodes
+        .contains_key("node_modules/legacy-plugin"));
 }
 
 #[test]
 fn test_hidden_tree_metadata_preservation_in_graph() {
-    use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::graph::DependencyGraph;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
     let mut lockfile = LockfileV3::new("meta-app", Some("1.0.0".to_string()));
     let mut extra = BTreeMap::new();
-    extra.insert("funding".to_string(), serde_json::json!("https://example.com/fund"));
-    extra.insert("deprecated".to_string(), serde_json::json!("legacy package"));
+    extra.insert(
+        "funding".to_string(),
+        serde_json::json!("https://example.com/fund"),
+    );
+    extra.insert(
+        "deprecated".to_string(),
+        serde_json::json!("legacy package"),
+    );
 
-    lockfile.insert_package("node_modules/custom", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        extra: extra.clone(),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/custom",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            extra: extra.clone(),
+            ..Default::default()
+        },
+    );
 
     // from_lockfile_v3 preserves extra into Node
     let graph = DependencyGraph::from_lockfile_v3(&lockfile);
-    let node = graph.nodes.get("node_modules/custom").expect("Node missing");
+    let node = graph
+        .nodes
+        .get("node_modules/custom")
+        .expect("Node missing");
     assert_eq!(node.extra.get("funding"), extra.get("funding"));
     assert_eq!(node.extra.get("deprecated"), extra.get("deprecated"));
 
     // to_lockfile_v3 writes it back into LockfilePackage
     let generated_lock = graph.to_lockfile_v3("meta-app", Some("1.0.0"));
-    let gen_pkg = generated_lock.packages.get("node_modules/custom").expect("Package missing");
+    let gen_pkg = generated_lock
+        .packages
+        .get("node_modules/custom")
+        .expect("Package missing");
     assert_eq!(gen_pkg.extra.get("funding"), extra.get("funding"));
     assert_eq!(gen_pkg.extra.get("deprecated"), extra.get("deprecated"));
 }
@@ -1095,10 +1243,13 @@ fn test_lockfile_preserves_package_metadata_and_normalizes_bins() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("meta-pkg", "1.0.0", |version| {
         version.license = Some("MIT".to_string());
-        version.engines.insert("node".to_string(), ">=18".to_string());
-        version.bin = Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([
-            ("meta".to_string(), "./bin/meta.js".to_string()),
-        ])));
+        version
+            .engines
+            .insert("node".to_string(), ">=18".to_string());
+        version.bin = Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "meta".to_string(),
+            "./bin/meta.js".to_string(),
+        )])));
         version.extra.insert(
             "funding".to_string(),
             serde_json::json!({ "type": "github", "url": "https://github.com/sponsors/example" }),
@@ -1107,27 +1258,43 @@ fn test_lockfile_preserves_package_metadata_and_normalizes_bins() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("metadata-app".to_string());
-    manifest.dependencies.insert("meta-pkg".to_string(), "1.0.0".to_string());
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    manifest
+        .dependencies
+        .insert("meta-pkg".to_string(), "1.0.0".to_string());
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
     let lockfile = graph.to_lockfile_v3("metadata-app", Some("1.0.0"));
     let package = lockfile.packages.get("node_modules/meta-pkg").unwrap();
 
     assert_eq!(package.license.as_deref(), Some("MIT"));
-    assert_eq!(package.engines.as_ref().and_then(|m| m.get("node")).map(String::as_str), Some(">=18"));
-    assert_eq!(package.bin, Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([
-        ("meta".to_string(), "bin/meta.js".to_string()),
-    ]))));
+    assert_eq!(
+        package
+            .engines
+            .as_ref()
+            .and_then(|m| m.get("node"))
+            .as_deref(),
+        Some(">=18")
+    );
+    assert_eq!(
+        package.bin,
+        Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "meta".to_string(),
+            "bin/meta.js".to_string()
+        ),])))
+    );
     assert!(package.extra.contains_key("funding"));
 }
 
 #[test]
 fn test_fast_path_detects_lockfile_drift_missing_transitive_dep() {
-    use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
     let mut manifest = Manifest::default();
     manifest.name = Some("drift-app".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
 
     let mut lockfile = LockfileV3::new("drift-app", Some("1.0.0".to_string()));
     let mut lock_deps = BTreeMap::new();
@@ -1139,11 +1306,14 @@ fn test_fast_path_detects_lockfile_drift_missing_transitive_dep() {
     // pkg-a is in lockfile, and declares dependency on missing-b
     let mut a_deps = BTreeMap::new();
     a_deps.insert("missing-b".to_string(), "^1.0.0".to_string());
-    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        dependencies: Some(a_deps),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(a_deps),
+            ..Default::default()
+        },
+    );
     // Note: missing-b is intentionally NOT added to lockfile.packages!
 
     let options = ResolverOptions::default();
@@ -1153,12 +1323,14 @@ fn test_fast_path_detects_lockfile_drift_missing_transitive_dep() {
 
 #[test]
 fn test_fast_path_detects_lockfile_version_constraint_mismatch() {
-    use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
     let mut manifest = Manifest::default();
     manifest.name = Some("drift-mismatch-app".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
 
     let mut lockfile = LockfileV3::new("drift-mismatch-app", Some("1.0.0".to_string()));
     let mut lock_deps = BTreeMap::new();
@@ -1169,17 +1341,23 @@ fn test_fast_path_detects_lockfile_version_constraint_mismatch() {
 
     let mut a_deps = BTreeMap::new();
     a_deps.insert("dep-b".to_string(), "^2.0.0".to_string());
-    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        dependencies: Some(a_deps),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(a_deps),
+            ..Default::default()
+        },
+    );
 
     // dep-b is locked at 1.5.0, which violates ^2.0.0 constraint
-    lockfile.insert_package("node_modules/dep-b", LockfilePackage {
-        version: Some("1.5.0".to_string()),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/dep-b",
+        LockfilePackage {
+            version: Some("1.5.0".to_string()),
+            ..Default::default()
+        },
+    );
 
     let options = ResolverOptions::default();
     // Fast path must detect version mismatch drift and return None
@@ -1188,16 +1366,21 @@ fn test_fast_path_detects_lockfile_version_constraint_mismatch() {
 
 #[test]
 fn test_fast_path_detects_overrides_drift() {
-    use rnpm_lockfile::{LockfilePackage, LockfileV3};
     use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
     let mut manifest = Manifest::default();
     manifest.name = Some("overrides-drift-app".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
     // Manifest adds an override for dep-b -> 2.5.0
-    manifest.extra.insert("overrides".to_string(), serde_json::json!({
-        "dep-b": "2.5.0"
-    }));
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "dep-b": "2.5.0"
+        }),
+    );
 
     let mut lockfile = LockfileV3::new("overrides-drift-app", Some("1.0.0".to_string()));
     let mut lock_deps = BTreeMap::new();
@@ -1207,10 +1390,13 @@ fn test_fast_path_detects_overrides_drift() {
         // Lockfile has no overrides in extra
     }
 
-    lockfile.insert_package("node_modules/pkg-a", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
 
     let options = ResolverOptions::default();
     // Fast path must detect overrides drift and return None
@@ -1219,50 +1405,53 @@ fn test_fast_path_detects_overrides_drift() {
 
 #[test]
 fn test_intermediate_ancestor_hoisting() {
-    use crate::hoisting::{determine_placement, PlacementDecision};
     use crate::graph::Node;
-    use rnpm_core::spec::PackageTarget;
+    use crate::hoisting::{determine_placement, PlacementDecision};
     use rnpm_core::semver::Range;
+    use rnpm_core::spec::PackageTarget;
 
     let mut graph = crate::graph::DependencyGraph::new();
 
     // Root node_modules has C@1.0.0
-    graph.nodes.insert("node_modules/C".to_string(), Node {
-        location: "node_modules/C".to_string(),
-        install_name: "C".to_string(),
-        name: "C".to_string(),
-        version: "1.0.0".to_string(),
-        parsed_version: rnpm_core::semver::Version::parse("1.0.0").ok(),
-        ..Default::default()
-    });
+    graph.nodes.insert(
+        "node_modules/C".to_string(),
+        Node {
+            location: "node_modules/C".to_string(),
+            install_name: "C".to_string(),
+            name: "C".to_string(),
+            version: "1.0.0".to_string(),
+            parsed_version: rnpm_core::semver::Version::parse("1.0.0").ok(),
+            ..Default::default()
+        },
+    );
 
     // Node A is at node_modules/A
-    graph.nodes.insert("node_modules/A".to_string(), Node {
-        location: "node_modules/A".to_string(),
-        install_name: "A".to_string(),
-        name: "A".to_string(),
-        version: "1.0.0".to_string(),
-        ..Default::default()
-    });
+    graph.nodes.insert(
+        "node_modules/A".to_string(),
+        Node {
+            location: "node_modules/A".to_string(),
+            install_name: "A".to_string(),
+            name: "A".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
 
     // Node B is nested at node_modules/A/node_modules/B
-    graph.nodes.insert("node_modules/A/node_modules/B".to_string(), Node {
-        location: "node_modules/A/node_modules/B".to_string(),
-        install_name: "B".to_string(),
-        name: "B".to_string(),
-        version: "1.0.0".to_string(),
-        ..Default::default()
-    });
+    graph.nodes.insert(
+        "node_modules/A/node_modules/B".to_string(),
+        Node {
+            location: "node_modules/A/node_modules/B".to_string(),
+            install_name: "B".to_string(),
+            name: "B".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
 
     // Dependent B requires C@^2.0.0
     let target = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
-    let decision = determine_placement(
-        &graph,
-        "node_modules/A/node_modules/B",
-        "C",
-        "C",
-        &target,
-    );
+    let decision = determine_placement(&graph, "node_modules/A/node_modules/B", "C", "C", &target);
 
     // Root has incompatible C@1.0.0, so C@^2.0.0 hoists to intermediate ancestor node_modules/A/node_modules/C!
     assert_eq!(
@@ -1280,18 +1469,23 @@ fn test_multi_node_peer_cycles_3_node() {
     // pkg-b peers pkg-c (^1.0.0)
     // pkg-c peers pkg-a (^1.0.0)
     provider.add_version("pkg-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("pkg-b".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("pkg-b", "1.0.0", |v| {
-        v.peer_dependencies.insert("pkg-c".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("pkg-c".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("pkg-c", "1.0.0", |v| {
-        v.peer_dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("pkg-a".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-cycle-3-app".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -1308,7 +1502,8 @@ fn test_optional_peer_when_present_and_compatible() {
 
     provider.add_version("canvas", "2.8.0", |_| {});
     provider.add_version("chart-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("canvas".to_string(), "^2.0.0".to_string());
         let mut meta = BTreeMap::new();
         meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
         v.peer_dependencies_meta = meta;
@@ -1317,8 +1512,12 @@ fn test_optional_peer_when_present_and_compatible() {
     let mut manifest = Manifest::default();
     manifest.name = Some("opt-peer-present".to_string());
     // Both chart-pkg and canvas installed explicitly
-    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("canvas".to_string(), "2.8.0".to_string());
+    manifest
+        .dependencies
+        .insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("canvas".to_string(), "2.8.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -1341,7 +1540,8 @@ fn test_optional_peer_when_present_and_incompatible() {
     provider.add_version("canvas", "1.0.0", |_| {});
     // chart-pkg optionally peers canvas ^2.0.0
     provider.add_version("chart-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("canvas".to_string(), "^2.0.0".to_string());
         let mut meta = BTreeMap::new();
         meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
         v.peer_dependencies_meta = meta;
@@ -1349,8 +1549,12 @@ fn test_optional_peer_when_present_and_incompatible() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("opt-peer-incompat".to_string());
-    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("canvas".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("canvas".to_string(), "1.0.0".to_string());
 
     // In strict mode (strict_peers: true), incompatible optional peer must NOT fail with ERESOLVE!
     let options = ResolverOptions {
@@ -1362,7 +1566,10 @@ fn test_optional_peer_when_present_and_incompatible() {
 
     assert!(graph.nodes.contains_key("node_modules/chart-pkg"));
     assert!(graph.nodes.contains_key("node_modules/canvas"));
-    assert_eq!(graph.nodes.get("node_modules/canvas").unwrap().version, "1.0.0");
+    assert_eq!(
+        graph.nodes.get("node_modules/canvas").unwrap().version,
+        "1.0.0"
+    );
 }
 
 #[test]
@@ -1373,7 +1580,8 @@ fn test_optional_peer_absent_not_auto_downloaded() {
     provider.add_version("canvas", "2.8.0", |_| {});
     // chart-pkg optionally peers canvas ^2.0.0
     provider.add_version("chart-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("canvas".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("canvas".to_string(), "^2.0.0".to_string());
         let mut meta = BTreeMap::new();
         meta.insert("canvas".to_string(), PeerDependencyMeta { optional: true });
         v.peer_dependencies_meta = meta;
@@ -1381,7 +1589,9 @@ fn test_optional_peer_absent_not_auto_downloaded() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("opt-peer-absent".to_string());
-    manifest.dependencies.insert("chart-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("chart-pkg".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -1393,8 +1603,8 @@ fn test_optional_peer_absent_not_auto_downloaded() {
 
 #[test]
 fn test_extreme_monorepo_50_fixture() {
-    use rnpm_core::workspace::discover_workspaces;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::discover_workspaces;
     use std::path::PathBuf;
 
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1405,7 +1615,11 @@ fn test_extreme_monorepo_50_fixture() {
 
     let members = discover_workspaces(&fixture_dir)
         .expect("Must discover all workspace members in extreme-monorepo-50");
-    assert_eq!(members.len(), 52, "Must discover exactly 52 workspace packages");
+    assert_eq!(
+        members.len(),
+        52,
+        "Must discover exactly 52 workspace packages"
+    );
 
     // Construct DAG and compute topological order
     let graph = WorkspaceDependencyGraph::construct(&members)
@@ -1440,9 +1654,9 @@ fn test_extreme_monorepo_50_fixture() {
 
 #[test]
 fn test_extreme_circular_monorepo_fixture() {
-    use rnpm_core::workspace::discover_workspaces;
-    use crate::workspace::WorkspaceDependencyGraph;
     use crate::error::SolverError;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::discover_workspaces;
     use std::path::PathBuf;
 
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1453,7 +1667,11 @@ fn test_extreme_circular_monorepo_fixture() {
 
     let members = discover_workspaces(&fixture_dir)
         .expect("Must discover workspace members in extreme-circular-monorepo");
-    assert_eq!(members.len(), 2, "Must discover exactly 2 workspace packages");
+    assert_eq!(
+        members.len(),
+        2,
+        "Must discover exactly 2 workspace packages"
+    );
 
     let result = WorkspaceDependencyGraph::construct(&members);
     assert!(result.is_err(), "Must detect circular dependency");
@@ -1467,20 +1685,24 @@ fn test_extreme_circular_monorepo_fixture() {
     }
 }
 
-
 #[test]
 fn test_peer_conflict_rich_diagnostics() {
     let mut provider = InMemoryPackageProvider::new();
 
     provider.add_version("react", "18.2.0", |_| {});
     provider.add_version("plugin", "1.0.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^17.0.0".to_string());
+        v.peer_dependencies
+            .insert("react".to_string(), "^17.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("app".to_string());
-    manifest.dependencies.insert("react".to_string(), "18.2.0".to_string());
-    manifest.dependencies.insert("plugin".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("react".to_string(), "18.2.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions {
         strict_peers: true,
@@ -1513,15 +1735,19 @@ fn test_platform_filtering_isolation_before_download() {
     provider.add_version("linux-bundle", "1.0.0", |v| {
         v.os = Some(vec!["linux".to_string()]);
         v.libc = Some(vec!["glibc".to_string()]);
-        v.dependencies.insert("cuda-driver".to_string(), "1.0.0".to_string());
-        v.dependencies.insert("large-weights".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("cuda-driver".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("large-weights".to_string(), "1.0.0".to_string());
     });
     provider.add_version("cuda-driver", "1.0.0", |_| {});
     provider.add_version("large-weights", "1.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("platform-isolation-test".to_string());
-    manifest.optional_dependencies.insert("linux-bundle".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("linux-bundle".to_string(), "1.0.0".to_string());
 
     // Host: Windows x64
     let win_opts = ResolverOptions {
@@ -1548,19 +1774,24 @@ fn test_root_peer_dependencies_auto_installed() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("root-peer-app".to_string());
-    manifest.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+    manifest
+        .peer_dependencies
+        .insert("react".to_string(), "^18.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
 
     assert!(graph.nodes.contains_key("node_modules/react"));
-    assert_eq!(graph.nodes.get("node_modules/react").unwrap().version, "18.2.0");
+    assert_eq!(
+        graph.nodes.get("node_modules/react").unwrap().version,
+        "18.2.0"
+    );
 }
 
 #[test]
 fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections() {
-    use rnpm_lockfile::LockfileV3;
     use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::LockfileV3;
 
     let mut provider = InMemoryPackageProvider::new();
 
@@ -1571,13 +1802,16 @@ fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections()
 
     // 2. Convergent diamond hubs that bridge across different branches
     provider.add_version("diamond-hub-core", "1.0.0", |v| {
-        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-utils".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("diamond-hub-crypto", "1.0.0", |v| {
-        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-utils".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("diamond-hub-telemetry", "1.0.0", |v| {
-        v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-utils".to_string(), "^1.0.0".to_string());
     });
 
     // 3. Construct 12 layers with 10 packages per layer (120 layer packages)
@@ -1599,23 +1833,28 @@ fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections()
                     v.dependencies.insert(next_b, "1.0.0".to_string());
                 } else {
                     // Bottom layer: all depend on shared-utils ^1.0.0
-                    v.dependencies.insert("shared-utils".to_string(), "^1.0.0".to_string());
+                    v.dependencies
+                        .insert("shared-utils".to_string(), "^1.0.0".to_string());
                 }
 
                 // Cross-cutting diamond hub intersections
                 if l % 3 == 0 && i % 3 == 0 {
-                    v.dependencies.insert("diamond-hub-core".to_string(), "^1.0.0".to_string());
+                    v.dependencies
+                        .insert("diamond-hub-core".to_string(), "^1.0.0".to_string());
                 }
                 if l % 4 == 0 && i % 4 == 0 {
-                    v.dependencies.insert("diamond-hub-crypto".to_string(), "^1.0.0".to_string());
+                    v.dependencies
+                        .insert("diamond-hub-crypto".to_string(), "^1.0.0".to_string());
                 }
                 if l % 5 == 0 && i % 5 == 0 {
-                    v.dependencies.insert("diamond-hub-telemetry".to_string(), "^1.0.0".to_string());
+                    v.dependencies
+                        .insert("diamond-hub-telemetry".to_string(), "^1.0.0".to_string());
                 }
 
                 // Sub-branch conflict: layer 8, pkg 5 requires incompatible shared-utils ^2.0.0
                 if l == 8 && i == 5 {
-                    v.dependencies.insert("shared-utils".to_string(), "^2.0.0".to_string());
+                    v.dependencies
+                        .insert("shared-utils".to_string(), "^2.0.0".to_string());
                 }
             });
         }
@@ -1625,7 +1864,9 @@ fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections()
     let mut manifest = Manifest::default();
     manifest.name = Some("stress-100-project".to_string());
     for i in 0..PKGS_PER_LAYER {
-        manifest.dependencies.insert(format!("pkg-l0-{}", i), "1.0.0".to_string());
+        manifest
+            .dependencies
+            .insert(format!("pkg-l0-{}", i), "1.0.0".to_string());
     }
 
     let start = std::time::Instant::now();
@@ -1650,7 +1891,9 @@ fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections()
     // Verify diamond hubs are hoisted to root node_modules
     assert!(graph.nodes.contains_key("node_modules/diamond-hub-core"));
     assert!(graph.nodes.contains_key("node_modules/diamond-hub-crypto"));
-    assert!(graph.nodes.contains_key("node_modules/diamond-hub-telemetry"));
+    assert!(graph
+        .nodes
+        .contains_key("node_modules/diamond-hub-telemetry"));
 
     // Verify conflict-nested shared-utils@2.0.0 exists for pkg-l8-5
     let nested_node = graph.nodes.iter().find(|(path, node)| {
@@ -1671,7 +1914,11 @@ fn test_deep_transitive_resolution_100_plus_dependencies_diamond_intersections()
 
     // All paths in lockfile must be POSIX
     for path in lockfile.packages.keys() {
-        assert!(!path.contains('\\'), "Lockfile key {} contains backslash", path);
+        assert!(
+            !path.contains('\\'),
+            "Lockfile key {} contains backslash",
+            path
+        );
     }
 
     let lock_json = lockfile.to_json_string().unwrap();
@@ -1690,13 +1937,21 @@ fn test_cyclic_peer_resolution_extreme_density_clique() {
 
     // 6-node dense peer clique: P0 through P5
     // Every package has peer dependencies on all 5 other packages (30 mutual peer edges)
-    let packages = ["clique-p0", "clique-p1", "clique-p2", "clique-p3", "clique-p4", "clique-p5"];
+    let packages = [
+        "clique-p0",
+        "clique-p1",
+        "clique-p2",
+        "clique-p3",
+        "clique-p4",
+        "clique-p5",
+    ];
 
     for &pkg in &packages {
         provider.add_version(pkg, "1.0.0", |v| {
             for &peer in &packages {
                 if peer != pkg {
-                    v.peer_dependencies.insert(peer.to_string(), "^1.0.0".to_string());
+                    v.peer_dependencies
+                        .insert(peer.to_string(), "^1.0.0".to_string());
                 }
             }
         });
@@ -1705,7 +1960,9 @@ fn test_cyclic_peer_resolution_extreme_density_clique() {
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-clique-app".to_string());
     // Root depends on the first node
-    manifest.dependencies.insert("clique-p0".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("clique-p0".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -1714,12 +1971,20 @@ fn test_cyclic_peer_resolution_extreme_density_clique() {
     // All 6 packages must be installed in root node_modules
     for &pkg in &packages {
         let loc = format!("node_modules/{}", pkg);
-        assert!(graph.nodes.contains_key(&loc), "Missing clique node: {}", loc);
+        assert!(
+            graph.nodes.contains_key(&loc),
+            "Missing clique node: {}",
+            loc
+        );
     }
 
     // Verify peer dependency edges exist between the clique members
     let p0_edges = graph.get_outgoing_edges("node_modules/clique-p0");
-    assert_eq!(p0_edges.len(), 5, "P0 must have 5 peer edges to other clique members");
+    assert_eq!(
+        p0_edges.len(),
+        5,
+        "P0 must have 5 peer edges to other clique members"
+    );
     for edge in p0_edges {
         assert_eq!(edge.dep_type, DependencyType::Peer);
         assert!(packages.contains(&edge.package_name.as_str()));
@@ -1738,38 +2003,52 @@ fn test_cyclic_peer_resolution_multi_level_overlapping_requirements() {
     // which itself has a peer dependency on gamma!
 
     provider.add_version("alpha", "1.0.0", |v| {
-        v.peer_dependencies.insert("beta".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("epsilon".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("epsilon".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("beta", "1.0.0", |v| {
-        v.peer_dependencies.insert("alpha".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("sub-widget".to_string(), "1.0.0".to_string());
+        v.peer_dependencies
+            .insert("alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("gamma".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("sub-widget".to_string(), "1.0.0".to_string());
     });
 
     provider.add_version("gamma", "1.0.0", |v| {
-        v.peer_dependencies.insert("beta".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("delta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("delta".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("delta", "1.0.0", |v| {
-        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("epsilon".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("gamma".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("epsilon".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("epsilon", "1.0.0", |v| {
-        v.peer_dependencies.insert("delta".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("delta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("alpha".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("sub-widget", "1.0.0", |v| {
-        v.peer_dependencies.insert("gamma".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("gamma".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("multi-level-peer-app".to_string());
-    manifest.dependencies.insert("alpha".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("alpha".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -1789,35 +2068,54 @@ fn test_cyclic_peer_resolution_dense_mixed_optional_and_conflicts() {
 
     // Node A peers B (required), C (optional present), D (optional absent)
     provider.add_version("node-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("node-b".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("opt-present".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("opt-absent".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("node-b".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("opt-present".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("opt-absent".to_string(), "^1.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("opt-present".to_string(), PeerDependencyMeta { optional: true });
-        meta.insert("opt-absent".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "opt-present".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
+        meta.insert(
+            "opt-absent".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     // Node B peers Node A (cyclic) and opt-present (cyclic optional)
     provider.add_version("node-b", "1.0.0", |v| {
-        v.peer_dependencies.insert("node-a".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("opt-present".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("node-a".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("opt-present".to_string(), "^1.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("opt-present".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "opt-present".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     // opt-present is in provider and peers node-a
     provider.add_version("opt-present", "1.0.0", |v| {
-        v.peer_dependencies.insert("node-a".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("node-a".to_string(), "^1.0.0".to_string());
     });
     // Note: opt-absent is NOT in provider
 
     let mut manifest = Manifest::default();
     manifest.name = Some("dense-mixed-peer-app".to_string());
-    manifest.dependencies.insert("node-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("node-a".to_string(), "1.0.0".to_string());
     // Explicitly include opt-present in root so it is present in scope
-    manifest.dependencies.insert("opt-present".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("opt-present".to_string(), "1.0.0".to_string());
 
     // Scenario 1: Clean resolution with mixed optional cyclic peers
     let options = ResolverOptions::default();
@@ -1832,13 +2130,18 @@ fn test_cyclic_peer_resolution_dense_mixed_optional_and_conflicts() {
     // Scenario 2: Strict peer conflict within cyclic relationship
     // Create an incompatible node-b-v2 requiring node-a@^2.0.0
     provider.add_version("node-b-conflict", "1.0.0", |v| {
-        v.peer_dependencies.insert("node-a".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("node-a".to_string(), "^2.0.0".to_string());
     });
 
     let mut conflict_manifest = Manifest::default();
     conflict_manifest.name = Some("peer-conflict-app".to_string());
-    conflict_manifest.dependencies.insert("node-a".to_string(), "1.0.0".to_string());
-    conflict_manifest.dependencies.insert("node-b-conflict".to_string(), "1.0.0".to_string());
+    conflict_manifest
+        .dependencies
+        .insert("node-a".to_string(), "1.0.0".to_string());
+    conflict_manifest
+        .dependencies
+        .insert("node-b-conflict".to_string(), "1.0.0".to_string());
 
     let strict_opts = ResolverOptions {
         strict_peers: true,
@@ -1857,7 +2160,9 @@ fn test_cyclic_peer_resolution_dense_mixed_optional_and_conflicts() {
     let legacy_graph = resolve_dependency_graph(&conflict_manifest, &provider, &legacy_opts)
         .expect("legacy_peer_deps must bypass peer conflict");
     assert!(legacy_graph.nodes.contains_key("node_modules/node-a"));
-    assert!(legacy_graph.nodes.contains_key("node_modules/node-b-conflict"));
+    assert!(legacy_graph
+        .nodes
+        .contains_key("node_modules/node-b-conflict"));
 }
 
 #[test]
@@ -1866,21 +2171,26 @@ fn test_pathological_overrides_deep_scoped_and_spec_targeted() {
 
     // 5-level deep chain: app -> lev1 -> lev2 -> lev3 -> lev4 -> deep-target
     provider.add_version("lev1", "1.0.0", |v| {
-        v.dependencies.insert("lev2".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("lev2".to_string(), "1.0.0".to_string());
     });
     provider.add_version("lev2", "1.0.0", |v| {
-        v.dependencies.insert("lev3".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("lev3".to_string(), "1.0.0".to_string());
     });
     provider.add_version("lev3", "1.0.0", |v| {
-        v.dependencies.insert("lev4".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("lev4".to_string(), "1.0.0".to_string());
     });
     provider.add_version("lev4", "1.0.0", |v| {
-        v.dependencies.insert("deep-target".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("deep-target".to_string(), "^1.0.0".to_string());
     });
 
     // Another branch: app -> other-lev1 -> lev2 -> lev3 -> lev4 -> deep-target
     provider.add_version("other-lev1", "1.0.0", |v| {
-        v.dependencies.insert("lev2".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("lev2".to_string(), "1.0.0".to_string());
     });
 
     provider.add_version("deep-target", "1.0.0", |_| {});
@@ -1905,17 +2215,27 @@ fn test_pathological_overrides_deep_scoped_and_spec_targeted() {
 
     // Package that uses all these
     provider.add_version("consumer-pkg", "1.0.0", |v| {
-        v.dependencies.insert("wildcard-pkg".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("range-pkg".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("shadow-pkg".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("@deep/scoped-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("wildcard-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("range-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shadow-pkg".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("@deep/scoped-pkg".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("pathological-overrides-app".to_string());
-    manifest.dependencies.insert("lev1".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("canon-pkg".to_string(), "4.2.0".to_string());
-    manifest.dependencies.insert("consumer-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("lev1".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("canon-pkg".to_string(), "4.2.0".to_string());
+    manifest
+        .dependencies
+        .insert("consumer-pkg".to_string(), "1.0.0".to_string());
 
     // Configure pathological overrides:
     // 1. Deep 4-level nested override: lev1 -> lev2 -> lev3 -> lev4 -> deep-target = 5.0.0
@@ -1938,14 +2258,20 @@ fn test_pathological_overrides_deep_scoped_and_spec_targeted() {
         "shadow-pkg": "$canon-pkg",
         "@deep/scoped-pkg@^1.0.0": "1.9.9"
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
         .expect("Pathological overrides resolution must succeed");
 
     // 1. Verify deep nested override
-    let deep_node = graph.nodes.values().find(|n| n.name == "deep-target").unwrap();
+    let deep_node = graph
+        .nodes
+        .values()
+        .find(|n| n.name == "deep-target")
+        .unwrap();
     assert_eq!(deep_node.version, "5.0.0");
 
     // 2. Verify wildcard spec override
@@ -2009,7 +2335,9 @@ fn test_pathological_scoped_aliases_and_overrides() {
         "@org/real-core": "1.8.8",
         "alias-client": "npm:@org/real-client@2.9.0"
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2041,7 +2369,10 @@ fn test_pathological_scoped_aliases_and_overrides() {
 
     // Verify Lockfile v3 serialization preserves alias real names and POSIX paths
     let lockfile = graph.to_lockfile_v3("alias-overrides-app", Some("1.0.0"));
-    let pkg_core = lockfile.packages.get("node_modules/@scope/alias-core").unwrap();
+    let pkg_core = lockfile
+        .packages
+        .get("node_modules/@scope/alias-core")
+        .unwrap();
     assert_eq!(pkg_core.name.as_deref(), Some("@org/real-core"));
     assert_eq!(pkg_core.version.as_deref(), Some("1.8.8"));
 
@@ -2049,7 +2380,10 @@ fn test_pathological_scoped_aliases_and_overrides() {
     assert_eq!(pkg_client.name.as_deref(), Some("@org/real-client"));
     assert_eq!(pkg_client.version.as_deref(), Some("2.9.0"));
 
-    let pkg_lib = lockfile.packages.get("node_modules/@scope/alias-lib").unwrap();
+    let pkg_lib = lockfile
+        .packages
+        .get("node_modules/@scope/alias-lib")
+        .unwrap();
     assert_eq!(pkg_lib.name.as_deref(), Some("unscoped-lib"));
     assert_eq!(pkg_lib.version.as_deref(), Some("3.1.5+build.2024"));
 }
@@ -2081,14 +2415,17 @@ fn test_stress_cyclic_peer_web_mesh() {
     for (pkg, peers) in &packages {
         provider.add_version(*pkg, "1.0.0", |v| {
             for peer in peers {
-                v.peer_dependencies.insert(peer.to_string(), "^1.0.0".to_string());
+                v.peer_dependencies
+                    .insert(peer.to_string(), "^1.0.0".to_string());
             }
         });
     }
 
     let mut manifest = Manifest::default();
     manifest.name = Some("stress-cyclic-mesh-app".to_string());
-    manifest.dependencies.insert("mesh-p0".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("mesh-p0".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2118,33 +2455,44 @@ fn test_stress_deep_peer_deduplication_and_ancestor_hoisting() {
     // Deep 6-level linear chain:
     // app -> deep-l1 -> deep-l2 -> deep-l3 -> deep-l4 -> deep-l5 -> deep-l6
     provider.add_version("deep-l1", "1.0.0", |v| {
-        v.dependencies.insert("deep-l2".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("deep-l2".to_string(), "1.0.0".to_string());
     });
     provider.add_version("deep-l2", "1.0.0", |v| {
-        v.dependencies.insert("deep-l3".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("deep-l3".to_string(), "1.0.0".to_string());
     });
     provider.add_version("deep-l3", "1.0.0", |v| {
-        v.dependencies.insert("deep-l4".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("deep-l4".to_string(), "1.0.0".to_string());
         // deep-l3 peers root-peer@^1.0.0
-        v.peer_dependencies.insert("root-peer".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("root-peer".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("deep-l4", "1.0.0", |v| {
-        v.dependencies.insert("deep-l5".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("deep-l5".to_string(), "1.0.0".to_string());
     });
     provider.add_version("deep-l5", "1.0.0", |v| {
-        v.dependencies.insert("deep-l6".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("deep-l6".to_string(), "1.0.0".to_string());
     });
     provider.add_version("deep-l6", "1.0.0", |v| {
         // deep-l6 also peers root-peer@^1.0.0
-        v.peer_dependencies.insert("root-peer".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("root-peer".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("root-peer", "1.2.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("deep-peer-dedup-app".to_string());
-    manifest.dependencies.insert("deep-l1".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("root-peer".to_string(), "1.2.0".to_string());
+    manifest
+        .dependencies
+        .insert("deep-l1".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("root-peer".to_string(), "1.2.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2152,22 +2500,34 @@ fn test_stress_deep_peer_deduplication_and_ancestor_hoisting() {
 
     // root-peer is hoisted at root node_modules/root-peer
     assert!(graph.nodes.contains_key("node_modules/root-peer"));
-    assert_eq!(graph.nodes.get("node_modules/root-peer").unwrap().version, "1.2.0");
+    assert_eq!(
+        graph.nodes.get("node_modules/root-peer").unwrap().version,
+        "1.2.0"
+    );
 
     // Both deep-l3 and deep-l6 must reuse the root instance (no duplicate nested root-peer)
     for (loc, node) in &graph.nodes {
         if node.name == "root-peer" {
-            assert_eq!(loc, "node_modules/root-peer", "root-peer must only exist at root, found at {loc}");
+            assert_eq!(
+                loc, "node_modules/root-peer",
+                "root-peer must only exist at root, found at {loc}"
+            );
         }
     }
 
     // Verify outgoing edges from both deep-l3 and deep-l6 point directly to node_modules/root-peer
     let l3_edges = graph.get_outgoing_edges("node_modules/deep-l3");
-    let l3_peer_edge = l3_edges.iter().find(|e| e.package_name == "root-peer").unwrap();
+    let l3_peer_edge = l3_edges
+        .iter()
+        .find(|e| e.package_name == "root-peer")
+        .unwrap();
     assert_eq!(l3_peer_edge.to_location, "node_modules/root-peer");
 
     let l6_edges = graph.get_outgoing_edges("node_modules/deep-l6");
-    let l6_peer_edge = l6_edges.iter().find(|e| e.package_name == "root-peer").unwrap();
+    let l6_peer_edge = l6_edges
+        .iter()
+        .find(|e| e.package_name == "root-peer")
+        .unwrap();
     assert_eq!(l6_peer_edge.to_location, "node_modules/root-peer");
 }
 
@@ -2177,8 +2537,10 @@ fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
 
     // Packages
     provider.add_version("builder", "1.0.0", |v| {
-        v.dependencies.insert("bundler".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("@core/plugin".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("bundler".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("@core/plugin".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("bundler", "1.0.0", |_| {});
     provider.add_version("bundler", "2.0.0", |_| {});
@@ -2188,26 +2550,32 @@ fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
 
     // Scoped multi-hop: @scope/framework -> @scope/nested-dep -> deep-leaf
     provider.add_version("@scope/framework", "1.0.0", |v| {
-        v.dependencies.insert("@scope/nested-dep".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("@scope/nested-dep".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("@scope/nested-dep", "1.0.0", |v| {
-        v.dependencies.insert("deep-leaf".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("deep-leaf".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("deep-leaf", "1.0.0", |_| {});
     provider.add_version("deep-leaf", "3.2.1", |_| {});
 
     // Independent consumer requesting bundler and deep-leaf
     provider.add_version("standard-consumer", "1.0.0", |v| {
-        v.dependencies.insert("bundler".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("deep-leaf".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("bundler".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("deep-leaf".to_string(), "^1.0.0".to_string());
     });
 
     // Spec-targeted override on target-tool
     provider.add_version("consumer-old-tool", "1.0.0", |v| {
-        v.dependencies.insert("target-tool".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("target-tool".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("consumer-new-tool", "1.0.0", |v| {
-        v.dependencies.insert("target-tool".to_string(), "^2.0.0".to_string());
+        v.dependencies
+            .insert("target-tool".to_string(), "^2.0.0".to_string());
     });
     provider.add_version("target-tool", "1.0.0", |_| {});
     provider.add_version("target-tool", "2.0.0", |_| {});
@@ -2215,21 +2583,33 @@ fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
 
     // Mixed nested object + arrow: server -> engine -> worker
     provider.add_version("server", "1.0.0", |v| {
-        v.dependencies.insert("engine".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("engine".to_string(), "1.0.0".to_string());
     });
     provider.add_version("engine", "1.0.0", |v| {
-        v.dependencies.insert("worker".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("worker".to_string(), "1.0.0".to_string());
     });
     provider.add_version("worker", "1.0.0", |_| {});
     provider.add_version("worker", "4.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("arrow-stress-app".to_string());
-    manifest.dependencies.insert("builder".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("@scope/framework".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("consumer-old-tool".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("consumer-new-tool".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("server".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("builder".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("@scope/framework".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("consumer-old-tool".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("consumer-new-tool".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("server".to_string(), "1.0.0".to_string());
 
     let overrides_json = serde_json::json!({
         "builder > bundler": "2.0.0",
@@ -2240,7 +2620,9 @@ fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
             "engine > worker": "4.0.0"
         }
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2248,35 +2630,53 @@ fn test_stress_overrides_arrow_syntax_and_nested_spec_ranges() {
 
     // 1. builder > bundler overridden to 2.0.0
     let builder_edges = graph.get_outgoing_edges("node_modules/builder");
-    let bundler_edge = builder_edges.iter().find(|e| e.package_name == "bundler").unwrap();
+    let bundler_edge = builder_edges
+        .iter()
+        .find(|e| e.package_name == "bundler")
+        .unwrap();
     let bundler_node = graph.nodes.get(&bundler_edge.to_location).unwrap();
     assert_eq!(bundler_node.version, "2.0.0");
 
     // 2. builder > @core/plugin overridden to 1.5.0
-    let plugin_edge = builder_edges.iter().find(|e| e.package_name == "@core/plugin").unwrap();
+    let plugin_edge = builder_edges
+        .iter()
+        .find(|e| e.package_name == "@core/plugin")
+        .unwrap();
     let plugin_node = graph.nodes.get(&plugin_edge.to_location).unwrap();
     assert_eq!(plugin_node.version, "1.5.0");
 
     // 3. Multi-hop scoped: @scope/framework > @scope/nested-dep > deep-leaf overridden to 3.2.1
     let nested_edges = graph.get_outgoing_edges("node_modules/@scope/nested-dep");
-    let leaf_edge = nested_edges.iter().find(|e| e.package_name == "deep-leaf").unwrap();
+    let leaf_edge = nested_edges
+        .iter()
+        .find(|e| e.package_name == "deep-leaf")
+        .unwrap();
     let leaf_node = graph.nodes.get(&leaf_edge.to_location).unwrap();
     assert_eq!(leaf_node.version, "3.2.1");
 
     // 4. Spec-targeted override on target-tool@^2.0.0 -> 2.9.9, while ^1.0.0 -> 1.0.0
     let old_tool_edges = graph.get_outgoing_edges("node_modules/consumer-old-tool");
-    let old_edge = old_tool_edges.iter().find(|e| e.package_name == "target-tool").unwrap();
+    let old_edge = old_tool_edges
+        .iter()
+        .find(|e| e.package_name == "target-tool")
+        .unwrap();
     let old_node = graph.nodes.get(&old_edge.to_location).unwrap();
     assert_eq!(old_node.version, "1.0.0");
 
     let new_tool_edges = graph.get_outgoing_edges("node_modules/consumer-new-tool");
-    let new_edge = new_tool_edges.iter().find(|e| e.package_name == "target-tool").unwrap();
+    let new_edge = new_tool_edges
+        .iter()
+        .find(|e| e.package_name == "target-tool")
+        .unwrap();
     let new_node = graph.nodes.get(&new_edge.to_location).unwrap();
     assert_eq!(new_node.version, "2.9.9");
 
     // 5. Nested object + arrow key: server -> engine -> worker overridden to 4.0.0
     let engine_edges = graph.get_outgoing_edges("node_modules/engine");
-    let worker_edge = engine_edges.iter().find(|e| e.package_name == "worker").unwrap();
+    let worker_edge = engine_edges
+        .iter()
+        .find(|e| e.package_name == "worker")
+        .unwrap();
     let worker_node = graph.nodes.get(&worker_edge.to_location).unwrap();
     assert_eq!(worker_node.version, "4.0.0");
 }
@@ -2292,26 +2692,36 @@ fn test_stress_npm_aliases_with_peers_and_overrides() {
 
     // Package react-router peers "react"
     provider.add_version("react-router", "6.14.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
     });
 
     // Package custom-ui peers alias name "my-react"
     provider.add_version("custom-ui", "1.0.0", |v| {
-        v.peer_dependencies.insert("my-react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies
+            .insert("my-react".to_string(), "^18.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("alias-peer-override-app".to_string());
     // Install react via npm: alias "my-react"
-    manifest.dependencies.insert("my-react".to_string(), "npm:react@^18.0.0".to_string());
-    manifest.dependencies.insert("react-router".to_string(), "6.14.0".to_string());
-    manifest.dependencies.insert("custom-ui".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("my-react".to_string(), "npm:react@^18.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("react-router".to_string(), "6.14.0".to_string());
+    manifest
+        .dependencies
+        .insert("custom-ui".to_string(), "1.0.0".to_string());
 
     // Override real package react to 18.3.1
     let overrides_json = serde_json::json!({
         "react": "18.3.1"
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2334,7 +2744,14 @@ fn test_stress_npm_aliases_with_peers_and_overrides() {
     // custom-ui is placed at node_modules/custom-ui
     assert!(graph.nodes.contains_key("node_modules/custom-ui"));
     let ui_edges = graph.get_outgoing_edges("node_modules/custom-ui");
-    let ui_peer_edge = ui_edges.iter().find(|e| e.install_name == "my-react" || e.package_name == "my-react" || e.package_name == "react").unwrap();
+    let ui_peer_edge = ui_edges
+        .iter()
+        .find(|e| {
+            e.install_name == "my-react"
+                || e.package_name == "my-react"
+                || e.package_name == "react"
+        })
+        .unwrap();
     assert_eq!(ui_peer_edge.to_location, "node_modules/my-react");
     assert_eq!(ui_peer_edge.dep_type, DependencyType::Peer);
 
@@ -2354,8 +2771,10 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
         v.os = Some(vec!["linux".to_string()]);
         v.cpu = Some(vec!["x64".to_string()]);
         v.libc = Some(vec!["glibc".to_string()]);
-        v.dependencies.insert("cuda-core".to_string(), "1.0.0".to_string());
-        v.dependencies.insert("blas".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("cuda-core".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("blas".to_string(), "1.0.0".to_string());
     });
     provider.add_version("cuda-core", "1.0.0", |_| {});
     provider.add_version("blas", "1.0.0", |_| {});
@@ -2365,7 +2784,8 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
         v.os = Some(vec!["linux".to_string()]);
         v.cpu = Some(vec!["x64".to_string()]);
         v.libc = Some(vec!["musl".to_string()]);
-        v.dependencies.insert("musl-shim".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("musl-shim".to_string(), "1.0.0".to_string());
     });
     provider.add_version("musl-shim", "1.0.0", |_| {});
 
@@ -2373,14 +2793,16 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     provider.add_version("addon-darwin-arm64", "1.0.0", |v| {
         v.os = Some(vec!["darwin".to_string()]);
         v.cpu = Some(vec!["arm64".to_string()]);
-        v.dependencies.insert("metal-framework".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("metal-framework".to_string(), "1.0.0".to_string());
     });
 
     // macOS x64 optional addon + subdependency
     provider.add_version("addon-darwin-x64", "1.0.0", |v| {
         v.os = Some(vec!["darwin".to_string()]);
         v.cpu = Some(vec!["x64".to_string()]);
-        v.dependencies.insert("metal-framework".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("metal-framework".to_string(), "1.0.0".to_string());
     });
     provider.add_version("metal-framework", "1.0.0", |_| {});
 
@@ -2388,17 +2810,28 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
     provider.add_version("addon-win32-x64", "1.0.0", |v| {
         v.os = Some(vec!["win32".to_string()]);
         v.cpu = Some(vec!["x64".to_string()]);
-        v.dependencies.insert("directx-helper".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("directx-helper".to_string(), "1.0.0".to_string());
     });
     provider.add_version("directx-helper", "1.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("platform-matrix-app".to_string());
-    manifest.optional_dependencies.insert("addon-linux-glibc".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("addon-linux-musl".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("addon-darwin-arm64".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("addon-darwin-x64".to_string(), "1.0.0".to_string());
-    manifest.optional_dependencies.insert("addon-win32-x64".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("addon-linux-glibc".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("addon-linux-musl".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("addon-darwin-arm64".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("addon-darwin-x64".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("addon-win32-x64".to_string(), "1.0.0".to_string());
 
     // Host 1: Linux x64 glibc
     let opts_glibc = ResolverOptions {
@@ -2470,13 +2903,20 @@ fn test_adversarial_dense_5_node_peer_clique() {
 
     // 5-node dense peer clique: c1, c2, c3, c4, c5
     // Each package has peer dependencies on all other 4 packages (20 edges total)
-    let packages = ["clique5-c1", "clique5-c2", "clique5-c3", "clique5-c4", "clique5-c5"];
+    let packages = [
+        "clique5-c1",
+        "clique5-c2",
+        "clique5-c3",
+        "clique5-c4",
+        "clique5-c5",
+    ];
 
     for &pkg in &packages {
         provider.add_version(pkg, "1.0.0", |v| {
             for &peer in &packages {
                 if peer != pkg {
-                    v.peer_dependencies.insert(peer.to_string(), "^1.0.0".to_string());
+                    v.peer_dependencies
+                        .insert(peer.to_string(), "^1.0.0".to_string());
                 }
             }
         });
@@ -2484,7 +2924,9 @@ fn test_adversarial_dense_5_node_peer_clique() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("adversarial-clique5-app".to_string());
-    manifest.dependencies.insert("clique5-c1".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("clique5-c1".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2508,7 +2950,10 @@ fn test_adversarial_dense_5_node_peer_clique() {
             }
         }
     }
-    assert_eq!(total_peer_edges, 20, "5-node clique must have exactly 20 peer edges");
+    assert_eq!(
+        total_peer_edges, 20,
+        "5-node clique must have exactly 20 peer edges"
+    );
 }
 
 #[test]
@@ -2517,53 +2962,78 @@ fn test_adversarial_multitier_cyclic_peer_diamond_cross_edges() {
 
     // Top tier: diamond top branches
     provider.add_version("tier1-left", "1.0.0", |v| {
-        v.peer_dependencies.insert("tier2-hub".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier2-hub".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("tier1-right", "1.0.0", |v| {
-        v.peer_dependencies.insert("tier2-hub".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier2-hub".to_string(), "^1.0.0".to_string());
     });
 
     // Middle tier: hub
     provider.add_version("tier2-hub", "1.0.0", |v| {
-        v.peer_dependencies.insert("tier3-alpha".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("tier3-beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier3-alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier3-beta".to_string(), "^1.0.0".to_string());
     });
 
     // Bottom tier: diamond cross edges and back-edges
     // tier3-alpha peers tier2-hub (cycle) and tier3-beta (diamond cross edge)
     provider.add_version("tier3-alpha", "1.0.0", |v| {
-        v.peer_dependencies.insert("tier2-hub".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("tier3-beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier2-hub".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier3-beta".to_string(), "^1.0.0".to_string());
     });
 
     // tier3-beta peers tier1-left (back-edge to top tier) and tier3-alpha (cross-edge)
     provider.add_version("tier3-beta", "1.0.0", |v| {
-        v.peer_dependencies.insert("tier1-left".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("tier3-alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier1-left".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tier3-alpha".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("multitier-diamond-peer-app".to_string());
-    manifest.dependencies.insert("tier1-left".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("tier1-right".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("tier1-left".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("tier1-right".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
-    let graph = resolve_dependency_graph(&manifest, &provider, &options)
-        .expect("Multi-tier cyclic peer dependencies with diamond cross-edges must resolve cleanly");
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).expect(
+        "Multi-tier cyclic peer dependencies with diamond cross-edges must resolve cleanly",
+    );
 
-    for node_name in ["tier1-left", "tier1-right", "tier2-hub", "tier3-alpha", "tier3-beta"] {
+    for node_name in [
+        "tier1-left",
+        "tier1-right",
+        "tier2-hub",
+        "tier3-alpha",
+        "tier3-beta",
+    ] {
         let loc = format!("node_modules/{node_name}");
         assert!(graph.nodes.contains_key(&loc), "Expected node at {loc}");
     }
 
     // Verify cross-edge tier3-alpha -> tier3-beta exists
     let alpha_edges = graph.get_outgoing_edges("node_modules/tier3-alpha");
-    assert!(alpha_edges.iter().any(|e| e.package_name == "tier3-beta" && e.dep_type == DependencyType::Peer));
-    assert!(alpha_edges.iter().any(|e| e.package_name == "tier2-hub" && e.dep_type == DependencyType::Peer));
+    assert!(alpha_edges
+        .iter()
+        .any(|e| e.package_name == "tier3-beta" && e.dep_type == DependencyType::Peer));
+    assert!(alpha_edges
+        .iter()
+        .any(|e| e.package_name == "tier2-hub" && e.dep_type == DependencyType::Peer));
 
     // Verify back-edge tier3-beta -> tier1-left exists
     let beta_edges = graph.get_outgoing_edges("node_modules/tier3-beta");
-    assert!(beta_edges.iter().any(|e| e.package_name == "tier1-left" && e.dep_type == DependencyType::Peer));
+    assert!(beta_edges
+        .iter()
+        .any(|e| e.package_name == "tier1-left" && e.dep_type == DependencyType::Peer));
 }
 
 #[test]
@@ -2574,16 +3044,20 @@ fn test_adversarial_strict_peer_conflict_cyclic_dependencies() {
     // Cyclic peer dependency with version conflict:
     // cyclic-strict-a@1.0.0 peers cyclic-strict-b@^1.0.0
     provider.add_version("cyclic-strict-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("cyclic-strict-b".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("cyclic-strict-b".to_string(), "^1.0.0".to_string());
     });
     // cyclic-strict-b@1.0.0 peers cyclic-strict-a@^2.0.0 (conflicts with 1.0.0!)
     provider.add_version("cyclic-strict-b", "1.0.0", |v| {
-        v.peer_dependencies.insert("cyclic-strict-a".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("cyclic-strict-a".to_string(), "^2.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("strict-cyclic-conflict-app".to_string());
-    manifest.dependencies.insert("cyclic-strict-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("cyclic-strict-a".to_string(), "1.0.0".to_string());
 
     // 1. With strict_peers: true, MUST fail with SolverError::PeerConflict
     let strict_opts = ResolverOptions {
@@ -2628,23 +3102,31 @@ fn test_adversarial_disjoint_branches_peer_resolution() {
     // Branch 1: root -> branch-left -> tool-alpha (peers plugin-beta@^1.0.0)
     // Branch 2: root -> branch-right -> plugin-beta (peers tool-alpha@^1.0.0)
     provider.add_version("branch-left", "1.0.0", |v| {
-        v.dependencies.insert("tool-alpha".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("tool-alpha".to_string(), "1.0.0".to_string());
     });
     provider.add_version("tool-alpha", "1.0.0", |v| {
-        v.peer_dependencies.insert("plugin-beta".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("plugin-beta".to_string(), "^1.0.0".to_string());
     });
 
     provider.add_version("branch-right", "1.0.0", |v| {
-        v.dependencies.insert("plugin-beta".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("plugin-beta".to_string(), "1.0.0".to_string());
     });
     provider.add_version("plugin-beta", "1.0.0", |v| {
-        v.peer_dependencies.insert("tool-alpha".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("tool-alpha".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("disjoint-branches-app".to_string());
-    manifest.dependencies.insert("branch-left".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("branch-right".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("branch-left".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("branch-right".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2662,10 +3144,15 @@ fn test_adversarial_dual_prod_and_optional_peer_dependencies() {
 
     // Package dual-dep has BOTH a direct prod dependency AND an optional peer dependency on shared-util
     provider.add_version("dual-dep-pkg", "1.0.0", |v| {
-        v.dependencies.insert("shared-util".to_string(), "1.0.0".to_string());
-        v.peer_dependencies.insert("shared-util".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-util".to_string(), "1.0.0".to_string());
+        v.peer_dependencies
+            .insert("shared-util".to_string(), "^1.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("shared-util".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "shared-util".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
@@ -2673,7 +3160,9 @@ fn test_adversarial_dual_prod_and_optional_peer_dependencies() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("dual-prod-peer-app".to_string());
-    manifest.dependencies.insert("dual-dep-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dual-dep-pkg".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
@@ -2708,13 +3197,18 @@ fn test_adversarial_select_version_semver_not_lexicographical() {
     let mut manifest = Manifest::default();
     manifest.name = Some("sort-test-app".to_string());
     // Use workspace:* which triggers select_max_semver_version
-    manifest.dependencies.insert("sort-test-pkg".to_string(), "workspace:*".to_string());
+    manifest
+        .dependencies
+        .insert("sort-test-pkg".to_string(), "workspace:*".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
         .expect("SemVer version selection must succeed");
 
-    let node = graph.nodes.get("node_modules/sort-test-pkg").expect("Node must be installed");
+    let node = graph
+        .nodes
+        .get("node_modules/sort-test-pkg")
+        .expect("Node must be installed");
     assert_eq!(
         node.version, "10.0.0",
         "SemVer-aware selection must pick 10.0.0 over 9.0.0"
@@ -2730,9 +3224,12 @@ fn test_registry_latest_tag_wins_when_range_allows_it() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("tagged-app".to_string());
-    manifest.dependencies.insert("tagged-pkg".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("tagged-pkg".to_string(), "^1.0.0".to_string());
 
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
     assert_eq!(graph.nodes["node_modules/tagged-pkg"].version, "1.3.0");
 }
 
@@ -2740,15 +3237,19 @@ fn test_registry_latest_tag_wins_when_range_allows_it() {
 fn test_dev_reachability_marks_transitive_lockfile_entries() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("dev-tool", "1.0.0", |v| {
-        v.dependencies.insert("dev-helper".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("dev-helper".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("dev-helper", "1.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("dev-flags-app".to_string());
-    manifest.dev_dependencies.insert("dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^1.0.0".to_string());
 
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
     let lockfile = graph.to_lockfile_v3("dev-flags-app", Some("1.0.0"));
     assert_eq!(lockfile.packages["node_modules/dev-tool"].dev, Some(true));
     assert_eq!(lockfile.packages["node_modules/dev-helper"].dev, Some(true));
@@ -2756,16 +3257,17 @@ fn test_dev_reachability_marks_transitive_lockfile_entries() {
 
 #[test]
 fn test_workspace_cycle_detection_clean_messages() {
-    use rnpm_core::workspace::WorkspaceMember;
-    use crate::workspace::WorkspaceDependencyGraph;
     use crate::error::SolverError;
+    use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // 1. Direct 2-node cycle: pkg-a -> pkg-b -> pkg-a
     let mut ma = Manifest::default();
     ma.name = Some("pkg-a".to_string());
     ma.version = Some("1.0.0".to_string());
-    ma.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    ma.dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
     let mem_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2777,7 +3279,8 @@ fn test_workspace_cycle_detection_clean_messages() {
     let mut mb = Manifest::default();
     mb.name = Some("pkg-b".to_string());
     mb.version = Some("1.0.0".to_string());
-    mb.dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    mb.dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let mem_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2800,7 +3303,8 @@ fn test_workspace_cycle_detection_clean_messages() {
     // 2. 3-node cycle: a -> b -> c -> a
     let mut m1 = Manifest::default();
     m1.name = Some("a".to_string());
-    m1.dependencies.insert("b".to_string(), "workspace:*".to_string());
+    m1.dependencies
+        .insert("b".to_string(), "workspace:*".to_string());
     let mem1 = WorkspaceMember {
         name: "a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2811,7 +3315,8 @@ fn test_workspace_cycle_detection_clean_messages() {
 
     let mut m2 = Manifest::default();
     m2.name = Some("b".to_string());
-    m2.dependencies.insert("c".to_string(), "workspace:*".to_string());
+    m2.dependencies
+        .insert("c".to_string(), "workspace:*".to_string());
     let mem2 = WorkspaceMember {
         name: "b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2822,7 +3327,8 @@ fn test_workspace_cycle_detection_clean_messages() {
 
     let mut m3 = Manifest::default();
     m3.name = Some("c".to_string());
-    m3.dependencies.insert("a".to_string(), "workspace:*".to_string());
+    m3.dependencies
+        .insert("a".to_string(), "workspace:*".to_string());
     let mem3 = WorkspaceMember {
         name: "c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2845,7 +3351,8 @@ fn test_workspace_cycle_detection_clean_messages() {
     // 3. Self cycle: self-pkg -> self-pkg
     let mut ms = Manifest::default();
     ms.name = Some("self-pkg".to_string());
-    ms.dependencies.insert("self-pkg".to_string(), "workspace:*".to_string());
+    ms.dependencies
+        .insert("self-pkg".to_string(), "workspace:*".to_string());
     let mem_s = WorkspaceMember {
         name: "self-pkg".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2869,7 +3376,9 @@ fn test_workspace_cycle_detection_clean_messages() {
     // The entry package should be stripped from the cycle report
     let mut m_entry = Manifest::default();
     m_entry.name = Some("entry".to_string());
-    m_entry.dependencies.insert("pkg-x".to_string(), "workspace:*".to_string());
+    m_entry
+        .dependencies
+        .insert("pkg-x".to_string(), "workspace:*".to_string());
     let mem_entry = WorkspaceMember {
         name: "entry".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2880,7 +3389,8 @@ fn test_workspace_cycle_detection_clean_messages() {
 
     let mut mx = Manifest::default();
     mx.name = Some("pkg-x".to_string());
-    mx.dependencies.insert("pkg-y".to_string(), "workspace:*".to_string());
+    mx.dependencies
+        .insert("pkg-y".to_string(), "workspace:*".to_string());
     let mem_x = WorkspaceMember {
         name: "pkg-x".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2891,7 +3401,8 @@ fn test_workspace_cycle_detection_clean_messages() {
 
     let mut my = Manifest::default();
     my.name = Some("pkg-y".to_string());
-    my.dependencies.insert("pkg-x".to_string(), "workspace:*".to_string());
+    my.dependencies
+        .insert("pkg-x".to_string(), "workspace:*".to_string());
     let mem_y = WorkspaceMember {
         name: "pkg-y".to_string(),
         version: Some("1.0.0".to_string()),
@@ -2914,10 +3425,10 @@ fn test_workspace_cycle_detection_clean_messages() {
 
 #[test]
 fn test_workspace_protocol_resolution_stress_50_plus_packages() {
-    use rnpm_core::workspace::WorkspaceMember;
-    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
     use crate::solver::ResolverOptions;
     use crate::types::InMemoryPackageProvider;
+    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Create 60 workspace packages organized into 6 tiers
@@ -2966,8 +3477,12 @@ fn test_workspace_protocol_resolution_stress_50_plus_packages() {
             // Diamond: depends on Tier 3 via workspace:* and Tier 2 via workspace:^
             let dep1 = format!("pkg-{:02}", i - 10);
             let dep2 = format!("pkg-{:02}", i - 20);
-            manifest.dependencies.insert(dep1, "workspace:*".to_string());
-            manifest.dependencies.insert(dep2, "workspace:^".to_string());
+            manifest
+                .dependencies
+                .insert(dep1, "workspace:*".to_string());
+            manifest
+                .dependencies
+                .insert(dep2, "workspace:^".to_string());
         } else if i >= 50 {
             // Top tier: depends on Tier 4 via workspace:~
             let dep = format!("pkg-{:02}", i - 10);
@@ -2994,7 +3509,11 @@ fn test_workspace_protocol_resolution_stress_50_plus_packages() {
 
     // Verify all dependencies appear before their dependents in topological_order
     let pos_of = |pkg: &str| -> usize {
-        ws_graph.topological_order.iter().position(|p| p == pkg).unwrap()
+        ws_graph
+            .topological_order
+            .iter()
+            .position(|p| p == pkg)
+            .unwrap()
     };
 
     for member in &members {
@@ -3025,8 +3544,14 @@ fn test_workspace_protocol_resolution_stress_50_plus_packages() {
         let link_loc = format!("node_modules/{name}");
         let phys_loc = format!("packages/{name}");
 
-        assert!(dep_graph.nodes.contains_key(&link_loc), "Missing link node: {link_loc}");
-        assert!(dep_graph.nodes.contains_key(&phys_loc), "Missing physical node: {phys_loc}");
+        assert!(
+            dep_graph.nodes.contains_key(&link_loc),
+            "Missing link node: {link_loc}"
+        );
+        assert!(
+            dep_graph.nodes.contains_key(&phys_loc),
+            "Missing physical node: {phys_loc}"
+        );
 
         let link_node = dep_graph.nodes.get(&link_loc).unwrap();
         assert!(link_node.flags.link);
@@ -3037,21 +3562,19 @@ fn test_workspace_protocol_resolution_stress_50_plus_packages() {
     assert_eq!(lockfile.packages.len(), TOTAL_PKGS * 2 + 1); // 60 links + 60 physical + 1 root
 }
 
-
-
-
-
 #[test]
 fn test_workspace_circular_dev_dependencies_prod_to_dev() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // pkg-a depends on pkg-b in production (dependencies)
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    manifest_a
+        .dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3064,7 +3587,9 @@ fn test_workspace_circular_dev_dependencies_prod_to_dev() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dev_dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dev_dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3078,9 +3603,20 @@ fn test_workspace_circular_dev_dependencies_prod_to_dev() {
 
     // Production dependency pkg-a -> pkg-b means pkg-b is a dependency of pkg-a.
     // In leaf-first execution order, pkg-b must be built BEFORE pkg-a!
-    let pos_a = ws_graph.topological_order.iter().position(|x| x == "pkg-a").unwrap();
-    let pos_b = ws_graph.topological_order.iter().position(|x| x == "pkg-b").unwrap();
-    assert!(pos_b < pos_a, "Leaf dependency pkg-b must precede dependent pkg-a");
+    let pos_a = ws_graph
+        .topological_order
+        .iter()
+        .position(|x| x == "pkg-a")
+        .unwrap();
+    let pos_b = ws_graph
+        .topological_order
+        .iter()
+        .position(|x| x == "pkg-b")
+        .unwrap();
+    assert!(
+        pos_b < pos_a,
+        "Leaf dependency pkg-b must precede dependent pkg-a"
+    );
 
     // Verify dependencies separation
     assert!(ws_graph.dependencies["pkg-a"].contains_key("pkg-b"));
@@ -3090,15 +3626,17 @@ fn test_workspace_circular_dev_dependencies_prod_to_dev() {
 
 #[test]
 fn test_workspace_mutual_dev_dependencies_cycle() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // pkg-a dev-depends on pkg-b
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dev_dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    manifest_a
+        .dev_dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3111,7 +3649,9 @@ fn test_workspace_mutual_dev_dependencies_cycle() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dev_dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dev_dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3137,8 +3677,8 @@ fn test_workspace_mutual_dev_dependencies_cycle() {
 
 #[test]
 fn test_workspace_protocol_variations() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Sibling package target: 1.2.3
@@ -3169,7 +3709,9 @@ fn test_workspace_protocol_variations() {
         let mut consumer_m = Manifest::default();
         consumer_m.name = Some("consumer-pkg".to_string());
         consumer_m.version = Some("1.0.0".to_string());
-        consumer_m.dependencies.insert("target-pkg".to_string(), spec.to_string());
+        consumer_m
+            .dependencies
+            .insert("target-pkg".to_string(), spec.to_string());
         let consumer_member = WorkspaceMember {
             name: "consumer-pkg".to_string(),
             version: Some("1.0.0".to_string()),
@@ -3189,9 +3731,9 @@ fn test_workspace_protocol_variations() {
 
     // Test cases that MUST fail
     let invalid_specs = [
-        "workspace:^2.0.0",         // Sibling is 1.2.3
-        "workspace:~1.1.0",         // Sibling is 1.2.3
-        "workspace:2.0.0",          // Sibling is 1.2.3
+        "workspace:^2.0.0",          // Sibling is 1.2.3
+        "workspace:~1.1.0",          // Sibling is 1.2.3
+        "workspace:2.0.0",           // Sibling is 1.2.3
         "workspace:../other-dir",    // Path does not resolve to target-pkg
         "workspace:../../../escape", // Escapes workspace root
         "workspace:invalid-semver!", // Malformed constraint
@@ -3201,7 +3743,9 @@ fn test_workspace_protocol_variations() {
         let mut consumer_m = Manifest::default();
         consumer_m.name = Some("consumer-pkg".to_string());
         consumer_m.version = Some("1.0.0".to_string());
-        consumer_m.dependencies.insert("target-pkg".to_string(), spec.to_string());
+        consumer_m
+            .dependencies
+            .insert("target-pkg".to_string(), spec.to_string());
         let consumer_member = WorkspaceMember {
             name: "consumer-pkg".to_string(),
             version: Some("1.0.0".to_string()),
@@ -3221,8 +3765,8 @@ fn test_workspace_protocol_variations() {
 
 #[test]
 fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::WorkspaceDependencyGraph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     // Diamond DAG in production:
@@ -3239,7 +3783,9 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
     let mut m_core = Manifest::default();
     m_core.name = Some("pkg-core".to_string());
     m_core.version = Some("1.0.0".to_string());
-    m_core.dev_dependencies.insert("pkg-app".to_string(), "workspace:*".to_string());
+    m_core
+        .dev_dependencies
+        .insert("pkg-app".to_string(), "workspace:*".to_string());
     let member_core = WorkspaceMember {
         name: "pkg-core".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3251,8 +3797,10 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
     let mut m_ui = Manifest::default();
     m_ui.name = Some("pkg-ui".to_string());
     m_ui.version = Some("1.0.0".to_string());
-    m_ui.dependencies.insert("pkg-core".to_string(), "workspace:^1.0.0".to_string());
-    m_ui.dev_dependencies.insert("pkg-app".to_string(), "workspace:*".to_string());
+    m_ui.dependencies
+        .insert("pkg-core".to_string(), "workspace:^1.0.0".to_string());
+    m_ui.dev_dependencies
+        .insert("pkg-app".to_string(), "workspace:*".to_string());
     let member_ui = WorkspaceMember {
         name: "pkg-ui".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3264,8 +3812,12 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
     let mut m_api = Manifest::default();
     m_api.name = Some("pkg-api".to_string());
     m_api.version = Some("1.0.0".to_string());
-    m_api.dependencies.insert("pkg-core".to_string(), "workspace:^1.0.0".to_string());
-    m_api.dev_dependencies.insert("pkg-ui".to_string(), "workspace:*".to_string());
+    m_api
+        .dependencies
+        .insert("pkg-core".to_string(), "workspace:^1.0.0".to_string());
+    m_api
+        .dev_dependencies
+        .insert("pkg-ui".to_string(), "workspace:*".to_string());
     let member_api = WorkspaceMember {
         name: "pkg-api".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3277,8 +3829,12 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
     let mut m_app = Manifest::default();
     m_app.name = Some("pkg-app".to_string());
     m_app.version = Some("1.0.0".to_string());
-    m_app.dependencies.insert("pkg-ui".to_string(), "workspace:^1.0.0".to_string());
-    m_app.dependencies.insert("pkg-api".to_string(), "workspace:^1.0.0".to_string());
+    m_app
+        .dependencies
+        .insert("pkg-ui".to_string(), "workspace:^1.0.0".to_string());
+    m_app
+        .dependencies
+        .insert("pkg-api".to_string(), "workspace:^1.0.0".to_string());
     let member_app = WorkspaceMember {
         name: "pkg-app".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3289,8 +3845,9 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
 
     // Unordered input
     let members = vec![member_app, member_ui, member_api, member_core];
-    let ws_graph = WorkspaceDependencyGraph::construct(&members)
-        .expect("Complex 4-package workspace DAG with diamond and dev back-edges must resolve cleanly");
+    let ws_graph = WorkspaceDependencyGraph::construct(&members).expect(
+        "Complex 4-package workspace DAG with diamond and dev back-edges must resolve cleanly",
+    );
 
     let order = &ws_graph.topological_order;
     assert_eq!(order.len(), 4);
@@ -3311,8 +3868,8 @@ fn test_workspace_complex_dag_diamond_with_dev_back_edges() {
 
 #[test]
 fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
-    use rnpm_core::workspace::WorkspaceMember;
     use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     let mut provider = InMemoryPackageProvider::new();
@@ -3326,7 +3883,9 @@ fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dependencies.insert("shared-lib".to_string(), "^1.0.0".to_string());
+    manifest_a
+        .dependencies
+        .insert("shared-lib".to_string(), "^1.0.0".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3339,7 +3898,9 @@ fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dependencies.insert("shared-lib".to_string(), "^2.0.0".to_string());
+    manifest_b
+        .dependencies
+        .insert("shared-lib".to_string(), "^2.0.0".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3349,19 +3910,27 @@ fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
     };
 
     let options = ResolverOptions::default();
-    let graph = resolve_workspace_graph(
-        &root_manifest,
-        &[member_a, member_b],
-        &provider,
-        &options,
-    ).expect("Resolution with cross-workspace conflicting external versions must succeed");
+    let graph = resolve_workspace_graph(&root_manifest, &[member_a, member_b], &provider, &options)
+        .expect("Resolution with cross-workspace conflicting external versions must succeed");
 
     // Both versions of shared-lib must exist in the graph!
-    let v1_node = graph.nodes.values().find(|n| n.name == "shared-lib" && n.version == "1.2.0");
-    let v2_node = graph.nodes.values().find(|n| n.name == "shared-lib" && n.version == "2.1.0");
+    let v1_node = graph
+        .nodes
+        .values()
+        .find(|n| n.name == "shared-lib" && n.version == "1.2.0");
+    let v2_node = graph
+        .nodes
+        .values()
+        .find(|n| n.name == "shared-lib" && n.version == "2.1.0");
 
-    assert!(v1_node.is_some(), "shared-lib@1.2.0 must be present in graph");
-    assert!(v2_node.is_some(), "shared-lib@2.1.0 must be present in graph");
+    assert!(
+        v1_node.is_some(),
+        "shared-lib@1.2.0 must be present in graph"
+    );
+    assert!(
+        v2_node.is_some(),
+        "shared-lib@2.1.0 must be present in graph"
+    );
 
     // One version is hoisted to root node_modules/shared-lib
     assert!(graph.nodes.contains_key("node_modules/shared-lib"));
@@ -3369,28 +3938,46 @@ fn test_workspace_cross_workspace_hoisting_conflicting_external_versions() {
 
     // The conflicting version is nested under its member's node_modules
     if root_shared.version == "1.2.0" {
-        assert!(graph.nodes.contains_key("packages/pkg-b/node_modules/shared-lib"));
+        assert!(graph
+            .nodes
+            .contains_key("packages/pkg-b/node_modules/shared-lib"));
         assert_eq!(
-            graph.nodes.get("packages/pkg-b/node_modules/shared-lib").unwrap().version,
+            graph
+                .nodes
+                .get("packages/pkg-b/node_modules/shared-lib")
+                .unwrap()
+                .version,
             "2.1.0"
         );
     } else {
         assert_eq!(root_shared.version, "2.1.0");
-        assert!(graph.nodes.contains_key("packages/pkg-a/node_modules/shared-lib"));
+        assert!(graph
+            .nodes
+            .contains_key("packages/pkg-a/node_modules/shared-lib"));
         assert_eq!(
-            graph.nodes.get("packages/pkg-a/node_modules/shared-lib").unwrap().version,
+            graph
+                .nodes
+                .get("packages/pkg-a/node_modules/shared-lib")
+                .unwrap()
+                .version,
             "1.2.0"
         );
     }
 
     // Outgoing edges from members point to their respective versions
     let edges_a = graph.get_outgoing_edges("packages/pkg-a");
-    let edge_a = edges_a.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let edge_a = edges_a
+        .iter()
+        .find(|e| e.package_name == "shared-lib")
+        .unwrap();
     let target_a = graph.nodes.get(&edge_a.to_location).unwrap();
     assert_eq!(target_a.version, "1.2.0");
 
     let edges_b = graph.get_outgoing_edges("packages/pkg-b");
-    let edge_b = edges_b.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let edge_b = edges_b
+        .iter()
+        .find(|e| e.package_name == "shared-lib")
+        .unwrap();
     let target_b = graph.nodes.get(&edge_b.to_location).unwrap();
     assert_eq!(target_b.version, "2.1.0");
 }
@@ -3408,55 +3995,98 @@ fn test_adversarial_bipartite_peer_mesh_with_optional_and_strict() {
     // 4 Plugins forming a bipartite peer web with mixed required and optional peers
     // 1. plugin-ui: strict peer core-engine (^2.0.0), strict peer core-renderer (^3.0.0), optional peer core-telemetry (^5.0.0)
     provider.add_version("plugin-ui", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
-        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
-        v.peer_dependencies.insert("core-telemetry".to_string(), "^5.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-engine".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-telemetry".to_string(), "^5.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("core-telemetry".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "core-telemetry".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     // 2. plugin-store: strict peer core-engine (^2.0.0), strict peer core-database (^1.0.0), optional peer core-renderer (^3.0.0)
     provider.add_version("plugin-store", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
-        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-engine".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-renderer".to_string(), "^3.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("core-renderer".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "core-renderer".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     // 3. plugin-analytics: strict peer core-telemetry (^5.0.0), optional peer core-database (^1.0.0), optional peer core-engine (^2.0.0)
     provider.add_version("plugin-analytics", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-telemetry".to_string(), "^5.0.0".to_string());
-        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("core-engine".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-telemetry".to_string(), "^5.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-engine".to_string(), "^2.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("core-database".to_string(), PeerDependencyMeta { optional: true });
-        meta.insert("core-engine".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "core-database".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
+        meta.insert(
+            "core-engine".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     // 4. plugin-export: strict peer core-renderer (^3.0.0), strict peer core-database (^1.0.0), optional absent peer core-opt-missing (^1.0.0)
     provider.add_version("plugin-export", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
-        v.peer_dependencies.insert("core-database".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("core-opt-missing".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-database".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-opt-missing".to_string(), "^1.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("core-opt-missing".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "core-opt-missing".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("bipartite-peer-app".to_string());
-    manifest.dependencies.insert("core-engine".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("core-renderer".to_string(), "3.5.0".to_string());
-    manifest.dependencies.insert("core-database".to_string(), "1.8.0".to_string());
-    manifest.dependencies.insert("core-telemetry".to_string(), "5.1.0".to_string());
-    manifest.dependencies.insert("plugin-ui".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("plugin-store".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("plugin-analytics".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("plugin-export".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-engine".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-renderer".to_string(), "3.5.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-database".to_string(), "1.8.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-telemetry".to_string(), "5.1.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-ui".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-store".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-analytics".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-export".to_string(), "1.0.0".to_string());
 
     // Phase 1: Successful resolution under strict_peers: true
     let strict_opts = ResolverOptions {
@@ -3483,67 +4113,120 @@ fn test_adversarial_bipartite_peer_mesh_with_optional_and_strict() {
 
     // Verify plugin-ui edges
     let ui_edges = graph.get_outgoing_edges("node_modules/plugin-ui");
-    let ui_engine = ui_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    let ui_engine = ui_edges
+        .iter()
+        .find(|e| e.package_name == "core-engine")
+        .unwrap();
     assert_eq!(ui_engine.dep_type, DependencyType::Peer);
-    let ui_renderer = ui_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    let ui_renderer = ui_edges
+        .iter()
+        .find(|e| e.package_name == "core-renderer")
+        .unwrap();
     assert_eq!(ui_renderer.dep_type, DependencyType::Peer);
-    let ui_telemetry = ui_edges.iter().find(|e| e.package_name == "core-telemetry").unwrap();
+    let ui_telemetry = ui_edges
+        .iter()
+        .find(|e| e.package_name == "core-telemetry")
+        .unwrap();
     assert_eq!(ui_telemetry.dep_type, DependencyType::PeerOptional);
 
     // Verify plugin-store edges
     let store_edges = graph.get_outgoing_edges("node_modules/plugin-store");
-    let store_engine = store_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    let store_engine = store_edges
+        .iter()
+        .find(|e| e.package_name == "core-engine")
+        .unwrap();
     assert_eq!(store_engine.dep_type, DependencyType::Peer);
-    let store_db = store_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    let store_db = store_edges
+        .iter()
+        .find(|e| e.package_name == "core-database")
+        .unwrap();
     assert_eq!(store_db.dep_type, DependencyType::Peer);
-    let store_renderer = store_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    let store_renderer = store_edges
+        .iter()
+        .find(|e| e.package_name == "core-renderer")
+        .unwrap();
     assert_eq!(store_renderer.dep_type, DependencyType::PeerOptional);
 
     // Verify plugin-analytics edges
     let analytics_edges = graph.get_outgoing_edges("node_modules/plugin-analytics");
-    let an_telemetry = analytics_edges.iter().find(|e| e.package_name == "core-telemetry").unwrap();
+    let an_telemetry = analytics_edges
+        .iter()
+        .find(|e| e.package_name == "core-telemetry")
+        .unwrap();
     assert_eq!(an_telemetry.dep_type, DependencyType::Peer);
-    let an_db = analytics_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    let an_db = analytics_edges
+        .iter()
+        .find(|e| e.package_name == "core-database")
+        .unwrap();
     assert_eq!(an_db.dep_type, DependencyType::PeerOptional);
-    let an_engine = analytics_edges.iter().find(|e| e.package_name == "core-engine").unwrap();
+    let an_engine = analytics_edges
+        .iter()
+        .find(|e| e.package_name == "core-engine")
+        .unwrap();
     assert_eq!(an_engine.dep_type, DependencyType::PeerOptional);
 
     // Verify plugin-export edges
     let export_edges = graph.get_outgoing_edges("node_modules/plugin-export");
-    let exp_renderer = export_edges.iter().find(|e| e.package_name == "core-renderer").unwrap();
+    let exp_renderer = export_edges
+        .iter()
+        .find(|e| e.package_name == "core-renderer")
+        .unwrap();
     assert_eq!(exp_renderer.dep_type, DependencyType::Peer);
-    let exp_db = export_edges.iter().find(|e| e.package_name == "core-database").unwrap();
+    let exp_db = export_edges
+        .iter()
+        .find(|e| e.package_name == "core-database")
+        .unwrap();
     assert_eq!(exp_db.dep_type, DependencyType::Peer);
-    assert!(!export_edges.iter().any(|e| e.package_name == "core-opt-missing"));
+    assert!(!export_edges
+        .iter()
+        .any(|e| e.package_name == "core-opt-missing"));
 
     // Phase 2: Adversarial strict peer conflict in the bipartite mesh
     provider.add_version("plugin-strict-conflict", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-engine".to_string(), "^3.0.0".to_string());
-        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-engine".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-renderer".to_string(), "^3.0.0".to_string());
     });
     let mut conflict_manifest = manifest.clone();
-    conflict_manifest.dependencies.insert("plugin-strict-conflict".to_string(), "1.0.0".to_string());
+    conflict_manifest
+        .dependencies
+        .insert("plugin-strict-conflict".to_string(), "1.0.0".to_string());
 
     let err = resolve_dependency_graph(&conflict_manifest, &provider, &strict_opts).unwrap_err();
     assert!(err.is_peer_conflict());
-    assert!(err.to_string().contains("Conflicting peer dependency 'core-engine'"));
+    assert!(err
+        .to_string()
+        .contains("Conflicting peer dependency 'core-engine'"));
 
     // Phase 3: Adversarial optional peer conflict in the bipartite mesh
     provider.add_version("plugin-optional-conflict", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-renderer".to_string(), "^3.0.0".to_string());
-        v.peer_dependencies.insert("core-engine".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-renderer".to_string(), "^3.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-engine".to_string(), "^3.0.0".to_string());
         let mut meta = BTreeMap::new();
-        meta.insert("core-engine".to_string(), PeerDependencyMeta { optional: true });
+        meta.insert(
+            "core-engine".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
         v.peer_dependencies_meta = meta;
     });
     let mut opt_conflict_manifest = manifest.clone();
-    opt_conflict_manifest.dependencies.insert("plugin-optional-conflict".to_string(), "1.0.0".to_string());
+    opt_conflict_manifest
+        .dependencies
+        .insert("plugin-optional-conflict".to_string(), "1.0.0".to_string());
 
     let opt_graph = resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts)
         .expect("Incompatible optional peer must be omitted and not fail strict resolution");
     let opt_edges = opt_graph.get_outgoing_edges("node_modules/plugin-optional-conflict");
-    assert!(opt_edges.iter().any(|e| e.package_name == "core-renderer" && e.dep_type == DependencyType::Peer));
-    assert!(!opt_edges.iter().any(|e| e.package_name == "core-engine"), "Incompatible optional peer must be omitted");
+    assert!(opt_edges
+        .iter()
+        .any(|e| e.package_name == "core-renderer" && e.dep_type == DependencyType::Peer));
+    assert!(
+        !opt_edges.iter().any(|e| e.package_name == "core-engine"),
+        "Incompatible optional peer must be omitted"
+    );
 }
 
 #[test]
@@ -3552,40 +4235,54 @@ fn test_adversarial_deep_transitive_nested_overrides() {
 
     // Branch Alpha: 5-level deep chain: root -> alpha-1 -> alpha-2 -> alpha-3 -> alpha-4 -> alpha-5
     provider.add_version("alpha-1", "1.0.0", |v| {
-        v.dependencies.insert("alpha-2".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("alpha-2".to_string(), "1.0.0".to_string());
     });
     provider.add_version("alpha-2", "1.0.0", |v| {
-        v.dependencies.insert("alpha-3".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("alpha-3".to_string(), "1.0.0".to_string());
     });
     provider.add_version("alpha-3", "1.0.0", |v| {
-        v.dependencies.insert("alpha-4".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("alpha-4".to_string(), "1.0.0".to_string());
     });
     provider.add_version("alpha-4", "1.0.0", |v| {
-        v.dependencies.insert("alpha-5".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("alpha-5".to_string(), "1.0.0".to_string());
     });
     provider.add_version("alpha-5", "1.0.0", |v| {
-        v.dependencies.insert("shared-lib".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("metric-tracker".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("logger".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-lib".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("metric-tracker".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("logger".to_string(), "^1.0.0".to_string());
     });
 
     // Branch Beta: 5-level deep chain: root -> beta-1 -> beta-2 -> beta-3 -> beta-4 -> beta-5
     provider.add_version("beta-1", "1.0.0", |v| {
-        v.dependencies.insert("beta-2".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("beta-2".to_string(), "1.0.0".to_string());
     });
     provider.add_version("beta-2", "1.0.0", |v| {
-        v.dependencies.insert("beta-3".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("beta-3".to_string(), "1.0.0".to_string());
     });
     provider.add_version("beta-3", "1.0.0", |v| {
-        v.dependencies.insert("beta-4".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("beta-4".to_string(), "1.0.0".to_string());
     });
     provider.add_version("beta-4", "1.0.0", |v| {
-        v.dependencies.insert("beta-5".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("beta-5".to_string(), "1.0.0".to_string());
     });
     provider.add_version("beta-5", "1.0.0", |v| {
-        v.dependencies.insert("shared-lib".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("metric-tracker".to_string(), "^1.0.0".to_string());
-        v.dependencies.insert("logger".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-lib".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("metric-tracker".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("logger".to_string(), "^1.0.0".to_string());
     });
 
     // Shared packages available in provider
@@ -3602,8 +4299,12 @@ fn test_adversarial_deep_transitive_nested_overrides() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("deep-transitive-overrides-app".to_string());
-    manifest.dependencies.insert("alpha-1".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("beta-1".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("alpha-1".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("beta-1".to_string(), "1.0.0".to_string());
 
     // Configure 5-level deep nested and spec-targeted overrides:
     // - Branch Alpha: nested object syntax overrides shared-lib@^1.0.0 to 2.0.0;
@@ -3637,21 +4338,39 @@ fn test_adversarial_deep_transitive_nested_overrides() {
         },
         "beta-1 > beta-2 > beta-3 > beta-4 > beta-5 > metric-tracker@^1.0.0": "2.5.0"
     });
-    manifest.extra.insert("overrides".to_string(), overrides_json);
+    manifest
+        .extra
+        .insert("overrides".to_string(), overrides_json);
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options)
         .expect("Deep transitive nested overrides resolution must succeed");
 
     // Both 2.0.0 and 3.0.0 of shared-lib must exist in the resolved graph
-    let shared_nodes: Vec<_> = graph.nodes.values().filter(|n| n.name == "shared-lib").collect();
-    assert_eq!(shared_nodes.len(), 2, "Both overridden versions of shared-lib must exist");
+    let shared_nodes: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|n| n.name == "shared-lib")
+        .collect();
+    assert_eq!(
+        shared_nodes.len(),
+        2,
+        "Both overridden versions of shared-lib must exist"
+    );
     assert!(shared_nodes.iter().any(|n| n.version == "2.0.0"));
     assert!(shared_nodes.iter().any(|n| n.version == "3.0.0"));
 
     // Both 4.0.0 and 2.5.0 of metric-tracker must exist in the resolved graph
-    let metric_nodes: Vec<_> = graph.nodes.values().filter(|n| n.name == "metric-tracker").collect();
-    assert_eq!(metric_nodes.len(), 2, "Both overridden versions of metric-tracker must exist");
+    let metric_nodes: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|n| n.name == "metric-tracker")
+        .collect();
+    assert_eq!(
+        metric_nodes.len(),
+        2,
+        "Both overridden versions of metric-tracker must exist"
+    );
     assert!(metric_nodes.iter().any(|n| n.version == "4.0.0"));
     assert!(metric_nodes.iter().any(|n| n.version == "2.5.0"));
 
@@ -3659,21 +4378,30 @@ fn test_adversarial_deep_transitive_nested_overrides() {
     let alpha_5_node = graph.nodes.values().find(|n| n.name == "alpha-5").unwrap();
     let alpha_5_edges = graph.get_outgoing_edges(&alpha_5_node.location);
 
-    let alpha_shared_edge = alpha_5_edges.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let alpha_shared_edge = alpha_5_edges
+        .iter()
+        .find(|e| e.package_name == "shared-lib")
+        .unwrap();
     let alpha_shared_target = graph.nodes.get(&alpha_shared_edge.to_location).unwrap();
     assert_eq!(
         alpha_shared_target.version, "2.0.0",
         "Alpha branch must resolve shared-lib to overridden 2.0.0"
     );
 
-    let alpha_metric_edge = alpha_5_edges.iter().find(|e| e.package_name == "metric-tracker").unwrap();
+    let alpha_metric_edge = alpha_5_edges
+        .iter()
+        .find(|e| e.package_name == "metric-tracker")
+        .unwrap();
     let alpha_metric_target = graph.nodes.get(&alpha_metric_edge.to_location).unwrap();
     assert_eq!(
         alpha_metric_target.version, "4.0.0",
         "Alpha branch must resolve metric-tracker to overridden 4.0.0"
     );
 
-    let alpha_logger_edge = alpha_5_edges.iter().find(|e| e.package_name == "logger").unwrap();
+    let alpha_logger_edge = alpha_5_edges
+        .iter()
+        .find(|e| e.package_name == "logger")
+        .unwrap();
     let alpha_logger_target = graph.nodes.get(&alpha_logger_edge.to_location).unwrap();
     assert_eq!(
         alpha_logger_target.version, "1.0.0",
@@ -3684,21 +4412,30 @@ fn test_adversarial_deep_transitive_nested_overrides() {
     let beta_5_node = graph.nodes.values().find(|n| n.name == "beta-5").unwrap();
     let beta_5_edges = graph.get_outgoing_edges(&beta_5_node.location);
 
-    let beta_shared_edge = beta_5_edges.iter().find(|e| e.package_name == "shared-lib").unwrap();
+    let beta_shared_edge = beta_5_edges
+        .iter()
+        .find(|e| e.package_name == "shared-lib")
+        .unwrap();
     let beta_shared_target = graph.nodes.get(&beta_shared_edge.to_location).unwrap();
     assert_eq!(
         beta_shared_target.version, "3.0.0",
         "Beta branch must resolve shared-lib to overridden 3.0.0"
     );
 
-    let beta_metric_edge = beta_5_edges.iter().find(|e| e.package_name == "metric-tracker").unwrap();
+    let beta_metric_edge = beta_5_edges
+        .iter()
+        .find(|e| e.package_name == "metric-tracker")
+        .unwrap();
     let beta_metric_target = graph.nodes.get(&beta_metric_edge.to_location).unwrap();
     assert_eq!(
         beta_metric_target.version, "2.5.0",
         "Beta branch must resolve metric-tracker to overridden 2.5.0"
     );
 
-    let beta_logger_edge = beta_5_edges.iter().find(|e| e.package_name == "logger").unwrap();
+    let beta_logger_edge = beta_5_edges
+        .iter()
+        .find(|e| e.package_name == "logger")
+        .unwrap();
     let beta_logger_target = graph.nodes.get(&beta_logger_edge.to_location).unwrap();
     assert_eq!(
         beta_logger_target.version, "1.0.0",
@@ -3715,9 +4452,9 @@ fn test_adversarial_deep_transitive_nested_overrides() {
 
 #[test]
 fn test_adversarial_workspace_circular_dev_with_peer_chains() {
-    use rnpm_core::workspace::WorkspaceMember;
-    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
     use crate::error::SolverError;
+    use crate::workspace::{resolve_workspace_graph, WorkspaceDependencyGraph};
+    use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
     let mut provider = InMemoryPackageProvider::new();
@@ -3725,13 +4462,17 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
 
     let mut root_manifest = Manifest::default();
     root_manifest.name = Some("ws-peer-cycle-root".to_string());
-    root_manifest.dependencies.insert("shared-logger".to_string(), "^2.0.0".to_string());
+    root_manifest
+        .dependencies
+        .insert("shared-logger".to_string(), "^2.0.0".to_string());
 
     // Package A (core engine) depends on Package B in production
     let mut manifest_a = Manifest::default();
     manifest_a.name = Some("pkg-a".to_string());
     manifest_a.version = Some("1.0.0".to_string());
-    manifest_a.dependencies.insert("pkg-b".to_string(), "workspace:*".to_string());
+    manifest_a
+        .dependencies
+        .insert("pkg-b".to_string(), "workspace:*".to_string());
     let member_a = WorkspaceMember {
         name: "pkg-a".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3744,8 +4485,12 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
     let mut manifest_b = Manifest::default();
     manifest_b.name = Some("pkg-b".to_string());
     manifest_b.version = Some("1.0.0".to_string());
-    manifest_b.dev_dependencies.insert("pkg-c".to_string(), "workspace:*".to_string());
-    manifest_b.dev_dependencies.insert("pkg-a".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dev_dependencies
+        .insert("pkg-c".to_string(), "workspace:*".to_string());
+    manifest_b
+        .dev_dependencies
+        .insert("pkg-a".to_string(), "workspace:*".to_string());
     let member_b = WorkspaceMember {
         name: "pkg-b".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3758,8 +4503,12 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
     let mut manifest_c = Manifest::default();
     manifest_c.name = Some("pkg-c".to_string());
     manifest_c.version = Some("1.0.0".to_string());
-    manifest_c.peer_dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest_c.peer_dependencies.insert("shared-logger".to_string(), "^2.0.0".to_string());
+    manifest_c
+        .peer_dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest_c
+        .peer_dependencies
+        .insert("shared-logger".to_string(), "^2.0.0".to_string());
     let member_c = WorkspaceMember {
         name: "pkg-c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3769,8 +4518,12 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
     };
 
     // 1. Verify that WorkspaceDependencyGraph::construct gracefully breaks the circular devDependency back-edge (pkg-b -> pkg-a)
-    let ws_graph = WorkspaceDependencyGraph::construct(&[member_a.clone(), member_b.clone(), member_c.clone()])
-        .expect("Circular devDependencies in workspace must construct and topo sort successfully");
+    let ws_graph = WorkspaceDependencyGraph::construct(&[
+        member_a.clone(),
+        member_b.clone(),
+        member_c.clone(),
+    ])
+    .expect("Circular devDependencies in workspace must construct and topo sort successfully");
 
     // Sibling dependencies separation
     assert!(ws_graph.dependencies["pkg-a"].contains_key("pkg-b"));
@@ -3778,9 +4531,20 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
     assert!(ws_graph.dev_dependencies["pkg-b"].contains_key("pkg-c"));
 
     // In topological order, leaf pkg-b must precede dependent pkg-a
-    let pos_a = ws_graph.topological_order.iter().position(|x| x == "pkg-a").unwrap();
-    let pos_b = ws_graph.topological_order.iter().position(|x| x == "pkg-b").unwrap();
-    assert!(pos_b < pos_a, "Leaf dependency pkg-b must precede dependent pkg-a");
+    let pos_a = ws_graph
+        .topological_order
+        .iter()
+        .position(|x| x == "pkg-a")
+        .unwrap();
+    let pos_b = ws_graph
+        .topological_order
+        .iter()
+        .position(|x| x == "pkg-b")
+        .unwrap();
+    assert!(
+        pos_b < pos_a,
+        "Leaf dependency pkg-b must precede dependent pkg-a"
+    );
 
     // 2. Full workspace graph resolution with peer satisfaction
     let options = ResolverOptions {
@@ -3792,7 +4556,8 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
         &[member_a.clone(), member_b.clone(), member_c.clone()],
         &provider,
         &options,
-    ).expect("Workspace resolution must preserve peer satisfaction despite dev cycle breaking");
+    )
+    .expect("Workspace resolution must preserve peer satisfaction despite dev cycle breaking");
 
     // All workspace links and locations exist
     assert!(graph.nodes.contains_key("node_modules/pkg-a"));
@@ -3823,19 +4588,25 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
 
     // Verify edges from pkg-c: peer satisfaction to pkg-a AND external shared-logger
     let edges_c = graph.get_outgoing_edges("packages/pkg-c");
-    let peer_edge_a = edges_c.iter().find(|e| e.package_name == "pkg-a")
+    let peer_edge_a = edges_c
+        .iter()
+        .find(|e| e.package_name == "pkg-a")
         .expect("pkg-c must have resolved peer dependency edge to pkg-a");
     assert_eq!(peer_edge_a.dep_type, DependencyType::Peer);
     assert_eq!(peer_edge_a.to_location, "node_modules/pkg-a");
 
-    let peer_edge_logger = edges_c.iter().find(|e| e.package_name == "shared-logger")
+    let peer_edge_logger = edges_c
+        .iter()
+        .find(|e| e.package_name == "shared-logger")
         .expect("pkg-c must have resolved peer dependency edge to shared-logger");
     assert_eq!(peer_edge_logger.dep_type, DependencyType::Peer);
     assert_eq!(peer_edge_logger.to_location, "node_modules/shared-logger");
 
     // 3. Strict peer conflict verification: if pkg-c requires incompatible pkg-a (^2.0.0)
     let mut manifest_c_bad = manifest_c.clone();
-    manifest_c_bad.peer_dependencies.insert("pkg-a".to_string(), "^2.0.0".to_string());
+    manifest_c_bad
+        .peer_dependencies
+        .insert("pkg-a".to_string(), "^2.0.0".to_string());
     let member_c_bad = WorkspaceMember {
         name: "pkg-c".to_string(),
         version: Some("1.0.0".to_string()),
@@ -3849,7 +4620,8 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
         &[member_a, member_b, member_c_bad],
         &provider,
         &options,
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(strict_err.is_peer_conflict());
     match strict_err {
         SolverError::PeerConflict { peer, .. } => {
@@ -3861,8 +4633,8 @@ fn test_adversarial_workspace_circular_dev_with_peer_chains() {
 
 #[test]
 fn test_required_platform_incompatibility_fails_ebadplatform() {
-    use crate::solver::Solver;
     use crate::overrides::Overrides;
+    use crate::solver::Solver;
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("darwin-only", "1.0.0", |v| {
         v.os = Some(vec!["darwin".to_string()]);
@@ -3871,7 +4643,9 @@ fn test_required_platform_incompatibility_fails_ebadplatform() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("my-app".to_string());
-    manifest.dependencies.insert("darwin-only".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("darwin-only".to_string(), "^1.0.0".to_string());
 
     let mut options = ResolverOptions::default();
     options.platform = Platform {
@@ -3882,16 +4656,25 @@ fn test_required_platform_incompatibility_fails_ebadplatform() {
 
     let solver = Solver::new(&provider, options, Overrides::default());
     let err = solver.resolve(&manifest).unwrap_err();
-    assert!(err.is_platform_incompatible(), "Must be platform incompatible error");
+    assert!(
+        err.is_platform_incompatible(),
+        "Must be platform incompatible error"
+    );
     let err_str = err.to_string();
-    assert!(err_str.contains("EBADPLATFORM"), "Error must contain EBADPLATFORM: {err_str}");
-    assert!(err_str.contains("darwin-only"), "Error must mention package: {err_str}");
+    assert!(
+        err_str.contains("EBADPLATFORM"),
+        "Error must contain EBADPLATFORM: {err_str}"
+    );
+    assert!(
+        err_str.contains("darwin-only"),
+        "Error must mention package: {err_str}"
+    );
 }
 
 #[test]
 fn test_optional_platform_incompatibility_is_skipped() {
-    use crate::solver::Solver;
     use crate::overrides::Overrides;
+    use crate::solver::Solver;
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("darwin-opt", "1.0.0", |v| {
         v.os = Some(vec!["darwin".to_string()]);
@@ -3899,7 +4682,9 @@ fn test_optional_platform_incompatibility_is_skipped() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("my-app".to_string());
-    manifest.optional_dependencies.insert("darwin-opt".to_string(), "^1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("darwin-opt".to_string(), "^1.0.0".to_string());
 
     let mut options = ResolverOptions::default();
     options.platform = Platform {
@@ -3909,29 +4694,46 @@ fn test_optional_platform_incompatibility_is_skipped() {
     };
 
     let solver = Solver::new(&provider, options, Overrides::default());
-    let graph = solver.resolve(&manifest).expect("Optional incompatible platform should succeed and skip");
-    assert!(graph.is_skipped("darwin-opt"), "darwin-opt must be in skipped set");
+    let graph = solver
+        .resolve(&manifest)
+        .expect("Optional incompatible platform should succeed and skip");
+    assert!(
+        graph.is_skipped("darwin-opt"),
+        "darwin-opt must be in skipped set"
+    );
 }
 
 #[test]
 fn test_lockfile_v3_preserves_peer_dependencies_meta_and_overrides() {
-    use rnpm_core::manifest::PeerDependencyMeta;
-    use crate::solver::Solver;
     use crate::overrides::Overrides;
+    use crate::solver::Solver;
+    use rnpm_core::manifest::PeerDependencyMeta;
 
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("my-plugin", "1.0.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
-        v.peer_dependencies_meta.insert("react".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies_meta
+            .insert("react".to_string(), PeerDependencyMeta { optional: true });
     });
     provider.add_version("react", "18.2.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("root-app".to_string());
-    manifest.dependencies.insert("my-plugin".to_string(), "1.0.0".to_string());
-    manifest.peer_dependencies.insert("root-peer".to_string(), "^2.0.0".to_string());
-    manifest.peer_dependencies_meta.insert("root-peer".to_string(), PeerDependencyMeta { optional: true });
-    manifest.extra.insert("overrides".to_string(), serde_json::json!({ "react": "18.2.0" }));
+    manifest
+        .dependencies
+        .insert("my-plugin".to_string(), "1.0.0".to_string());
+    manifest
+        .peer_dependencies
+        .insert("root-peer".to_string(), "^2.0.0".to_string());
+    manifest.peer_dependencies_meta.insert(
+        "root-peer".to_string(),
+        PeerDependencyMeta { optional: true },
+    );
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "react": "18.2.0" }),
+    );
 
     let options = ResolverOptions::default();
     let overrides = Overrides::from_manifest(&manifest).unwrap();
@@ -3940,13 +4742,168 @@ fn test_lockfile_v3_preserves_peer_dependencies_meta_and_overrides() {
 
     let lockfile = graph.to_lockfile_v3("root-app", Some("1.0.0"));
     let root_pkg = lockfile.packages.get("").expect("Root package must exist");
-    assert!(root_pkg.extra.contains_key("overrides"), "Root overrides must be preserved");
-    assert!(root_pkg.peer_dependencies.as_ref().unwrap().contains_key("root-peer"));
-    assert!(root_pkg.peer_dependencies_meta.as_ref().unwrap().contains_key("root-peer"));
+    assert!(
+        !root_pkg.extra.contains_key("overrides"),
+        "Root overrides must not be emitted into lockfile extra"
+    );
+    assert!(
+        !root_pkg.extra.contains_key("directories"),
+        "Root directories must not be emitted into lockfile extra"
+    );
+    assert!(root_pkg
+        .peer_dependencies
+        .as_ref()
+        .unwrap()
+        .contains_key("root-peer"));
+    assert!(root_pkg
+        .peer_dependencies_meta
+        .as_ref()
+        .unwrap()
+        .contains_key("root-peer"));
 
-    let plugin_pkg = lockfile.packages.get("node_modules/my-plugin").expect("my-plugin node must exist");
-    assert!(plugin_pkg.peer_dependencies.as_ref().unwrap().contains_key("react"));
-    assert!(plugin_pkg.peer_dependencies_meta.as_ref().unwrap().contains_key("react"));
+    let plugin_pkg = lockfile
+        .packages
+        .get("node_modules/my-plugin")
+        .expect("my-plugin node must exist");
+    assert!(plugin_pkg
+        .peer_dependencies
+        .as_ref()
+        .unwrap()
+        .contains_key("react"));
+    assert!(plugin_pkg
+        .peer_dependencies_meta
+        .as_ref()
+        .unwrap()
+        .contains_key("react"));
+}
+
+#[test]
+fn test_arborist_lockfile_metadata_alignment() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Dev tool watcher with an optional native addon
+    provider.add_version("dev-watcher", "1.0.0", |v| {
+        v.optional_dependencies
+            .insert("dev-opt-addon".to_string(), "1.0.0".to_string());
+    });
+
+    // Package 1: Dev + optional combined dependency (e.g. dev tool optional addon)
+    provider.add_version("dev-opt-addon", "1.0.0", |v| {
+        v.license = Some("Apache-2.0".to_string());
+        v.libc = Some(vec!["glibc".to_string()]);
+        v.extra.insert(
+            "directories".to_string(),
+            serde_json::json!({ "doc": "docs" }),
+        );
+        v.extra
+            .insert("deprecated".to_string(), serde_json::Value::Bool(false));
+    });
+
+    // Package 2: Deprecated package with a message
+    provider.add_version("deprecated-pkg", "2.0.0", |v| {
+        v.deprecated = Some("Deprecated in favor of new-pkg".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("meta-alignment-app".to_string());
+    // Dev watcher is a dev dependency
+    manifest
+        .dev_dependencies
+        .insert("dev-watcher".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("deprecated-pkg".to_string(), "2.0.0".to_string());
+
+    // Root spurious extra fields that npm Arborist omits
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "foo": "1.0.0" }),
+    );
+    manifest.extra.insert(
+        "directories".to_string(),
+        serde_json::json!({ "bin": "bin" }),
+    );
+    manifest
+        .extra
+        .insert("deprecated".to_string(), serde_json::Value::Bool(false));
+    manifest.extra.insert(
+        "funding".to_string(),
+        serde_json::json!({ "type": "individual", "url": "https://example.com" }),
+    );
+
+    let options = ResolverOptions::default();
+    let solver =
+        crate::solver::Solver::new(&provider, options, crate::overrides::Overrides::default());
+    let graph = solver.resolve(&manifest).unwrap();
+    let lockfile = graph.to_lockfile_v3("meta-alignment-app", Some("1.0.0"));
+
+    // 1. Root package checks
+    let root_pkg = lockfile.packages.get("").expect("Root package must exist");
+    assert!(
+        !root_pkg.extra.contains_key("overrides"),
+        "Root must not emit overrides in lockfile extra"
+    );
+    assert!(
+        !root_pkg.extra.contains_key("directories"),
+        "Root must not emit directories in lockfile extra"
+    );
+    assert!(
+        !root_pkg.extra.contains_key("deprecated"),
+        "Root must not emit deprecated: false in lockfile extra"
+    );
+    assert!(
+        root_pkg.extra.contains_key("funding"),
+        "Root must preserve valid funding in lockfile extra"
+    );
+
+    // 2. Normal package: dev-opt-addon
+    let addon_pkg = lockfile
+        .packages
+        .get("node_modules/dev-opt-addon")
+        .expect("dev-opt-addon must exist");
+    assert_eq!(
+        addon_pkg.license.as_deref(),
+        Some("Apache-2.0"),
+        "License must be set correctly"
+    );
+    assert_eq!(
+        addon_pkg.libc.as_deref(),
+        Some(&["glibc".to_string()][..]),
+        "Libc must be set correctly"
+    );
+    assert_eq!(
+        addon_pkg.dev,
+        Some(true),
+        "Must emit dev: true when both dev and optional"
+    );
+    assert_eq!(
+        addon_pkg.optional,
+        Some(true),
+        "Must emit optional: true when both dev and optional"
+    );
+    assert_eq!(
+        addon_pkg.dev_optional, None,
+        "Must not emit devOptional in fresh v3 lockfiles"
+    );
+    assert!(
+        !addon_pkg.extra.contains_key("directories"),
+        "Must omit directories from lockfile package entries"
+    );
+    assert!(
+        !addon_pkg.extra.contains_key("deprecated"),
+        "Must omit deprecated: false from lockfile package entries"
+    );
+
+    // 3. Normal package: deprecated-pkg
+    let dep_pkg = lockfile
+        .packages
+        .get("node_modules/deprecated-pkg")
+        .expect("deprecated-pkg must exist");
+    assert_eq!(
+        dep_pkg.extra.get("deprecated").and_then(|v| v.as_str()),
+        Some("Deprecated in favor of new-pkg"),
+        "Must preserve real string deprecation messages"
+    );
 }
 
 #[test]
@@ -3954,12 +4911,15 @@ fn test_default_peer_resolution_auto_installs_transitive_peer() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("core-lib", "1.2.0", |_| {});
     provider.add_version("plugin-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-lib".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("default-peer-auto-install".to_string());
-    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-a".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
@@ -3968,9 +4928,16 @@ fn test_default_peer_resolution_auto_installs_transitive_peer() {
     assert!(graph.nodes.contains_key("node_modules/core-lib"));
     let core_node = graph.nodes.get("node_modules/core-lib").unwrap();
     assert_eq!(core_node.version, "1.2.0");
-    assert!(core_node.flags.peer, "Auto-installed peer dependency must have peer flag set");
+    assert!(
+        core_node.flags.peer,
+        "Auto-installed peer dependency must have peer flag set"
+    );
 
-    let peer_edge = graph.edges.iter().find(|e| e.package_name == "core-lib").unwrap();
+    let peer_edge = graph
+        .edges
+        .iter()
+        .find(|e| e.package_name == "core-lib")
+        .unwrap();
     assert_eq!(peer_edge.from_location, "node_modules/plugin-a");
     assert_eq!(peer_edge.to_location, "node_modules/core-lib");
     assert_eq!(peer_edge.dep_type, DependencyType::Peer);
@@ -3982,20 +4949,27 @@ fn test_default_peer_resolution_fails_on_conflict_with_eresolve() {
     provider.add_version("core-lib", "1.0.0", |_| {});
     provider.add_version("core-lib", "2.0.0", |_| {});
     provider.add_version("plugin-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-lib".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-conflict-default".to_string());
-    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-a".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions::default();
     let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
 
     assert!(err.is_peer_conflict());
     let err_str = err.to_string();
-    assert!(err_str.contains("ERESOLVE: Conflicting peer dependency 'core-lib' required by 'plugin-a'"));
+    assert!(
+        err_str.contains("ERESOLVE: Conflicting peer dependency 'core-lib' required by 'plugin-a'")
+    );
     assert!(err_str.contains("peer core-lib@\"^1.0.0\" from plugin-a"));
     assert!(err_str.contains("Found: core-lib@2.0.0 at node_modules/core-lib"));
     assert!(err_str.contains("--legacy-peer-deps"));
@@ -4003,29 +4977,42 @@ fn test_default_peer_resolution_fails_on_conflict_with_eresolve() {
 
 #[test]
 fn test_default_peer_resolution_with_overrides_resolves_conflict() {
-    use crate::solver::Solver;
     use crate::overrides::Overrides;
+    use crate::solver::Solver;
 
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("core-lib", "1.0.0", |_| {});
     provider.add_version("core-lib", "2.0.0", |_| {});
     provider.add_version("plugin-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-lib".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("peer-conflict-override".to_string());
-    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
-    manifest.extra.insert("overrides".to_string(), serde_json::json!({ "core-lib": "2.0.0" }));
+    manifest
+        .dependencies
+        .insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "core-lib": "2.0.0" }),
+    );
 
     let options = ResolverOptions::default();
     let overrides = Overrides::from_manifest(&manifest).unwrap();
     let solver = Solver::new(&provider, options, overrides);
-    let graph = solver.resolve(&manifest).expect("Overrides must resolve conflicting peer dependency");
+    let graph = solver
+        .resolve(&manifest)
+        .expect("Overrides must resolve conflicting peer dependency");
 
     assert!(graph.nodes.contains_key("node_modules/core-lib"));
-    assert_eq!(graph.nodes.get("node_modules/core-lib").unwrap().version, "2.0.0");
+    assert_eq!(
+        graph.nodes.get("node_modules/core-lib").unwrap().version,
+        "2.0.0"
+    );
 }
 
 #[test]
@@ -4034,14 +5021,21 @@ fn test_legacy_peer_deps_completely_bypasses_peer_dependencies_and_conflicts() {
     provider.add_version("core-lib", "1.0.0", |_| {});
     provider.add_version("core-lib", "2.0.0", |_| {});
     provider.add_version("plugin-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-lib".to_string(), "^1.0.0".to_string());
     });
     // Root also declares peerDependencies that should be ignored
     let mut manifest = Manifest::default();
     manifest.name = Some("legacy-peer-app".to_string());
-    manifest.dependencies.insert("core-lib".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("plugin-a".to_string(), "1.0.0".to_string());
-    manifest.peer_dependencies.insert("uninstalled-peer".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-lib".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-a".to_string(), "1.0.0".to_string());
+    manifest
+        .peer_dependencies
+        .insert("uninstalled-peer".to_string(), "^1.0.0".to_string());
 
     let options = ResolverOptions {
         legacy_peer_deps: true,
@@ -4052,25 +5046,36 @@ fn test_legacy_peer_deps_completely_bypasses_peer_dependencies_and_conflicts() {
 
     assert!(graph.nodes.contains_key("node_modules/core-lib"));
     assert!(graph.nodes.contains_key("node_modules/plugin-a"));
-    assert!(!graph.nodes.contains_key("node_modules/uninstalled-peer"), "Root peer must not be auto-installed in legacy mode");
+    assert!(
+        !graph.nodes.contains_key("node_modules/uninstalled-peer"),
+        "Root peer must not be auto-installed in legacy mode"
+    );
     // Ensure no peer edges exist
-    assert!(graph.edges.iter().all(|e| e.dep_type != DependencyType::Peer && e.dep_type != DependencyType::PeerOptional));
+    assert!(graph
+        .edges
+        .iter()
+        .all(|e| e.dep_type != DependencyType::Peer && e.dep_type != DependencyType::PeerOptional));
 }
 
 #[test]
 fn test_legacy_peer_deps_bypasses_missing_and_cyclic_peers() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("cyclic-a", "1.0.0", |v| {
-        v.peer_dependencies.insert("cyclic-b".to_string(), "^2.0.0".to_string());
-        v.peer_dependencies.insert("missing-pkg".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("cyclic-b".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("missing-pkg".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("cyclic-b", "1.0.0", |v| {
-        v.peer_dependencies.insert("cyclic-a".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("cyclic-a".to_string(), "^2.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("legacy-cyclic-test".to_string());
-    manifest.dependencies.insert("cyclic-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("cyclic-a".to_string(), "1.0.0".to_string());
 
     let legacy_opts = ResolverOptions {
         legacy_peer_deps: true,
@@ -4094,12 +5099,15 @@ fn test_legacy_peer_deps_bypasses_missing_and_cyclic_peers() {
 fn test_strict_peer_deps_fails_on_missing_peer_package() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("lib-with-missing-peer", "1.0.0", |v| {
-        v.peer_dependencies.insert("ghost-pkg".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("ghost-pkg".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("strict-missing-peer".to_string());
-    manifest.dependencies.insert("lib-with-missing-peer".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("lib-with-missing-peer".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions {
         strict_peer_deps: true,
@@ -4109,7 +5117,169 @@ fn test_strict_peer_deps_fails_on_missing_peer_package() {
     assert!(err.is_peer_conflict());
     let err_str = err.to_string();
     assert!(err_str.contains("ERESOLVE: Conflicting peer dependency 'ghost-pkg'"));
-    assert!(err_str.contains("Peer package '^1.0.0' not found in registry") || err_str.contains("ghost-pkg"));
+    assert!(
+        err_str.contains("Peer package '^1.0.0' not found in registry")
+            || err_str.contains("ghost-pkg")
+    );
+}
+
+#[test]
+fn test_dev_optional_lockfile_v3_emission_matches_arborist() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // 1. Dev tool that has an optional dependency (dev && optional)
+    provider.add_version("dev-tool", "1.0.0", |v| {
+        v.optional_dependencies
+            .insert("dev-and-opt-addon".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("shared-helper".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("dev-and-opt-addon", "1.0.0", |_| {});
+
+    // 2. Optional tool that also depends on shared-helper (making shared-helper reachable from dev and opt)
+    provider.add_version("opt-tool", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared-helper".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("shared-helper", "1.0.0", |_| {});
+
+    // 3. Prod tool that also depends on prod-shared (making prod-shared reachable from prod, dev, and opt)
+    provider.add_version("prod-tool", "1.0.0", |v| {
+        v.dependencies
+            .insert("prod-shared".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("prod-shared", "1.0.0", |_| {});
+
+    provider.add_version("dev-tool-2", "1.0.0", |v| {
+        v.dependencies
+            .insert("prod-shared".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("opt-tool-2", "1.0.0", |v| {
+        v.dependencies
+            .insert("prod-shared".to_string(), "1.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-opt-alignment-app".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "1.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dev-tool-2".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("opt-tool".to_string(), "1.0.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("opt-tool-2".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("prod-tool".to_string(), "1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let solver =
+        crate::solver::Solver::new(&provider, options, crate::overrides::Overrides::default());
+    let graph = solver.resolve(&manifest).unwrap();
+    let lockfile = graph.to_lockfile_v3("dev-opt-alignment-app", Some("1.0.0"));
+
+    // Case 1: dev-tool is exclusively dev
+    let dev_pkg = lockfile
+        .packages
+        .get("node_modules/dev-tool")
+        .expect("dev-tool must exist");
+    assert_eq!(dev_pkg.dev, Some(true));
+    assert_eq!(dev_pkg.optional, None);
+    assert_eq!(dev_pkg.dev_optional, None);
+
+    // Case 2: opt-tool is exclusively optional
+    let opt_pkg = lockfile
+        .packages
+        .get("node_modules/opt-tool")
+        .expect("opt-tool must exist");
+    assert_eq!(opt_pkg.dev, None);
+    assert_eq!(opt_pkg.optional, Some(true));
+    assert_eq!(opt_pkg.dev_optional, None);
+
+    // Case 3: dev-and-opt-addon is reachable only through dev-tool via an optional edge.
+    // It is both dev and optional (`dev && optional`): emit `dev: true, optional: true` and omit `devOptional`.
+    let addon_pkg = lockfile
+        .packages
+        .get("node_modules/dev-and-opt-addon")
+        .expect("dev-and-opt-addon must exist");
+    assert_eq!(
+        addon_pkg.dev,
+        Some(true),
+        "Must emit dev: true when both dev and optional"
+    );
+    assert_eq!(
+        addon_pkg.optional,
+        Some(true),
+        "Must emit optional: true when both dev and optional"
+    );
+    assert_eq!(
+        addon_pkg.dev_optional, None,
+        "Must NOT emit devOptional when both dev and optional"
+    );
+
+    // Case 4: shared-helper is reached by dev-tool (dev path) and opt-tool (optional path),
+    // but neither is pure prod, and it is neither exclusively dev nor exclusively optional.
+    // Emit `devOptional: true` (and omit `dev` and `optional`).
+    let helper_pkg = lockfile
+        .packages
+        .get("node_modules/shared-helper")
+        .expect("shared-helper must exist");
+    assert_eq!(
+        helper_pkg.dev_optional,
+        Some(true),
+        "Must emit devOptional: true when reachable from dev and optional paths"
+    );
+    assert_eq!(
+        helper_pkg.dev, None,
+        "Must NOT emit dev when devOptional is true"
+    );
+    assert_eq!(
+        helper_pkg.optional, None,
+        "Must NOT emit optional when devOptional is true"
+    );
+
+    // Case 5: prod-shared is reached by dev-tool-2, opt-tool-2, AND prod-tool.
+    // Because it is reachable by a pure prod path, omit dev, optional, and devOptional.
+    let prod_shared_pkg = lockfile
+        .packages
+        .get("node_modules/prod-shared")
+        .expect("prod-shared must exist");
+    assert_eq!(prod_shared_pkg.dev, None);
+    assert_eq!(prod_shared_pkg.optional, None);
+    assert_eq!(prod_shared_pkg.dev_optional, None);
+
+    // Verify round-trip via from_lockfile_v3
+    let reimported_graph = crate::graph::DependencyGraph::from_lockfile_v3(&lockfile);
+    let helper_node = reimported_graph
+        .nodes
+        .get("node_modules/shared-helper")
+        .expect("shared-helper node");
+    assert!(helper_node.flags.dev_optional);
+    assert!(!helper_node.flags.dev);
+    assert!(!helper_node.flags.optional);
+
+    let addon_node = reimported_graph
+        .nodes
+        .get("node_modules/dev-and-opt-addon")
+        .expect("addon node");
+    assert!(addon_node.flags.dev);
+    assert!(addon_node.flags.optional);
+    assert!(!addon_node.flags.dev_optional);
+
+    let reserialized_lockfile =
+        reimported_graph.to_lockfile_v3("dev-opt-alignment-app", Some("1.0.0"));
+    let reserialized_helper = reserialized_lockfile
+        .packages
+        .get("node_modules/shared-helper")
+        .unwrap();
+    assert_eq!(reserialized_helper.dev_optional, Some(true));
+    assert_eq!(reserialized_helper.dev, None);
+    assert_eq!(reserialized_helper.optional, None);
 }
 
 #[test]
@@ -4117,12 +5287,15 @@ fn test_strict_peer_deps_fails_on_no_matching_version() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("peer-lib", "1.0.0", |_| {});
     provider.add_version("pkg-requiring-v5", "1.0.0", |v| {
-        v.peer_dependencies.insert("peer-lib".to_string(), "^5.0.0".to_string());
+        v.peer_dependencies
+            .insert("peer-lib".to_string(), "^5.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("strict-no-version".to_string());
-    manifest.dependencies.insert("pkg-requiring-v5".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-requiring-v5".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions {
         strict_peer_deps: true,
@@ -4139,13 +5312,18 @@ fn test_strict_peer_deps_succeeds_when_peers_are_satisfied() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("core-lib", "1.5.0", |_| {});
     provider.add_version("plugin-ok", "1.0.0", |v| {
-        v.peer_dependencies.insert("core-lib".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("core-lib".to_string(), "^1.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("strict-satisfied".to_string());
-    manifest.dependencies.insert("core-lib".to_string(), "1.5.0".to_string());
-    manifest.dependencies.insert("plugin-ok".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("core-lib".to_string(), "1.5.0".to_string());
+    manifest
+        .dependencies
+        .insert("plugin-ok".to_string(), "1.0.0".to_string());
 
     let options = ResolverOptions {
         strict_peer_deps: true,

@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::path::{Path, PathBuf};
 use anyhow::Context;
 use reqwest::Url;
 use rnpm_registry::{RegistryClient, RegistryClientConfig};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Options controlling diff generation and formatting.
 #[derive(Debug, Clone)]
@@ -112,7 +112,8 @@ pub fn myers_diff(a: &[&str], b: &[&str], ignore_all_space: bool) -> Vec<DiffOp>
         let d_isize = d as isize;
 
         let prev_k = if k == -d_isize
-            || (k != d_isize && v_prev[(k - 1 + offset) as usize] < v_prev[(k + 1 + offset) as usize])
+            || (k != d_isize
+                && v_prev[(k - 1 + offset) as usize] < v_prev[(k + 1 + offset) as usize])
         {
             k + 1
         } else {
@@ -372,11 +373,15 @@ async fn fetch_registry_package_files(
         let parsed = Url::parse(reg).context("Invalid registry URL")?;
         client_config.default_registry = parsed.clone();
         if let Some(host) = parsed.host_str() {
-            client_config.trusted_hosts.insert(host.to_ascii_lowercase());
+            client_config
+                .trusted_hosts
+                .insert(host.to_ascii_lowercase());
             if let Some(port) = parsed.port_or_known_default() {
-                client_config
-                    .trusted_hosts
-                    .insert(format!("{}:{}", host.to_ascii_lowercase(), port));
+                client_config.trusted_hosts.insert(format!(
+                    "{}:{}",
+                    host.to_ascii_lowercase(),
+                    port
+                ));
             }
         }
     }
@@ -410,16 +415,23 @@ async fn fetch_registry_package_files(
             .filter(|v| range.satisfies(v))
             .collect();
         matching.sort();
-        let highest = matching
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("npm error code ETARGET\nnpm error No matching version found for '{}@{}'", pkg_name, version_req))?;
+        let highest = matching.last().ok_or_else(|| {
+            anyhow::anyhow!(
+                "npm error code ETARGET\nnpm error No matching version found for '{}@{}'",
+                pkg_name,
+                version_req
+            )
+        })?;
         highest.to_string()
     };
 
-    let ver_info = packument
-        .versions
-        .get(&resolved_version)
-        .ok_or_else(|| anyhow::anyhow!("Version '{}' not found in packument for '{}'", resolved_version, pkg_name))?;
+    let ver_info = packument.versions.get(&resolved_version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Version '{}' not found in packument for '{}'",
+            resolved_version,
+            pkg_name
+        )
+    })?;
 
     let tarball_url = &ver_info.dist.tarball;
     let tarball_bytes = client
@@ -515,8 +527,14 @@ pub fn generate_diff(
         ("".to_string(), "".to_string())
     } else {
         (
-            options.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
-            options.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
+            options
+                .src_prefix
+                .clone()
+                .unwrap_or_else(|| "a/".to_string()),
+            options
+                .dst_prefix
+                .clone()
+                .unwrap_or_else(|| "b/".to_string()),
         )
     };
 
@@ -548,23 +566,35 @@ pub fn generate_diff(
                 } else {
                     "/dev/null".to_string()
                 };
-                output.push_str(&format!("diff --git {src_prefix}{path} {dst_prefix}{path}\n"));
+                output.push_str(&format!(
+                    "diff --git {src_prefix}{path} {dst_prefix}{path}\n"
+                ));
                 output.push_str(&format!("Binary files {src_desc} and {dst_desc} differ\n"));
             }
             continue;
         }
 
-        let a_str = a_bytes.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
-        let b_str = b_bytes.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+        let a_str = a_bytes
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let b_str = b_bytes
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
 
         let a_lines: Vec<&str> = if a_bytes.is_some() {
-            a_str.lines().map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+            a_str
+                .lines()
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .collect()
         } else {
             Vec::new()
         };
 
         let b_lines: Vec<&str> = if b_bytes.is_some() {
-            b_str.lines().map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+            b_str
+                .lines()
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .collect()
         } else {
             Vec::new()
         };
@@ -590,7 +620,9 @@ pub fn generate_diff(
                 "/dev/null".to_string()
             };
 
-            output.push_str(&format!("diff --git {src_prefix}{path} {dst_prefix}{path}\n"));
+            output.push_str(&format!(
+                "diff --git {src_prefix}{path} {dst_prefix}{path}\n"
+            ));
             output.push_str(&format!("--- {src_hdr}\n"));
             output.push_str(&format!("+++ {dst_hdr}\n"));
 
@@ -628,12 +660,12 @@ pub async fn run_diff(
                 ));
             }
             let manifest = rnpm_core::manifest::Manifest::from_file(&manifest_path)?;
-            let name = manifest.name.ok_or_else(|| {
-                anyhow::anyhow!("npm error package.json has no 'name' field")
-            })?;
-            let version = manifest.version.ok_or_else(|| {
-                anyhow::anyhow!("npm error package.json has no 'version' field")
-            })?;
+            let name = manifest
+                .name
+                .ok_or_else(|| anyhow::anyhow!("npm error package.json has no 'name' field"))?;
+            let version = manifest
+                .version
+                .ok_or_else(|| anyhow::anyhow!("npm error package.json has no 'version' field"))?;
             let spec_a = format!("{}@{}", name, version);
             let files_a = resolve_spec_files(&spec_a, current_dir, registry_url.as_deref()).await?;
             let files_b = read_directory_files(current_dir)?;
@@ -641,14 +673,17 @@ pub async fn run_diff(
         }
         1 => {
             // Compare spec vs current directory
-            let files_a = resolve_spec_files(&all_specs[0], current_dir, registry_url.as_deref()).await?;
+            let files_a =
+                resolve_spec_files(&all_specs[0], current_dir, registry_url.as_deref()).await?;
             let files_b = read_directory_files(current_dir)?;
             (files_a, files_b)
         }
         2 => {
             // Compare spec1 vs spec2
-            let files_a = resolve_spec_files(&all_specs[0], current_dir, registry_url.as_deref()).await?;
-            let files_b = resolve_spec_files(&all_specs[1], current_dir, registry_url.as_deref()).await?;
+            let files_a =
+                resolve_spec_files(&all_specs[0], current_dir, registry_url.as_deref()).await?;
+            let files_b =
+                resolve_spec_files(&all_specs[1], current_dir, registry_url.as_deref()).await?;
             (files_a, files_b)
         }
         n => {
@@ -702,10 +737,7 @@ mod tests {
         let hunks = build_hunks(&a, &b, &ops, 3);
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].header, "@@ -1,3 +1,3 @@");
-        assert_eq!(
-            hunks[0].lines,
-            vec![" a", "-b", "+x", " c"]
-        );
+        assert_eq!(hunks[0].lines, vec![" a", "-b", "+x", " c"]);
     }
 
     #[test]
@@ -736,10 +768,14 @@ mod tests {
         assert!(diff_text.contains("--- /dev/null"));
         assert!(diff_text.contains("+++ b/bar.txt"));
 
-        let diff_names = generate_diff(&files_a, &files_b, &DiffOptions {
-            name_only: true,
-            ..Default::default()
-        });
+        let diff_names = generate_diff(
+            &files_a,
+            &files_b,
+            &DiffOptions {
+                name_only: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(diff_names, "bar.txt\nfoo.txt\n");
     }
 
@@ -752,20 +788,28 @@ mod tests {
         files_b.insert("app.js".to_string(), b"v2\n".to_vec());
 
         // Custom prefixes
-        let diff_custom = generate_diff(&files_a, &files_b, &DiffOptions {
-            src_prefix: Some("src/".to_string()),
-            dst_prefix: Some("dst/".to_string()),
-            ..Default::default()
-        });
+        let diff_custom = generate_diff(
+            &files_a,
+            &files_b,
+            &DiffOptions {
+                src_prefix: Some("src/".to_string()),
+                dst_prefix: Some("dst/".to_string()),
+                ..Default::default()
+            },
+        );
         assert!(diff_custom.contains("diff --git src/app.js dst/app.js"));
         assert!(diff_custom.contains("--- src/app.js"));
         assert!(diff_custom.contains("+++ dst/app.js"));
 
         // No prefix
-        let diff_noprefix = generate_diff(&files_a, &files_b, &DiffOptions {
-            no_prefix: true,
-            ..Default::default()
-        });
+        let diff_noprefix = generate_diff(
+            &files_a,
+            &files_b,
+            &DiffOptions {
+                no_prefix: true,
+                ..Default::default()
+            },
+        );
         assert!(diff_noprefix.contains("diff --git app.js app.js"));
         assert!(diff_noprefix.contains("--- app.js"));
         assert!(diff_noprefix.contains("+++ app.js"));

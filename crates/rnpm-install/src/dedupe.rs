@@ -1,12 +1,12 @@
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
 
+use crate::prune::{extract_package_name_from_path, scan_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_fs::junction::{is_junction, remove_dir_all_safe};
 use rnpm_lockfile::LockfileV3;
-use crate::prune::{extract_package_name_from_path, scan_node_modules};
 
 /// Options controlling `npm dedupe` and `npm find-dupes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +199,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
     };
 
     // 2. Load lockfile if present
-    let lockfile_path = project_dir.join("package-lock.json");
+    let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
     let mut lockfile = if lockfile_path.is_file() {
         LockfileV3::load_from_file(&lockfile_path).ok()
     } else {
@@ -312,7 +312,8 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
             let filter_matches = options.packages.iter().any(|f| {
                 f == &pkg.name
                     || f == pkg.name.strip_prefix('@').unwrap_or(&pkg.name)
-                    || (pkg.name.contains('/') && f == pkg.name.rsplit('/').next().unwrap_or(&pkg.name))
+                    || (pkg.name.contains('/')
+                        && f == pkg.name.rsplit('/').next().unwrap_or(&pkg.name))
             });
             if !filter_matches {
                 continue;

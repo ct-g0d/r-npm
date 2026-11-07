@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
-use serde::{Deserialize, Serialize};
 use reqwest::Url;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_lockfile::LockfileV3;
 use rnpm_registry::metadata::AbbreviatedVersion;
 use rnpm_registry::{RegistryClient, RegistryClientConfig};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 /// Options for outdated command.
 #[derive(Debug, Clone, Default)]
@@ -32,10 +32,10 @@ pub struct OutdatedPackage {
     pub current: String,
     pub wanted: String,
     pub latest: String,
-    pub location: String,          // Relative location, e.g. "node_modules/chalk"
+    pub location: String, // Relative location, e.g. "node_modules/chalk"
     pub absolute_location: String, // Absolute path, e.g. "C:\path\to\node_modules\chalk"
-    pub dependent: String,         // Depended by, e.g. "my-app"
-    pub package_type: String,      // e.g. "dependencies", "devDependencies", etc.
+    pub dependent: String, // Depended by, e.g. "my-app"
+    pub package_type: String, // e.g. "dependencies", "devDependencies", etc.
     pub homepage: Option<String>,
     pub dependent_location: String, // Path of the dependent package
 }
@@ -171,7 +171,8 @@ pub async fn run_outdated_inner(
                 };
 
                 if seen_names.insert(pkg_name.clone()) {
-                    let parent_name = extract_parent_name_from_path(path_key).unwrap_or_else(|| root_name.clone());
+                    let parent_name = extract_parent_name_from_path(path_key)
+                        .unwrap_or_else(|| root_name.clone());
                     let spec = lock_pkg.version.clone().unwrap_or_else(|| "*".to_string());
                     let pkg_type = if lock_pkg.is_dev() {
                         "devDependencies".to_string()
@@ -217,7 +218,12 @@ pub async fn run_outdated_inner(
         let (disk_ver, disk_hp) = find_installed_on_disk(project_dir, &dep.location_rel);
         let (current_ver, hp) = if let Some(v) = disk_ver {
             (v, disk_hp)
-        } else if let Some(v) = find_installed_in_lockfile(lockfile.as_ref(), &lockfile_path, &dep.name, &dep.location_rel) {
+        } else if let Some(v) = find_installed_in_lockfile(
+            lockfile.as_ref(),
+            &lockfile_path,
+            &dep.name,
+            &dep.location_rel,
+        ) {
             (v, disk_hp)
         } else {
             ("MISSING".to_string(), disk_hp)
@@ -244,7 +250,9 @@ pub async fn run_outdated_inner(
         client_config.auth_token = Some(token.to_string());
     }
     if let Some(host) = registry_url.host_str() {
-        client_config.trusted_hosts.insert(host.to_ascii_lowercase());
+        client_config
+            .trusted_hosts
+            .insert(host.to_ascii_lowercase());
         if let Some(port) = registry_url.port_or_known_default() {
             client_config
                 .trusted_hosts
@@ -393,7 +401,14 @@ pub fn resolve_wanted_and_latest(
 /// Header: `Package  Current  Wanted  Latest  Location  Depended by`
 /// Space aligned with columns matching npm layout.
 pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
-    let headers = ["Package", "Current", "Wanted", "Latest", "Location", "Depended by"];
+    let headers = [
+        "Package",
+        "Current",
+        "Wanted",
+        "Latest",
+        "Location",
+        "Depended by",
+    ];
     let is_right_aligned = [false, true, true, true, false, false];
 
     let mut col_widths = [
@@ -575,11 +590,7 @@ pub fn format_json(packages: &[OutdatedPackage], long: bool) -> serde_json::Valu
             } else {
                 None
             },
-            homepage: if long {
-                pkg.homepage.clone()
-            } else {
-                None
-            },
+            homepage: if long { pkg.homepage.clone() } else { None },
         };
 
         if let Ok(val) = serde_json::to_value(entry) {
@@ -635,7 +646,10 @@ fn matches_package_filter(pkg_name: &str, filter: &str) -> bool {
 
 /// Look for installed package on disk at `<location_rel>/package.json`.
 /// Returns `(version, homepage)`.
-fn find_installed_on_disk(project_dir: &Path, location_rel: &str) -> (Option<String>, Option<String>) {
+fn find_installed_on_disk(
+    project_dir: &Path,
+    location_rel: &str,
+) -> (Option<String>, Option<String>) {
     let mut pkg_json_path = project_dir.to_path_buf();
     for part in location_rel.split('/') {
         pkg_json_path = pkg_json_path.join(part);
@@ -645,8 +659,14 @@ fn find_installed_on_disk(project_dir: &Path, location_rel: &str) -> (Option<Str
     if pkg_json_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&pkg_json_path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                let version = val.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let homepage = val.get("homepage").and_then(|h| h.as_str()).map(|s| s.to_string());
+                let version = val
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let homepage = val
+                    .get("homepage")
+                    .and_then(|h| h.as_str())
+                    .map(|s| s.to_string());
                 return (version, homepage);
             }
         }
@@ -721,7 +741,11 @@ fn extract_parent_name_from_path(path: &str) -> Option<String> {
         let parent_pkg_idx = parent_nm + 1;
         if parent_pkg_idx < parts.len() {
             if parts[parent_pkg_idx].starts_with('@') && parent_pkg_idx + 1 < parts.len() {
-                return Some(format!("{}/{}", parts[parent_pkg_idx], parts[parent_pkg_idx + 1]));
+                return Some(format!(
+                    "{}/{}",
+                    parts[parent_pkg_idx],
+                    parts[parent_pkg_idx + 1]
+                ));
             } else {
                 return Some(parts[parent_pkg_idx].to_string());
             }
@@ -734,11 +758,11 @@ fn extract_parent_name_from_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rnpm_registry::metadata::DistInfo;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
-    use rnpm_registry::metadata::DistInfo;
 
     /// Helper to construct dummy AbbreviatedVersion for resolution tests.
     fn make_abbreviated_version(name: &str, version: &str) -> AbbreviatedVersion {
@@ -774,12 +798,30 @@ mod tests {
     #[test]
     fn test_version_resolution_semver_range_and_dist_tags() {
         let mut versions = BTreeMap::new();
-        versions.insert("2.4.0".to_string(), make_abbreviated_version("chalk", "2.4.0"));
-        versions.insert("2.4.1".to_string(), make_abbreviated_version("chalk", "2.4.1"));
-        versions.insert("2.4.2".to_string(), make_abbreviated_version("chalk", "2.4.2"));
-        versions.insert("4.1.2".to_string(), make_abbreviated_version("chalk", "4.1.2"));
-        versions.insert("5.3.0".to_string(), make_abbreviated_version("chalk", "5.3.0"));
-        versions.insert("6.0.1".to_string(), make_abbreviated_version("chalk", "6.0.1"));
+        versions.insert(
+            "2.4.0".to_string(),
+            make_abbreviated_version("chalk", "2.4.0"),
+        );
+        versions.insert(
+            "2.4.1".to_string(),
+            make_abbreviated_version("chalk", "2.4.1"),
+        );
+        versions.insert(
+            "2.4.2".to_string(),
+            make_abbreviated_version("chalk", "2.4.2"),
+        );
+        versions.insert(
+            "4.1.2".to_string(),
+            make_abbreviated_version("chalk", "4.1.2"),
+        );
+        versions.insert(
+            "5.3.0".to_string(),
+            make_abbreviated_version("chalk", "5.3.0"),
+        );
+        versions.insert(
+            "6.0.1".to_string(),
+            make_abbreviated_version("chalk", "6.0.1"),
+        );
 
         let mut dist_tags = HashMap::new();
         dist_tags.insert("latest".to_string(), "6.0.1".to_string());
@@ -806,7 +848,12 @@ mod tests {
         assert_eq!(latest, "6.0.1");
 
         // Declared spec is invalid semver / git URL
-        let (wanted, latest) = resolve_wanted_and_latest("git+https://github.com/foo/bar.git", "2.4.2", &dist_tags, &versions);
+        let (wanted, latest) = resolve_wanted_and_latest(
+            "git+https://github.com/foo/bar.git",
+            "2.4.2",
+            &dist_tags,
+            &versions,
+        );
         assert_eq!(wanted, "2.4.2");
         assert_eq!(latest, "6.0.1");
     }
@@ -826,7 +873,10 @@ mod tests {
             homepage: None,
             dependent_location: "/app".to_string(),
         };
-        assert!(!pkg_up_to_date.is_outdated(), "Package should NOT be outdated when current == wanted == latest");
+        assert!(
+            !pkg_up_to_date.is_outdated(),
+            "Package should NOT be outdated when current == wanted == latest"
+        );
 
         let pkg_outdated_wanted = OutdatedPackage {
             current: "18.1.0".to_string(),
@@ -834,7 +884,10 @@ mod tests {
             latest: "18.2.0".to_string(),
             ..pkg_up_to_date.clone()
         };
-        assert!(pkg_outdated_wanted.is_outdated(), "Package is outdated when current != wanted");
+        assert!(
+            pkg_outdated_wanted.is_outdated(),
+            "Package is outdated when current != wanted"
+        );
 
         let pkg_outdated_latest = OutdatedPackage {
             current: "2.4.2".to_string(),
@@ -842,7 +895,10 @@ mod tests {
             latest: "6.0.1".to_string(),
             ..pkg_up_to_date.clone()
         };
-        assert!(pkg_outdated_latest.is_outdated(), "Package is outdated when current != latest");
+        assert!(
+            pkg_outdated_latest.is_outdated(),
+            "Package is outdated when current != latest"
+        );
 
         let pkg_missing = OutdatedPackage {
             current: "MISSING".to_string(),
@@ -850,7 +906,10 @@ mod tests {
             latest: "6.0.1".to_string(),
             ..pkg_up_to_date.clone()
         };
-        assert!(pkg_missing.is_outdated(), "Package is outdated when current is MISSING");
+        assert!(
+            pkg_missing.is_outdated(),
+            "Package is outdated when current is MISSING"
+        );
     }
 
     // 3. Tabular formatting tests
@@ -872,8 +931,14 @@ mod tests {
         let table = format_tabular(&pkgs);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "Package  Current  Wanted  Latest  Location            Depended by");
-        assert_eq!(lines[1], "chalk      2.4.2   2.4.2   6.0.1  node_modules/chalk  my-app");
+        assert_eq!(
+            lines[0],
+            "Package  Current  Wanted  Latest  Location            Depended by"
+        );
+        assert_eq!(
+            lines[1],
+            "chalk      2.4.2   2.4.2   6.0.1  node_modules/chalk  my-app"
+        );
     }
 
     // 4. Long format tests
@@ -934,7 +999,10 @@ mod tests {
         // Long JSON
         let json_long = format_json(&pkgs, true);
         assert_eq!(json_long["chalk"]["type"], "dependencies");
-        assert_eq!(json_long["chalk"]["homepage"], "https://github.com/chalk/chalk#readme");
+        assert_eq!(
+            json_long["chalk"]["homepage"],
+            "https://github.com/chalk/chalk#readme"
+        );
     }
 
     // 6. Parseable format tests
@@ -1052,8 +1120,13 @@ mod tests {
                 }
             });
             let bytes = serde_json::to_vec(&json).unwrap();
-            (200, vec![("Content-Type", "application/json".to_string())], bytes)
-        }).await;
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                bytes,
+            )
+        })
+        .await;
 
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path();
@@ -1083,8 +1156,14 @@ mod tests {
         };
 
         let (code, output) = run_outdated_inner(project_dir, &options).await.unwrap();
-        assert_eq!(code, 0, "Exit code must be 0 when all packages are up to date");
-        assert!(output.is_empty(), "Output should be empty for text mode when up to date");
+        assert_eq!(
+            code, 0,
+            "Exit code must be 0 when all packages are up to date"
+        );
+        assert!(
+            output.is_empty(),
+            "Output should be empty for text mode when up to date"
+        );
 
         // JSON mode returns `{}`
         let json_options = OutdatedOptions {
@@ -1092,7 +1171,9 @@ mod tests {
             registry: Some(format!("http://{}/", mock_server.addr)),
             ..Default::default()
         };
-        let (code_json, output_json) = run_outdated_inner(project_dir, &json_options).await.unwrap();
+        let (code_json, output_json) = run_outdated_inner(project_dir, &json_options)
+            .await
+            .unwrap();
         assert_eq!(code_json, 0);
         assert_eq!(output_json.trim(), "{}");
 
@@ -1125,8 +1206,13 @@ mod tests {
                 }
             });
             let bytes = serde_json::to_vec(&json).unwrap();
-            (200, vec![("Content-Type", "application/json".to_string())], bytes)
-        }).await;
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                bytes,
+            )
+        })
+        .await;
 
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path();
@@ -1168,7 +1254,9 @@ mod tests {
             registry: Some(format!("http://{}/", mock_server.addr)),
             ..Default::default()
         };
-        let (code_json, output_json) = run_outdated_inner(project_dir, &json_options).await.unwrap();
+        let (code_json, output_json) = run_outdated_inner(project_dir, &json_options)
+            .await
+            .unwrap();
         assert_eq!(code_json, 1);
         let parsed: serde_json::Value = serde_json::from_str(&output_json).unwrap();
         assert_eq!(parsed["chalk"]["current"], "2.4.0");
@@ -1182,7 +1270,9 @@ mod tests {
             registry: Some(format!("http://{}/", mock_server.addr)),
             ..Default::default()
         };
-        let (code_p, output_p) = run_outdated_inner(project_dir, &parseable_options).await.unwrap();
+        let (code_p, output_p) = run_outdated_inner(project_dir, &parseable_options)
+            .await
+            .unwrap();
         assert_eq!(code_p, 1);
         assert!(output_p.contains("chalk@2.4.2:chalk@2.4.0:chalk@6.0.1:my-app"));
 
@@ -1210,8 +1300,13 @@ mod tests {
                 }
             });
             let bytes = serde_json::to_vec(&json).unwrap();
-            (200, vec![("Content-Type", "application/json".to_string())], bytes)
-        }).await;
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                bytes,
+            )
+        })
+        .await;
 
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path();
@@ -1259,8 +1354,13 @@ mod tests {
                 }
             });
             let bytes = serde_json::to_vec(&json).unwrap();
-            (200, vec![("Content-Type", "application/json".to_string())], bytes)
-        }).await;
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                bytes,
+            )
+        })
+        .await;
 
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path();
@@ -1297,7 +1397,10 @@ mod tests {
 
         let (code, output) = run_outdated_inner(project_dir, &options).await.unwrap();
         assert_eq!(code, 1);
-        assert!(output.contains("1.0.5"), "Should read 1.0.5 from package-lock.json");
+        assert!(
+            output.contains("1.0.5"),
+            "Should read 1.0.5 from package-lock.json"
+        );
         assert!(output.contains("1.1.0"));
 
         let _ = mock_server.shutdown.send(());
@@ -1325,11 +1428,16 @@ mod tests {
                     }
                 });
                 let bytes = serde_json::to_vec(&json).unwrap();
-                (200, vec![("Content-Type", "application/json".to_string())], bytes)
+                (
+                    200,
+                    vec![("Content-Type", "application/json".to_string())],
+                    bytes,
+                )
             } else {
                 (404, vec![], b"Not Found".to_vec())
             }
-        }).await;
+        })
+        .await;
 
         let tmp = tempdir().unwrap();
         let project_dir = tmp.path();
@@ -1360,7 +1468,10 @@ mod tests {
         let (code, output) = run_outdated_inner(project_dir, &options).await.unwrap();
         assert_eq!(code, 1);
         assert!(output.contains("chalk"));
-        assert!(!output.contains("ignored-pkg"), "Filtered-out package must not appear in output");
+        assert!(
+            !output.contains("ignored-pkg"),
+            "Filtered-out package must not appear in output"
+        );
 
         let _ = mock_server.shutdown.send(());
     }

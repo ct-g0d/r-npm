@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 
 /// Options controlling SBOM generation.
 #[derive(Debug, Clone)]
@@ -107,7 +107,10 @@ pub fn current_rfc3339_time() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
 
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hours, mins, s)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hours, mins, s
+    )
 }
 
 fn derive_package_name(path: &str) -> String {
@@ -281,7 +284,10 @@ pub struct CycloneDxDependency {
 // -------------------------------------------------------------------------
 
 /// Generate SBOM data structure from project directory.
-pub fn generate_sbom(project_dir: &Path, options: &SbomOptions) -> anyhow::Result<serde_json::Value> {
+pub fn generate_sbom(
+    project_dir: &Path,
+    options: &SbomOptions,
+) -> anyhow::Result<serde_json::Value> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.is_file() {
         return Err(anyhow::anyhow!(
@@ -603,8 +609,10 @@ pub fn generate_sbom(project_dir: &Path, options: &SbomOptions) -> anyhow::Resul
             }
 
             // Ensure every component is represented in dependencies
-            let registered_refs: BTreeSet<String> =
-                dependencies.iter().map(|d| d.component_ref.clone()).collect();
+            let registered_refs: BTreeSet<String> = dependencies
+                .iter()
+                .map(|d| d.component_ref.clone())
+                .collect();
             for comp in &components {
                 if !registered_refs.contains(&comp.bom_ref) {
                     dependencies.push(CycloneDxDependency {

@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha512};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -43,7 +43,10 @@ struct TestRegistryServer {
 impl TestRegistryServer {
     async fn start<F>(handler: F) -> Self
     where
-        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)> + Send + Sync + 'static,
+        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)>
+            + Send
+            + Sync
+            + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -115,110 +118,141 @@ impl TestRegistryServer {
 async fn test_nested_conflict_diamond_reification_and_lockfile() {
     // dep-a (1.0.0) -> shared@^1.0.0
     let dep_a_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"dep-a","version":"1.0.0","dependencies":{"shared-lib":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"dep-a","version":"1.0.0","dependencies":{"shared-lib":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'dep-a';"),
     ]);
     let dep_a_integrity = compute_ssri(&dep_a_tarball);
 
     // dep-b (1.0.0) -> shared@^2.0.0
     let dep_b_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"dep-b","version":"1.0.0","dependencies":{"shared-lib":"^2.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"dep-b","version":"1.0.0","dependencies":{"shared-lib":"^2.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'dep-b';"),
     ]);
     let dep_b_integrity = compute_ssri(&dep_b_tarball);
 
     // shared-lib 1.0.0
     let shared_1_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"shared-lib","version":"1.0.0"}"#),
+        (
+            "package.json",
+            br#"{"name":"shared-lib","version":"1.0.0"}"#,
+        ),
         ("index.js", b"module.exports = 'shared-1';"),
     ]);
     let shared_1_integrity = compute_ssri(&shared_1_tarball);
 
     // shared-lib 2.0.0
     let shared_2_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"shared-lib","version":"2.0.0"}"#),
+        (
+            "package.json",
+            br#"{"name":"shared-lib","version":"2.0.0"}"#,
+        ),
         ("index.js", b"module.exports = 'shared-2';"),
     ]);
     let shared_2_integrity = compute_ssri(&shared_2_tarball);
 
-    let server = TestRegistryServer::start(move |path, base_url| {
-        match path {
-            "/dep-a" => {
-                let json = serde_json::json!({
-                    "name": "dep-a",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "dep-a",
-                            "version": "1.0.0",
-                            "dependencies": { "shared-lib": "^1.0.0" },
-                            "dist": {
-                                "tarball": format!("{base_url}/dep-a/-/dep-a-1.0.0.tgz"),
-                                "integrity": dep_a_integrity
-                            }
+    let server = TestRegistryServer::start(move |path, base_url| match path {
+        "/dep-a" => {
+            let json = serde_json::json!({
+                "name": "dep-a",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "dep-a",
+                        "version": "1.0.0",
+                        "dependencies": { "shared-lib": "^1.0.0" },
+                        "dist": {
+                            "tarball": format!("{base_url}/dep-a/-/dep-a-1.0.0.tgz"),
+                            "integrity": dep_a_integrity
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            "/dep-b" => {
-                let json = serde_json::json!({
-                    "name": "dep-b",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "dep-b",
-                            "version": "1.0.0",
-                            "dependencies": { "shared-lib": "^2.0.0" },
-                            "dist": {
-                                "tarball": format!("{base_url}/dep-b/-/dep-b-1.0.0.tgz"),
-                                "integrity": dep_b_integrity
-                            }
-                        }
-                    }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            "/shared-lib" => {
-                let json = serde_json::json!({
-                    "name": "shared-lib",
-                    "dist-tags": { "latest": "2.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "shared-lib",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/shared-lib/-/shared-lib-1.0.0.tgz"),
-                                "integrity": shared_1_integrity
-                            }
-                        },
-                        "2.0.0": {
-                            "name": "shared-lib",
-                            "version": "2.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/shared-lib/-/shared-lib-2.0.0.tgz"),
-                                "integrity": shared_2_integrity
-                            }
-                        }
-                    }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            p if p.ends_with("/dep-a-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], dep_a_tarball.clone()))
-            }
-            p if p.ends_with("/dep-b-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], dep_b_tarball.clone()))
-            }
-            p if p.ends_with("/shared-lib-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], shared_1_tarball.clone()))
-            }
-            p if p.ends_with("/shared-lib-2.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], shared_2_tarball.clone()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        "/dep-b" => {
+            let json = serde_json::json!({
+                "name": "dep-b",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "dep-b",
+                        "version": "1.0.0",
+                        "dependencies": { "shared-lib": "^2.0.0" },
+                        "dist": {
+                            "tarball": format!("{base_url}/dep-b/-/dep-b-1.0.0.tgz"),
+                            "integrity": dep_b_integrity
+                        }
+                    }
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
+        }
+        "/shared-lib" => {
+            let json = serde_json::json!({
+                "name": "shared-lib",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "shared-lib",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/shared-lib/-/shared-lib-1.0.0.tgz"),
+                            "integrity": shared_1_integrity
+                        }
+                    },
+                    "2.0.0": {
+                        "name": "shared-lib",
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/shared-lib/-/shared-lib-2.0.0.tgz"),
+                            "integrity": shared_2_integrity
+                        }
+                    }
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
+        }
+        p if p.ends_with("/dep-a-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            dep_a_tarball.clone(),
+        )),
+        p if p.ends_with("/dep-b-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            dep_b_tarball.clone(),
+        )),
+        p if p.ends_with("/shared-lib-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            shared_1_tarball.clone(),
+        )),
+        p if p.ends_with("/shared-lib-2.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            shared_2_tarball.clone(),
+        )),
+        _ => None,
+    })
+    .await;
 
     let temp_proj = tempfile::tempdir().unwrap();
     let temp_cache = tempfile::tempdir().unwrap();
@@ -235,7 +269,8 @@ async fn test_nested_conflict_diamond_reification_and_lockfile() {
     std::fs::write(
         temp_proj.path().join("package.json"),
         root_pkg_json.to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -244,7 +279,8 @@ async fn test_nested_conflict_diamond_reification_and_lockfile() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 4);
@@ -257,53 +293,74 @@ async fn test_nested_conflict_diamond_reification_and_lockfile() {
     let root_shared = node_modules.join("shared-lib");
     assert!(root_shared.exists());
 
-    let nested_shared_in_b = node_modules.join("dep-b").join("node_modules").join("shared-lib");
-    let nested_shared_in_a = node_modules.join("dep-a").join("node_modules").join("shared-lib");
-    assert!(nested_shared_in_b.exists() || nested_shared_in_a.exists(), "One conflicting shared-lib must be nested");
+    let nested_shared_in_b = node_modules
+        .join("dep-b")
+        .join("node_modules")
+        .join("shared-lib");
+    let nested_shared_in_a = node_modules
+        .join("dep-a")
+        .join("node_modules")
+        .join("shared-lib");
+    assert!(
+        nested_shared_in_b.exists() || nested_shared_in_a.exists(),
+        "One conflicting shared-lib must be nested"
+    );
 
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
     assert!(lockfile.packages.contains_key("node_modules/dep-a"));
     assert!(lockfile.packages.contains_key("node_modules/dep-b"));
     assert!(lockfile.packages.contains_key("node_modules/shared-lib"));
     assert!(
-        lockfile.packages.contains_key("node_modules/dep-b/node_modules/shared-lib")
-            || lockfile.packages.contains_key("node_modules/dep-a/node_modules/shared-lib")
+        lockfile
+            .packages
+            .contains_key("node_modules/dep-b/node_modules/shared-lib")
+            || lockfile
+                .packages
+                .contains_key("node_modules/dep-a/node_modules/shared-lib")
     );
 }
 
 #[tokio::test]
 async fn test_npm_alias_installation_and_lockfile() {
     let real_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"actual-lib","version":"1.0.0"}"#),
+        (
+            "package.json",
+            br#"{"name":"actual-lib","version":"1.0.0"}"#,
+        ),
         ("index.js", b"module.exports = 'actual-lib';"),
     ]);
     let real_integrity = compute_ssri(&real_tarball);
 
-    let server = TestRegistryServer::start(move |path, base_url| {
-        match path {
-            "/actual-lib" => {
-                let json = serde_json::json!({
-                    "name": "actual-lib",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "actual-lib",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/actual-lib/-/actual-lib-1.0.0.tgz"),
-                                "integrity": real_integrity
-                            }
+    let server = TestRegistryServer::start(move |path, base_url| match path {
+        "/actual-lib" => {
+            let json = serde_json::json!({
+                "name": "actual-lib",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "actual-lib",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/actual-lib/-/actual-lib-1.0.0.tgz"),
+                            "integrity": real_integrity
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            p if p.ends_with("/actual-lib-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], real_tarball.clone()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        p if p.ends_with("/actual-lib-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            real_tarball.clone(),
+        )),
+        _ => None,
+    })
+    .await;
 
     let temp_proj = tempfile::tempdir().unwrap();
     let temp_cache = tempfile::tempdir().unwrap();
@@ -319,7 +376,8 @@ async fn test_npm_alias_installation_and_lockfile() {
     std::fs::write(
         temp_proj.path().join("package.json"),
         root_pkg_json.to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -328,19 +386,26 @@ async fn test_npm_alias_installation_and_lockfile() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 1);
 
     // Directory node_modules/my-custom-alias must exist
-    let alias_dir = temp_proj.path().join("node_modules").join("my-custom-alias");
+    let alias_dir = temp_proj
+        .path()
+        .join("node_modules")
+        .join("my-custom-alias");
     assert!(alias_dir.exists());
     assert!(alias_dir.join("index.js").exists());
 
     // Lockfile v3 must record node_modules/my-custom-alias with name: "actual-lib"
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
-    let entry = lockfile.packages.get("node_modules/my-custom-alias").expect("Lockfile entry for alias");
+    let entry = lockfile
+        .packages
+        .get("node_modules/my-custom-alias")
+        .expect("Lockfile entry for alias");
     assert_eq!(entry.name.as_deref(), Some("actual-lib"));
     assert_eq!(entry.version.as_deref(), Some("1.0.0"));
 }
@@ -359,42 +424,49 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
     ]);
     let pkg_200_integrity = compute_ssri(&pkg_200_tarball);
 
-    let server = TestRegistryServer::start(move |path, base_url| {
-        match path {
-            "/dep-pkg" => {
-                let json = serde_json::json!({
-                    "name": "dep-pkg",
-                    "dist-tags": { "latest": "2.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "dep-pkg",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/dep-pkg/-/dep-pkg-1.0.0.tgz"),
-                                "integrity": pkg_100_integrity
-                            }
-                        },
-                        "2.0.0": {
-                            "name": "dep-pkg",
-                            "version": "2.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/dep-pkg/-/dep-pkg-2.0.0.tgz"),
-                                "integrity": pkg_200_integrity
-                            }
+    let server = TestRegistryServer::start(move |path, base_url| match path {
+        "/dep-pkg" => {
+            let json = serde_json::json!({
+                "name": "dep-pkg",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "dep-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/dep-pkg/-/dep-pkg-1.0.0.tgz"),
+                            "integrity": pkg_100_integrity
+                        }
+                    },
+                    "2.0.0": {
+                        "name": "dep-pkg",
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/dep-pkg/-/dep-pkg-2.0.0.tgz"),
+                            "integrity": pkg_200_integrity
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            p if p.ends_with("/dep-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg_100_tarball.clone()))
-            }
-            p if p.ends_with("/dep-pkg-2.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg_200_tarball.clone()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        p if p.ends_with("/dep-pkg-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            pkg_100_tarball.clone(),
+        )),
+        p if p.ends_with("/dep-pkg-2.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            pkg_200_tarball.clone(),
+        )),
+        _ => None,
+    })
+    .await;
 
     let temp_proj = tempfile::tempdir().unwrap();
     let temp_cache = tempfile::tempdir().unwrap();
@@ -413,7 +485,8 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
     std::fs::write(
         temp_proj.path().join("package.json"),
         root_pkg_json.to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -422,50 +495,61 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 1);
 
     // Verify that version 2.0.0 was installed because of override
     let pkg_json = std::fs::read_to_string(
-        temp_proj.path().join("node_modules").join("dep-pkg").join("package.json")
-    ).unwrap();
+        temp_proj
+            .path()
+            .join("node_modules")
+            .join("dep-pkg")
+            .join("package.json"),
+    )
+    .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&pkg_json).unwrap();
     assert_eq!(parsed["version"], "2.0.0");
 
-    // Verify that overrides field is copied into root lockfile descriptor
+    // Verify that overrides field is not emitted into root lockfile descriptor (Arborist alignment)
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
     let root_pkg = lockfile.packages.get("").expect("Root package entry");
-    let overrides_extra = root_pkg.extra.get("overrides").expect("Overrides in root lockfile descriptor");
-    assert_eq!(overrides_extra["dep-pkg"], "2.0.0");
+    assert!(
+        !root_pkg.extra.contains_key("overrides"),
+        "Overrides must not be emitted into root lockfile descriptor"
+    );
 }
 
 #[tokio::test]
 async fn test_required_platform_incompatibility_fails_ebadplatform() {
-    let server = TestRegistryServer::start(move |path, _| {
-        match path {
-            "/incompatible-pkg" => {
-                let json = serde_json::json!({
-                    "name": "incompatible-pkg",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "incompatible-pkg",
-                            "version": "1.0.0",
-                            "os": ["nonexistent_os_matrix_999"],
-                            "dist": {
-                                "tarball": "http://example.com/incompatible-pkg.tgz",
-                                "integrity": "sha512-test"
-                            }
+    let server = TestRegistryServer::start(move |path, _| match path {
+        "/incompatible-pkg" => {
+            let json = serde_json::json!({
+                "name": "incompatible-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "incompatible-pkg",
+                        "version": "1.0.0",
+                        "os": ["nonexistent_os_matrix_999"],
+                        "dist": {
+                            "tarball": "http://example.com/incompatible-pkg.tgz",
+                            "integrity": "sha512-test"
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        _ => None,
+    })
+    .await;
 
     let temp_proj = tempfile::tempdir().unwrap();
     let temp_cache = tempfile::tempdir().unwrap();
@@ -481,7 +565,8 @@ async fn test_required_platform_incompatibility_fails_ebadplatform() {
     std::fs::write(
         temp_proj.path().join("package.json"),
         root_pkg_json.to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -490,7 +575,8 @@ async fn test_required_platform_incompatibility_fails_ebadplatform() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run().await;
     assert!(res.is_err(), "Required platform incompatibility must fail");
@@ -513,7 +599,8 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
             "name": "cyclic-dev-root",
             "workspaces": ["packages/*"]
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let packages_dir = root.join("packages");
     let pkg_a_dir = packages_dir.join("pkg-a");
@@ -531,7 +618,8 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
                 "pkg-b": "workspace:*"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // pkg-b devDepends on pkg-a (cycle in devDependencies only)
     std::fs::write(
@@ -543,7 +631,8 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
                 "pkg-a": "workspace:*"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),
@@ -552,7 +641,10 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
     };
 
     let mut installer = Installer::new(options).unwrap();
-    let summary = installer.run().await.expect("Cyclic workspace devDependencies must install successfully");
+    let summary = installer
+        .run()
+        .await
+        .expect("Cyclic workspace devDependencies must install successfully");
     assert_eq!(summary.packages_installed, 2);
 
     assert!(root.join("node_modules").join("pkg-a").exists());
@@ -570,7 +662,8 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
             "name": "cyclic-prod-root",
             "workspaces": ["packages/*"]
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let packages_dir = root.join("packages");
     let pkg_a_dir = packages_dir.join("pkg-a");
@@ -588,7 +681,8 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
                 "pkg-b": "workspace:*"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // pkg-b production depends on pkg-a (cycle in production dependencies)
     std::fs::write(
@@ -600,7 +694,8 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
                 "pkg-a": "workspace:*"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),

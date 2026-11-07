@@ -1,8 +1,8 @@
-use std::env;
-use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
 use crate::error::ConfigError;
 use crate::npmrc::Npmrc;
+use std::collections::BTreeMap;
+use std::env;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOptions<'a> {
@@ -39,7 +39,11 @@ impl<'a> ConfigOptions<'a> {
         self
     }
 
-    pub fn with_cli<KeyType: Into<String>, ValType: Into<String>>(mut self, key: KeyType, value: ValType) -> Self {
+    pub fn with_cli<KeyType: Into<String>, ValType: Into<String>>(
+        mut self,
+        key: KeyType,
+        value: ValType,
+    ) -> Self {
         let mut map = self.cli_overrides.unwrap_or_default();
         map.insert(key.into(), value.into());
         self.cli_overrides = Some(map);
@@ -81,11 +85,12 @@ impl Config {
     }
 
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.get(key).and_then(|val| match val.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" => Some(false),
-            _ => None,
-        })
+        self.get(key)
+            .and_then(|val| match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => None,
+            })
     }
 
     pub fn load(project_dir: Option<&Path>) -> Result<Self, ConfigError> {
@@ -154,9 +159,7 @@ impl Config {
                     .or_else(|| env_lookup("npm_config_userconfig"))
                     .map(PathBuf::from)
             })
-            .or_else(|| {
-                base_npmrc.settings.get("userconfig").map(PathBuf::from)
-            })
+            .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
             .or_else(|| find_user_npmrc_with_env(env_lookup));
 
         if let Some(path) = user_config_path {
@@ -166,9 +169,10 @@ impl Config {
             }
         }
 
-        let ws_root = options.workspace_root.map(|path| path.to_path_buf()).or_else(|| {
-            options.project_dir.and_then(find_workspace_root)
-        });
+        let ws_root = options
+            .workspace_root
+            .map(|path| path.to_path_buf())
+            .or_else(|| options.project_dir.and_then(find_workspace_root));
 
         if let Some(ws_path) = ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
@@ -285,9 +289,7 @@ impl Config {
                     .or_else(|| env_lookup("npm_config_userconfig"))
                     .map(PathBuf::from)
             })
-            .or_else(|| {
-                base_npmrc.settings.get("userconfig").map(PathBuf::from)
-            })
+            .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
             .or_else(|| find_user_npmrc_with_env(env_lookup));
 
         if let Some(path) = &user_config_path {
@@ -302,9 +304,10 @@ impl Config {
             }
         }
 
-        let ws_root = options.workspace_root.map(|path| path.to_path_buf()).or_else(|| {
-            options.project_dir.and_then(find_workspace_root)
-        });
+        let ws_root = options
+            .workspace_root
+            .map(|path| path.to_path_buf())
+            .or_else(|| options.project_dir.and_then(find_workspace_root));
 
         if let Some(ws_path) = &ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
@@ -404,9 +407,14 @@ impl Config {
         }
 
         let global_prefix = find_global_prefix_with_env(env_lookup);
-        let local_prefix = options.project_dir.map(find_local_prefix).unwrap_or_else(|| {
-            env::current_dir().map(|d| find_local_prefix(&d)).unwrap_or_else(|_| PathBuf::from("."))
-        });
+        let local_prefix = options
+            .project_dir
+            .map(find_local_prefix)
+            .unwrap_or_else(|| {
+                env::current_dir()
+                    .map(|d| find_local_prefix(&d))
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
 
         let effective = base_npmrc.scrubbed_settings();
 
@@ -420,16 +428,23 @@ impl Config {
 }
 
 pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
-    let project_dir_canon = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
+    let project_dir_canon = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
     let mut current = project_dir.parent();
     while let Some(dir) = current {
         let pkg_json = dir.join("package.json");
         if pkg_json.exists() {
             if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&pkg_json) {
                 if !manifest.workspace_patterns().is_empty() {
-                    if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(dir, &manifest) {
+                    if let Ok(members) =
+                        rnpm_core::workspace::discover_workspaces_from_manifest(dir, &manifest)
+                    {
                         for member in members {
-                            let member_canon = member.path.canonicalize().unwrap_or_else(|_| member.path.clone());
+                            let member_canon = member
+                                .path
+                                .canonicalize()
+                                .unwrap_or_else(|_| member.path.clone());
                             if member_canon == project_dir_canon
                                 || member.path == project_dir
                                 || project_dir.ends_with(&member.relative_path)
@@ -517,7 +532,11 @@ impl ConfigDetailed {
                 continue;
             }
             if let Some(src) = &layer.source {
-                out.push_str(&format!("; \"{}\" config from {}\n", layer.name, src.display()));
+                out.push_str(&format!(
+                    "; \"{}\" config from {}\n",
+                    layer.name,
+                    src.display()
+                ));
             } else if layer.name == "env" {
                 out.push_str("; environment-related config\n");
             } else {
@@ -529,8 +548,14 @@ impl ConfigDetailed {
             out.push('\n');
         }
 
-        out.push_str(&format!("; npm local prefix = {}\n", self.local_prefix.display()));
-        out.push_str(&format!("; npm global prefix = {}\n", self.global_prefix.display()));
+        out.push_str(&format!(
+            "; npm local prefix = {}\n",
+            self.local_prefix.display()
+        ));
+        out.push_str(&format!(
+            "; npm global prefix = {}\n",
+            self.global_prefix.display()
+        ));
         if let Ok(cwd) = env::current_dir() {
             out.push_str(&format!("; cwd = {}\n", cwd.display()));
         }
@@ -562,7 +587,10 @@ where
             return PathBuf::from(appdata).join("npm");
         }
         if let Some(userprofile) = lookup("USERPROFILE") {
-            return PathBuf::from(userprofile).join("AppData").join("Roaming").join("npm");
+            return PathBuf::from(userprofile)
+                .join("AppData")
+                .join("Roaming")
+                .join("npm");
         }
         PathBuf::from(r"C:\npm")
     }
@@ -611,7 +639,9 @@ pub fn find_local_prefix(start_dir: &Path) -> PathBuf {
 
 /// Resolves the local executable bin directory (node_modules/.bin) for a project.
 pub fn find_local_bin_dir(start_dir: &Path) -> PathBuf {
-    find_local_prefix(start_dir).join("node_modules").join(".bin")
+    find_local_prefix(start_dir)
+        .join("node_modules")
+        .join(".bin")
 }
 
 /// Resolves the local node_modules directory for a project.
@@ -658,7 +688,9 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
         || value_trimmed.contains('\n')
         || value_trimmed.contains('\r')
     {
-        return Err(ConfigError::InvalidLine("Newline in key or value".to_string()));
+        return Err(ConfigError::InvalidLine(
+            "Newline in key or value".to_string(),
+        ));
     }
 
     let mut lines = Vec::new();

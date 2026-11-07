@@ -42,11 +42,17 @@ fn test_cli_list_clean_tree_and_depth() {
         .output()
         .expect("Failed to execute rnpm ls");
 
-    assert!(output.status.success(), "Exit code must be 0 for clean tree");
+    assert!(
+        output.status.success(),
+        "Exit code must be 0 for clean tree"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("list-clean-app@1.0.0"));
     assert!(stdout.contains("+-- dep-a@1.2.0") || stdout.contains("`-- dep-a@1.2.0"));
-    assert!(!stdout.contains("sub-b@2.1.0"), "Depth 0 must not show sub-b");
+    assert!(
+        !stdout.contains("sub-b@2.1.0"),
+        "Depth 0 must not show sub-b"
+    );
 
     // 2. rnpm ls --all (shows sub-b)
     let output_all = Command::new(rnpm_bin)
@@ -72,7 +78,10 @@ fn test_cli_list_clean_tree_and_depth() {
     assert_eq!(json_val["name"], "list-clean-app");
     assert_eq!(json_val["version"], "1.0.0");
     assert_eq!(json_val["dependencies"]["dep-a"]["version"], "1.2.0");
-    assert_eq!(json_val["dependencies"]["dep-a"]["dependencies"]["sub-b"]["version"], "2.1.0");
+    assert_eq!(
+        json_val["dependencies"]["dep-a"]["dependencies"]["sub-b"]["version"],
+        "2.1.0"
+    );
 
     // 4. rnpm ls --parseable
     let output_p = Command::new(rnpm_bin)
@@ -83,7 +92,9 @@ fn test_cli_list_clean_tree_and_depth() {
 
     assert!(output_p.status.success());
     let stdout_p = String::from_utf8_lossy(&output_p.stdout);
-    assert!(stdout_p.contains("list-clean-app") || stdout_p.contains(project_dir.to_str().unwrap()));
+    assert!(
+        stdout_p.contains("list-clean-app") || stdout_p.contains(project_dir.to_str().unwrap())
+    );
     assert!(stdout_p.contains("dep-a"));
     assert!(stdout_p.contains("sub-b"));
 
@@ -128,7 +139,11 @@ fn test_cli_list_problems_exit_code_1_and_elsproblems() {
         "name": "extra-dep",
         "version": "3.0.0"
     });
-    std::fs::write(extraneous_dir.join("package.json"), extraneous_pkg.to_string()).unwrap();
+    std::fs::write(
+        extraneous_dir.join("package.json"),
+        extraneous_pkg.to_string(),
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin)
         .arg("ls")
@@ -136,7 +151,10 @@ fn test_cli_list_problems_exit_code_1_and_elsproblems() {
         .output()
         .expect("Failed to execute rnpm ls");
 
-    assert!(!output.status.success(), "Exit code must be 1 when problems exist");
+    assert!(
+        !output.status.success(),
+        "Exit code must be 1 when problems exist"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 

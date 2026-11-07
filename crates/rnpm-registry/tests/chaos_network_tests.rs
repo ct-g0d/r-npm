@@ -456,7 +456,8 @@ async fn test_chaos_truncated_gzip_tarball_persistent_truncation_fails() {
 
 #[tokio::test]
 async fn test_chaos_http_429_integer_seconds_eventual_success() {
-    let metadata_json = r#"{"name":"throttled-int-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
+    let metadata_json =
+        r#"{"name":"throttled-int-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
 
     let server = RawChaosServer::start(move |mut stream, attempt, _| async move {
         let mut buf = [0u8; 2048];
@@ -464,7 +465,8 @@ async fn test_chaos_http_429_integer_seconds_eventual_success() {
 
         if attempt == 0 {
             // Rate limit: 429 with Retry-After: 1
-            let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+            let resp =
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes()).await;
             let _ = stream.flush().await;
         } else {
@@ -490,7 +492,10 @@ async fn test_chaos_http_429_integer_seconds_eventual_success() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let meta = client.get_package_metadata("throttled-int-pkg").await.unwrap();
+    let meta = client
+        .get_package_metadata("throttled-int-pkg")
+        .await
+        .unwrap();
     assert_eq!(meta.name, "throttled-int-pkg");
     assert_eq!(server.connection_count.load(Ordering::SeqCst), 2);
 
@@ -499,7 +504,8 @@ async fn test_chaos_http_429_integer_seconds_eventual_success() {
 
 #[tokio::test]
 async fn test_chaos_http_429_http_date_eventual_success() {
-    let metadata_json = r#"{"name":"throttled-date-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
+    let metadata_json =
+        r#"{"name":"throttled-date-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
 
     let server = RawChaosServer::start(move |mut stream, attempt, _| async move {
         let mut buf = [0u8; 2048];
@@ -536,7 +542,10 @@ async fn test_chaos_http_429_http_date_eventual_success() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let meta = client.get_package_metadata("throttled-date-pkg").await.unwrap();
+    let meta = client
+        .get_package_metadata("throttled-date-pkg")
+        .await
+        .unwrap();
     assert_eq!(meta.name, "throttled-date-pkg");
     assert_eq!(server.connection_count.load(Ordering::SeqCst), 2);
 
@@ -677,7 +686,9 @@ async fn test_chaos_auth_token_leakage_untrusted_redirect_strips_auth() {
         let reqs_trusted = server_trusted.received_requests.lock().await;
         assert_eq!(reqs_trusted.len(), 1);
         assert!(
-            reqs_trusted[0].to_lowercase().contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
+            reqs_trusted[0]
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
             "Initial request to trusted origin must contain authorization token"
         );
     }
@@ -756,7 +767,9 @@ async fn test_chaos_auth_token_leakage_trusted_redirect_retains_auth() {
         let reqs_dest = server_dest.received_requests.lock().await;
         assert_eq!(reqs_dest.len(), 1);
         assert!(
-            reqs_dest[0].to_lowercase().contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
+            reqs_dest[0]
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {secret_token}").to_lowercase()),
             "Redirect to trusted target must retain Authorization header! Got: {}",
             reqs_dest[0]
         );
@@ -774,7 +787,8 @@ async fn test_chaos_auth_token_leakage_trusted_redirect_retains_auth() {
 async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_recovery() {
     let mode = Arc::new(AtomicUsize::new(0)); // 0: fail with 500, 1: succeed with 200
     let mode_clone = mode.clone();
-    let mock_json = r#"{"name":"circuit-recovering-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
+    let mock_json =
+        r#"{"name":"circuit-recovering-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
 
     let server = RawChaosServer::start(move |mut stream, _, _| {
         let m = mode_clone.clone();
@@ -817,7 +831,10 @@ async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_rec
     let client = RegistryClient::with_config(config).unwrap();
 
     // 1. Initial state: Closed
-    assert_eq!(client.circuit_state(&host).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host).await,
+        CircuitBreakerState::Closed
+    );
 
     // 2. Accumulate failures up to threshold (3 consecutive failures)
     for i in 1..=3 {
@@ -857,7 +874,10 @@ async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_rec
 
     // 6. Server recovers: probe request succeeds
     mode.store(1, Ordering::SeqCst);
-    let probe_res = client.get_package_metadata("circuit-recovering-pkg").await.unwrap();
+    let probe_res = client
+        .get_package_metadata("circuit-recovering-pkg")
+        .await
+        .unwrap();
     assert_eq!(probe_res.name, "circuit-recovering-pkg");
     assert_eq!(
         server.connection_count.load(Ordering::SeqCst),
@@ -873,7 +893,10 @@ async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_rec
     );
 
     // 8. Subsequent requests flow normally
-    let subsequent_res = client.get_package_metadata("circuit-recovering-pkg").await.unwrap();
+    let subsequent_res = client
+        .get_package_metadata("circuit-recovering-pkg")
+        .await
+        .unwrap();
     assert_eq!(subsequent_res.name, "circuit-recovering-pkg");
     assert_eq!(server.connection_count.load(Ordering::SeqCst), 5);
 

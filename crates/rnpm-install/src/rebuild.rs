@@ -1,12 +1,11 @@
-use std::path::PathBuf;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
+use crate::prune::{extract_package_name_from_path, scan_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_lifecycle::{
-    execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource,
-    ScriptSandboxPolicy,
+    execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource, ScriptSandboxPolicy,
 };
-use crate::prune::{extract_package_name_from_path, scan_node_modules};
 
 /// Options controlling `npm rebuild` execution.
 #[derive(Debug, Clone, PartialEq, Eq)]

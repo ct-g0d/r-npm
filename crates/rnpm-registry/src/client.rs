@@ -2,8 +2,8 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::RegistryError;
 use crate::metadata::AbbreviatedPackageMetadata;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-    LOCATION, RETRY_AFTER, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode};
 use std::collections::HashSet;
@@ -88,9 +88,7 @@ pub enum MetadataFetchResult {
         etag: Option<String>,
     },
     /// Server returned HTTP 304 Not Modified; cached data is still valid.
-    NotModified {
-        etag: Option<String>,
-    },
+    NotModified { etag: Option<String> },
 }
 
 impl MetadataFetchResult {
@@ -133,9 +131,7 @@ pub enum BytesFetchResult {
         etag: Option<String>,
     },
     /// Server returned HTTP 304 Not Modified.
-    NotModified {
-        etag: Option<String>,
-    },
+    NotModified { etag: Option<String> },
 }
 
 impl BytesFetchResult {
@@ -228,9 +224,7 @@ pub enum TarballFetchResult {
         permit: OwnedSemaphorePermit,
     },
     /// Server returned HTTP 304 Not Modified.
-    NotModified {
-        etag: Option<String>,
-    },
+    NotModified { etag: Option<String> },
 }
 
 impl TarballFetchResult {
@@ -406,7 +400,10 @@ pub fn format_http_date(st: std::time::SystemTime) -> String {
     ];
     let wk = weekdays[day_of_week];
     let mon = months[(m.saturating_sub(1) as usize).min(11)];
-    format!("{wk}, {:02} {mon} {y} {:02}:{:02}:{:02} GMT", d, hour, min, sec)
+    format!(
+        "{wk}, {:02} {mon} {y} {:02}:{:02}:{:02} GMT",
+        d, hour, min, sec
+    )
 }
 
 /// Parses an HTTP-date string (IMF-fixdate, RFC 850, or ANSI C asctime, and RFC 2822)
@@ -469,7 +466,8 @@ pub fn parse_http_date_to_unix_timestamp(s: &str) -> Option<i64> {
             }
         }
     } else {
-        if month_idx + 1 < tokens.len() && tokens[month_idx + 1].chars().all(|c| c.is_ascii_digit()) {
+        if month_idx + 1 < tokens.len() && tokens[month_idx + 1].chars().all(|c| c.is_ascii_digit())
+        {
             day = tokens[month_idx + 1].parse::<u64>().ok();
         }
         for tok in tokens.iter().skip(time_idx + 1) {
@@ -503,12 +501,16 @@ pub fn parse_http_date_to_unix_timestamp(s: &str) -> Option<i64> {
             let num_str = &t[1..];
             let offset_parts: Vec<&str> = num_str.split(':').collect();
             if offset_parts.len() == 2 {
-                if let (Ok(h), Ok(m)) = (offset_parts[0].parse::<i64>(), offset_parts[1].parse::<i64>()) {
+                if let (Ok(h), Ok(m)) = (
+                    offset_parts[0].parse::<i64>(),
+                    offset_parts[1].parse::<i64>(),
+                ) {
                     tz_offset_secs = sign * (h * 3600 + m * 60);
                     break;
                 }
             } else if num_str.len() == 4 {
-                if let (Ok(h), Ok(m)) = (num_str[0..2].parse::<i64>(), num_str[2..4].parse::<i64>()) {
+                if let (Ok(h), Ok(m)) = (num_str[0..2].parse::<i64>(), num_str[2..4].parse::<i64>())
+                {
                     tz_offset_secs = sign * (h * 3600 + m * 60);
                     break;
                 }
@@ -517,7 +519,8 @@ pub fn parse_http_date_to_unix_timestamp(s: &str) -> Option<i64> {
     }
 
     let days = days_from_civil(year, month, day);
-    let total_secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64) - tz_offset_secs;
+    let total_secs =
+        days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64) - tz_offset_secs;
     Some(total_secs)
 }
 
@@ -572,10 +575,7 @@ impl RegistryClient {
             HeaderValue::from_str(&config.user_agent)
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
-        headers.insert(
-            CONNECTION,
-            HeaderValue::from_static("keep-alive"),
-        );
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         let max_idle = if config.pool_max_idle_per_host == 0 {
             DEFAULT_POOL_MAX_IDLE_PER_HOST
@@ -600,8 +600,9 @@ impl RegistryClient {
         }
 
         if let Some(https_proxy) = &config.https_proxy {
-            let mut proxy = reqwest::Proxy::https(https_proxy)
-                .map_err(|err| RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}")))?;
+            let mut proxy = reqwest::Proxy::https(https_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}"))
+            })?;
             if let Some(no_proxy) = &config.no_proxy {
                 proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
             }
@@ -609,8 +610,9 @@ impl RegistryClient {
         }
 
         if let Some(http_proxy) = &config.http_proxy {
-            let mut proxy = reqwest::Proxy::http(http_proxy)
-                .map_err(|err| RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}")))?;
+            let mut proxy = reqwest::Proxy::http(http_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}"))
+            })?;
             if let Some(no_proxy) = &config.no_proxy {
                 proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
             }
@@ -619,22 +621,25 @@ impl RegistryClient {
 
         if let Some(general_proxy) = &config.proxy {
             if config.https_proxy.is_none() && config.http_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::all(general_proxy)
-                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                let mut proxy = reqwest::Proxy::all(general_proxy).map_err(|err| {
+                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+                })?;
                 if let Some(no_proxy) = &config.no_proxy {
                     proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
                 }
                 builder = builder.proxy(proxy);
             } else if config.http_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::http(general_proxy)
-                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                let mut proxy = reqwest::Proxy::http(general_proxy).map_err(|err| {
+                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+                })?;
                 if let Some(no_proxy) = &config.no_proxy {
                     proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
                 }
                 builder = builder.proxy(proxy);
             } else if config.https_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::https(general_proxy)
-                    .map_err(|err| RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}")))?;
+                let mut proxy = reqwest::Proxy::https(general_proxy).map_err(|err| {
+                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+                })?;
                 if let Some(no_proxy) = &config.no_proxy {
                     proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
                 }
@@ -644,7 +649,10 @@ impl RegistryClient {
 
         if let Some(cafile_path) = &config.cafile {
             let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
-                RegistryError::Other(format!("Failed to read cafile at '{}': {err}", cafile_path.display()))
+                RegistryError::Other(format!(
+                    "Failed to read cafile at '{}': {err}",
+                    cafile_path.display()
+                ))
             })?;
             let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
             if certs.is_empty() {
@@ -661,7 +669,9 @@ impl RegistryClient {
         if let Some(ca_content_or_path) = &config.ca {
             let pem_bytes = if Path::new(ca_content_or_path).exists() {
                 std::fs::read(ca_content_or_path).map_err(|err| {
-                    RegistryError::Other(format!("Failed to read CA path '{ca_content_or_path}': {err}"))
+                    RegistryError::Other(format!(
+                        "Failed to read CA path '{ca_content_or_path}': {err}"
+                    ))
                 })?
             } else {
                 ca_content_or_path.as_bytes().to_vec()
@@ -696,7 +706,9 @@ impl RegistryClient {
 
             let combined_pem = format!("{}\n{}", cert_content.trim(), key_content.trim());
             let identity = reqwest::Identity::from_pem(combined_pem.as_bytes()).map_err(|err| {
-                RegistryError::Other(format!("Failed to parse client certificate and key into Identity: {err}"))
+                RegistryError::Other(format!(
+                    "Failed to parse client certificate and key into Identity: {err}"
+                ))
             })?;
             builder = builder.identity(identity);
         }
@@ -715,7 +727,8 @@ impl RegistryClient {
         } else {
             0
         };
-        let circuit_breaker = CircuitBreaker::new(failure_threshold, config.circuit_breaker_reset_timeout);
+        let circuit_breaker =
+            CircuitBreaker::new(failure_threshold, config.circuit_breaker_reset_timeout);
 
         Ok(Self {
             client,
@@ -782,14 +795,19 @@ impl RegistryClient {
 
         if let Some(reg_host) = self.config.default_registry.host_str() {
             if reg_host.eq_ignore_ascii_case(&host)
-                && self.config.default_registry.port_or_known_default() == url.port_or_known_default()
+                && self.config.default_registry.port_or_known_default()
+                    == url.port_or_known_default()
             {
                 return true;
             }
         }
 
         if let Some(port) = url.port_or_known_default() {
-            if self.config.trusted_hosts.contains(&format!("{host}:{port}")) {
+            if self
+                .config
+                .trusted_hosts
+                .contains(&format!("{host}:{port}"))
+            {
                 return true;
             }
         }
@@ -905,10 +923,19 @@ impl RegistryClient {
             } else {
                 format!("{path}/")
             };
-            self.config.auth_tokens.contains_key(&format!("//{host}{port_part}{normalized_path}"))
-                || self.config.auth_tokens.contains_key(&format!("//{host}{port_part}{path}"))
-                || self.config.auth_tokens.contains_key(&format!("//{host}{port_part}/"))
-                || (!port_part.is_empty() && self.config.auth_tokens.contains_key(&format!("//{host}/")))
+            self.config
+                .auth_tokens
+                .contains_key(&format!("//{host}{port_part}{normalized_path}"))
+                || self
+                    .config
+                    .auth_tokens
+                    .contains_key(&format!("//{host}{port_part}{path}"))
+                || self
+                    .config
+                    .auth_tokens
+                    .contains_key(&format!("//{host}{port_part}/"))
+                || (!port_part.is_empty()
+                    && self.config.auth_tokens.contains_key(&format!("//{host}/")))
         };
 
         if has_explicit_token {
@@ -959,7 +986,14 @@ impl RegistryClient {
     ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
         let permit = self.acquire_permit().await?;
         let resp = self
-            .execute_request_loop_with_body(method, initial_url, content_type, accept_header, otp, body)
+            .execute_request_loop_with_body(
+                method,
+                initial_url,
+                content_type,
+                accept_header,
+                otp,
+                body,
+            )
             .await?;
         Ok((resp, permit))
     }
@@ -975,15 +1009,16 @@ impl RegistryClient {
         let host_key = if let Some(port) = initial_url.port() {
             format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
-            initial_url.host_str().unwrap_or_default().to_ascii_lowercase()
+            initial_url
+                .host_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
         };
 
         if self.config.circuit_breaker_enabled {
             let state = self.circuit_breaker.check_state(&host_key).await;
             if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen {
-                    host: host_key,
-                });
+                return Err(RegistryError::CircuitBreakerOpen { host: host_key });
             }
         }
 
@@ -1082,8 +1117,9 @@ impl RegistryClient {
 
                     // Check for retryable HTTP status codes (429, 502, 503, 504)
                     let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
-                    let is_retryable_server_error = self.config.retry_on_status.contains(&status.as_u16())
-                        || status.is_server_error();
+                    let is_retryable_server_error =
+                        self.config.retry_on_status.contains(&status.as_u16())
+                            || status.is_server_error();
 
                     if is_rate_limited {
                         let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
@@ -1098,12 +1134,16 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                                    .min(self.config.max_retry_backoff)
+                                (self.config.initial_retry_backoff
+                                    * 2u32.saturating_pow(attempt as u32))
+                                .min(self.config.max_retry_backoff)
                             };
                             debug!(
                                 "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
-                                initial_url, delay, attempt + 1, self.config.max_retries
+                                initial_url,
+                                delay,
+                                attempt + 1,
+                                self.config.max_retries
                             );
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -1112,7 +1152,9 @@ impl RegistryClient {
                             if self.config.circuit_breaker_enabled {
                                 self.circuit_breaker.record_failure(&host_key).await;
                             }
-                            return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
+                            return Err(RegistryError::RateLimited {
+                                retry_after: retry_after_secs,
+                            });
                         }
                     } else if is_retryable_server_error {
                         let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
@@ -1127,12 +1169,17 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                                    .min(self.config.max_retry_backoff)
+                                (self.config.initial_retry_backoff
+                                    * 2u32.saturating_pow(attempt as u32))
+                                .min(self.config.max_retry_backoff)
                             };
                             debug!(
                                 "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
-                                status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
+                                status.as_u16(),
+                                initial_url,
+                                delay,
+                                attempt + 1,
+                                self.config.max_retries
                             );
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -1153,11 +1200,16 @@ impl RegistryClient {
                 Err(err) => {
                     // Check if network error is transient and retryable
                     if err.is_transient() && attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                            .min(self.config.max_retry_backoff);
+                        let delay = (self.config.initial_retry_backoff
+                            * 2u32.saturating_pow(attempt as u32))
+                        .min(self.config.max_retry_backoff);
                         debug!(
                             "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
-                            err, initial_url, delay, attempt + 1, self.config.max_retries
+                            err,
+                            initial_url,
+                            delay,
+                            attempt + 1,
+                            self.config.max_retries
                         );
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -1186,15 +1238,16 @@ impl RegistryClient {
         let host_key = if let Some(port) = initial_url.port() {
             format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
-            initial_url.host_str().unwrap_or_default().to_ascii_lowercase()
+            initial_url
+                .host_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
         };
 
         if self.config.circuit_breaker_enabled {
             let state = self.circuit_breaker.check_state(&host_key).await;
             if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen {
-                    host: host_key,
-                });
+                return Err(RegistryError::CircuitBreakerOpen { host: host_key });
             }
         }
 
@@ -1298,8 +1351,9 @@ impl RegistryClient {
                     let status = resp.status();
 
                     let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
-                    let is_retryable_server_error = self.config.retry_on_status.contains(&status.as_u16())
-                        || status.is_server_error();
+                    let is_retryable_server_error =
+                        self.config.retry_on_status.contains(&status.as_u16())
+                            || status.is_server_error();
 
                     if is_rate_limited {
                         let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
@@ -1314,12 +1368,16 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                                    .min(self.config.max_retry_backoff)
+                                (self.config.initial_retry_backoff
+                                    * 2u32.saturating_pow(attempt as u32))
+                                .min(self.config.max_retry_backoff)
                             };
                             debug!(
                                 "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
-                                initial_url, delay, attempt + 1, self.config.max_retries
+                                initial_url,
+                                delay,
+                                attempt + 1,
+                                self.config.max_retries
                             );
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -1328,7 +1386,9 @@ impl RegistryClient {
                             if self.config.circuit_breaker_enabled {
                                 self.circuit_breaker.record_failure(&host_key).await;
                             }
-                            return Err(RegistryError::RateLimited { retry_after: retry_after_secs });
+                            return Err(RegistryError::RateLimited {
+                                retry_after: retry_after_secs,
+                            });
                         }
                     } else if is_retryable_server_error {
                         let retry_after_secs = parse_retry_after(resp.headers().get(RETRY_AFTER));
@@ -1343,12 +1403,17 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                                    .min(self.config.max_retry_backoff)
+                                (self.config.initial_retry_backoff
+                                    * 2u32.saturating_pow(attempt as u32))
+                                .min(self.config.max_retry_backoff)
                             };
                             debug!(
                                 "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
-                                status.as_u16(), initial_url, delay, attempt + 1, self.config.max_retries
+                                status.as_u16(),
+                                initial_url,
+                                delay,
+                                attempt + 1,
+                                self.config.max_retries
                             );
                             tokio::time::sleep(delay).await;
                             attempt += 1;
@@ -1368,11 +1433,16 @@ impl RegistryClient {
                 }
                 Err(err) => {
                     if err.is_transient() && attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(attempt as u32))
-                            .min(self.config.max_retry_backoff);
+                        let delay = (self.config.initial_retry_backoff
+                            * 2u32.saturating_pow(attempt as u32))
+                        .min(self.config.max_retry_backoff);
                         debug!(
                             "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
-                            err, initial_url, delay, attempt + 1, self.config.max_retries
+                            err,
+                            initial_url,
+                            delay,
+                            attempt + 1,
+                            self.config.max_retries
                         );
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -1465,7 +1535,8 @@ impl RegistryClient {
             url,
             if_none_match,
             NPM_INSTALL_V1_JSON,
-        ).await
+        )
+        .await
     }
 
     /// Fetch the full npm packument when lockfile metadata omitted by the
@@ -1506,162 +1577,159 @@ impl RegistryClient {
 
         let mut stream_attempt = 0;
         loop {
-        let (mut resp, _permit) = self
-            .execute_with_permit(
-                Method::GET,
-                url.clone(),
-                Some(accept_header),
-                if_none_match,
-            )
-            .await?;
+            let (mut resp, _permit) = self
+                .execute_with_permit(Method::GET, url.clone(), Some(accept_header), if_none_match)
+                .await?;
 
-        let status = resp.status();
-        if status == StatusCode::NOT_MODIFIED {
+            let status = resp.status();
+            if status == StatusCode::NOT_MODIFIED {
+                let etag = resp
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| if_none_match.map(|s| s.to_string()));
+                return Ok(MetadataFetchResult::NotModified { etag });
+            }
+
+            if status == StatusCode::NOT_FOUND {
+                return Err(RegistryError::PackageNotFound {
+                    package: package_name.to_string(),
+                    status: 404,
+                });
+            }
+
+            if status == StatusCode::UNAUTHORIZED {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Unauthorized {
+                    url: url.to_string(),
+                    status: 401,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::FORBIDDEN {
+                let msg = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::Forbidden {
+                    url: url.to_string(),
+                    status: 403,
+                    message: msg,
+                });
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
+                return Err(RegistryError::RateLimited { retry_after });
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
             let etag = resp
                 .headers()
                 .get(ETAG)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string())
-                .or_else(|| if_none_match.map(|s| s.to_string()));
-            return Ok(MetadataFetchResult::NotModified { etag });
-        }
+                .map(|s| s.to_string());
 
-        if status == StatusCode::NOT_FOUND {
-            return Err(RegistryError::PackageNotFound {
-                package: package_name.to_string(),
-                status: 404,
-            });
-        }
+            let expected_content_length = resp
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| resp.content_length());
 
-        if status == StatusCode::UNAUTHORIZED {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Unauthorized {
-                url: url.to_string(),
-                status: 401,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN {
-            let msg = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::Forbidden {
-                url: url.to_string(),
-                status: 403,
-                message: msg,
-            });
-        }
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = parse_retry_after(resp.headers().get(RETRY_AFTER));
-            return Err(RegistryError::RateLimited { retry_after });
-        }
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(RegistryError::ServerError {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        let etag = resp
-            .headers()
-            .get(ETAG)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
-
-        let expected_content_length = resp
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| resp.content_length());
-
-        if let Some(content_length) = expected_content_length {
-            if content_length > self.config.max_metadata_size as u64 {
-                return Err(RegistryError::SizeLimitExceeded {
+            if let Some(content_length) = expected_content_length {
+                if content_length > self.config.max_metadata_size as u64 {
+                    return Err(RegistryError::SizeLimitExceeded {
                     limit: self.config.max_metadata_size as u64,
                     actual: content_length,
                     message: format!("Metadata Content-Length for package '{package_name}' exceeds maximum metadata size"),
                 });
+                }
             }
-        }
 
-        let mut bytes = Vec::new();
-        let mut stream_err: Option<RegistryError> = None;
-        loop {
-            let chunk_res = tokio::time::timeout(
-                self.config.chunk_idle_timeout,
-                resp.chunk(),
-            ).await;
+            let mut bytes = Vec::new();
+            let mut stream_err: Option<RegistryError> = None;
+            loop {
+                let chunk_res =
+                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
 
-            let chunk_opt = match chunk_res {
-                Ok(Ok(chunk)) => chunk,
-                Ok(Err(e)) => {
-                    stream_err = Some(RegistryError::Http(e));
-                    break;
-                }
-                Err(_) => {
-                    stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
-                    break;
-                }
-            };
+                let chunk_opt = match chunk_res {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(e)) => {
+                        stream_err = Some(RegistryError::Http(e));
+                        break;
+                    }
+                    Err(_) => {
+                        stream_err = Some(RegistryError::SlowlorisTimeout(
+                            self.config.chunk_idle_timeout,
+                        ));
+                        break;
+                    }
+                };
 
-            match chunk_opt {
-                Some(chunk) => {
-                    if bytes.len() + chunk.len() > self.config.max_metadata_size {
-                        return Err(RegistryError::SizeLimitExceeded {
+                match chunk_opt {
+                    Some(chunk) => {
+                        if bytes.len() + chunk.len() > self.config.max_metadata_size {
+                            return Err(RegistryError::SizeLimitExceeded {
                             limit: self.config.max_metadata_size as u64,
                             actual: (bytes.len() + chunk.len()) as u64,
                             message: format!("Metadata payload for package '{package_name}' exceeds maximum metadata size"),
                         });
+                        }
+                        bytes.extend_from_slice(&chunk);
                     }
-                    bytes.extend_from_slice(&chunk);
+                    None => break,
                 }
-                None => break,
             }
-        }
 
-        if let Some(err) = stream_err {
-            if err.is_transient() && stream_attempt < self.config.max_retries {
-                let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
+            if let Some(err) = stream_err {
+                if err.is_transient() && stream_attempt < self.config.max_retries {
+                    let delay = (self.config.initial_retry_backoff
+                        * 2u32.saturating_pow(stream_attempt as u32))
                     .min(self.config.max_retry_backoff);
-                debug!(
+                    debug!(
                     "Stream metadata error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                     err, url, delay, stream_attempt + 1, self.config.max_retries
                 );
-                tokio::time::sleep(delay).await;
-                stream_attempt += 1;
-                continue;
-            } else {
-                if self.config.circuit_breaker_enabled && err.is_transient() {
-                    self.circuit_breaker.record_failure(&host_key).await;
-                }
-                return Err(err);
-            }
-        }
-
-        if let Some(content_length) = expected_content_length {
-            if bytes.len() as u64 != content_length {
-                let mismatch_err = RegistryError::ContentLengthMismatch {
-                    expected: content_length,
-                    actual: bytes.len() as u64,
-                };
-                if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                        .min(self.config.max_retry_backoff);
                     tokio::time::sleep(delay).await;
                     stream_attempt += 1;
                     continue;
                 } else {
-                    return Err(mismatch_err);
+                    if self.config.circuit_breaker_enabled && err.is_transient() {
+                        self.circuit_breaker.record_failure(&host_key).await;
+                    }
+                    return Err(err);
                 }
             }
-        }
 
-        let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
-        metadata.validate()?;
-        return Ok(MetadataFetchResult::Fresh { metadata, etag });
+            if let Some(content_length) = expected_content_length {
+                if bytes.len() as u64 != content_length {
+                    let mismatch_err = RegistryError::ContentLengthMismatch {
+                        expected: content_length,
+                        actual: bytes.len() as u64,
+                    };
+                    if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
+                        let delay = (self.config.initial_retry_backoff
+                            * 2u32.saturating_pow(stream_attempt as u32))
+                        .min(self.config.max_retry_backoff);
+                        tokio::time::sleep(delay).await;
+                        stream_attempt += 1;
+                        continue;
+                    } else {
+                        return Err(mismatch_err);
+                    }
+                }
+            }
+
+            let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
+            metadata.validate()?;
+            return Ok(MetadataFetchResult::Fresh { metadata, etag });
         }
     }
 
@@ -1696,7 +1764,10 @@ impl RegistryClient {
     }
 
     /// Download a tarball stream from URL, safely following redirects.
-    pub async fn download_tarball(&self, tarball_url: &str) -> Result<TarballStream, RegistryError> {
+    pub async fn download_tarball(
+        &self,
+        tarball_url: &str,
+    ) -> Result<TarballStream, RegistryError> {
         self.download_tarball_stream(tarball_url).await
     }
 
@@ -1756,7 +1827,10 @@ impl RegistryClient {
             });
         }
 
-        Ok(TarballStream { response: resp, permit })
+        Ok(TarballStream {
+            response: resp,
+            permit,
+        })
     }
 
     /// Download a tarball response conditionally using ETag (`If-None-Match`).
@@ -1840,7 +1914,10 @@ impl RegistryClient {
     }
 
     /// Download tarball directly to memory bytes.
-    pub async fn download_tarball_bytes(&self, tarball_url: &str) -> Result<Vec<u8>, RegistryError> {
+    pub async fn download_tarball_bytes(
+        &self,
+        tarball_url: &str,
+    ) -> Result<Vec<u8>, RegistryError> {
         match self
             .download_tarball_bytes_conditional(tarball_url, None)
             .await?
@@ -1954,10 +2031,8 @@ impl RegistryClient {
             let mut stream_err = None;
 
             loop {
-                let chunk_res = tokio::time::timeout(
-                    self.config.chunk_idle_timeout,
-                    resp.chunk(),
-                ).await;
+                let chunk_res =
+                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
 
                 let chunk_opt = match chunk_res {
                     Ok(Ok(opt)) => opt,
@@ -1966,14 +2041,18 @@ impl RegistryClient {
                         break;
                     }
                     Err(_) => {
-                        stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                        stream_err = Some(RegistryError::SlowlorisTimeout(
+                            self.config.chunk_idle_timeout,
+                        ));
                         break;
                     }
                 };
 
                 match chunk_opt {
                     Some(chunk) => {
-                        if (bytes.len() as u64) + (chunk.len() as u64) > self.config.max_package_size {
+                        if (bytes.len() as u64) + (chunk.len() as u64)
+                            > self.config.max_package_size
+                        {
                             stream_err = Some(RegistryError::SizeLimitExceeded {
                                 limit: self.config.max_package_size,
                                 actual: (bytes.len() as u64) + (chunk.len() as u64),
@@ -1989,8 +2068,9 @@ impl RegistryClient {
 
             if let Some(err) = stream_err {
                 if err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                        .min(self.config.max_retry_backoff);
+                    let delay = (self.config.initial_retry_backoff
+                        * 2u32.saturating_pow(stream_attempt as u32))
+                    .min(self.config.max_retry_backoff);
                     debug!(
                         "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                         err, url, delay, stream_attempt + 1, self.config.max_retries
@@ -2071,7 +2151,10 @@ impl RegistryClient {
 
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            RegistryError::Other(format!("Failed to create directories for {}: {e}", dest_path.display()))
+            RegistryError::Other(format!(
+                "Failed to create directories for {}: {e}",
+                dest_path.display()
+            ))
         })?;
 
         let temp_path = {
@@ -2152,10 +2235,8 @@ impl RegistryClient {
             let mut stream_err = None;
 
             loop {
-                let chunk_res = tokio::time::timeout(
-                    self.config.chunk_idle_timeout,
-                    resp.chunk(),
-                ).await;
+                let chunk_res =
+                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
 
                 let chunk_opt = match chunk_res {
                     Ok(Ok(opt)) => opt,
@@ -2164,7 +2245,9 @@ impl RegistryClient {
                         break;
                     }
                     Err(_) => {
-                        stream_err = Some(RegistryError::SlowlorisTimeout(self.config.chunk_idle_timeout));
+                        stream_err = Some(RegistryError::SlowlorisTimeout(
+                            self.config.chunk_idle_timeout,
+                        ));
                         break;
                     }
                 };
@@ -2197,8 +2280,9 @@ impl RegistryClient {
                 let _ = tokio::fs::remove_file(&temp_path).await;
 
                 if err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff * 2u32.saturating_pow(stream_attempt as u32))
-                        .min(self.config.max_retry_backoff);
+                    let delay = (self.config.initial_retry_backoff
+                        * 2u32.saturating_pow(stream_attempt as u32))
+                    .min(self.config.max_retry_backoff);
                     debug!(
                         "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                         err, url, delay, stream_attempt + 1, self.config.max_retries
@@ -2230,13 +2314,15 @@ impl RegistryClient {
             })?;
             drop(file);
 
-            tokio::fs::rename(&temp_path, dest_path).await.map_err(|e| {
-                RegistryError::Other(format!(
-                    "Failed to rename {} to {}: {e}",
-                    temp_path.display(),
-                    dest_path.display()
-                ))
-            })?;
+            tokio::fs::rename(&temp_path, dest_path)
+                .await
+                .map_err(|e| {
+                    RegistryError::Other(format!(
+                        "Failed to rename {} to {}: {e}",
+                        temp_path.display(),
+                        dest_path.display()
+                    ))
+                })?;
 
             return Ok(written);
         }
@@ -2281,7 +2367,8 @@ impl RegistryClient {
         otp: Option<&str>,
     ) -> Result<(), RegistryError> {
         let registry = self.registry_for_package(package_name);
-        self.publish_to(registry, package_name, publish_payload, otp).await
+        self.publish_to(registry, package_name, publish_payload, otp)
+            .await
     }
 
     /// Publish a package to a specific registry URL.
@@ -2294,7 +2381,8 @@ impl RegistryClient {
     ) -> Result<(), RegistryError> {
         let encoded = encode_package_name(package_name);
         let base_str = registry.as_str().trim_end_matches('/');
-        let target_url = Url::parse(&format!("{base_str}/{encoded}")).map_err(RegistryError::UrlParse)?;
+        let target_url =
+            Url::parse(&format!("{base_str}/{encoded}")).map_err(RegistryError::UrlParse)?;
 
         let body_bytes = serde_json::to_vec(publish_payload)?;
 
@@ -2339,7 +2427,10 @@ impl RegistryClient {
                 url: target_url.to_string(),
                 status: 401,
                 message: if body_text.is_empty() {
-                    format!("Authentication required to publish package to {}.", registry)
+                    format!(
+                        "Authentication required to publish package to {}.",
+                        registry
+                    )
                 } else {
                     body_text
                 },
@@ -2372,7 +2463,8 @@ impl RegistryClient {
     pub async fn whoami(&self, registry: Option<&Url>) -> Result<String, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let base_str = reg_url.as_str().trim_end_matches('/');
-        let target_url = Url::parse(&format!("{base_str}/-/whoami")).map_err(RegistryError::UrlParse)?;
+        let target_url =
+            Url::parse(&format!("{base_str}/-/whoami")).map_err(RegistryError::UrlParse)?;
 
         // Verify that we have an active auth token for this registry
         let token = self.auth_token_for_url(&target_url);
@@ -2385,7 +2477,12 @@ impl RegistryClient {
         }
 
         let (resp, _permit) = self
-            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .execute_with_permit(
+                Method::GET,
+                target_url.clone(),
+                Some("application/json"),
+                None,
+            )
             .await?;
 
         let status = resp.status();
@@ -2429,7 +2526,9 @@ impl RegistryClient {
         if !trimmed.is_empty() {
             Ok(trimmed)
         } else {
-            Err(RegistryError::MalformedMetadata("Empty or invalid whoami response".into()))
+            Err(RegistryError::MalformedMetadata(
+                "Empty or invalid whoami response".into(),
+            ))
         }
     }
 
@@ -2437,11 +2536,17 @@ impl RegistryClient {
     pub async fn ping(&self, registry: Option<&Url>) -> Result<std::time::Duration, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let base_str = reg_url.as_str().trim_end_matches('/');
-        let target_url = Url::parse(&format!("{base_str}/-/ping")).map_err(RegistryError::UrlParse)?;
+        let target_url =
+            Url::parse(&format!("{base_str}/-/ping")).map_err(RegistryError::UrlParse)?;
 
         let start = std::time::Instant::now();
         let (resp, _permit) = self
-            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .execute_with_permit(
+                Method::GET,
+                target_url.clone(),
+                Some("application/json"),
+                None,
+            )
             .await?;
 
         let elapsed = start.elapsed();
@@ -2458,10 +2563,14 @@ impl RegistryClient {
     }
 
     /// List active authentication tokens on the registry (GET /-/npm/v1/tokens).
-    pub async fn token_list(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn token_list(
+        &self,
+        registry: Option<&Url>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let base_str = reg_url.as_str().trim_end_matches('/');
-        let target_url = Url::parse(&format!("{base_str}/-/npm/v1/tokens")).map_err(RegistryError::UrlParse)?;
+        let target_url =
+            Url::parse(&format!("{base_str}/-/npm/v1/tokens")).map_err(RegistryError::UrlParse)?;
 
         let token = self.auth_token_for_url(&target_url);
         if token.is_none() {
@@ -2473,7 +2582,12 @@ impl RegistryClient {
         }
 
         let (resp, _permit) = self
-            .execute_with_permit(Method::GET, target_url.clone(), Some("application/json"), None)
+            .execute_with_permit(
+                Method::GET,
+                target_url.clone(),
+                Some("application/json"),
+                None,
+            )
             .await?;
 
         let status = resp.status();
@@ -2485,15 +2599,23 @@ impl RegistryClient {
             });
         }
 
-        let body_json = resp.json::<serde_json::Value>().await.map_err(RegistryError::Http)?;
+        let body_json = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(RegistryError::Http)?;
         Ok(body_json)
     }
 
     /// Delete/revoke an authentication token on the registry (DELETE /-/npm/v1/tokens/token/<key>).
-    pub async fn token_revoke(&self, registry: Option<&Url>, token_id: &str) -> Result<(), RegistryError> {
+    pub async fn token_revoke(
+        &self,
+        registry: Option<&Url>,
+        token_id: &str,
+    ) -> Result<(), RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let base_str = reg_url.as_str().trim_end_matches('/');
-        let target_url = Url::parse(&format!("{base_str}/-/npm/v1/tokens/token/{token_id}")).map_err(RegistryError::UrlParse)?;
+        let target_url = Url::parse(&format!("{base_str}/-/npm/v1/tokens/token/{token_id}"))
+            .map_err(RegistryError::UrlParse)?;
 
         let token = self.auth_token_for_url(&target_url);
         if token.is_none() {
@@ -2505,7 +2627,12 @@ impl RegistryClient {
         }
 
         let (resp, _permit) = self
-            .execute_with_permit(Method::DELETE, target_url.clone(), Some("application/json"), None)
+            .execute_with_permit(
+                Method::DELETE,
+                target_url.clone(),
+                Some("application/json"),
+                None,
+            )
             .await?;
 
         let status = resp.status();
@@ -2530,8 +2657,12 @@ impl RegistryClient {
     ) -> Result<serde_json::Value, RegistryError> {
         validate_admin_token(username)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/user/org.couchdb.user:{}", reg_url.as_str().trim_end_matches('/'), username))
-            .map_err(RegistryError::UrlParse)?;
+        let target = Url::parse(&format!(
+            "{}/-/user/org.couchdb.user:{}",
+            reg_url.as_str().trim_end_matches('/'),
+            username
+        ))
+        .map_err(RegistryError::UrlParse)?;
         self.admin_json_request(
             Method::PUT,
             target,
@@ -2543,16 +2674,26 @@ impl RegistryClient {
                 "roles": [],
             })),
             otp,
-        ).await
+        )
+        .await
     }
 
     /// List dist-tags for a package using npm's registry administration API.
-    pub async fn dist_tags(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn dist_tags(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/dist-tags", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/dist-tags",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// Add or replace one dist-tag.
@@ -2568,9 +2709,15 @@ impl RegistryClient {
         validate_admin_token(version)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/dist-tags/{}", reg_url.as_str().trim_end_matches('/'), encoded, tag))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::PUT, target, Some(serde_json::json!(version)), otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/dist-tags/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded,
+            tag
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!(version)), otp)
+            .await?;
         Ok(())
     }
 
@@ -2585,234 +2732,522 @@ impl RegistryClient {
         validate_admin_token(tag)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/dist-tags/{}", reg_url.as_str().trim_end_matches('/'), encoded, tag))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/dist-tags/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded,
+            tag
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp)
+            .await?;
         Ok(())
     }
 
     /// List package owners/collaborators.
-    pub async fn package_owners(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn package_owners(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/collaborators?format=cli", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/collaborators?format=cli",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// Add a package owner/collaborator.
-    pub async fn package_owner_add(&self, registry: Option<&Url>, package_name: &str, user: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn package_owner_add(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        user: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         validate_admin_token(user)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/collaborators/{}", reg_url.as_str().trim_end_matches('/'), encoded, user))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({})), otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/collaborators/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded,
+            user
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({})), otp)
+            .await?;
         Ok(())
     }
 
     /// Remove a package owner/collaborator.
-    pub async fn package_owner_remove(&self, registry: Option<&Url>, package_name: &str, user: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn package_owner_remove(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        user: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         validate_admin_token(user)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/collaborators/{}", reg_url.as_str().trim_end_matches('/'), encoded, user))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/collaborators/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded,
+            user
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp)
+            .await?;
         Ok(())
     }
 
     /// Unpublish a package or one version.
-    pub async fn unpublish(&self, registry: Option<&Url>, package_name: &str, version: Option<&str>, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn unpublish(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        version: Option<&str>,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
         let suffix = version.map(|v| format!("/{}", v)).unwrap_or_default();
-        if let Some(v) = version { validate_admin_token(v)?; }
-        let target = Url::parse(&format!("{}/{encoded}{suffix}", reg_url.as_str().trim_end_matches('/')))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        if let Some(v) = version {
+            validate_admin_token(v)?;
+        }
+        let target = Url::parse(&format!(
+            "{}/{encoded}{suffix}",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp)
+            .await?;
         Ok(())
     }
 
     /// Set or clear a deprecation message on one version.
-    pub async fn deprecate(&self, registry: Option<&Url>, package_name: &str, version: &str, message: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn deprecate(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        version: &str,
+        message: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         validate_admin_token(version)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let package_url = Url::parse(&format!("{}/{}", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
-        let mut document = self.admin_json_request(Method::GET, package_url.clone(), None, None).await?;
-        let versions = document.get_mut("versions").and_then(|v| v.as_object_mut())
-            .ok_or_else(|| RegistryError::MalformedMetadata("registry package response has no versions object".into()))?;
-        let version_doc = versions.get_mut(version)
-            .ok_or_else(|| RegistryError::ServerError { status: 404, body: format!("version {version} not found") })?;
+        let package_url = Url::parse(&format!(
+            "{}/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        let mut document = self
+            .admin_json_request(Method::GET, package_url.clone(), None, None)
+            .await?;
+        let versions = document
+            .get_mut("versions")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| {
+                RegistryError::MalformedMetadata(
+                    "registry package response has no versions object".into(),
+                )
+            })?;
+        let version_doc = versions
+            .get_mut(version)
+            .ok_or_else(|| RegistryError::ServerError {
+                status: 404,
+                body: format!("version {version} not found"),
+            })?;
         if message.is_empty() {
-            if let Some(obj) = version_doc.as_object_mut() { obj.remove("deprecated"); }
+            if let Some(obj) = version_doc.as_object_mut() {
+                obj.remove("deprecated");
+            }
         } else if let Some(obj) = version_doc.as_object_mut() {
-            obj.insert("deprecated".into(), serde_json::Value::String(message.into()));
+            obj.insert(
+                "deprecated".into(),
+                serde_json::Value::String(message.into()),
+            );
         }
-        self.admin_json_request(Method::PUT, package_url, Some(document), otp).await?;
+        self.admin_json_request(Method::PUT, package_url, Some(document), otp)
+            .await?;
         Ok(())
     }
 
     /// Read or change a package's access level.
-    pub async fn package_access(&self, registry: Option<&Url>, package_name: &str, access: Option<&str>, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn package_access(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        access: Option<&str>,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/access", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/access",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
         match access {
             Some(level) if level == "public" || level == "restricted" => {
-                self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"access": level})), otp).await
+                self.admin_json_request(
+                    Method::PUT,
+                    target,
+                    Some(serde_json::json!({"access": level})),
+                    otp,
+                )
+                .await
             }
-            Some(_) => Err(RegistryError::MalformedMetadata("access must be public or restricted".into())),
-            None => self.admin_json_request(Method::GET, target, None, None).await,
+            Some(_) => Err(RegistryError::MalformedMetadata(
+                "access must be public or restricted".into(),
+            )),
+            None => {
+                self.admin_json_request(Method::GET, target, None, None)
+                    .await
+            }
         }
     }
 
     /// Star a package for the authenticated user using npm's package document API.
-    pub async fn star_package(&self, registry: Option<&Url>, package_name: &str, otp: Option<&str>) -> Result<(), RegistryError> {
-        self.update_package_star(registry, package_name, true, otp).await
+    pub async fn star_package(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.update_package_star(registry, package_name, true, otp)
+            .await
     }
 
     /// Remove a package star for the authenticated user.
-    pub async fn unstar_package(&self, registry: Option<&Url>, package_name: &str, otp: Option<&str>) -> Result<(), RegistryError> {
-        self.update_package_star(registry, package_name, false, otp).await
+    pub async fn unstar_package(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.update_package_star(registry, package_name, false, otp)
+            .await
     }
 
-    async fn update_package_star(&self, registry: Option<&Url>, package_name: &str, starred: bool, otp: Option<&str>) -> Result<(), RegistryError> {
+    async fn update_package_star(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        starred: bool,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let package_url = Url::parse(&format!("{}/{}", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
+        let package_url = Url::parse(&format!(
+            "{}/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
         let username = self.whoami(Some(reg_url)).await?;
-        let mut document = self.admin_json_request(Method::GET, package_url.clone(), None, None).await?;
-        let users = document.as_object_mut()
-            .ok_or_else(|| RegistryError::MalformedMetadata("package response is not an object".into()))?
+        let mut document = self
+            .admin_json_request(Method::GET, package_url.clone(), None, None)
+            .await?;
+        let users = document
+            .as_object_mut()
+            .ok_or_else(|| {
+                RegistryError::MalformedMetadata("package response is not an object".into())
+            })?
             .entry("users")
             .or_insert_with(|| serde_json::json!({}));
-        let users = users.as_object_mut()
-            .ok_or_else(|| RegistryError::MalformedMetadata("package users field is not an object".into()))?;
-        if starred { users.insert(username, serde_json::Value::Bool(true)); }
-        else { users.remove(&username); }
-        self.admin_json_request(Method::PUT, package_url, Some(document), otp).await?;
+        let users = users.as_object_mut().ok_or_else(|| {
+            RegistryError::MalformedMetadata("package users field is not an object".into())
+        })?;
+        if starred {
+            users.insert(username, serde_json::Value::Bool(true));
+        } else {
+            users.remove(&username);
+        }
+        self.admin_json_request(Method::PUT, package_url, Some(document), otp)
+            .await?;
         Ok(())
     }
 
     /// List packages starred by a user using npm's CouchDB starredByUser view.
-    pub async fn starred_packages(&self, registry: Option<&Url>, user: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn starred_packages(
+        &self,
+        registry: Option<&Url>,
+        user: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let username = match user {
-            Some(user) => { validate_admin_token(user)?; user.to_string() },
+            Some(user) => {
+                validate_admin_token(user)?;
+                user.to_string()
+            }
             None => self.whoami(Some(reg_url)).await?,
         };
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         query.append_pair("key", &format!("\"{username}\""));
-        let target = Url::parse(&format!("{}/-/_view/starredByUser?{}", reg_url.as_str().trim_end_matches('/'), query.finish()))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/_view/starredByUser?{}",
+            reg_url.as_str().trim_end_matches('/'),
+            query.finish()
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// Retrieve the authenticated user's npm profile.
-    pub async fn profile_get(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn profile_get(
+        &self,
+        registry: Option<&Url>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/npm/v1/user", reg_url.as_str().trim_end_matches('/')))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/npm/v1/user",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// Update selected fields in the authenticated user's npm profile.
-    pub async fn profile_set(&self, registry: Option<&Url>, profile: serde_json::Value, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn profile_set(
+        &self,
+        registry: Option<&Url>,
+        profile: serde_json::Value,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/npm/v1/user", reg_url.as_str().trim_end_matches('/')))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::POST, target, Some(profile), otp).await
+        let target = Url::parse(&format!(
+            "{}/-/npm/v1/user",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, Some(profile), otp)
+            .await
     }
 
     /// List organization members or change one member's role.
-    pub async fn org_members(&self, registry: Option<&Url>, org: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn org_members(
+        &self,
+        registry: Option<&Url>,
+        org: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.org_url(registry, org, "user")?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
-    pub async fn org_member_set(&self, registry: Option<&Url>, org: &str, user: &str, role: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn org_member_set(
+        &self,
+        registry: Option<&Url>,
+        org: &str,
+        user: &str,
+        role: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.org_url(registry, org, "user")?;
-        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"user": user, "role": role})), None).await
+        self.admin_json_request(
+            Method::PUT,
+            target,
+            Some(serde_json::json!({"user": user, "role": role})),
+            None,
+        )
+        .await
     }
 
-    pub async fn org_member_remove(&self, registry: Option<&Url>, org: &str, user: &str) -> Result<(), RegistryError> {
+    pub async fn org_member_remove(
+        &self,
+        registry: Option<&Url>,
+        org: &str,
+        user: &str,
+    ) -> Result<(), RegistryError> {
         let target = self.org_url(registry, org, "user")?;
-        self.admin_json_request(Method::DELETE, target, Some(serde_json::json!({"user": user})), None).await?;
+        self.admin_json_request(
+            Method::DELETE,
+            target,
+            Some(serde_json::json!({"user": user})),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
-    pub async fn team_create(&self, registry: Option<&Url>, scope: &str, team: &str, description: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn team_create(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+        description: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.org_url(registry, scope, "team")?;
-        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"name": team, "description": description})), None).await
+        self.admin_json_request(
+            Method::PUT,
+            target,
+            Some(serde_json::json!({"name": team, "description": description})),
+            None,
+        )
+        .await
     }
 
-    pub async fn team_destroy(&self, registry: Option<&Url>, scope: &str, team: &str) -> Result<(), RegistryError> {
+    pub async fn team_destroy(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+    ) -> Result<(), RegistryError> {
         let target = self.team_url(registry, scope, team, "")?;
-        self.admin_json_request(Method::DELETE, target, None, None).await?;
+        self.admin_json_request(Method::DELETE, target, None, None)
+            .await?;
         Ok(())
     }
 
-    pub async fn team_users(&self, registry: Option<&Url>, scope: &str, team: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn team_users(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.team_url(registry, scope, team, "user")?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
-    pub async fn teams(&self, registry: Option<&Url>, scope: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn teams(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.org_url(registry, scope, "team")?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
-    pub async fn team_add_user(&self, registry: Option<&Url>, scope: &str, team: &str, user: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn team_add_user(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+        user: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let target = self.team_url(registry, scope, team, "user")?;
-        self.admin_json_request(Method::PUT, target, Some(serde_json::json!({"user": user})), None).await
+        self.admin_json_request(
+            Method::PUT,
+            target,
+            Some(serde_json::json!({"user": user})),
+            None,
+        )
+        .await
     }
 
-    pub async fn team_remove_user(&self, registry: Option<&Url>, scope: &str, team: &str, user: &str) -> Result<(), RegistryError> {
+    pub async fn team_remove_user(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+        user: &str,
+    ) -> Result<(), RegistryError> {
         let target = self.team_url(registry, scope, team, "user")?;
-        self.admin_json_request(Method::DELETE, target, Some(serde_json::json!({"user": user})), None).await?;
+        self.admin_json_request(
+            Method::DELETE,
+            target,
+            Some(serde_json::json!({"user": user})),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
-    fn org_url(&self, registry: Option<&Url>, org: &str, resource: &str) -> Result<Url, RegistryError> {
+    fn org_url(
+        &self,
+        registry: Option<&Url>,
+        org: &str,
+        resource: &str,
+    ) -> Result<Url, RegistryError> {
         validate_admin_token(org)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        Url::parse(&format!("{}/-/org/{}/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(org.trim_start_matches('@')), resource))
-            .map_err(RegistryError::UrlParse)
+        Url::parse(&format!(
+            "{}/-/org/{}/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encode_path_segment(org.trim_start_matches('@')),
+            resource
+        ))
+        .map_err(RegistryError::UrlParse)
     }
 
-    fn team_url(&self, registry: Option<&Url>, scope: &str, team: &str, resource: &str) -> Result<Url, RegistryError> {
+    fn team_url(
+        &self,
+        registry: Option<&Url>,
+        scope: &str,
+        team: &str,
+        resource: &str,
+    ) -> Result<Url, RegistryError> {
         validate_admin_token(scope)?;
         validate_admin_token(team)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let suffix = if resource.is_empty() { String::new() } else { format!("/{resource}") };
-        Url::parse(&format!("{}/-/team/{}/{}{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(scope.trim_start_matches('@')), encode_path_segment(team), suffix))
-            .map_err(RegistryError::UrlParse)
+        let suffix = if resource.is_empty() {
+            String::new()
+        } else {
+            format!("/{resource}")
+        };
+        Url::parse(&format!(
+            "{}/-/team/{}/{}{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encode_path_segment(scope.trim_start_matches('@')),
+            encode_path_segment(team),
+            suffix
+        ))
+        .map_err(RegistryError::UrlParse)
     }
 
     /// Search the registry using npm's search API.
-    pub async fn search(&self, registry: Option<&Url>, text: &str, size: usize, from: usize) -> Result<serde_json::Value, RegistryError> {
+    pub async fn search(
+        &self,
+        registry: Option<&Url>,
+        text: &str,
+        size: usize,
+        from: usize,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         query.append_pair("text", text);
         query.append_pair("size", &size.to_string());
         query.append_pair("from", &from.to_string());
-        let target = Url::parse(&format!("{}/-/v1/search?{}", reg_url.as_str().trim_end_matches('/'), query.finish()))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/v1/search?{}",
+            reg_url.as_str().trim_end_matches('/'),
+            query.finish()
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// List trusted publishing relationships for a package.
-    pub async fn trust_list(&self, registry: Option<&Url>, package_name: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn trust_list(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/trust", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/trust",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
     /// Create one trusted publishing relationship for a package. The payload
@@ -2827,51 +3262,104 @@ impl RegistryClient {
     ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/trust", reg_url.as_str().trim_end_matches('/'), encoded))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::POST, target, Some(config), otp).await
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/trust",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, Some(config), otp)
+            .await
     }
 
     /// Revoke one trusted publishing relationship by its registry id.
-    pub async fn trust_revoke(&self, registry: Option<&Url>, package_name: &str, trust_id: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn trust_revoke(
+        &self,
+        registry: Option<&Url>,
+        package_name: &str,
+        trust_id: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         validate_admin_token(trust_id)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let target = Url::parse(&format!("{}/-/package/{}/trust/{}", reg_url.as_str().trim_end_matches('/'), encoded, encode_path_segment(trust_id)))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/package/{}/trust/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded,
+            encode_path_segment(trust_id)
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp)
+            .await?;
         Ok(())
     }
 
-    pub async fn stage_list(&self, registry: Option<&Url>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn stage_list(
+        &self,
+        registry: Option<&Url>,
+    ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/stage", reg_url.as_str().trim_end_matches('/')))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/stage",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
-    pub async fn stage_view(&self, registry: Option<&Url>, stage_id: &str) -> Result<serde_json::Value, RegistryError> {
+    pub async fn stage_view(
+        &self,
+        registry: Option<&Url>,
+        stage_id: &str,
+    ) -> Result<serde_json::Value, RegistryError> {
         validate_admin_token(stage_id)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/stage/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::GET, target, None, None).await
+        let target = Url::parse(&format!(
+            "{}/-/stage/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encode_path_segment(stage_id)
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
     }
 
-    pub async fn stage_approve(&self, registry: Option<&Url>, stage_id: &str, otp: Option<&str>) -> Result<serde_json::Value, RegistryError> {
+    pub async fn stage_approve(
+        &self,
+        registry: Option<&Url>,
+        stage_id: &str,
+        otp: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
         validate_admin_token(stage_id)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/stage/{}/approve", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::POST, target, None, otp).await
+        let target = Url::parse(&format!(
+            "{}/-/stage/{}/approve",
+            reg_url.as_str().trim_end_matches('/'),
+            encode_path_segment(stage_id)
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::POST, target, None, otp)
+            .await
     }
 
-    pub async fn stage_reject(&self, registry: Option<&Url>, stage_id: &str, otp: Option<&str>) -> Result<(), RegistryError> {
+    pub async fn stage_reject(
+        &self,
+        registry: Option<&Url>,
+        stage_id: &str,
+        otp: Option<&str>,
+    ) -> Result<(), RegistryError> {
         validate_admin_token(stage_id)?;
         let reg_url = registry.unwrap_or(&self.config.default_registry);
-        let target = Url::parse(&format!("{}/-/stage/{}", reg_url.as_str().trim_end_matches('/'), encode_path_segment(stage_id)))
-            .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp).await?;
+        let target = Url::parse(&format!(
+            "{}/-/stage/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encode_path_segment(stage_id)
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::DELETE, target, None, otp)
+            .await?;
         Ok(())
     }
 
@@ -2890,30 +3378,62 @@ impl RegistryClient {
                 Some("application/json"),
                 otp,
                 serde_json::to_vec(&body)?,
-            ).await?
+            )
+            .await?
         } else if otp.is_some() {
-            self.execute_with_body_permit(method, target.clone(), Some("application/json"), Some("application/json"), otp, Vec::new()).await?
+            self.execute_with_body_permit(
+                method,
+                target.clone(),
+                Some("application/json"),
+                Some("application/json"),
+                otp,
+                Vec::new(),
+            )
+            .await?
         } else {
-            self.execute_with_permit(method, target.clone(), Some("application/json"), None).await?
+            self.execute_with_permit(method, target.clone(), Some("application/json"), None)
+                .await?
         };
         let (response, _permit) = result;
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(match status {
-                StatusCode::UNAUTHORIZED => RegistryError::Unauthorized { url: target.to_string(), status: 401, message: body_text },
-                StatusCode::FORBIDDEN => RegistryError::Forbidden { url: target.to_string(), status: 403, message: body_text },
-                _ => RegistryError::ServerError { status: status.as_u16(), body: body_text },
+                StatusCode::UNAUTHORIZED => RegistryError::Unauthorized {
+                    url: target.to_string(),
+                    status: 401,
+                    message: body_text,
+                },
+                StatusCode::FORBIDDEN => RegistryError::Forbidden {
+                    url: target.to_string(),
+                    status: 403,
+                    message: body_text,
+                },
+                _ => RegistryError::ServerError {
+                    status: status.as_u16(),
+                    body: body_text,
+                },
             });
         }
-        if body_text.trim().is_empty() { return Ok(serde_json::Value::Null); }
-        serde_json::from_str(&body_text).map_err(|e| RegistryError::MalformedMetadata(format!("Invalid registry JSON response: {e}")))
+        if body_text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&body_text).map_err(|e| {
+            RegistryError::MalformedMetadata(format!("Invalid registry JSON response: {e}"))
+        })
     }
 }
 
 fn validate_admin_token(value: &str) -> Result<(), RegistryError> {
-    if value.is_empty() || value.contains('\r') || value.contains('\n') || value.contains('/') || value.contains('\\') {
-        return Err(RegistryError::SecurityViolation("registry administration argument contains forbidden characters".into()));
+    if value.is_empty()
+        || value.contains('\r')
+        || value.contains('\n')
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return Err(RegistryError::SecurityViolation(
+            "registry administration argument contains forbidden characters".into(),
+        ));
     }
     Ok(())
 }
@@ -2932,7 +3452,10 @@ mod tests {
     fn test_encode_package_name() {
         assert_eq!(encode_package_name("lodash"), "lodash");
         assert_eq!(encode_package_name("@scope/pkg"), "@scope%2fpkg");
-        assert_eq!(encode_package_name("@npmcli/arborist"), "@npmcli%2farborist");
+        assert_eq!(
+            encode_package_name("@npmcli/arborist"),
+            "@npmcli%2farborist"
+        );
         assert_eq!(encode_package_name("my-package-123"), "my-package-123");
     }
 
@@ -2952,11 +3475,26 @@ mod tests {
     #[test]
     fn test_client_config_defaults_and_keepalive() {
         let config = RegistryClientConfig::default();
-        assert_eq!(config.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
-        assert_eq!(config.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
-        assert_eq!(config.tcp_keepalive, Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS));
-        assert_eq!(config.pool_idle_timeout, Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS));
-        assert_eq!(config.connect_timeout, Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS));
+        assert_eq!(
+            config.max_concurrent_requests,
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(
+            config.pool_max_idle_per_host,
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert_eq!(
+            config.tcp_keepalive,
+            Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS)
+        );
+        assert_eq!(
+            config.pool_idle_timeout,
+            Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            config.connect_timeout,
+            Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
+        );
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert!(config.retry_on_status.contains(&429));
         assert!(config.retry_on_status.contains(&503));

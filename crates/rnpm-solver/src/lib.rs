@@ -1,6 +1,11 @@
 //! Dependency graph resolution, hoisting, overrides, peer dependencies, and workspaces.
 
-#![allow(clippy::result_large_err, clippy::type_complexity, clippy::too_many_arguments, clippy::field_reassign_with_default)]
+#![allow(
+    clippy::result_large_err,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::field_reassign_with_default
+)]
 
 pub mod aliases;
 pub mod error;
@@ -20,7 +25,7 @@ pub use aliases::DependencySpec;
 pub use error::SolverError;
 pub use graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
 pub use overrides::Overrides;
-pub use platform::Platform;
+pub use platform::{is_platform_compatible, Platform};
 pub use solver::{
     resolve_dependency_graph, resolve_dependency_graph_with_lockfile, resolve_fast_path,
     ResolverOptions, Solver,

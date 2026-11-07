@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 data-encoding = { workspace = true }
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

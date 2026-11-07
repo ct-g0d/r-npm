@@ -1,11 +1,11 @@
+use crate::error::FsError;
+use crate::tarball::{extract_tar_gz, ExtractionSummary, TarLimits};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::error::FsError;
-use crate::tarball::{extract_tar_gz, ExtractionSummary, TarLimits};
 
 static TRASH_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -28,9 +28,7 @@ pub fn extract_and_replace<R: Read>(
     limits: Option<TarLimits>,
 ) -> Result<ExtractionSummary, FsError> {
     let dest_v = crate::path::to_verbatim_path(destination);
-    let parent = dest_v
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let parent = dest_v.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
     // Create staging directory in the same parent directory (guarantees same filesystem)
@@ -42,13 +40,15 @@ pub fn extract_and_replace<R: Read>(
 
     // Extract into staging directory.
     // If extraction fails or a tar-bomb limit is violated, staging_temp is dropped and cleaned up.
-    let summary = extract_tar_gz(reader, staging_path, limits).inspect_err(|_err| {
+    let mut summary = extract_tar_gz(reader, staging_path, limits).inspect_err(|_err| {
         // Explicitly clean up staging directory on error
         let _ = fs::remove_dir_all(staging_path);
     })?;
 
     // Staging succeeded: replace destination with staging directory
+    let t_rename = std::time::Instant::now();
     replace_dir_with_retries(staging_path, &dest_v, 30)?;
+    summary.materialize_duration += t_rename.elapsed();
 
     // Extraction and atomic rename succeeded; disable tempdir auto-deletion
     std::mem::forget(staging_temp);
@@ -65,9 +65,7 @@ pub fn replace_dir_with_retries(
 ) -> Result<(), FsError> {
     let staging_v = crate::path::to_verbatim_path(staging);
     let destination_v = crate::path::to_verbatim_path(destination);
-    let parent = destination_v
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let parent = destination_v.parent().unwrap_or_else(|| Path::new("."));
 
     let mut attempt = 0;
     let mut delay = Duration::from_millis(10);

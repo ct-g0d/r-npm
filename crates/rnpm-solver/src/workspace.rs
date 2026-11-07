@@ -1,10 +1,10 @@
 //! Workspace dependency graph resolution, topological sorting, protocol handling,
 //! and cycle detection for monorepos.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_core::workspace::WorkspaceMember;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
 
 use crate::error::SolverError;
@@ -73,12 +73,7 @@ impl WorkspaceDependencyGraph {
                     })?;
 
                     // Validate version constraint
-                    validate_workspace_protocol_constraint(
-                        member,
-                        sibling,
-                        ws_spec,
-                        &dep_spec,
-                    )?;
+                    validate_workspace_protocol_constraint(member, sibling, ws_spec, &dep_spec)?;
 
                     member_prod.insert(dep_name, dep_spec);
                 } else if let Some(sibling) = member_map.get(&dep_name) {
@@ -110,12 +105,7 @@ impl WorkspaceDependencyGraph {
                         }
                     })?;
 
-                    validate_workspace_protocol_constraint(
-                        member,
-                        sibling,
-                        ws_spec,
-                        dep_spec,
-                    )?;
+                    validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
 
                     member_dev.insert(dep_name.clone(), dep_spec.clone());
                 } else if let Some(sibling) = member_map.get(dep_name) {
@@ -130,11 +120,7 @@ impl WorkspaceDependencyGraph {
         }
 
         // 2. Perform topological sorting and cycle detection
-        let topological_order = topological_sort_with_dev_deps(
-            &member_map,
-            &prod_deps,
-            &dev_deps,
-        )?;
+        let topological_order = topological_sort_with_dev_deps(&member_map, &prod_deps, &dev_deps)?;
 
         Ok(Self {
             members: member_map,
@@ -183,9 +169,7 @@ impl WorkspaceDependencyGraph {
 }
 
 fn normalize_path_str(p: &str) -> String {
-    p.replace('\\', "/")
-        .trim_matches('/')
-        .to_string()
+    p.replace('\\', "/").trim_matches('/').to_string()
 }
 
 fn normalize_relative_path(base: &str, relative: &str) -> String {
@@ -230,7 +214,11 @@ fn validate_workspace_protocol_constraint(
     }
 
     // Relative path check: workspace:../foo, workspace:./foo, or paths containing slashes
-    if clean.starts_with('.') || clean.starts_with('/') || clean.contains('/') || clean.contains('\\') {
+    if clean.starts_with('.')
+        || clean.starts_with('/')
+        || clean.contains('/')
+        || clean.contains('\\')
+    {
         let normalized = normalize_relative_path(&requester.relative_path, clean);
         let sibling_norm = normalize_path_str(&sibling.relative_path);
 
@@ -270,16 +258,15 @@ fn validate_workspace_protocol_constraint(
         }
     })?;
 
-    let sibling_ver = Version::parse(sibling_version_str).map_err(|e| {
-        SolverError::UnresolvedDependency {
+    let sibling_ver =
+        Version::parse(sibling_version_str).map_err(|e| SolverError::UnresolvedDependency {
             name: sibling.name.clone(),
             spec: raw_spec.to_string(),
             message: format!(
                 "Invalid version '{}' in workspace package '{}': {e}",
                 sibling_version_str, sibling.name
             ),
-        }
-    })?;
+        })?;
 
     if clean == "^" {
         // workspace:^ resolves to ^<sibling_version>
@@ -580,7 +567,11 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
             rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
         }),
-        license: root_manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+        license: root_manifest
+            .extra
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         engines: root_manifest.engines.clone(),
         parsed_version: parsed_root_version,
         extra: root_manifest.extra.clone(),
@@ -591,7 +582,10 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     for member in members {
         let member_loc = member.relative_path.clone();
         let link_loc = format!("node_modules/{}", member.name);
-        let mem_ver = member.version.clone().unwrap_or_else(|| "0.0.0".to_string());
+        let mem_ver = member
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.0".to_string());
         let parsed_mem_ver = Version::parse(&mem_ver).ok();
 
         let member_node = Node {
@@ -615,7 +609,12 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
-            license: member.manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            license: member
+                .manifest
+                .extra
+                .get("license")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             engines: member.manifest.engines.clone(),
             ..Default::default()
         };
@@ -728,7 +727,9 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 } else {
                     DependencyType::Peer
                 };
-                root_deps.entry(k.clone()).or_insert_with(|| (v.clone(), p_type));
+                root_deps
+                    .entry(k.clone())
+                    .or_insert_with(|| (v.clone(), p_type));
             }
         }
     }
@@ -751,27 +752,31 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
 
         if options.dev {
             for (k, v) in &member.manifest.dev_dependencies {
-                let is_ws = ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
+                let is_ws = ws_graph.has_sibling_edge(&member.name, k)
+                    || v.trim().starts_with("workspace:");
                 if !is_ws {
                     member_deps.insert(k.clone(), (v.clone(), DependencyType::Dev));
                 }
             }
         }
         for (k, v) in &member.manifest.dependencies {
-            let is_ws = ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
+            let is_ws =
+                ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
             if !is_ws {
                 member_deps.insert(k.clone(), (v.clone(), DependencyType::Prod));
             }
         }
         for (k, v) in &member.manifest.optional_dependencies {
-            let is_ws = ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
+            let is_ws =
+                ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
             if !is_ws {
                 member_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
             }
         }
         if !options.legacy_peer_deps {
             for (k, v) in &member.manifest.peer_dependencies {
-                let is_ws = ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
+                let is_ws = ws_graph.has_sibling_edge(&member.name, k)
+                    || v.trim().starts_with("workspace:");
                 if !is_ws {
                     let is_opt_peer = member
                         .manifest
@@ -784,7 +789,9 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                     } else {
                         DependencyType::Peer
                     };
-                    member_deps.entry(k.clone()).or_insert_with(|| (v.clone(), p_type));
+                    member_deps
+                        .entry(k.clone())
+                        .or_insert_with(|| (v.clone(), p_type));
                 }
             }
         }

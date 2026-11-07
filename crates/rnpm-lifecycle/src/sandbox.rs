@@ -27,17 +27,38 @@ pub fn check_dangerous_command_patterns(cmd: &str) -> Option<String> {
         ("~/.ssh", "Access to SSH keys directory (~/.ssh)"),
         ("~/.npmrc", "Access to user npm configuration (~/.npmrc)"),
         ("~/.aws", "Access to AWS credentials directory (~/.aws)"),
-        ("%userprofile%/.ssh", "Access to Windows user SSH keys (%USERPROFILE%/.ssh)"),
-        ("%userprofile%/.npmrc", "Access to Windows user npm config (%USERPROFILE%/.npmrc)"),
-        ("%userprofile%/.aws", "Access to Windows user AWS credentials (%USERPROFILE%/.aws)"),
-        ("/etc/passwd", "Access to system accounts file (/etc/passwd)"),
-        ("/etc/shadow", "Access to system password hashes (/etc/shadow)"),
+        (
+            "%userprofile%/.ssh",
+            "Access to Windows user SSH keys (%USERPROFILE%/.ssh)",
+        ),
+        (
+            "%userprofile%/.npmrc",
+            "Access to Windows user npm config (%USERPROFILE%/.npmrc)",
+        ),
+        (
+            "%userprofile%/.aws",
+            "Access to Windows user AWS credentials (%USERPROFILE%/.aws)",
+        ),
+        (
+            "/etc/passwd",
+            "Access to system accounts file (/etc/passwd)",
+        ),
+        (
+            "/etc/shadow",
+            "Access to system password hashes (/etc/shadow)",
+        ),
         ("$home/.ssh", "Access to user SSH keys ($HOME/.ssh)"),
         ("${home}/.ssh", "Access to user SSH keys (${HOME}/.ssh)"),
         ("$home/.npmrc", "Access to user npm config ($HOME/.npmrc)"),
-        ("${home}/.npmrc", "Access to user npm config (${HOME}/.npmrc)"),
+        (
+            "${home}/.npmrc",
+            "Access to user npm config (${HOME}/.npmrc)",
+        ),
         ("$home/.aws", "Access to user AWS credentials ($HOME/.aws)"),
-        ("${home}/.aws", "Access to user AWS credentials (${HOME}/.aws)"),
+        (
+            "${home}/.aws",
+            "Access to user AWS credentials (${HOME}/.aws)",
+        ),
     ];
 
     for (pattern, description) in sensitive_paths {
@@ -48,10 +69,15 @@ pub fn check_dangerous_command_patterns(cmd: &str) -> Option<String> {
 
     // 2. Obfuscated execution & base64 decoding
     if lower.contains("base64 -d") || lower.contains("base64 --decode") {
-        return Some("Obfuscated execution detected: base64 decoding invocation ('base64 -d')".to_string());
+        return Some(
+            "Obfuscated execution detected: base64 decoding invocation ('base64 -d')".to_string(),
+        );
     }
     if lower.contains("frombase64string") {
-        return Some("Obfuscated execution detected: .NET/PowerShell base64 decoder ('FromBase64String')".to_string());
+        return Some(
+            "Obfuscated execution detected: .NET/PowerShell base64 decoder ('FromBase64String')"
+                .to_string(),
+        );
     }
     if lower.contains("eval(") {
         return Some("Obfuscated or dynamic code execution detected: 'eval('".to_string());
@@ -59,16 +85,27 @@ pub fn check_dangerous_command_patterns(cmd: &str) -> Option<String> {
 
     // 3. Unauthorized network calls and interactive shells
     let direct_phrases = [
-        ("invoke-webrequest", "PowerShell web download command ('Invoke-WebRequest')"),
-        ("invoke-expression", "PowerShell arbitrary expression execution ('Invoke-Expression')"),
-        ("bash -i", "Interactive reverse shell invocation ('bash -i')"),
+        (
+            "invoke-webrequest",
+            "PowerShell web download command ('Invoke-WebRequest')",
+        ),
+        (
+            "invoke-expression",
+            "PowerShell arbitrary expression execution ('Invoke-Expression')",
+        ),
+        (
+            "bash -i",
+            "Interactive reverse shell invocation ('bash -i')",
+        ),
         ("sh -i", "Interactive reverse shell invocation ('sh -i')"),
         ("zsh -i", "Interactive reverse shell invocation ('zsh -i')"),
     ];
 
     for (phrase, desc) in direct_phrases {
         if lower.contains(phrase) {
-            return Some(format!("Unauthorized network or interactive shell detected: {desc}"));
+            return Some(format!(
+                "Unauthorized network or interactive shell detected: {desc}"
+            ));
         }
     }
 

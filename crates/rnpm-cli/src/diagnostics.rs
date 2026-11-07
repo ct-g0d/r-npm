@@ -1,6 +1,6 @@
 use rnpm_core::error::{CoreError, IntegrityError, ManifestError, SpecError};
-use rnpm_lockfile::LockfileError;
 use rnpm_fs::FsError;
+use rnpm_lockfile::LockfileError;
 use rnpm_registry::RegistryError;
 use rnpm_solver::SolverError;
 
@@ -111,37 +111,43 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     // Direct downcasts for strong typing
     for cause in err.chain() {
         if let Some(solver_err) = cause.downcast_ref::<SolverError>() {
-        match solver_err {
-            SolverError::PeerConflict { .. } => {
-                return Diagnostic::new("ERESOLVE", solver_err.to_string());
+            match solver_err {
+                SolverError::PeerConflict { .. } => {
+                    return Diagnostic::new("ERESOLVE", solver_err.to_string());
+                }
+                SolverError::Spec(SpecError::UnsupportedProtocol { protocol, spec }) => {
+                    return Diagnostic::new(
+                        "EUNSUPPORTEDPROTOCOL",
+                        format!("Unsupported URL Type \"{protocol}\": {spec}"),
+                    )
+                    .with_detail(
+                        "Supported protocols are npm registry packages, 'file:', and 'workspace:'.",
+                    );
+                }
+                _ => {}
             }
-            SolverError::Spec(SpecError::UnsupportedProtocol { protocol, spec }) => {
-                return Diagnostic::new(
-                    "EUNSUPPORTEDPROTOCOL",
-                    format!("Unsupported URL Type \"{protocol}\": {spec}"),
-                )
-                .with_detail("Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
-            }
-            _ => {}
-        }
         }
 
         if let Some(reg_err) = cause.downcast_ref::<RegistryError>() {
-        match reg_err {
-            RegistryError::PackageNotFound { package, status } => {
-                return Diagnostic::new(
-                    "E404",
-                    format!("Package '{package}' not found in registry (HTTP {status})"),
-                );
-            }
-            RegistryError::VersionNotFound { package, version } => {
-                return Diagnostic::new(
-                    "ETARGET",
-                    format!("No matching version found for {package}@{version}"),
-                );
-            }
-            RegistryError::Unauthorized { message, status: _, url } => {
-                return Diagnostic::new(
+            match reg_err {
+                RegistryError::PackageNotFound { package, status } => {
+                    return Diagnostic::new(
+                        "E404",
+                        format!("Package '{package}' not found in registry (HTTP {status})"),
+                    );
+                }
+                RegistryError::VersionNotFound { package, version } => {
+                    return Diagnostic::new(
+                        "ETARGET",
+                        format!("No matching version found for {package}@{version}"),
+                    );
+                }
+                RegistryError::Unauthorized {
+                    message,
+                    status: _,
+                    url,
+                } => {
+                    return Diagnostic::new(
                     "ENEEDAUTH",
                     format!("This command requires you to be logged in to {url}"),
                 )
@@ -150,108 +156,152 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 } else {
                     format!("{message}\nYou need to authorize this machine using `npm adduser` or `npm login`")
                 });
+                }
+                RegistryError::Forbidden {
+                    message,
+                    status: _,
+                    url,
+                } => {
+                    return Diagnostic::new("E403", format!("403 Forbidden - {url}: {message}"));
+                }
+                RegistryError::PublishConflict {
+                    message,
+                    status: _,
+                    url: _,
+                } => {
+                    let msg = if message.is_empty()
+                        || message
+                            .to_ascii_lowercase()
+                            .contains("cannot publish over existing")
+                    {
+                        "Cannot publish over existing version.".to_string()
+                    } else {
+                        message.clone()
+                    };
+                    return Diagnostic::new("EPUBLISHCONFLICT", msg)
+                        .with_detail("Update the version in package.json before publishing.");
+                }
+                RegistryError::RateLimited { .. } => {
+                    return Diagnostic::new("E429", "Registry rate limit exceeded (HTTP 429)");
+                }
+                RegistryError::SecurityViolation(msg) => {
+                    return Diagnostic::new("ESECURITY", msg);
+                }
+                _ => {}
             }
-            RegistryError::Forbidden { message, status: _, url } => {
-                return Diagnostic::new(
-                    "E403",
-                    format!("403 Forbidden - {url}: {message}"),
-                );
-            }
-            RegistryError::PublishConflict { message, status: _, url: _ } => {
-                let msg = if message.is_empty() || message.to_ascii_lowercase().contains("cannot publish over existing") {
-                    "Cannot publish over existing version.".to_string()
-                } else {
-                    message.clone()
-                };
-                return Diagnostic::new("EPUBLISHCONFLICT", msg)
-                    .with_detail("Update the version in package.json before publishing.");
-            }
-            RegistryError::RateLimited { .. } => {
-                return Diagnostic::new(
-                    "E429",
-                    "Registry rate limit exceeded (HTTP 429)",
-                );
-            }
-            RegistryError::SecurityViolation(msg) => {
-                return Diagnostic::new("ESECURITY", msg);
-            }
-            _ => {}
-        }
         }
 
         if let Some(fs_err) = cause.downcast_ref::<FsError>() {
-        match fs_err {
-            FsError::TarBombLimitExceeded { limit_type, detail } => {
-                return Diagnostic::new(
-                    "ETARBOMB",
-                    format!("Tar bomb resource limit exceeded ({limit_type}): {detail}"),
-                );
+            match fs_err {
+                FsError::TarBombLimitExceeded { limit_type, detail } => {
+                    return Diagnostic::new(
+                        "ETARBOMB",
+                        format!("Tar bomb resource limit exceeded ({limit_type}): {detail}"),
+                    );
+                }
+                FsError::PathTraversal { path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Path traversal detected in tarball entry: '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::AbsolutePath { path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Absolute path rejected in tarball entry: '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::EscapingSymlink { link, target } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Symlink target '{}' escapes destination for link '{}'",
+                            target.display(),
+                            link.display()
+                        ),
+                    );
+                }
+                FsError::WindowsReservedDeviceName { name, path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Windows reserved device name rejected: '{name}' in path '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::TrailingDotOrSpace { name, path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Trailing dot or space rejected in component '{name}' in path '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::ForbiddenModeBits { mode, path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "SUID/SGID mode bits (0o{mode:o}) forbidden in path '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::ForbiddenSpecialEntry { path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Forbidden special entry (block, character, or fifo) in path '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::ForbiddenSparseFile { path } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Forbidden sparse file in tarball entry: '{}'",
+                            path.display()
+                        ),
+                    );
+                }
+                FsError::DanglingHardlink { link, target } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Dangling hardlink '{}' targets non-existent entry '{}'",
+                            link.display(),
+                            target.display()
+                        ),
+                    );
+                }
+                FsError::CircularHardlink { link, target } => {
+                    return Diagnostic::new(
+                        "ESECURITY",
+                        format!(
+                            "Circular hardlink detected: link '{}' to target '{}'",
+                            link.display(),
+                            target.display()
+                        ),
+                    );
+                }
+                _ => {}
             }
-            FsError::PathTraversal { path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Path traversal detected in tarball entry: '{}'", path.display()),
-                );
-            }
-            FsError::AbsolutePath { path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Absolute path rejected in tarball entry: '{}'", path.display()),
-                );
-            }
-            FsError::EscapingSymlink { link, target } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Symlink target '{}' escapes destination for link '{}'", target.display(), link.display()),
-                );
-            }
-            FsError::WindowsReservedDeviceName { name, path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Windows reserved device name rejected: '{name}' in path '{}'", path.display()),
-                );
-            }
-            FsError::TrailingDotOrSpace { name, path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Trailing dot or space rejected in component '{name}' in path '{}'", path.display()),
-                );
-            }
-            FsError::ForbiddenModeBits { mode, path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("SUID/SGID mode bits (0o{mode:o}) forbidden in path '{}'", path.display()),
-                );
-            }
-            FsError::ForbiddenSpecialEntry { path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Forbidden special entry (block, character, or fifo) in path '{}'", path.display()),
-                );
-            }
-            FsError::ForbiddenSparseFile { path } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Forbidden sparse file in tarball entry: '{}'", path.display()),
-                );
-            }
-            FsError::DanglingHardlink { link, target } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Dangling hardlink '{}' targets non-existent entry '{}'", link.display(), target.display()),
-                );
-            }
-            FsError::CircularHardlink { link, target } => {
-                return Diagnostic::new(
-                    "ESECURITY",
-                    format!("Circular hardlink detected: link '{}' to target '{}'", link.display(), target.display()),
-                );
-            }
-            _ => {}
-        }
         }
 
-        if let Some(ManifestError::MalformedJson { message, line, column }) = cause.downcast_ref::<ManifestError>() {
+        if let Some(ManifestError::MalformedJson {
+            message,
+            line,
+            column,
+        }) = cause.downcast_ref::<ManifestError>()
+        {
             return Diagnostic::new(
                 "EJSONPARSE",
                 format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
@@ -266,35 +316,48 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         }
 
         if let Some(core_err) = cause.downcast_ref::<CoreError>() {
-        match core_err {
-            CoreError::Spec(SpecError::UnsupportedProtocol { protocol, spec }) => {
-                return Diagnostic::new(
-                    "EUNSUPPORTEDPROTOCOL",
-                    format!("Unsupported URL Type \"{protocol}\": {spec}"),
-                )
-                .with_detail("Supported protocols are npm registry packages, 'file:', and 'workspace:'.");
-            }
-            CoreError::Integrity(IntegrityError::Mismatch { algorithm, expected, actual }) => {
-                return Diagnostic::new(
+            match core_err {
+                CoreError::Spec(SpecError::UnsupportedProtocol { protocol, spec }) => {
+                    return Diagnostic::new(
+                        "EUNSUPPORTEDPROTOCOL",
+                        format!("Unsupported URL Type \"{protocol}\": {spec}"),
+                    )
+                    .with_detail(
+                        "Supported protocols are npm registry packages, 'file:', and 'workspace:'.",
+                    );
+                }
+                CoreError::Integrity(IntegrityError::Mismatch {
+                    algorithm,
+                    expected,
+                    actual,
+                }) => {
+                    return Diagnostic::new(
                     "EINTEGRITY",
                     format!("Integrity verification failed for {algorithm}: expected '{expected}', actual '{actual}'"),
                 );
+                }
+                CoreError::Manifest(ManifestError::MalformedJson {
+                    message,
+                    line,
+                    column,
+                }) => {
+                    return Diagnostic::new(
+                        "EJSONPARSE",
+                        format!(
+                            "Malformed JSON in manifest: {message} at line {line}, column {column}"
+                        ),
+                    );
+                }
+                _ => {}
             }
-            CoreError::Manifest(ManifestError::MalformedJson { message, line, column }) => {
-                return Diagnostic::new(
-                    "EJSONPARSE",
-                    format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
-                );
-            }
-            _ => {}
-        }
         }
     }
 
     // Pattern matching across error strings
     if err_str.contains("Unsupported URL Type") || err_str.contains("Unsupported protocol") {
-        Diagnostic::new("EUNSUPPORTEDPROTOCOL", err_str)
-            .with_detail("Supported protocols are npm registry packages, 'file:', and 'workspace:'.")
+        Diagnostic::new("EUNSUPPORTEDPROTOCOL", err_str).with_detail(
+            "Supported protocols are npm registry packages, 'file:', and 'workspace:'.",
+        )
     } else if err_str.contains("ERESOLVE") || err_str.contains("Conflicting peer dependency") {
         Diagnostic::new("ERESOLVE", err_str)
     } else if err_str.contains("ELOCKFILE_DRIFT")
@@ -308,9 +371,13 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         || err_str.contains("EINTEGRITY")
     {
         Diagnostic::new("EINTEGRITY", err_str)
-    } else if (err_str.contains("Package '") && err_str.contains("' not found in registry")) || err_str.contains("HTTP 404") {
+    } else if (err_str.contains("Package '") && err_str.contains("' not found in registry"))
+        || err_str.contains("HTTP 404")
+    {
         Diagnostic::new("E404", err_str)
-    } else if (err_str.contains("Version '") && err_str.contains("' not found")) || err_str.contains("ETARGET") {
+    } else if (err_str.contains("Version '") && err_str.contains("' not found"))
+        || err_str.contains("ETARGET")
+    {
         Diagnostic::new("ETARGET", err_str)
     } else if err_str.contains("Authentication failed") || err_str.contains("HTTP 401") {
         Diagnostic::new("E401", err_str)
@@ -331,11 +398,20 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     } else if err_str.contains("Malformed JSON")
         || err_str.contains("EJSONPARSE")
         || err_str.contains("JSON serialization/deserialization error")
-        || (err_str.contains("package-lock.json") && (err_str.contains("syntax error") || err_str.contains("expected") || (err_str.contains("line ") && err_str.contains("column "))))
-        || (err_str.contains("package.json") && (err_str.contains("syntax error") || err_str.contains("expected") || (err_str.contains("line ") && err_str.contains("column "))))
+        || (err_str.contains("package-lock.json")
+            && (err_str.contains("syntax error")
+                || err_str.contains("expected")
+                || (err_str.contains("line ") && err_str.contains("column "))))
+        || (err_str.contains("package.json")
+            && (err_str.contains("syntax error")
+                || err_str.contains("expected")
+                || (err_str.contains("line ") && err_str.contains("column "))))
     {
         Diagnostic::new("EJSONPARSE", err_str)
-    } else if err_str.contains("ENOLOCK") || err_str.contains("requires an existing lockfile") || err_str.contains("requires a committed lockfile") {
+    } else if err_str.contains("ENOLOCK")
+        || err_str.contains("requires an existing lockfile")
+        || err_str.contains("requires a committed lockfile")
+    {
         Diagnostic::new("ENOLOCK", err_str)
     } else if err_str.contains("ENOWORKSPACES") {
         Diagnostic::new("ENOWORKSPACES", err_str)

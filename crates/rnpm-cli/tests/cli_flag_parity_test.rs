@@ -12,8 +12,13 @@ fn setup_base_fixture(dir: &std::path::Path) {
     fs::write(
         pkg_prod_dir.join("package.json"),
         r#"{"name": "pkg-prod", "version": "1.0.0", "main": "index.js"}"#,
-    ).unwrap();
-    fs::write(pkg_prod_dir.join("index.js"), "module.exports = 'pkg-prod';").unwrap();
+    )
+    .unwrap();
+    fs::write(
+        pkg_prod_dir.join("index.js"),
+        "module.exports = 'pkg-prod';",
+    )
+    .unwrap();
 
     // pkg-dev
     let pkg_dev_dir = pkgs_dir.join("pkg-dev");
@@ -21,7 +26,8 @@ fn setup_base_fixture(dir: &std::path::Path) {
     fs::write(
         pkg_dev_dir.join("package.json"),
         r#"{"name": "pkg-dev", "version": "1.0.0", "main": "index.js"}"#,
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(pkg_dev_dir.join("index.js"), "module.exports = 'pkg-dev';").unwrap();
 
     // pkg-opt (darwin + arm64 only)
@@ -40,7 +46,11 @@ fn setup_base_fixture(dir: &std::path::Path) {
         pkg_funded_dir.join("package.json"),
         r#"{"name": "pkg-funded", "version": "1.0.0", "main": "index.js", "funding": "https://example.com/donate"}"#,
     ).unwrap();
-    fs::write(pkg_funded_dir.join("index.js"), "module.exports = 'pkg-funded';").unwrap();
+    fs::write(
+        pkg_funded_dir.join("index.js"),
+        "module.exports = 'pkg-funded';",
+    )
+    .unwrap();
 
     // Root package.json
     fs::write(
@@ -59,7 +69,8 @@ fn setup_base_fixture(dir: &std::path::Path) {
                 "pkg-opt": "file:./packages/pkg-opt"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[test]
@@ -76,10 +87,20 @@ fn test_include_overrides_omit_precedence() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let node_modules = temp.path().join("node_modules");
-    assert!(node_modules.join("pkg-prod").exists(), "pkg-prod must be installed");
-    assert!(node_modules.join("pkg-dev").exists(), "pkg-dev must be installed because --include=dev overrides --omit=dev");
+    assert!(
+        node_modules.join("pkg-prod").exists(),
+        "pkg-prod must be installed"
+    );
+    assert!(
+        node_modules.join("pkg-dev").exists(),
+        "pkg-dev must be installed because --include=dev overrides --omit=dev"
+    );
 
     // 2. Order invariance: --include=dev --omit=dev (include still wins)
     let temp_rev = tempdir().unwrap();
@@ -91,9 +112,17 @@ fn test_include_overrides_omit_precedence() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output_rev.status.success(), "stderr: {}", String::from_utf8_lossy(&output_rev.stderr));
     assert!(
-        temp_rev.path().join("node_modules").join("pkg-dev").exists(),
+        output_rev.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output_rev.stderr)
+    );
+    assert!(
+        temp_rev
+            .path()
+            .join("node_modules")
+            .join("pkg-dev")
+            .exists(),
         "pkg-dev must be installed regardless of flag order"
     );
 
@@ -110,7 +139,10 @@ fn test_include_overrides_omit_precedence() {
     assert!(output_omit.status.success());
     let nm_omit = temp_omit.path().join("node_modules");
     assert!(nm_omit.join("pkg-prod").exists());
-    assert!(!nm_omit.join("pkg-dev").exists(), "pkg-dev must NOT be installed when omitted");
+    assert!(
+        !nm_omit.join("pkg-dev").exists(),
+        "pkg-dev must NOT be installed when omitted"
+    );
 
     // 4. NODE_ENV=production overridden by --include=dev
     let temp_prod_env = tempdir().unwrap();
@@ -125,7 +157,11 @@ fn test_include_overrides_omit_precedence() {
 
     assert!(output_prod_env.status.success());
     assert!(
-        temp_prod_env.path().join("node_modules").join("pkg-dev").exists(),
+        temp_prod_env
+            .path()
+            .join("node_modules")
+            .join("pkg-dev")
+            .exists(),
         "pkg-dev must be installed when --include=dev overrides NODE_ENV=production"
     );
 
@@ -159,7 +195,11 @@ fn test_no_package_lock_and_package_lock_false() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output1.status.success(), "stderr: {}", String::from_utf8_lossy(&output1.stderr));
+    assert!(
+        output1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
     assert!(
         temp1.path().join("node_modules").join("pkg-prod").exists(),
         "node_modules/pkg-prod must be installed"
@@ -179,7 +219,11 @@ fn test_no_package_lock_and_package_lock_false() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output2.status.success(), "stderr: {}", String::from_utf8_lossy(&output2.stderr));
+    assert!(
+        output2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
     assert!(
         temp2.path().join("node_modules").join("pkg-prod").exists(),
         "node_modules/pkg-prod must be installed"
@@ -193,7 +237,11 @@ fn test_no_package_lock_and_package_lock_false() {
     let temp3 = tempdir().unwrap();
     setup_base_fixture(temp3.path());
     let existing_lock_content = r#"{"name": "pre-existing", "lockfileVersion": 3, "packages": {}}"#;
-    fs::write(temp3.path().join("package-lock.json"), existing_lock_content).unwrap();
+    fs::write(
+        temp3.path().join("package-lock.json"),
+        existing_lock_content,
+    )
+    .unwrap();
 
     let output3 = Command::new(rnpm_bin)
         .current_dir(temp3.path())
@@ -201,7 +249,11 @@ fn test_no_package_lock_and_package_lock_false() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output3.status.success(), "stderr: {}", String::from_utf8_lossy(&output3.stderr));
+    assert!(
+        output3.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output3.stderr)
+    );
     let current_lock_content = fs::read_to_string(temp3.path().join("package-lock.json")).unwrap();
     assert_eq!(
         current_lock_content, existing_lock_content,
@@ -223,7 +275,11 @@ fn test_dry_run_simulation_without_filesystem_mutation() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("rnpm: dry-run: would install") || stdout.contains("would install"),
@@ -260,7 +316,11 @@ fn test_platform_overrides() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output1.status.success(), "stderr: {}", String::from_utf8_lossy(&output1.stderr));
+    assert!(
+        output1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
     assert!(
         temp1.path().join("node_modules").join("pkg-opt").exists(),
         "pkg-opt must be installed when target platform matches --os=darwin --cpu=arm64"
@@ -276,7 +336,11 @@ fn test_platform_overrides() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output2.status.success(), "stderr: {}", String::from_utf8_lossy(&output2.stderr));
+    assert!(
+        output2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
     assert!(
         !temp2.path().join("node_modules").join("pkg-opt").exists(),
         "pkg-opt must be skipped when target platform is incompatible (--os=linux --cpu=x64)"
@@ -293,11 +357,20 @@ fn test_platform_overrides() {
 
     let output3 = Command::new(rnpm_bin)
         .current_dir(temp3.path())
-        .args(["install", "--package-lock-only", "--os=darwin", "--cpu=arm64"])
+        .args([
+            "install",
+            "--package-lock-only",
+            "--os=darwin",
+            "--cpu=arm64",
+        ])
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output3.status.success(), "stderr: {}", String::from_utf8_lossy(&output3.stderr));
+    assert!(
+        output3.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output3.stderr)
+    );
     let lockfile_str = fs::read_to_string(temp3.path().join("package-lock.json")).unwrap();
     assert!(
         lockfile_str.contains("pkg-opt"),
@@ -319,7 +392,11 @@ fn test_audit_and_fund_controls() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output_def.status.success(), "stderr: {}", String::from_utf8_lossy(&output_def.stderr));
+    assert!(
+        output_def.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output_def.stderr)
+    );
     let stdout_def = String::from_utf8_lossy(&output_def.stdout);
     assert!(
         stdout_def.contains("looking for funding") || stdout_def.contains("funding"),
@@ -448,10 +525,17 @@ fn test_workspace_root_options() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output1.status.success(), "stderr: {}", String::from_utf8_lossy(&output1.stderr));
+    assert!(
+        output1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
     let log1 = fs::read_to_string(&marker_file).unwrap_or_default();
     assert!(log1.contains("pkg-a"), "pkg-a must have run");
-    assert!(!log1.contains("root"), "root must NOT run without --workspace-root");
+    assert!(
+        !log1.contains("root"),
+        "root must NOT run without --workspace-root"
+    );
 
     // 2. With --workspace-root: both pkg-a AND root run
     let _ = fs::remove_file(&marker_file);
@@ -461,20 +545,36 @@ fn test_workspace_root_options() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output2.status.success(), "stderr: {}", String::from_utf8_lossy(&output2.stderr));
+    assert!(
+        output2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
     let log2 = fs::read_to_string(&marker_file).unwrap_or_default();
     assert!(log2.contains("pkg-a"), "pkg-a must run");
-    assert!(log2.contains("root"), "root must run when --workspace-root is specified: {log2}");
+    assert!(
+        log2.contains("root"),
+        "root must run when --workspace-root is specified: {log2}"
+    );
 
     // 3. With --include-workspace-root alias: both pkg-a AND root run
     let _ = fs::remove_file(&marker_file);
     let output3 = Command::new(rnpm_bin)
         .current_dir(temp.path())
-        .args(["run", "test", "--workspace=pkg-a", "--include-workspace-root"])
+        .args([
+            "run",
+            "test",
+            "--workspace=pkg-a",
+            "--include-workspace-root",
+        ])
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output3.status.success(), "stderr: {}", String::from_utf8_lossy(&output3.stderr));
+    assert!(
+        output3.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output3.stderr)
+    );
     let log3 = fs::read_to_string(&marker_file).unwrap_or_default();
     assert!(log3.contains("pkg-a"));
     assert!(log3.contains("root"));
@@ -490,11 +590,21 @@ fn test_include_peer_and_optional_combinations() {
 
     let output = Command::new(rnpm_bin)
         .current_dir(temp.path())
-        .args(["install", "--omit=optional,peer", "--include=optional,peer", "--os=darwin", "--cpu=arm64"])
+        .args([
+            "install",
+            "--omit=optional,peer",
+            "--include=optional,peer",
+            "--os=darwin",
+            "--cpu=arm64",
+        ])
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let node_modules = temp.path().join("node_modules");
     assert!(
         node_modules.join("pkg-opt").exists(),
@@ -512,11 +622,20 @@ fn test_dry_run_with_add_packages_preserves_package_json() {
 
     let output = Command::new(rnpm_bin)
         .current_dir(temp.path())
-        .args(["install", "file:./packages/pkg-dev", "--save-dev", "--dry-run"])
+        .args([
+            "install",
+            "file:./packages/pkg-dev",
+            "--save-dev",
+            "--dry-run",
+        ])
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("would add") || stdout.contains("would install"));
 
@@ -545,7 +664,8 @@ fn test_workspace_root_install_options() {
                 "pkg-dev": "file:./packages/pkg-dev"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     fs::write(
         temp.path().join("package.json"),
@@ -557,7 +677,8 @@ fn test_workspace_root_install_options() {
                 "pkg-prod": "file:./packages/pkg-prod"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // 1. Install targeting only workspace pkg-a without root
     let output1 = Command::new(rnpm_bin)
@@ -566,9 +687,16 @@ fn test_workspace_root_install_options() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output1.status.success(), "stderr: {}", String::from_utf8_lossy(&output1.stderr));
+    assert!(
+        output1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
     let node_modules = temp.path().join("node_modules");
-    assert!(node_modules.join("pkg-dev").exists(), "pkg-a's dependency must be installed");
+    assert!(
+        node_modules.join("pkg-dev").exists(),
+        "pkg-a's dependency must be installed"
+    );
 
     // 2. Install targeting workspace pkg-a AND workspace root
     let temp2 = tempdir().unwrap();
@@ -585,7 +713,8 @@ fn test_workspace_root_install_options() {
                 "pkg-dev": "file:./packages/pkg-dev"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         temp2.path().join("package.json"),
         r#"{
@@ -596,7 +725,8 @@ fn test_workspace_root_install_options() {
                 "pkg-prod": "file:./packages/pkg-prod"
             }
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let output2 = Command::new(rnpm_bin)
         .current_dir(temp2.path())
@@ -604,9 +734,18 @@ fn test_workspace_root_install_options() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output2.status.success(), "stderr: {}", String::from_utf8_lossy(&output2.stderr));
+    assert!(
+        output2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
     let node_modules2 = temp2.path().join("node_modules");
-    assert!(node_modules2.join("pkg-dev").exists(), "pkg-a's dependency must be installed");
-    assert!(node_modules2.join("pkg-prod").exists(), "root dependency must also be installed with --workspace-root");
+    assert!(
+        node_modules2.join("pkg-dev").exists(),
+        "pkg-a's dependency must be installed"
+    );
+    assert!(
+        node_modules2.join("pkg-prod").exists(),
+        "root dependency must also be installed with --workspace-root"
+    );
 }
-

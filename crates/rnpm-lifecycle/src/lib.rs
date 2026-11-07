@@ -1,12 +1,12 @@
-﻿#![allow(clippy::upper_case_acronyms, clippy::field_reassign_with_default)]
+#![allow(clippy::upper_case_acronyms, clippy::field_reassign_with_default)]
 
+use anyhow::{Context, Result};
+use rnpm_core::manifest::Manifest;
+use std::collections::BinaryHeap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::collections::BinaryHeap;
 use std::process::{Command, ExitStatus};
-use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
-use rnpm_core::manifest::Manifest;
 
 pub mod error;
 pub mod policy;
@@ -65,7 +65,8 @@ pub mod process_guard {
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 
     extern "system" {
-        fn CreateJobObjectW(lpJobAttributes: *const std::ffi::c_void, lpName: *const u16) -> HANDLE;
+        fn CreateJobObjectW(lpJobAttributes: *const std::ffi::c_void, lpName: *const u16)
+            -> HANDLE;
         fn SetInformationJobObject(
             hJob: HANDLE,
             JobObjectInformationClass: i32,
@@ -129,7 +130,8 @@ pub mod process_guard {
         }
 
         pub fn terminate(&self, exit_code: u32) -> bool {
-            self.terminated.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.terminated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 if self.job_handle.is_null() {
                     return false;
@@ -158,8 +160,13 @@ pub mod process_guard {
     pub fn is_process_running(pid: u32) -> bool {
         unsafe {
             extern "system" {
-                fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
-                fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+                fn OpenProcess(
+                    dwDesiredAccess: u32,
+                    bInheritHandle: i32,
+                    dwProcessId: u32,
+                ) -> *mut std::ffi::c_void;
+                fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32)
+                    -> i32;
                 fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
             }
             const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -254,6 +261,30 @@ pub mod process_guard {
 pub enum PackageSource {
     Registry,
     Local,
+    Git,
+    LocalTarball,
+}
+
+impl PackageSource {
+    pub fn is_registry(&self) -> bool {
+        matches!(self, PackageSource::Registry)
+    }
+
+    pub fn runs_prepare(&self) -> bool {
+        matches!(
+            self,
+            PackageSource::Local | PackageSource::Git | PackageSource::LocalTarball
+        )
+    }
+
+    pub fn lifecycle_hooks(&self) -> &'static [&'static str] {
+        match self {
+            PackageSource::Registry => &["preinstall", "install", "postinstall"],
+            PackageSource::Local | PackageSource::Git | PackageSource::LocalTarball => {
+                &["preinstall", "install", "postinstall", "prepare"]
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -544,7 +575,9 @@ fn replace_bearer(text: &str) -> String {
         out.push_str(&text[last_idx..idx + 7]);
         let remainder = &text[idx + 7..];
         let end_token = remainder
-            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';')
+            .find(|c: char| {
+                c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';'
+            })
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + 7 + end_token;
@@ -619,7 +652,16 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
         out.push_str(&text[last_idx..idx + key_len]);
         let remainder = &text[idx + key_len..];
         let end_token = remainder
-            .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ',')
+            .find(|c: char| {
+                c.is_whitespace()
+                    || c == ';'
+                    || c == '&'
+                    || c == '"'
+                    || c == '\''
+                    || c == '\n'
+                    || c == '\r'
+                    || c == ','
+            })
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + key_len + end_token;
@@ -650,7 +692,8 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
 
                 if combined.len() > 512 {
                     let split_candidate = combined.len() - 256;
-                    let split_pos = match combined[..split_candidate].rfind(['\n', '\r', ' ', ';']) {
+                    let split_pos = match combined[..split_candidate].rfind(['\n', '\r', ' ', ';'])
+                    {
                         Some(pos) => pos + 1,
                         None => split_candidate,
                     };
@@ -768,7 +811,10 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     } else if existing_path.is_empty() {
         joined_custom_path
     } else {
-        format!("{joined_custom_path}{}{existing_path}", if cfg!(windows) { ";" } else { ":" })
+        format!(
+            "{joined_custom_path}{}{existing_path}",
+            if cfg!(windows) { ";" } else { ":" }
+        )
     };
 
     // Update all variations of PATH to avoid Windows case-sensitivity mismatches
@@ -779,7 +825,10 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     env.insert("Path".to_string(), final_path);
 
     // 4. Standard npm environment contract
-    env.insert("INIT_CWD".to_string(), ctx.project_root.to_string_lossy().to_string());
+    env.insert(
+        "INIT_CWD".to_string(),
+        ctx.project_root.to_string_lossy().to_string(),
+    );
     env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
     env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
     env.insert("npm_package_name".to_string(), ctx.package_name.clone());
@@ -789,16 +838,23 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     }
 
     let pkg_json = ctx.package_dir.join("package.json");
-    env.insert("npm_package_json".to_string(), pkg_json.to_string_lossy().to_string());
+    env.insert(
+        "npm_package_json".to_string(),
+        pkg_json.to_string_lossy().to_string(),
+    );
 
     let node_str = node_bin.to_string_lossy().to_string();
     env.insert("NODE".to_string(), node_str.clone());
     env.insert("npm_node_execpath".to_string(), node_str);
 
-    let rnpm_exec = ctx.npm_execpath.clone().unwrap_or_else(|| {
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm"))
-    });
-    env.insert("npm_execpath".to_string(), rnpm_exec.to_string_lossy().to_string());
+    let rnpm_exec = ctx
+        .npm_execpath
+        .clone()
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm")));
+    env.insert(
+        "npm_execpath".to_string(),
+        rnpm_exec.to_string_lossy().to_string(),
+    );
 
     env
 }
@@ -814,7 +870,8 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     );
 
     // Validate against sandbox policy
-    ctx.sandbox_policy.check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
+    ctx.sandbox_policy
+        .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let env = build_lifecycle_env(ctx);
@@ -849,18 +906,21 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         cmd.stderr(std::process::Stdio::inherit());
     }
 
-    let guard = process_guard::ProcessTreeGuard::new_with_limits(
-        ctx.sandbox_policy.max_active_processes,
-    );
+    let guard =
+        process_guard::ProcessTreeGuard::new_with_limits(ctx.sandbox_policy.max_active_processes);
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to spawn lifecycle script for {}", ctx.package_name))?;
 
     #[cfg(windows)]
     if let Some(ref g) = guard {
         use std::os::windows::io::AsRawHandle;
         if !g.assign_process(child.as_raw_handle()) {
-            warn!("Failed to assign process to Windows Job Object for {}", ctx.package_name);
+            warn!(
+                "Failed to assign process to Windows Job Object for {}",
+                ctx.package_name
+            );
         }
     }
     #[cfg(not(windows))]
@@ -872,9 +932,11 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let stdout_handle = child_stdout.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
+    let stdout_handle =
+        child_stdout.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
 
-    let stderr_handle = child_stderr.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
+    let stderr_handle =
+        child_stderr.map(|mut r| std::thread::spawn(move || drain_and_scrub_reader(&mut r)));
 
     let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
     let status = if let Some(timeout) = effective_timeout {
@@ -908,12 +970,20 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
             }
         }
     } else {
-        child.wait()
-            .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?
+        child.wait().with_context(|| {
+            format!(
+                "Failed to wait for lifecycle script for {}",
+                ctx.package_name
+            )
+        })?
     };
 
-    let stdout_str = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-    let stderr_str = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stdout_str = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr_str = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     if ctx.capture_output {
         *ctx.captured_output.lock().unwrap() = Some(ScriptOutput {
@@ -926,7 +996,9 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     if !status.success() {
         warn!(
             "Lifecycle script '{}' failed for {} with exit code: {:?}",
-            ctx.event, ctx.package_name, status.code()
+            ctx.event,
+            ctx.package_name,
+            status.code()
         );
     }
 
@@ -956,7 +1028,8 @@ where
     );
 
     // Validate against sandbox policy
-    ctx.sandbox_policy.check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
+    ctx.sandbox_policy
+        .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let env = build_lifecycle_env(ctx);
@@ -995,14 +1068,18 @@ where
         ctx.sandbox_policy.max_active_processes,
     ));
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to spawn lifecycle script for {}", ctx.package_name))?;
 
     #[cfg(windows)]
     if let Some(ref g) = *guard {
         use std::os::windows::io::AsRawHandle;
         if !g.assign_process(child.as_raw_handle()) {
-            warn!("Failed to assign process to Windows Job Object for {}", ctx.package_name);
+            warn!(
+                "Failed to assign process to Windows Job Object for {}",
+                ctx.package_name
+            );
         }
     }
     #[cfg(not(windows))]
@@ -1142,8 +1219,12 @@ where
         g.terminate(0);
     }
 
-    let status = status_res
-        .with_context(|| format!("Failed to wait for lifecycle script for {}", ctx.package_name))?;
+    let status = status_res.with_context(|| {
+        format!(
+            "Failed to wait for lifecycle script for {}",
+            ctx.package_name
+        )
+    })?;
 
     let stdout_str = stdout_task.await.unwrap_or_default();
     let stderr_str = stderr_task.await.unwrap_or_default();
@@ -1159,7 +1240,9 @@ where
     if !status.success() {
         warn!(
             "Lifecycle script '{}' failed for {} with exit code: {:?}",
-            ctx.event, ctx.package_name, status.code()
+            ctx.event,
+            ctx.package_name,
+            status.code()
         );
     }
 
@@ -1177,24 +1260,30 @@ pub fn execute_lifecycle_script_captured(ctx: &LifecycleContext) -> Result<Scrip
     let mut ctx_clone = ctx.clone();
     ctx_clone.capture_output = true;
     let status = execute_lifecycle_script(&ctx_clone)?;
-    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
-        exit_code: status.code().unwrap_or(-1),
-        stdout: String::new(),
-        stderr: String::new(),
-    });
+    let out = ctx_clone
+        .get_captured_output()
+        .unwrap_or_else(|| ScriptOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
     Ok(out)
 }
 
 /// Spawns and executes a lifecycle script asynchronously, capturing stdout and stderr cleanly.
-pub async fn execute_lifecycle_script_async_captured(ctx: &LifecycleContext) -> Result<ScriptOutput> {
+pub async fn execute_lifecycle_script_async_captured(
+    ctx: &LifecycleContext,
+) -> Result<ScriptOutput> {
     let mut ctx_clone = ctx.clone();
     ctx_clone.capture_output = true;
     let status = execute_lifecycle_script_async(&ctx_clone).await?;
-    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
-        exit_code: status.code().unwrap_or(-1),
-        stdout: String::new(),
-        stderr: String::new(),
-    });
+    let out = ctx_clone
+        .get_captured_output()
+        .unwrap_or_else(|| ScriptOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
     Ok(out)
 }
 
@@ -1209,11 +1298,13 @@ where
     let mut ctx_clone = ctx.clone();
     ctx_clone.capture_output = true;
     let status = execute_lifecycle_script_with_abort(&ctx_clone, abort_fut).await?;
-    let out = ctx_clone.get_captured_output().unwrap_or_else(|| ScriptOutput {
-        exit_code: status.code().unwrap_or(-1),
-        stdout: String::new(),
-        stderr: String::new(),
-    });
+    let out = ctx_clone
+        .get_captured_output()
+        .unwrap_or_else(|| ScriptOutput {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
     Ok(out)
 }
 
@@ -1298,7 +1389,12 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Matches a workspace member name or path against a filter pattern.
 /// Supports exact names ("foo"), scopes ("@scope" or "@scope/*"), wildcards ("ui-*", "*-app"),
 /// and relative filesystem paths ("packages/foo" or "./packages/foo").
-pub fn matches_filter(filter: &str, member_name: &str, member_path: &Path, root_dir: &Path) -> bool {
+pub fn matches_filter(
+    filter: &str,
+    member_name: &str,
+    member_path: &Path,
+    root_dir: &Path,
+) -> bool {
     let filter = filter.trim();
     if filter.is_empty() {
         return false;
@@ -1312,23 +1408,29 @@ pub fn matches_filter(filter: &str, member_name: &str, member_path: &Path, root_
     // 2. Scope prefix match: e.g. "@scope" or "@scope/*"
     if filter.starts_with('@') {
         if let Some(scope_name) = filter.strip_suffix("/*") {
-            if member_name.starts_with(scope_name) && member_name[scope_name.len()..].starts_with('/') {
+            if member_name.starts_with(scope_name)
+                && member_name[scope_name.len()..].starts_with('/')
+            {
                 return true;
             }
         } else if !filter.contains('/')
-            && member_name.starts_with(filter) && member_name[filter.len()..].starts_with('/') {
-                return true;
-            }
+            && member_name.starts_with(filter)
+            && member_name[filter.len()..].starts_with('/')
+        {
+            return true;
+        }
     }
 
     // 3. Glob wildcard matching
-    if (filter.contains('*') || filter.contains('?'))
-        && glob_match(filter, member_name) {
-            return true;
-        }
+    if (filter.contains('*') || filter.contains('?')) && glob_match(filter, member_name) {
+        return true;
+    }
 
     // 4. Path matching relative to root_dir
-    let norm_filter = filter.replace('\\', "/").trim_start_matches("./").to_string();
+    let norm_filter = filter
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
     if let Ok(rel) = member_path.strip_prefix(root_dir) {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if rel_str == norm_filter || glob_match(&norm_filter, &rel_str) {
@@ -1455,7 +1557,10 @@ pub fn execute_binary(
     } else if existing_path.is_empty() {
         joined_custom
     } else {
-        format!("{joined_custom}{}{existing_path}", if cfg!(windows) { ";" } else { ":" })
+        format!(
+            "{joined_custom}{}{existing_path}",
+            if cfg!(windows) { ";" } else { ":" }
+        )
     };
     env.remove("Path");
     env.remove("path");
@@ -1463,11 +1568,17 @@ pub fn execute_binary(
     #[cfg(windows)]
     env.insert("Path".to_string(), final_path);
 
-    env.insert("INIT_CWD".to_string(), current_dir.to_string_lossy().to_string());
+    env.insert(
+        "INIT_CWD".to_string(),
+        current_dir.to_string_lossy().to_string(),
+    );
 
     #[cfg(windows)]
     let mut cmd = {
-        let ext = binary_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = binary_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
             let mut c = Command::new("cmd.exe");
             c.arg("/c").arg(binary_path);
@@ -1480,7 +1591,9 @@ pub fn execute_binary(
             c.args(args);
             c
         } else {
-            let is_js = ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("cjs") || ext.eq_ignore_ascii_case("mjs");
+            let is_js = ext.eq_ignore_ascii_case("js")
+                || ext.eq_ignore_ascii_case("cjs")
+                || ext.eq_ignore_ascii_case("mjs");
             let has_shebang = if binary_path.exists() {
                 if let Ok(bytes) = std::fs::read(binary_path) {
                     bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
@@ -1523,14 +1636,18 @@ pub fn execute_binary(
 
     let guard = process_guard::ProcessTreeGuard::new();
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to spawn binary '{}'", binary_path.display()))?;
 
     #[cfg(windows)]
     if let Some(ref g) = guard {
         use std::os::windows::io::AsRawHandle;
         if !g.assign_process(child.as_raw_handle()) {
-            warn!("Failed to assign process to Windows Job Object for {}", binary_path.display());
+            warn!(
+                "Failed to assign process to Windows Job Object for {}",
+                binary_path.display()
+            );
         }
     }
     #[cfg(not(windows))]
@@ -1538,7 +1655,8 @@ pub fn execute_binary(
         g.assign_process(child.id());
     }
 
-    let status = child.wait()
+    let status = child
+        .wait()
         .with_context(|| format!("Failed to wait for binary '{}'", binary_path.display()))?;
 
     if let Some(ref g) = guard {
@@ -1590,7 +1708,10 @@ where
     } else if existing_path.is_empty() {
         joined_custom
     } else {
-        format!("{joined_custom}{}{existing_path}", if cfg!(windows) { ";" } else { ":" })
+        format!(
+            "{joined_custom}{}{existing_path}",
+            if cfg!(windows) { ";" } else { ":" }
+        )
     };
     env.remove("Path");
     env.remove("path");
@@ -1598,11 +1719,17 @@ where
     #[cfg(windows)]
     env.insert("Path".to_string(), final_path);
 
-    env.insert("INIT_CWD".to_string(), current_dir.to_string_lossy().to_string());
+    env.insert(
+        "INIT_CWD".to_string(),
+        current_dir.to_string_lossy().to_string(),
+    );
 
     #[cfg(windows)]
     let mut cmd = {
-        let ext = binary_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = binary_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
             let mut c = Command::new("cmd.exe");
             c.arg("/c").arg(binary_path);
@@ -1615,7 +1742,9 @@ where
             c.args(args);
             c
         } else {
-            let is_js = ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("cjs") || ext.eq_ignore_ascii_case("mjs");
+            let is_js = ext.eq_ignore_ascii_case("js")
+                || ext.eq_ignore_ascii_case("cjs")
+                || ext.eq_ignore_ascii_case("mjs");
             let has_shebang = if binary_path.exists() {
                 if let Ok(bytes) = std::fs::read(binary_path) {
                     bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
@@ -1658,14 +1787,18 @@ where
 
     let guard = std::sync::Arc::new(process_guard::ProcessTreeGuard::new());
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to spawn binary '{}'", binary_path.display()))?;
 
     #[cfg(windows)]
     if let Some(ref g) = *guard {
         use std::os::windows::io::AsRawHandle;
         if !g.assign_process(child.as_raw_handle()) {
-            warn!("Failed to assign process to Windows Job Object for {}", binary_path.display());
+            warn!(
+                "Failed to assign process to Windows Job Object for {}",
+                binary_path.display()
+            );
         }
     }
     #[cfg(not(windows))]
@@ -1761,8 +1894,8 @@ where
         g.terminate(0);
     }
 
-    let status = status_res
-        .with_context(|| format!("Failed to wait for binary '{bin_display}'"))?;
+    let status =
+        status_res.with_context(|| format!("Failed to wait for binary '{bin_display}'"))?;
 
     Ok(status)
 }
@@ -1782,7 +1915,8 @@ pub async fn execute_binary_async(
         path_entries,
         extra_env,
         std::future::pending(),
-    ).await
+    )
+    .await
 }
 
 /// Executes dependency lifecycle scripts bottom-up (topologically), followed by root hooks,
@@ -1800,14 +1934,20 @@ pub async fn execute_topological_with_abort(
     // Check if already aborted
     if let Some(ref rx) = abort_rx {
         if *rx.borrow() {
-            return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+            return Err(anyhow::anyhow!(
+                "Topological lifecycle execution aborted by signal"
+            ));
         }
     }
 
     // Topological sorting: leaf nodes first (bottom-up)
     let mut name_to_node: HashMap<String, &LifecyclePackageNode> = HashMap::new();
     for node in nodes {
-        let name = node.manifest.name.clone().unwrap_or_else(|| node.package_path.clone());
+        let name = node
+            .manifest
+            .name
+            .clone()
+            .unwrap_or_else(|| node.package_path.clone());
         name_to_node.insert(name, node);
         if let Some(stripped) = node.package_path.strip_prefix("node_modules/") {
             name_to_node.insert(stripped.to_string(), node);
@@ -1846,23 +1986,28 @@ pub async fn execute_topological_with_abort(
     }
 
     for node in nodes {
-        visit(node, &name_to_node, &mut visited, &mut in_stack, &mut ordered);
+        visit(
+            node,
+            &name_to_node,
+            &mut visited,
+            &mut in_stack,
+            &mut ordered,
+        );
     }
 
     // Execute dependency hooks in bottom-up order:
-    // Hooks: preinstall -> install -> postinstall
+    // Hooks: preinstall -> install -> postinstall -> prepare (for local / git / tarball dependencies)
     // Note: Registry dependencies NEVER run `prepare` per docs/lifecycle-contract.md!
     for node in ordered {
-        let hooks = match node.source {
-            PackageSource::Registry => &["preinstall", "install", "postinstall"][..],
-            PackageSource::Local => &["preinstall", "install", "postinstall", "prepare"][..],
-        };
+        let hooks = node.source.lifecycle_hooks();
 
         for &hook in hooks {
             if let Some(script_cmd) = node.manifest.scripts.get(hook) {
                 if let Some(ref rx) = abort_rx {
                     if *rx.borrow() {
-                        return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+                        return Err(anyhow::anyhow!(
+                            "Topological lifecycle execution aborted by signal"
+                        ));
                     }
                 }
 
@@ -1893,14 +2038,16 @@ pub async fn execute_topological_with_abort(
                 };
 
                 match execute_lifecycle_script_with_abort(&ctx, abort_fut).await {
-                    Ok(status) if status.success() => {},
+                    Ok(status) if status.success() => {}
                     Ok(status) => {
                         if node.optional {
                             let pkg_name = node.manifest.name.as_deref().unwrap_or("unknown");
                             let pkg_ver = node.manifest.version.as_deref().unwrap_or("unknown");
                             warn!(
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {}@{} ({}):",
-                                pkg_name, pkg_ver, node.disk_path.display()
+                                pkg_name,
+                                pkg_ver,
+                                node.disk_path.display()
                             );
                             warn!(
                                 "npm warn optional {} failed at the {} script with exit code: {:?}.",
@@ -1914,17 +2061,21 @@ pub async fn execute_topological_with_abort(
                         } else {
                             return Err(anyhow::anyhow!(
                                 "Lifecycle script '{}' failed for package {} with exit code: {:?}",
-                                hook, node.manifest.name.as_deref().unwrap_or("unknown"), status.code()
+                                hook,
+                                node.manifest.name.as_deref().unwrap_or("unknown"),
+                                status.code()
                             ));
                         }
-                    },
+                    }
                     Err(e) => {
                         if node.optional {
                             let pkg_name = node.manifest.name.as_deref().unwrap_or("unknown");
                             let pkg_ver = node.manifest.version.as_deref().unwrap_or("unknown");
                             warn!(
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {}@{} ({}):",
-                                pkg_name, pkg_ver, node.disk_path.display()
+                                pkg_name,
+                                pkg_ver,
+                                node.disk_path.display()
                             );
                             warn!(
                                 "npm warn optional {} failed at the {} script: {}",
@@ -1950,7 +2101,9 @@ pub async fn execute_topological_with_abort(
         if let Some(script_cmd) = root_manifest.scripts.get(hook) {
             if let Some(ref rx) = abort_rx {
                 if *rx.borrow() {
-                    return Err(anyhow::anyhow!("Topological lifecycle execution aborted by signal"));
+                    return Err(anyhow::anyhow!(
+                        "Topological lifecycle execution aborted by signal"
+                    ));
                 }
             }
 
@@ -1984,7 +2137,8 @@ pub async fn execute_topological_with_abort(
             if !status.success() {
                 return Err(anyhow::anyhow!(
                     "Root lifecycle script '{}' failed with exit code: {:?}",
-                    hook, status.code()
+                    hook,
+                    status.code()
                 ));
             }
         }
@@ -2042,10 +2196,16 @@ pub fn sort_workspace_members_topologically<'a>(
 
     let mut name_to_indices: HashMap<&str, Vec<usize>> = HashMap::new();
     for (idx, m) in members.iter().enumerate() {
-        name_to_indices.entry(m.name.as_str()).or_default().push(idx);
+        name_to_indices
+            .entry(m.name.as_str())
+            .or_default()
+            .push(idx);
         if let Some(ref m_name) = m.manifest.name {
             if m_name.as_str() != m.name.as_str() {
-                name_to_indices.entry(m_name.as_str()).or_default().push(idx);
+                name_to_indices
+                    .entry(m_name.as_str())
+                    .or_default()
+                    .push(idx);
             }
         }
     }
@@ -2184,7 +2344,9 @@ pub async fn execute_workspace_scripts_topological_with_abort(
 
     if let Some(ref filters) = opts.filter_members {
         let any_match = members.iter().any(|m| {
-            filters.iter().any(|f| matches_filter(f, &m.name, &m.path, root_dir))
+            filters
+                .iter()
+                .any(|f| matches_filter(f, &m.name, &m.path, root_dir))
         });
         if !any_match {
             return Err(anyhow::anyhow!(
@@ -2208,7 +2370,10 @@ pub async fn execute_workspace_scripts_topological_with_abort(
         }
 
         if let Some(ref filter) = opts.filter_members {
-            if !filter.iter().any(|f| matches_filter(f, &member.name, &member.path, root_dir)) {
+            if !filter
+                .iter()
+                .any(|f| matches_filter(f, &member.name, &member.path, root_dir))
+            {
                 continue;
             }
         }
@@ -2267,13 +2432,8 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             );
             println!("> {full_cmd}\n");
 
-            let mut ctx = LifecycleContext::new(
-                root_dir,
-                &member.path,
-                &member.name,
-                hook_name,
-                &full_cmd,
-            );
+            let mut ctx =
+                LifecycleContext::new(root_dir, &member.path, &member.name, hook_name, &full_cmd);
             ctx.package_version = member.manifest.version.clone();
             ctx.foreground_scripts = opts.foreground_scripts;
             if opts.foreground_scripts {
@@ -2301,9 +2461,7 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                     exit_code: code,
                     message: format!(
                         "Workspace member '{}' script '{}' exited with status code: {}",
-                        member.name,
-                        hook_name,
-                        code
+                        member.name, hook_name, code
                     ),
                 }));
             }
@@ -2322,5 +2480,12 @@ pub async fn execute_workspace_scripts_topological(
     topological_order: &[String],
     opts: &WorkspaceRunOptions,
 ) -> Result<WorkspaceRunSummary> {
-    execute_workspace_scripts_topological_with_abort(root_dir, members, topological_order, opts, None).await
+    execute_workspace_scripts_topological_with_abort(
+        root_dir,
+        members,
+        topological_order,
+        opts,
+        None,
+    )
+    .await
 }

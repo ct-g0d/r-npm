@@ -24,13 +24,13 @@ pub use metadata::{
     AbbreviatedPackageMetadata, AbbreviatedVersion, AttestationProvenance, DistAttestations,
     DistInfo, DistSignature, PackageBin,
 };
-pub use publish::{
-    create_publish_payload, PublishAttachment, PublishPayloadOptions, PublishTarballData,
-};
 pub use provenance::{
     format_registry_signature_payload, normalize_repository_url, validate_dist_signatures,
     verify_provenance, AttestationItem, AttestationResponse, BuildProvenance, DsseEnvelope,
     DsseSignature, InTotoStatement, InTotoSubject, ProvenancePolicy, ProvenanceVerifier,
     SigstoreBundle, SlsaPredicate, TransparencyLogMetadata, VerificationMaterial,
     VerifiedProvenance, NPM_REGISTRY_KEYID,
+};
+pub use publish::{
+    create_publish_payload, PublishAttachment, PublishPayloadOptions, PublishTarballData,
 };

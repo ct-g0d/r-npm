@@ -5,18 +5,58 @@ use rnpm_install::rebuild::{execute_rebuild, matches_rebuild_filter, RebuildOpti
 
 #[test]
 fn test_matches_rebuild_filter() {
-    assert!(matches_rebuild_filter("fsevents", "fsevents", Some("2.3.2"), "node_modules/fsevents"));
-    assert!(matches_rebuild_filter("fsevents@2.3.2", "fsevents", Some("2.3.2"), "node_modules/fsevents"));
-    assert!(matches_rebuild_filter("node_modules/fsevents", "fsevents", Some("2.3.2"), "node_modules/fsevents"));
+    assert!(matches_rebuild_filter(
+        "fsevents",
+        "fsevents",
+        Some("2.3.2"),
+        "node_modules/fsevents"
+    ));
+    assert!(matches_rebuild_filter(
+        "fsevents@2.3.2",
+        "fsevents",
+        Some("2.3.2"),
+        "node_modules/fsevents"
+    ));
+    assert!(matches_rebuild_filter(
+        "node_modules/fsevents",
+        "fsevents",
+        Some("2.3.2"),
+        "node_modules/fsevents"
+    ));
 
     // Scoped package matching
-    assert!(matches_rebuild_filter("@scope/native", "@scope/native", Some("1.0.0"), "node_modules/@scope/native"));
-    assert!(matches_rebuild_filter("native", "@scope/native", Some("1.0.0"), "node_modules/@scope/native"));
-    assert!(matches_rebuild_filter("@scope/native@1.0.0", "@scope/native", Some("1.0.0"), "node_modules/@scope/native"));
+    assert!(matches_rebuild_filter(
+        "@scope/native",
+        "@scope/native",
+        Some("1.0.0"),
+        "node_modules/@scope/native"
+    ));
+    assert!(matches_rebuild_filter(
+        "native",
+        "@scope/native",
+        Some("1.0.0"),
+        "node_modules/@scope/native"
+    ));
+    assert!(matches_rebuild_filter(
+        "@scope/native@1.0.0",
+        "@scope/native",
+        Some("1.0.0"),
+        "node_modules/@scope/native"
+    ));
 
     // Non-matching
-    assert!(!matches_rebuild_filter("other", "fsevents", Some("2.3.2"), "node_modules/fsevents"));
-    assert!(!matches_rebuild_filter("fsevents@1.0.0", "fsevents", Some("2.3.2"), "node_modules/fsevents"));
+    assert!(!matches_rebuild_filter(
+        "other",
+        "fsevents",
+        Some("2.3.2"),
+        "node_modules/fsevents"
+    ));
+    assert!(!matches_rebuild_filter(
+        "fsevents@1.0.0",
+        "fsevents",
+        Some("2.3.2"),
+        "node_modules/fsevents"
+    ));
 }
 
 #[tokio::test]
@@ -57,7 +97,9 @@ async fn test_rebuild_executes_installed_lifecycle_scripts() {
         strict_sandbox: false,
     };
 
-    let summary = execute_rebuild(&opts).await.expect("Rebuild should succeed");
+    let summary = execute_rebuild(&opts)
+        .await
+        .expect("Rebuild should succeed");
     assert_eq!(summary.rebuilt_packages.len(), 2);
 
     let content = fs::read_to_string(&marker_file).expect("Marker file should be created");
@@ -101,12 +143,17 @@ async fn test_rebuild_selective_packages() {
         strict_sandbox: false,
     };
 
-    let summary = execute_rebuild(&opts).await.expect("Selective rebuild should succeed");
+    let summary = execute_rebuild(&opts)
+        .await
+        .expect("Selective rebuild should succeed");
     assert_eq!(summary.rebuilt_packages, vec!["target-pkg@1.0.0"]);
 
     let content = fs::read_to_string(&marker_file).unwrap();
     assert!(content.contains("target-rebuilt"));
-    assert!(!content.contains("other-rebuilt"), "other-pkg should NOT be rebuilt");
+    assert!(
+        !content.contains("other-rebuilt"),
+        "other-pkg should NOT be rebuilt"
+    );
 }
 
 #[tokio::test]
@@ -124,7 +171,8 @@ async fn test_rebuild_native_addon_with_binding_gyp() {
     fs::write(
         native_pkg.join("package.json"),
         r#"{"name": "native-addon", "version": "1.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Create a mock node-gyp in node_modules/.bin so node-gyp rebuild executes cleanly
     let bin_dir = root.join("node_modules").join(".bin");
@@ -143,13 +191,25 @@ async fn test_rebuild_native_addon_with_binding_gyp() {
 
     #[cfg(windows)]
     {
-        fs::write(bin_dir.join("node-gyp.cmd"), format!("@node \"{escaped_mock_gyp}\" %*\n")).unwrap();
-        fs::write(bin_dir.join("node-gyp"), format!("#!/bin/sh\nnode \"{escaped_mock_gyp}\" \"$@\"\n")).unwrap();
+        fs::write(
+            bin_dir.join("node-gyp.cmd"),
+            format!("@node \"{escaped_mock_gyp}\" %*\n"),
+        )
+        .unwrap();
+        fs::write(
+            bin_dir.join("node-gyp"),
+            format!("#!/bin/sh\nnode \"{escaped_mock_gyp}\" \"$@\"\n"),
+        )
+        .unwrap();
     }
     #[cfg(not(windows))]
     {
         let script = bin_dir.join("node-gyp");
-        fs::write(&script, format!("#!/bin/sh\nnode \"{escaped_mock_gyp}\" \"$@\"\n")).unwrap();
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nnode \"{escaped_mock_gyp}\" \"$@\"\n"),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -167,11 +227,16 @@ async fn test_rebuild_native_addon_with_binding_gyp() {
         strict_sandbox: false,
     };
 
-    let summary = execute_rebuild(&opts).await.expect("Native addon rebuild should succeed");
+    let summary = execute_rebuild(&opts)
+        .await
+        .expect("Native addon rebuild should succeed");
     assert_eq!(summary.rebuilt_packages, vec!["native-addon@1.0.0"]);
 
     // Verify mock node-gyp rebuild was called
-    assert!(marker_file.exists(), "binding.gyp presence must automatically invoke node-gyp rebuild");
+    assert!(
+        marker_file.exists(),
+        "binding.gyp presence must automatically invoke node-gyp rebuild"
+    );
     let content = fs::read_to_string(&marker_file).unwrap();
     assert_eq!(content, "node-gyp rebuild invoked");
 }
@@ -201,7 +266,12 @@ async fn test_rebuild_ignore_scripts_flag() {
         strict_sandbox: false,
     };
 
-    let summary = execute_rebuild(&opts).await.expect("Rebuild with ignore-scripts should succeed");
+    let summary = execute_rebuild(&opts)
+        .await
+        .expect("Rebuild with ignore-scripts should succeed");
     assert_eq!(summary.rebuilt_packages.len(), 0);
-    assert!(!marker_file.exists(), "--ignore-scripts must prevent any scripts from running");
+    assert!(
+        !marker_file.exists(),
+        "--ignore-scripts must prevent any scripts from running"
+    );
 }

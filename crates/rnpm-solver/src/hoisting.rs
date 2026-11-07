@@ -1,6 +1,6 @@
+use crate::graph::DependencyGraph;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
-use crate::graph::DependencyGraph;
 
 /// Placement decision made by the deduplication and hoisting engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +104,10 @@ pub fn determine_placement_with_peers(
     package_name: &str,
     target: &PackageTarget,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
-    peer_dependencies_meta: &std::collections::BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
@@ -140,7 +143,13 @@ pub fn determine_placement_with_peers(
             )
         {
             // Check if there is an intermediate shadowing conflict between parent and root
-            if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target) {
+            if !is_shadowed_by_incompatible_between(
+                graph,
+                parent_location,
+                "",
+                install_name,
+                target,
+            ) {
                 return PlacementDecision::Reuse(root_target);
             }
         }
@@ -176,24 +185,36 @@ pub fn determine_placement_with_peers(
         candidate.push_str(install_name);
 
         if let Some(existing) = graph.nodes.get(&candidate) {
-            if existing.name == package_name && node_satisfies_target(existing, target)
+            if existing.name == package_name
+                && node_satisfies_target(existing, target)
                 && !candidate_has_incompatible_peer(
                     graph,
                     &candidate,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
-                && !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target) {
-                    return PlacementDecision::Reuse(candidate);
-                }
-        } else if !is_shadowed_by_incompatible_between(graph, parent_location, ancestor, install_name, target)
-            && !candidate_has_incompatible_peer(
-                graph,
-                &candidate,
-                peer_dependencies,
-                peer_dependencies_meta,
-            )
-        {
+                && !is_shadowed_by_incompatible_between(
+                    graph,
+                    parent_location,
+                    ancestor,
+                    install_name,
+                    target,
+                )
+            {
+                return PlacementDecision::Reuse(candidate);
+            }
+        } else if !is_shadowed_by_incompatible_between(
+            graph,
+            parent_location,
+            ancestor,
+            install_name,
+            target,
+        ) && !candidate_has_incompatible_peer(
+            graph,
+            &candidate,
+            peer_dependencies,
+            peer_dependencies_meta,
+        ) {
             return PlacementDecision::PlaceNew(candidate);
         }
     }
@@ -217,10 +238,15 @@ fn candidate_has_incompatible_peer(
     graph: &DependencyGraph,
     candidate_location: &str,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
-    peer_dependencies_meta: &std::collections::BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
 ) -> bool {
     peer_dependencies.iter().any(|(peer_name, peer_spec)| {
-        let Some(existing) = find_visible_peer_node(graph, candidate_location, peer_name, peer_name) else {
+        let Some(existing) =
+            find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
+        else {
             return false;
         };
         let Ok(target) = PackageTarget::parse(peer_spec) else {
@@ -272,7 +298,11 @@ fn is_shadowed_by_incompatible_between(
 
 /// Helper check if a node matches either `install_name` or physical `name`.
 #[inline]
-pub fn node_matches_peer_name(node: &crate::graph::Node, install_name: &str, package_name: &str) -> bool {
+pub fn node_matches_peer_name(
+    node: &crate::graph::Node,
+    install_name: &str,
+    package_name: &str,
+) -> bool {
     node.name == package_name
         || node.install_name == install_name
         || node.name == install_name
@@ -347,7 +377,8 @@ pub fn find_visible_peer_node<'a>(
         }
 
         // 3. Aliased packages search in scope: e.g. <current>/node_modules/<alias> where node.name == package_name
-        if let Some(node) = find_matching_node_in_scope(graph, current, install_name, package_name) {
+        if let Some(node) = find_matching_node_in_scope(graph, current, install_name, package_name)
+        {
             return Some(node);
         }
 
@@ -418,24 +449,36 @@ mod tests {
         let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
 
         let decision = determine_placement(&graph, "node_modules/A", "B", "B", &target);
-        assert_eq!(decision, PlacementDecision::PlaceNew("node_modules/B".to_string()));
+        assert_eq!(
+            decision,
+            PlacementDecision::PlaceNew("node_modules/B".to_string())
+        );
     }
 
     #[test]
     fn test_deduplication_compatible_root() {
         let mut graph = DependencyGraph::new();
-        graph.nodes.insert("node_modules/B".to_string(), make_test_node("node_modules/B", "B", "1.2.0"));
+        graph.nodes.insert(
+            "node_modules/B".to_string(),
+            make_test_node("node_modules/B", "B", "1.2.0"),
+        );
 
         let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
         let decision = determine_placement(&graph, "node_modules/A", "B", "B", &target);
-        assert_eq!(decision, PlacementDecision::Reuse("node_modules/B".to_string()));
+        assert_eq!(
+            decision,
+            PlacementDecision::Reuse("node_modules/B".to_string())
+        );
     }
 
     #[test]
     fn test_conflict_nesting() {
         let mut graph = DependencyGraph::new();
         // Root has B@1.2.0
-        graph.nodes.insert("node_modules/B".to_string(), make_test_node("node_modules/B", "B", "1.2.0"));
+        graph.nodes.insert(
+            "node_modules/B".to_string(),
+            make_test_node("node_modules/B", "B", "1.2.0"),
+        );
 
         // Dependent requires B@^2.0.0
         let target = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
@@ -450,11 +493,18 @@ mod tests {
     fn test_find_visible_node() {
         let mut graph = DependencyGraph::new();
         // Root node_modules/react
-        graph.nodes.insert("node_modules/react".to_string(), make_test_node("node_modules/react", "react", "18.2.0"));
+        graph.nodes.insert(
+            "node_modules/react".to_string(),
+            make_test_node("node_modules/react", "react", "18.2.0"),
+        );
         // Nested node_modules/nested-lib/node_modules/local-dep
         graph.nodes.insert(
             "node_modules/nested-lib/node_modules/local-dep".to_string(),
-            make_test_node("node_modules/nested-lib/node_modules/local-dep", "local-dep", "1.0.0"),
+            make_test_node(
+                "node_modules/nested-lib/node_modules/local-dep",
+                "local-dep",
+                "1.0.0",
+            ),
         );
 
         // From root: can see react
@@ -470,7 +520,10 @@ mod tests {
         // From nested-lib: can see local-dep under itself
         let vis3 = find_visible_node(&graph, "node_modules/nested-lib", "local-dep");
         assert!(vis3.is_some());
-        assert_eq!(vis3.unwrap().location, "node_modules/nested-lib/node_modules/local-dep");
+        assert_eq!(
+            vis3.unwrap().location,
+            "node_modules/nested-lib/node_modules/local-dep"
+        );
 
         // From root: CANNOT see nested-lib's local-dep
         let vis4 = find_visible_node(&graph, "", "local-dep");
@@ -483,7 +536,9 @@ mod tests {
         // Package installed with alias: install_name="my-react", name="react"
         let mut aliased_node = make_test_node("node_modules/my-react", "react", "18.2.0");
         aliased_node.install_name = "my-react".to_string();
-        graph.nodes.insert("node_modules/my-react".to_string(), aliased_node);
+        graph
+            .nodes
+            .insert("node_modules/my-react".to_string(), aliased_node);
 
         // Nested consumer: node_modules/react-redux
         graph.nodes.insert(
@@ -492,13 +547,15 @@ mod tests {
         );
 
         // 1. Peer requirement asking for physical name "react"
-        let found_by_pkg_name = find_visible_peer_node(&graph, "node_modules/react-redux", "react", "react");
+        let found_by_pkg_name =
+            find_visible_peer_node(&graph, "node_modules/react-redux", "react", "react");
         assert!(found_by_pkg_name.is_some());
         assert_eq!(found_by_pkg_name.unwrap().location, "node_modules/my-react");
         assert_eq!(found_by_pkg_name.unwrap().name, "react");
 
         // 2. Peer requirement asking for alias name "my-react"
-        let found_by_alias = find_visible_peer_node(&graph, "node_modules/react-redux", "my-react", "my-react");
+        let found_by_alias =
+            find_visible_peer_node(&graph, "node_modules/react-redux", "my-react", "my-react");
         assert!(found_by_alias.is_some());
         assert_eq!(found_by_alias.unwrap().location, "node_modules/my-react");
     }

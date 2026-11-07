@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
+use rnpm_config::{find_global_bin_dir, find_global_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_fs::junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
 use rnpm_shim::generator::create_shim_trio;
 use rnpm_shim::normalize_shebang;
-use rnpm_config::{find_global_bin_dir, find_global_node_modules};
+use std::path::{Path, PathBuf};
 
 /// Invoked with no arguments: `npm link`
 /// Creates a global link (NTFS junction on Windows, symlink on Unix) from global prefix
@@ -18,8 +18,8 @@ pub fn link_package(current_dir: &Path, global_prefix: &Path) -> Result<PathBuf>
         ));
     }
 
-    let manifest = Manifest::from_file(&manifest_path)
-        .context("Failed to parse package.json for npm link")?;
+    let manifest =
+        Manifest::from_file(&manifest_path).context("Failed to parse package.json for npm link")?;
 
     let pkg_name = manifest.name.as_deref().ok_or_else(|| {
         anyhow!("npm error code EINVALIDPKG\nnpm error package.json missing 'name' field")
@@ -42,8 +42,13 @@ pub fn link_package(current_dir: &Path, global_prefix: &Path) -> Result<PathBuf>
         }
     }
 
-    create_junction(&target_link, current_dir)
-        .map_err(|e| anyhow!("Failed to create global link at '{}' -> '{}': {e}", target_link.display(), current_dir.display()))?;
+    create_junction(&target_link, current_dir).map_err(|e| {
+        anyhow!(
+            "Failed to create global link at '{}' -> '{}': {e}",
+            target_link.display(),
+            current_dir.display()
+        )
+    })?;
 
     // Install bin shims in global bin directory
     let global_bin = find_global_bin_dir(global_prefix);
@@ -97,9 +102,16 @@ pub fn link_package_from_global(
         }
     }
 
-    let real_target = source_pkg.canonicalize().unwrap_or_else(|_| source_pkg.clone());
-    create_junction(&target_link, &real_target)
-        .map_err(|e| anyhow!("Failed to link package '{}' into '{}': {e}", package_name, target_link.display()))?;
+    let real_target = source_pkg
+        .canonicalize()
+        .unwrap_or_else(|_| source_pkg.clone());
+    create_junction(&target_link, &real_target).map_err(|e| {
+        anyhow!(
+            "Failed to link package '{}' into '{}': {e}",
+            package_name,
+            target_link.display()
+        )
+    })?;
 
     // Install bin shims in local node_modules/.bin if package has binaries
     let manifest_path = real_target.join("package.json");

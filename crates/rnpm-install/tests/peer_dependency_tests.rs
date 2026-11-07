@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha512};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -43,7 +43,10 @@ struct TestRegistryServer {
 impl TestRegistryServer {
     async fn start<F>(handler: F) -> Self
     where
-        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)> + Send + Sync + 'static,
+        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)>
+            + Send
+            + Sync
+            + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -120,7 +123,10 @@ async fn test_default_peer_resolution_auto_installs_matching_peer() {
     let peer_integrity = compute_ssri(&peer_tarball);
 
     let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'pkg-parent';"),
     ]);
     let parent_integrity = compute_ssri(&parent_tarball);
@@ -165,36 +171,48 @@ async fn test_default_peer_resolution_auto_installs_matching_peer() {
         legacy_peer_deps: false,
         strict_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 2);
 
     // Verify both packages exist in node_modules
-    assert!(temp_proj.path().join("node_modules").join("pkg-parent").join("index.js").exists());
-    assert!(temp_proj.path().join("node_modules").join("pkg-peer").join("index.js").exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-parent")
+        .join("index.js")
+        .exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-peer")
+        .join("index.js")
+        .exists());
 
     // Verify lockfile v3 records pkg-peer with peer: true
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
-    let peer_lock = lockfile.get_package("node_modules/pkg-peer").expect("pkg-peer in lockfile");
+    let peer_lock = lockfile
+        .get_package("node_modules/pkg-peer")
+        .expect("pkg-peer in lockfile");
     assert_eq!(peer_lock.peer, Some(true));
 }
 
 #[tokio::test]
 async fn test_peer_dependency_conflict_fails_with_eresolve_by_default() {
-    let peer1_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-peer","version":"1.0.0"}"#),
-    ]);
+    let peer1_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"pkg-peer","version":"1.0.0"}"#)]);
     let peer1_integrity = compute_ssri(&peer1_tarball);
 
-    let peer2_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-peer","version":"2.0.0"}"#),
-    ]);
+    let peer2_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"pkg-peer","version":"2.0.0"}"#)]);
     let peer2_integrity = compute_ssri(&peer2_tarball);
 
-    let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
-    ]);
+    let parent_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+    )]);
     let parent_integrity = compute_ssri(&parent_tarball);
 
     let server = TestRegistryServer::start(move |path, base_url| {
@@ -235,7 +253,8 @@ async fn test_peer_dependency_conflict_fails_with_eresolve_by_default() {
         legacy_peer_deps: false,
         strict_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.run().await.unwrap_err();
     let err_str = err.to_string();
@@ -245,14 +264,14 @@ async fn test_peer_dependency_conflict_fails_with_eresolve_by_default() {
 
 #[tokio::test]
 async fn test_strict_peer_deps_fails_on_peer_conflict() {
-    let peer2_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-peer","version":"2.0.0"}"#),
-    ]);
+    let peer2_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"pkg-peer","version":"2.0.0"}"#)]);
     let peer2_integrity = compute_ssri(&peer2_tarball);
 
-    let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
-    ]);
+    let parent_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+    )]);
     let parent_integrity = compute_ssri(&parent_tarball);
 
     let server = TestRegistryServer::start(move |path, base_url| {
@@ -292,11 +311,15 @@ async fn test_strict_peer_deps_fails_on_peer_conflict() {
         strict_peer_deps: true,
         legacy_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.run().await.unwrap_err();
     let err_str = err.to_string();
-    assert!(err_str.contains("ERESOLVE"), "strict_peer_deps must fail with ERESOLVE on peer conflict");
+    assert!(
+        err_str.contains("ERESOLVE"),
+        "strict_peer_deps must fail with ERESOLVE on peer conflict"
+    );
 }
 
 #[tokio::test]
@@ -308,7 +331,10 @@ async fn test_legacy_peer_deps_bypasses_peer_conflict() {
     let peer2_integrity = compute_ssri(&peer2_tarball);
 
     let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'pkg-parent';"),
     ]);
     let parent_integrity = compute_ssri(&parent_tarball);
@@ -354,13 +380,27 @@ async fn test_legacy_peer_deps_bypasses_peer_conflict() {
         legacy_peer_deps: true,
         strict_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let summary = installer.run().await.expect("legacy_peer_deps must succeed despite conflicting peer dependency");
+    let summary = installer
+        .run()
+        .await
+        .expect("legacy_peer_deps must succeed despite conflicting peer dependency");
     assert_eq!(summary.packages_installed, 2);
 
-    assert!(temp_proj.path().join("node_modules").join("pkg-parent").join("index.js").exists());
-    assert!(temp_proj.path().join("node_modules").join("pkg-peer").join("index.js").exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-parent")
+        .join("index.js")
+        .exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-peer")
+        .join("index.js")
+        .exists());
 
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
     let peer_entry = lockfile.get_package("node_modules/pkg-peer").unwrap();
@@ -376,7 +416,10 @@ async fn test_omit_peer_resolves_lockfile_but_omits_disk_extraction() {
     let peer_integrity = compute_ssri(&peer_tarball);
 
     let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'pkg-parent';"),
     ]);
     let parent_integrity = compute_ssri(&parent_tarball);
@@ -422,30 +465,42 @@ async fn test_omit_peer_resolves_lockfile_but_omits_disk_extraction() {
         legacy_peer_deps: false,
         strict_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 1);
 
     // Only pkg-parent is written to disk! pkg-peer must be omitted from node_modules
-    assert!(temp_proj.path().join("node_modules").join("pkg-parent").join("index.js").exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-parent")
+        .join("index.js")
+        .exists());
     assert!(
-        !temp_proj.path().join("node_modules").join("pkg-peer").exists(),
+        !temp_proj
+            .path()
+            .join("node_modules")
+            .join("pkg-peer")
+            .exists(),
         "pkg-peer must NOT be extracted to disk when omit_peer is true"
     );
 
     // BUT lockfile v3 still contains pkg-peer!
     let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
-    assert!(lockfile.packages.contains_key("node_modules/pkg-peer"), "Lockfile must contain pkg-peer even with omit_peer: true");
+    assert!(
+        lockfile.packages.contains_key("node_modules/pkg-peer"),
+        "Lockfile must contain pkg-peer even with omit_peer: true"
+    );
     let peer_entry = lockfile.get_package("node_modules/pkg-peer").unwrap();
     assert_eq!(peer_entry.peer, Some(true));
 }
 
 #[tokio::test]
 async fn test_omit_peer_does_not_mask_peer_conflict() {
-    let peer1_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-peer","version":"1.0.0"}"#),
-    ]);
+    let peer1_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"pkg-peer","version":"1.0.0"}"#)]);
     let peer1_integrity = compute_ssri(&peer1_tarball);
 
     let peer2_tarball = create_test_tarball(&[
@@ -455,7 +510,10 @@ async fn test_omit_peer_does_not_mask_peer_conflict() {
     let peer2_integrity = compute_ssri(&peer2_tarball);
 
     let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'pkg-parent';"),
     ]);
     let parent_integrity = compute_ssri(&parent_tarball);
@@ -502,7 +560,8 @@ async fn test_omit_peer_does_not_mask_peer_conflict() {
         omit_peer: true,
         legacy_peer_deps: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.run().await.unwrap_err();
     let err_str = err.to_string();
@@ -520,9 +579,13 @@ async fn test_omit_peer_does_not_mask_peer_conflict() {
         omit_peer: true,
         legacy_peer_deps: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let summary = legacy_installer.run().await.expect("omit_peer + legacy_peer_deps must succeed");
+    let summary = legacy_installer
+        .run()
+        .await
+        .expect("omit_peer + legacy_peer_deps must succeed");
     assert!(summary.packages_installed > 0);
 }
 
@@ -535,7 +598,10 @@ async fn test_peer_conflict_resolved_by_manifest_overrides() {
     let peer2_integrity = compute_ssri(&peer2_tarball);
 
     let parent_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#),
+        (
+            "package.json",
+            br#"{"name":"pkg-parent","version":"1.0.0","peerDependencies":{"pkg-peer":"^1.0.0"}}"#,
+        ),
         ("index.js", b"module.exports = 'pkg-parent';"),
     ]);
     let parent_integrity = compute_ssri(&parent_tarball);
@@ -582,11 +648,25 @@ async fn test_peer_conflict_resolved_by_manifest_overrides() {
         cache_dir: Some(temp_cache.path().to_path_buf()),
         offline: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let summary = installer.run().await.expect("Overrides must resolve peer dependency conflict under default peer resolution");
+    let summary = installer
+        .run()
+        .await
+        .expect("Overrides must resolve peer dependency conflict under default peer resolution");
     assert_eq!(summary.packages_installed, 2);
 
-    assert!(temp_proj.path().join("node_modules").join("pkg-parent").join("index.js").exists());
-    assert!(temp_proj.path().join("node_modules").join("pkg-peer").join("index.js").exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-parent")
+        .join("index.js")
+        .exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("pkg-peer")
+        .join("index.js")
+        .exists());
 }

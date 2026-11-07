@@ -1,29 +1,37 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use tar::{Builder, Header};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::{InstallOptions, Installer, UninstallOptions};
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use crate::{InstallOptions, Installer, UninstallOptions};
 
 fn setup_fixture_project(dir: &Path) {
     // 1. Root package.json
     let mut manifest = Manifest::default();
     manifest.name = Some("test-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("pkg-b".to_string(), "^2.0.0".to_string());
-    manifest.dev_dependencies.insert("pkg-dev".to_string(), "^0.5.0".to_string());
-    manifest.optional_dependencies.insert("pkg-opt".to_string(), "^3.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "^2.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("pkg-dev".to_string(), "^0.5.0".to_string());
+    manifest
+        .optional_dependencies
+        .insert("pkg-opt".to_string(), "^3.0.0".to_string());
     manifest.save_to_file(dir.join("package.json")).unwrap();
 
     // 2. package-lock.json
@@ -84,24 +92,46 @@ fn setup_fixture_project(dir: &Path) {
     };
     lockfile.insert_package("node_modules/pkg-opt", pkg_opt);
 
-    lockfile.save_to_file(&dir.join("package-lock.json")).unwrap();
+    lockfile
+        .save_to_file(&dir.join("package-lock.json"))
+        .unwrap();
 
     // 3. node_modules layout
     let nm = dir.join("node_modules");
     fs::create_dir_all(nm.join("pkg-a")).unwrap();
-    fs::write(nm.join("pkg-a").join("package.json"), r#"{"name":"pkg-a","version":"1.0.0"}"#).unwrap();
+    fs::write(
+        nm.join("pkg-a").join("package.json"),
+        r#"{"name":"pkg-a","version":"1.0.0"}"#,
+    )
+    .unwrap();
 
     fs::create_dir_all(nm.join("sub-dep")).unwrap();
-    fs::write(nm.join("sub-dep").join("package.json"), r#"{"name":"sub-dep","version":"1.0.0"}"#).unwrap();
+    fs::write(
+        nm.join("sub-dep").join("package.json"),
+        r#"{"name":"sub-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
 
     fs::create_dir_all(nm.join("pkg-b")).unwrap();
-    fs::write(nm.join("pkg-b").join("package.json"), r#"{"name":"pkg-b","version":"2.0.0"}"#).unwrap();
+    fs::write(
+        nm.join("pkg-b").join("package.json"),
+        r#"{"name":"pkg-b","version":"2.0.0"}"#,
+    )
+    .unwrap();
 
     fs::create_dir_all(nm.join("pkg-dev")).unwrap();
-    fs::write(nm.join("pkg-dev").join("package.json"), r#"{"name":"pkg-dev","version":"0.5.0"}"#).unwrap();
+    fs::write(
+        nm.join("pkg-dev").join("package.json"),
+        r#"{"name":"pkg-dev","version":"0.5.0"}"#,
+    )
+    .unwrap();
 
     fs::create_dir_all(nm.join("pkg-opt")).unwrap();
-    fs::write(nm.join("pkg-opt").join("package.json"), r#"{"name":"pkg-opt","version":"3.0.0"}"#).unwrap();
+    fs::write(
+        nm.join("pkg-opt").join("package.json"),
+        r#"{"name":"pkg-opt","version":"3.0.0"}"#,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -124,7 +154,9 @@ fn test_uninstall_single_package_and_transitive_pruning() {
     let summary = installer.uninstall(&uninstall_opts).unwrap();
     assert_eq!(summary.removed_packages, vec!["pkg-a".to_string()]);
     // Transitive dependency sub-dep must also be pruned!
-    assert!(summary.pruned_dependencies.contains(&"node_modules/sub-dep".to_string()));
+    assert!(summary
+        .pruned_dependencies
+        .contains(&"node_modules/sub-dep".to_string()));
 
     // Verify package.json
     let updated_manifest = Manifest::from_file(project_dir.join("package.json")).unwrap();
@@ -132,9 +164,12 @@ fn test_uninstall_single_package_and_transitive_pruning() {
     assert!(updated_manifest.dependencies.contains_key("pkg-b"));
 
     // Verify package-lock.json
-    let updated_lockfile = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    let updated_lockfile =
+        LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
     assert!(!updated_lockfile.packages.contains_key("node_modules/pkg-a"));
-    assert!(!updated_lockfile.packages.contains_key("node_modules/sub-dep"));
+    assert!(!updated_lockfile
+        .packages
+        .contains_key("node_modules/sub-dep"));
     assert!(updated_lockfile.packages.contains_key("node_modules/pkg-b"));
 
     // Verify node_modules deletion
@@ -169,11 +204,16 @@ fn test_uninstall_multiple_packages() {
     assert!(!updated_manifest.dependencies.contains_key("pkg-b"));
     assert!(updated_manifest.dev_dependencies.contains_key("pkg-dev"));
 
-    let updated_lockfile = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    let updated_lockfile =
+        LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
     assert!(!updated_lockfile.packages.contains_key("node_modules/pkg-a"));
     assert!(!updated_lockfile.packages.contains_key("node_modules/pkg-b"));
-    assert!(!updated_lockfile.packages.contains_key("node_modules/sub-dep"));
-    assert!(updated_lockfile.packages.contains_key("node_modules/pkg-dev"));
+    assert!(!updated_lockfile
+        .packages
+        .contains_key("node_modules/sub-dep"));
+    assert!(updated_lockfile
+        .packages
+        .contains_key("node_modules/pkg-dev"));
 
     assert!(!project_dir.join("node_modules").join("pkg-a").exists());
     assert!(!project_dir.join("node_modules").join("pkg-b").exists());
@@ -240,9 +280,15 @@ fn test_uninstall_preserves_shared_dependency() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("shared-test".to_string());
-    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
-    manifest.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut lockfile = LockfileV3::new("shared-test", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
@@ -266,7 +312,9 @@ fn test_uninstall_preserves_shared_dependency() {
         ..Default::default()
     };
     lockfile.insert_package("node_modules/shared-lib", shared_lib);
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     let nm = project_dir.join("node_modules");
     fs::create_dir_all(nm.join("pkg-a")).unwrap();
@@ -276,21 +324,29 @@ fn test_uninstall_preserves_shared_dependency() {
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     // Uninstall pkg-a
-    let summary = installer.uninstall(&UninstallOptions {
-        packages: vec!["pkg-a".to_string()],
-        ..Default::default()
-    }).unwrap();
+    let summary = installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["pkg-a".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     assert_eq!(summary.removed_packages, vec!["pkg-a".to_string()]);
     // shared-lib must NOT be pruned because pkg-b still depends on it!
-    assert!(!summary.pruned_dependencies.contains(&"node_modules/shared-lib".to_string()));
+    assert!(!summary
+        .pruned_dependencies
+        .contains(&"node_modules/shared-lib".to_string()));
 
-    let updated_lockfile = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    let updated_lockfile =
+        LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
     assert!(!updated_lockfile.packages.contains_key("node_modules/pkg-a"));
-    assert!(updated_lockfile.packages.contains_key("node_modules/shared-lib"));
+    assert!(updated_lockfile
+        .packages
+        .contains_key("node_modules/shared-lib"));
     assert!(updated_lockfile.packages.contains_key("node_modules/pkg-b"));
 
     assert!(!nm.join("pkg-a").exists());
@@ -305,8 +361,12 @@ fn test_uninstall_nested_conflict_dependency() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("nested-test".to_string());
-    manifest.dependencies.insert("parent".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("parent".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut lockfile = LockfileV3::new("nested-test", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
@@ -324,23 +384,34 @@ fn test_uninstall_nested_conflict_dependency() {
         ..Default::default()
     };
     lockfile.insert_package("node_modules/parent/node_modules/conflict-child", child);
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
-    let nested_dir = project_dir.join("node_modules").join("parent").join("node_modules").join("conflict-child");
+    let nested_dir = project_dir
+        .join("node_modules")
+        .join("parent")
+        .join("node_modules")
+        .join("conflict-child");
     fs::create_dir_all(&nested_dir).unwrap();
 
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let summary = installer.uninstall(&UninstallOptions {
-        packages: vec!["parent".to_string()],
-        ..Default::default()
-    }).unwrap();
+    let summary = installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["parent".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     assert_eq!(summary.removed_packages, vec!["parent".to_string()]);
-    assert!(summary.pruned_dependencies.contains(&"node_modules/parent/node_modules/conflict-child".to_string()));
+    assert!(summary
+        .pruned_dependencies
+        .contains(&"node_modules/parent/node_modules/conflict-child".to_string()));
 
     assert!(!project_dir.join("node_modules").join("parent").exists());
 }
@@ -352,32 +423,47 @@ fn test_uninstall_scoped_package_and_cleans_empty_scope_dir() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("scope-test".to_string());
-    manifest.dependencies.insert("@my-scope/my-lib".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("@my-scope/my-lib".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut lockfile = LockfileV3::new("scope-test", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
         root.dependencies = Some(manifest.dependencies.clone());
     }
-    lockfile.insert_package("node_modules/@my-scope/my-lib", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        ..Default::default()
-    });
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile.insert_package(
+        "node_modules/@my-scope/my-lib",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
-    let scope_pkg_dir = project_dir.join("node_modules").join("@my-scope").join("my-lib");
+    let scope_pkg_dir = project_dir
+        .join("node_modules")
+        .join("@my-scope")
+        .join("my-lib");
     fs::create_dir_all(&scope_pkg_dir).unwrap();
     fs::write(scope_pkg_dir.join("index.js"), "module.exports = {};").unwrap();
 
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    installer.uninstall(&UninstallOptions {
-        packages: vec!["@my-scope/my-lib".to_string()],
-        ..Default::default()
-    }).unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["@my-scope/my-lib".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     // Verify package is gone AND the empty @my-scope directory is cleanly removed
     assert!(!scope_pkg_dir.exists());
@@ -391,19 +477,30 @@ fn test_uninstall_package_with_bin_shims() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("shim-test".to_string());
-    manifest.dependencies.insert("tool-pkg".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("tool-pkg".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut lockfile = LockfileV3::new("shim-test", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
         root.dependencies = Some(manifest.dependencies.clone());
     }
-    lockfile.insert_package("node_modules/tool-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        bin: Some(rnpm_lockfile::PackageBin::Single("./bin/run.js".to_string())),
-        ..Default::default()
-    });
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile.insert_package(
+        "node_modules/tool-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            bin: Some(rnpm_lockfile::PackageBin::Single(
+                "./bin/run.js".to_string(),
+            )),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     // Setup node_modules/tool-pkg and its manifest declaring bin
     let tool_dir = project_dir.join("node_modules").join("tool-pkg");
@@ -411,7 +508,9 @@ fn test_uninstall_package_with_bin_shims() {
     let mut tool_manifest = Manifest::default();
     tool_manifest.name = Some("tool-pkg".to_string());
     tool_manifest.bin = Some(PackageBin::Single("./bin/run.js".to_string()));
-    tool_manifest.save_to_file(tool_dir.join("package.json")).unwrap();
+    tool_manifest
+        .save_to_file(tool_dir.join("package.json"))
+        .unwrap();
 
     // Setup .bin shims
     let bin_dir = project_dir.join("node_modules").join(".bin");
@@ -426,12 +525,15 @@ fn test_uninstall_package_with_bin_shims() {
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    installer.uninstall(&UninstallOptions {
-        packages: vec!["tool-pkg".to_string()],
-        ..Default::default()
-    }).unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["tool-pkg".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     // Shims and empty .bin must be gone
     assert!(!bin_dir.join("tool-pkg").exists());
@@ -440,7 +542,10 @@ fn test_uninstall_package_with_bin_shims() {
         assert!(!bin_dir.join("tool-pkg.cmd").exists());
         assert!(!bin_dir.join("tool-pkg.ps1").exists());
     }
-    assert!(!bin_dir.exists(), "Empty .bin directory should be cleaned up");
+    assert!(
+        !bin_dir.exists(),
+        "Empty .bin directory should be cleaned up"
+    );
     assert!(!tool_dir.exists());
 }
 
@@ -458,19 +563,29 @@ fn test_uninstall_junction_safety() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("junction-test".to_string());
-    manifest.dependencies.insert("linked-pkg".to_string(), "file:../external-repo".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest.dependencies.insert(
+        "linked-pkg".to_string(),
+        "file:../external-repo".to_string(),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut lockfile = LockfileV3::new("junction-test", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
         root.dependencies = Some(manifest.dependencies.clone());
     }
-    lockfile.insert_package("node_modules/linked-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        link: Some(true),
-        ..Default::default()
-    });
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile.insert_package(
+        "node_modules/linked-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     // Create directory junction/symlink in node_modules pointing to external_dir
     let nm = project_dir.join("node_modules");
@@ -482,20 +597,32 @@ fn test_uninstall_junction_safety() {
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.clone(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    installer.uninstall(&UninstallOptions {
-        packages: vec!["linked-pkg".to_string()],
-        ..Default::default()
-    }).unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["linked-pkg".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     // Junction in node_modules is deleted
     assert!(!link_path.exists());
 
     // CRITICAL SECURITY PROPERTY: Target external directory AND its contents MUST BE PRESERVED!
-    assert!(external_dir.exists(), "External target directory must not be deleted");
-    assert!(precious_file.exists(), "External files must not be deleted when removing junction");
-    assert_eq!(fs::read_to_string(&precious_file).unwrap(), "console.log('valuable code');");
+    assert!(
+        external_dir.exists(),
+        "External target directory must not be deleted"
+    );
+    assert!(
+        precious_file.exists(),
+        "External files must not be deleted when removing junction"
+    );
+    assert_eq!(
+        fs::read_to_string(&precious_file).unwrap(),
+        "console.log('valuable code');"
+    );
 }
 
 #[test]
@@ -505,12 +632,15 @@ fn test_uninstall_security_rejects_path_traversal() {
 
     let mut manifest = Manifest::default();
     manifest.name = Some("security-test".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let dangerous_inputs = vec![
         "../../etc/passwd",
@@ -524,7 +654,10 @@ fn test_uninstall_security_rejects_path_traversal() {
             packages: vec![dangerous.to_string()],
             ..Default::default()
         });
-        assert!(res.is_err(), "Must reject path traversal input: {dangerous}");
+        assert!(
+            res.is_err(),
+            "Must reject path traversal input: {dangerous}"
+        );
     }
 }
 
@@ -537,429 +670,470 @@ fn test_uninstall_deterministic_serialization_preserves_formatting() {
     let installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    installer.uninstall(&UninstallOptions {
-        packages: vec!["pkg-a".to_string()],
-        ..Default::default()
-    }).unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["pkg-a".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
 
     // Verify package-lock.json ends with newline and is valid deterministic JSON
     let lockfile_content = fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
-    assert!(lockfile_content.ends_with('\n'), "package-lock.json must end with newline");
+    assert!(
+        lockfile_content.ends_with('\n'),
+        "package-lock.json must end with newline"
+    );
     let parsed_lock: LockfileV3 = serde_json::from_str(&lockfile_content).unwrap();
     assert_eq!(parsed_lock.lockfile_version, 3);
 
     // Verify package.json ends with newline
     let manifest_content = fs::read_to_string(project_dir.join("package.json")).unwrap();
-    assert!(manifest_content.ends_with('\n'), "package.json must end with newline");
+    assert!(
+        manifest_content.ends_with('\n'),
+        "package.json must end with newline"
+    );
     let parsed_manifest: Manifest = serde_json::from_str(&manifest_content).unwrap();
     assert_eq!(parsed_manifest.name.as_deref(), Some("test-app"));
 }
 
-
-    fn make_tarball(pkg_name: &str, version: &str, deps: &[(&str, &str)]) -> Vec<u8> {
-        let mut dep_map = serde_json::Map::new();
-        for (d_name, d_range) in deps {
-            dep_map.insert(d_name.to_string(), serde_json::Value::String(d_range.to_string()));
-        }
-
-        let manifest_json = serde_json::json!({
-            "name": pkg_name,
-            "version": version,
-            "dependencies": dep_map
-        });
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
-
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        {
-            let mut builder = Builder::new(&mut gz);
-            let mut header = Header::new_gnu();
-            header.set_size(manifest_bytes.len() as u64);
-            header.set_mode(0o644);
-            let path = "package/package.json";
-            header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
-            header.set_cksum();
-            builder.append(&header, Cursor::new(manifest_bytes)).unwrap();
-            builder.finish().unwrap();
-        }
-        gz.finish().unwrap()
+fn make_tarball(pkg_name: &str, version: &str, deps: &[(&str, &str)]) -> Vec<u8> {
+    let mut dep_map = serde_json::Map::new();
+    for (d_name, d_range) in deps {
+        dep_map.insert(
+            d_name.to_string(),
+            serde_json::Value::String(d_range.to_string()),
+        );
     }
 
-    #[tokio::test]
-    async fn test_update_all_dependencies_and_superseded_cleanup() {
-        let project_dir = tempdir().unwrap();
-        let cache_dir = tempdir().unwrap();
+    let manifest_json = serde_json::json!({
+        "name": pkg_name,
+        "version": version,
+        "dependencies": dep_map
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
 
-        // Tarballs
-        let pkg_a_100_tar = make_tarball("pkg-a", "1.0.0", &[("trans-old", "^1.0.0")]);
-        let pkg_a_110_tar = make_tarball("pkg-a", "1.1.0", &[("trans-new", "^1.0.0")]);
-        let trans_old_tar = make_tarball("trans-old", "1.0.0", &[]);
-        let trans_new_tar = make_tarball("trans-new", "1.0.0", &[]);
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        let path = "package/package.json";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(manifest_bytes))
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
 
-        let a_100_int = Integrity::from_bytes(&pkg_a_100_tar, Algorithm::Sha512).to_string();
-        let a_110_int = Integrity::from_bytes(&pkg_a_110_tar, Algorithm::Sha512).to_string();
-        let old_int = Integrity::from_bytes(&trans_old_tar, Algorithm::Sha512).to_string();
-        let new_int = Integrity::from_bytes(&trans_new_tar, Algorithm::Sha512).to_string();
+#[tokio::test]
+async fn test_update_all_dependencies_and_superseded_cleanup() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
 
-        let a_100_tar_c = pkg_a_100_tar.clone();
-        let a_110_tar_c = pkg_a_110_tar.clone();
-        let trans_old_tar_c = trans_old_tar.clone();
-        let trans_new_tar_c = trans_new_tar.clone();
+    // Tarballs
+    let pkg_a_100_tar = make_tarball("pkg-a", "1.0.0", &[("trans-old", "^1.0.0")]);
+    let pkg_a_110_tar = make_tarball("pkg-a", "1.1.0", &[("trans-new", "^1.0.0")]);
+    let trans_old_tar = make_tarball("trans-old", "1.0.0", &[]);
+    let trans_new_tar = make_tarball("trans-new", "1.0.0", &[]);
 
-        let a_100_int_c = a_100_int.clone();
-        let a_110_int_c = a_110_int.clone();
-        let old_int_c = old_int.clone();
-        let new_int_c = new_int.clone();
+    let a_100_int = Integrity::from_bytes(&pkg_a_100_tar, Algorithm::Sha512).to_string();
+    let a_110_int = Integrity::from_bytes(&pkg_a_110_tar, Algorithm::Sha512).to_string();
+    let old_int = Integrity::from_bytes(&trans_old_tar, Algorithm::Sha512).to_string();
+    let new_int = Integrity::from_bytes(&trans_new_tar, Algorithm::Sha512).to_string();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        let server_url = format!("http://{local_addr}/");
-        let su1 = server_url.clone();
-        let su2 = server_url.clone();
-        let su3 = server_url.clone();
-        let su4 = server_url.clone();
+    let a_100_tar_c = pkg_a_100_tar.clone();
+    let a_110_tar_c = pkg_a_110_tar.clone();
+    let trans_old_tar_c = trans_old_tar.clone();
+    let trans_new_tar_c = trans_new_tar.clone();
 
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let a_100_int_c = a_100_int.clone();
+    let a_110_int_c = a_110_int.clone();
+    let old_int_c = old_int.clone();
+    let new_int_c = new_int.clone();
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut rx => break,
-                    accept_res = listener.accept() => {
-                        if let Ok((mut stream, _)) = accept_res {
-                            let a_100_int_c = a_100_int_c.clone();
-                            let a_110_int_c = a_110_int_c.clone();
-                            let old_int_c = old_int_c.clone();
-                            let new_int_c = new_int_c.clone();
-                            let a_100_tar_c = a_100_tar_c.clone();
-                            let a_110_tar_c = a_110_tar_c.clone();
-                            let trans_old_tar_c = trans_old_tar_c.clone();
-                            let trans_new_tar_c = trans_new_tar_c.clone();
-                            let su1 = su1.clone();
-                            let su2 = su2.clone();
-                            let su3 = su3.clone();
-                            let su4 = su4.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su1 = server_url.clone();
+    let su2 = server_url.clone();
+    let su3 = server_url.clone();
+    let su4 = server_url.clone();
 
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 4096];
-                                let n = stream.read(&mut buf).await.unwrap_or(0);
-                                if n > 0 {
-                                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let (status, headers, body) = if req_str.contains("GET /pkg-a") {
-                                        let json = serde_json::json!({
-                                            "name": "pkg-a",
-                                            "dist-tags": { "latest": "1.1.0" },
-                                            "versions": {
-                                                "1.0.0": {
-                                                    "name": "pkg-a",
-                                                    "version": "1.0.0",
-                                                    "dist": {
-                                                        "tarball": format!("{su1}tarballs/pkg-a-1.0.0.tgz"),
-                                                        "integrity": a_100_int_c
-                                                    },
-                                                    "dependencies": { "trans-old": "^1.0.0" }
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let a_100_int_c = a_100_int_c.clone();
+                        let a_110_int_c = a_110_int_c.clone();
+                        let old_int_c = old_int_c.clone();
+                        let new_int_c = new_int_c.clone();
+                        let a_100_tar_c = a_100_tar_c.clone();
+                        let a_110_tar_c = a_110_tar_c.clone();
+                        let trans_old_tar_c = trans_old_tar_c.clone();
+                        let trans_new_tar_c = trans_new_tar_c.clone();
+                        let su1 = su1.clone();
+                        let su2 = su2.clone();
+                        let su3 = su3.clone();
+                        let su4 = su4.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /pkg-a") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-a",
+                                        "dist-tags": { "latest": "1.1.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "pkg-a",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su1}tarballs/pkg-a-1.0.0.tgz"),
+                                                    "integrity": a_100_int_c
                                                 },
-                                                "1.1.0": {
-                                                    "name": "pkg-a",
-                                                    "version": "1.1.0",
-                                                    "dist": {
-                                                        "tarball": format!("{su2}tarballs/pkg-a-1.1.0.tgz"),
-                                                        "integrity": a_110_int_c
-                                                    },
-                                                    "dependencies": { "trans-new": "^1.0.0" }
+                                                "dependencies": { "trans-old": "^1.0.0" }
+                                            },
+                                            "1.1.0": {
+                                                "name": "pkg-a",
+                                                "version": "1.1.0",
+                                                "dist": {
+                                                    "tarball": format!("{su2}tarballs/pkg-a-1.1.0.tgz"),
+                                                    "integrity": a_110_int_c
+                                                },
+                                                "dependencies": { "trans-new": "^1.0.0" }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /trans-old") {
+                                    let json = serde_json::json!({
+                                        "name": "trans-old",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "trans-old",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su3}tarballs/trans-old-1.0.0.tgz"),
+                                                    "integrity": old_int_c
                                                 }
                                             }
-                                        });
-                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
-                                    } else if req_str.contains("GET /trans-old") {
-                                        let json = serde_json::json!({
-                                            "name": "trans-old",
-                                            "dist-tags": { "latest": "1.0.0" },
-                                            "versions": {
-                                                "1.0.0": {
-                                                    "name": "trans-old",
-                                                    "version": "1.0.0",
-                                                    "dist": {
-                                                        "tarball": format!("{su3}tarballs/trans-old-1.0.0.tgz"),
-                                                        "integrity": old_int_c
-                                                    }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /trans-new") {
+                                    let json = serde_json::json!({
+                                        "name": "trans-new",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "trans-new",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su4}tarballs/trans-new-1.0.0.tgz"),
+                                                    "integrity": new_int_c
                                                 }
                                             }
-                                        });
-                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
-                                    } else if req_str.contains("GET /trans-new") {
-                                        let json = serde_json::json!({
-                                            "name": "trans-new",
-                                            "dist-tags": { "latest": "1.0.0" },
-                                            "versions": {
-                                                "1.0.0": {
-                                                    "name": "trans-new",
-                                                    "version": "1.0.0",
-                                                    "dist": {
-                                                        "tarball": format!("{su4}tarballs/trans-new-1.0.0.tgz"),
-                                                        "integrity": new_int_c
-                                                    }
-                                                }
-                                            }
-                                        });
-                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
-                                    } else if req_str.contains("GET /tarballs/pkg-a-1.0.0.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], a_100_tar_c)
-                                    } else if req_str.contains("GET /tarballs/pkg-a-1.1.0.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], a_110_tar_c)
-                                    } else if req_str.contains("GET /tarballs/trans-old-1.0.0.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], trans_old_tar_c)
-                                    } else if req_str.contains("GET /tarballs/trans-new-1.0.0.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], trans_new_tar_c)
-                                    } else {
-                                        (404, vec![], b"Not Found".to_vec())
-                                    };
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/pkg-a-1.0.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], a_100_tar_c)
+                                } else if req_str.contains("GET /tarballs/pkg-a-1.1.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], a_110_tar_c)
+                                } else if req_str.contains("GET /tarballs/trans-old-1.0.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], trans_old_tar_c)
+                                } else if req_str.contains("GET /tarballs/trans-new-1.0.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], trans_new_tar_c)
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
 
-                                    let status_text = if status == 200 { "OK" } else { "Not Found" };
-                                    let mut response = format!(
-                                        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                                        body.len()
-                                    );
-                                    for (k, v) in headers {
-                                        response.push_str(&format!("{k}: {v}\r\n"));
-                                    }
-                                    response.push_str("\r\n");
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    let _ = stream.write_all(&body).await;
-                                    let _ = stream.flush().await;
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
                                 }
-                            });
-                        }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
                     }
                 }
             }
-        });
+        }
+    });
 
-        // 1. Initial state: package.json has "pkg-a": "^1.0.0"
-        let pkg_json = project_dir.path().join("package.json");
-        std::fs::write(&pkg_json, r#"{
+    // 1. Initial state: package.json has "pkg-a": "^1.0.0"
+    let pkg_json = project_dir.path().join("package.json");
+    std::fs::write(
+        &pkg_json,
+        r#"{
             "name": "test-project",
             "version": "1.0.0",
             "dependencies": {
                 "pkg-a": "^1.0.0"
             }
-        }"#).unwrap();
+        }"#,
+    )
+    .unwrap();
 
-        // Initial lockfile pinned to 1.0.0 and trans-old
-        let mut initial_lock = LockfileV3::new("test-project", Some("1.0.0".to_string()));
-        if let Some(root) = initial_lock.root_package_mut() {
-            let mut d = BTreeMap::new();
-            d.insert("pkg-a".to_string(), "^1.0.0".to_string());
-            root.dependencies = Some(d);
-        }
-        let mut a_entry = LockfilePackage {
-            version: Some("1.0.0".to_string()),
-            resolved: Some(format!("{server_url}tarballs/pkg-a-1.0.0.tgz")),
-            integrity: Some(a_100_int.clone()),
-            ..Default::default()
-        };
-        let mut a_deps = BTreeMap::new();
-        a_deps.insert("trans-old".to_string(), "^1.0.0".to_string());
-        a_entry.dependencies = Some(a_deps);
-        initial_lock.insert_package("node_modules/pkg-a", a_entry);
-
-        let old_entry = LockfilePackage {
-            version: Some("1.0.0".to_string()),
-            resolved: Some(format!("{server_url}tarballs/trans-old-1.0.0.tgz")),
-            integrity: Some(old_int.clone()),
-            ..Default::default()
-        };
-        initial_lock.insert_package("node_modules/trans-old", old_entry);
-
-        let lock_path = project_dir.path().join("package-lock.json");
-        initial_lock.save_to_file(&lock_path).unwrap();
-
-        // Dummy initial node_modules/trans-old on disk
-        let old_dir = project_dir.path().join("node_modules/trans-old");
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("package.json"), "{}").unwrap();
-
-        // 2. Run update (all dependencies)
-        let options = InstallOptions {
-            project_dir: project_dir.path().to_path_buf(),
-            registry_url: Some(server_url.clone()),
-            cache_dir: Some(cache_dir.path().to_path_buf()),
-            offline: false,
-            ignore_scripts: true,
-            ..Default::default()
-        };
-
-        let mut installer = Installer::new(options).unwrap();
-        let summary = installer.update(&[]).await.unwrap();
-
-        assert_eq!(summary.packages_updated, 1);
-        assert_eq!(summary.updated_packages, vec!["pkg-a"]);
-        assert_eq!(summary.old_versions.get("pkg-a"), Some(&"1.0.0".to_string()));
-        assert_eq!(summary.new_versions.get("pkg-a"), Some(&"1.1.0".to_string()));
-
-        // Verify lockfile rewritten deterministically
-        let updated_lock = LockfileV3::load_from_file(&lock_path).unwrap();
-        let updated_a = updated_lock.get_package("node_modules/pkg-a").unwrap();
-        assert_eq!(updated_a.version, Some("1.1.0".to_string()));
-
-        // Verify newly needed dependency trans-new is present in lockfile and node_modules
-        assert!(updated_lock.get_package("node_modules/trans-new").is_some());
-        assert!(project_dir.path().join("node_modules/trans-new/package.json").exists());
-
-        // Verify superseded orphaned dependency trans-old is removed from lockfile and node_modules
-        assert!(updated_lock.get_package("node_modules/trans-old").is_none());
-        assert!(!project_dir.path().join("node_modules/trans-old").exists());
-
-        let _ = tx.send(());
+    // Initial lockfile pinned to 1.0.0 and trans-old
+    let mut initial_lock = LockfileV3::new("test-project", Some("1.0.0".to_string()));
+    if let Some(root) = initial_lock.root_package_mut() {
+        let mut d = BTreeMap::new();
+        d.insert("pkg-a".to_string(), "^1.0.0".to_string());
+        root.dependencies = Some(d);
     }
+    let mut a_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{server_url}tarballs/pkg-a-1.0.0.tgz")),
+        integrity: Some(a_100_int.clone()),
+        ..Default::default()
+    };
+    let mut a_deps = BTreeMap::new();
+    a_deps.insert("trans-old".to_string(), "^1.0.0".to_string());
+    a_entry.dependencies = Some(a_deps);
+    initial_lock.insert_package("node_modules/pkg-a", a_entry);
 
-    #[tokio::test]
-    async fn test_update_specific_package_filter() {
-        let project_dir = tempdir().unwrap();
-        let cache_dir = tempdir().unwrap();
+    let old_entry = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some(format!("{server_url}tarballs/trans-old-1.0.0.tgz")),
+        integrity: Some(old_int.clone()),
+        ..Default::default()
+    };
+    initial_lock.insert_package("node_modules/trans-old", old_entry);
 
-        let pkg_a_tar = make_tarball("pkg-a", "1.1.0", &[]);
-        let pkg_b_tar = make_tarball("pkg-b", "1.1.0", &[]);
-        let a_int = Integrity::from_bytes(&pkg_a_tar, Algorithm::Sha512).to_string();
-        let b_int = Integrity::from_bytes(&pkg_b_tar, Algorithm::Sha512).to_string();
+    let lock_path = project_dir.path().join("package-lock.json");
+    initial_lock.save_to_file(&lock_path).unwrap();
 
-        let a_tar_c = pkg_a_tar.clone();
-        let b_tar_c = pkg_b_tar.clone();
-        let a_int_c = a_int.clone();
-        let b_int_c = b_int.clone();
+    // Dummy initial node_modules/trans-old on disk
+    let old_dir = project_dir.path().join("node_modules/trans-old");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    std::fs::write(old_dir.join("package.json"), "{}").unwrap();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_addr = listener.local_addr().unwrap();
-        let server_url = format!("http://{local_addr}/");
-        let su1 = server_url.clone();
-        let su2 = server_url.clone();
+    // 2. Run update (all dependencies)
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: true,
+        ..Default::default()
+    };
 
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.update(&[]).await.unwrap();
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut rx => break,
-                    accept_res = listener.accept() => {
-                        if let Ok((mut stream, _)) = accept_res {
-                            let a_int_c = a_int_c.clone();
-                            let b_int_c = b_int_c.clone();
-                            let a_tar_c = a_tar_c.clone();
-                            let b_tar_c = b_tar_c.clone();
-                            let su1 = su1.clone();
-                            let su2 = su2.clone();
+    assert_eq!(summary.packages_updated, 1);
+    assert_eq!(summary.updated_packages, vec!["pkg-a"]);
+    assert_eq!(
+        summary.old_versions.get("pkg-a"),
+        Some(&"1.0.0".to_string())
+    );
+    assert_eq!(
+        summary.new_versions.get("pkg-a"),
+        Some(&"1.1.0".to_string())
+    );
 
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 4096];
-                                let n = stream.read(&mut buf).await.unwrap_or(0);
-                                if n > 0 {
-                                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let (status, headers, body) = if req_str.contains("GET /pkg-a") {
-                                        let json = serde_json::json!({
-                                            "name": "pkg-a",
-                                            "dist-tags": { "latest": "1.1.0" },
-                                            "versions": {
-                                                "1.0.0": { "name": "pkg-a", "version": "1.0.0", "dist": { "tarball": format!("{su1}tarballs/pkg-a.tgz"), "integrity": a_int_c } },
-                                                "1.1.0": { "name": "pkg-a", "version": "1.1.0", "dist": { "tarball": format!("{su1}tarballs/pkg-a.tgz"), "integrity": a_int_c } }
-                                            }
-                                        });
-                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
-                                    } else if req_str.contains("GET /pkg-b") {
-                                        let json = serde_json::json!({
-                                            "name": "pkg-b",
-                                            "dist-tags": { "latest": "1.1.0" },
-                                            "versions": {
-                                                "1.0.0": { "name": "pkg-b", "version": "1.0.0", "dist": { "tarball": format!("{su2}tarballs/pkg-b.tgz"), "integrity": b_int_c } },
-                                                "1.1.0": { "name": "pkg-b", "version": "1.1.0", "dist": { "tarball": format!("{su2}tarballs/pkg-b.tgz"), "integrity": b_int_c } }
-                                            }
-                                        });
-                                        (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
-                                    } else if req_str.contains("GET /tarballs/pkg-a.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], a_tar_c)
-                                    } else if req_str.contains("GET /tarballs/pkg-b.tgz") {
-                                        (200, vec![("Content-Type", String::from("application/octet-stream"))], b_tar_c)
-                                    } else {
-                                        (404, vec![], b"Not Found".to_vec())
-                                    };
+    // Verify lockfile rewritten deterministically
+    let updated_lock = LockfileV3::load_from_file(&lock_path).unwrap();
+    let updated_a = updated_lock.get_package("node_modules/pkg-a").unwrap();
+    assert_eq!(updated_a.version, Some("1.1.0".to_string()));
 
-                                    let status_text = if status == 200 { "OK" } else { "Not Found" };
-                                    let mut response = format!(
-                                        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                                        body.len()
-                                    );
-                                    for (k, v) in headers {
-                                        response.push_str(&format!("{k}: {v}\r\n"));
-                                    }
-                                    response.push_str("\r\n");
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    let _ = stream.write_all(&body).await;
-                                    let _ = stream.flush().await;
+    // Verify newly needed dependency trans-new is present in lockfile and node_modules
+    assert!(updated_lock.get_package("node_modules/trans-new").is_some());
+    assert!(project_dir
+        .path()
+        .join("node_modules/trans-new/package.json")
+        .exists());
+
+    // Verify superseded orphaned dependency trans-old is removed from lockfile and node_modules
+    assert!(updated_lock.get_package("node_modules/trans-old").is_none());
+    assert!(!project_dir.path().join("node_modules/trans-old").exists());
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_update_specific_package_filter() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let pkg_a_tar = make_tarball("pkg-a", "1.1.0", &[]);
+    let pkg_b_tar = make_tarball("pkg-b", "1.1.0", &[]);
+    let a_int = Integrity::from_bytes(&pkg_a_tar, Algorithm::Sha512).to_string();
+    let b_int = Integrity::from_bytes(&pkg_b_tar, Algorithm::Sha512).to_string();
+
+    let a_tar_c = pkg_a_tar.clone();
+    let b_tar_c = pkg_b_tar.clone();
+    let a_int_c = a_int.clone();
+    let b_int_c = b_int.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su1 = server_url.clone();
+    let su2 = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let a_int_c = a_int_c.clone();
+                        let b_int_c = b_int_c.clone();
+                        let a_tar_c = a_tar_c.clone();
+                        let b_tar_c = b_tar_c.clone();
+                        let su1 = su1.clone();
+                        let su2 = su2.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /pkg-a") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-a",
+                                        "dist-tags": { "latest": "1.1.0" },
+                                        "versions": {
+                                            "1.0.0": { "name": "pkg-a", "version": "1.0.0", "dist": { "tarball": format!("{su1}tarballs/pkg-a.tgz"), "integrity": a_int_c } },
+                                            "1.1.0": { "name": "pkg-a", "version": "1.1.0", "dist": { "tarball": format!("{su1}tarballs/pkg-a.tgz"), "integrity": a_int_c } }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /pkg-b") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-b",
+                                        "dist-tags": { "latest": "1.1.0" },
+                                        "versions": {
+                                            "1.0.0": { "name": "pkg-b", "version": "1.0.0", "dist": { "tarball": format!("{su2}tarballs/pkg-b.tgz"), "integrity": b_int_c } },
+                                            "1.1.0": { "name": "pkg-b", "version": "1.1.0", "dist": { "tarball": format!("{su2}tarballs/pkg-b.tgz"), "integrity": b_int_c } }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/pkg-a.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], a_tar_c)
+                                } else if req_str.contains("GET /tarballs/pkg-b.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], b_tar_c)
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
+
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
                                 }
-                            });
-                        }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
                     }
                 }
             }
-        });
+        }
+    });
 
-        // package.json defines pkg-a and pkg-b
-        let pkg_json = project_dir.path().join("package.json");
-        std::fs::write(&pkg_json, r#"{
+    // package.json defines pkg-a and pkg-b
+    let pkg_json = project_dir.path().join("package.json");
+    std::fs::write(
+        &pkg_json,
+        r#"{
             "name": "test-multi",
             "version": "1.0.0",
             "dependencies": {
                 "pkg-a": "^1.0.0",
                 "pkg-b": "^1.0.0"
             }
-        }"#).unwrap();
+        }"#,
+    )
+    .unwrap();
 
-        // Lockfile has both at 1.0.0
-        let mut lock = LockfileV3::new("test-multi", Some("1.0.0".to_string()));
-        let mut d = BTreeMap::new();
-        d.insert("pkg-a".to_string(), "^1.0.0".to_string());
-        d.insert("pkg-b".to_string(), "^1.0.0".to_string());
-        lock.root_package_mut().unwrap().dependencies = Some(d);
+    // Lockfile has both at 1.0.0
+    let mut lock = LockfileV3::new("test-multi", Some("1.0.0".to_string()));
+    let mut d = BTreeMap::new();
+    d.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    d.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(d);
 
-        lock.insert_package("node_modules/pkg-a", LockfilePackage {
+    lock.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
             version: Some("1.0.0".to_string()),
             resolved: Some(format!("{server_url}tarballs/pkg-a.tgz")),
             integrity: Some(a_int),
             ..Default::default()
-        });
-        lock.insert_package("node_modules/pkg-b", LockfilePackage {
+        },
+    );
+    lock.insert_package(
+        "node_modules/pkg-b",
+        LockfilePackage {
             version: Some("1.0.0".to_string()),
             resolved: Some(format!("{server_url}tarballs/pkg-b.tgz")),
             integrity: Some(b_int),
             ..Default::default()
-        });
-        let lock_path = project_dir.path().join("package-lock.json");
-        lock.save_to_file(&lock_path).unwrap();
+        },
+    );
+    let lock_path = project_dir.path().join("package-lock.json");
+    lock.save_to_file(&lock_path).unwrap();
 
-        let options = InstallOptions {
-            project_dir: project_dir.path().to_path_buf(),
-            registry_url: Some(server_url.clone()),
-            cache_dir: Some(cache_dir.path().to_path_buf()),
-            offline: false,
-            ignore_scripts: true,
-            ..Default::default()
-        };
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        registry_url: Some(server_url.clone()),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: true,
+        ..Default::default()
+    };
 
-        let mut installer = Installer::new(options).unwrap();
-        // Update ONLY pkg-a
-        let summary = installer.update(&["pkg-a".to_string()]).await.unwrap();
+    let mut installer = Installer::new(options).unwrap();
+    // Update ONLY pkg-a
+    let summary = installer.update(&["pkg-a".to_string()]).await.unwrap();
 
-        assert_eq!(summary.packages_updated, 1);
-        assert_eq!(summary.updated_packages, vec!["pkg-a"]);
+    assert_eq!(summary.packages_updated, 1);
+    assert_eq!(summary.updated_packages, vec!["pkg-a"]);
 
-        let reloaded = LockfileV3::load_from_file(&lock_path).unwrap();
-        assert_eq!(reloaded.get_package("node_modules/pkg-a").unwrap().version, Some("1.1.0".to_string()));
-        // pkg-b remains at 1.0.0!
-        assert_eq!(reloaded.get_package("node_modules/pkg-b").unwrap().version, Some("1.0.0".to_string()));
+    let reloaded = LockfileV3::load_from_file(&lock_path).unwrap();
+    assert_eq!(
+        reloaded.get_package("node_modules/pkg-a").unwrap().version,
+        Some("1.1.0".to_string())
+    );
+    // pkg-b remains at 1.0.0!
+    assert_eq!(
+        reloaded.get_package("node_modules/pkg-b").unwrap().version,
+        Some("1.0.0".to_string())
+    );
 
-        let _ = tx.send(());
-    }
-
+    let _ = tx.send(());
+}
 
 #[tokio::test]
 async fn test_workspace_installation_linking_and_lockfile() {
@@ -992,11 +1166,13 @@ async fn test_workspace_installation_linking_and_lockfile() {
     fs::write(
         lib_a_dir.join("bin").join("tool.js"),
         "#!/usr/bin/env node\nconsole.log('lib-a tool');\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         lib_a_dir.join("index.js"),
         "module.exports = { name: 'lib-a' };\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // 3. Member B: @mono/lib-b depends on @mono/lib-a via workspace:*
     let lib_b_dir = root.join("packages").join("lib-b");
@@ -1012,7 +1188,8 @@ async fn test_workspace_installation_linking_and_lockfile() {
     fs::write(
         lib_b_dir.join("index.js"),
         "const a = require('@mono/lib-a'); module.exports = { a };\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // 4. Member C: app depends on @mono/lib-b via workspace:^ and @mono/lib-a via workspace:~
     let app_dir = root.join("packages").join("app");
@@ -1032,7 +1209,8 @@ async fn test_workspace_installation_linking_and_lockfile() {
     fs::write(
         app_dir.join("app.js"),
         "#!/usr/bin/env node\nconsole.log('app running');\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     // 5. Run Installer
     let options = InstallOptions {
@@ -1057,9 +1235,18 @@ async fn test_workspace_installation_linking_and_lockfile() {
     assert!(link_b.exists(), "Link for @mono/lib-b must exist");
     assert!(link_app.exists(), "Link for my-app must exist");
 
-    assert!(is_junction(&link_a).unwrap(), "Link for @mono/lib-a must be a junction or symlink");
-    assert!(is_junction(&link_b).unwrap(), "Link for @mono/lib-b must be a junction or symlink");
-    assert!(is_junction(&link_app).unwrap(), "Link for my-app must be a junction or symlink");
+    assert!(
+        is_junction(&link_a).unwrap(),
+        "Link for @mono/lib-a must be a junction or symlink"
+    );
+    assert!(
+        is_junction(&link_b).unwrap(),
+        "Link for @mono/lib-b must be a junction or symlink"
+    );
+    assert!(
+        is_junction(&link_app).unwrap(),
+        "Link for my-app must be a junction or symlink"
+    );
 
     // Test live linking: reading through junction reads target content
     let linked_a_pkg = fs::read_to_string(link_a.join("package.json")).unwrap();
@@ -1067,7 +1254,10 @@ async fn test_workspace_installation_linking_and_lockfile() {
 
     // Mutate source file and verify junction immediately sees it without reinstall
     fs::write(lib_a_dir.join("test-sync.txt"), "sync test").unwrap();
-    assert!(link_a.join("test-sync.txt").exists(), "Junction must reflect changes immediately");
+    assert!(
+        link_a.join("test-sync.txt").exists(),
+        "Junction must reflect changes immediately"
+    );
 
     // Verify companion shims in node_modules/.bin
     let bin_dir = node_modules.join(".bin");
@@ -1148,14 +1338,16 @@ async fn test_workspace_installation_detects_cycles() {
     fs::write(
         p1_dir.join("package.json"),
         r#"{"name": "pkg-1", "version": "1.0.0", "dependencies": {"pkg-2": "workspace:*"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let p2_dir = root.join("packages").join("pkg-2");
     fs::create_dir_all(&p2_dir).unwrap();
     fs::write(
         p2_dir.join("package.json"),
         r#"{"name": "pkg-2", "version": "1.0.0", "dependencies": {"pkg-1": "workspace:*"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),
@@ -1188,7 +1380,8 @@ async fn test_workspace_installation_missing_member_fails() {
     fs::write(
         p1_dir.join("package.json"),
         r#"{"name": "pkg-1", "version": "1.0.0", "dependencies": {"missing-pkg": "workspace:*"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),
@@ -1198,7 +1391,10 @@ async fn test_workspace_installation_missing_member_fails() {
     let mut installer = Installer::new(options).unwrap();
     let err = installer.run().await.unwrap_err();
     let err_msg = err.to_string();
-    assert!(err_msg.contains("missing-pkg"), "Should report missing package: {err_msg}");
+    assert!(
+        err_msg.contains("missing-pkg"),
+        "Should report missing package: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -1220,9 +1416,18 @@ async fn test_workspace_junction_security_content_preserved() {
 
     // Safely remove the junction
     rnpm_fs::remove_junction(&link_path).unwrap();
-    assert!(!link_path.exists(), "Junction reparse point must be removed");
-    assert!(secret_file.exists(), "Target file must NEVER be deleted when removing junction!");
-    assert_eq!(fs::read_to_string(&secret_file).unwrap(), "precious content");
+    assert!(
+        !link_path.exists(),
+        "Junction reparse point must be removed"
+    );
+    assert!(
+        secret_file.exists(),
+        "Target file must NEVER be deleted when removing junction!"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "precious content"
+    );
 }
 
 #[tokio::test]
@@ -1318,14 +1523,18 @@ async fn test_targeted_update_preserves_satisfying_and_unrelated_dependencies() 
     });
 
     let pkg_json = project_dir.path().join("package.json");
-    std::fs::write(&pkg_json, r#"{
+    std::fs::write(
+        &pkg_json,
+        r#"{
         "name": "targeted-test",
         "version": "1.0.0",
         "dependencies": {
             "pkg-a": "^1.0.0",
             "pkg-b": "^1.0.0"
         }
-    }"#).unwrap();
+    }"#,
+    )
+    .unwrap();
 
     let mut lock = LockfileV3::new("targeted-test", Some("1.0.0".to_string()));
     let mut d = BTreeMap::new();
@@ -1387,11 +1596,29 @@ async fn test_targeted_update_preserves_satisfying_and_unrelated_dependencies() 
 
     let updated_lock = LockfileV3::load_from_file(&lock_path).unwrap();
     // pkg-a updated to 1.1.0
-    assert_eq!(updated_lock.get_package("node_modules/pkg-a").unwrap().version, Some("1.1.0".to_string()));
+    assert_eq!(
+        updated_lock
+            .get_package("node_modules/pkg-a")
+            .unwrap()
+            .version,
+        Some("1.1.0".to_string())
+    );
     // pkg-b is completely UNTOUCHED at 1.0.0
-    assert_eq!(updated_lock.get_package("node_modules/pkg-b").unwrap().version, Some("1.0.0".to_string()));
+    assert_eq!(
+        updated_lock
+            .get_package("node_modules/pkg-b")
+            .unwrap()
+            .version,
+        Some("1.0.0".to_string())
+    );
     // dep-shared satisfies ^1.0.0 so it is RETAINED at 1.0.0 without modification
-    assert_eq!(updated_lock.get_package("node_modules/dep-shared").unwrap().version, Some("1.0.0".to_string()));
+    assert_eq!(
+        updated_lock
+            .get_package("node_modules/dep-shared")
+            .unwrap()
+            .version,
+        Some("1.0.0".to_string())
+    );
 
     let _ = tx.send(());
 }
@@ -1412,7 +1639,11 @@ async fn test_install_reification_path_containment_and_illegal_package_names() {
 
     for bad_name in illegal_names {
         let pkg_json = project_dir.path().join("package.json");
-        std::fs::write(&pkg_json, format!(r#"{{"name": "test-sec", "dependencies": {{"{bad_name}": "1.0.0"}}}}"#)).unwrap();
+        std::fs::write(
+            &pkg_json,
+            format!(r#"{{"name": "test-sec", "dependencies": {{"{bad_name}": "1.0.0"}}}}"#),
+        )
+        .unwrap();
 
         let options = InstallOptions {
             project_dir: project_dir.path().to_path_buf(),
@@ -1425,7 +1656,10 @@ async fn test_install_reification_path_containment_and_illegal_package_names() {
 
         let mut installer = Installer::new(options).unwrap();
         let res = installer.run().await;
-        assert!(res.is_err(), "Expected error for illegal package name '{bad_name}', but succeeded");
+        assert!(
+            res.is_err(),
+            "Expected error for illegal package name '{bad_name}', but succeeded"
+        );
     }
 }
 
@@ -1444,9 +1678,17 @@ async fn test_file_directory_dependency_installation_and_ci() {
             "local-cmd": "./bin/run.js"
         }
     });
-    fs::write(local_pkg_dir.join("package.json"), serde_json::to_string_pretty(&local_manifest).unwrap()).unwrap();
+    fs::write(
+        local_pkg_dir.join("package.json"),
+        serde_json::to_string_pretty(&local_manifest).unwrap(),
+    )
+    .unwrap();
     fs::create_dir_all(local_pkg_dir.join("bin")).unwrap();
-    fs::write(local_pkg_dir.join("bin").join("run.js"), "#!/usr/bin/env node\nconsole.log('hello');\n").unwrap();
+    fs::write(
+        local_pkg_dir.join("bin").join("run.js"),
+        "#!/usr/bin/env node\nconsole.log('hello');\n",
+    )
+    .unwrap();
 
     // 2. Create the main app project depending on "file:../packages/local-pkg"
     let app_dir = root.join("app");
@@ -1458,7 +1700,11 @@ async fn test_file_directory_dependency_installation_and_ci() {
             "local-pkg": "file:../packages/local-pkg"
         }
     });
-    fs::write(app_dir.join("package.json"), serde_json::to_string_pretty(&app_manifest).unwrap()).unwrap();
+    fs::write(
+        app_dir.join("package.json"),
+        serde_json::to_string_pretty(&app_manifest).unwrap(),
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: app_dir.clone(),
@@ -1480,17 +1726,31 @@ async fn test_file_directory_dependency_installation_and_ci() {
 
     // Verify bin shim
     #[cfg(windows)]
-    assert!(app_dir.join("node_modules").join(".bin").join("local-cmd.cmd").exists());
+    assert!(app_dir
+        .join("node_modules")
+        .join(".bin")
+        .join("local-cmd.cmd")
+        .exists());
     #[cfg(not(windows))]
-    assert!(app_dir.join("node_modules").join(".bin").join("local-cmd").exists());
+    assert!(app_dir
+        .join("node_modules")
+        .join(".bin")
+        .join("local-cmd")
+        .exists());
 
     // 5. Verify package-lock.json
     let lockfile = LockfileV3::load_from_file(&app_dir.join("package-lock.json")).unwrap();
-    let lock_link = lockfile.packages.get("node_modules/local-pkg").expect("Lockfile must contain node_modules/local-pkg");
+    let lock_link = lockfile
+        .packages
+        .get("node_modules/local-pkg")
+        .expect("Lockfile must contain node_modules/local-pkg");
     assert_eq!(lock_link.link, Some(true));
     assert_eq!(lock_link.resolved.as_deref(), Some("../packages/local-pkg"));
 
-    let lock_target = lockfile.packages.get("../packages/local-pkg").expect("Lockfile must contain physical package info");
+    let lock_target = lockfile
+        .packages
+        .get("../packages/local-pkg")
+        .expect("Lockfile must contain physical package info");
     assert_eq!(lock_target.version.as_deref(), Some("2.5.0"));
 
     // 6. Test CI installation (run_ci)
@@ -1528,7 +1788,9 @@ async fn test_file_archive_dependency_installation_and_ci() {
             let path = "package/package.json";
             header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
             header.set_cksum();
-            builder.append(&header, Cursor::new(manifest_bytes)).unwrap();
+            builder
+                .append(&header, Cursor::new(manifest_bytes))
+                .unwrap();
             builder.finish().unwrap();
         }
         gz.finish().unwrap()
@@ -1547,7 +1809,11 @@ async fn test_file_archive_dependency_installation_and_ci() {
             "archive-lib": "file:./pkgs/archive-lib-3.0.0.tgz"
         }
     });
-    fs::write(root.join("package.json"), serde_json::to_string_pretty(&app_manifest).unwrap()).unwrap();
+    fs::write(
+        root.join("package.json"),
+        serde_json::to_string_pretty(&app_manifest).unwrap(),
+    )
+    .unwrap();
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),
@@ -1563,15 +1829,22 @@ async fn test_file_archive_dependency_installation_and_ci() {
     // 4. Verify extraction in node_modules
     let pkg_dir = root.join("node_modules").join("archive-lib");
     assert!(pkg_dir.exists());
-    let pkg_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(pkg_dir.join("package.json")).unwrap()).unwrap();
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pkg_dir.join("package.json")).unwrap()).unwrap();
     assert_eq!(pkg_json["name"], "archive-lib");
     assert_eq!(pkg_json["version"], "3.0.0");
 
     // 5. Verify package-lock.json
     let lockfile = LockfileV3::load_from_file(&root.join("package-lock.json")).unwrap();
-    let lock_pkg = lockfile.packages.get("node_modules/archive-lib").expect("Lockfile must contain node_modules/archive-lib");
+    let lock_pkg = lockfile
+        .packages
+        .get("node_modules/archive-lib")
+        .expect("Lockfile must contain node_modules/archive-lib");
     assert_eq!(lock_pkg.version.as_deref(), Some("3.0.0"));
-    assert_eq!(lock_pkg.resolved.as_deref(), Some("file:./pkgs/archive-lib-3.0.0.tgz"));
+    assert_eq!(
+        lock_pkg.resolved.as_deref(),
+        Some("file:./pkgs/archive-lib-3.0.0.tgz")
+    );
     assert!(lock_pkg.integrity.as_ref().unwrap().starts_with("sha512-"));
 
     // 6. Test CI installation (run_ci)
@@ -1642,7 +1915,10 @@ async fn test_workspace_member_lifecycle_prepare_dev_deps_and_ci_topological_exe
     assert_eq!(summary.packages_installed, 2);
 
     let order_file = root.join("order.log");
-    assert!(order_file.exists(), "order.log must be created by lifecycle scripts");
+    assert!(
+        order_file.exists(),
+        "order.log must be created by lifecycle scripts"
+    );
     let content = fs::read_to_string(&order_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
 
@@ -1664,7 +1940,10 @@ async fn test_workspace_member_lifecycle_prepare_dev_deps_and_ci_topological_exe
     let ci_summary = ci_installer.run_ci().await.unwrap();
     assert_eq!(ci_summary.packages_installed, 2);
 
-    assert!(order_file.exists(), "order.log must be created during run_ci");
+    assert!(
+        order_file.exists(),
+        "order.log must be created during run_ci"
+    );
     let ci_content = fs::read_to_string(&order_file).unwrap();
     let ci_lines: Vec<&str> = ci_content.lines().collect();
 
@@ -1684,39 +1963,65 @@ async fn test_ci_drift_detection_dev_dependencies_mutated() {
     let mut manifest = Manifest::default();
     manifest.name = Some("dev-drift-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dev_dependencies.insert("dev-tool".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     // 2. Matching lockfile
     let mut lockfile = LockfileV3::new("dev-drift-app", Some("1.0.0".to_string()));
     let mut dev_deps = BTreeMap::new();
     dev_deps.insert("dev-tool".to_string(), "^1.0.0".to_string());
     lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps);
-    lockfile.insert_package("node_modules/dev-tool", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("https://registry.npmjs.org/dev-tool/-/dev-tool-1.0.0.tgz".to_string()),
-        integrity: Some("sha512-validhash".to_string()),
-        dev: Some(true),
-        ..Default::default()
-    });
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile.insert_package(
+        "node_modules/dev-tool",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dev-tool/-/dev-tool-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-validhash".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     // 3. Mutate devDependencies in package.json to ^2.0.0
-    manifest.dev_dependencies.insert("dev-tool".to_string(), "^2.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^2.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run_ci().await;
-    assert!(res.is_err(), "run_ci must fail when devDependencies mutated in package.json");
+    assert!(
+        res.is_err(),
+        "run_ci must fail when devDependencies mutated in package.json"
+    );
     let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Error must contain ELOCKFILE_DRIFT: {err_msg}");
-    assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
-    assert!(err_msg.contains("dev-tool"), "Error must mention drifted package: {err_msg}");
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("dev-tool"),
+        "Error must mention drifted package: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -1730,39 +2035,64 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     deps.insert("dep-a".to_string(), "^1.0.0".to_string());
     deps.insert("dep-b".to_string(), "^1.0.0".to_string());
     lockfile.root_package_mut().unwrap().dependencies = Some(deps);
-    lockfile.insert_package("node_modules/dep-a", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("https://registry.npmjs.org/dep-a/-/dep-a-1.0.0.tgz".to_string()),
-        integrity: Some("sha512-hasha".to_string()),
-        ..Default::default()
-    });
-    lockfile.insert_package("node_modules/dep-b", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("https://registry.npmjs.org/dep-b/-/dep-b-1.0.0.tgz".to_string()),
-        integrity: Some("sha512-hashb".to_string()),
-        ..Default::default()
-    });
-    lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lockfile.insert_package(
+        "node_modules/dep-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dep-a/-/dep-a-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-hasha".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/dep-b",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dep-b/-/dep-b-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-hashb".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     // 2. package.json has "dep-b" deleted, only contains "dep-a"
     let mut manifest = Manifest::default();
     manifest.name = Some("dep-drift-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("dep-a".to_string(), "^1.0.0".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest
+        .dependencies
+        .insert("dep-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run_ci().await;
-    assert!(res.is_err(), "run_ci must fail when dependency deleted from package.json but present in lockfile");
+    assert!(
+        res.is_err(),
+        "run_ci must fail when dependency deleted from package.json but present in lockfile"
+    );
     let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Error must contain ELOCKFILE_DRIFT: {err_msg}");
-    assert!(err_msg.contains("EUSAGE"), "Error must contain EUSAGE: {err_msg}");
-    assert!(err_msg.contains("dep-b"), "Error must mention removed dependency: {err_msg}");
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("dep-b"),
+        "Error must mention removed dependency: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -1800,12 +2130,19 @@ async fn test_ci_migrates_v1_lockfile_and_detects_drift() {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run_ci().await;
-    assert!(res.is_err(), "run_ci must detect missing dep-b after migrating v1 lockfile");
+    assert!(
+        res.is_err(),
+        "run_ci must detect missing dep-b after migrating v1 lockfile"
+    );
     let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("ELOCKFILE_DRIFT"), "Must emit ELOCKFILE_DRIFT: {err_msg}");
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Must emit ELOCKFILE_DRIFT: {err_msg}"
+    );
     assert!(err_msg.contains("dep-b"), "Must mention dep-b: {err_msg}");
 }
 
@@ -1849,12 +2186,16 @@ async fn test_ci_junction_safe_node_modules_pruning() {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     installer.run_ci().await.unwrap();
 
     // Crucial check: external target file was NOT deleted!
-    assert!(secret_file.exists(), "External file must be preserved when run_ci cleans node_modules with junctions!");
+    assert!(
+        secret_file.exists(),
+        "External file must be preserved when run_ci cleans node_modules with junctions!"
+    );
 }
 
 #[tokio::test]
@@ -1865,8 +2206,13 @@ async fn test_ci_security_adversarial_file_path_traversal_rejected() {
     let mut manifest = Manifest::default();
     manifest.name = Some("sec-traversal-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("malicious-pkg".to_string(), "file:../../secret.tgz".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest.dependencies.insert(
+        "malicious-pkg".to_string(),
+        "file:../../secret.tgz".to_string(),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let valid_hash = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
@@ -1883,22 +2229,31 @@ async fn test_ci_security_adversarial_file_path_traversal_rejected() {
         let mut deps = BTreeMap::new();
         deps.insert("malicious-pkg".to_string(), bad_resolved.to_string());
         lockfile.root_package_mut().unwrap().dependencies = Some(deps);
-        lockfile.insert_package("node_modules/malicious-pkg", LockfilePackage {
-            version: Some("1.0.0".to_string()),
-            resolved: Some(bad_resolved.to_string()),
-            integrity: Some(valid_hash.to_string()),
-            ..Default::default()
-        });
-        lockfile.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+        lockfile.insert_package(
+            "node_modules/malicious-pkg",
+            LockfilePackage {
+                version: Some("1.0.0".to_string()),
+                resolved: Some(bad_resolved.to_string()),
+                integrity: Some(valid_hash.to_string()),
+                ..Default::default()
+            },
+        );
+        lockfile
+            .save_to_file(&project_dir.join("package-lock.json"))
+            .unwrap();
 
         let mut installer = Installer::new(InstallOptions {
             project_dir: project_dir.to_path_buf(),
             offline: true,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let res = installer.run_ci().await;
-        assert!(res.is_err(), "run_ci must reject adversarial file: traversal path '{bad_resolved}'");
+        assert!(
+            res.is_err(),
+            "run_ci must reject adversarial file: traversal path '{bad_resolved}'"
+        );
     }
 }
 
@@ -1919,69 +2274,110 @@ async fn test_ci_transitive_package_integrity_verification() {
     let mut manifest = Manifest::default();
     manifest.name = Some("integrity-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest.dependencies.insert(
+        "parent-pkg".to_string(),
+        "file:./pkgs/child-pkg-1.0.0.tgz".to_string(),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     // 1. Missing or empty integrity on transitive dependency in lockfile
     let mut lock_missing_integrity = LockfileV3::new("integrity-app", Some("1.0.0".to_string()));
     let mut deps = BTreeMap::new();
-    deps.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
-    lock_missing_integrity.root_package_mut().unwrap().dependencies = Some(deps);
-    lock_missing_integrity.insert_package("node_modules/parent-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
-        integrity: Some(child_valid_integrity.clone()),
-        ..Default::default()
-    });
+    deps.insert(
+        "parent-pkg".to_string(),
+        "file:./pkgs/child-pkg-1.0.0.tgz".to_string(),
+    );
+    lock_missing_integrity
+        .root_package_mut()
+        .unwrap()
+        .dependencies = Some(deps);
+    lock_missing_integrity.insert_package(
+        "node_modules/parent-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(child_valid_integrity.clone()),
+            ..Default::default()
+        },
+    );
     // Transitive package has empty integrity!
-    lock_missing_integrity.insert_package("node_modules/child-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
-        integrity: Some("   ".to_string()),
-        ..Default::default()
-    });
-    lock_missing_integrity.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lock_missing_integrity.insert_package(
+        "node_modules/child-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+            integrity: Some("   ".to_string()),
+            ..Default::default()
+        },
+    );
+    lock_missing_integrity
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run_ci().await;
-    assert!(res.is_err(), "run_ci must fail when transitive package has empty integrity");
+    assert!(
+        res.is_err(),
+        "run_ci must fail when transitive package has empty integrity"
+    );
 
     // 2. Mismatched integrity on transitive dependency
     let mut lock_tampered = LockfileV3::new("integrity-app", Some("1.0.0".to_string()));
     let mut deps2 = BTreeMap::new();
-    deps2.insert("parent-pkg".to_string(), "file:./pkgs/child-pkg-1.0.0.tgz".to_string());
+    deps2.insert(
+        "parent-pkg".to_string(),
+        "file:./pkgs/child-pkg-1.0.0.tgz".to_string(),
+    );
     lock_tampered.root_package_mut().unwrap().dependencies = Some(deps2);
-    lock_tampered.insert_package("node_modules/parent-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
-        integrity: Some(child_valid_integrity.clone()),
-        ..Default::default()
-    });
+    lock_tampered.insert_package(
+        "node_modules/parent-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(child_valid_integrity.clone()),
+            ..Default::default()
+        },
+    );
     // Tampered integrity!
     let tampered_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
-    lock_tampered.insert_package("node_modules/child-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
-        integrity: Some(tampered_integrity.to_string()),
-        ..Default::default()
-    });
-    lock_tampered.save_to_file(&project_dir.join("package-lock.json")).unwrap();
+    lock_tampered.insert_package(
+        "node_modules/child-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/child-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(tampered_integrity.to_string()),
+            ..Default::default()
+        },
+    );
+    lock_tampered
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
 
     let mut installer2 = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res2 = installer2.run_ci().await;
-    assert!(res2.is_err(), "run_ci must fail when transitive package integrity verification fails");
+    assert!(
+        res2.is_err(),
+        "run_ci must fail when transitive package integrity verification fails"
+    );
     let err_str = res2.unwrap_err().to_string();
-    assert!(err_str.to_lowercase().contains("integrity"), "Error must mention integrity: {err_str}");
+    assert!(
+        err_str.to_lowercase().contains("integrity"),
+        "Error must mention integrity: {err_str}"
+    );
 }
 
 #[tokio::test]
@@ -1998,8 +2394,13 @@ async fn test_ci_and_install_persists_hidden_lockfile() {
     let mut manifest = Manifest::default();
     manifest.name = Some("hidden-lock-test".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest.dependencies.insert("local-dep".to_string(), "file:./pkgs/local-dep-1.0.0.tgz".to_string());
-    manifest.save_to_file(project_dir.join("package.json")).unwrap();
+    manifest.dependencies.insert(
+        "local-dep".to_string(),
+        "file:./pkgs/local-dep-1.0.0.tgz".to_string(),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
 
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
@@ -2014,11 +2415,37 @@ async fn test_ci_and_install_persists_hidden_lockfile() {
 
     // Verify hidden lockfile was created in node_modules/.package-lock.json
     let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
-    assert!(hidden_path.exists(), "node_modules/.package-lock.json must exist after install");
+    assert!(
+        hidden_path.exists(),
+        "node_modules/.package-lock.json must exist after install"
+    );
+
+    // Check raw JSON on disk does not have root "" entry and has lockfileVersion 3
+    let raw_hidden_json = fs::read_to_string(&hidden_path).unwrap();
+    let parsed_hidden: serde_json::Value = serde_json::from_str(&raw_hidden_json).unwrap();
+    assert!(
+        parsed_hidden.get("packages").unwrap().get("").is_none(),
+        "Hidden lockfile node_modules/.package-lock.json must omit the root \"\" entry"
+    );
+    assert_eq!(
+        parsed_hidden
+            .get("lockfileVersion")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        3,
+        "Hidden lockfile must enforce lockfileVersion 3"
+    );
 
     let loaded_hidden = LockfileV3::load_hidden(project_dir).unwrap();
     assert_eq!(loaded_hidden.name, "hidden-lock-test");
-    assert!(loaded_hidden.packages.contains_key("node_modules/local-dep"));
+    assert!(
+        !loaded_hidden.packages.contains_key(""),
+        "Loaded hidden lockfile must omit root \"\""
+    );
+    assert!(loaded_hidden
+        .packages
+        .contains_key("node_modules/local-dep"));
 
     // 2. Remove node_modules and run CI
     fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
@@ -2029,10 +2456,34 @@ async fn test_ci_and_install_persists_hidden_lockfile() {
     assert_eq!(ci_summary.packages_installed, 1);
 
     // Verify hidden lockfile was created after run_ci
-    assert!(hidden_path.exists(), "node_modules/.package-lock.json must exist after run_ci");
+    assert!(
+        hidden_path.exists(),
+        "node_modules/.package-lock.json must exist after run_ci"
+    );
+    let raw_ci_hidden_json = fs::read_to_string(&hidden_path).unwrap();
+    let parsed_ci_hidden: serde_json::Value = serde_json::from_str(&raw_ci_hidden_json).unwrap();
+    assert!(
+        parsed_ci_hidden.get("packages").unwrap().get("").is_none(),
+        "CI hidden lockfile node_modules/.package-lock.json must omit the root \"\" entry"
+    );
+    assert_eq!(
+        parsed_ci_hidden
+            .get("lockfileVersion")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        3,
+        "CI hidden lockfile must enforce lockfileVersion 3"
+    );
     let loaded_ci_hidden = LockfileV3::load_hidden(project_dir).unwrap();
     assert_eq!(loaded_ci_hidden.name, "hidden-lock-test");
-    assert!(loaded_ci_hidden.packages.contains_key("node_modules/local-dep"));
+    assert!(
+        !loaded_ci_hidden.packages.contains_key(""),
+        "Loaded CI hidden lockfile must omit root \"\""
+    );
+    assert!(loaded_ci_hidden
+        .packages
+        .contains_key("node_modules/local-dep"));
 }
 
 #[test]
@@ -2046,7 +2497,9 @@ fn test_apply_npmrc_to_client_config() {
     let mut npmrc = Npmrc::new();
     npmrc.set("strict-ssl", "false").unwrap();
     npmrc.set("proxy", "http://proxy.local:8080").unwrap();
-    npmrc.set("https-proxy", "https://proxy.local:8443").unwrap();
+    npmrc
+        .set("https-proxy", "https://proxy.local:8443")
+        .unwrap();
     npmrc.set("http-proxy", "http://proxy.local:8080").unwrap();
     npmrc.set("no-proxy", "localhost,127.0.0.1").unwrap();
     npmrc.set("ca", "dummy-ca-pem").unwrap();
@@ -2060,10 +2513,22 @@ fn test_apply_npmrc_to_client_config() {
     apply_npmrc_to_client_config(&mut client_config, &npmrc);
 
     assert!(!client_config.strict_ssl);
-    assert_eq!(client_config.proxy.as_deref(), Some("http://proxy.local:8080"));
-    assert_eq!(client_config.https_proxy.as_deref(), Some("https://proxy.local:8443"));
-    assert_eq!(client_config.http_proxy.as_deref(), Some("http://proxy.local:8080"));
-    assert_eq!(client_config.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+    assert_eq!(
+        client_config.proxy.as_deref(),
+        Some("http://proxy.local:8080")
+    );
+    assert_eq!(
+        client_config.https_proxy.as_deref(),
+        Some("https://proxy.local:8443")
+    );
+    assert_eq!(
+        client_config.http_proxy.as_deref(),
+        Some("http://proxy.local:8080")
+    );
+    assert_eq!(
+        client_config.no_proxy.as_deref(),
+        Some("localhost,127.0.0.1")
+    );
     assert_eq!(client_config.ca.as_deref(), Some("dummy-ca-pem"));
     assert_eq!(client_config.cafile, Some(PathBuf::from("test/cafile.pem")));
     assert_eq!(client_config.cert.as_deref(), Some("test/client.crt"));
@@ -2094,7 +2559,10 @@ async fn test_offline_mode_metadata_cache_miss_enotcached() {
     let mut installer = crate::Installer::new(options).unwrap();
     let err = installer.run().await.unwrap_err();
     let err_str = err.to_string();
-    assert!(err_str.contains("ENOTCACHED"), "Must contain ENOTCACHED code: {err_str}");
+    assert!(
+        err_str.contains("ENOTCACHED"),
+        "Must contain ENOTCACHED code: {err_str}"
+    );
     assert!(
         err_str.contains("only-if-cached") && err_str.contains("--offline"),
         "Must contain offline cache mode explanation: {err_str}"
@@ -2127,7 +2595,13 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
             }
         }
     }"#;
-    cache.put("pacote:packument:my-cached-pkg", metadata_json.as_bytes(), None).unwrap();
+    cache
+        .put(
+            "pacote:packument:my-cached-pkg",
+            metadata_json.as_bytes(),
+            None,
+        )
+        .unwrap();
 
     let options = crate::InstallOptions {
         project_dir: project_dir.clone(),
@@ -2141,7 +2615,10 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
     let mut installer = crate::Installer::new(options).unwrap();
     let err = installer.run().await.unwrap_err();
     let err_str = err.to_string();
-    assert!(err_str.contains("ENOTCACHED"), "Must contain ENOTCACHED code: {err_str}");
+    assert!(
+        err_str.contains("ENOTCACHED"),
+        "Must contain ENOTCACHED code: {err_str}"
+    );
     assert!(
         err_str.contains("only-if-cached") && err_str.contains("--offline"),
         "Must contain offline cache mode explanation: {err_str}"
@@ -2168,7 +2645,9 @@ async fn test_offline_mode_cache_hit_success() {
         header.set_size(content.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, "package/package.json", &content[..]).unwrap();
+        builder
+            .append_data(&mut header, "package/package.json", &content[..])
+            .unwrap();
         builder.finish().unwrap();
     }
     let tarball_bytes = gz.finish().unwrap();
@@ -2199,8 +2678,16 @@ async fn test_offline_mode_cache_hit_success() {
             }}
         }}"#
     );
-    cache.put("pacote:packument:offline-pkg", metadata_json.as_bytes(), None).unwrap();
-    cache.put_with_integrity(tarball_url, &tarball_bytes, Some(&integrity), None).unwrap();
+    cache
+        .put(
+            "pacote:packument:offline-pkg",
+            metadata_json.as_bytes(),
+            None,
+        )
+        .unwrap();
+    cache
+        .put_with_integrity(tarball_url, &tarball_bytes, Some(&integrity), None)
+        .unwrap();
 
     // 3. Project package.json
     let pkg_json = r#"{"name": "test-app", "dependencies": {"offline-pkg": "^1.0.0"}}"#;
@@ -2221,7 +2708,11 @@ async fn test_offline_mode_cache_hit_success() {
     assert_eq!(summary.packages_installed, 1);
     assert_eq!(summary.cache_hits, 1);
     assert_eq!(summary.cache_misses, 0);
-    assert!(project_dir.join("node_modules").join("offline-pkg").join("package.json").exists());
+    assert!(project_dir
+        .join("node_modules")
+        .join("offline-pkg")
+        .join("package.json")
+        .exists());
 }
 
 #[tokio::test]
@@ -2235,21 +2726,24 @@ async fn test_install_save_flags_and_package_lock_only_matrix() {
     fs::write(
         local_pkg_a.join("package.json"),
         r#"{"name": "pkg-a", "version": "1.2.3"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let local_pkg_b = root.join("packages").join("pkg-b");
     fs::create_dir_all(&local_pkg_b).unwrap();
     fs::write(
         local_pkg_b.join("package.json"),
         r#"{"name": "pkg-b", "version": "2.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let app_dir = root.join("app");
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("package.json"),
         r#"{"name": "app", "version": "1.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Test A: --save-dev (-D)
     {
@@ -2349,7 +2843,8 @@ async fn test_install_save_flags_and_package_lock_only_matrix() {
         fs::write(
             app_lock_only_dir.join("package.json"),
             r#"{"name": "app-lock-only", "version": "1.0.0"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let opts = InstallOptions {
             project_dir: app_lock_only_dir.clone(),
@@ -2369,7 +2864,9 @@ async fn test_install_save_flags_and_package_lock_only_matrix() {
 
 #[tokio::test]
 async fn test_link_and_unlink_package_flow() {
-    use crate::link::{link_package, link_package_from_global, unlink_package, unlink_package_from_consumer};
+    use crate::link::{
+        link_package, link_package_from_global, unlink_package, unlink_package_from_consumer,
+    };
     use rnpm_config::{find_global_bin_dir, find_global_node_modules};
 
     let tmp = tempdir().unwrap();
@@ -2390,7 +2887,11 @@ async fn test_link_and_unlink_package_flow() {
     fs::write(pkg_dir.join("package.json"), manifest_content).unwrap();
     let bin_dir = pkg_dir.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    fs::write(bin_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('linked');\n").unwrap();
+    fs::write(
+        bin_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('linked');\n",
+    )
+    .unwrap();
 
     // 2. Run link_package (npm link in package dir)
     let global_link_path = link_package(&pkg_dir, &global_prefix).unwrap();
@@ -2409,10 +2910,12 @@ async fn test_link_and_unlink_package_flow() {
     fs::write(
         consumer_dir.join("package.json"),
         r#"{"name": "consumer", "version": "1.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // 4. Run link_package_from_global (npm link my-linked-tool in consumer)
-    let consumer_link_path = link_package_from_global(&consumer_dir, "my-linked-tool", &global_prefix).unwrap();
+    let consumer_link_path =
+        link_package_from_global(&consumer_dir, "my-linked-tool", &global_prefix).unwrap();
     assert!(consumer_link_path.exists());
     assert!(rnpm_fs::is_junction(&consumer_link_path).unwrap());
 
@@ -2424,7 +2927,10 @@ async fn test_link_and_unlink_package_flow() {
 
     // 5. Test consumer unlink (npm unlink my-linked-tool in consumer)
     unlink_package_from_consumer(&consumer_dir, "my-linked-tool").unwrap();
-    assert!(!consumer_dir.join("node_modules").join("my-linked-tool").exists());
+    assert!(!consumer_dir
+        .join("node_modules")
+        .join("my-linked-tool")
+        .exists());
     #[cfg(windows)]
     assert!(!local_bin.join("my-linked-tool.cmd").exists());
     #[cfg(not(windows))]
@@ -2461,8 +2967,13 @@ async fn test_global_install_and_uninstall_mode() {
                 "my-global-bin": "./cli.js"
             }
         }"#,
-    ).unwrap();
-    fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('global');\n").unwrap();
+    )
+    .unwrap();
+    fs::write(
+        pkg_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('global');\n",
+    )
+    .unwrap();
 
     let target_spec = format!("my-global-pkg@file:{}", pkg_dir.display());
 
@@ -2505,3 +3016,530 @@ async fn test_global_install_and_uninstall_mode() {
     assert!(!global_bin.join("my-global-bin").exists());
 }
 
+#[test]
+fn test_find_enclosing_bin_dir_and_target_rel() {
+    use crate::{compute_bin_target_rel, find_enclosing_bin_dir};
+    use std::path::{Path, PathBuf};
+
+    let root_nm = Path::new("D:/project/node_modules");
+    let root_bin = Path::new("D:/project/node_modules/.bin");
+
+    // 1. Root level package
+    let root_pkg = Path::new("D:/project/node_modules/bar");
+    assert_eq!(
+        find_enclosing_bin_dir(root_pkg, root_bin, root_nm),
+        root_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(root_pkg, root_bin, "bin/bar.js"),
+        "bar/bin/bar.js"
+    );
+
+    // 2. Root level scoped package
+    let scoped_pkg = Path::new("D:/project/node_modules/@scope/bar");
+    assert_eq!(
+        find_enclosing_bin_dir(scoped_pkg, root_bin, root_nm),
+        root_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(scoped_pkg, root_bin, "bin/bar.js"),
+        "@scope/bar/bin/bar.js"
+    );
+
+    // 3. Nested package inside parent
+    let nested_pkg = Path::new("D:/project/node_modules/parent/node_modules/child");
+    let expected_nested_bin = PathBuf::from("D:/project/node_modules/parent/node_modules/.bin");
+    assert_eq!(
+        find_enclosing_bin_dir(nested_pkg, root_bin, root_nm),
+        expected_nested_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(nested_pkg, &expected_nested_bin, "bin/child.js"),
+        "child/bin/child.js"
+    );
+
+    // 4. Nested scoped package inside parent
+    let nested_scoped_pkg = Path::new("D:/project/node_modules/parent/node_modules/@scope/child");
+    assert_eq!(
+        find_enclosing_bin_dir(nested_scoped_pkg, root_bin, root_nm),
+        expected_nested_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(nested_scoped_pkg, &expected_nested_bin, "bin/child.js"),
+        "@scope/child/bin/child.js"
+    );
+
+    // 5. Deeply nested package
+    let deep_pkg = Path::new("D:/project/node_modules/a/node_modules/b/node_modules/c");
+    let expected_deep_bin =
+        PathBuf::from("D:/project/node_modules/a/node_modules/b/node_modules/.bin");
+    assert_eq!(
+        find_enclosing_bin_dir(deep_pkg, root_bin, root_nm),
+        expected_deep_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(deep_pkg, &expected_deep_bin, "bin/c.js"),
+        "c/bin/c.js"
+    );
+
+    // 6. Workspace member nested node_modules
+    let ws_pkg = Path::new("D:/project/packages/foo/node_modules/bar");
+    let expected_ws_bin = PathBuf::from("D:/project/packages/foo/node_modules/.bin");
+    assert_eq!(
+        find_enclosing_bin_dir(ws_pkg, root_bin, root_nm),
+        expected_ws_bin
+    );
+    assert_eq!(
+        compute_bin_target_rel(ws_pkg, &expected_ws_bin, "bin/bar.js"),
+        "bar/bin/bar.js"
+    );
+
+    // 7. Relative paths
+    let rel_root_pkg = Path::new("node_modules/bar");
+    let rel_root_nm = Path::new("node_modules");
+    let rel_root_bin = Path::new("node_modules/.bin");
+    assert_eq!(
+        find_enclosing_bin_dir(rel_root_pkg, rel_root_bin, rel_root_nm),
+        rel_root_bin
+    );
+
+    let rel_nested_pkg = Path::new("node_modules/foo/node_modules/bar");
+    assert_eq!(
+        find_enclosing_bin_dir(rel_nested_pkg, rel_root_bin, rel_root_nm),
+        PathBuf::from("node_modules/foo/node_modules/.bin")
+    );
+    assert_eq!(
+        compute_bin_target_rel(
+            rel_nested_pkg,
+            Path::new("node_modules/foo/node_modules/.bin"),
+            "bin/bar.js"
+        ),
+        "bar/bin/bar.js"
+    );
+}
+
+#[tokio::test]
+async fn test_shrinkwrap_precedence_over_package_lock_on_install() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create a local dependency
+    let dep_dir = root.join("dep-pkg");
+    fs::create_dir_all(&dep_dir).unwrap();
+    let mut dep_manifest = Manifest::default();
+    dep_manifest.name = Some("dep-pkg".to_string());
+    dep_manifest.version = Some("1.0.0".to_string());
+    dep_manifest
+        .save_to_file(dep_dir.join("package.json"))
+        .unwrap();
+
+    // 2. Create consumer project
+    let project_dir = root.join("consumer");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("consumer".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep-pkg".to_string(), "file:../dep-pkg".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // Create a dummy package-lock.json with an invalid resolved URL that would fail if used
+    let mut dummy_lock = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    dummy_lock.insert_package(
+        "node_modules/dep-pkg",
+        LockfilePackage {
+            version: Some("99.99.99".to_string()),
+            resolved: Some("https://invalid.example.com/nonexistent.tgz".to_string()),
+            integrity: Some("sha512-invalid==".to_string()),
+            ..Default::default()
+        },
+    );
+    dummy_lock
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // Create valid npm-shrinkwrap.json
+    let mut sw = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = sw.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("dep-pkg".to_string(), "file:../dep-pkg".to_string());
+        root_pkg.dependencies = Some(deps);
+    }
+    sw.insert_package(
+        "node_modules/dep-pkg",
+        LockfilePackage {
+            resolved: Some("../dep-pkg".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    sw.insert_package(
+        "../dep-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    sw.save_to_file(&project_dir.join("npm-shrinkwrap.json"))
+        .unwrap();
+
+    let initial_package_lock_content =
+        fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.run().await.unwrap();
+
+    // Summary lockfile path MUST be npm-shrinkwrap.json
+    assert_eq!(
+        summary.lockfile_path,
+        project_dir.join("npm-shrinkwrap.json")
+    );
+
+    // package-lock.json must NOT have been updated or overwritten
+    let current_package_lock = fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
+    assert_eq!(current_package_lock, initial_package_lock_content);
+
+    // npm-shrinkwrap.json must exist and be valid
+    let loaded_sw = LockfileV3::load_from_file(&project_dir.join("npm-shrinkwrap.json")).unwrap();
+    assert!(loaded_sw.packages.contains_key("node_modules/dep-pkg"));
+
+    // node_modules/.package-lock.json must omit the root "" package
+    let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+    assert!(hidden_path.exists());
+    let raw_hidden = fs::read_to_string(&hidden_path).unwrap();
+    let parsed_hidden: serde_json::Value = serde_json::from_str(&raw_hidden).unwrap();
+    assert!(parsed_hidden.get("packages").unwrap().get("").is_none());
+}
+
+#[tokio::test]
+async fn test_shrinkwrap_precedence_over_package_lock_on_ci() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create a local dependency
+    let dep_dir = root.join("dep-pkg");
+    fs::create_dir_all(&dep_dir).unwrap();
+    let mut dep_manifest = Manifest::default();
+    dep_manifest.name = Some("dep-pkg".to_string());
+    dep_manifest.version = Some("1.0.0".to_string());
+    dep_manifest
+        .save_to_file(dep_dir.join("package.json"))
+        .unwrap();
+
+    // 2. Create consumer project
+    let project_dir = root.join("consumer");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("consumer".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep-pkg".to_string(), "file:../dep-pkg".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // Create a drifted package-lock.json (missing dep-pkg)
+    let drifted_lock = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    drifted_lock
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // Create valid matching npm-shrinkwrap.json
+    let mut sw = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = sw.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("dep-pkg".to_string(), "file:../dep-pkg".to_string());
+        root_pkg.dependencies = Some(deps);
+    }
+    sw.insert_package(
+        "node_modules/dep-pkg",
+        LockfilePackage {
+            resolved: Some("../dep-pkg".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    sw.insert_package(
+        "../dep-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    sw.save_to_file(&project_dir.join("npm-shrinkwrap.json"))
+        .unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    };
+
+    // run_ci MUST succeed because npm-shrinkwrap.json is valid, ignoring the drifted package-lock.json
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+
+    assert_eq!(
+        ci_summary.lockfile_path,
+        project_dir.join("npm-shrinkwrap.json")
+    );
+    assert_eq!(ci_summary.packages_installed, 1);
+
+    // Verify hidden lockfile was created in node_modules/.package-lock.json and omits root ""
+    let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+    assert!(hidden_path.exists());
+    let raw_hidden = fs::read_to_string(&hidden_path).unwrap();
+    let parsed_hidden: serde_json::Value = serde_json::from_str(&raw_hidden).unwrap();
+    assert!(parsed_hidden.get("packages").unwrap().get("").is_none());
+    assert_eq!(
+        parsed_hidden
+            .get("lockfileVersion")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn test_shrinkwrap_ci_drift_error_reports_shrinkwrap() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    let project_dir = root.join("consumer");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("consumer".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // Create npm-shrinkwrap.json that does not have dep-a
+    let sw = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    sw.save_to_file(&project_dir.join("npm-shrinkwrap.json"))
+        .unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let err = ci_installer.run_ci().await.unwrap_err();
+    let err_msg = err.to_string();
+
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("npm-shrinkwrap.json"),
+        "Error message must reference npm-shrinkwrap.json: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_local_tarball_prepare_hook_runs() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let marker_path = project_dir.join("local_prepare_ran.txt");
+    let escaped_marker = marker_path.to_string_lossy().replace('\\', "/");
+
+    let manifest_json = serde_json::json!({
+        "name": "local-tarball-prepare",
+        "version": "1.0.0",
+        "scripts": {
+            "prepare": format!("node -e \"require('fs').writeFileSync('{escaped_marker}', 'local tarball prepare ran')\"")
+        }
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        let path = "package/package.json";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        builder
+            .append(&header, std::io::Cursor::new(manifest_bytes))
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let tar_bytes = gz.finish().unwrap();
+
+    let pkgs = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs).unwrap();
+    fs::write(pkgs.join("dep-1.0.0.tgz"), &tar_bytes).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("consumer-local-prepare".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies.insert(
+        "local-tarball-prepare".to_string(),
+        "file:./pkgs/dep-1.0.0.tgz".to_string(),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    assert!(
+        marker_path.exists(),
+        "LocalTarball dependency prepare script MUST run during install"
+    );
+    let content = fs::read_to_string(&marker_path).unwrap();
+    assert_eq!(content, "local tarball prepare ran");
+}
+
+#[test]
+fn test_clean_empty_bin_dirs_removes_empty_and_preserves_non_empty() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+
+    // 1. Root .bin (empty)
+    let root_bin = nm.join(".bin");
+    fs::create_dir_all(&root_bin).unwrap();
+
+    // 2. Package A with empty nested .bin
+    let pkg_a_bin = nm.join("pkg-a").join("node_modules").join(".bin");
+    fs::create_dir_all(&pkg_a_bin).unwrap();
+
+    // 3. Scoped package C with empty nested .bin
+    let pkg_c_bin = nm
+        .join("@scope")
+        .join("pkg-c")
+        .join("node_modules")
+        .join(".bin");
+    fs::create_dir_all(&pkg_c_bin).unwrap();
+
+    // 4. Package B with non-empty nested .bin
+    let pkg_b_bin = nm.join("pkg-b").join("node_modules").join(".bin");
+    fs::create_dir_all(&pkg_b_bin).unwrap();
+    fs::write(pkg_b_bin.join("some-shim.cmd"), "@echo off\n").unwrap();
+
+    // Run clean_empty_bin_dirs
+    crate::clean_empty_bin_dirs(&nm);
+
+    // Empty bin dirs must be removed
+    assert!(!root_bin.exists(), "Root empty .bin must be removed");
+    assert!(
+        !pkg_a_bin.exists(),
+        "pkg-a empty nested .bin must be removed"
+    );
+    assert!(
+        !pkg_c_bin.exists(),
+        "@scope/pkg-c empty nested .bin must be removed"
+    );
+
+    // Non-empty bin dir must remain intact
+    assert!(
+        pkg_b_bin.exists(),
+        "pkg-b non-empty nested .bin must be preserved"
+    );
+    assert!(pkg_b_bin.join("some-shim.cmd").exists());
+}
+
+#[tokio::test]
+async fn test_run_ci_does_not_create_nested_bin_when_no_bins_declared() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // 1. Create dependency without bin
+    let dep_no_bin = root.join("dep-no-bin");
+    fs::create_dir_all(&dep_no_bin).unwrap();
+    let mut manifest_no_bin = Manifest::default();
+    manifest_no_bin.name = Some("dep-no-bin".to_string());
+    manifest_no_bin.version = Some("1.0.0".to_string());
+    manifest_no_bin
+        .save_to_file(dep_no_bin.join("package.json"))
+        .unwrap();
+
+    // 2. Create consumer project
+    let project_dir = root.join("consumer");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("consumer".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep-no-bin".to_string(), "file:../dep-no-bin".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lock = LockfileV3::new("consumer", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lock.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("dep-no-bin".to_string(), "file:../dep-no-bin".to_string());
+        root_pkg.dependencies = Some(deps);
+    }
+    lock.insert_package(
+        "node_modules/dep-no-bin",
+        LockfilePackage {
+            resolved: Some("../dep-no-bin".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "../dep-no-bin",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            bin: None,
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut ci_installer = Installer::new(options).unwrap();
+    let ci_summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(ci_summary.packages_installed, 1);
+
+    // Verify:
+    // No .bin directory inside node_modules/dep-no-bin
+    assert!(!project_dir.join("node_modules/dep-no-bin/.bin").exists());
+    assert!(!project_dir
+        .join("node_modules/dep-no-bin/node_modules/.bin")
+        .exists());
+    // Also root .bin should NOT exist because dep-no-bin had no bin
+    assert!(!project_dir.join("node_modules/.bin").exists());
+}

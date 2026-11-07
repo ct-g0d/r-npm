@@ -8,8 +8,9 @@ pub use config::{
     delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
     find_global_npmrc, find_global_npmrc_with_env, find_global_prefix, find_global_prefix_with_env,
     find_local_bin_dir, find_local_node_modules, find_local_prefix, find_user_npmrc,
-    find_user_npmrc_with_env, find_workspace_root, get_default_global_npmrc, get_default_user_npmrc,
-    set_config_value_in_file, Config, ConfigDetailed, ConfigLayer, ConfigOptions,
+    find_user_npmrc_with_env, find_workspace_root, get_default_global_npmrc,
+    get_default_user_npmrc, set_config_value_in_file, Config, ConfigDetailed, ConfigLayer,
+    ConfigOptions,
 };
 pub use error::ConfigError;
 pub use npmrc::{
@@ -127,27 +128,35 @@ mod scoped_registry_tests {
 
     #[test]
     fn test_parse_scoped_registry_flags_and_entries() {
-        let res1 = parse_scoped_registry_entry("--@myorg:registry=https://custom.registry.com", None).unwrap();
+        let res1 =
+            parse_scoped_registry_entry("--@myorg:registry=https://custom.registry.com", None)
+                .unwrap();
         assert!(res1.is_some());
         let (scope1, url1) = res1.unwrap();
         assert_eq!(scope1, "@myorg");
         assert_eq!(url1.as_str(), "https://custom.registry.com/");
 
-        let res2 = parse_scoped_registry_entry("@other:registry=https://other.registry.org/", None).unwrap();
+        let res2 = parse_scoped_registry_entry("@other:registry=https://other.registry.org/", None)
+            .unwrap();
         assert!(res2.is_some());
         let (scope2, url2) = res2.unwrap();
         assert_eq!(scope2, "@other");
         assert_eq!(url2.as_str(), "https://other.registry.org/");
 
-        let res3 = parse_scoped_registry_entry("--@scope:registry", Some("https://scope.pkg.dev")).unwrap();
+        let res3 = parse_scoped_registry_entry("--@scope:registry", Some("https://scope.pkg.dev"))
+            .unwrap();
         assert!(res3.is_some());
         let (scope3, url3) = res3.unwrap();
         assert_eq!(scope3, "@scope");
         assert_eq!(url3.as_str(), "https://scope.pkg.dev/");
 
         // Non-registry args should return None
-        assert!(parse_scoped_registry_entry("--legacy-peer-deps", None).unwrap().is_none());
-        assert!(parse_scoped_registry_entry("lodash", None).unwrap().is_none());
+        assert!(parse_scoped_registry_entry("--legacy-peer-deps", None)
+            .unwrap()
+            .is_none());
+        assert!(parse_scoped_registry_entry("lodash", None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -1,10 +1,15 @@
+use crate::error::ManifestError;
+use serde::{
+    de::{self, Deserializer, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use serde::{de::{self, Deserializer, SeqAccess, Visitor}, Deserialize, Serialize};
-use crate::error::ManifestError;
 
-pub fn deserialize_opt_vec_or_string<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+pub fn deserialize_opt_vec_or_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -66,7 +71,6 @@ where
 
     deserializer.deserialize_any(OptVecOrStringVisitor)
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -175,16 +179,18 @@ impl Manifest {
             bytes
         };
 
-        let mut manifest: Self = serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
-        let value: serde_json::Value = serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
+        let mut manifest: Self =
+            serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
+        let value: serde_json::Value =
+            serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
         manifest.capture_dependency_order(&value);
         Ok(manifest)
     }
@@ -192,16 +198,18 @@ impl Manifest {
     /// Parse manifest from string, with tolerance for UTF-8 BOM.
     pub fn from_str(s: &str) -> Result<Self, ManifestError> {
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
-        let mut manifest: Self = serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
-        let value: serde_json::Value = serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
+        let mut manifest: Self =
+            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
+        let value: serde_json::Value =
+            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
         manifest.capture_dependency_order(&value);
         Ok(manifest)
     }
@@ -217,7 +225,9 @@ impl Manifest {
     }
 
     fn capture_dependency_order(&mut self, value: &serde_json::Value) {
-        let Some(object) = value.as_object() else { return };
+        let Some(object) = value.as_object() else {
+            return;
+        };
         let collect = |key: &str| {
             object
                 .get(key)
@@ -251,9 +261,7 @@ impl Manifest {
                     .to_string();
                 vec![(bin_name, script_path.clone())]
             }
-            Some(PackageBin::Map(map)) => {
-                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-            }
+            Some(PackageBin::Map(map)) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 
@@ -281,11 +289,12 @@ impl Manifest {
 
     /// Serialize manifest to a deterministic formatted JSON string with a trailing newline.
     pub fn to_json_string(&self) -> Result<String, ManifestError> {
-        let mut json = serde_json::to_string_pretty(self).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
+        let mut json =
+            serde_json::to_string_pretty(self).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
         json.push('\n');
         Ok(json)
     }

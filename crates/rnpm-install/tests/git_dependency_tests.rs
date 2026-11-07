@@ -26,7 +26,11 @@ fn get_git_output(dir: &Path, args: &[&str]) -> String {
         .env("SSH_ASKPASS", "")
         .output()
         .expect("Failed to execute git command");
-    assert!(output.status.success(), "Git command failed: git {:?}", args);
+    assert!(
+        output.status.success(),
+        "Git command failed: git {:?}",
+        args
+    );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -59,19 +63,28 @@ fn test_git_spec_target_parsing() {
     // github:
     let t1 = PackageTarget::parse("github:facebook/react#v18.2.0").unwrap();
     assert!(t1.is_git());
-    assert_eq!(t1.git_clone_url().unwrap(), "https://github.com/facebook/react.git");
+    assert_eq!(
+        t1.git_clone_url().unwrap(),
+        "https://github.com/facebook/react.git"
+    );
     assert_eq!(t1.git_committish(), Some("v18.2.0"));
 
     // git+https:
     let t2 = PackageTarget::parse("git+https://github.com/org/repo.git#commit123").unwrap();
     assert!(t2.is_git());
-    assert_eq!(t2.git_clone_url().unwrap(), "https://github.com/org/repo.git");
+    assert_eq!(
+        t2.git_clone_url().unwrap(),
+        "https://github.com/org/repo.git"
+    );
     assert_eq!(t2.git_committish(), Some("commit123"));
 
     // git+ssh:
     let t3 = PackageTarget::parse("git+ssh://git@github.com/org/repo.git#main").unwrap();
     assert!(t3.is_git());
-    assert_eq!(t3.git_clone_url().unwrap(), "ssh://git@github.com/org/repo.git");
+    assert_eq!(
+        t3.git_clone_url().unwrap(),
+        "ssh://git@github.com/org/repo.git"
+    );
     assert_eq!(t3.git_committish(), Some("main"));
 
     // git://:
@@ -83,13 +96,19 @@ fn test_git_spec_target_parsing() {
     // gitlab:
     let t5 = PackageTarget::parse("gitlab:gitlab-org/gitlab#v2.0").unwrap();
     assert!(t5.is_git());
-    assert_eq!(t5.git_clone_url().unwrap(), "https://gitlab.com/gitlab-org/gitlab.git");
+    assert_eq!(
+        t5.git_clone_url().unwrap(),
+        "https://gitlab.com/gitlab-org/gitlab.git"
+    );
     assert_eq!(t5.git_committish(), Some("v2.0"));
 
     // bitbucket:
     let t6 = PackageTarget::parse("bitbucket:atlassian/repo#feature-branch").unwrap();
     assert!(t6.is_git());
-    assert_eq!(t6.git_clone_url().unwrap(), "https://bitbucket.org/atlassian/repo.git");
+    assert_eq!(
+        t6.git_clone_url().unwrap(),
+        "https://bitbucket.org/atlassian/repo.git"
+    );
     assert_eq!(t6.git_committish(), Some("feature-branch"));
 }
 
@@ -119,13 +138,18 @@ async fn test_git_install_commit_and_tag_ref() {
             "my-git-dep": format!("{git_url}#v1.0.0")
         }
     });
-    std::fs::write(proj_dir.path().join("package.json"), consumer_manifest.to_string()).unwrap();
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.install().await.expect("Install failed");
     assert_eq!(summary.packages_installed, 1);
@@ -133,15 +157,21 @@ async fn test_git_install_commit_and_tag_ref() {
     // Verify extracted package in node_modules
     let installed_pkg_json = proj_dir.path().join("node_modules/my-git-dep/package.json");
     assert!(installed_pkg_json.exists());
-    let installed_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
+    let installed_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
     assert_eq!(installed_json["version"], "1.0.0");
 
     // Verify package-lock.json contains resolved commit SHA
     let lockfile = LockfileV3::load_from_file(&proj_dir.path().join("package-lock.json")).unwrap();
-    let lock_entry = lockfile.get_package("node_modules/my-git-dep").expect("Missing lock entry");
+    let lock_entry = lockfile
+        .get_package("node_modules/my-git-dep")
+        .expect("Missing lock entry");
     assert_eq!(lock_entry.version.as_deref(), Some("1.0.0"));
     let resolved = lock_entry.resolved.as_ref().expect("Missing resolved URL");
-    assert!(resolved.contains(&commit1), "Resolved URL '{resolved}' should contain commit SHA '{commit1}'");
+    assert!(
+        resolved.contains(&commit1),
+        "Resolved URL '{resolved}' should contain commit SHA '{commit1}'"
+    );
 
     // Verify cache remote exists
     assert!(cache_dir.path().join("_git-remotes").exists());
@@ -159,8 +189,16 @@ async fn test_git_install_branch_ref() {
         "version": "1.5.0-feat",
         "main": "feature.js"
     });
-    std::fs::write(repo_dir.path().join("package.json"), manifest_branch.to_string()).unwrap();
-    std::fs::write(repo_dir.path().join("feature.js"), "module.exports = 'feature-x';\n").unwrap();
+    std::fs::write(
+        repo_dir.path().join("package.json"),
+        manifest_branch.to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.path().join("feature.js"),
+        "module.exports = 'feature-x';\n",
+    )
+    .unwrap();
     run_git(repo_dir.path(), &["add", "."]);
     run_git(repo_dir.path(), &["commit", "-m", "Feature commit"]);
 
@@ -173,21 +211,30 @@ async fn test_git_install_branch_ref() {
             "branch-dep": format!("{git_url}#feature-x")
         }
     });
-    std::fs::write(proj_dir.path().join("package.json"), consumer_manifest.to_string()).unwrap();
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.install().await.expect("Install branch failed");
     assert_eq!(summary.packages_installed, 1);
 
     let installed_pkg_json = proj_dir.path().join("node_modules/branch-dep/package.json");
-    let installed_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
+    let installed_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
     assert_eq!(installed_json["version"], "1.5.0-feat");
-    assert!(proj_dir.path().join("node_modules/branch-dep/feature.js").exists());
+    assert!(proj_dir
+        .path()
+        .join("node_modules/branch-dep/feature.js")
+        .exists());
 }
 
 #[tokio::test]
@@ -204,17 +251,25 @@ async fn test_git_install_direct_commit_sha() {
             "sha-dep": format!("{git_url}#{commit_sha}")
         }
     });
-    std::fs::write(proj_dir.path().join("package.json"), consumer_manifest.to_string()).unwrap();
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.install().await.expect("Install SHA failed");
     assert_eq!(summary.packages_installed, 1);
-    assert!(proj_dir.path().join("node_modules/sha-dep/package.json").exists());
+    assert!(proj_dir
+        .path()
+        .join("node_modules/sha-dep/package.json")
+        .exists());
 }
 
 #[tokio::test]
@@ -223,11 +278,19 @@ async fn test_git_install_semver_tag_resolution() {
     let (_c1, git_url) = init_test_git_repo(repo_dir.path(), "semver-git-dep", "1.0.0");
     run_git(repo_dir.path(), &["tag", "v1.0.0"]);
 
-    std::fs::write(repo_dir.path().join("package.json"), r#"{"name":"semver-git-dep","version":"1.2.0"}"#).unwrap();
+    std::fs::write(
+        repo_dir.path().join("package.json"),
+        r#"{"name":"semver-git-dep","version":"1.2.0"}"#,
+    )
+    .unwrap();
     run_git(repo_dir.path(), &["commit", "-am", "v1.2.0"]);
     run_git(repo_dir.path(), &["tag", "v1.2.0"]);
 
-    std::fs::write(repo_dir.path().join("package.json"), r#"{"name":"semver-git-dep","version":"2.0.0"}"#).unwrap();
+    std::fs::write(
+        repo_dir.path().join("package.json"),
+        r#"{"name":"semver-git-dep","version":"2.0.0"}"#,
+    )
+    .unwrap();
     run_git(repo_dir.path(), &["commit", "-am", "v2.0.0"]);
     run_git(repo_dir.path(), &["tag", "v2.0.0"]);
 
@@ -240,18 +303,29 @@ async fn test_git_install_semver_tag_resolution() {
             "semver-git-dep": format!("{git_url}#semver:^1.0.0")
         }
     });
-    std::fs::write(proj_dir.path().join("package.json"), consumer_manifest.to_string()).unwrap();
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    installer.install().await.expect("Install semver git failed");
+    installer
+        .install()
+        .await
+        .expect("Install semver git failed");
 
-    let installed_pkg_json = proj_dir.path().join("node_modules/semver-git-dep/package.json");
-    let installed_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
+    let installed_pkg_json = proj_dir
+        .path()
+        .join("node_modules/semver-git-dep/package.json");
+    let installed_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
     // ^1.0.0 should select highest 1.x tag -> 1.2.0
     assert_eq!(installed_json["version"], "1.2.0");
 }
@@ -278,7 +352,8 @@ async fn test_git_caching_and_offline_mode() {
         cache_dir: Some(cache_dir.path().to_path_buf()),
         offline: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
     installer1.install().await.expect("Online install failed");
 
     // 2. Offline install with cached repo succeeds
@@ -296,9 +371,16 @@ async fn test_git_caching_and_offline_mode() {
         cache_dir: Some(cache_dir.path().to_path_buf()),
         offline: true,
         ..Default::default()
-    }).unwrap();
-    installer2.install().await.expect("Offline install should succeed with cached repo");
-    assert!(proj2_dir.path().join("node_modules/cached-dep/package.json").exists());
+    })
+    .unwrap();
+    installer2
+        .install()
+        .await
+        .expect("Offline install should succeed with cached repo");
+    assert!(proj2_dir
+        .path()
+        .join("node_modules/cached-dep/package.json")
+        .exists());
 
     // 3. Offline install with UNCACHED repo fails gracefully
     let proj3_dir = tempdir().unwrap();
@@ -315,7 +397,8 @@ async fn test_git_caching_and_offline_mode() {
         cache_dir: Some(cache_dir.path().to_path_buf()),
         offline: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
     let err = installer3.install().await.unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("offline mode"),
@@ -343,7 +426,8 @@ async fn test_git_invalid_ref_error_handling() {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.install().await.unwrap_err();
     assert!(
@@ -369,7 +453,8 @@ async fn test_git_clone_failure_error_handling() {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.install().await.unwrap_err();
     assert!(
@@ -384,10 +469,16 @@ async fn test_git_missing_package_json_error_handling() {
     std::fs::create_dir_all(repo_dir.path()).unwrap();
     run_git(repo_dir.path(), &["init"]);
     run_git(repo_dir.path(), &["config", "user.name", "Tester"]);
-    run_git(repo_dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(
+        repo_dir.path(),
+        &["config", "user.email", "test@example.com"],
+    );
     std::fs::write(repo_dir.path().join("README.md"), "No package.json here\n").unwrap();
     run_git(repo_dir.path(), &["add", "."]);
-    run_git(repo_dir.path(), &["commit", "-m", "init without package.json"]);
+    run_git(
+        repo_dir.path(),
+        &["commit", "-m", "init without package.json"],
+    );
 
     let path_str = repo_dir.path().to_str().unwrap().replace('\\', "/");
     let git_url = format!("git+file://{path_str}");
@@ -406,7 +497,8 @@ async fn test_git_missing_package_json_error_handling() {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let err = installer.install().await.unwrap_err();
     assert!(
@@ -435,7 +527,8 @@ async fn test_git_ci_workflow() {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     // 1. Initial install generates lockfile
     installer.install().await.expect("Install failed");
@@ -453,7 +546,8 @@ async fn test_git_ci_workflow() {
     // 4. Verify node_modules restored from git
     let restored_json = proj_dir.path().join("node_modules/ci-git-dep/package.json");
     assert!(restored_json.exists());
-    let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&restored_json).unwrap()).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&restored_json).unwrap()).unwrap();
     assert_eq!(parsed["name"], "ci-git-dep");
     assert_eq!(parsed["version"], "1.0.0");
 
@@ -469,7 +563,10 @@ async fn test_git_bin_shims() {
     std::fs::create_dir_all(repo_dir.path()).unwrap();
     run_git(repo_dir.path(), &["init"]);
     run_git(repo_dir.path(), &["config", "user.name", "Tester"]);
-    run_git(repo_dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(
+        repo_dir.path(),
+        &["config", "user.email", "test@example.com"],
+    );
 
     let manifest = serde_json::json!({
         "name": "bin-git-dep",
@@ -480,7 +577,11 @@ async fn test_git_bin_shims() {
     });
     std::fs::write(repo_dir.path().join("package.json"), manifest.to_string()).unwrap();
     std::fs::create_dir_all(repo_dir.path().join("bin")).unwrap();
-    std::fs::write(repo_dir.path().join("bin/cli.js"), "#!/usr/bin/env node\nconsole.log('hi');\n").unwrap();
+    std::fs::write(
+        repo_dir.path().join("bin/cli.js"),
+        "#!/usr/bin/env node\nconsole.log('hi');\n",
+    )
+    .unwrap();
     run_git(repo_dir.path(), &["add", "."]);
     run_git(repo_dir.path(), &["commit", "-m", "add bin"]);
 
@@ -496,23 +597,95 @@ async fn test_git_bin_shims() {
             "bin-git-dep": git_url
         }
     });
-    std::fs::write(proj_dir.path().join("package.json"), consumer_manifest.to_string()).unwrap();
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: proj_dir.path().to_path_buf(),
         cache_dir: Some(cache_dir.path().to_path_buf()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     installer.install().await.expect("Install with bin failed");
 
     let bin_dir = proj_dir.path().join("node_modules/.bin");
     #[cfg(windows)]
     {
-        assert!(bin_dir.join("git-tool.cmd").exists() || bin_dir.join("git-tool.ps1").exists() || bin_dir.join("git-tool").exists());
+        assert!(
+            bin_dir.join("git-tool.cmd").exists()
+                || bin_dir.join("git-tool.ps1").exists()
+                || bin_dir.join("git-tool").exists()
+        );
     }
     #[cfg(not(windows))]
     {
         assert!(bin_dir.join("git-tool").exists());
     }
+}
+
+#[tokio::test]
+async fn test_git_dependency_runs_prepare_lifecycle() {
+    let repo_dir = tempdir().unwrap();
+    run_git(repo_dir.path(), &["init"]);
+    run_git(repo_dir.path(), &["config", "user.name", "Tester"]);
+    run_git(
+        repo_dir.path(),
+        &["config", "user.email", "test@example.com"],
+    );
+
+    let proj_dir = tempdir().unwrap();
+    let marker_path = proj_dir.path().join("git_prepare_executed.txt");
+    let escaped_marker = marker_path.to_string_lossy().replace('\\', "/");
+
+    let manifest = serde_json::json!({
+        "name": "lifecycle-git-dep",
+        "version": "1.0.0",
+        "scripts": {
+            "prepare": format!("node -e \"require('fs').writeFileSync('{escaped_marker}', 'git prepare ran')\"")
+        }
+    });
+    std::fs::write(repo_dir.path().join("package.json"), manifest.to_string()).unwrap();
+    std::fs::write(repo_dir.path().join("index.js"), "module.exports = {};\n").unwrap();
+    run_git(repo_dir.path(), &["add", "."]);
+    run_git(repo_dir.path(), &["commit", "-m", "add prepare script"]);
+
+    let path_str = repo_dir.path().to_str().unwrap().replace('\\', "/");
+    let git_url = format!("git+file://{path_str}");
+
+    let cache_dir = tempdir().unwrap();
+
+    let consumer_manifest = serde_json::json!({
+        "name": "consumer-git-prepare",
+        "dependencies": {
+            "lifecycle-git-dep": git_url
+        }
+    });
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer
+        .install()
+        .await
+        .expect("Install git dep with prepare script failed");
+
+    assert!(
+        marker_path.exists(),
+        "Git dependency prepare script MUST be executed during install"
+    );
+    let content = std::fs::read_to_string(&marker_path).unwrap();
+    assert_eq!(content, "git prepare ran");
 }

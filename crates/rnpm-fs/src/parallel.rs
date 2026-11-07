@@ -1,9 +1,9 @@
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use crate::atomic::extract_and_replace;
 use crate::error::FsError;
 use crate::tarball::{ExtractionSummary, TarLimits};
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// A single extraction task for parallel batch extraction.
 pub struct BatchExtractionItem<R> {
@@ -45,7 +45,9 @@ pub fn extract_batch_parallel<R: Read + Send>(
     };
 
     let actual_threads = concurrency.min(num_items);
-    let items_queue = Arc::new(Mutex::new(items.into_iter().enumerate().collect::<Vec<_>>()));
+    let items_queue = Arc::new(Mutex::new(
+        items.into_iter().enumerate().collect::<Vec<_>>(),
+    ));
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(actual_threads);

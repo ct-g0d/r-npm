@@ -1,5 +1,5 @@
-use rnpm_core::spec::PackageTarget;
 use crate::error::SolverError;
+use rnpm_core::spec::PackageTarget;
 
 /// Resolved dependency specification distinguishing install name (folder name / manifest key)
 /// from the real package name and target.
@@ -64,11 +64,13 @@ fn split_alias_name_and_spec(input: &str) -> Result<(String, Option<&str>), Solv
     }
 
     if s.starts_with('@') {
-        let slash = s.find('/').ok_or_else(|| SolverError::UnresolvedDependency {
-            name: s.to_string(),
-            spec: input.to_string(),
-            message: "Invalid scoped alias format".to_string(),
-        })?;
+        let slash = s
+            .find('/')
+            .ok_or_else(|| SolverError::UnresolvedDependency {
+                name: s.to_string(),
+                spec: input.to_string(),
+                message: "Invalid scoped alias format".to_string(),
+            })?;
         let after_slash = &s[slash + 1..];
         if let Some(at) = after_slash.find('@') {
             let full_at = slash + 1 + at;

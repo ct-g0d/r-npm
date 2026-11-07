@@ -1,6 +1,6 @@
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use serde_json::Value;
 
 use crate::inspect_tree::{build_dependency_tree, InspectedNode, TreeOptions};
 
@@ -108,7 +108,10 @@ fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut Hash
                 "extraneous: {}@{} {}",
                 node.name,
                 node.version.as_deref().unwrap_or(""),
-                node.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                node.path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             );
             if seen.insert(p.clone()) {
                 out.push(p);
@@ -177,7 +180,9 @@ pub fn filter_tree_by_packages(node: &mut InspectedNode, filter_pkgs: &[String])
     let mut filtered_deps = BTreeMap::new();
 
     for (name, mut child) in std::mem::take(&mut node.dependencies) {
-        let direct_match = filter_pkgs.iter().any(|p| package_matches_filter(&name, &child, p));
+        let direct_match = filter_pkgs
+            .iter()
+            .any(|p| package_matches_filter(&name, &child, p));
 
         filter_tree_by_packages(&mut child, filter_pkgs);
 
@@ -232,7 +237,10 @@ fn format_child_text(
 
     if node.missing {
         let req = node.required.as_deref().unwrap_or("*");
-        out.push_str(&format!("{prefix}{branch}UNMET DEPENDENCY {}@{}\n", node.name, req));
+        out.push_str(&format!(
+            "{prefix}{branch}UNMET DEPENDENCY {}@{}\n",
+            node.name, req
+        ));
     } else {
         let ver = node.version.as_deref().unwrap_or("unknown");
         let mut marker = String::new();
@@ -243,7 +251,10 @@ fn format_child_text(
         } else if node.deduped {
             marker = " deduped".to_string();
         }
-        out.push_str(&format!("{prefix}{branch}{}@{}{}\n", node.name, ver, marker));
+        out.push_str(&format!(
+            "{prefix}{branch}{}@{}{}\n",
+            node.name, ver, marker
+        ));
     }
 
     let continuation = if is_last { "    " } else { "|   " };
@@ -263,7 +274,15 @@ fn format_child_text(
         for (idx, name) in dep_keys.iter().enumerate() {
             let child_is_last = idx == dep_keys.len() - 1;
             let child = node.dependencies.get(name).unwrap();
-            format_child_text(child, max_depth, current_depth + 1, &child_prefix, child_is_last, long, out);
+            format_child_text(
+                child,
+                max_depth,
+                current_depth + 1,
+                &child_prefix,
+                child_is_last,
+                long,
+                out,
+            );
         }
     }
 }
@@ -286,7 +305,10 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     }
 
     if !root.problems.is_empty() {
-        map.insert("problems".to_string(), serde_json::to_value(&root.problems).unwrap_or_default());
+        map.insert(
+            "problems".to_string(),
+            serde_json::to_value(&root.problems).unwrap_or_default(),
+        );
     }
 
     let mut deps_map = serde_json::Map::new();
@@ -308,7 +330,12 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     Value::Object(map)
 }
 
-fn format_child_json(node: &InspectedNode, max_depth: usize, current_depth: usize, long: bool) -> Value {
+fn format_child_json(
+    node: &InspectedNode,
+    max_depth: usize,
+    current_depth: usize,
+    long: bool,
+) -> Value {
     let mut map = serde_json::Map::new();
 
     if node.missing {
@@ -317,7 +344,10 @@ fn format_child_json(node: &InspectedNode, max_depth: usize, current_depth: usiz
         }
         map.insert("missing".to_string(), Value::Bool(true));
         if !node.problems.is_empty() {
-            map.insert("problems".to_string(), serde_json::to_value(&node.problems).unwrap_or_default());
+            map.insert(
+                "problems".to_string(),
+                serde_json::to_value(&node.problems).unwrap_or_default(),
+            );
         }
         return Value::Object(map);
     }
@@ -350,13 +380,19 @@ fn format_child_json(node: &InspectedNode, max_depth: usize, current_depth: usiz
     }
 
     if !node.problems.is_empty() {
-        map.insert("problems".to_string(), serde_json::to_value(&node.problems).unwrap_or_default());
+        map.insert(
+            "problems".to_string(),
+            serde_json::to_value(&node.problems).unwrap_or_default(),
+        );
     }
 
     if current_depth < max_depth && !node.deduped && !node.dependencies.is_empty() {
         let mut child_map = serde_json::Map::new();
         for (name, child) in &node.dependencies {
-            child_map.insert(name.clone(), format_child_json(child, max_depth, current_depth + 1, long));
+            child_map.insert(
+                name.clone(),
+                format_child_json(child, max_depth, current_depth + 1, long),
+            );
         }
         map.insert("dependencies".to_string(), Value::Object(child_map));
     }
@@ -475,18 +511,38 @@ mod tests {
 
     #[test]
     fn test_text_tree_formatting_branches_and_markers() {
-        let mut root = InspectedNode::new_root("my-pkg".into(), Some("1.0.0".into()), Path::new("/workspace/my-pkg"));
+        let mut root = InspectedNode::new_root(
+            "my-pkg".into(),
+            Some("1.0.0".into()),
+            Path::new("/workspace/my-pkg"),
+        );
 
         // Child 1: regular
-        let c1 = InspectedNode::new_root("alpha".into(), Some("1.0.0".into()), Path::new("/workspace/my-pkg/node_modules/alpha"));
+        let c1 = InspectedNode::new_root(
+            "alpha".into(),
+            Some("1.0.0".into()),
+            Path::new("/workspace/my-pkg/node_modules/alpha"),
+        );
         // Child 2: extraneous
-        let mut c2 = InspectedNode::new_root("beta".into(), Some("2.0.0".into()), Path::new("/workspace/my-pkg/node_modules/beta"));
+        let mut c2 = InspectedNode::new_root(
+            "beta".into(),
+            Some("2.0.0".into()),
+            Path::new("/workspace/my-pkg/node_modules/beta"),
+        );
         c2.extraneous = true;
         // Child 3: invalid
-        let mut c3 = InspectedNode::new_root("gamma".into(), Some("1.5.0".into()), Path::new("/workspace/my-pkg/node_modules/gamma"));
+        let mut c3 = InspectedNode::new_root(
+            "gamma".into(),
+            Some("1.5.0".into()),
+            Path::new("/workspace/my-pkg/node_modules/gamma"),
+        );
         c3.invalid = Some("\"^2.0.0\" from the root project".into());
         // Child 4: deduped
-        let mut c4 = InspectedNode::new_root("delta".into(), Some("1.0.0".into()), Path::new("/workspace/my-pkg/node_modules/delta"));
+        let mut c4 = InspectedNode::new_root(
+            "delta".into(),
+            Some("1.0.0".into()),
+            Path::new("/workspace/my-pkg/node_modules/delta"),
+        );
         c4.deduped = true;
         // Child 5: missing
         let mut c5 = InspectedNode::new_root("epsilon".into(), None, Path::new(""));
@@ -507,15 +563,23 @@ mod tests {
         assert_eq!(lines[2], "+-- beta@2.0.0 extraneous");
         assert_eq!(lines[3], "+-- delta@1.0.0 deduped");
         assert_eq!(lines[4], "+-- UNMET DEPENDENCY epsilon@^3.0.0");
-        assert_eq!(lines[5], "`-- gamma@1.5.0 invalid: \"^2.0.0\" from the root project");
+        assert_eq!(
+            lines[5],
+            "`-- gamma@1.5.0 invalid: \"^2.0.0\" from the root project"
+        );
     }
 
     #[test]
     fn test_long_text_formatting() {
-        let mut root = InspectedNode::new_root("root-pkg".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("root-pkg".into(), Some("1.0.0".into()), Path::new("/app"));
         root.description = Some("Root application".into());
 
-        let mut child = InspectedNode::new_root("dep".into(), Some("2.0.0".into()), Path::new("/app/node_modules/dep"));
+        let mut child = InspectedNode::new_root(
+            "dep".into(),
+            Some("2.0.0".into()),
+            Path::new("/app/node_modules/dep"),
+        );
         child.description = Some("A dependency description".into());
         root.dependencies.insert("dep".into(), child);
 
@@ -532,11 +596,24 @@ mod tests {
 
     #[test]
     fn test_depth_filtering() {
-        let mut root = InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
 
-        let mut l1 = InspectedNode::new_root("l1".into(), Some("1.0.0".into()), Path::new("/app/node_modules/l1"));
-        let mut l2 = InspectedNode::new_root("l2".into(), Some("1.0.0".into()), Path::new("/app/node_modules/l1/node_modules/l2"));
-        let l3 = InspectedNode::new_root("l3".into(), Some("1.0.0".into()), Path::new("/app/node_modules/l1/node_modules/l2/node_modules/l3"));
+        let mut l1 = InspectedNode::new_root(
+            "l1".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/l1"),
+        );
+        let mut l2 = InspectedNode::new_root(
+            "l2".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/l1/node_modules/l2"),
+        );
+        let l3 = InspectedNode::new_root(
+            "l3".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/l1/node_modules/l2/node_modules/l3"),
+        );
 
         l2.dependencies.insert("l3".into(), l3);
         l1.dependencies.insert("l2".into(), l2);
@@ -563,8 +640,13 @@ mod tests {
 
     #[test]
     fn test_json_formatting_clean() {
-        let mut root = InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
-        let child = InspectedNode::new_root("dep".into(), Some("2.0.0".into()), Path::new("/app/node_modules/dep"));
+        let mut root =
+            InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
+        let child = InspectedNode::new_root(
+            "dep".into(),
+            Some("2.0.0".into()),
+            Path::new("/app/node_modules/dep"),
+        );
         root.dependencies.insert("dep".into(), child);
 
         let json = format_tree_json(&root, 0, false);
@@ -577,13 +659,17 @@ mod tests {
 
     #[test]
     fn test_json_formatting_with_problems() {
-        let mut root = InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
-        root.problems.push("missing: uninstalled@^1.0.0, required by app@1.0.0".into());
+        let mut root =
+            InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
+        root.problems
+            .push("missing: uninstalled@^1.0.0, required by app@1.0.0".into());
 
         let mut child = InspectedNode::new_root("uninstalled".into(), None, Path::new(""));
         child.missing = true;
         child.required = Some("^1.0.0".into());
-        child.problems.push("missing: uninstalled@^1.0.0, required by app@1.0.0".into());
+        child
+            .problems
+            .push("missing: uninstalled@^1.0.0, required by app@1.0.0".into());
         root.dependencies.insert("uninstalled".into(), child);
 
         let json = format_tree_json(&root, 0, false);
@@ -596,9 +682,18 @@ mod tests {
 
     #[test]
     fn test_parseable_formatting() {
-        let mut root = InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
-        let mut d1 = InspectedNode::new_root("d1".into(), Some("1.0.0".into()), Path::new("/app/node_modules/d1"));
-        let d2 = InspectedNode::new_root("d2".into(), Some("1.0.0".into()), Path::new("/app/node_modules/d1/node_modules/d2"));
+        let mut root =
+            InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut d1 = InspectedNode::new_root(
+            "d1".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/d1"),
+        );
+        let d2 = InspectedNode::new_root(
+            "d2".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/d1/node_modules/d2"),
+        );
 
         d1.dependencies.insert("d2".into(), d2);
         root.dependencies.insert("d1".into(), d1);
@@ -606,31 +701,56 @@ mod tests {
         let mut paths_d0 = Vec::new();
         let mut seen = HashSet::new();
         collect_parseable_paths(&root, 0, &mut paths_d0, &mut seen);
-        assert_eq!(paths_d0, vec![
-            PathBuf::from("/app").display().to_string(),
-            PathBuf::from("/app/node_modules/d1").display().to_string(),
-        ]);
+        assert_eq!(
+            paths_d0,
+            vec![
+                PathBuf::from("/app").display().to_string(),
+                PathBuf::from("/app/node_modules/d1").display().to_string(),
+            ]
+        );
 
         let mut paths_all = Vec::new();
         let mut seen = HashSet::new();
         collect_parseable_paths(&root, usize::MAX, &mut paths_all, &mut seen);
-        assert_eq!(paths_all, vec![
-            PathBuf::from("/app").display().to_string(),
-            PathBuf::from("/app/node_modules/d1").display().to_string(),
-            PathBuf::from("/app/node_modules/d1/node_modules/d2").display().to_string(),
-        ]);
+        assert_eq!(
+            paths_all,
+            vec![
+                PathBuf::from("/app").display().to_string(),
+                PathBuf::from("/app/node_modules/d1").display().to_string(),
+                PathBuf::from("/app/node_modules/d1/node_modules/d2")
+                    .display()
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
     fn test_packages_filtering_direct_and_transitive() {
-        let mut root = InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
 
-        let mut a = InspectedNode::new_root("a".into(), Some("1.0.0".into()), Path::new("/app/node_modules/a"));
-        let b = InspectedNode::new_root("b".into(), Some("1.0.0".into()), Path::new("/app/node_modules/a/node_modules/b"));
+        let mut a = InspectedNode::new_root(
+            "a".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/a"),
+        );
+        let b = InspectedNode::new_root(
+            "b".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/a/node_modules/b"),
+        );
         a.dependencies.insert("b".into(), b);
 
-        let mut c = InspectedNode::new_root("c".into(), Some("1.0.0".into()), Path::new("/app/node_modules/c"));
-        let d = InspectedNode::new_root("d".into(), Some("1.0.0".into()), Path::new("/app/node_modules/c/node_modules/d"));
+        let mut c = InspectedNode::new_root(
+            "c".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/c"),
+        );
+        let d = InspectedNode::new_root(
+            "d".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/c/node_modules/d"),
+        );
         c.dependencies.insert("d".into(), d);
 
         root.dependencies.insert("a".into(), a);
@@ -647,10 +767,19 @@ mod tests {
 
     #[test]
     fn test_packages_filtering_with_version_and_scope() {
-        let mut root = InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
 
-        let s1 = InspectedNode::new_root("@scope/pkg".into(), Some("1.2.3".into()), Path::new("/app/node_modules/@scope/pkg"));
-        let other = InspectedNode::new_root("other".into(), Some("1.0.0".into()), Path::new("/app/node_modules/other"));
+        let s1 = InspectedNode::new_root(
+            "@scope/pkg".into(),
+            Some("1.2.3".into()),
+            Path::new("/app/node_modules/@scope/pkg"),
+        );
+        let other = InspectedNode::new_root(
+            "other".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/other"),
+        );
 
         root.dependencies.insert("@scope/pkg".into(), s1);
         root.dependencies.insert("other".into(), other);
@@ -686,17 +815,27 @@ mod tests {
 
         let prod_dir = project_dir.join("node_modules").join("prod-pkg");
         std::fs::create_dir_all(&prod_dir).unwrap();
-        std::fs::write(prod_dir.join("package.json"), serde_json::json!({
-            "name": "prod-pkg",
-            "version": "1.0.0"
-        }).to_string()).unwrap();
+        std::fs::write(
+            prod_dir.join("package.json"),
+            serde_json::json!({
+                "name": "prod-pkg",
+                "version": "1.0.0"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let dev_dir = project_dir.join("node_modules").join("dev-pkg");
         std::fs::create_dir_all(&dev_dir).unwrap();
-        std::fs::write(dev_dir.join("package.json"), serde_json::json!({
-            "name": "dev-pkg",
-            "version": "1.0.0"
-        }).to_string()).unwrap();
+        std::fs::write(
+            dev_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dev-pkg",
+                "version": "1.0.0"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let opts = ListOptions {
             omit: vec!["dev".into()],
@@ -755,16 +894,37 @@ mod tests {
 
     #[test]
     fn test_multilevel_nested_branch_lines() {
-        let mut root = InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("root".into(), Some("1.0.0".into()), Path::new("/app"));
 
-        let mut mid = InspectedNode::new_root("mid".into(), Some("1.0.0".into()), Path::new("/app/node_modules/mid"));
-        let sub1 = InspectedNode::new_root("sub1".into(), Some("1.0.0".into()), Path::new("/app/node_modules/mid/node_modules/sub1"));
-        let sub2 = InspectedNode::new_root("sub2".into(), Some("1.0.0".into()), Path::new("/app/node_modules/mid/node_modules/sub2"));
+        let mut mid = InspectedNode::new_root(
+            "mid".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/mid"),
+        );
+        let sub1 = InspectedNode::new_root(
+            "sub1".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/mid/node_modules/sub1"),
+        );
+        let sub2 = InspectedNode::new_root(
+            "sub2".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/mid/node_modules/sub2"),
+        );
         mid.dependencies.insert("sub1".into(), sub1);
         mid.dependencies.insert("sub2".into(), sub2);
 
-        let mut last = InspectedNode::new_root("last".into(), Some("1.0.0".into()), Path::new("/app/node_modules/last"));
-        let end1 = InspectedNode::new_root("end1".into(), Some("1.0.0".into()), Path::new("/app/node_modules/last/node_modules/end1"));
+        let mut last = InspectedNode::new_root(
+            "last".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/last"),
+        );
+        let end1 = InspectedNode::new_root(
+            "end1".into(),
+            Some("1.0.0".into()),
+            Path::new("/app/node_modules/last/node_modules/end1"),
+        );
         last.dependencies.insert("end1".into(), end1);
 
         root.dependencies.insert("mid".into(), mid);
@@ -783,11 +943,16 @@ mod tests {
 
     #[test]
     fn test_json_long_includes_description_and_license() {
-        let mut root = InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
+        let mut root =
+            InspectedNode::new_root("app".into(), Some("1.0.0".into()), Path::new("/app"));
         root.description = Some("App description".into());
         root.license = Some("MIT".into());
 
-        let mut child = InspectedNode::new_root("dep".into(), Some("2.0.0".into()), Path::new("/app/node_modules/dep"));
+        let mut child = InspectedNode::new_root(
+            "dep".into(),
+            Some("2.0.0".into()),
+            Path::new("/app/node_modules/dep"),
+        );
         child.description = Some("Dep description".into());
         child.license = Some("Apache-2.0".into());
         root.dependencies.insert("dep".into(), child);
@@ -795,7 +960,10 @@ mod tests {
         let json = format_tree_json(&root, 0, true);
         assert_eq!(json["description"], "App description");
         assert_eq!(json["license"], "MIT");
-        assert_eq!(json["dependencies"]["dep"]["description"], "Dep description");
+        assert_eq!(
+            json["dependencies"]["dep"]["description"],
+            "Dep description"
+        );
         assert_eq!(json["dependencies"]["dep"]["license"], "Apache-2.0");
     }
 
@@ -815,10 +983,27 @@ mod tests {
         assert!(!package_matches_filter("foo", &node, "foo@1.0.0"));
 
         // Scoped package
-        let scoped_node = InspectedNode::new_root("@types/node".into(), Some("18.11.0".into()), Path::new(""));
-        assert!(package_matches_filter("@types/node", &scoped_node, "@types/node"));
-        assert!(package_matches_filter("@types/node", &scoped_node, "@types/node@^18.0.0"));
-        assert!(!package_matches_filter("@types/node", &scoped_node, "@types/node@^20.0.0"));
-        assert!(!package_matches_filter("@types/react", &scoped_node, "@types/node"));
+        let scoped_node =
+            InspectedNode::new_root("@types/node".into(), Some("18.11.0".into()), Path::new(""));
+        assert!(package_matches_filter(
+            "@types/node",
+            &scoped_node,
+            "@types/node"
+        ));
+        assert!(package_matches_filter(
+            "@types/node",
+            &scoped_node,
+            "@types/node@^18.0.0"
+        ));
+        assert!(!package_matches_filter(
+            "@types/node",
+            &scoped_node,
+            "@types/node@^20.0.0"
+        ));
+        assert!(!package_matches_filter(
+            "@types/react",
+            &scoped_node,
+            "@types/node"
+        ));
     }
 }

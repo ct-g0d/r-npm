@@ -1,8 +1,8 @@
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs;
 use std::io::Write;
 use std::process::Command;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use tempfile::tempdir;
 
 fn create_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -302,8 +302,16 @@ fn test_diff_binary_files() {
     fs::create_dir_all(&dir_a).unwrap();
     fs::create_dir_all(&dir_b).unwrap();
 
-    fs::write(dir_a.join("image.png"), vec![0x89, b'P', b'N', b'G', 0x00, 0x01]).unwrap();
-    fs::write(dir_b.join("image.png"), vec![0x89, b'P', b'N', b'G', 0x00, 0x02]).unwrap();
+    fs::write(
+        dir_a.join("image.png"),
+        vec![0x89, b'P', b'N', b'G', 0x00, 0x01],
+    )
+    .unwrap();
+    fs::write(
+        dir_b.join("image.png"),
+        vec![0x89, b'P', b'N', b'G', 0x00, 0x02],
+    )
+    .unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let output = Command::new(rnpm_bin)

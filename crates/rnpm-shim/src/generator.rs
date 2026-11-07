@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
-use rnpm_core::manifest::{Manifest, PackageBin};
 use crate::error::ShimError;
 use crate::path::compute_relative_path;
 use crate::shebang::{normalize_shebang_file, read_shebang_from_file, ShebangInfo};
+use rnpm_core::manifest::{Manifest, PackageBin};
+use std::path::{Path, PathBuf};
 
 /// The string contents of the executable shim trio (sh, cmd, ps1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +50,11 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let sh_args_str = if info.args.is_empty() {
         "  ".to_string()
     } else {
-        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_posix_arg(arg)).collect();
+        let escaped: Vec<String> = info
+            .args
+            .iter()
+            .map(|arg| crate::escape_posix_arg(arg))
+            .collect();
         format!("{} ", escaped.join(" "))
     };
     let sh_rel_path = crate::escape_posix_path(rel_path);
@@ -81,7 +85,11 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let cmd_args_str = if info.args.is_empty() {
         " ".to_string()
     } else {
-        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_cmd_arg(arg)).collect();
+        let escaped: Vec<String> = info
+            .args
+            .iter()
+            .map(|arg| crate::escape_cmd_arg(arg))
+            .collect();
         format!("{} ", escaped.join(" "))
     };
     let win_rel_path = crate::escape_cmd_path(&rel_path.replace('/', "\\"));
@@ -109,7 +117,11 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let ps1_args_str = if info.args.is_empty() {
         "  ".to_string()
     } else {
-        let escaped: Vec<String> = info.args.iter().map(|arg| crate::escape_ps1_arg(arg)).collect();
+        let escaped: Vec<String> = info
+            .args
+            .iter()
+            .map(|arg| crate::escape_ps1_arg(arg))
+            .collect();
         format!("{} ", escaped.join(" "))
     };
     let ps1_rel_path = crate::escape_ps1_path(rel_path);
@@ -164,23 +176,28 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
         let mut close_count = 0usize;
         let mut else_count = 0usize;
         let mut ret_count = 0usize;
-        ps1
-            .split("\r\n")
+        ps1.split("\r\n")
             .map(|line| {
                 let bare = line.trim_start();
                 if bare == "}" {
                     close_count += 1;
-                    if close_count == 2 || close_count == 3 { return "  }".to_string(); }
+                    if close_count == 2 || close_count == 3 {
+                        return "  }".to_string();
+                    }
                     return "}".to_string();
                 }
                 if bare == "} else {" {
                     else_count += 1;
-                    if else_count == 1 || else_count == 3 { return "  } else {".to_string(); }
+                    if else_count == 1 || else_count == 3 {
+                        return "  } else {".to_string();
+                    }
                     return "} else {".to_string();
                 }
                 if bare == "$ret=$LASTEXITCODE" {
                     ret_count += 1;
-                    if ret_count <= 2 { return "  $ret=$LASTEXITCODE".to_string(); }
+                    if ret_count <= 2 {
+                        return "  $ret=$LASTEXITCODE".to_string();
+                    }
                     return "$ret=$LASTEXITCODE".to_string();
                 }
                 line.to_string()

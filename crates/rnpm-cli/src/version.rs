@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::process::Command;
 use anyhow::{Context, Result};
 use rnpm_core::semver::Version;
 use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct VersionOptions {
@@ -56,7 +56,9 @@ fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
         .output()
     {
         if output.status.success() {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            {
                 for (k, v) in map {
                     results.insert(k, v);
                 }
@@ -92,7 +94,9 @@ fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
     } else {
         let mut entries = Vec::new();
         for (k, v) in &results {
-            let key_str = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            let key_str = if k
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
                 && !k.is_empty()
                 && !k.chars().next().unwrap().is_ascii_digit()
             {
@@ -134,8 +138,8 @@ async fn execute_version_bump(
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("0.0.0");
-    let old_ver_parsed = Version::parse_loose(old_version_raw)
-        .unwrap_or_else(|_| Version::new(0, 0, 0));
+    let old_ver_parsed =
+        Version::parse_loose(old_version_raw).unwrap_or_else(|_| Version::new(0, 0, 0));
     let old_version = old_ver_parsed.to_string();
 
     let new_version = match target {
@@ -235,8 +239,12 @@ async fn execute_version_bump(
                             "version".to_string(),
                             serde_json::Value::String(new_version.clone()),
                         );
-                        if let Some(serde_json::Value::Object(ref mut pkgs)) = map.get_mut("packages") {
-                            if let Some(serde_json::Value::Object(ref mut root_pkg)) = pkgs.get_mut("") {
+                        if let Some(serde_json::Value::Object(ref mut pkgs)) =
+                            map.get_mut("packages")
+                        {
+                            if let Some(serde_json::Value::Object(ref mut root_pkg)) =
+                                pkgs.get_mut("")
+                            {
                                 root_pkg.insert(
                                     "version".to_string(),
                                     serde_json::Value::String(new_version.clone()),
@@ -374,13 +382,8 @@ fn run_lifecycle_step(
     new_version: &str,
     current_ver: &str,
 ) -> Result<()> {
-    let mut ctx = LifecycleContext::new(
-        project_dir,
-        project_dir,
-        pkg_name,
-        script_name,
-        script_cmd,
-    );
+    let mut ctx =
+        LifecycleContext::new(project_dir, project_dir, pkg_name, script_name, script_cmd);
     ctx.package_version = Some(current_ver.to_string());
     ctx.extra_env
         .insert("npm_old_version".to_string(), old_version.to_string());

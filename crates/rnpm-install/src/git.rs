@@ -5,13 +5,13 @@
 //! commit SHA resolution for locking and provenance, reading package.json,
 //! offline mode handling, and graceful error reporting.
 
-use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
-use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_core::spec::PackageTarget;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info, warn};
 
 /// Result of resolving and checking out a git dependency.
 #[derive(Debug, Clone)]
@@ -141,7 +141,10 @@ impl GitFetcher {
 
         if remote_dir.exists() {
             if offline {
-                debug!("Using cached git repository for '{}' (offline mode)", clone_url);
+                debug!(
+                    "Using cached git repository for '{}' (offline mode)",
+                    clone_url
+                );
                 return Ok(remote_dir);
             }
 
@@ -198,11 +201,8 @@ impl GitFetcher {
 
         // 2. Fallback to bare clone if mirror fails
         let _ = safe_remove_dir_all(&remote_dir);
-        let (bare_ok, _, bare_err) = run_git_cmd(
-            &["clone", "--bare", &normalized_url, &remote_dir_str],
-            None,
-        )
-        .await?;
+        let (bare_ok, _, bare_err) =
+            run_git_cmd(&["clone", "--bare", &normalized_url, &remote_dir_str], None).await?;
 
         if bare_ok {
             return Ok(remote_dir);
@@ -267,16 +267,11 @@ impl GitFetcher {
         // 2. Semver range over tags: e.g. semver:^1.0.0
         if let Some(range_str) = ref_name.strip_prefix("semver:") {
             let range = Range::parse(range_str.trim()).map_err(|e| {
-                anyhow!(
-                    "Invalid semver range '{range_str}' in git dependency '{clone_url}': {e}"
-                )
+                anyhow!("Invalid semver range '{range_str}' in git dependency '{clone_url}': {e}")
             })?;
 
-            let (ok, stdout, stderr) = run_git_cmd(
-                &["--git-dir", &remote_dir_str, "tag", "-l"],
-                None,
-            )
-            .await?;
+            let (ok, stdout, stderr) =
+                run_git_cmd(&["--git-dir", &remote_dir_str, "tag", "-l"], None).await?;
 
             if !ok {
                 return Err(anyhow!(
@@ -314,11 +309,8 @@ impl GitFetcher {
             matching_tags.sort_by(|a, b| a.0.cmp(&b.0));
             let (_, best_tag) = matching_tags.last().unwrap();
             let tag_ref = format!("refs/tags/{best_tag}^{{commit}}");
-            let (ok, sha, stderr) = run_git_cmd(
-                &["--git-dir", &remote_dir_str, "rev-parse", &tag_ref],
-                None,
-            )
-            .await?;
+            let (ok, sha, stderr) =
+                run_git_cmd(&["--git-dir", &remote_dir_str, "rev-parse", &tag_ref], None).await?;
 
             if ok && is_valid_hex_sha(&sha) {
                 return Ok(sha);
@@ -407,10 +399,9 @@ impl GitFetcher {
         let archive_bytes = run_git_archive(remote_dir, commit_sha).await;
         if let Ok(bytes) = archive_bytes {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-            if archive.unpack(&checkout_dir).is_ok()
-                && checkout_dir.join("package.json").exists() {
-                    return Ok(checkout_dir);
-                }
+            if archive.unpack(&checkout_dir).is_ok() && checkout_dir.join("package.json").exists() {
+                return Ok(checkout_dir);
+            }
         }
 
         // 2. Fallback method: work-tree checkout
@@ -525,8 +516,9 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
                 let _ = std::fs::copy(&from, &to);
             }
         } else {
-            std::fs::copy(&from, &to)
-                .with_context(|| format!("Failed to copy '{}' -> '{}'", from.display(), to.display()))?;
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("Failed to copy '{}' -> '{}'", from.display(), to.display())
+            })?;
         }
     }
     Ok(())
@@ -581,9 +573,10 @@ async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String,
         cmd.current_dir(dir);
     }
 
-    let output = cmd.output().await.map_err(|e| {
-        anyhow!("Failed to execute 'git {}': {e}", args.join(" "))
-    })?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to execute 'git {}': {e}", args.join(" ")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -594,14 +587,21 @@ async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String,
 async fn run_git_archive(remote_dir: &Path, commit_sha: &str) -> Result<Vec<u8>> {
     let remote_dir_str = remote_dir.to_string_lossy();
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["--git-dir", &remote_dir_str, "archive", "--format=tar", commit_sha])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "");
+    cmd.args([
+        "--git-dir",
+        &remote_dir_str,
+        "archive",
+        "--format=tar",
+        commit_sha,
+    ])
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "")
+    .env("SSH_ASKPASS", "");
 
-    let output = cmd.output().await.map_err(|e| {
-        anyhow!("Failed to execute 'git archive': {e}")
-    })?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to execute 'git archive': {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -672,9 +672,13 @@ mod tests {
     #[test]
     fn test_hex_sha_validation() {
         assert!(is_valid_hex_sha("1234567890abcdef1234567890abcdef12345678"));
-        assert!(is_valid_hex_sha("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"));
+        assert!(is_valid_hex_sha(
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        ));
         assert!(!is_valid_hex_sha("12345"));
-        assert!(!is_valid_hex_sha("1234567890abcdef1234567890abcdef1234567g"));
+        assert!(!is_valid_hex_sha(
+            "1234567890abcdef1234567890abcdef1234567g"
+        ));
     }
 
     #[test]

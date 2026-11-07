@@ -1,10 +1,10 @@
 use crate::error::RegistryError;
+use indexmap::IndexMap;
 use serde::{
     de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
 use std::collections::{BTreeMap, HashMap};
-use indexmap::IndexMap;
 use url::Url;
 
 pub fn deserialize_unique_versions<'de, D>(
@@ -144,7 +144,6 @@ where
         .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
         .collect())
 }
-
 
 /// Represents either a single string binary path or a map of command names to paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,9 +468,15 @@ mod tests {
         }"#;
 
         let res: Result<AbbreviatedPackageMetadata, _> = serde_json::from_str(json);
-        assert!(res.is_err(), "Duplicate version keys must be rejected during deserialization");
+        assert!(
+            res.is_err(),
+            "Duplicate version keys must be rejected during deserialization"
+        );
         let err_msg = res.unwrap_err().to_string();
-        assert!(err_msg.contains("duplicate version key '1.0.0'"), "Error message was: {err_msg}");
+        assert!(
+            err_msg.contains("duplicate version key '1.0.0'"),
+            "Error message was: {err_msg}"
+        );
     }
 
     #[test]
@@ -526,7 +531,9 @@ mod tests {
         let meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
         let err = meta.validate().unwrap_err();
         assert!(err.is_malformed_metadata());
-        assert!(err.to_string().contains("points to non-existent version '9.9.9'"));
+        assert!(err
+            .to_string()
+            .contains("points to non-existent version '9.9.9'"));
     }
 
     #[test]
@@ -539,7 +546,8 @@ mod tests {
         ];
 
         for scheme_url in schemes {
-            let json = format!(r#"{{
+            let json = format!(
+                r#"{{
                 "name": "example",
                 "versions": {{
                     "1.0.0": {{
@@ -548,11 +556,15 @@ mod tests {
                         "dist": {{ "tarball": "{scheme_url}" }}
                     }}
                 }}
-            }}"#);
+            }}"#
+            );
             let meta: AbbreviatedPackageMetadata = serde_json::from_str(&json).unwrap();
             let err = meta.validate().unwrap_err();
             assert!(err.is_malformed_metadata());
-            assert!(err.to_string().contains("forbidden scheme") || err.to_string().contains("malformed tarball URL"));
+            assert!(
+                err.to_string().contains("forbidden scheme")
+                    || err.to_string().contains("malformed tarball URL")
+            );
         }
     }
 

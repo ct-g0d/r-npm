@@ -1,9 +1,9 @@
-use std::path::PathBuf;
 use crate::error::{IntegrityError, SemverError};
 use crate::integrity::{Algorithm, Integrity};
 use crate::manifest::Manifest;
 use crate::semver::{Comparator, Op, PrereleaseId, Range, Version};
 use crate::spec::{PackageSpec, PackageTarget};
+use std::path::PathBuf;
 
 #[test]
 fn test_semver_version_parsing_and_order() {
@@ -62,9 +62,18 @@ fn test_semver_inc_node_semver_rules() {
     assert_eq!(v.inc("minor", None).unwrap().to_string(), "1.3.0");
     assert_eq!(v.inc("patch", None).unwrap().to_string(), "1.2.4");
     assert_eq!(v.inc("prerelease", None).unwrap().to_string(), "1.2.4-0");
-    assert_eq!(v.inc("prepatch", Some("beta")).unwrap().to_string(), "1.2.4-beta.0");
-    assert_eq!(v.inc("preminor", Some("beta")).unwrap().to_string(), "1.3.0-beta.0");
-    assert_eq!(v.inc("premajor", Some("beta")).unwrap().to_string(), "2.0.0-beta.0");
+    assert_eq!(
+        v.inc("prepatch", Some("beta")).unwrap().to_string(),
+        "1.2.4-beta.0"
+    );
+    assert_eq!(
+        v.inc("preminor", Some("beta")).unwrap().to_string(),
+        "1.3.0-beta.0"
+    );
+    assert_eq!(
+        v.inc("premajor", Some("beta")).unwrap().to_string(),
+        "2.0.0-beta.0"
+    );
 
     let v_pre = Version::parse("1.0.0-alpha").unwrap();
     assert_eq!(v_pre.inc("major", None).unwrap().to_string(), "1.0.0");
@@ -76,13 +85,28 @@ fn test_semver_inc_node_semver_rules() {
     assert_eq!(v_pre_patch.inc("patch", None).unwrap().to_string(), "1.2.3");
 
     let v_b0 = Version::parse("1.2.3-beta.0").unwrap();
-    assert_eq!(v_b0.inc("prerelease", None).unwrap().to_string(), "1.2.3-beta.1");
-    assert_eq!(v_b0.inc("prerelease", Some("beta")).unwrap().to_string(), "1.2.3-beta.1");
-    assert_eq!(v_b0.inc("prerelease", Some("alpha")).unwrap().to_string(), "1.2.3-alpha.0");
+    assert_eq!(
+        v_b0.inc("prerelease", None).unwrap().to_string(),
+        "1.2.3-beta.1"
+    );
+    assert_eq!(
+        v_b0.inc("prerelease", Some("beta")).unwrap().to_string(),
+        "1.2.3-beta.1"
+    );
+    assert_eq!(
+        v_b0.inc("prerelease", Some("alpha")).unwrap().to_string(),
+        "1.2.3-alpha.0"
+    );
 
     let v_b = Version::parse("1.2.3-beta").unwrap();
-    assert_eq!(v_b.inc("prerelease", None).unwrap().to_string(), "1.2.3-beta.0");
-    assert_eq!(v_b.inc("prerelease", Some("beta")).unwrap().to_string(), "1.2.3-beta.0");
+    assert_eq!(
+        v_b.inc("prerelease", None).unwrap().to_string(),
+        "1.2.3-beta.0"
+    );
+    assert_eq!(
+        v_b.inc("prerelease", Some("beta")).unwrap().to_string(),
+        "1.2.3-beta.0"
+    );
 }
 
 #[test]
@@ -200,7 +224,10 @@ fn test_package_spec_parsing() {
     // file: specifier
     let s6 = PackageSpec::parse("foo@file:../local-pkg").unwrap();
     assert_eq!(s6.name, "foo");
-    assert_eq!(s6.target, PackageTarget::File(PathBuf::from("../local-pkg")));
+    assert_eq!(
+        s6.target,
+        PackageTarget::File(PathBuf::from("../local-pkg"))
+    );
 
     // parse_dependency helper
     let s7 = PackageSpec::parse_dependency("aliased", "npm:@scope/lib@~1.0.0").unwrap();
@@ -225,7 +252,8 @@ fn test_package_spec_parsing() {
     );
 
     // Git dependency: git+https://...#v1.0.0
-    let s9 = PackageSpec::parse_dependency("my-lib", "git+https://github.com/org/repo.git#v1.0.0").unwrap();
+    let s9 = PackageSpec::parse_dependency("my-lib", "git+https://github.com/org/repo.git#v1.0.0")
+        .unwrap();
     assert_eq!(s9.name, "my-lib");
     assert_eq!(
         s9.target,
@@ -240,11 +268,15 @@ fn test_package_spec_parsing() {
     );
 
     // Remote tarball URL dependency
-    let s10 = PackageSpec::parse_dependency("pkg", "https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap();
+    let s10 =
+        PackageSpec::parse_dependency("pkg", "https://cdn.example.com/packages/pkg-1.0.0.tgz")
+            .unwrap();
     assert_eq!(s10.name, "pkg");
     assert_eq!(
         s10.target,
-        PackageTarget::Url(url::Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap())
+        PackageTarget::Url(
+            url::Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap()
+        )
     );
 }
 
@@ -256,38 +288,62 @@ fn test_git_spec_edge_cases_and_clone_urls() {
     let t1 = PackageTarget::parse("github:facebook/react#v18.2.0").unwrap();
     assert_eq!(t1.git().unwrap().0, "github:facebook/react");
     assert_eq!(t1.git().unwrap().1, Some("v18.2.0"));
-    assert_eq!(t1.git_clone_url().unwrap(), "https://github.com/facebook/react.git");
+    assert_eq!(
+        t1.git_clone_url().unwrap(),
+        "https://github.com/facebook/react.git"
+    );
     assert_eq!(t1.git_committish(), Some("v18.2.0"));
 
     // 2. gitlab with commit sha
     let t2 = PackageTarget::parse("gitlab:gitlab-org/gitlab#abcdef123456").unwrap();
-    assert_eq!(t2.git_clone_url().unwrap(), "https://gitlab.com/gitlab-org/gitlab.git");
+    assert_eq!(
+        t2.git_clone_url().unwrap(),
+        "https://gitlab.com/gitlab-org/gitlab.git"
+    );
     assert_eq!(t2.git_committish(), Some("abcdef123456"));
 
     // 3. bitbucket with branch
     let t3 = PackageTarget::parse("bitbucket:atlassian/repo#feature-branch").unwrap();
-    assert_eq!(t3.git_clone_url().unwrap(), "https://bitbucket.org/atlassian/repo.git");
+    assert_eq!(
+        t3.git_clone_url().unwrap(),
+        "https://bitbucket.org/atlassian/repo.git"
+    );
     assert_eq!(t3.git_committish(), Some("feature-branch"));
 
     // 4. git+ssh
     let t4 = PackageTarget::parse("git+ssh://git@github.com/owner/repo.git#main").unwrap();
-    assert_eq!(t4.git_clone_url().unwrap(), "ssh://git@github.com/owner/repo.git");
+    assert_eq!(
+        t4.git_clone_url().unwrap(),
+        "ssh://git@github.com/owner/repo.git"
+    );
     assert_eq!(t4.git_committish(), Some("main"));
 
     // 5. git://
     let t5 = PackageTarget::parse("git://github.com/owner/repo.git").unwrap();
-    assert_eq!(t5.git_clone_url().unwrap(), "git://github.com/owner/repo.git");
+    assert_eq!(
+        t5.git_clone_url().unwrap(),
+        "git://github.com/owner/repo.git"
+    );
     assert_eq!(t5.git_committish(), None);
 
     // 6. Direct HTTP URL
     let u1 = PackageTarget::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap();
     assert!(u1.is_url());
-    assert_eq!(u1.url().unwrap(), &Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap());
+    assert_eq!(
+        u1.url().unwrap(),
+        &Url::parse("https://cdn.example.com/packages/pkg-1.0.0.tgz").unwrap()
+    );
 
     // 7. Display roundtrip
     assert_eq!(t1.to_string(), "github:facebook/react#v18.2.0");
-    assert_eq!(t4.to_string(), "git+ssh://git@github.com/owner/repo.git#main");
-    assert_eq!(u1.to_string(), "https://cdn.example.com/packages/pkg-1.0.0.tgz");
+    assert_eq!(
+        t4.to_string(),
+        "git+ssh://git@github.com/owner/repo.git#main"
+    );
+    assert_eq!(
+        u1.to_string(),
+        "https://cdn.example.com/packages/pkg-1.0.0.tgz"
+    );
 
     assert_eq!(PackageTarget::parse(&t1.to_string()).unwrap(), t1);
     assert_eq!(PackageTarget::parse(&t4.to_string()).unwrap(), t4);
@@ -324,7 +380,10 @@ fn test_ssri_integrity_verification_and_precedence() {
     let attack_str = format!("{} {}", fake_sha512, integrity_sha1);
     let attack_integrity = Integrity::parse(&attack_str).unwrap();
     let result = attack_integrity.verify(data);
-    assert!(result.is_err(), "Strongest hash failure must reject even if weaker hash matches");
+    assert!(
+        result.is_err(),
+        "Strongest hash failure must reject even if weaker hash matches"
+    );
     if let Err(IntegrityError::Mismatch { algorithm, .. }) = result {
         assert_eq!(algorithm, "sha512");
     } else {
@@ -364,7 +423,10 @@ fn test_manifest_parsing_and_bom_tolerance() {
     assert_eq!(manifest.name.as_deref(), Some("@myorg/my-pkg"));
     assert_eq!(manifest.version.as_deref(), Some("1.2.3"));
     assert_eq!(manifest.dependencies.get("react").unwrap(), "^18.2.0");
-    assert_eq!(manifest.bin_entries(), vec![("cli".to_string(), "./bin/cli.js".to_string())]);
+    assert_eq!(
+        manifest.bin_entries(),
+        vec![("cli".to_string(), "./bin/cli.js".to_string())]
+    );
     assert_eq!(manifest.bundled_package_names(), vec!["react".to_string()]);
 
     // UTF-8 BOM tolerance on bytes
@@ -393,7 +455,10 @@ fn test_manifest_parsing_and_bom_tolerance() {
     // Malformed JSON diagnostic
     let malformed = r#"{ "name": "bad", "version": 1.2.3 }"#;
     let err = Manifest::from_str(malformed).unwrap_err();
-    assert!(matches!(err, crate::error::ManifestError::MalformedJson { .. }));
+    assert!(matches!(
+        err,
+        crate::error::ManifestError::MalformedJson { .. }
+    ));
 }
 
 #[test]
@@ -424,9 +489,9 @@ fn test_workspace_spec_parsing() {
 
 #[test]
 fn test_workspace_discovery() {
+    use crate::workspace::discover_workspaces;
     use std::fs;
     use tempfile::tempdir;
-    use crate::workspace::discover_workspaces;
 
     let temp = tempdir().unwrap();
     let root = temp.path();
@@ -448,7 +513,8 @@ fn test_workspace_discovery() {
     fs::write(
         pkg_a_dir.join("package.json"),
         r#"{"name": "pkg-a", "version": "1.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Create packages/pkg-b
     let pkg_b_dir = root.join("packages").join("pkg-b");
@@ -456,7 +522,8 @@ fn test_workspace_discovery() {
     fs::write(
         pkg_b_dir.join("package.json"),
         r#"{"name": "pkg-b", "version": "2.1.0", "dependencies": {"pkg-a": "workspace:*"}}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Create packages/ignored
     let ignored_dir = root.join("packages").join("ignored");
@@ -464,7 +531,8 @@ fn test_workspace_discovery() {
     fs::write(
         ignored_dir.join("package.json"),
         r#"{"name": "ignored", "version": "0.0.1"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Create apps/nested/app-1
     let app_1_dir = root.join("apps").join("nested").join("app-1");
@@ -472,7 +540,8 @@ fn test_workspace_discovery() {
     fs::write(
         app_1_dir.join("package.json"),
         r#"{"name": "@myorg/app-1", "version": "0.1.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let members = discover_workspaces(root).unwrap();
     assert_eq!(members.len(), 3);
@@ -486,7 +555,10 @@ fn test_workspace_discovery() {
     let pkg_b_member = members.iter().find(|m| m.name == "pkg-b").unwrap();
     assert_eq!(pkg_b_member.relative_path, "packages/pkg-b");
     assert_eq!(pkg_b_member.version.as_deref(), Some("2.1.0"));
-    assert_eq!(pkg_b_member.manifest.dependencies.get("pkg-a").unwrap(), "workspace:*");
+    assert_eq!(
+        pkg_b_member.manifest.dependencies.get("pkg-a").unwrap(),
+        "workspace:*"
+    );
 
     let app_1_member = members.iter().find(|m| m.name == "@myorg/app-1").unwrap();
     assert_eq!(app_1_member.relative_path, "apps/nested/app-1");
@@ -494,10 +566,10 @@ fn test_workspace_discovery() {
 
 #[test]
 fn test_workspace_discovery_duplicate_names_error() {
+    use crate::error::WorkspaceError;
+    use crate::workspace::discover_workspaces;
     use std::fs;
     use tempfile::tempdir;
-    use crate::workspace::discover_workspaces;
-    use crate::error::WorkspaceError;
 
     let temp = tempdir().unwrap();
     let root = temp.path();
@@ -505,15 +577,24 @@ fn test_workspace_discovery_duplicate_names_error() {
     fs::write(
         root.join("package.json"),
         r#"{"name": "root", "workspaces": ["packages/*"]}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let d1 = root.join("packages").join("dir-1");
     let d2 = root.join("packages").join("dir-2");
     fs::create_dir_all(&d1).unwrap();
     fs::create_dir_all(&d2).unwrap();
 
-    fs::write(d1.join("package.json"), r#"{"name": "conflict-pkg", "version": "1.0.0"}"#).unwrap();
-    fs::write(d2.join("package.json"), r#"{"name": "conflict-pkg", "version": "2.0.0"}"#).unwrap();
+    fs::write(
+        d1.join("package.json"),
+        r#"{"name": "conflict-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        d2.join("package.json"),
+        r#"{"name": "conflict-pkg", "version": "2.0.0"}"#,
+    )
+    .unwrap();
 
     let result = discover_workspaces(root);
     assert!(result.is_err());
@@ -527,10 +608,10 @@ fn test_workspace_discovery_duplicate_names_error() {
 
 #[test]
 fn test_workspace_discovery_malformed_json_error() {
+    use crate::error::WorkspaceError;
+    use crate::workspace::discover_workspaces;
     use std::fs;
     use tempfile::tempdir;
-    use crate::workspace::discover_workspaces;
-    use crate::error::WorkspaceError;
 
     let temp = tempdir().unwrap();
     let root = temp.path();
@@ -538,7 +619,8 @@ fn test_workspace_discovery_malformed_json_error() {
     fs::write(
         root.join("package.json"),
         r#"{"name": "root", "workspaces": ["packages/*"]}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let d = root.join("packages").join("broken");
     fs::create_dir_all(&d).unwrap();
@@ -701,21 +783,30 @@ fn test_semver_loose_version_parsing() {
     assert_eq!((v_pre1.major, v_pre1.minor, v_pre1.patch), (1, 0, 0));
     assert_eq!(
         v_pre1.prerelease,
-        vec![PrereleaseId::Alpha("alpha".to_string()), PrereleaseId::Numeric(1)]
+        vec![
+            PrereleaseId::Alpha("alpha".to_string()),
+            PrereleaseId::Numeric(1)
+        ]
     );
 
     let v_pre2 = Version::parse_loose("v1.2-beta.2+build.99").unwrap();
     assert_eq!((v_pre2.major, v_pre2.minor, v_pre2.patch), (1, 2, 0));
     assert_eq!(
         v_pre2.prerelease,
-        vec![PrereleaseId::Alpha("beta".to_string()), PrereleaseId::Numeric(2)]
+        vec![
+            PrereleaseId::Alpha("beta".to_string()),
+            PrereleaseId::Numeric(2)
+        ]
     );
     assert_eq!(v_pre2.build, vec!["build".to_string(), "99".to_string()]);
 
     // Build metadata on partial version
     let v_build = Version::parse_loose("2+build-metadata.1").unwrap();
     assert_eq!((v_build.major, v_build.minor, v_build.patch), (2, 0, 0));
-    assert_eq!(v_build.build, vec!["build-metadata".to_string(), "1".to_string()]);
+    assert_eq!(
+        v_build.build,
+        vec!["build-metadata".to_string(), "1".to_string()]
+    );
 
     // Negative tests for invalid versions
     assert!(Version::parse_loose("").is_err());
@@ -1083,7 +1174,9 @@ fn test_semver_integer_overflow_prevention() {
 
 #[test]
 fn test_semver_wildcard_operators_and_hyphen() {
-    let wildcards = ["*", "x", "X", "=*", "= *", "=x", "=X", "<= *", "<=* ", "<=x", "<=X"];
+    let wildcards = [
+        "*", "x", "X", "=*", "= *", "=x", "=X", "<= *", "<=* ", "<=x", "<=X",
+    ];
     let test_versions = ["0.0.0", "1.0.0", "1.2.3", "99.99.99"];
 
     for w in &wildcards {
@@ -1224,4 +1317,3 @@ fn test_semver_zero_version_cascades() {
     assert!(!r3.satisfies(&Version::parse("0.1.0").unwrap()));
     assert!(!r3.satisfies(&Version::parse("0.0.3").unwrap()));
 }
-

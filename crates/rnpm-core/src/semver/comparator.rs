@@ -1,8 +1,8 @@
+use super::version::Version;
+use crate::error::SemverError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::error::SemverError;
-use super::version::Version;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {

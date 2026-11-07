@@ -64,8 +64,12 @@ fn format_peer_conflict(
     required_by: &[String],
     message: &str,
 ) -> String {
-    let mut out = format!("ERESOLVE: Conflicting peer dependency '{peer}' required by '{parent}': {message}\n");
-    out.push_str(&format!("  Could not resolve dependency:\n    peer {peer}@\"{required_spec}\" from {parent}\n"));
+    let mut out = format!(
+        "ERESOLVE: Conflicting peer dependency '{peer}' required by '{parent}': {message}\n"
+    );
+    out.push_str(&format!(
+        "  Could not resolve dependency:\n    peer {peer}@\"{required_spec}\" from {parent}\n"
+    ));
     match (found_version, found_location) {
         (Some(ver), Some(loc)) => {
             out.push_str(&format!("  Found: {peer}@{ver} at {loc}\n"));
@@ -87,12 +91,18 @@ fn format_peer_conflict(
         out.push('\n');
     }
     out.push_str("  Suggested resolutions:\n");
-    out.push_str(&format!("    1. Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}\n"));
+    out.push_str(&format!(
+        "    1. Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}\n"
+    ));
     out.push_str("    2. Run with --legacy-peer-deps to ignore peer dependency requirements\n");
     if let Some(ver) = found_version {
-        out.push_str(&format!("    3. Update '{parent}' to a version compatible with '{peer}@{ver}'\n"));
+        out.push_str(&format!(
+            "    3. Update '{parent}' to a version compatible with '{peer}@{ver}'\n"
+        ));
     } else {
-        out.push_str(&format!("    3. Install '{peer}' as an explicit dependency in package.json\n"));
+        out.push_str(&format!(
+            "    3. Install '{peer}' as an explicit dependency in package.json\n"
+        ));
     }
     out
 }
@@ -151,7 +161,15 @@ impl SolverError {
     /// Accessor for peer conflict details: (parent, peer, required_spec, found_version, found_location, required_by, message)
     pub fn peer_conflict_details(
         &self,
-    ) -> Option<(&str, &str, &str, Option<&str>, Option<&str>, &[String], &str)> {
+    ) -> Option<(
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        Option<&str>,
+        &[String],
+        &str,
+    )> {
         match self {
             SolverError::PeerConflict {
                 parent,
@@ -187,13 +205,18 @@ impl SolverError {
                 suggestions.push(format!(
                     "Add an override in package.json: \"overrides\": {{ \"{peer}\": \"...\" }}"
                 ));
-                suggestions.push("Run with --legacy-peer-deps to ignore peer dependency requirements".to_string());
+                suggestions.push(
+                    "Run with --legacy-peer-deps to ignore peer dependency requirements"
+                        .to_string(),
+                );
                 if let Some(found) = found_version {
                     suggestions.push(format!(
                         "Update '{parent}' to a version compatible with '{peer}@{found}'"
                     ));
                 } else {
-                    suggestions.push(format!("Install '{peer}' as an explicit dependency in package.json"));
+                    suggestions.push(format!(
+                        "Install '{peer}' as an explicit dependency in package.json"
+                    ));
                 }
                 suggestions
             }

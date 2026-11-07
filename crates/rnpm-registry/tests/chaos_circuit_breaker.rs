@@ -146,12 +146,21 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
 
     let server = MockHttpServer::start(move |_req, _idx| {
         if mode_clone.load(Ordering::SeqCst) {
-            (503, vec![("Retry-After", "0".into())], b"Service Flapping 503".to_vec())
+            (
+                503,
+                vec![("Retry-After", "0".into())],
+                b"Service Flapping 503".to_vec(),
+            )
         } else {
             let body = r#"{"name":"recovered-pkg","dist-tags":{"latest":"1.0.0"},"versions":{}}"#;
-            (200, vec![("Content-Type", "application/json".into())], body.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                body.as_bytes().to_vec(),
+            )
         }
-    }).await;
+    })
+    .await;
 
     let host_key = server.addr.to_string();
 
@@ -169,18 +178,27 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
     let client = RegistryClient::with_config(config).unwrap();
 
     // 1. Initial State: Closed
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Closed
+    );
 
     // 2. Failure #1: 503 Service Unavailable -> State remains Closed
     let res1 = client.get_package_metadata("pkg-a").await;
     assert!(res1.is_err());
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Closed
+    );
     assert_eq!(server.request_counter.load(Ordering::SeqCst), 1);
 
     // 3. Failure #2: 503 Service Unavailable -> consecutive failures == threshold (2) -> Trips to Open
     let res2 = client.get_package_metadata("pkg-b").await;
     assert!(res2.is_err());
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Open);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Open
+    );
     assert_eq!(server.request_counter.load(Ordering::SeqCst), 2);
 
     // 4. Fast Failure in Open state: Requests fail fast WITHOUT network roundtrips
@@ -188,7 +206,10 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
         let res_fast = client.get_package_metadata(&format!("pkg-fast-{i}")).await;
         assert!(res_fast.is_err());
         let err = res_fast.unwrap_err();
-        assert!(err.is_circuit_breaker_open(), "Expected circuit breaker open error");
+        assert!(
+            err.is_circuit_breaker_open(),
+            "Expected circuit breaker open error"
+        );
     }
     // Verify server received ZERO additional requests during the Open period
     assert_eq!(
@@ -201,12 +222,18 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Transition from Open -> HalfOpen
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::HalfOpen);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::HalfOpen
+    );
 
     // 6. HalfOpen Flap-Back Test: If probe fails, immediately trips back to Open
     let res_probe_fail = client.get_package_metadata("probe-fail").await;
     assert!(res_probe_fail.is_err());
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Open);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Open
+    );
     assert_eq!(server.request_counter.load(Ordering::SeqCst), 3);
 
     // Another fast-fail check
@@ -216,7 +243,10 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
 
     // 7. Second Cooldown: Wait for cooldown again
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::HalfOpen);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::HalfOpen
+    );
 
     // Server recovers to healthy
     mode_503.store(false, Ordering::SeqCst);
@@ -224,13 +254,19 @@ async fn test_chaos_503_flapping_circuit_breaker_state_transitions() {
     // 8. Probe Success in HalfOpen: Transitions back to Closed
     let meta = client.get_package_metadata("recovered-pkg").await.unwrap();
     assert_eq!(meta.name, "recovered-pkg");
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Closed
+    );
     assert_eq!(server.request_counter.load(Ordering::SeqCst), 4);
 
     // 9. Subsequent requests succeed cleanly in Closed state
     let meta2 = client.get_package_metadata("recovered-pkg").await.unwrap();
     assert_eq!(meta2.name, "recovered-pkg");
-    assert_eq!(client.circuit_state(&host_key).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_key).await,
+        CircuitBreakerState::Closed
+    );
     assert_eq!(server.request_counter.load(Ordering::SeqCst), 5);
 
     server.stop();
@@ -297,8 +333,15 @@ async fn test_chaos_premature_connection_abort_truncated_tarball_recovery() {
     let downloaded_bytes = client.download_tarball_bytes(&tarball_url).await.unwrap();
 
     assert_eq!(downloaded_bytes, full_payload);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "Client must have retried after premature disconnect");
-    assert!(start.elapsed() >= Duration::from_millis(20), "Client must have observed exponential backoff");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "Client must have retried after premature disconnect"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(20),
+        "Client must have observed exponential backoff"
+    );
 
     server.stop();
 }
@@ -353,7 +396,11 @@ async fn test_chaos_premature_connection_abort_truncated_metadata_recovery() {
 
     let meta = client.get_package_metadata("resilient-pkg").await.unwrap();
     assert_eq!(meta.name, "resilient-pkg");
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "Metadata request must recover cleanly from body truncation");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "Metadata request must recover cleanly from body truncation"
+    );
 
     server.stop();
 }
@@ -408,12 +455,19 @@ async fn test_chaos_premature_connection_abort_download_to_file_recovery() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let tarball_url = format!("{}stream-file.tgz", server.url());
-    let written = client.download_tarball_to_file(&tarball_url, &dest_file).await.unwrap();
+    let written = client
+        .download_tarball_to_file(&tarball_url, &dest_file)
+        .await
+        .unwrap();
     assert_eq!(written, full_content.len() as u64);
 
     let on_disk = tokio::fs::read(&dest_file).await.unwrap();
     assert_eq!(on_disk, full_content);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "File streaming must recover cleanly from mid-stream abort");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "File streaming must recover cleanly from mid-stream abort"
+    );
 
     server.stop();
 }
@@ -432,12 +486,21 @@ async fn test_chaos_429_rate_limit_retry_after_parsing_and_delayed_recovery() {
         let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
         if attempt == 0 {
             // First attempt: return HTTP 429 with 1 second Retry-After
-            (429, vec![("Retry-After", "1".into())], b"Rate limited. Please wait 1 second.".to_vec())
+            (
+                429,
+                vec![("Retry-After", "1".into())],
+                b"Rate limited. Please wait 1 second.".to_vec(),
+            )
         } else {
             // Second attempt: succeeds
-            (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                mock_json.as_bytes().to_vec(),
+            )
         }
-    }).await;
+    })
+    .await;
 
     let config = RegistryClientConfig {
         default_registry: server.url(),
@@ -451,11 +514,18 @@ async fn test_chaos_429_rate_limit_retry_after_parsing_and_delayed_recovery() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let start = Instant::now();
-    let meta = client.get_package_metadata("rate-limited-pkg").await.unwrap();
+    let meta = client
+        .get_package_metadata("rate-limited-pkg")
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(meta.name, "rate-limited-pkg");
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "Client should have retried after 429");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "Client should have retried after 429"
+    );
     assert!(
         elapsed >= Duration::from_millis(900),
         "Client must respect the 1s Retry-After header delay; elapsed was: {:?}",
@@ -473,8 +543,13 @@ async fn test_chaos_429_rate_limit_exceeds_budget_fails_fast() {
     // Server returns 429 with Retry-After: 60 (seconds)
     let server = MockHttpServer::start(move |_req, _idx| {
         attempts_clone.fetch_add(1, Ordering::SeqCst);
-        (429, vec![("Retry-After", "60".into())], b"Rate limit: 60s cooldown".to_vec())
-    }).await;
+        (
+            429,
+            vec![("Retry-After", "60".into())],
+            b"Rate limit: 60s cooldown".to_vec(),
+        )
+    })
+    .await;
 
     let config = RegistryClientConfig {
         default_registry: server.url(),
@@ -494,8 +569,15 @@ async fn test_chaos_429_rate_limit_exceeds_budget_fails_fast() {
     let err = res.unwrap_err();
     assert!(err.is_rate_limited());
     assert_eq!(err.retry_after(), Some(60));
-    assert_eq!(attempts.load(Ordering::SeqCst), 1, "Must NOT retry when Retry-After exceeds budget");
-    assert!(elapsed < Duration::from_millis(500), "Must fail fast immediately");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "Must NOT retry when Retry-After exceeds budget"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "Must fail fast immediately"
+    );
 
     server.stop();
 }

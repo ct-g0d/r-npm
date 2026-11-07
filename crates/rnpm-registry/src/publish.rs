@@ -49,7 +49,10 @@ pub struct PublishAttachment {
 pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value {
     let base = opts.registry_url.as_str().trim_end_matches('/');
     let encoded_pkg = encode_package_name(opts.name);
-    let tarball_url = format!("{base}/{encoded_pkg}/-/{filename}", filename = opts.tarball.filename);
+    let tarball_url = format!(
+        "{base}/{encoded_pkg}/-/{filename}",
+        filename = opts.tarball.filename
+    );
 
     let mut dist = serde_json::json!({
         "shasum": opts.tarball.shasum,
@@ -69,7 +72,10 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     };
 
     if let Some(map) = manifest_version.as_object_mut() {
-        map.insert("_id".to_string(), serde_json::json!(format!("{}@{}", opts.name, opts.version)));
+        map.insert(
+            "_id".to_string(),
+            serde_json::json!(format!("{}@{}", opts.name, opts.version)),
+        );
         map.insert("name".to_string(), serde_json::json!(opts.name));
         map.insert("version".to_string(), serde_json::json!(opts.version));
         if let Some(desc) = opts.description {
@@ -83,7 +89,10 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
                 _ => serde_json::Map::new(),
             };
             pub_cfg.insert("access".to_string(), serde_json::json!(access));
-            map.insert("publishConfig".to_string(), serde_json::Value::Object(pub_cfg));
+            map.insert(
+                "publishConfig".to_string(),
+                serde_json::Value::Object(pub_cfg),
+            );
         }
     }
 
@@ -168,7 +177,10 @@ mod tests {
         assert_eq!(version_doc["_id"], "my-pkg@1.0.0");
         assert_eq!(version_doc["name"], "my-pkg");
         assert_eq!(version_doc["version"], "1.0.0");
-        assert_eq!(version_doc["dist"]["shasum"], "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            version_doc["dist"]["shasum"],
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
         assert_eq!(version_doc["dist"]["integrity"], "sha512-dummy==");
         assert_eq!(
             version_doc["dist"]["tarball"],
@@ -179,7 +191,10 @@ mod tests {
         let attachment = &payload["_attachments"]["my-pkg-1.0.0.tgz"];
         assert_eq!(attachment["content_type"], "application/octet-stream");
         assert_eq!(attachment["length"], tarball_bytes.len());
-        assert_eq!(attachment["shasum"], "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            attachment["shasum"],
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
         assert_eq!(attachment["integrity"], "sha512-dummy==");
         assert_eq!(attachment["data"], BASE64.encode(tarball_bytes));
     }

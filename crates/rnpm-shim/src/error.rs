@@ -11,10 +11,7 @@ pub enum ShimError {
     },
 
     #[error("Cannot compute relative path between incompatible paths: from '{from}', to '{to}'")]
-    IncompatiblePaths {
-        from: PathBuf,
-        to: PathBuf,
-    },
+    IncompatiblePaths { from: PathBuf, to: PathBuf },
 
     #[error("Target script does not exist: '{0}'")]
     TargetNotFound(PathBuf),

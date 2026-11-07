@@ -1,7 +1,7 @@
-use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// Configuration options for `npm init` execution.
 #[derive(Debug, Clone)]
@@ -176,8 +176,12 @@ pub fn run_init<R: BufRead, W: Write>(
     let manifest_path = options.directory.join("package.json");
 
     let existing_val: Option<Value> = if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("Failed to read existing manifest at '{}'", manifest_path.display()))?;
+        let content = std::fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "Failed to read existing manifest at '{}'",
+                manifest_path.display()
+            )
+        })?;
         let clean = content.strip_prefix('\u{feff}').unwrap_or(&content);
         serde_json::from_str(clean).ok()
     } else {
@@ -237,7 +241,11 @@ pub fn run_init<R: BufRead, W: Write>(
 
     let default_test = existing_val
         .as_ref()
-        .and_then(|ext| ext.get("scripts").and_then(|s| s.get("test")).and_then(|v| v.as_str()))
+        .and_then(|ext| {
+            ext.get("scripts")
+                .and_then(|s| s.get("test"))
+                .and_then(|v| v.as_str())
+        })
         .unwrap_or("echo \"Error: no test specified\" && exit 1")
         .to_string();
 
@@ -357,20 +365,37 @@ pub fn run_init<R: BufRead, W: Write>(
 
         std::fs::create_dir_all(&options.directory)?;
         std::fs::write(&manifest_path, &formatted)?;
-        writeln!(writer, "Wrote to {}:\n\n{}", manifest_path.display(), formatted)?;
+        writeln!(
+            writer,
+            "Wrote to {}:\n\n{}",
+            manifest_path.display(),
+            formatted
+        )?;
         return Ok(());
     }
 
     // Interactive mode
-    writeln!(writer, "This utility will walk you through creating a package.json file.")?;
+    writeln!(
+        writer,
+        "This utility will walk you through creating a package.json file."
+    )?;
     writeln!(
         writer,
         "It only covers the most common items, and tries to guess sensible defaults.\n"
     )?;
-    writeln!(writer, "See `npm help init` for definitive documentation on these fields")?;
+    writeln!(
+        writer,
+        "See `npm help init` for definitive documentation on these fields"
+    )?;
     writeln!(writer, "and exactly what they do.\n")?;
-    writeln!(writer, "Use `npm install <pkg>` afterwards to install a package and")?;
-    writeln!(writer, "save it as a dependency in the package.json file.\n")?;
+    writeln!(
+        writer,
+        "Use `npm install <pkg>` afterwards to install a package and"
+    )?;
+    writeln!(
+        writer,
+        "save it as a dependency in the package.json file.\n"
+    )?;
     writeln!(writer, "Press ^C at any time to quit.")?;
 
     let name = prompt_field("package name", &default_name, reader, writer)?;
@@ -466,15 +491,30 @@ mod tests {
     #[test]
     fn test_transform_initializer_cases() {
         assert_eq!(transform_initializer("react-app"), "create-react-app");
-        assert_eq!(transform_initializer("create-react-app"), "create-react-app");
+        assert_eq!(
+            transform_initializer("create-react-app"),
+            "create-react-app"
+        );
         assert_eq!(transform_initializer("vite@latest"), "create-vite@latest");
-        assert_eq!(transform_initializer("next-app@14.0.0"), "create-next-app@14.0.0");
+        assert_eq!(
+            transform_initializer("next-app@14.0.0"),
+            "create-next-app@14.0.0"
+        );
         assert_eq!(transform_initializer("@scope/pkg"), "@scope/create-pkg");
-        assert_eq!(transform_initializer("@scope/create-pkg"), "@scope/create-pkg");
+        assert_eq!(
+            transform_initializer("@scope/create-pkg"),
+            "@scope/create-pkg"
+        );
         assert_eq!(transform_initializer("@scope"), "@scope/create");
         assert_eq!(transform_initializer("@scope/"), "@scope/create");
-        assert_eq!(transform_initializer("@scope@latest"), "@scope/create@latest");
-        assert_eq!(transform_initializer("@scope/bar@1.0.0"), "@scope/create-bar@1.0.0");
+        assert_eq!(
+            transform_initializer("@scope@latest"),
+            "@scope/create@latest"
+        );
+        assert_eq!(
+            transform_initializer("@scope/bar@1.0.0"),
+            "@scope/create-bar@1.0.0"
+        );
     }
 
     #[test]
@@ -503,11 +543,15 @@ mod tests {
         let manifest_path = dir.path().join("package.json");
         assert!(manifest_path.is_file());
 
-        let json: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert_eq!(json["version"], "1.0.0");
         assert_eq!(json["description"], "");
         assert_eq!(json["main"], "index.js");
-        assert_eq!(json["scripts"]["test"], "echo \"Error: no test specified\" && exit 1");
+        assert_eq!(
+            json["scripts"]["test"],
+            "echo \"Error: no test specified\" && exit 1"
+        );
         assert_eq!(json["keywords"], Value::Array(vec![]));
         assert_eq!(json["author"], "");
         assert_eq!(json["license"], "ISC");
@@ -527,7 +571,8 @@ mod tests {
         run_init(&options, &mut input, &mut output).unwrap();
 
         let manifest_path = dir.path().join("package.json");
-        let json: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
         let name = json["name"].as_str().unwrap();
         assert!(name.starts_with("@testscope/"));
     }
@@ -545,7 +590,8 @@ mod tests {
     "chalk": "^4.0.0"
   }
 }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let options = InitOptions {
             yes: true,
@@ -557,7 +603,8 @@ mod tests {
         let mut output = Vec::new();
         run_init(&options, &mut input, &mut output).unwrap();
 
-        let json: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert_eq!(json["name"], "custom-existing");
         assert_eq!(json["version"], "3.2.1");
         assert_eq!(json["dependencies"]["chalk"], "^4.0.0");
@@ -583,7 +630,8 @@ mod tests {
         let manifest_path = dir.path().join("package.json");
         assert!(manifest_path.is_file());
 
-        let json: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert_eq!(json["name"], "my-interactive-pkg");
         assert_eq!(json["version"], "2.0.0");
         assert_eq!(json["description"], "custom desc");

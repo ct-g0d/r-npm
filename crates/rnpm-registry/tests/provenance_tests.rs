@@ -1,15 +1,14 @@
-use std::collections::HashMap;
 use data_encoding::{BASE64, HEXLOWER};
 use sha2::{Digest, Sha512};
+use std::collections::HashMap;
 
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_registry::provenance::{
-    format_registry_signature_payload, normalize_repository_url,
-    AttestationItem, AttestationResponse, DsseEnvelope,
-    DsseSignature, InTotoStatement, InTotoSubject, ProvenancePolicy, ProvenanceVerifier,
-    SigstoreBundle, SlsaBuilder, SlsaConfigSource, SlsaInvocation, SlsaPredicate,
-    TlogEntry, VerificationMaterial, X509Certificate, X509CertificateChain,
-    NPM_REGISTRY_KEYID,
+    format_registry_signature_payload, normalize_repository_url, AttestationItem,
+    AttestationResponse, DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject,
+    ProvenancePolicy, ProvenanceVerifier, SigstoreBundle, SlsaBuilder, SlsaConfigSource,
+    SlsaInvocation, SlsaPredicate, TlogEntry, VerificationMaterial, X509Certificate,
+    X509CertificateChain, NPM_REGISTRY_KEYID,
 };
 use rnpm_registry::RegistryError;
 
@@ -201,23 +200,33 @@ fn test_verify_version_policies() {
             "integrity": "sha512-test=="
         }
     }"#;
-    let ver: rnpm_registry::metadata::AbbreviatedVersion = serde_json::from_str(packument_json).unwrap();
+    let ver: rnpm_registry::metadata::AbbreviatedVersion =
+        serde_json::from_str(packument_json).unwrap();
 
     // AllowAny allows missing provenance
     let allow_any = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
-    assert!(allow_any.verify_version(&ver, None, None).unwrap().is_none());
+    assert!(allow_any
+        .verify_version(&ver, None, None)
+        .unwrap()
+        .is_none());
 
     // RequireProvenance rejects missing provenance
     let req_prov = ProvenanceVerifier::new(ProvenancePolicy::RequireProvenance);
     let err1 = req_prov.verify_version(&ver, None, None).unwrap_err();
-    assert!(matches!(err1, RegistryError::ProvenanceVerificationFailed(_)));
+    assert!(matches!(
+        err1,
+        RegistryError::ProvenanceVerificationFailed(_)
+    ));
 
     // RequireRepository rejects missing provenance
     let req_repo = ProvenanceVerifier::new(ProvenancePolicy::RequireRepository {
         expected_repository: "owner/repo".into(),
     });
     let err2 = req_repo.verify_version(&ver, None, None).unwrap_err();
-    assert!(matches!(err2, RegistryError::UntrustedSourceRepository { .. }));
+    assert!(matches!(
+        err2,
+        RegistryError::UntrustedSourceRepository { .. }
+    ));
 }
 
 #[test]
@@ -226,10 +235,17 @@ fn test_missing_tlog_entries_rejected() {
     let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
     let mut bundle = make_test_bundle("pkg", &sha512_hex, "https://github.com/org/pkg", "sha123");
 
-    bundle.verification_material.as_mut().unwrap().tlog_entries.clear();
+    bundle
+        .verification_material
+        .as_mut()
+        .unwrap()
+        .tlog_entries
+        .clear();
 
     let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
-    let err = verifier.verify("pkg", &bundle, None, Some(tarball_bytes)).unwrap_err();
+    let err = verifier
+        .verify("pkg", &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
     assert!(matches!(err, RegistryError::InvalidSigstoreBundle(_)));
 }
 

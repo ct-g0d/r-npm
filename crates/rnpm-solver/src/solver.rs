@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
+use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, warn};
 
 use crate::aliases::DependencySpec;
@@ -203,12 +203,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             cpu: root_manifest.cpu.clone(),
             libc: root_manifest.libc.clone(),
             bin: root_manifest.bin.clone().map(|b| match b {
-                rnpm_core::manifest::PackageBin::Single(s) => {
-                    rnpm_lockfile::PackageBin::Single(s)
-                }
+                rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m),
             }),
-            license: root_manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            license: root_manifest
+                .extra
+                .get("license")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             engines: root_manifest.engines.clone(),
             parsed_version: None,
             extra: root_manifest.extra.clone(),
@@ -261,24 +263,25 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
         let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
         let mut queued = std::collections::HashSet::new();
-        let enqueue_root = |install_name: &str,
-                            this: &mut Solver<'a, P>,
-                            queued: &mut std::collections::HashSet<String>| {
-            if !queued.insert(install_name.to_string()) {
-                return;
-            }
-            if let Some((raw_spec, dep_type)) = root_deps.get(install_name).cloned() {
-                this.push_task(ResolveTask {
-                    parent_location: String::new(),
-                    parent_package_name: root_name.clone(),
-                    install_name: install_name.to_string(),
-                    raw_spec,
-                    dep_type,
-                    dev_path: dep_type == DependencyType::Dev,
-                    ancestors: root_ancestors.clone(),
-                });
-            }
-        };
+        let enqueue_root =
+            |install_name: &str,
+             this: &mut Solver<'a, P>,
+             queued: &mut std::collections::HashSet<String>| {
+                if !queued.insert(install_name.to_string()) {
+                    return;
+                }
+                if let Some((raw_spec, dep_type)) = root_deps.get(install_name).cloned() {
+                    this.push_task(ResolveTask {
+                        parent_location: String::new(),
+                        parent_package_name: root_name.clone(),
+                        install_name: install_name.to_string(),
+                        raw_spec,
+                        dep_type,
+                        dev_path: dep_type == DependencyType::Dev,
+                        ancestors: root_ancestors.clone(),
+                    });
+                }
+            };
 
         // npm's Arborist normalizes dependency keys lexicographically before
         // walking the root tree. Using the manifest's insertion order here
@@ -313,7 +316,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
     fn process_task(&mut self, task: ResolveTask) -> Result<(), SolverError> {
         if self.options.legacy_peer_deps
-            && (task.dep_type == DependencyType::Peer || task.dep_type == DependencyType::PeerOptional)
+            && (task.dep_type == DependencyType::Peer
+                || task.dep_type == DependencyType::PeerOptional)
         {
             return Ok(());
         }
@@ -349,11 +353,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 (alias_str, "*")
             };
 
-            if let Some(overridden) = self.overrides.resolve_override_strings(
-                real_pkg,
-                inner_spec,
-                &task.ancestors,
-            ) {
+            if let Some(overridden) =
+                self.overrides
+                    .resolve_override_strings(real_pkg, inner_spec, &task.ancestors)
+            {
                 debug!(
                     "Overriding aliased package '{}' (install: '{}'): '{}' -> '{}'",
                     real_pkg, task.install_name, inner_spec, overridden
@@ -374,17 +377,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let dep_spec = DependencySpec::parse(&task.install_name, &effective_spec)?;
 
         // 3. Check for cyclic peer dependencies and existing peer instances
-        let is_peer = task.dep_type == DependencyType::Peer
-            || task.dep_type == DependencyType::PeerOptional;
+        let is_peer =
+            task.dep_type == DependencyType::Peer || task.dep_type == DependencyType::PeerOptional;
         if is_peer
-            && self
-                .queue
-                .iter()
-                .any(|queued| {
-                    queued.parent_location.is_empty()
-                        && (queued.install_name == task.install_name
-                            || queued.install_name == dep_spec.package_name)
-                })
+            && self.queue.iter().any(|queued| {
+                queued.parent_location.is_empty()
+                    && (queued.install_name == task.install_name
+                        || queued.install_name == dep_spec.package_name)
+            })
         {
             // A depth-first subtree can encounter a peer before the root's
             // direct dependency that is meant to satisfy it.  Defer that
@@ -400,10 +400,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             } else {
                 None
             };
-            if self
-                .peer_ctx
-                .is_cycle_on_path_with_alias(&task.ancestors, &dep_spec.package_name, dep_alias)
-            {
+            if self.peer_ctx.is_cycle_on_path_with_alias(
+                &task.ancestors,
+                &dep_spec.package_name,
+                dep_alias,
+            ) {
                 let cycle_path_str = self
                     .peer_ctx
                     .find_cycle_path_on_path(&task.ancestors, &dep_spec.package_name, dep_alias)
@@ -471,7 +472,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &task.install_name,
                 &dep_spec.package_name,
             ) {
-                if crate::hoisting::node_matches_peer_name(existing, &task.install_name, &dep_spec.package_name) {
+                if crate::hoisting::node_matches_peer_name(
+                    existing,
+                    &task.install_name,
+                    &dep_spec.package_name,
+                ) {
                     if crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         debug!(
                             "Peer dependency '{}@{}' satisfied by existing node at '{}'",
@@ -497,7 +502,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 (*task.ancestors).clone(),
                                 format!(
                                     "Installed {}@{} at '{}' does not satisfy peer constraint '{}'",
-                                    existing.name, existing.version, existing.location, effective_spec
+                                    existing.name,
+                                    existing.version,
+                                    existing.location,
+                                    effective_spec
                                 ),
                             ));
                         } else {
@@ -613,26 +621,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         );
         let platform_skipped = !compatible && task.dep_type == DependencyType::Optional;
         if !compatible && !platform_skipped {
-                let wanted = format!(
-                    "os: {:?}, cpu: {:?}, libc: {:?}",
-                    chosen_version.os.as_deref().unwrap_or(&[]),
-                    chosen_version.cpu.as_deref().unwrap_or(&[]),
-                    chosen_version.libc.as_deref().unwrap_or(&[])
-                );
-                let current = format!(
-                    "os: {}, cpu: {}, libc: {}",
-                    self.options.platform.os,
-                    self.options.platform.cpu,
-                    self.options.platform.libc.as_deref().unwrap_or("none")
-                );
-                return Err(SolverError::platform_incompatible(
-                    &dep_spec.package_name,
-                    &chosen_version.version,
-                    wanted,
-                    current,
-                    (*task.ancestors).clone(),
-                    format!("Package '{}@{}' is incompatible with the current platform", dep_spec.package_name, chosen_version.version),
-                ));
+            let wanted = format!(
+                "os: {:?}, cpu: {:?}, libc: {:?}",
+                chosen_version.os.as_deref().unwrap_or(&[]),
+                chosen_version.cpu.as_deref().unwrap_or(&[]),
+                chosen_version.libc.as_deref().unwrap_or(&[])
+            );
+            let current = format!(
+                "os: {}, cpu: {}, libc: {}",
+                self.options.platform.os,
+                self.options.platform.cpu,
+                self.options.platform.libc.as_deref().unwrap_or("none")
+            );
+            return Err(SolverError::platform_incompatible(
+                &dep_spec.package_name,
+                &chosen_version.version,
+                wanted,
+                current,
+                (*task.ancestors).clone(),
+                format!(
+                    "Package '{}@{}' is incompatible with the current platform",
+                    dep_spec.package_name, chosen_version.version
+                ),
+            ));
         }
         if platform_skipped {
             debug!(
@@ -657,14 +668,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .nodes
             .values()
             .filter(|node| {
-                [&node.dependencies, &node.optional_dependencies, &node.peer_dependencies]
-                    .iter()
-                    .filter_map(|deps| deps.get(&dep_spec.install_name))
-                    .filter_map(|spec| PackageTarget::parse(spec).ok())
-                    .any(|target| crate::hoisting::node_satisfies_target(
-                        &Node { version: chosen_version.version.clone(), parsed_version: Version::parse(&chosen_version.version).ok(), ..Node::default() },
+                [
+                    &node.dependencies,
+                    &node.optional_dependencies,
+                    &node.peer_dependencies,
+                ]
+                .iter()
+                .filter_map(|deps| deps.get(&dep_spec.install_name))
+                .filter_map(|spec| PackageTarget::parse(spec).ok())
+                .any(|target| {
+                    crate::hoisting::node_satisfies_target(
+                        &Node {
+                            version: chosen_version.version.clone(),
+                            parsed_version: Version::parse(&chosen_version.version).ok(),
+                            ..Node::default()
+                        },
                         &target,
-                    ))
+                    )
+                })
             })
             .count();
         if !task.parent_location.is_empty()
@@ -739,6 +760,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let flags = NodeFlags {
                     dev: task.dep_type == DependencyType::Dev,
                     optional: task.dep_type == DependencyType::Optional,
+                    dev_optional: false,
                     peer: is_peer,
                     bundled: false,
                     has_install_script: chosen_version.has_install_script,
@@ -770,7 +792,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     extra: {
                         let mut extra = chosen_version.extra.clone();
                         if let Some(deprecated) = &chosen_version.deprecated {
-                            extra.insert("deprecated".to_string(), serde_json::Value::String(deprecated.clone()));
+                            extra.insert(
+                                "deprecated".to_string(),
+                                serde_json::Value::String(deprecated.clone()),
+                            );
                         }
                         extra
                     },
@@ -846,7 +871,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // a shared hoisted slot (for example Express's `ms`).  The
                 // BTreeMap keeps traversal deterministic and matches npm's
                 // lockfile dependency ordering.
-                let child_tasks = child_deps.into_iter().map(|(c_name, (c_spec, c_type))| ResolveTask {
+                let child_tasks = child_deps
+                    .into_iter()
+                    .map(|(c_name, (c_spec, c_type))| ResolveTask {
                         parent_location: target_loc.clone(),
                         parent_package_name: dep_spec.package_name.clone(),
                         install_name: c_name,
@@ -854,7 +881,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         dep_type: c_type,
                         dev_path: task.dev_path || c_type == DependencyType::Dev,
                         ancestors: child_ancestors.clone(),
-                    }).collect::<Vec<_>>();
+                    })
+                    .collect::<Vec<_>>();
                 // Keep a package's direct dependencies ahead of their
                 // descendants. This matches Arborist's breadth-first
                 // placement pass and lets a later direct dependency claim a
@@ -898,7 +926,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             return false;
         }
         let parent = compatible_edges[0].from_location.clone();
-        if compatible_edges.iter().any(|edge| edge.from_location != parent) {
+        if compatible_edges
+            .iter()
+            .any(|edge| edge.from_location != parent)
+        {
             return false;
         }
         let nested = format!("{parent}/node_modules/{install_name}");
@@ -911,11 +942,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         node.location = nested.clone();
         self.graph.nodes.insert(nested.clone(), node);
         for edge in &mut self.graph.edges {
-            if edge.to_location != root_location { continue; }
+            if edge.to_location != root_location {
+                continue;
+            }
             let keep_nested = PackageTarget::parse(&edge.spec)
                 .map(|target| crate::hoisting::node_satisfies_target(&existing_node, &target))
                 .unwrap_or(false);
-            if keep_nested { edge.to_location = nested.clone(); }
+            if keep_nested {
+                edge.to_location = nested.clone();
+            }
         }
         true
     }
@@ -936,15 +971,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     && location.ends_with(&format!("/node_modules/{install_name}"))
                     && node.name == package_name
                     && crate::hoisting::node_satisfies_target(node, target)
-                    && !self.graph.nodes.keys().any(|child| {
-                        child.starts_with(&format!("{location}/node_modules/"))
-                    })
+                    && !self
+                        .graph
+                        .nodes
+                        .keys()
+                        .any(|child| child.starts_with(&format!("{location}/node_modules/")))
             })
             .map(|(location, _)| location.clone())
             .collect();
         for candidate in candidates {
             self.graph.edges.iter_mut().for_each(|edge| {
-                if edge.to_location == candidate { edge.to_location = root_location.to_string(); }
+                if edge.to_location == candidate {
+                    edge.to_location = root_location.to_string();
+                }
             });
             self.graph.nodes.remove(&candidate);
         }
@@ -984,7 +1023,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // compatible release.
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
-                        if Version::parse(&latest.version).ok().is_some_and(|v| range.satisfies(&v)) {
+                        if Version::parse(&latest.version)
+                            .ok()
+                            .is_some_and(|v| range.satisfies(&v))
+                        {
                             return Some(latest);
                         }
                     }
@@ -1045,9 +1087,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
 /// Returns the highest version in `meta.versions` by SemVer comparison,
 /// falling back to the last entry if no versions parse as valid SemVer.
-fn select_max_semver_version<'b>(
-    meta: &'b PackageMetadata,
-) -> Option<&'b PackageVersionMetadata> {
+fn select_max_semver_version<'b>(meta: &'b PackageMetadata) -> Option<&'b PackageVersionMetadata> {
     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
     for (ver_str, v_meta) in &meta.versions {
         if let Ok(parsed) = Version::parse(ver_str) {
@@ -1063,7 +1103,8 @@ fn select_max_semver_version<'b>(
             }
         }
     }
-    best.map(|(v_meta, _)| v_meta).or_else(|| meta.versions.values().last())
+    best.map(|(v_meta, _)| v_meta)
+        .or_else(|| meta.versions.values().last())
 }
 
 /// Attempts fast-path dependency graph construction from a lockfile v3 without tree traversal.
@@ -1087,7 +1128,7 @@ pub fn resolve_fast_path(
 
     // Apply platform filters for optional dependencies
     for node in graph.nodes.values_mut() {
-        if node.flags.optional {
+        if node.flags.optional || node.flags.dev_optional {
             let compatible = options.platform.matches_with_libc(
                 node.os.as_deref(),
                 node.cpu.as_deref(),
@@ -1109,6 +1150,9 @@ pub fn resolve_fast_path(
             }
         }
     }
+
+    // Propagate skipped status from incompatible optional packages to exclusive descendants
+    graph.normalize_dependency_flags();
 
     // Comprehensive lockfile drift check: verify that all non-skipped dependencies
     // exist in the lockfile and satisfy their version/override constraints.
@@ -1214,7 +1258,8 @@ fn validate_fast_path_dep(
     overrides: &Overrides,
     buf: &mut String,
 ) -> bool {
-    let target_loc = DependencyGraph::find_in_scope_hierarchy(&graph.nodes, from_loc, dep_name, buf);
+    let target_loc =
+        DependencyGraph::find_in_scope_hierarchy(&graph.nodes, from_loc, dep_name, buf);
 
     let Some(target) = target_loc else {
         // Missing target
@@ -1258,7 +1303,10 @@ fn validate_fast_path_dep(
         if let Some(overridden) = overrides.resolve_override(dep_name, raw_spec, &ancestors) {
             if let Ok(parsed_override) = DependencySpec::parse(dep_name, &overridden) {
                 return target_node.name == parsed_override.package_name
-                    && crate::hoisting::node_satisfies_target(target_node, &parsed_override.target);
+                    && crate::hoisting::node_satisfies_target(
+                        target_node,
+                        &parsed_override.target,
+                    );
             }
             return false;
         }

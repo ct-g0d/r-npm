@@ -158,7 +158,11 @@ fn test_top_level_get_set_aliases() {
         .args(["set", "alias-key", "alias-value", "--location", "project"])
         .output()
         .unwrap();
-    assert!(set.status.success(), "set failed: {}", String::from_utf8_lossy(&set.stderr));
+    assert!(
+        set.status.success(),
+        "set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
 
     let get = Command::new(rnpm_bin)
         .current_dir(&proj_dir)
@@ -167,7 +171,11 @@ fn test_top_level_get_set_aliases() {
         .args(["get", "alias-key"])
         .output()
         .unwrap();
-    assert!(get.status.success(), "get failed: {}", String::from_utf8_lossy(&get.stderr));
+    assert!(
+        get.status.success(),
+        "get failed: {}",
+        String::from_utf8_lossy(&get.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "alias-value");
 }
 
@@ -190,7 +198,10 @@ fn test_prefix_root_bin_cli() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), proj_dir.to_string_lossy());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        proj_dir.to_string_lossy()
+    );
 
     let out = Command::new(rnpm_bin)
         .current_dir(&proj_dir)
@@ -224,7 +235,10 @@ fn test_prefix_root_bin_cli() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), global_prefix.to_string_lossy());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        global_prefix.to_string_lossy()
+    );
 
     let out = Command::new(rnpm_bin)
         .current_dir(&proj_dir)
@@ -238,7 +252,10 @@ fn test_prefix_root_bin_cli() {
     } else {
         global_prefix.join("lib").join("node_modules")
     };
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected_root.to_string_lossy());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        expected_root.to_string_lossy()
+    );
 
     let out = Command::new(rnpm_bin)
         .current_dir(&proj_dir)
@@ -252,7 +269,10 @@ fn test_prefix_root_bin_cli() {
     } else {
         global_prefix.join("bin")
     };
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected_bin.to_string_lossy());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        expected_bin.to_string_lossy()
+    );
 }
 
 #[test]
@@ -276,8 +296,13 @@ fn test_link_and_unlink_cli() {
                 "my-cli-cmd": "./bin/run.js"
             }
         }"#,
-    ).unwrap();
-    fs::write(pkg_dir.join("bin").join("run.js"), "#!/usr/bin/env node\nconsole.log(123);\n").unwrap();
+    )
+    .unwrap();
+    fs::write(
+        pkg_dir.join("bin").join("run.js"),
+        "#!/usr/bin/env node\nconsole.log(123);\n",
+    )
+    .unwrap();
 
     // 2. npm link in pkg-source
     let out = Command::new(rnpm_bin)
@@ -313,7 +338,8 @@ fn test_link_and_unlink_cli() {
     fs::write(
         consumer_dir.join("package.json"),
         r#"{"name": "consumer-app", "version": "1.0.0"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     // 4. npm link my-cli-linked in consumer-app
     let out = Command::new(rnpm_bin)
@@ -384,8 +410,13 @@ fn test_global_install_and_uninstall_cli() {
                 "glob-runner": "./bin/run.js"
             }
         }"#,
-    ).unwrap();
-    fs::write(tool_dir.join("bin").join("run.js"), "#!/usr/bin/env node\nconsole.log(999);\n").unwrap();
+    )
+    .unwrap();
+    fs::write(
+        tool_dir.join("bin").join("run.js"),
+        "#!/usr/bin/env node\nconsole.log(999);\n",
+    )
+    .unwrap();
 
     let spec = format!("glob-cli-pkg@file:{}", tool_dir.display());
 
@@ -396,7 +427,11 @@ fn test_global_install_and_uninstall_cli() {
         .args(["install", "-g", &spec])
         .output()
         .expect("rnpm install -g failed");
-    assert!(out.status.success(), "install -g failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "install -g failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let global_nm = if cfg!(windows) {
         global_prefix.join("node_modules")
@@ -423,7 +458,11 @@ fn test_global_install_and_uninstall_cli() {
         .args(["uninstall", "--global", "glob-cli-pkg"])
         .output()
         .expect("rnpm uninstall --global failed");
-    assert!(out.status.success(), "uninstall --global failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "uninstall --global failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     assert!(!installed_pkg.exists());
     #[cfg(windows)]

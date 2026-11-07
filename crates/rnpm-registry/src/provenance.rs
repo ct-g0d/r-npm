@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use data_encoding::{BASE64, BASE64_NOPAD, HEXLOWER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
 
 use crate::error::RegistryError;
 use crate::metadata::{AbbreviatedVersion, DistSignature};
@@ -214,9 +214,11 @@ impl SlsaPredicate {
     }
 
     pub fn build_type(&self) -> Option<&str> {
-        self.build_type
-            .as_deref()
-            .or_else(|| self.build_definition.as_ref().and_then(|d| d.build_type.as_deref()))
+        self.build_type.as_deref().or_else(|| {
+            self.build_definition
+                .as_ref()
+                .and_then(|d| d.build_type.as_deref())
+        })
     }
 
     pub fn source_repository(&self) -> Option<String> {
@@ -305,7 +307,11 @@ impl SlsaPredicate {
         // v1.0: buildDefinition.resolvedDependencies
         if let Some(bd) = self.build_definition.as_ref() {
             for dep in &bd.resolved_dependencies {
-                if let Some(sha) = dep.digest.get("gitCommit").or_else(|| dep.digest.get("sha1")) {
+                if let Some(sha) = dep
+                    .digest
+                    .get("gitCommit")
+                    .or_else(|| dep.digest.get("sha1"))
+                {
                     return Some(sha.clone());
                 }
             }
@@ -324,7 +330,11 @@ impl SlsaPredicate {
 
         // Materials
         for mat in &self.materials {
-            if let Some(sha) = mat.digest.get("sha1").or_else(|| mat.digest.get("gitCommit")) {
+            if let Some(sha) = mat
+                .digest
+                .get("sha1")
+                .or_else(|| mat.digest.get("gitCommit"))
+            {
                 return Some(sha.clone());
             }
         }
@@ -550,7 +560,10 @@ impl BuildProvenance {
     pub fn is_github_actions(&self) -> bool {
         self.builder_id.contains("github.com/actions")
             || self.builder_id.contains("GitHub")
-            || self.source_repository.as_ref().is_some_and(|r| !r.is_empty())
+            || self
+                .source_repository
+                .as_ref()
+                .is_some_and(|r| !r.is_empty())
     }
 }
 
@@ -641,10 +654,9 @@ impl ProvenanceVerifier {
         tarball_bytes: Option<&[u8]>,
     ) -> Result<VerifiedProvenance, RegistryError> {
         // 1. Validate DSSE envelope presence
-        let envelope = bundle
-            .dsse_envelope
-            .as_ref()
-            .ok_or_else(|| RegistryError::InvalidSigstoreBundle("Missing dsseEnvelope in bundle".into()))?;
+        let envelope = bundle.dsse_envelope.as_ref().ok_or_else(|| {
+            RegistryError::InvalidSigstoreBundle("Missing dsseEnvelope in bundle".into())
+        })?;
 
         if envelope.signatures.is_empty() {
             return Err(RegistryError::InvalidSigstoreBundle(
@@ -653,10 +665,9 @@ impl ProvenanceVerifier {
         }
 
         // 2. Validate verificationMaterial
-        let vm = bundle
-            .verification_material
-            .as_ref()
-            .ok_or_else(|| RegistryError::InvalidSigstoreBundle("Missing verificationMaterial in bundle".into()))?;
+        let vm = bundle.verification_material.as_ref().ok_or_else(|| {
+            RegistryError::InvalidSigstoreBundle("Missing verificationMaterial in bundle".into())
+        })?;
 
         // 3. Validate Rekor transparency log entries
         if vm.tlog_entries.is_empty() {
@@ -738,7 +749,11 @@ impl ProvenanceVerifier {
 
         // 8. Extract build provenance details
         let build = BuildProvenance {
-            builder_id: statement.predicate.builder_id().unwrap_or_default().to_string(),
+            builder_id: statement
+                .predicate
+                .builder_id()
+                .unwrap_or_default()
+                .to_string(),
             source_repository: statement.predicate.source_repository(),
             commit_sha: statement.predicate.commit_sha(),
             workflow_path: statement.predicate.workflow_path(),
@@ -746,7 +761,10 @@ impl ProvenanceVerifier {
         };
 
         // 9. Enforce repository policy if required
-        if let ProvenancePolicy::RequireRepository { expected_repository } = &self.policy {
+        if let ProvenancePolicy::RequireRepository {
+            expected_repository,
+        } = &self.policy
+        {
             let expected_norm = normalize_repository_url(expected_repository);
             match &build.source_repository {
                 Some(actual_repo) => {
@@ -926,7 +944,8 @@ impl ProvenanceVerifier {
         }
 
         Err(RegistryError::ProvenanceVerificationFailed(
-            "Neither tarball_bytes nor tarball_integrity was provided for digest verification".into(),
+            "Neither tarball_bytes nor tarball_integrity was provided for digest verification"
+                .into(),
         ))
     }
 
@@ -953,14 +972,24 @@ pub fn verify_provenance(
     tarball_bytes: Option<&[u8]>,
     policy: &ProvenancePolicy,
 ) -> Result<VerifiedProvenance, RegistryError> {
-    ProvenanceVerifier::new(policy.clone()).verify(package_name, bundle, tarball_integrity, tarball_bytes)
+    ProvenanceVerifier::new(policy.clone()).verify(
+        package_name,
+        bundle,
+        tarball_integrity,
+        tarball_bytes,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_statement_v02(pkg: &str, sha512_hex: &str, repo: &str, commit: &str) -> InTotoStatement {
+    fn sample_statement_v02(
+        pkg: &str,
+        sha512_hex: &str,
+        repo: &str,
+        commit: &str,
+    ) -> InTotoStatement {
         let mut digest = HashMap::new();
         digest.insert("sha512".to_string(), sha512_hex.to_string());
 
@@ -1053,7 +1082,10 @@ mod tests {
 
         let verified = res.unwrap();
         assert_eq!(verified.package_name, "my-package");
-        assert_eq!(verified.build.source_repository.as_deref(), Some("my-org/my-package"));
+        assert_eq!(
+            verified.build.source_repository.as_deref(),
+            Some("my-org/my-package")
+        );
         assert_eq!(
             verified.build.commit_sha.as_deref(),
             Some("11223344556677889900aabbccddeeff11223344")
@@ -1086,7 +1118,11 @@ mod tests {
             .unwrap_err();
 
         match err {
-            RegistryError::AttestationDigestMismatch { algorithm, expected, actual } => {
+            RegistryError::AttestationDigestMismatch {
+                algorithm,
+                expected,
+                actual,
+            } => {
                 assert_eq!(algorithm, "sha512");
                 assert_eq!(expected, good_sha512);
                 assert_eq!(actual, HEXLOWER.encode(&Sha512::digest(tampered_tarball)));
@@ -1162,7 +1198,10 @@ mod tests {
         digest.insert("sha512".to_string(), sha512_hex.clone());
 
         let mut resolved_digest = HashMap::new();
-        resolved_digest.insert("gitCommit".to_string(), "commit1234567890abcdef".to_string());
+        resolved_digest.insert(
+            "gitCommit".to_string(),
+            "commit1234567890abcdef".to_string(),
+        );
 
         let statement = InTotoStatement {
             statement_type: "https://in-toto.io/Statement/v1".into(),
@@ -1208,9 +1247,18 @@ mod tests {
         let verified = verifier
             .verify("v1-pkg", &bundle, None, Some(tarball_bytes))
             .unwrap();
-        assert_eq!(verified.build.source_repository.as_deref(), Some("trusted-org/v1-pkg"));
-        assert_eq!(verified.build.commit_sha.as_deref(), Some("commit1234567890abcdef"));
-        assert_eq!(verified.build.workflow_path.as_deref(), Some(".github/workflows/ci.yml"));
+        assert_eq!(
+            verified.build.source_repository.as_deref(),
+            Some("trusted-org/v1-pkg")
+        );
+        assert_eq!(
+            verified.build.commit_sha.as_deref(),
+            Some("commit1234567890abcdef")
+        );
+        assert_eq!(
+            verified.build.workflow_path.as_deref(),
+            Some(".github/workflows/ci.yml")
+        );
     }
 
     #[test]
@@ -1233,11 +1281,14 @@ mod tests {
         assert!(res_trusted.is_ok());
 
         // Validate with mismatched trusted keyid
-        let err_untrusted = validate_dist_signatures(&signatures, Some(&["SHA256:some-other-key"]))
-            .unwrap_err();
+        let err_untrusted =
+            validate_dist_signatures(&signatures, Some(&["SHA256:some-other-key"])).unwrap_err();
         match err_untrusted {
             RegistryError::InvalidSignature(msg) => {
-                assert!(msg.contains("None of the signatures matched trusted keyids"), "{msg}");
+                assert!(
+                    msg.contains("None of the signatures matched trusted keyids"),
+                    "{msg}"
+                );
             }
             other => panic!("Expected InvalidSignature, got: {other:?}"),
         }
@@ -1275,6 +1326,10 @@ mod tests {
         let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
         // Verifying with SRI string without raw tarball bytes
         let res = verifier.verify("sri-pkg", &bundle, Some(&sri_integrity), None);
-        assert!(res.is_ok(), "SRI integrity verification failed: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "SRI integrity verification failed: {:?}",
+            res.err()
+        );
     }
 }

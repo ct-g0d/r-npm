@@ -1,9 +1,9 @@
+use crate::error::ConfigError;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
 use url::Url;
-use crate::error::ConfigError;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
 
@@ -137,7 +137,8 @@ impl Npmrc {
             let mut reg_url = Url::parse(value_trimmed)?;
             ensure_trailing_slash(&mut reg_url);
             self.registry = reg_url;
-            self.settings.insert(key_trimmed.to_string(), value_trimmed.to_string());
+            self.settings
+                .insert(key_trimmed.to_string(), value_trimmed.to_string());
             return Ok(());
         }
 
@@ -147,25 +148,32 @@ impl Npmrc {
             ensure_trailing_slash(&mut reg_url);
             self.scoped_registries
                 .insert(scope.to_ascii_lowercase(), reg_url);
-            self.settings.insert(key_trimmed.to_string(), value_trimmed.to_string());
+            self.settings
+                .insert(key_trimmed.to_string(), value_trimmed.to_string());
             return Ok(());
         }
 
         // 3. Check if key is URI-scoped auth: e.g. "//registry.npmjs.org/:_authToken" or "https://registry.npmjs.org/:_authToken"
         if let Some(uri_prefix) = key_trimmed.strip_suffix(":_authToken") {
             let norm_prefix = normalize_uri_prefix(uri_prefix);
-            if value_trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            if value_trimmed
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+            {
                 return Err(ConfigError::InvalidLine(
                     "Auth token contains illegal whitespace or control characters".to_string(),
                 ));
             }
-            self.auth_tokens.insert(norm_prefix, value_trimmed.to_string());
-            self.settings.insert(key_trimmed.to_string(), value_trimmed.to_string());
+            self.auth_tokens
+                .insert(norm_prefix, value_trimmed.to_string());
+            self.settings
+                .insert(key_trimmed.to_string(), value_trimmed.to_string());
             return Ok(());
         }
 
         // Fallback: general setting
-        self.settings.insert(key_trimmed.to_string(), value_trimmed.to_string());
+        self.settings
+            .insert(key_trimmed.to_string(), value_trimmed.to_string());
         Ok(())
     }
 
@@ -231,8 +239,7 @@ impl Npmrc {
 
     /// Compute the package metadata URL using scoped registry precedence and safe package encoding.
     pub fn package_metadata_url(&self, package_name: &str) -> Result<Url, ConfigError> {
-        validate_package_name(package_name)
-            .map_err(|e| ConfigError::InvalidLine(e.to_string()))?;
+        validate_package_name(package_name).map_err(|e| ConfigError::InvalidLine(e.to_string()))?;
         let registry = self.registry_for_package(package_name);
         let encoded = encode_package_name(package_name);
         let base_str = registry.as_str().trim_end_matches('/');
@@ -435,7 +442,9 @@ pub fn encode_package_name(name: &str) -> String {
 pub fn validate_package_name(name: &str) -> Result<(), ConfigError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(ConfigError::InvalidLine("Package name cannot be empty".to_string()));
+        return Err(ConfigError::InvalidLine(
+            "Package name cannot be empty".to_string(),
+        ));
     }
 
     if trimmed.contains('\0')
@@ -561,7 +570,9 @@ where
 
                         let var_name = var_name.trim();
                         let is_valid_name = !var_name.is_empty()
-                            && var_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                            && var_name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_');
 
                         if is_valid_name {
                             let val = match lookup(var_name) {
@@ -632,8 +643,16 @@ pub fn scrub_credentials(text: &str) -> String {
 
     // 3. Redact :_authToken=<val> and other key-value credentials
     for key in &[
-        "_authtoken", "_authToken", "authtoken", "password", "secret", "token", "_auth",
-        "npm_token", "ci_auth_key", "auth_key",
+        "_authtoken",
+        "_authToken",
+        "authtoken",
+        "password",
+        "secret",
+        "token",
+        "_auth",
+        "npm_token",
+        "ci_auth_key",
+        "auth_key",
     ] {
         result = replace_kv_pairs(&result, key);
     }
@@ -693,7 +712,9 @@ fn replace_bearer(text: &str) -> String {
         out.push_str(&text[last_idx..idx + 7]);
         let remainder = &text[idx + 7..];
         let end_token = remainder
-            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';')
+            .find(|c: char| {
+                c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';'
+            })
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + 7 + end_token;
@@ -738,7 +759,15 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
         out.push_str(&text[last_idx..idx + key_len]);
         let remainder = &text[idx + key_len..];
         let end_token = remainder
-            .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '"' || c == '\'' || c == '\n' || c == '\r')
+            .find(|c: char| {
+                c.is_whitespace()
+                    || c == ';'
+                    || c == '&'
+                    || c == '"'
+                    || c == '\''
+                    || c == '\n'
+                    || c == '\r'
+            })
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + key_len + end_token;

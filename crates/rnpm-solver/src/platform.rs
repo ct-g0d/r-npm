@@ -17,11 +17,7 @@ impl Platform {
         }
     }
 
-    pub fn with_libc(
-        os: impl Into<String>,
-        cpu: impl Into<String>,
-        libc: Option<String>,
-    ) -> Self {
+    pub fn with_libc(os: impl Into<String>, cpu: impl Into<String>, libc: Option<String>) -> Self {
         Self {
             os: os.into(),
             cpu: cpu.into(),
@@ -63,6 +59,8 @@ impl Platform {
             "s390x"
         } else if cfg!(target_arch = "riscv64") {
             "riscv64"
+        } else if cfg!(target_arch = "wasm32") {
+            "wasm32"
         } else {
             std::env::consts::ARCH
         };
@@ -82,6 +80,17 @@ impl Platform {
             cpu: cpu.to_string(),
             libc,
         }
+    }
+
+    /// Evaluates whether a package with given `os`, `cpu`, and optional `libc` constraints
+    /// is compatible with this platform.
+    pub fn is_compatible(
+        &self,
+        os_list: Option<&[String]>,
+        cpu_list: Option<&[String]>,
+        libc_list: Option<&[String]>,
+    ) -> bool {
+        self.matches_with_libc(os_list, cpu_list, libc_list)
     }
 
     /// Evaluates if this platform matches both `os` and `cpu` constraints.
@@ -182,6 +191,17 @@ impl Default for Platform {
     }
 }
 
+/// Evaluates whether a package with given `os`, `cpu`, and optional `libc` constraints
+/// is compatible with the specified target platform.
+pub fn is_platform_compatible(
+    platform: &Platform,
+    os_list: Option<&[String]>,
+    cpu_list: Option<&[String]>,
+    libc_list: Option<&[String]>,
+) -> bool {
+    platform.matches_with_libc(os_list, cpu_list, libc_list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +264,79 @@ mod tests {
         assert!(linux_glibc.matches_with_libc(None, None, Some(&not_musl)));
         assert!(!linux_musl.matches_with_libc(None, None, Some(&not_musl)));
         assert!(win.matches_with_libc(None, None, Some(&not_musl)));
+    }
+
+    #[test]
+    fn test_is_platform_compatible_wasm32_and_os() {
+        let win_x64 = Platform::new("win32", "x64");
+        let mac_arm = Platform::new("darwin", "arm64");
+        let linux_x64 = Platform::new("linux", "x64");
+
+        // wasm32 cpu filter
+        let wasm_cpu = vec!["wasm32".to_string()];
+        assert!(!is_platform_compatible(
+            &win_x64,
+            None,
+            Some(&wasm_cpu),
+            None
+        ));
+        assert!(!is_platform_compatible(
+            &mac_arm,
+            None,
+            Some(&wasm_cpu),
+            None
+        ));
+        assert!(!is_platform_compatible(
+            &linux_x64,
+            None,
+            Some(&wasm_cpu),
+            None
+        ));
+
+        // darwin & linux os filter
+        let darwin_linux = vec!["darwin".to_string(), "linux".to_string()];
+        assert!(!is_platform_compatible(
+            &win_x64,
+            Some(&darwin_linux),
+            None,
+            None
+        ));
+        assert!(is_platform_compatible(
+            &mac_arm,
+            Some(&darwin_linux),
+            None,
+            None
+        ));
+        assert!(is_platform_compatible(
+            &linux_x64,
+            Some(&darwin_linux),
+            None,
+            None
+        ));
+
+        // win32 x64 positive match
+        let win_os = vec!["win32".to_string()];
+        let x64_cpu = vec!["x64".to_string()];
+        assert!(is_platform_compatible(
+            &win_x64,
+            Some(&win_os),
+            Some(&x64_cpu),
+            None
+        ));
+        assert!(!is_platform_compatible(
+            &mac_arm,
+            Some(&win_os),
+            Some(&x64_cpu),
+            None
+        ));
+
+        // Negated wasm32
+        let not_wasm = vec!["!wasm32".to_string()];
+        assert!(is_platform_compatible(
+            &win_x64,
+            None,
+            Some(&not_wasm),
+            None
+        ));
     }
 }

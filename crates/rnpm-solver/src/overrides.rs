@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use rnpm_core::semver::{Range, Version};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Value in an override definition: either an exact spec string or a nested map of overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +48,9 @@ impl Overrides {
     }
 
     /// Construct overrides from a manifest.
-    pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Result<Self, crate::error::SolverError> {
+    pub fn from_manifest(
+        manifest: &rnpm_core::manifest::Manifest,
+    ) -> Result<Self, crate::error::SolverError> {
         Ok(Self::from_json_value(
             manifest.extra.get("overrides"),
             manifest.dependencies.clone(),
@@ -244,8 +246,8 @@ fn split_arrow_key(key: &str) -> Vec<String> {
             // Check if this '>' is a comparator rather than an arrow separator:
             // 1. Followed by '=' (e.g. '>=')
             // 2. Preceded by '@' (e.g. '@>')
-            let is_comparator = (i + 1 < chars.len() && chars[i + 1] == '=')
-                || (i > 0 && chars[i - 1] == '@');
+            let is_comparator =
+                (i + 1 < chars.len() && chars[i + 1] == '=') || (i > 0 && chars[i - 1] == '@');
             if !is_comparator {
                 let part: String = chars[last_idx..i].iter().collect();
                 let trimmed = part.trim();
@@ -453,19 +455,34 @@ mod tests {
         let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
 
         // Under foo: bar is 2.0.0
-        assert_eq!(overrides.resolve_override("bar", "^1.0.0", &["foo"]), Some("2.0.0".to_string()));
+        assert_eq!(
+            overrides.resolve_override("bar", "^1.0.0", &["foo"]),
+            Some("2.0.0".to_string())
+        );
 
         // Under foo: baz is 3.0.0
-        assert_eq!(overrides.resolve_override("baz", "^1.0.0", &["foo"]), Some("3.0.0".to_string()));
+        assert_eq!(
+            overrides.resolve_override("baz", "^1.0.0", &["foo"]),
+            Some("3.0.0".to_string())
+        );
 
         // Under @scope/a: @scope/b is 1.0.0
-        assert_eq!(overrides.resolve_override("@scope/b", "*", &["@scope/a"]), Some("1.0.0".to_string()));
+        assert_eq!(
+            overrides.resolve_override("@scope/b", "*", &["@scope/a"]),
+            Some("1.0.0".to_string())
+        );
 
         // Under a > b: c is 4.0.0
-        assert_eq!(overrides.resolve_override("c", "^1.0.0", &["a", "b"]), Some("4.0.0".to_string()));
+        assert_eq!(
+            overrides.resolve_override("c", "^1.0.0", &["a", "b"]),
+            Some("4.0.0".to_string())
+        );
 
         // Under nested > x: y is 5.0.0
-        assert_eq!(overrides.resolve_override("y", "^1.0.0", &["nested", "x"]), Some("5.0.0".to_string()));
+        assert_eq!(
+            overrides.resolve_override("y", "^1.0.0", &["nested", "x"]),
+            Some("5.0.0".to_string())
+        );
 
         // Top level lookup for bar should be None
         assert_eq!(overrides.resolve_override("bar", "^1.0.0", &[]), None);

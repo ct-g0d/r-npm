@@ -1,10 +1,10 @@
-use std::fmt;
-use std::str::FromStr;
+use crate::error::IntegrityError;
 use data_encoding::BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use crate::error::IntegrityError;
+use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Algorithm {

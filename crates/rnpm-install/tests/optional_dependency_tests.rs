@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha512};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -48,7 +48,10 @@ struct TestRegistryServer {
 impl TestRegistryServer {
     async fn start<F>(handler: F) -> Self
     where
-        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)> + Send + Sync + 'static,
+        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)>
+            + Send
+            + Sync
+            + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -124,13 +127,19 @@ impl TestRegistryServer {
 #[tokio::test]
 async fn test_platform_skipping_incompatible_os_or_cpu() {
     let normal_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"normal-pkg","version":"1.0.0"}"#),
+        (
+            "package.json",
+            br#"{"name":"normal-pkg","version":"1.0.0"}"#,
+        ),
         ("index.js", b"module.exports = 'normal';"),
     ]);
     let normal_integrity = compute_ssri(&normal_tarball);
 
     let darwin_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"darwin-pkg","version":"1.0.0","os":["darwin"],"cpu":["arm64"]}"#),
+        (
+            "package.json",
+            br#"{"name":"darwin-pkg","version":"1.0.0","os":["darwin"],"cpu":["arm64"]}"#,
+        ),
         ("index.js", b"module.exports = 'darwin';"),
     ]);
     let darwin_integrity = compute_ssri(&darwin_tarball);
@@ -138,53 +147,64 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
     let normal_tarball_clone = normal_tarball.clone();
     let darwin_tarball_clone = darwin_tarball.clone();
 
-    let server = TestRegistryServer::start(move |path, base_url| {
-        match path {
-            "/normal-pkg" => {
-                let json = serde_json::json!({
-                    "name": "normal-pkg",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "normal-pkg",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/normal-pkg/-/normal-pkg-1.0.0.tgz"),
-                                "integrity": normal_integrity
-                            }
+    let server = TestRegistryServer::start(move |path, base_url| match path {
+        "/normal-pkg" => {
+            let json = serde_json::json!({
+                "name": "normal-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "normal-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/normal-pkg/-/normal-pkg-1.0.0.tgz"),
+                            "integrity": normal_integrity
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            "/darwin-pkg" => {
-                let json = serde_json::json!({
-                    "name": "darwin-pkg",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "darwin-pkg",
-                            "version": "1.0.0",
-                            "os": ["darwin"],
-                            "cpu": ["arm64"],
-                            "dist": {
-                                "tarball": format!("{base_url}/darwin-pkg/-/darwin-pkg-1.0.0.tgz"),
-                                "integrity": darwin_integrity
-                            }
-                        }
-                    }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            p if p.ends_with("/normal-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
-            }
-            p if p.ends_with("/darwin-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], darwin_tarball_clone.clone()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        "/darwin-pkg" => {
+            let json = serde_json::json!({
+                "name": "darwin-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "darwin-pkg",
+                        "version": "1.0.0",
+                        "os": ["darwin"],
+                        "cpu": ["arm64"],
+                        "dist": {
+                            "tarball": format!("{base_url}/darwin-pkg/-/darwin-pkg-1.0.0.tgz"),
+                            "integrity": darwin_integrity
+                        }
+                    }
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
+        }
+        p if p.ends_with("/normal-pkg-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            normal_tarball_clone.clone(),
+        )),
+        p if p.ends_with("/darwin-pkg-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            darwin_tarball_clone.clone(),
+        )),
+        _ => None,
+    })
+    .await;
 
     let reg_url = server.url();
 
@@ -206,7 +226,8 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
     std::fs::write(
         temp_proj.path().join("package.json"),
         root_pkg_json.to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -215,34 +236,50 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let summary = installer.run().await.unwrap();
     assert_eq!(summary.packages_installed, 1);
 
     // Verify normal-pkg was installed
-    assert!(temp_proj.path().join("node_modules").join("normal-pkg").exists());
-    assert!(temp_proj.path().join("node_modules").join("normal-pkg").join("index.js").exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("normal-pkg")
+        .exists());
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("normal-pkg")
+        .join("index.js")
+        .exists());
 
     // Verify darwin-pkg was SKIPPED on non-darwin host (or if host is win32)
     if cfg!(not(target_os = "macos")) {
         assert!(
-            !temp_proj.path().join("node_modules").join("darwin-pkg").exists(),
+            !temp_proj
+                .path()
+                .join("node_modules")
+                .join("darwin-pkg")
+                .exists(),
             "darwin-pkg must not be extracted on non-macos platform"
         );
 
         // Verify darwin-pkg tarball was NEVER requested from the registry!
         let paths = server.requested_paths.lock().await;
         let downloaded_darwin = paths.iter().any(|p| p.contains("darwin-pkg-1.0.0.tgz"));
-        assert!(!downloaded_darwin, "darwin-pkg tarball must NEVER be downloaded");
+        assert!(
+            !downloaded_darwin,
+            "darwin-pkg tarball must NEVER be downloaded"
+        );
     }
 }
 
 #[tokio::test]
 async fn test_optional_download_failure_isolation() {
-    let normal_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
-    ]);
+    let normal_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#)]);
     let normal_integrity = compute_ssri(&normal_tarball);
     let normal_tarball_clone = normal_tarball.clone();
 
@@ -263,7 +300,11 @@ async fn test_optional_download_failure_isolation() {
                         }
                     }
                 });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+                Some((
+                    200,
+                    vec![("Content-Type", "application/json".to_string())],
+                    json.to_string().into_bytes(),
+                ))
             }
             "/bad-dl-pkg" => {
                 let json = serde_json::json!({
@@ -280,18 +321,27 @@ async fn test_optional_download_failure_isolation() {
                         }
                     }
                 });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+                Some((
+                    200,
+                    vec![("Content-Type", "application/json".to_string())],
+                    json.to_string().into_bytes(),
+                ))
             }
-            p if p.ends_with("/good-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
-            }
+            p if p.ends_with("/good-pkg-1.0.0.tgz") => Some((
+                200,
+                vec![("Content-Type", "application/octet-stream".to_string())],
+                normal_tarball_clone.clone(),
+            )),
             // missing-404.tgz returns 404
-            p if p.ends_with("/missing-404.tgz") => {
-                Some((404, vec![("Content-Type", "text/plain".to_string())], b"Tarball Not Found".to_vec()))
-            }
+            p if p.ends_with("/missing-404.tgz") => Some((
+                404,
+                vec![("Content-Type", "text/plain".to_string())],
+                b"Tarball Not Found".to_vec(),
+            )),
             _ => None,
         }
-    }).await;
+    })
+    .await;
 
     let reg_url = server.url();
     let temp_proj = tempfile::tempdir().unwrap();
@@ -308,7 +358,11 @@ async fn test_optional_download_failure_isolation() {
             "bad-dl-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -317,12 +371,24 @@ async fn test_optional_download_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run().await;
-    assert!(res.is_ok(), "Installation must succeed despite optional download failure");
-    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
-    assert!(!temp_proj.path().join("node_modules").join("bad-dl-pkg").exists());
+    assert!(
+        res.is_ok(),
+        "Installation must succeed despite optional download failure"
+    );
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("good-pkg")
+        .exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("bad-dl-pkg")
+        .exists());
 
     // 2. Contrast: required dependency download failure MUST fail install!
     let temp_proj_req = tempfile::tempdir().unwrap();
@@ -333,7 +399,11 @@ async fn test_optional_download_failure_isolation() {
             "bad-dl-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj_req.path().join("package.json"),
+        root_req_json.to_string(),
+    )
+    .unwrap();
 
     let mut req_installer = Installer::new(InstallOptions {
         project_dir: temp_proj_req.path().to_path_buf(),
@@ -342,73 +412,88 @@ async fn test_optional_download_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let req_res = req_installer.run().await;
-    assert!(req_res.is_err(), "Required dependency download failure MUST fail install");
+    assert!(
+        req_res.is_err(),
+        "Required dependency download failure MUST fail install"
+    );
 }
 
 #[tokio::test]
 async fn test_optional_ssri_failure_isolation() {
-    let normal_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"valid-pkg","version":"1.0.0"}"#),
-    ]);
+    let normal_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"valid-pkg","version":"1.0.0"}"#)]);
     let normal_integrity = compute_ssri(&normal_tarball);
 
-    let corrupt_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"corrupt-pkg","version":"1.0.0"}"#),
-    ]);
+    let corrupt_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"corrupt-pkg","version":"1.0.0"}"#,
+    )]);
     // Intentionally wrong integrity hash!
     let fake_integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
     let normal_tarball_clone = normal_tarball.clone();
     let corrupt_tarball_clone = corrupt_tarball.clone();
 
-    let server = TestRegistryServer::start(move |path, base_url| {
-        match path {
-            "/valid-pkg" => {
-                let json = serde_json::json!({
-                    "name": "valid-pkg",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "valid-pkg",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/valid-pkg/-/valid-pkg-1.0.0.tgz"),
-                                "integrity": normal_integrity
-                            }
+    let server = TestRegistryServer::start(move |path, base_url| match path {
+        "/valid-pkg" => {
+            let json = serde_json::json!({
+                "name": "valid-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "valid-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/valid-pkg/-/valid-pkg-1.0.0.tgz"),
+                            "integrity": normal_integrity
                         }
                     }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            "/corrupt-pkg" => {
-                let json = serde_json::json!({
-                    "name": "corrupt-pkg",
-                    "dist-tags": { "latest": "1.0.0" },
-                    "versions": {
-                        "1.0.0": {
-                            "name": "corrupt-pkg",
-                            "version": "1.0.0",
-                            "dist": {
-                                "tarball": format!("{base_url}/corrupt-pkg/-/corrupt-pkg-1.0.0.tgz"),
-                                "integrity": fake_integrity
-                            }
-                        }
-                    }
-                });
-                Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-            }
-            p if p.ends_with("/valid-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball_clone.clone()))
-            }
-            p if p.ends_with("/corrupt-pkg-1.0.0.tgz") => {
-                Some((200, vec![("Content-Type", "application/octet-stream".to_string())], corrupt_tarball_clone.clone()))
-            }
-            _ => None,
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
         }
-    }).await;
+        "/corrupt-pkg" => {
+            let json = serde_json::json!({
+                "name": "corrupt-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "corrupt-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/corrupt-pkg/-/corrupt-pkg-1.0.0.tgz"),
+                            "integrity": fake_integrity
+                        }
+                    }
+                }
+            });
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                json.to_string().into_bytes(),
+            ))
+        }
+        p if p.ends_with("/valid-pkg-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            normal_tarball_clone.clone(),
+        )),
+        p if p.ends_with("/corrupt-pkg-1.0.0.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            corrupt_tarball_clone.clone(),
+        )),
+        _ => None,
+    })
+    .await;
 
     let reg_url = server.url();
     let temp_proj = tempfile::tempdir().unwrap();
@@ -425,7 +510,11 @@ async fn test_optional_ssri_failure_isolation() {
             "corrupt-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -434,12 +523,24 @@ async fn test_optional_ssri_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run().await;
-    assert!(res.is_ok(), "Installation must succeed despite optional SSRI mismatch");
-    assert!(temp_proj.path().join("node_modules").join("valid-pkg").exists());
-    assert!(!temp_proj.path().join("node_modules").join("corrupt-pkg").exists());
+    assert!(
+        res.is_ok(),
+        "Installation must succeed despite optional SSRI mismatch"
+    );
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("valid-pkg")
+        .exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("corrupt-pkg")
+        .exists());
 
     // 2. Contrast: required dependency SSRI mismatch MUST fail install!
     let temp_proj_req = tempfile::tempdir().unwrap();
@@ -450,7 +551,11 @@ async fn test_optional_ssri_failure_isolation() {
             "corrupt-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj_req.path().join("package.json"),
+        root_req_json.to_string(),
+    )
+    .unwrap();
 
     let mut req_installer = Installer::new(InstallOptions {
         project_dir: temp_proj_req.path().to_path_buf(),
@@ -459,17 +564,20 @@ async fn test_optional_ssri_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let req_res = req_installer.run().await;
-    assert!(req_res.is_err(), "Required dependency SSRI mismatch MUST fail install");
+    assert!(
+        req_res.is_err(),
+        "Required dependency SSRI mismatch MUST fail install"
+    );
 }
 
 #[tokio::test]
 async fn test_optional_lifecycle_failure_isolation() {
-    let normal_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"clean-pkg","version":"1.0.0"}"#),
-    ]);
+    let normal_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"clean-pkg","version":"1.0.0"}"#)]);
     let normal_integrity = compute_ssri(&normal_tarball);
 
     let failing_tarball = create_test_tarball(&[
@@ -541,7 +649,11 @@ async fn test_optional_lifecycle_failure_isolation() {
             "failing-native-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -550,11 +662,19 @@ async fn test_optional_lifecycle_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run().await;
-    assert!(res.is_ok(), "Installation must succeed despite optional lifecycle build script failure");
-    assert!(temp_proj.path().join("node_modules").join("clean-pkg").exists());
+    assert!(
+        res.is_ok(),
+        "Installation must succeed despite optional lifecycle build script failure"
+    );
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("clean-pkg")
+        .exists());
 
     // 2. Contrast: required dependency build script failure MUST fail install!
     let temp_proj_req = tempfile::tempdir().unwrap();
@@ -565,7 +685,11 @@ async fn test_optional_lifecycle_failure_isolation() {
             "failing-native-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj_req.path().join("package.json"),
+        root_req_json.to_string(),
+    )
+    .unwrap();
 
     let mut req_installer = Installer::new(InstallOptions {
         project_dir: temp_proj_req.path().to_path_buf(),
@@ -574,10 +698,14 @@ async fn test_optional_lifecycle_failure_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let req_res = req_installer.run().await;
-    assert!(req_res.is_err(), "Required dependency lifecycle script failure MUST fail install");
+    assert!(
+        req_res.is_err(),
+        "Required dependency lifecycle script failure MUST fail install"
+    );
 }
 
 #[tokio::test]
@@ -596,20 +724,28 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
             "other-os-pkg": "1.0.0"
         }
     });
-    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
 
-    let normal_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
-    ]);
+    let normal_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#)]);
     let normal_integrity = compute_ssri(&normal_tarball);
 
     let server = TestRegistryServer::start(move |path, _base_url| {
         if path.ends_with("/good-pkg-1.0.0.tgz") {
-            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], normal_tarball.clone()))
+            Some((
+                200,
+                vec![("Content-Type", "application/octet-stream".to_string())],
+                normal_tarball.clone(),
+            ))
         } else {
             None
         }
-    }).await;
+    })
+    .await;
 
     let reg_url = server.url();
 
@@ -625,35 +761,46 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
         root_pkg.optional_dependencies = Some(opt_deps);
     }
 
-    lockfile.insert_package("node_modules/good-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some(format!("{}/good-pkg-1.0.0.tgz", reg_url)),
-        integrity: Some(normal_integrity),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/good-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some(format!("{}/good-pkg-1.0.0.tgz", reg_url)),
+            integrity: Some(normal_integrity),
+            ..Default::default()
+        },
+    );
 
     // Incompatible platform optional package in lockfile
     let mut skipped_child_deps = std::collections::BTreeMap::new();
     skipped_child_deps.insert("other-os-child".to_string(), "1.0.0".to_string());
-    lockfile.insert_package("node_modules/other-os-pkg", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("http://invalid-url-should-never-be-called.local/other.tgz".to_string()),
-        integrity: Some("sha512-dummy".to_string()),
-        optional: Some(true),
-        os: Some(vec!["non_existent_os_xyz".to_string()]),
-        cpu: Some(vec!["non_existent_cpu_xyz".to_string()]),
-        dependencies: Some(skipped_child_deps),
-        ..Default::default()
-    });
-    lockfile.insert_package("node_modules/other-os-pkg/node_modules/other-os-child", LockfilePackage {
-        version: Some("1.0.0".to_string()),
-        resolved: Some("http://invalid-url-should-never-be-called.local/child.tgz".to_string()),
-        integrity: Some("sha512-dummy-child".to_string()),
-        optional: Some(true),
-        ..Default::default()
-    });
+    lockfile.insert_package(
+        "node_modules/other-os-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("http://invalid-url-should-never-be-called.local/other.tgz".to_string()),
+            integrity: Some("sha512-dummy".to_string()),
+            optional: Some(true),
+            os: Some(vec!["non_existent_os_xyz".to_string()]),
+            cpu: Some(vec!["non_existent_cpu_xyz".to_string()]),
+            dependencies: Some(skipped_child_deps),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/other-os-pkg/node_modules/other-os-child",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("http://invalid-url-should-never-be-called.local/child.tgz".to_string()),
+            integrity: Some("sha512-dummy-child".to_string()),
+            optional: Some(true),
+            ..Default::default()
+        },
+    );
 
-    lockfile.save_to_file(&temp_proj.path().join("package-lock.json")).unwrap();
+    lockfile
+        .save_to_file(&temp_proj.path().join("package-lock.json"))
+        .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -662,20 +809,37 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run_ci().await;
-    assert!(res.is_ok(), "CI install must succeed and skip incompatible optional dependency");
-    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
-    assert!(!temp_proj.path().join("node_modules").join("other-os-pkg").exists());
-    assert!(!temp_proj.path().join("node_modules").join("other-os-pkg").join("node_modules").join("other-os-child").exists());
+    assert!(
+        res.is_ok(),
+        "CI install must succeed and skip incompatible optional dependency"
+    );
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("good-pkg")
+        .exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("other-os-pkg")
+        .exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("other-os-pkg")
+        .join("node_modules")
+        .join("other-os-child")
+        .exists());
 }
 
 #[tokio::test]
 async fn test_optional_corrupted_tarball_bytes_isolation() {
-    let good_tarball = create_test_tarball(&[
-        ("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#),
-    ]);
+    let good_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"good-pkg","version":"1.0.0"}"#)]);
     let good_integrity = compute_ssri(&good_tarball);
 
     // Corrupted binary payload (not valid gzip)
@@ -747,7 +911,11 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
             "corrupt-tarball-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj.path().join("package.json"), root_pkg_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
 
     let mut installer = Installer::new(InstallOptions {
         project_dir: temp_proj.path().to_path_buf(),
@@ -756,12 +924,24 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res = installer.run().await;
-    assert!(res.is_ok(), "Installation must succeed despite optional corrupted tarball");
-    assert!(temp_proj.path().join("node_modules").join("good-pkg").exists());
-    assert!(!temp_proj.path().join("node_modules").join("corrupt-tarball-pkg").exists());
+    assert!(
+        res.is_ok(),
+        "Installation must succeed despite optional corrupted tarball"
+    );
+    assert!(temp_proj
+        .path()
+        .join("node_modules")
+        .join("good-pkg")
+        .exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("corrupt-tarball-pkg")
+        .exists());
 
     // 2. When required: extraction error must fail install
     let temp_proj_req = tempfile::tempdir().unwrap();
@@ -772,7 +952,11 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
             "corrupt-tarball-pkg": "^1.0.0"
         }
     });
-    std::fs::write(temp_proj_req.path().join("package.json"), root_req_json.to_string()).unwrap();
+    std::fs::write(
+        temp_proj_req.path().join("package.json"),
+        root_req_json.to_string(),
+    )
+    .unwrap();
 
     let mut installer_req = Installer::new(InstallOptions {
         project_dir: temp_proj_req.path().to_path_buf(),
@@ -781,8 +965,226 @@ async fn test_optional_corrupted_tarball_bytes_isolation() {
         offline: false,
         ignore_scripts: false,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let res_req = installer_req.run().await;
-    assert!(res_req.is_err(), "Required dependency corrupted tarball extraction must fail installation");
+    assert!(
+        res_req.is_err(),
+        "Required dependency corrupted tarball extraction must fail installation"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_optional_wasm32_package_and_transitive_deps_skipped_on_win32_x64() {
+    let sharp_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"sharp","version":"0.33.5"}"#)]);
+    let sharp_integrity = compute_ssri(&sharp_tarball);
+
+    let color_tarball =
+        create_test_tarball(&[("package.json", br#"{"name":"color","version":"4.2.3"}"#)]);
+    let color_integrity = compute_ssri(&color_tarball);
+
+    let win64_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"@img/sharp-win32-x64","version":"0.33.5"}"#,
+    )]);
+    let win64_integrity = compute_ssri(&win64_tarball);
+
+    let wasm_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"@img/sharp-wasm32","version":"0.33.5"}"#,
+    )]);
+    let wasm_integrity = compute_ssri(&wasm_tarball);
+
+    let emnapi_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"@emnapi/runtime","version":"1.2.2"}"#,
+    )]);
+    let emnapi_integrity = compute_ssri(&emnapi_tarball);
+
+    let s_tar = sharp_tarball.clone();
+    let c_tar = color_tarball.clone();
+    let w_tar = win64_tarball.clone();
+    let wasm_tar = wasm_tarball.clone();
+    let em_tar = emnapi_tarball.clone();
+
+    let server = TestRegistryServer::start(move |path, _base_url| match path {
+        p if p.ends_with("/sharp-0.33.5.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            s_tar.clone(),
+        )),
+        p if p.ends_with("/color-4.2.3.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            c_tar.clone(),
+        )),
+        p if p.ends_with("/sharp-win32-x64-0.33.5.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            w_tar.clone(),
+        )),
+        p if p.ends_with("/sharp-wasm32-0.33.5.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            wasm_tar.clone(),
+        )),
+        p if p.ends_with("/emnapi-runtime-1.2.2.tgz") => Some((
+            200,
+            vec![("Content-Type", "application/octet-stream".to_string())],
+            em_tar.clone(),
+        )),
+        _ => None,
+    })
+    .await;
+
+    let reg_url = server.url();
+
+    let temp_proj = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    let root_pkg_json = serde_json::json!({
+        "name": "test-ci-wasm32",
+        "version": "1.0.0",
+        "dependencies": {
+            "sharp": "0.33.5"
+        }
+    });
+    std::fs::write(
+        temp_proj.path().join("package.json"),
+        root_pkg_json.to_string(),
+    )
+    .unwrap();
+
+    let mut lockfile = LockfileV3::new("test-ci-wasm32", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lockfile.root_package_mut() {
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert("sharp".to_string(), "0.33.5".to_string());
+        root_pkg.dependencies = Some(deps);
+    }
+
+    // sharp node_modules entry
+    let mut sharp_deps = std::collections::BTreeMap::new();
+    sharp_deps.insert("color".to_string(), "4.2.3".to_string());
+    let mut sharp_opt_deps = std::collections::BTreeMap::new();
+    sharp_opt_deps.insert("@img/sharp-wasm32".to_string(), "0.33.5".to_string());
+    sharp_opt_deps.insert("@img/sharp-win32-x64".to_string(), "0.33.5".to_string());
+
+    lockfile.insert_package(
+        "node_modules/sharp",
+        LockfilePackage {
+            version: Some("0.33.5".to_string()),
+            resolved: Some(format!("{}/sharp-0.33.5.tgz", reg_url)),
+            integrity: Some(sharp_integrity),
+            dependencies: Some(sharp_deps),
+            optional_dependencies: Some(sharp_opt_deps),
+            ..Default::default()
+        },
+    );
+
+    // color entry (prod dependency of sharp)
+    lockfile.insert_package(
+        "node_modules/color",
+        LockfilePackage {
+            version: Some("4.2.3".to_string()),
+            resolved: Some(format!("{}/color-4.2.3.tgz", reg_url)),
+            integrity: Some(color_integrity),
+            ..Default::default()
+        },
+    );
+
+    // @img/sharp-win32-x64 entry (compatible optional dependency on win32 x64)
+    lockfile.insert_package(
+        "node_modules/@img/sharp-win32-x64",
+        LockfilePackage {
+            version: Some("0.33.5".to_string()),
+            resolved: Some(format!("{}/sharp-win32-x64-0.33.5.tgz", reg_url)),
+            integrity: Some(win64_integrity),
+            os: Some(vec!["win32".to_string()]),
+            cpu: Some(vec!["x64".to_string()]),
+            optional: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // @img/sharp-wasm32 entry (incompatible optional dependency with cpu: ["wasm32"])
+    let mut wasm_deps = std::collections::BTreeMap::new();
+    wasm_deps.insert("@emnapi/runtime".to_string(), "1.2.2".to_string());
+    lockfile.insert_package(
+        "node_modules/@img/sharp-wasm32",
+        LockfilePackage {
+            version: Some("0.33.5".to_string()),
+            resolved: Some(format!("{}/sharp-wasm32-0.33.5.tgz", reg_url)),
+            integrity: Some(wasm_integrity),
+            cpu: Some(vec!["wasm32".to_string()]),
+            optional: Some(true),
+            dependencies: Some(wasm_deps),
+            ..Default::default()
+        },
+    );
+
+    // @emnapi/runtime entry (transitive dependency ONLY required by @img/sharp-wasm32)
+    lockfile.insert_package(
+        "node_modules/@emnapi/runtime",
+        LockfilePackage {
+            version: Some("1.2.2".to_string()),
+            resolved: Some(format!("{}/emnapi-runtime-1.2.2.tgz", reg_url)),
+            integrity: Some(emnapi_integrity),
+            optional: Some(true),
+            ..Default::default()
+        },
+    );
+
+    lockfile
+        .save_to_file(&temp_proj.path().join("package-lock.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: temp_proj.path().to_path_buf(),
+        registry_url: Some(reg_url),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ignore_scripts: false,
+        os: Some("win32".to_string()),
+        cpu: Some("x64".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(res.is_ok(), "CI run failed: {:?}", res.err());
+
+    let nm = temp_proj.path().join("node_modules");
+
+    // sharp and its compatible optional win32-x64 dependency AND its regular dependency 'color' MUST exist
+    assert!(nm.join("sharp").exists(), "sharp should be installed");
+    assert!(nm.join("color").exists(), "color should be installed");
+    assert!(
+        nm.join("@img").join("sharp-win32-x64").exists(),
+        "@img/sharp-win32-x64 should be installed on win32 x64"
+    );
+
+    // Incompatible wasm32 package MUST NOT be installed
+    assert!(
+        !nm.join("@img").join("sharp-wasm32").exists(),
+        "@img/sharp-wasm32 must be skipped on win32 x64"
+    );
+
+    // Transitive dependency only needed by wasm32 MUST NOT be installed
+    assert!(
+        !nm.join("@emnapi").join("runtime").exists(),
+        "@emnapi/runtime must be skipped when parent wasm32 package is skipped"
+    );
+
+    // Verify neither wasm32 nor emnapi was ever fetched
+    let requested = server.requested_paths.lock().await;
+    assert!(
+        !requested.iter().any(|p| p.contains("sharp-wasm32")),
+        "@img/sharp-wasm32 should not be downloaded"
+    );
+    assert!(
+        !requested.iter().any(|p| p.contains("emnapi-runtime")),
+        "@emnapi/runtime should not be downloaded"
+    );
 }

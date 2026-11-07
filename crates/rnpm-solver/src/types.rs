@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use crate::error::SolverError;
 use rnpm_core::manifest::PeerDependencyMeta;
 use rnpm_core::semver::Version;
 use rnpm_lockfile::PackageBin;
 use serde::{Deserialize, Serialize};
-use crate::error::SolverError;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Metadata for a specific version of a package.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -75,7 +75,11 @@ impl PackageVersionMetadata {
                 rnpm_core::manifest::PackageBin::Single(s) => PackageBin::Single(s),
                 rnpm_core::manifest::PackageBin::Map(m) => PackageBin::Map(m),
             }),
-            license: manifest.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+            license: manifest
+                .extra
+                .get("license")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
             engines: manifest.engines.clone(),
             has_install_script: manifest.scripts.contains_key("preinstall")
                 || manifest.scripts.contains_key("install")
@@ -129,23 +133,21 @@ impl InMemoryPackageProvider {
         let name_str = name.into();
         let version_str = version.into();
 
-        let pkg = self
-            .packages
-            .entry(name_str.clone())
-            .or_insert_with(|| {
-                let mut dist_tags = BTreeMap::new();
-                dist_tags.insert("latest".to_string(), version_str.clone());
-                PackageMetadata {
-                    name: name_str.clone(),
-                    dist_tags,
-                    versions: BTreeMap::new(),
-                }
-            });
+        let pkg = self.packages.entry(name_str.clone()).or_insert_with(|| {
+            let mut dist_tags = BTreeMap::new();
+            dist_tags.insert("latest".to_string(), version_str.clone());
+            PackageMetadata {
+                name: name_str.clone(),
+                dist_tags,
+                versions: BTreeMap::new(),
+            }
+        });
 
         // Keep the synthetic provider's implicit latest tag aligned with the
         // highest version, while preserving an explicitly assigned tag.
         if !pkg.dist_tags.contains_key("latest") {
-            pkg.dist_tags.insert("latest".to_string(), version_str.clone());
+            pkg.dist_tags
+                .insert("latest".to_string(), version_str.clone());
         } else if !self.explicit_latest.contains(&name_str) {
             let should_update = pkg
                 .dist_tags
@@ -155,7 +157,8 @@ impl InMemoryPackageProvider {
                 .map(|(current, next)| next > current)
                 .unwrap_or(false);
             if should_update {
-                pkg.dist_tags.insert("latest".to_string(), version_str.clone());
+                pkg.dist_tags
+                    .insert("latest".to_string(), version_str.clone());
             }
         }
 

@@ -1,11 +1,11 @@
-use std::fmt;
-use std::path::PathBuf;
-use std::str::FromStr;
-use serde::{Deserialize, Serialize};
-use url::Url;
 use crate::error::SpecError;
 use crate::semver::range::Range;
 use crate::semver::version::Version;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::PathBuf;
+use std::str::FromStr;
+use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PackageTarget {
@@ -54,8 +54,15 @@ impl PackageTarget {
         // "git+ssh://git@github.com/org/repo.git", "git://github.com/org/repo.git",
         // "gitlab:user/repo", "bitbucket:user/repo", "git+file:///path/to/repo"
         let git_prefixes = [
-            "git+ssh://", "git+https://", "git+http://", "git+git://", "git+file://", "git://",
-            "github:", "gitlab:", "bitbucket:",
+            "git+ssh://",
+            "git+https://",
+            "git+http://",
+            "git+git://",
+            "git+file://",
+            "git://",
+            "github:",
+            "gitlab:",
+            "bitbucket:",
         ];
         for prefix in git_prefixes {
             if s.starts_with(prefix) {
@@ -293,8 +300,15 @@ impl PackageSpec {
 
         // Direct Git specifier without name (e.g. "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0")
         let git_prefixes = [
-            "git+ssh://", "git+https://", "git+http://", "git+git://", "git+file://", "git://",
-            "github:", "gitlab:", "bitbucket:",
+            "git+ssh://",
+            "git+https://",
+            "git+http://",
+            "git+git://",
+            "git+file://",
+            "git://",
+            "github:",
+            "gitlab:",
+            "bitbucket:",
         ];
         for prefix in git_prefixes {
             if trimmed.starts_with(prefix) {
@@ -415,7 +429,12 @@ fn extract_url_package_name(url_str: &str) -> String {
             }
             if let Some(dash_idx) = last_seg.rfind('-') {
                 let suffix = &last_seg[dash_idx + 1..];
-                if suffix.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                if suffix
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     return last_seg[..dash_idx].to_string();
                 }
             }

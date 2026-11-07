@@ -1,9 +1,9 @@
+use crate::npmrc::{interpolate_env, Npmrc};
+use crate::Config;
 use std::collections::HashMap;
 use std::fs;
 use tempfile::tempdir;
 use url::Url;
-use crate::npmrc::{interpolate_env, Npmrc};
-use crate::Config;
 
 #[test]
 fn test_env_interpolation() {
@@ -25,10 +25,7 @@ fn test_env_interpolation() {
     );
 
     // Unset without fallback produces empty
-    assert_eq!(
-        interpolate_env("val=${UNSET_VAR}", &lookup),
-        "val="
-    );
+    assert_eq!(interpolate_env("val=${UNSET_VAR}", &lookup), "val=");
 
     // $VAR shorthand
     assert_eq!(
@@ -96,16 +93,10 @@ fn test_auth_token_resolution() {
     );
 
     let github_url = Url::parse("https://npm.pkg.github.com/@myorg/foo").unwrap();
-    assert_eq!(
-        npmrc.get_auth_token(&github_url),
-        Some("ghp_secret_token")
-    );
+    assert_eq!(npmrc.get_auth_token(&github_url), Some("ghp_secret_token"));
 
     let local_url = Url::parse("http://localhost:4873/tarballs/foo.tgz").unwrap();
-    assert_eq!(
-        npmrc.get_auth_token(&local_url),
-        Some("local_test_token")
-    );
+    assert_eq!(npmrc.get_auth_token(&local_url), Some("local_test_token"));
 
     let unknown_url = Url::parse("https://unknown.registry.com/").unwrap();
     assert_eq!(npmrc.get_auth_token(&unknown_url), None);
@@ -118,9 +109,13 @@ fn test_config_merging_precedence() {
 
     // User settings
     let mut user_npmrc = Npmrc::new();
-    user_npmrc.set("registry", "https://user.registry.com/").unwrap();
+    user_npmrc
+        .set("registry", "https://user.registry.com/")
+        .unwrap();
     user_npmrc.set("package-lock", "true").unwrap();
-    user_npmrc.set("@myorg:registry", "https://user.myorg.com/").unwrap();
+    user_npmrc
+        .set("@myorg:registry", "https://user.myorg.com/")
+        .unwrap();
 
     // Project settings
     let project_npmrc_content = r#"
@@ -136,7 +131,10 @@ fn test_config_merging_precedence() {
     user_npmrc.merge(project_npmrc);
 
     // Project overrides user registry
-    assert_eq!(user_npmrc.registry.as_str(), "https://project.registry.com/");
+    assert_eq!(
+        user_npmrc.registry.as_str(),
+        "https://project.registry.com/"
+    );
     // User scoped registry preserved
     assert_eq!(
         user_npmrc.scoped_registries.get("@myorg").unwrap().as_str(),
@@ -149,7 +147,10 @@ fn test_config_merging_precedence() {
 
     // Test Config::load with project directory
     let loaded = Config::load(Some(&project_dir)).unwrap();
-    assert_eq!(loaded.npmrc.registry.as_str(), "https://project.registry.com/");
+    assert_eq!(
+        loaded.npmrc.registry.as_str(),
+        "https://project.registry.com/"
+    );
     assert_eq!(loaded.npmrc.settings.get("save-exact").unwrap(), "true");
 }
 
@@ -161,18 +162,9 @@ fn test_env_interpolation_escaping_and_defaults() {
     let lookup = |var: &str| env_map.get(var).cloned();
 
     // 1. Escaping ${VAR} and $VAR
-    assert_eq!(
-        interpolate_env(r"\${SET_VAR}", &lookup),
-        "${SET_VAR}"
-    );
-    assert_eq!(
-        interpolate_env(r"\$SET_VAR", &lookup),
-        "$SET_VAR"
-    );
-    assert_eq!(
-        interpolate_env("Cost is $$100", &lookup),
-        "Cost is $100"
-    );
+    assert_eq!(interpolate_env(r"\${SET_VAR}", &lookup), "${SET_VAR}");
+    assert_eq!(interpolate_env(r"\$SET_VAR", &lookup), "$SET_VAR");
+    assert_eq!(interpolate_env("Cost is $$100", &lookup), "Cost is $100");
 
     // 2. ${VAR:-default} uses default when unset OR empty
     assert_eq!(
@@ -183,24 +175,15 @@ fn test_env_interpolation_escaping_and_defaults() {
         interpolate_env("${EMPTY_VAR:-fallback}", &lookup),
         "fallback"
     );
-    assert_eq!(
-        interpolate_env("${SET_VAR:-fallback}", &lookup),
-        "val"
-    );
+    assert_eq!(interpolate_env("${SET_VAR:-fallback}", &lookup), "val");
 
     // 3. ${VAR-default} uses default ONLY when unset (keeps empty if set to empty)
     assert_eq!(
         interpolate_env("${UNSET_VAR-fallback}", &lookup),
         "fallback"
     );
-    assert_eq!(
-        interpolate_env("${EMPTY_VAR-fallback}", &lookup),
-        ""
-    );
-    assert_eq!(
-        interpolate_env("${SET_VAR-fallback}", &lookup),
-        "val"
-    );
+    assert_eq!(interpolate_env("${EMPTY_VAR-fallback}", &lookup), "");
+    assert_eq!(interpolate_env("${SET_VAR-fallback}", &lookup), "val");
 
     // 4. Multi-byte Unicode in input works safely without slice boundary issues
     let unicode_input = "prefix 🦀 ${SET_VAR} 🚀 suffix";
@@ -295,14 +278,18 @@ fn test_auth_token_for_package_and_crlf_rejection() {
 
     // Rejection of CRLF / newline injection in auth token
     let mut bad_npmrc = Npmrc::new();
-    assert!(bad_npmrc.set("//registry.org/:_authToken", "token\r\nevil=1").is_err());
+    assert!(bad_npmrc
+        .set("//registry.org/:_authToken", "token\r\nevil=1")
+        .is_err());
     assert!(bad_npmrc.set("key\ninvalid", "val").is_err());
 }
 
 #[test]
 fn test_package_metadata_url_and_validation() {
     let mut npmrc = Npmrc::new();
-    npmrc.set("@myorg:registry", "https://custom.registry.com/").unwrap();
+    npmrc
+        .set("@myorg:registry", "https://custom.registry.com/")
+        .unwrap();
 
     // Scoped package URL formatting
     let url = npmrc.package_metadata_url("@myorg/pkg").unwrap();
@@ -314,7 +301,9 @@ fn test_package_metadata_url_and_validation() {
 
     // Path traversal in package name is rejected
     assert!(npmrc.package_metadata_url("../foo").is_err());
-    assert!(npmrc.package_metadata_url("@myorg/../../etc/passwd").is_err());
+    assert!(npmrc
+        .package_metadata_url("@myorg/../../etc/passwd")
+        .is_err());
     assert!(npmrc.package_metadata_url("").is_err());
 }
 
@@ -459,9 +448,18 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
     use crate::npmrc::{is_sensitive_credential_key, mask_credential, scrub_credentials};
 
     let mut env_map = HashMap::new();
-    env_map.insert("NPM_TOKEN".to_string(), "npm_live_prod_secret_token_1234567890".to_string());
-    env_map.insert("CI_AUTH_KEY".to_string(), "ghp_ci_runner_key_9876543210abcdef".to_string());
-    env_map.insert("CUSTOM_REGISTRY_HOST".to_string(), "npm.internal.corp".to_string());
+    env_map.insert(
+        "NPM_TOKEN".to_string(),
+        "npm_live_prod_secret_token_1234567890".to_string(),
+    );
+    env_map.insert(
+        "CI_AUTH_KEY".to_string(),
+        "ghp_ci_runner_key_9876543210abcdef".to_string(),
+    );
+    env_map.insert(
+        "CUSTOM_REGISTRY_HOST".to_string(),
+        "npm.internal.corp".to_string(),
+    );
 
     let lookup = |var: &str| env_map.get(var).cloned();
 
@@ -499,10 +497,7 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
     );
 
     // 4. Verify escaped syntax remains literal
-    assert_eq!(
-        npmrc.settings.get("escaped_val").unwrap(),
-        "${NPM_TOKEN}"
-    );
+    assert_eq!(npmrc.settings.get("escaped_val").unwrap(), "${NPM_TOKEN}");
 
     // 5. Verify Debug formatting DOES NOT leak credentials
     let debug_repr = format!("{:?}", npmrc);
@@ -535,7 +530,9 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
     assert!(cleaned.contains("[REDACTED]"));
 
     // 8. Test key sensitivity detection
-    assert!(is_sensitive_credential_key("//registry.npmjs.org/:_authToken"));
+    assert!(is_sensitive_credential_key(
+        "//registry.npmjs.org/:_authToken"
+    ));
     assert!(is_sensitive_credential_key("NPM_TOKEN"));
     assert!(is_sensitive_credential_key("CI_AUTH_KEY"));
     assert!(is_sensitive_credential_key("_authToken"));
@@ -552,17 +549,25 @@ fn test_npmrc_token_expansion_npm_token_and_ci_auth_key() {
 
 #[test]
 fn test_full_npmrc_precedence_chain() {
-    use std::collections::BTreeMap;
     use crate::ConfigOptions;
+    use std::collections::BTreeMap;
 
     let temp_root = tempdir().unwrap();
     let root_path = temp_root.path();
 
     let global_file = root_path.join("global.npmrc");
-    fs::write(&global_file, "registry=https://global.registry.org/\nglobal_only=1\ncommon=from_global\n").unwrap();
+    fs::write(
+        &global_file,
+        "registry=https://global.registry.org/\nglobal_only=1\ncommon=from_global\n",
+    )
+    .unwrap();
 
     let user_file = root_path.join("user.npmrc");
-    fs::write(&user_file, "registry=https://user.registry.org/\nuser_only=2\ncommon=from_user\n").unwrap();
+    fs::write(
+        &user_file,
+        "registry=https://user.registry.org/\nuser_only=2\ncommon=from_user\n",
+    )
+    .unwrap();
 
     let ws_dir = root_path.join("workspace");
     let packages_dir = ws_dir.join("packages");
@@ -571,19 +576,33 @@ fn test_full_npmrc_precedence_chain() {
 
     let ws_pkg_json = r#"{"name": "root-ws", "workspaces": ["packages/*"]}"#;
     fs::write(ws_dir.join("package.json"), ws_pkg_json).unwrap();
-    fs::write(ws_dir.join(".npmrc"), "registry=https://ws.registry.org/\nws_only=3\ncommon=from_ws\n").unwrap();
+    fs::write(
+        ws_dir.join(".npmrc"),
+        "registry=https://ws.registry.org/\nws_only=3\ncommon=from_ws\n",
+    )
+    .unwrap();
 
     let member_pkg_json = r#"{"name": "pkg-member", "version": "1.0.0"}"#;
     fs::write(project_dir.join("package.json"), member_pkg_json).unwrap();
-    fs::write(project_dir.join(".npmrc"), "registry=https://proj.registry.org/\nproj_only=4\ncommon=from_proj\n").unwrap();
+    fs::write(
+        project_dir.join(".npmrc"),
+        "registry=https://proj.registry.org/\nproj_only=4\ncommon=from_proj\n",
+    )
+    .unwrap();
 
     let mut env_map = BTreeMap::new();
-    env_map.insert("npm_config_registry".to_string(), "https://env.registry.org/".to_string());
+    env_map.insert(
+        "npm_config_registry".to_string(),
+        "https://env.registry.org/".to_string(),
+    );
     env_map.insert("npm_config_env_only".to_string(), "5".to_string());
     env_map.insert("npm_config_common".to_string(), "from_env".to_string());
 
     let mut cli_map = BTreeMap::new();
-    cli_map.insert("registry".to_string(), "https://cli.registry.org/".to_string());
+    cli_map.insert(
+        "registry".to_string(),
+        "https://cli.registry.org/".to_string(),
+    );
     cli_map.insert("cli_only".to_string(), "6".to_string());
     cli_map.insert("common".to_string(), "from_cli".to_string());
 
@@ -661,31 +680,50 @@ fn test_workspace_and_project_npmrc_precedence() {
             .env_vars(std::collections::BTreeMap::new()),
     )
     .unwrap();
-    assert_eq!(loaded_b.npmrc.registry.as_str(), "https://pkg-b.registry.org/");
+    assert_eq!(
+        loaded_b.npmrc.registry.as_str(),
+        "https://pkg-b.registry.org/"
+    );
     assert_eq!(loaded_b.get("strict-ssl"), Some("true"));
     assert_eq!(loaded_b.get("shared_flag"), Some("from_pkg_b"));
 }
 
 #[test]
 fn test_env_vars_and_cli_overrides() {
-    use std::collections::BTreeMap;
     use crate::ConfigOptions;
+    use std::collections::BTreeMap;
 
     let mut env_map = BTreeMap::new();
     env_map.insert("NPM_CONFIG_STRICT_SSL".to_string(), "false".to_string());
-    env_map.insert("npm_config_proxy".to_string(), "http://proxy.corp:8080".to_string());
-    env_map.insert("NPM_CONFIG_HTTPS_PROXY".to_string(), "https://proxy.corp:8443".to_string());
+    env_map.insert(
+        "npm_config_proxy".to_string(),
+        "http://proxy.corp:8080".to_string(),
+    );
+    env_map.insert(
+        "NPM_CONFIG_HTTPS_PROXY".to_string(),
+        "https://proxy.corp:8443".to_string(),
+    );
     env_map.insert("npm_config_fetch_timeout".to_string(), "45000".to_string());
-    env_map.insert("npm_config_cafile".to_string(), "/path/to/cert.pem".to_string());
+    env_map.insert(
+        "npm_config_cafile".to_string(),
+        "/path/to/cert.pem".to_string(),
+    );
     env_map.insert("npm_config__auth".to_string(), "token_123".to_string());
 
-    let loaded_env = Config::load_with_options(ConfigOptions::new().env_vars(env_map.clone())).unwrap();
+    let loaded_env =
+        Config::load_with_options(ConfigOptions::new().env_vars(env_map.clone())).unwrap();
     assert_eq!(loaded_env.get("strict-ssl"), Some("false"));
     assert_eq!(loaded_env.get("strict_ssl"), Some("false"));
     assert_eq!(loaded_env.get_bool("strict_ssl"), Some(false));
     assert_eq!(loaded_env.get("proxy"), Some("http://proxy.corp:8080"));
-    assert_eq!(loaded_env.get("https-proxy"), Some("https://proxy.corp:8443"));
-    assert_eq!(loaded_env.get("https_proxy"), Some("https://proxy.corp:8443"));
+    assert_eq!(
+        loaded_env.get("https-proxy"),
+        Some("https://proxy.corp:8443")
+    );
+    assert_eq!(
+        loaded_env.get("https_proxy"),
+        Some("https://proxy.corp:8443")
+    );
     assert_eq!(loaded_env.get("fetch-timeout"), Some("45000"));
     assert_eq!(loaded_env.get("fetch_timeout"), Some("45000"));
     assert_eq!(loaded_env.get("cafile"), Some("/path/to/cert.pem"));
@@ -704,7 +742,10 @@ fn test_env_vars_and_cli_overrides() {
     assert_eq!(loaded_cli.get("strict-ssl"), Some("true"));
     assert_eq!(loaded_cli.get_bool("strict-ssl"), Some(true));
     assert_eq!(loaded_cli.get("proxy"), Some("http://cli.proxy:9000"));
-    assert_eq!(loaded_cli.get("https-proxy"), Some("https://proxy.corp:8443"));
+    assert_eq!(
+        loaded_cli.get("https-proxy"),
+        Some("https://proxy.corp:8443")
+    );
 }
 
 #[test]
@@ -744,11 +785,11 @@ fn test_config_file_set_and_delete() {
 
 #[test]
 fn test_config_detailed_and_paths() {
-    use std::path::PathBuf;
     use crate::{
         find_global_bin_dir, find_global_node_modules, find_global_prefix_with_env,
         find_local_bin_dir, find_local_node_modules, find_local_prefix, Config, ConfigOptions,
     };
+    use std::path::PathBuf;
 
     let dir = tempdir().unwrap();
     let proj_dir = dir.path().join("my-app");

@@ -222,10 +222,8 @@ async fn test_mock_streaming_tarball_download() {
 #[tokio::test]
 async fn test_security_auth_header_stripped_on_cross_host_redirect() {
     // Target CDN server on separate port
-    let cdn_server = MockHttpServer::start(|_req| {
-        (200, vec![], b"downloaded from cdn".to_vec())
-    })
-    .await;
+    let cdn_server =
+        MockHttpServer::start(|_req| (200, vec![], b"downloaded from cdn".to_vec())).await;
 
     let cdn_url = cdn_server.url();
 
@@ -286,13 +284,15 @@ async fn test_security_auth_header_retained_on_same_host_redirect() {
     let server = MockHttpServer::start(|req| {
         if req.contains("GET /step1") {
             assert!(
-                req.to_lowercase().contains("authorization: bearer secret-npm-token"),
+                req.to_lowercase()
+                    .contains("authorization: bearer secret-npm-token"),
                 "Step 1 must have auth"
             );
             (302, vec![("Location", "/step2".into())], vec![])
         } else if req.contains("GET /step2") {
             assert!(
-                req.to_lowercase().contains("authorization: bearer secret-npm-token"),
+                req.to_lowercase()
+                    .contains("authorization: bearer secret-npm-token"),
                 "Step 2 on same host must retain auth"
             );
             (200, vec![], b"same host ok".to_vec())
@@ -355,20 +355,29 @@ async fn test_error_handling() {
 
     // 404
     let err = client.get_package_metadata("not-found").await.unwrap_err();
-    assert!(matches!(err, rnpm_registry::RegistryError::PackageNotFound { .. }));
+    assert!(matches!(
+        err,
+        rnpm_registry::RegistryError::PackageNotFound { .. }
+    ));
     assert_eq!(err.status_code(), Some(404));
     assert!(err.is_not_found());
 
     // 401
     let err = client.get_package_metadata("unauth").await.unwrap_err();
-    assert!(matches!(err, rnpm_registry::RegistryError::Unauthorized { .. }));
+    assert!(matches!(
+        err,
+        rnpm_registry::RegistryError::Unauthorized { .. }
+    ));
     assert_eq!(err.status_code(), Some(401));
     assert!(err.is_unauthorized());
     assert!(err.is_auth_error());
 
     // 403
     let err = client.get_package_metadata("forbidden").await.unwrap_err();
-    assert!(matches!(err, rnpm_registry::RegistryError::Forbidden { .. }));
+    assert!(matches!(
+        err,
+        rnpm_registry::RegistryError::Forbidden { .. }
+    ));
     assert_eq!(err.status_code(), Some(403));
     assert!(err.is_forbidden());
     assert!(err.is_auth_error());
@@ -445,13 +454,29 @@ async fn test_concurrent_metadata_and_tarball_fetching() {
 
     let server = MockHttpServer::start(move |req| {
         if req.contains("GET /pkg-a") {
-            (200, vec![("Content-Type", "application/json".into())], pkg_a_json.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                pkg_a_json.as_bytes().to_vec(),
+            )
         } else if req.contains("GET /pkg-b") {
-            (200, vec![("Content-Type", "application/json".into())], pkg_b_json.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                pkg_b_json.as_bytes().to_vec(),
+            )
         } else if req.contains("GET /tarballs/pkg-a.tgz") {
-            (200, vec![("Content-Type", "application/octet-stream".into())], b"bytes-a".to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/octet-stream".into())],
+                b"bytes-a".to_vec(),
+            )
         } else if req.contains("GET /tarballs/pkg-b.tgz") {
-            (200, vec![("Content-Type", "application/octet-stream".into())], b"bytes-b".to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/octet-stream".into())],
+                b"bytes-b".to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
@@ -470,7 +495,9 @@ async fn test_concurrent_metadata_and_tarball_fetching() {
     let client = RegistryClient::with_config(config).unwrap();
 
     // Test concurrent metadata fetch
-    let metas = client.get_package_metadata_concurrent(&["pkg-a", "pkg-b"]).await;
+    let metas = client
+        .get_package_metadata_concurrent(&["pkg-a", "pkg-b"])
+        .await;
     assert_eq!(metas.len(), 2);
     assert_eq!(metas[0].as_ref().unwrap().name, "pkg-a");
     assert_eq!(metas[1].as_ref().unwrap().name, "pkg-b");
@@ -508,10 +535,18 @@ async fn test_retry_backoff_on_503_recovers() {
             let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 // First attempt: 503 Service Unavailable
-                (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+                (
+                    503,
+                    vec![("Retry-After", "0".into())],
+                    b"Service Unavailable".to_vec(),
+                )
             } else {
                 // Second attempt: succeeds with 200 OK
-                (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+                (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    mock_json.as_bytes().to_vec(),
+                )
             }
         } else {
             (404, vec![], b"Not Found".to_vec())
@@ -532,7 +567,11 @@ async fn test_retry_backoff_on_503_recovers() {
 
     let meta = client.get_package_metadata("flakey-503-pkg").await.unwrap();
     assert_eq!(meta.name, "flakey-503-pkg");
-    assert_eq!(attempt_counter.load(Ordering::SeqCst), 2, "Must have retried and succeeded on attempt 2");
+    assert_eq!(
+        attempt_counter.load(Ordering::SeqCst),
+        2,
+        "Must have retried and succeeded on attempt 2"
+    );
 
     server.stop();
 }
@@ -559,10 +598,18 @@ async fn test_retry_backoff_on_429_recovers() {
             let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 // First attempt: 429 Too Many Requests with 0-second Retry-After
-                (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec())
+                (
+                    429,
+                    vec![("Retry-After", "0".into())],
+                    b"Too Many Requests".to_vec(),
+                )
             } else {
                 // Second attempt: succeeds
-                (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+                (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    mock_json.as_bytes().to_vec(),
+                )
             }
         } else {
             (404, vec![], b"Not Found".to_vec())
@@ -583,7 +630,11 @@ async fn test_retry_backoff_on_429_recovers() {
 
     let meta = client.get_package_metadata("flakey-429-pkg").await.unwrap();
     assert_eq!(meta.name, "flakey-429-pkg");
-    assert_eq!(attempt_counter.load(Ordering::SeqCst), 2, "Must have retried on 429 and succeeded on attempt 2");
+    assert_eq!(
+        attempt_counter.load(Ordering::SeqCst),
+        2,
+        "Must have retried on 429 and succeeded on attempt 2"
+    );
 
     server.stop();
 }
@@ -596,7 +647,11 @@ async fn test_retry_backoff_exceeds_max_retries_fails() {
     let server = MockHttpServer::start(move |req| {
         if req.contains("GET /persistently-503-pkg") {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-            (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+            (
+                503,
+                vec![("Retry-After", "0".into())],
+                b"Service Unavailable".to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found".to_vec())
         }
@@ -614,7 +669,10 @@ async fn test_retry_backoff_exceeds_max_retries_fails() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("persistently-503-pkg").await.unwrap_err();
+    let err = client
+        .get_package_metadata("persistently-503-pkg")
+        .await
+        .unwrap_err();
     assert_eq!(err.status_code(), Some(503));
     // Attempt 0 + 2 retries = 3 total requests
     assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
@@ -639,7 +697,10 @@ async fn test_etag_304_conditional_metadata_and_tarball() {
 
     let server = MockHttpServer::start(move |req| {
         if req.contains("GET /cached-pkg") {
-            if req.to_lowercase().contains("if-none-match: \"pkg-etag-v1\"") {
+            if req
+                .to_lowercase()
+                .contains("if-none-match: \"pkg-etag-v1\"")
+            {
                 // 304 Not Modified
                 (304, vec![("ETag", "\"pkg-etag-v1\"".into())], vec![])
             } else {
@@ -653,7 +714,10 @@ async fn test_etag_304_conditional_metadata_and_tarball() {
                 )
             }
         } else if req.contains("GET /tarballs/cached-pkg.tgz") {
-            if req.to_lowercase().contains("if-none-match: \"tarball-etag-v1\"") {
+            if req
+                .to_lowercase()
+                .contains("if-none-match: \"tarball-etag-v1\"")
+            {
                 // 304 Not Modified
                 (304, vec![("ETag", "\"tarball-etag-v1\"".into())], vec![])
             } else {
@@ -681,7 +745,10 @@ async fn test_etag_304_conditional_metadata_and_tarball() {
     let client = RegistryClient::with_config(config).unwrap();
 
     // 1. Initial metadata fetch (unconditional)
-    let meta_res1 = client.get_package_metadata_conditional("cached-pkg", None).await.unwrap();
+    let meta_res1 = client
+        .get_package_metadata_conditional("cached-pkg", None)
+        .await
+        .unwrap();
     assert!(meta_res1.is_fresh());
     assert!(matches!(meta_res1, MetadataFetchResult::Fresh { .. }));
     assert_eq!(meta_res1.etag(), Some("\"pkg-etag-v1\""));
@@ -707,7 +774,10 @@ async fn test_etag_304_conditional_metadata_and_tarball() {
 
     // 4. Tarball conditional fetch (unconditional -> 200 Fresh)
     let tar_url = format!("{}tarballs/cached-pkg.tgz", server.url());
-    let tar_res1 = client.download_tarball_bytes_conditional(&tar_url, None).await.unwrap();
+    let tar_res1 = client
+        .download_tarball_bytes_conditional(&tar_url, None)
+        .await
+        .unwrap();
     assert!(tar_res1.is_fresh());
     assert_eq!(tar_res1.bytes(), Some(tarball_data.as_slice()));
     assert_eq!(tar_res1.etag(), Some("\"tarball-etag-v1\""));
@@ -723,14 +793,23 @@ async fn test_etag_304_conditional_metadata_and_tarball() {
     assert!(tar_res2.bytes().is_none());
 
     // 6. Tarball response conditional fetch
-    let stream_res1 = client.download_tarball_conditional(&tar_url, None).await.unwrap();
+    let stream_res1 = client
+        .download_tarball_conditional(&tar_url, None)
+        .await
+        .unwrap();
     assert!(stream_res1.is_modified());
     assert!(matches!(stream_res1, TarballFetchResult::Modified { .. }));
     assert_eq!(stream_res1.etag(), Some("\"tarball-etag-v1\""));
 
-    let stream_res2 = client.download_tarball_conditional(&tar_url, Some("\"tarball-etag-v1\"")).await.unwrap();
+    let stream_res2 = client
+        .download_tarball_conditional(&tar_url, Some("\"tarball-etag-v1\""))
+        .await
+        .unwrap();
     assert!(stream_res2.is_not_modified());
-    assert!(matches!(stream_res2, TarballFetchResult::NotModified { .. }));
+    assert!(matches!(
+        stream_res2,
+        TarballFetchResult::NotModified { .. }
+    ));
     assert_eq!(stream_res2.etag(), Some("\"tarball-etag-v1\""));
 
     server.stop();
@@ -821,10 +900,7 @@ impl FaultInjectionTcpServer {
             }
         });
 
-        Self {
-            addr,
-            shutdown: tx,
-        }
+        Self { addr, shutdown: tx }
     }
 
     fn url(&self) -> Url {
@@ -866,7 +942,10 @@ async fn test_network_fault_dropped_socket_mid_download_bytes() {
 
     let tarball_url = format!("{}faulty.tgz", server.url());
     let res = client.download_tarball_bytes(&tarball_url).await;
-    assert!(res.is_err(), "Expected download to fail when socket drops prematurely");
+    assert!(
+        res.is_err(),
+        "Expected download to fail when socket drops prematurely"
+    );
     let err = res.unwrap_err();
     assert!(
         err.is_decode() || matches!(err, RegistryError::Http(_)),
@@ -902,8 +981,13 @@ async fn test_network_fault_dropped_socket_mid_download_to_file() {
     let client = RegistryClient::with_config(config).unwrap();
 
     let tarball_url = format!("{}faulty-file.tgz", server.url());
-    let res = client.download_tarball_to_file(&tarball_url, &dest_file).await;
-    assert!(res.is_err(), "Expected file download to fail when socket is severed mid-stream");
+    let res = client
+        .download_tarball_to_file(&tarball_url, &dest_file)
+        .await;
+    assert!(
+        res.is_err(),
+        "Expected file download to fail when socket is severed mid-stream"
+    );
 
     server.stop();
 }
@@ -960,7 +1044,10 @@ async fn test_network_fault_corrupted_chunked_stream_premature_truncation() {
 
     let tarball_url = format!("{}truncated-chunk.tgz", server.url());
     let res = client.download_tarball_bytes(&tarball_url).await;
-    assert!(res.is_err(), "Expected decode error on truncated chunk body");
+    assert!(
+        res.is_err(),
+        "Expected decode error on truncated chunk body"
+    );
 
     server.stop();
 }
@@ -1017,7 +1104,10 @@ async fn test_network_fault_request_timeout() {
     let res = client.get_package_metadata("timeout-pkg").await;
     assert!(res.is_err(), "Expected request to timeout");
     let err = res.unwrap_err();
-    assert!(err.is_timeout(), "Expected error.is_timeout() to be true, got: {err:?}");
+    assert!(
+        err.is_timeout(),
+        "Expected error.is_timeout() to be true, got: {err:?}"
+    );
 
     server.stop();
 }
@@ -1095,9 +1185,21 @@ async fn test_chaotic_retry_oscillating_429_503_recovers() {
         if req.contains("GET /chaotic-recovering-pkg") {
             let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
             match attempt {
-                0 => (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec()),
-                1 => (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec()),
-                _ => (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec()),
+                0 => (
+                    429,
+                    vec![("Retry-After", "0".into())],
+                    b"Too Many Requests".to_vec(),
+                ),
+                1 => (
+                    503,
+                    vec![("Retry-After", "0".into())],
+                    b"Service Unavailable".to_vec(),
+                ),
+                _ => (
+                    200,
+                    vec![("Content-Type", "application/json".into())],
+                    mock_json.as_bytes().to_vec(),
+                ),
             }
         } else {
             (404, vec![], b"Not Found".to_vec())
@@ -1116,7 +1218,10 @@ async fn test_chaotic_retry_oscillating_429_503_recovers() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let meta = client.get_package_metadata("chaotic-recovering-pkg").await.unwrap();
+    let meta = client
+        .get_package_metadata("chaotic-recovering-pkg")
+        .await
+        .unwrap();
     assert_eq!(meta.name, "chaotic-recovering-pkg");
     assert_eq!(
         attempt_counter.load(Ordering::SeqCst),
@@ -1137,9 +1242,17 @@ async fn test_chaotic_retry_oscillating_exceeds_max_retries_fails() {
         if req.contains("GET /chaotic-exhaust-pkg") {
             let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
             if attempt.is_multiple_of(2) {
-                (429, vec![("Retry-After", "0".into())], b"Too Many Requests".to_vec())
+                (
+                    429,
+                    vec![("Retry-After", "0".into())],
+                    b"Too Many Requests".to_vec(),
+                )
             } else {
-                (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+                (
+                    503,
+                    vec![("Retry-After", "0".into())],
+                    b"Service Unavailable".to_vec(),
+                )
             }
         } else {
             (404, vec![], b"Not Found".to_vec())
@@ -1158,7 +1271,10 @@ async fn test_chaotic_retry_oscillating_exceeds_max_retries_fails() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("chaotic-exhaust-pkg").await.unwrap_err();
+    let err = client
+        .get_package_metadata("chaotic-exhaust-pkg")
+        .await
+        .unwrap_err();
     assert!(
         err.is_rate_limited() || err.status_code() == Some(503),
         "Expected rate limit or 503 status code when chaotic retries are exhausted"
@@ -1176,7 +1292,11 @@ async fn test_circuit_breaker_trips_under_consecutive_failures() {
 
     let server = MockHttpServer::start(move |_req| {
         counter_clone.fetch_add(1, Ordering::SeqCst);
-        (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+        (
+            503,
+            vec![("Retry-After", "0".into())],
+            b"Service Unavailable".to_vec(),
+        )
     })
     .await;
 
@@ -1198,12 +1318,18 @@ async fn test_circuit_breaker_trips_under_consecutive_failures() {
     // Request 1: fails with 503 (consecutive failures = 1)
     let res1 = client.get_package_metadata("pkg1").await;
     assert!(res1.is_err());
-    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_str).await,
+        CircuitBreakerState::Closed
+    );
 
     // Request 2: fails with 503 (consecutive failures = 2 -> trips circuit to OPEN)
     let res2 = client.get_package_metadata("pkg2").await;
     assert!(res2.is_err());
-    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Open);
+    assert_eq!(
+        client.circuit_state(&host_str).await,
+        CircuitBreakerState::Open
+    );
 
     let requests_before_fast_fail = request_counter.load(Ordering::SeqCst);
     assert_eq!(requests_before_fast_fail, 2);
@@ -1246,9 +1372,17 @@ async fn test_circuit_breaker_half_open_probe_and_recovery() {
 
     let server = MockHttpServer::start(move |_req| {
         if succ_clone.load(Ordering::SeqCst) {
-            (200, vec![("Content-Type", "application/json".into())], mock_json.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                mock_json.as_bytes().to_vec(),
+            )
         } else {
-            (503, vec![("Retry-After", "0".into())], b"Service Unavailable".to_vec())
+            (
+                503,
+                vec![("Retry-After", "0".into())],
+                b"Service Unavailable".to_vec(),
+            )
         }
     })
     .await;
@@ -1269,13 +1403,19 @@ async fn test_circuit_breaker_half_open_probe_and_recovery() {
 
     // 1. Initial request fails and immediately trips circuit
     let _ = client.get_package_metadata("unhealthy").await;
-    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Open);
+    assert_eq!(
+        client.circuit_state(&host_str).await,
+        CircuitBreakerState::Open
+    );
 
     // 2. Wait for reset timeout to elapse
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Verify circuit transitioned to HalfOpen
-    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::HalfOpen);
+    assert_eq!(
+        client.circuit_state(&host_str).await,
+        CircuitBreakerState::HalfOpen
+    );
 
     // 3. Remote server is now healthy
     should_succeed.store(true, Ordering::SeqCst);
@@ -1283,7 +1423,10 @@ async fn test_circuit_breaker_half_open_probe_and_recovery() {
     // 4. Probe request in HalfOpen state succeeds and resets circuit to Closed
     let meta = client.get_package_metadata("healthy-pkg").await.unwrap();
     assert_eq!(meta.name, "healthy-pkg");
-    assert_eq!(client.circuit_state(&host_str).await, CircuitBreakerState::Closed);
+    assert_eq!(
+        client.circuit_state(&host_str).await,
+        CircuitBreakerState::Closed
+    );
 
     // 5. Subsequent request succeeds normally
     let meta2 = client.get_package_metadata("healthy-pkg").await.unwrap();
@@ -1300,7 +1443,11 @@ async fn test_circuit_breaker_retry_after_budget_breaker() {
     // Server returns 429 with 1 hour Retry-After
     let server = MockHttpServer::start(move |_req| {
         counter_clone.fetch_add(1, Ordering::SeqCst);
-        (429, vec![("Retry-After", "3600".into())], b"Rate limit exceeded".to_vec())
+        (
+            429,
+            vec![("Retry-After", "3600".into())],
+            b"Rate limit exceeded".to_vec(),
+        )
     })
     .await;
 
@@ -1314,7 +1461,10 @@ async fn test_circuit_breaker_retry_after_budget_breaker() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client.get_package_metadata("budget-breaker-pkg").await.unwrap_err();
+    let err = client
+        .get_package_metadata("budget-breaker-pkg")
+        .await
+        .unwrap_err();
     assert!(err.is_rate_limited());
     assert_eq!(err.retry_after(), Some(3600));
 
@@ -1361,7 +1511,11 @@ async fn test_scoped_registry_routing_mixed_case_and_unicode_spoofing() {
     // Server 1: Default public registry
     let public_server = MockHttpServer::start(move |req| {
         if req.contains("GET /public-pkg") {
-            (200, vec![("Content-Type", "application/json".into())], mock_json_public.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                mock_json_public.as_bytes().to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found in Public".to_vec())
         }
@@ -1371,7 +1525,11 @@ async fn test_scoped_registry_routing_mixed_case_and_unicode_spoofing() {
     // Server 2: Private @corp registry
     let corp_server = MockHttpServer::start(move |req| {
         if req.contains("GET /@corp%2fwidget") {
-            (200, vec![("Content-Type", "application/json".into())], mock_json_corp.as_bytes().to_vec())
+            (
+                200,
+                vec![("Content-Type", "application/json".into())],
+                mock_json_corp.as_bytes().to_vec(),
+            )
         } else {
             (404, vec![], b"Not Found in Corp".to_vec())
         }
@@ -1451,7 +1609,10 @@ async fn test_direct_remote_tarball_url_download_and_auth_security() {
             // Redirects to untrusted external mirror
             (
                 302,
-                vec![("Location", "http://untrusted.cdn.mirror.com/pkg.tgz".to_string())],
+                vec![(
+                    "Location",
+                    "http://untrusted.cdn.mirror.com/pkg.tgz".to_string(),
+                )],
                 b"Redirecting".to_vec(),
             )
         } else {
@@ -1478,7 +1639,10 @@ async fn test_direct_remote_tarball_url_download_and_auth_security() {
     let client = RegistryClient::with_config(config).unwrap();
 
     // 2. Download direct HTTP remote tarball URL
-    let tarball_url = format!("{}/packages/pkg-1.0.0.tgz", cdn_server.url().as_str().trim_end_matches('/'));
+    let tarball_url = format!(
+        "{}/packages/pkg-1.0.0.tgz",
+        cdn_server.url().as_str().trim_end_matches('/')
+    );
     let downloaded_bytes = client.download_tarball_bytes(&tarball_url).await.unwrap();
     assert_eq!(downloaded_bytes, sample_tarball_bytes);
 
@@ -1492,8 +1656,14 @@ async fn test_direct_remote_tarball_url_download_and_auth_security() {
     assert_eq!(not_modified_res.etag(), Some("\"tarball-hash-xyz\""));
 
     // 4. Download 404 direct URL returns error
-    let missing_url = format!("{}/packages/missing.tgz", cdn_server.url().as_str().trim_end_matches('/'));
-    let not_found_err = client.download_tarball_bytes(&missing_url).await.unwrap_err();
+    let missing_url = format!(
+        "{}/packages/missing.tgz",
+        cdn_server.url().as_str().trim_end_matches('/')
+    );
+    let not_found_err = client
+        .download_tarball_bytes(&missing_url)
+        .await
+        .unwrap_err();
     assert_eq!(not_found_err.status_code(), Some(404));
 
     cdn_server.stop();

@@ -1,10 +1,12 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 fn normalize_bin_paths(bin: Option<PackageBin>) -> Option<PackageBin> {
     bin.map(|bin| match bin {
-        PackageBin::Single(path) => PackageBin::Single(path.strip_prefix("./").unwrap_or(&path).to_string()),
+        PackageBin::Single(path) => {
+            PackageBin::Single(path.strip_prefix("./").unwrap_or(&path).to_string())
+        }
         PackageBin::Map(paths) => PackageBin::Map(
             paths
                 .into_iter()
@@ -29,6 +31,8 @@ pub enum DependencyType {
 pub struct NodeFlags {
     pub dev: bool,
     pub optional: bool,
+    #[serde(default)]
+    pub dev_optional: bool,
     pub peer: bool,
     pub bundled: bool,
     pub has_install_script: bool,
@@ -115,7 +119,10 @@ impl DependencyGraph {
 
     pub fn is_skipped(&self, name: &str) -> bool {
         self.skipped.contains(name)
-            || self.nodes.values().any(|n| n.name == name && n.flags.skipped)
+            || self
+                .nodes
+                .values()
+                .any(|n| n.name == name && n.flags.skipped)
     }
 
     pub fn get_node(&self, location: &str) -> Option<&Node> {
@@ -162,13 +169,18 @@ impl DependencyGraph {
         let mut queue = VecDeque::from([self.root_location.clone()]);
         let mut outgoing: HashMap<String, Vec<DependencyEdge>> = HashMap::new();
         for edge in &self.edges {
-            outgoing.entry(edge.from_location.clone()).or_default().push(edge.clone());
+            outgoing
+                .entry(edge.from_location.clone())
+                .or_default()
+                .push(edge.clone());
         }
         while let Some(location) = queue.pop_front() {
             let dev_state = dev_states.get(&location).copied().unwrap_or(0);
             let optional_state = optional_states.get(&location).copied().unwrap_or(0);
             let skipped_state = skipped_states.get(&location).copied().unwrap_or(0);
-            let Some(edges) = outgoing.get(&location) else { continue };
+            let Some(edges) = outgoing.get(&location) else {
+                continue;
+            };
 
             for edge in edges {
                 let mut next_dev = 0;
@@ -176,7 +188,11 @@ impl DependencyGraph {
                     next_dev |= DEV_ONLY;
                 }
                 if dev_state & NON_DEV != 0 {
-                    next_dev |= if edge.dep_type == DependencyType::Dev { DEV_ONLY } else { NON_DEV };
+                    next_dev |= if edge.dep_type == DependencyType::Dev {
+                        DEV_ONLY
+                    } else {
+                        NON_DEV
+                    };
                 }
 
                 let mut next_optional = 0;
@@ -215,6 +231,25 @@ impl DependencyGraph {
             }
         }
 
+        // Identify nodes reachable via a pure production path from root
+        // (paths containing no dev, optional, or peer-optional edges).
+        let mut pure_prod_reachable: HashSet<String> = HashSet::new();
+        let mut prod_queue = VecDeque::from([self.root_location.clone()]);
+        pure_prod_reachable.insert(self.root_location.clone());
+        while let Some(loc) = prod_queue.pop_front() {
+            if let Some(edges) = outgoing.get(&loc) {
+                for edge in edges {
+                    if edge.dep_type != DependencyType::Dev
+                        && edge.dep_type != DependencyType::Optional
+                        && edge.dep_type != DependencyType::PeerOptional
+                        && pure_prod_reachable.insert(edge.to_location.clone())
+                    {
+                        prod_queue.push_back(edge.to_location.clone());
+                    }
+                }
+            }
+        }
+
         for (location, node) in &mut self.nodes {
             if location == &self.root_location {
                 continue;
@@ -222,8 +257,20 @@ impl DependencyGraph {
             let dev_state = dev_states.get(location).copied().unwrap_or(0);
             let optional_state = optional_states.get(location).copied().unwrap_or(0);
             let skipped_state = skipped_states.get(location).copied().unwrap_or(0);
-            node.flags.dev = dev_state == DEV_ONLY;
-            node.flags.optional = optional_state == OPTIONAL_ONLY;
+
+            let is_dev = dev_state == DEV_ONLY;
+            let is_optional = optional_state == OPTIONAL_ONLY;
+            let reachable_from_dev = (dev_state & DEV_ONLY) != 0;
+            let reachable_from_optional = (optional_state & OPTIONAL_ONLY) != 0;
+            let is_pure_prod = pure_prod_reachable.contains(location);
+
+            node.flags.dev = is_dev;
+            node.flags.optional = is_optional;
+            node.flags.dev_optional = !is_pure_prod
+                && reachable_from_dev
+                && reachable_from_optional
+                && !is_dev
+                && !is_optional;
             node.flags.skipped = skipped_state == DEV_ONLY;
             if node.flags.skipped {
                 self.skipped.insert(node.name.clone());
@@ -242,12 +289,18 @@ impl DependencyGraph {
             if root_node.dev_dependencies.remove(package_name).is_some() {
                 removed = true;
             }
-            if root_node.optional_dependencies.remove(package_name).is_some() {
+            if root_node
+                .optional_dependencies
+                .remove(package_name)
+                .is_some()
+            {
                 removed = true;
             }
         }
         if removed {
-            self.edges.retain(|e| !(e.from_location == self.root_location && e.install_name == package_name));
+            self.edges.retain(|e| {
+                !(e.from_location == self.root_location && e.install_name == package_name)
+            });
         }
         removed
     }
@@ -293,7 +346,8 @@ impl DependencyGraph {
             is_reachable
         });
 
-        self.edges.retain(|e| reachable.contains(&e.from_location) && reachable.contains(&e.to_location));
+        self.edges
+            .retain(|e| reachable.contains(&e.from_location) && reachable.contains(&e.to_location));
         pruned
     }
 
@@ -318,7 +372,9 @@ impl DependencyGraph {
                         root_pkg.peer_dependencies_meta = Some(
                             node.peer_dependencies_meta
                                 .iter()
-                                .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                                .map(|(k, v)| {
+                                    (k.clone(), serde_json::to_value(v).unwrap_or_default())
+                                })
                                 .collect(),
                         );
                     }
@@ -326,13 +382,35 @@ impl DependencyGraph {
                         root_pkg.optional_dependencies = Some(node.optional_dependencies.clone());
                     }
                     if let Some(bin) = &node.bin {
-                    root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
+                        root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
                     }
-                    root_pkg.license = node.license.clone();
-                    root_pkg.engines = if node.engines.is_empty() { None } else { Some(node.engines.clone()) };
+                    root_pkg.license = node.license.clone().or_else(|| {
+                        node.extra.get("license").and_then(|v| {
+                            if let Some(s) = v.as_str() {
+                                Some(s.to_string())
+                            } else if let Some(obj) = v.as_object() {
+                                obj.get("type").and_then(|t| t.as_str()).map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    root_pkg.engines = if node.engines.is_empty() {
+                        None
+                    } else {
+                        Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
+                    };
                     let mut filtered_extra = std::collections::BTreeMap::new();
                     for (k, v) in &node.extra {
-                        if matches!(k.as_str(), "overrides" | "workspaces" | "funding" | "deprecated" | "directories") {
+                        if k == "overrides" || k == "directories" || k == "license" || k == "libc" {
+                            continue;
+                        }
+                        if k == "deprecated"
+                            && (v == &serde_json::Value::Bool(false) || v.is_null() || v == "")
+                        {
+                            continue;
+                        }
+                        if matches!(k.as_str(), "funding" | "deprecated") {
                             filtered_extra.insert(k.clone(), v.clone());
                         }
                     }
@@ -358,6 +436,80 @@ impl DependencyGraph {
                     continue;
                 }
 
+                // npm 11 / Arborist Shrinkwrap.metaFromNode:
+                // - When a package node is both dev and optional (`dev && optional`),
+                //   emit `dev: true, optional: true` (and DO NOT emit `devOptional`).
+                // - When a package node is reachable from both a dev path and an optional path
+                //   but is neither exclusively dev nor exclusively optional (`dev_optional && !dev && !optional`),
+                //   emit `devOptional: true`.
+                // - When neither applies, omit `devOptional`.
+                let (dev, optional, dev_optional) = if node.flags.dev && node.flags.optional {
+                    (Some(true), Some(true), None)
+                } else if node.flags.dev_optional && !node.flags.dev && !node.flags.optional {
+                    (None, None, Some(true))
+                } else {
+                    (
+                        if node.flags.dev { Some(true) } else { None },
+                        if node.flags.optional {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                        None,
+                    )
+                };
+
+                let license = node.license.clone().or_else(|| {
+                    node.extra.get("license").and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            Some(s.to_string())
+                        } else if let Some(obj) = v.as_object() {
+                            obj.get("type").and_then(|t| t.as_str()).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                let libc = node
+                    .libc
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        node.extra.get("libc").and_then(|v| {
+                            if let Some(s) = v.as_str() {
+                                Some(vec![s.to_string()])
+                            } else if let Some(arr) = v.as_array() {
+                                let list: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect();
+                                if list.is_empty() {
+                                    None
+                                } else {
+                                    Some(list)
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                let os = node.os.as_ref().filter(|v| !v.is_empty()).cloned();
+                let cpu = node.cpu.as_ref().filter(|v| !v.is_empty()).cloned();
+
+                let mut extra = node.extra.clone();
+                extra.remove("directories");
+                extra.remove("overrides");
+                extra.remove("license");
+                extra.remove("libc");
+                if let Some(v) = extra.get("deprecated") {
+                    if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
+                        extra.remove("deprecated");
+                    }
+                }
+
                 let pkg = LockfilePackage {
                     preserve_dev_optional_split: true,
                     name: if node.install_name != node.name {
@@ -369,14 +521,9 @@ impl DependencyGraph {
                     resolved: node.resolved.clone(),
                     integrity: node.integrity.clone(),
                     link: None,
-                    // npm 11 emits the individual reachability flags for
-                    // packages that are both dev-only and optional (for
-                    // example fsevents under a dev watcher). Keep the
-                    // legacy devOptional field readable for migrated
-                    // lockfiles, but do not generate it for fresh v3 trees.
-                    dev: if node.flags.dev { Some(true) } else { None },
-                    optional: if node.flags.optional { Some(true) } else { None },
-                    dev_optional: None,
+                    dev,
+                    optional,
+                    dev_optional,
                     peer: if node.flags.peer { Some(true) } else { None },
                     in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
@@ -398,7 +545,9 @@ impl DependencyGraph {
                         Some(
                             node.peer_dependencies_meta
                                 .iter()
-                                .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+                                .map(|(k, v)| {
+                                    (k.clone(), serde_json::to_value(v).unwrap_or_default())
+                                })
                                 .collect(),
                         )
                     } else {
@@ -409,13 +558,17 @@ impl DependencyGraph {
                     } else {
                         None
                     },
-                    os: node.os.clone(),
-                    cpu: node.cpu.clone(),
-                    libc: node.libc.clone(),
+                    os,
+                    cpu,
+                    libc,
                     bin: normalize_bin_paths(node.bin.clone()),
-                    license: node.license.clone(),
-                    engines: if node.engines.is_empty() { None } else { Some(node.engines.clone()) },
-                    extra: node.extra.clone(),
+                    license,
+                    engines: if node.engines.is_empty() {
+                        None
+                    } else {
+                        Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
+                    },
+                    extra,
                     ..Default::default()
                 };
                 lockfile.insert_package(loc, pkg);
@@ -469,8 +622,9 @@ impl DependencyGraph {
                 resolved: pkg.resolved.clone(),
                 integrity: pkg.integrity.clone(),
                 flags: NodeFlags {
-                    dev: pkg.dev.unwrap_or(false) || is_dev_opt,
-                    optional: pkg.optional.unwrap_or(false) || is_dev_opt,
+                    dev: pkg.dev.unwrap_or(false),
+                    optional: pkg.optional.unwrap_or(false),
+                    dev_optional: is_dev_opt,
                     peer: pkg.peer.unwrap_or(false),
                     bundled: pkg.in_bundle.unwrap_or(false),
                     has_install_script: pkg.has_install_script.unwrap_or(false),
@@ -487,7 +641,7 @@ impl DependencyGraph {
                 libc: pkg.libc.clone(),
                 bin: pkg.bin.clone(),
                 license: pkg.license.clone(),
-                engines: pkg.engines.clone().unwrap_or_default(),
+                engines: pkg.engines_map().unwrap_or_default(),
                 extra: pkg.extra.clone(),
             };
             graph.nodes.insert(loc.clone(), node);
@@ -514,12 +668,8 @@ impl DependencyGraph {
                 );
 
             for (dep_name, dep_spec, dep_type) in all_deps {
-                let target_loc = Self::find_in_scope_hierarchy(
-                    &graph.nodes,
-                    loc,
-                    dep_name,
-                    &mut candidate_buf,
-                );
+                let target_loc =
+                    Self::find_in_scope_hierarchy(&graph.nodes, loc, dep_name, &mut candidate_buf);
 
                 if let Some(target) = target_loc {
                     let target_pkg_name = graph

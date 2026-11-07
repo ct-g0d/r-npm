@@ -19,11 +19,18 @@ impl CacheLock {
 
     /// Acquire an exclusive cross-process lock on the specified file path, with retry backoff and default timeout.
     pub fn acquire_exclusive(path: &Path) -> Result<Self, std::io::Error> {
-        Self::acquire_exclusive_with_options(path, Self::DEFAULT_TIMEOUT, Self::DEFAULT_STALE_THRESHOLD)
+        Self::acquire_exclusive_with_options(
+            path,
+            Self::DEFAULT_TIMEOUT,
+            Self::DEFAULT_STALE_THRESHOLD,
+        )
     }
 
     /// Acquire an exclusive cross-process lock with a specific timeout duration.
-    pub fn acquire_exclusive_timeout(path: &Path, timeout: Duration) -> Result<Self, std::io::Error> {
+    pub fn acquire_exclusive_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self, std::io::Error> {
         Self::acquire_exclusive_with_options(path, timeout, Self::DEFAULT_STALE_THRESHOLD)
     }
 
@@ -120,7 +127,10 @@ impl CacheLock {
         let mut file = match file_res {
             Ok(f) => f,
             Err(e) if is_transient_lock_error(&e) => {
-                debug!("Transient file lock / sharing violation opening {}", path.display());
+                debug!(
+                    "Transient file lock / sharing violation opening {}",
+                    path.display()
+                );
                 return Ok(None);
             }
             Err(e) => return Err(e),
@@ -145,7 +155,10 @@ impl CacheLock {
                 }))
             }
             Err(e) if is_would_block(&e) => {
-                debug!("Lock on {} is already held by another process", path.display());
+                debug!(
+                    "Lock on {} is already held by another process",
+                    path.display()
+                );
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -250,7 +263,7 @@ fn is_transient_lock_error(err: &std::io::Error) -> bool {
                     || code == 32     // ERROR_SHARING_VIOLATION
                     || code == 33     // ERROR_LOCK_VIOLATION
                     || code == 170    // ERROR_BUSY
-                    || code == 1224;  // ERROR_USER_MAPPED_FILE
+                    || code == 1224; // ERROR_USER_MAPPED_FILE
             }
             false
         }

@@ -43,7 +43,11 @@ fn test_cli_cache_clean_with_force() {
         .output()
         .expect("Failed to execute rnpm cache clean --force");
 
-    assert!(output.status.success(), "Command failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("rnpm: cache cleared successfully"));
 
@@ -66,7 +70,11 @@ fn test_cli_cache_verify() {
         .output()
         .expect("Failed to execute rnpm cache verify");
 
-    assert!(output.status.success(), "Command failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Command failed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Cache verified and compacted"));
     assert!(stdout.contains("Content verified:"));

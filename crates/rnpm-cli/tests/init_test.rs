@@ -1,7 +1,7 @@
+use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use tempfile::tempdir;
-use serde_json::Value;
 
 #[test]
 fn test_init_non_interactive_yes() {
@@ -16,21 +16,35 @@ fn test_init_non_interactive_yes() {
         .output()
         .expect("Failed to execute rnpm init -y");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let manifest_path = project_dir.join("package.json");
-    assert!(manifest_path.is_file(), "package.json should have been created");
+    assert!(
+        manifest_path.is_file(),
+        "package.json should have been created"
+    );
 
     let content = std::fs::read_to_string(&manifest_path).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
 
-    let dir_name = project_dir.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+    let dir_name = project_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_ascii_lowercase();
     let expected_name = dir_name.trim_start_matches('.');
     assert_eq!(json["name"], expected_name);
     assert_eq!(json["version"], "1.0.0");
     assert_eq!(json["description"], "");
     assert_eq!(json["main"], "index.js");
-    assert_eq!(json["scripts"]["test"], "echo \"Error: no test specified\" && exit 1");
+    assert_eq!(
+        json["scripts"]["test"],
+        "echo \"Error: no test specified\" && exit 1"
+    );
     assert_eq!(json["keywords"], serde_json::json!([]));
     assert_eq!(json["author"], "");
     assert_eq!(json["license"], "ISC");
@@ -49,7 +63,11 @@ fn test_init_non_interactive_force_and_aliases() {
         .output()
         .expect("Failed to execute rnpm init --force");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(project_dir.join("package.json").is_file());
 
     // Clean up and test -f
@@ -92,7 +110,11 @@ fn test_create_subcommand_alias() {
         .output()
         .expect("Failed to execute rnpm create -y");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(project_dir.join("package.json").is_file());
 }
 
@@ -112,9 +134,14 @@ fn test_init_with_scope_flags() {
         .expect("Failed to execute rnpm init -y --scope=@myorg");
 
     assert!(output.status.success());
-    let json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("package.json")).unwrap()).unwrap();
+    let json: Value =
+        serde_json::from_str(&std::fs::read_to_string(project_dir.join("package.json")).unwrap())
+            .unwrap();
     let name = json["name"].as_str().unwrap();
-    assert!(name.starts_with("@myorg/"), "Expected name to start with @myorg/, got: {name}");
+    assert!(
+        name.starts_with("@myorg/"),
+        "Expected name to start with @myorg/, got: {name}"
+    );
 
     // Test with --scope=anotherorg (without leading @)
     std::fs::remove_file(project_dir.join("package.json")).unwrap();
@@ -127,9 +154,14 @@ fn test_init_with_scope_flags() {
         .expect("Failed to execute rnpm init -y --scope=anotherorg");
 
     assert!(output.status.success());
-    let json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("package.json")).unwrap()).unwrap();
+    let json: Value =
+        serde_json::from_str(&std::fs::read_to_string(project_dir.join("package.json")).unwrap())
+            .unwrap();
     let name = json["name"].as_str().unwrap();
-    assert!(name.starts_with("@anotherorg/"), "Expected name to start with @anotherorg/, got: {name}");
+    assert!(
+        name.starts_with("@anotherorg/"),
+        "Expected name to start with @anotherorg/, got: {name}"
+    );
 }
 
 #[test]
@@ -151,7 +183,8 @@ fn test_init_preserves_existing_package_json() {
     std::fs::write(
         project_dir.join("package.json"),
         serde_json::to_string_pretty(&initial_manifest).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin)
         .arg("init")
@@ -172,7 +205,10 @@ fn test_init_preserves_existing_package_json() {
     assert_eq!(json["customSetting"], true);
     // Missing default fields should be populated
     assert_eq!(json["main"], "index.js");
-    assert_eq!(json["scripts"]["test"], "echo \"Error: no test specified\" && exit 1");
+    assert_eq!(
+        json["scripts"]["test"],
+        "echo \"Error: no test specified\" && exit 1"
+    );
     assert_eq!(json["keywords"], serde_json::json!([]));
     assert_eq!(json["author"], "");
     assert_eq!(json["license"], "ISC");
@@ -195,7 +231,9 @@ fn test_init_interactive_piped_custom_values() {
         "Alice <alice@example.com>",
         "MIT",
         "yes",
-    ].join("\n") + "\n";
+    ]
+    .join("\n")
+        + "\n";
 
     let mut child = Command::new(rnpm_bin)
         .arg("init")
@@ -208,11 +246,17 @@ fn test_init_interactive_piped_custom_values() {
 
     {
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
-        stdin.write_all(inputs.as_bytes()).expect("Failed to write stdin");
+        stdin
+            .write_all(inputs.as_bytes())
+            .expect("Failed to write stdin");
     }
 
     let output = child.wait_with_output().expect("Failed to wait on child");
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let content = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
@@ -222,8 +266,14 @@ fn test_init_interactive_piped_custom_values() {
     assert_eq!(json["description"], "Interactive description");
     assert_eq!(json["main"], "app.js");
     assert_eq!(json["scripts"]["test"], "jest --runInBand");
-    assert_eq!(json["repository"]["url"], "https://github.com/myorg/custom-interactive-pkg.git");
-    assert_eq!(json["keywords"], serde_json::json!(["cli", "rust", "package"]));
+    assert_eq!(
+        json["repository"]["url"],
+        "https://github.com/myorg/custom-interactive-pkg.git"
+    );
+    assert_eq!(
+        json["keywords"],
+        serde_json::json!(["cli", "rust", "package"])
+    );
     assert_eq!(json["author"], "Alice <alice@example.com>");
     assert_eq!(json["license"], "MIT");
 }
@@ -234,18 +284,7 @@ fn test_init_interactive_abort_on_no() {
     let project_dir = tmp.path();
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
-    let inputs = [
-        "aborted-pkg",
-        "1.0.0",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "no",
-    ].join("\n") + "\n";
+    let inputs = ["aborted-pkg", "1.0.0", "", "", "", "", "", "", "", "no"].join("\n") + "\n";
 
     let mut child = Command::new(rnpm_bin)
         .arg("init")
@@ -258,14 +297,19 @@ fn test_init_interactive_abort_on_no() {
 
     {
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
-        stdin.write_all(inputs.as_bytes()).expect("Failed to write stdin");
+        stdin
+            .write_all(inputs.as_bytes())
+            .expect("Failed to write stdin");
     }
 
     let output = child.wait_with_output().expect("Failed to wait on child");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("npm notice canceled"));
-    assert!(!project_dir.join("package.json").exists(), "package.json should not exist after cancel");
+    assert!(
+        !project_dir.join("package.json").exists(),
+        "package.json should not exist after cancel"
+    );
 }
 
 #[test]
@@ -287,11 +331,17 @@ fn test_init_interactive_defaults_on_empty_enters() {
 
     {
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
-        stdin.write_all(inputs.as_bytes()).expect("Failed to write stdin");
+        stdin
+            .write_all(inputs.as_bytes())
+            .expect("Failed to write stdin");
     }
 
     let output = child.wait_with_output().expect("Failed to wait on child");
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let content = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
@@ -336,8 +386,15 @@ fn test_init_initializer_delegation_to_create_pkg() {
         .output()
         .expect("Failed to execute rnpm init vite");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(marker_file.is_file(), "Marker file should have been written by create-vite");
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker_file.is_file(),
+        "Marker file should have been written by create-vite"
+    );
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
     assert_eq!(marker_content.trim(), "my-app --template react");
@@ -375,8 +432,15 @@ fn test_create_initializer_delegation() {
         .output()
         .expect("Failed to execute rnpm create react-app");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(marker_file.is_file(), "Marker file should have been written by create-react-app");
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker_file.is_file(),
+        "Marker file should have been written by create-react-app"
+    );
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
     assert_eq!(marker_content.trim(), "my-react-app");
@@ -392,7 +456,10 @@ fn test_init_scoped_initializer_delegation() {
     let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
 
     // Set up mock package in node_modules/@foo/create-bar
-    let tool_dir = project_dir.join("node_modules").join("@foo").join("create-bar");
+    let tool_dir = project_dir
+        .join("node_modules")
+        .join("@foo")
+        .join("create-bar");
     std::fs::create_dir_all(&tool_dir).unwrap();
     std::fs::write(
         tool_dir.join("index.js"),
@@ -414,7 +481,11 @@ fn test_init_scoped_initializer_delegation() {
         .output()
         .expect("Failed to execute rnpm init @foo/bar");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(marker_file.is_file());
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();

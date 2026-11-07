@@ -25,22 +25,13 @@ pub enum LockfileError {
     },
 
     #[error("Insecure resolved URL for package '{package}': '{url}' (insecure HTTP disallowed)")]
-    InsecureResolvedUrl {
-        package: String,
-        url: String,
-    },
+    InsecureResolvedUrl { package: String, url: String },
 
     #[error("Suspicious resolution URL for package '{package}': {reason}")]
-    SuspiciousResolution {
-        package: String,
-        reason: String,
-    },
+    SuspiciousResolution { package: String, reason: String },
 
     #[error("Poisoned dependency detected for package '{package}': {reason}")]
-    PoisonedDependency {
-        package: String,
-        reason: String,
-    },
+    PoisonedDependency { package: String, reason: String },
 
     #[error("Lockfile error: {0}")]
     Other(String),

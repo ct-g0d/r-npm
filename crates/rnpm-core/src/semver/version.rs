@@ -1,8 +1,8 @@
+use crate::error::SemverError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::error::SemverError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PrereleaseId {

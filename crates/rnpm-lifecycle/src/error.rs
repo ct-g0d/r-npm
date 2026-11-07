@@ -12,7 +12,9 @@ pub enum LifecycleError {
     #[error("Package '{0}' is not in the script execution allowlist")]
     PackageNotAllowlisted(String),
 
-    #[error("Dangerous command pattern detected in script for '{package}': {reason} (command: '{cmd}')")]
+    #[error(
+        "Dangerous command pattern detected in script for '{package}': {reason} (command: '{cmd}')"
+    )]
     DangerousCommandPattern {
         package: String,
         reason: String,

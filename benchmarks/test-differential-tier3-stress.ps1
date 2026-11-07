@@ -350,7 +350,8 @@ try {
         -Trials 5 `
         -Warmup 1 `
         -SimulateLoad `
-        -InjectOutlierDelayMs 400.0
+        -InjectOutlierDelayMs 400.0 `
+        -FailOnStabilityRegression
 
     Assert-Condition (Test-Path $ckPath) "Benchmark runner generated checkpoint artifact under simulated load"
 
@@ -366,6 +367,9 @@ try {
         # Check stability
         $rsd = $ckData.metrics.summary.wall_time.rsd_pct
         Write-Host "  Stabilized wall time median: $($ckData.metrics.summary.wall_time.median)ms | RSD: $rsd%" -ForegroundColor Cyan
+        $noiseRange = [Math]::Abs($ckData.metrics.summary.wall_time.max - $ckData.metrics.summary.wall_time.min)
+        $isGateAStable = ($rsd -le 15.0) -or ($noiseRange -le 25.0)
+        Assert-Condition $isGateAStable "Gate A stability criteria satisfied (RSD <= 15% or noise <= 25ms, actual RSD: $rsd%, noise: ${noiseRange}ms)"
         Assert-Condition ($ckData.correctness.normalized_tree_match) "Installed package tree matches reference under simulated load"
     }
 

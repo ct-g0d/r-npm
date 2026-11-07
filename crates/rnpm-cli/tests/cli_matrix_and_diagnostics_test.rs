@@ -14,7 +14,10 @@ fn test_clean_install_aliases_invocation() {
             .output()
             .expect("Failed to execute rnpm command");
 
-        assert!(output.status.success(), "Command '{cmd} --help' must succeed");
+        assert!(
+            output.status.success(),
+            "Command '{cmd} --help' must succeed"
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("package-lock.json"),
@@ -42,8 +45,15 @@ fn test_extended_commands_cli_help_matrix() {
             .output()
             .expect("Failed to execute rnpm command");
 
-        assert!(output.status.success(), "Implemented command '{cmd_name} --help' must succeed: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(!output.stdout.is_empty(), "Implemented command '{cmd_name}' should emit help text");
+        assert!(
+            output.status.success(),
+            "Implemented command '{cmd_name} --help' must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "Implemented command '{cmd_name}' should emit help text"
+        );
     }
 }
 
@@ -75,7 +85,11 @@ fn test_audit_cli_workflow_with_dependency_classifications_and_none_threshold() 
             "opt-dep": "^1.0.0"
         }
     });
-    fs::write(project_dir.join("package.json"), serde_json::to_string_pretty(&package_json).unwrap()).unwrap();
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&package_json).unwrap(),
+    )
+    .unwrap();
 
     let lockfile_json = serde_json::json!({
         "name": "audit-classifications-app",
@@ -126,7 +140,11 @@ fn test_audit_cli_workflow_with_dependency_classifications_and_none_threshold() 
             }
         }
     });
-    fs::write(project_dir.join("package-lock.json"), serde_json::to_string_pretty(&lockfile_json).unwrap()).unwrap();
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
 
     // Provide an empty advisories.json in project_dir so fetch_advisories succeeds offline with 0 vulns
     fs::write(project_dir.join("advisories.json"), "{}").unwrap();
@@ -135,11 +153,16 @@ fn test_audit_cli_workflow_with_dependency_classifications_and_none_threshold() 
         .arg("audit")
         .arg("--audit-level")
         .arg("none")
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm audit");
 
-    assert!(output.status.success(), "Audit with clean lockfile and audit-level none must succeed: {:?}", output);
+    assert!(
+        output.status.success(),
+        "Audit with clean lockfile and audit-level none must succeed: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("found 0 vulnerabilities"));
 }
@@ -157,7 +180,10 @@ fn test_audit_missing_lockfile_emits_enolock() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("npm error code ENOLOCK"), "Expected ENOLOCK, got: {stderr}");
+    assert!(
+        stderr.contains("npm error code ENOLOCK"),
+        "Expected ENOLOCK, got: {stderr}"
+    );
     assert!(stderr.contains("This command requires an existing lockfile."));
 }
 
@@ -174,7 +200,11 @@ fn test_audit_threshold_exit_codes() {
             "vuln-pkg": "^1.0.0"
         }
     });
-    fs::write(project_dir.join("package.json"), serde_json::to_string_pretty(&package_json).unwrap()).unwrap();
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&package_json).unwrap(),
+    )
+    .unwrap();
 
     let lockfile_json = serde_json::json!({
         "name": "audit-threshold-app",
@@ -193,7 +223,11 @@ fn test_audit_threshold_exit_codes() {
             }
         }
     });
-    fs::write(project_dir.join("package-lock.json"), serde_json::to_string_pretty(&lockfile_json).unwrap()).unwrap();
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
 
     // High severity advisory for vuln-pkg
     let advisories_json = serde_json::json!({
@@ -208,37 +242,54 @@ fn test_audit_threshold_exit_codes() {
             }
         ]
     });
-    fs::write(project_dir.join("advisories.json"), serde_json::to_string_pretty(&advisories_json).unwrap()).unwrap();
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
 
     // 1. Audit level moderate: high severity >= moderate threshold -> must exit 1
     let out_fail = Command::new(rnpm_bin)
         .arg("audit")
         .arg("--audit-level")
         .arg("moderate")
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm audit");
-    assert_eq!(out_fail.status.code(), Some(1), "Expected exit 1 for high severity >= moderate");
+    assert_eq!(
+        out_fail.status.code(),
+        Some(1),
+        "Expected exit 1 for high severity >= moderate"
+    );
 
     // 2. Audit level critical: high severity < critical threshold -> must exit 0
     let out_pass = Command::new(rnpm_bin)
         .arg("audit")
         .arg("--audit-level")
         .arg("critical")
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm audit");
-    assert!(out_pass.status.success(), "Expected exit 0 for high severity < critical");
+    assert!(
+        out_pass.status.success(),
+        "Expected exit 0 for high severity < critical"
+    );
 
     // 3. Audit level none: always exits 0 even with vulnerabilities present
     let out_none = Command::new(rnpm_bin)
         .arg("audit")
         .arg("--audit-level")
         .arg("none")
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm audit");
-    assert!(out_none.status.success(), "Expected exit 0 for --audit-level none");
+    assert!(
+        out_none.status.success(),
+        "Expected exit 0 for --audit-level none"
+    );
 }
 
 #[test]
@@ -248,7 +299,11 @@ fn test_audit_malformed_lockfile_emits_ejsonparse() {
     let project_dir = tmp.path();
 
     fs::write(project_dir.join("package.json"), "{\"name\":\"test\"}").unwrap();
-    fs::write(project_dir.join("package-lock.json"), "{\n  \"lockfileVersion\": 3,\n  \"invalid\": ").unwrap();
+    fs::write(
+        project_dir.join("package-lock.json"),
+        "{\n  \"lockfileVersion\": 3,\n  \"invalid\": ",
+    )
+    .unwrap();
 
     let output = Command::new(rnpm_bin)
         .arg("audit")
@@ -258,8 +313,14 @@ fn test_audit_malformed_lockfile_emits_ejsonparse() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("npm error code EJSONPARSE"), "Expected EJSONPARSE, got: {stderr}");
-    assert!(!stderr.contains("npm error npm error code"), "Double header detected in output: {stderr}");
+    assert!(
+        stderr.contains("npm error code EJSONPARSE"),
+        "Expected EJSONPARSE, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("npm error npm error code"),
+        "Double header detected in output: {stderr}"
+    );
 }
 
 #[test]
@@ -273,7 +334,10 @@ fn test_additional_aliases_and_flag_routing() {
             .arg("--help")
             .output()
             .expect("Failed to execute rnpm");
-        assert!(output.status.success(), "Command '{alias} --help' should succeed");
+        assert!(
+            output.status.success(),
+            "Command '{alias} --help' should succeed"
+        );
     }
 
     // Ci supports --offline
@@ -301,9 +365,17 @@ fn test_additional_aliases_and_flag_routing() {
         .args(flag_args)
         .output()
         .expect("Failed to execute rnpm");
-    assert!(!output.status.success(), "Flag args '{:?}' must fail", flag_args);
+    assert!(
+        !output.status.success(),
+        "Flag args '{:?}' must fail",
+        flag_args
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"), "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}", flag_args);
+    assert!(
+        stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"),
+        "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}",
+        flag_args
+    );
 }
 
 #[test]
@@ -319,8 +391,14 @@ fn test_cli_peer_dependency_flags_and_resolution() {
             .expect("Failed to run rnpm help");
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("--legacy-peer-deps"), "{cmd} --help must contain --legacy-peer-deps");
-        assert!(stdout.contains("--strict-peer-deps"), "{cmd} --help must contain --strict-peer-deps");
+        assert!(
+            stdout.contains("--legacy-peer-deps"),
+            "{cmd} --help must contain --legacy-peer-deps"
+        );
+        assert!(
+            stdout.contains("--strict-peer-deps"),
+            "{cmd} --help must contain --strict-peer-deps"
+        );
     }
 
     // 2. Verify flags are supported on install, ci, update and rejected on audit
@@ -350,4 +428,288 @@ fn test_cli_peer_dependency_flags_and_resolution() {
             "Flag {flag} on audit must be gated as ERR_UNSUPPORTED_FLAG, got: {stderr}"
         );
     }
+}
+
+#[test]
+fn test_audit_advisories_json_gated_by_env() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-gating",
+        "version": "1.0.0",
+        "dependencies": {
+            "vuln-pkg": "^1.0.0"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!({
+        "name": "test-gating",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-gating",
+                "version": "1.0.0",
+                "dependencies": {
+                    "vuln-pkg": "^1.0.0"
+                }
+            },
+            "node_modules/vuln-pkg": {
+                "version": "1.0.0"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    let advisories_json = serde_json::json!({
+        "vuln-pkg": [
+            {
+                "id": 999,
+                "name": "vuln-pkg",
+                "severity": "high",
+                "vulnerable_versions": "<=1.0.0",
+                "title": "Fake advisory",
+                "url": "https://example.com/fake"
+            }
+        ]
+    });
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
+
+    // Without RNPM_TEST_MOCK_ADVISORIES, advisories.json in project_dir is NOT read.
+    // Offline/no registry will fail or not load the fake advisory.
+    let output = Command::new(rnpm_bin)
+        .arg("audit")
+        .env_remove("RNPM_TEST_MOCK_ADVISORIES")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit");
+
+    // The fake advisory should NOT have triggered the exit 1 with "Fake advisory"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Fake advisory"),
+        "Arbitrary project must not inject advisories without RNPM_TEST_MOCK_ADVISORIES"
+    );
+}
+
+#[test]
+fn test_audit_fix_force_diagnostics() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-fix",
+        "version": "1.0.0"
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!({
+        "name": "test-fix",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-fix",
+                "version": "1.0.0"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    // Test audit fix without vulns
+    let output = Command::new(rnpm_bin)
+        .args(["audit", "fix"])
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit fix");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("found 0 vulnerabilities"));
+
+    // Test audit fix --force diagnostic
+    let output_force = Command::new(rnpm_bin)
+        .args(["audit", "fix", "--force"])
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit fix --force");
+    assert!(output_force.status.success());
+    let stderr = String::from_utf8_lossy(&output_force.stderr);
+    assert!(stderr.contains("npm warn audit --force installing breaking changes if necessary"));
+}
+
+#[test]
+fn test_ci_timing_wireup() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-ci-timing",
+        "version": "1.0.0"
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!({
+        "name": "test-ci-timing",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-ci-timing",
+                "version": "1.0.0"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .args(["ci", "--timing"])
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm ci --timing");
+
+    assert!(
+        output.status.success(),
+        "ci --timing should succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Timing Summary:"),
+        "Must output Timing Summary: {stdout}"
+    );
+    assert!(stdout.contains("plan"), "Must contain plan phase: {stdout}");
+    assert!(
+        stdout.contains("metadata"),
+        "Must contain metadata phase: {stdout}"
+    );
+    assert!(
+        stdout.contains("Counters & Metrics:"),
+        "Must output Counters & Metrics: {stdout}"
+    );
+}
+
+#[test]
+fn test_post_install_concise_audit_summary_no_full_table() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-concise-audit",
+        "version": "1.0.0",
+        "optionalDependencies": {
+            "vuln-pkg": "1.0.0"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!(
+        {
+            "name": "test-concise-audit",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "test-concise-audit",
+                    "version": "1.0.0",
+                    "optionalDependencies": {
+                        "vuln-pkg": "1.0.0"
+                    }
+                },
+                "node_modules/vuln-pkg": {
+                    "version": "1.0.0",
+                    "optional": true,
+                    "os": ["nonexistent_os"]
+                }
+            }
+        }
+    );
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    let advisories_json = serde_json::json!({
+        "vuln-pkg": [
+            {
+                "id": 101,
+                "name": "vuln-pkg",
+                "severity": "high",
+                "vulnerable_versions": "<=1.0.0",
+                "title": "High severity flaw in vuln-pkg",
+                "url": "https://example.com/advisory/101"
+            }
+        ]
+    });
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .arg("install")
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm install");
+
+    assert!(
+        output.status.success(),
+        "install should succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("found 1 vulnerability (1 high)"),
+        "Must output concise summary: {stdout}"
+    );
+    assert!(
+        stdout.contains("run `npm audit fix`"),
+        "Must suggest npm audit fix: {stdout}"
+    );
+    assert!(
+        !stdout.contains("# npm audit report"),
+        "Must NOT output full advisory table during install: {stdout}"
+    );
 }

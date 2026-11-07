@@ -4,7 +4,7 @@ use crate::lock::CacheLock;
 use data_encoding::HEXLOWER;
 use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -298,7 +298,13 @@ impl Cache {
     pub fn lock_path(&self, name: &str) -> PathBuf {
         let safe_name = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         self.root.join("locks").join(format!("{safe_name}.lock"))
     }
@@ -314,13 +320,15 @@ impl Cache {
         hasher.update(key.as_bytes());
         let hash = HEXLOWER.encode(&hasher.finalize());
         let lock_path = self.lock_path(&format!("idx_{hash}"));
-        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                CacheError::LockFailed(lock_path.display().to_string())
-            } else {
-                CacheError::Io(e)
-            }
-        })
+        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(
+            |e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    CacheError::LockFailed(lock_path.display().to_string())
+                } else {
+                    CacheError::Io(e)
+                }
+            },
+        )
     }
 
     /// Acquire an exclusive cross-process lock for a key.
@@ -336,13 +344,15 @@ impl Cache {
         stale_threshold: Duration,
     ) -> Result<CacheLock, CacheError> {
         let lock_path = self.lock_path(&format!("blob_{sha512_hex}"));
-        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                CacheError::LockFailed(lock_path.display().to_string())
-            } else {
-                CacheError::Io(e)
-            }
-        })
+        CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(
+            |e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    CacheError::LockFailed(lock_path.display().to_string())
+                } else {
+                    CacheError::Io(e)
+                }
+            },
+        )
     }
 
     /// Acquire an exclusive cross-process lock for a blob digest.
@@ -522,6 +532,26 @@ impl Cache {
             if let Some(entry) = self.get_index_entry_internal(stripped)? {
                 return Ok(Some(entry));
             }
+            if stripped.contains("://") {
+                if let Some((protocol, rest)) = stripped.split_once("://") {
+                    if let Some((host_part, name_part)) = rest.split_once(':') {
+                        if host_part.ends_with('/') {
+                            let trimmed_host = host_part.trim_end_matches('/');
+                            let alt_key =
+                                format!("pacote:packument:{protocol}://{trimmed_host}:{name_part}");
+                            if let Some(entry) = self.get_index_entry_internal(&alt_key)? {
+                                return Ok(Some(entry));
+                            }
+                        } else {
+                            let alt_key =
+                                format!("pacote:packument:{protocol}://{host_part}/:{name_part}");
+                            if let Some(entry) = self.get_index_entry_internal(&alt_key)? {
+                                return Ok(Some(entry));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(None)
@@ -573,7 +603,11 @@ impl Cache {
 
                         if entry.sha512_hex.is_empty() {
                             if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                if let Some(sha512) = parsed
+                                    .entries
+                                    .iter()
+                                    .find(|e| e.algorithm == Algorithm::Sha512)
+                                {
                                     entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
                                 }
                             }
@@ -592,7 +626,10 @@ impl Cache {
                     }
                 }
                 Err(err) => {
-                    warn!("Corrupt index entry at {}: {err}. Purging corrupt index.", index_path.display());
+                    warn!(
+                        "Corrupt index entry at {}: {err}. Purging corrupt index.",
+                        index_path.display()
+                    );
                     let _ = remove_file_with_retries(&index_path);
                     return Ok(None);
                 }
@@ -614,7 +651,11 @@ impl Cache {
                     }
                     if entry.sha512_hex.is_empty() {
                         if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                            if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                            if let Some(sha512) = parsed
+                                .entries
+                                .iter()
+                                .find(|e| e.algorithm == Algorithm::Sha512)
+                            {
                                 entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
                             }
                         }
@@ -626,7 +667,10 @@ impl Cache {
                 }
             }
             Err(_) => {
-                warn!("Corrupt index entry at {}. Purging corrupt index.", index_path.display());
+                warn!(
+                    "Corrupt index entry at {}. Purging corrupt index.",
+                    index_path.display()
+                );
                 let _ = remove_file_with_retries(&index_path);
                 Ok(None)
             }
@@ -648,9 +692,7 @@ impl Cache {
         if let Some(expected) = expected_integrity {
             expected.verify(data).map_err(|e| match e {
                 IntegrityError::Mismatch {
-                    expected,
-                    actual,
-                    ..
+                    expected, actual, ..
                 } => CacheError::IntegrityMismatch {
                     key: key.to_string(),
                     expected,
@@ -809,9 +851,7 @@ impl Cache {
 
         let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
         let _ = remove_file_with_retries(&index_path);
-        warn!(
-            "Blob for index key '{key}' was corrupted or missing. Stale index purged."
-        );
+        warn!("Blob for index key '{key}' was corrupted or missing. Stale index purged.");
         Ok(None)
     }
 
@@ -875,7 +915,11 @@ impl Cache {
         let sha512_hex = HEXLOWER.encode(&sha512_bytes);
 
         if let Some(expected) = expected_integrity {
-            if let Some(sha512_entry) = expected.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+            if let Some(sha512_entry) = expected
+                .entries
+                .iter()
+                .find(|e| e.algorithm == Algorithm::Sha512)
+            {
                 if sha512_entry.digest.as_slice() != sha512_bytes.as_slice() {
                     return Err(CacheError::IntegrityMismatch {
                         key: key.to_string(),
@@ -993,6 +1037,146 @@ impl Cache {
         Ok(())
     }
 
+    /// Helper to construct a registry-scoped cache key for packument metadata.
+    pub fn packument_key(registry: &str, name: &str, accept: Option<&str>) -> String {
+        packument_key(registry, name, accept)
+    }
+
+    /// Retrieve packument metadata scoped by registry URL and optional accept header.
+    ///
+    /// Preserves isolation so cached metadata from a test registry or private registry
+    /// is not served for registry.npmjs.org or other registries.
+    pub fn get_packument(
+        &self,
+        registry: &str,
+        name: &str,
+    ) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
+        self.get_packument_with_accept(registry, name, None)
+    }
+
+    /// Retrieve packument metadata scoped by registry URL and specific accept header.
+    pub fn get_packument_with_accept(
+        &self,
+        registry: &str,
+        name: &str,
+        accept: Option<&str>,
+    ) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
+        let key = Self::packument_key(registry, name, accept);
+        if let Some(res) = self.get(&key)? {
+            return Ok(Some(res));
+        }
+
+        // Try trailing slash alternative on registry URL
+        let reg_with_slash = format!("{}/", registry.trim_end_matches('/'));
+        let alt_key = match accept {
+            Some(a) if !a.is_empty() => format!("pacote:packument:{reg_with_slash}:{name}:{a}"),
+            _ => format!("pacote:packument:{reg_with_slash}:{name}"),
+        };
+        if alt_key != key {
+            if let Some(res) = self.get(&alt_key)? {
+                return Ok(Some(res));
+            }
+        }
+
+        // If an accept header was provided, also fallback to the key without accept header
+        if accept.is_some() {
+            let key_no_accept = Self::packument_key(registry, name, None);
+            if let Some(res) = self.get(&key_no_accept)? {
+                return Ok(Some(res));
+            }
+        } else {
+            let key_abbrev =
+                Self::packument_key(registry, name, Some("application/vnd.npm.install-v1+json"));
+            if let Some(res) = self.get(&key_abbrev)? {
+                return Ok(Some(res));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Store packument metadata scoped by registry URL.
+    pub fn put_packument(
+        &self,
+        registry: &str,
+        name: &str,
+        data: &[u8],
+        metadata: Option<serde_json::Value>,
+    ) -> Result<IndexEntry, CacheError> {
+        self.put_packument_with_accept(registry, name, None, data, metadata)
+    }
+
+    /// Store packument metadata scoped by registry URL and optional accept header.
+    pub fn put_packument_with_accept(
+        &self,
+        registry: &str,
+        name: &str,
+        accept: Option<&str>,
+        data: &[u8],
+        metadata: Option<serde_json::Value>,
+    ) -> Result<IndexEntry, CacheError> {
+        let key = Self::packument_key(registry, name, accept);
+        self.put(&key, data, metadata)
+    }
+
+    /// Store packument metadata scoped by registry URL and optional accept header with strict integrity verification.
+    pub fn put_packument_with_integrity(
+        &self,
+        registry: &str,
+        name: &str,
+        accept: Option<&str>,
+        data: &[u8],
+        expected_integrity: Option<&Integrity>,
+        metadata: Option<&[u8]>,
+    ) -> Result<IndexEntry, CacheError> {
+        let key = Self::packument_key(registry, name, accept);
+        self.put_with_integrity(&key, data, expected_integrity, metadata)
+    }
+
+    /// Retrieve the local filesystem path to a cached packument blob without reading it into memory.
+    pub fn get_packument_blob_path(
+        &self,
+        registry: &str,
+        name: &str,
+        accept: Option<&str>,
+    ) -> Result<Option<(IndexEntry, PathBuf)>, CacheError> {
+        let key = Self::packument_key(registry, name, accept);
+        if let Some(res) = self.get_blob_path(&key)? {
+            return Ok(Some(res));
+        }
+
+        let reg_with_slash = format!("{}/", registry.trim_end_matches('/'));
+        let alt_key = match accept {
+            Some(a) if !a.is_empty() => format!("pacote:packument:{reg_with_slash}:{name}:{a}"),
+            _ => format!("pacote:packument:{reg_with_slash}:{name}"),
+        };
+        if alt_key != key {
+            if let Some(res) = self.get_blob_path(&alt_key)? {
+                return Ok(Some(res));
+            }
+        }
+
+        if accept.is_some() {
+            let key_no_accept = Self::packument_key(registry, name, None);
+            if let Some(res) = self.get_blob_path(&key_no_accept)? {
+                return Ok(Some(res));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Purge a scoped packument entry from the cache.
+    pub fn purge_packument(
+        &self,
+        registry: &str,
+        name: &str,
+        accept: Option<&str>,
+    ) -> Result<(), CacheError> {
+        let key = Self::packument_key(registry, name, accept);
+        self.purge_key(&key)
+    }
+
     /// Clean up any orphaned temporary files in `<cache_root>/tmp` older than `max_age`.
     pub fn clean_stale_temp_files(&self, max_age: Duration) -> Result<usize, CacheError> {
         let mut count = 0;
@@ -1013,7 +1197,8 @@ impl Cache {
                     if max_age.is_zero() {
                         // If file is an active in-flight temporary file created by the current process recently (< 5000ms),
                         // preserve it so concurrent threads are not interrupted under thread starvation.
-                        !((file_name.starts_with(&in_flight_blob) || file_name.starts_with(&in_flight_idx))
+                        !((file_name.starts_with(&in_flight_blob)
+                            || file_name.starts_with(&in_flight_idx))
                             && age < Duration::from_millis(5000))
                     } else {
                         age >= max_age
@@ -1043,6 +1228,7 @@ impl Cache {
             self.root.join("index-v5"),
             self.root.join("tmp"),
             self.root.join("locks"),
+            self.root.join("_fingerprints"),
         ];
 
         for dir in &targets {
@@ -1068,6 +1254,7 @@ impl Cache {
         fs::create_dir_all(self.root.join("index-v5"))?;
         fs::create_dir_all(self.root.join("tmp"))?;
         fs::create_dir_all(self.root.join("locks"))?;
+        fs::create_dir_all(self.root.join("_fingerprints"))?;
 
         Ok(())
     }
@@ -1087,10 +1274,14 @@ impl Cache {
 
             for path in blob_paths {
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let is_hex = file_name.len() == 128 && file_name.chars().all(|c| c.is_ascii_hexdigit());
+                let is_hex =
+                    file_name.len() == 128 && file_name.chars().all(|c| c.is_ascii_hexdigit());
 
                 if !is_hex {
-                    warn!("Invalid blob file name '{}' in content-v2. Purging.", path.display());
+                    warn!(
+                        "Invalid blob file name '{}' in content-v2. Purging.",
+                        path.display()
+                    );
                     let _ = remove_file_with_retries(&path);
                     report.corrupted_blobs += 1;
                     continue;
@@ -1143,7 +1334,11 @@ impl Cache {
                         continue;
                     }
                     Err(e) => {
-                        warn!("Unreadable index file at {} ({}). Purging.", path.display(), e);
+                        warn!(
+                            "Unreadable index file at {} ({}). Purging.",
+                            path.display(),
+                            e
+                        );
                         let _ = remove_file_with_retries(&path);
                         report.corrupted_indices += 1;
                         continue;
@@ -1168,7 +1363,11 @@ impl Cache {
                         if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(json_str) {
                             if entry.sha512_hex.is_empty() {
                                 if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                    if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                    if let Some(sha512) = parsed
+                                        .entries
+                                        .iter()
+                                        .find(|e| e.algorithm == Algorithm::Sha512)
+                                    {
                                         entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
                                     }
                                 }
@@ -1190,7 +1389,11 @@ impl Cache {
                         if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(&content) {
                             if entry.sha512_hex.is_empty() {
                                 if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                    if let Some(sha512) = parsed.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                                    if let Some(sha512) = parsed
+                                        .entries
+                                        .iter()
+                                        .find(|e| e.algorithm == Algorithm::Sha512)
+                                    {
                                         entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
                                     }
                                 }
@@ -1211,7 +1414,10 @@ impl Cache {
                 let entry = match parsed_entry {
                     Some(e) if !e.key.is_empty() && !e.sha512_hex.is_empty() => e,
                     _ => {
-                        warn!("Corrupted or malformed index entry at {}. Purging.", path.display());
+                        warn!(
+                            "Corrupted or malformed index entry at {}. Purging.",
+                            path.display()
+                        );
                         let _ = remove_file_with_retries(&path);
                         report.corrupted_indices += 1;
                         continue;
@@ -1321,5 +1527,103 @@ impl Cache {
             }
         }
         Ok(count)
+    }
+
+    /// Compute storage path for a project fast-path fingerprint keyed by its canonical directory.
+    pub fn fingerprint_path(&self, project_dir: &Path) -> PathBuf {
+        let canonical = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let path_str = canonical.to_string_lossy();
+        let normalized = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
+        #[cfg(windows)]
+        let normalized_str = normalized.to_ascii_lowercase().replace('\\', "/");
+        #[cfg(not(windows))]
+        let normalized_str = normalized.to_string();
+
+        let mut hasher = Sha256::new();
+        hasher.update(normalized_str.as_bytes());
+        let key = HEXLOWER.encode(&hasher.finalize());
+        self.root
+            .join("_fingerprints")
+            .join(format!("{}.json", key))
+    }
+
+    /// Retrieve the cached project fingerprint for a project directory.
+    pub fn get_project_fingerprint(
+        &self,
+        project_dir: &Path,
+    ) -> Result<Option<String>, CacheError> {
+        let path = self.fingerprint_path(project_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = match fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        #[derive(Deserialize)]
+        struct FingerprintRecord {
+            fingerprint: String,
+        }
+        if let Ok(record) = serde_json::from_str::<FingerprintRecord>(&data) {
+            Ok(Some(record.fingerprint))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Store a project fingerprint in cache keyed by canonical project directory.
+    pub fn set_project_fingerprint(
+        &self,
+        project_dir: &Path,
+        fingerprint: &str,
+    ) -> Result<(), CacheError> {
+        let target_path = self.fingerprint_path(project_dir);
+        if let Some(parent) = target_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let canonical = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let record = serde_json::json!({
+            "project_path": canonical.to_string_lossy(),
+            "fingerprint": fingerprint,
+            "updated_at": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        let serialized = serde_json::to_vec_pretty(&record)?;
+
+        let temp_path = self.create_temp_path("fingerprint");
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&serialized)?;
+            file.flush()?;
+        }
+
+        if target_path.exists() {
+            let _ = remove_file_with_retries(&target_path);
+        }
+        if let Err(err) = rename_with_retries(&temp_path, &target_path) {
+            let _ = remove_file_with_retries(&temp_path);
+            return Err(CacheError::Io(err));
+        }
+        Ok(())
+    }
+}
+
+/// Helper to construct a registry-scoped cache key for packument metadata.
+/// Scopes the key by registry URL and optional accept header.
+pub fn packument_key(registry: &str, name: &str, accept: Option<&str>) -> String {
+    let reg = registry.trim_end_matches('/');
+    match accept {
+        Some(a) if !a.is_empty() => format!("pacote:packument:{reg}:{name}:{a}"),
+        _ => format!("pacote:packument:{reg}:{name}"),
     }
 }

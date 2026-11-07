@@ -40,10 +40,7 @@ pub enum FsError {
     ForbiddenSpecialEntry { path: PathBuf },
 
     #[error("Tar bomb resource limit exceeded ({limit_type}): {detail}")]
-    TarBombLimitExceeded {
-        limit_type: String,
-        detail: String,
-    },
+    TarBombLimitExceeded { limit_type: String, detail: String },
 
     #[error("Atomic replacement failed for '{path}' after {retries} retries: {source}")]
     AtomicReplacementFailed {
@@ -54,10 +51,7 @@ pub enum FsError {
     },
 
     #[error("Junction error for '{path}': {detail}")]
-    JunctionError {
-        path: PathBuf,
-        detail: String,
-    },
+    JunctionError { path: PathBuf, detail: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

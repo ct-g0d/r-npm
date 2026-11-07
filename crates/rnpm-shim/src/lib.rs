@@ -1,9 +1,9 @@
-﻿#![allow(clippy::permissions_set_readonly_false)]
+#![allow(clippy::permissions_set_readonly_false)]
 
-use std::fs;
-use std::path::Path;
 use anyhow::{Context, Result};
 use rnpm_core::manifest::Manifest;
+use std::fs;
+use std::path::Path;
 
 pub mod error;
 pub mod generator;
@@ -16,8 +16,7 @@ mod tests;
 /// Escapes a relative path string for use inside double quotes in POSIX shell script.
 pub fn escape_posix_path(path: &str) -> String {
     let forward = path.replace('\\', "/");
-    let sanitized = forward
-        .replace(['\0', '\r', '\n'], "");
+    let sanitized = forward.replace(['\0', '\r', '\n'], "");
     sanitized
         .replace('\\', "\\\\")
         .replace('\"', "\\\"")
@@ -31,7 +30,9 @@ pub fn escape_posix_arg(arg: &str) -> String {
     if sanitized.is_empty() {
         return "''".to_string();
     }
-    if sanitized.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+    if sanitized.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':'
+    }) {
         sanitized
     } else {
         format!("'{}'", sanitized.replace('\'', r"'\''"))
@@ -43,25 +44,37 @@ pub fn escape_posix_arg(arg: &str) -> String {
 /// and quotes/newlines/null bytes are stripped.
 pub fn escape_cmd_path(path: &str) -> String {
     let win = path.replace('/', "\\");
-    let sanitized = win
-        .replace(['\0', '\r', '\n', '\"'], "");
+    let sanitized = win.replace(['\0', '\r', '\n', '\"'], "");
     sanitized.replace('%', "%%")
 }
 
 /// Escapes an argument for Windows command line according to Win32 CommandLineToArgvW rules
 /// and protects against cmd shell metacharacters and injection vectors.
 pub fn escape_cmd_arg(arg: &str) -> String {
-    let sanitized = arg
-        .replace(['\0', '\r', '\n'], "");
+    let sanitized = arg.replace(['\0', '\r', '\n'], "");
     if sanitized.is_empty() {
         return "\"\"".to_string();
     }
 
     let needs_quotes = sanitized.chars().any(|c| {
-        c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0B' || c == '\"'
-            || c == '&' || c == '|' || c == '<' || c == '>' || c == '^'
-            || c == '(' || c == ')' || c == '%' || c == '!'
-            || c == ',' || c == ';' || c == '='
+        c == ' '
+            || c == '\t'
+            || c == '\n'
+            || c == '\r'
+            || c == '\x0B'
+            || c == '\"'
+            || c == '&'
+            || c == '|'
+            || c == '<'
+            || c == '>'
+            || c == '^'
+            || c == '('
+            || c == ')'
+            || c == '%'
+            || c == '!'
+            || c == ','
+            || c == ';'
+            || c == '='
     });
     if !needs_quotes {
         return sanitized;
@@ -123,7 +136,9 @@ pub fn escape_ps1_arg(arg: &str) -> String {
     if sanitized.is_empty() {
         return "''".to_string();
     }
-    if sanitized.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':') {
+    if sanitized.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ':'
+    }) {
         sanitized
     } else {
         format!("'{}'", sanitized.replace('\'', "''"))
@@ -176,7 +191,9 @@ pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
 /// Generates PowerShell (.ps1) wrapper matching docs/platform-fs-contract.md.
 pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
     let rel = format!("../{target_rel_from_node_modules}");
-    generator::generate_shim_content(&rel, None).ps1.replace("\r\n", "\n")
+    generator::generate_shim_content(&rel, None)
+        .ps1
+        .replace("\r\n", "\n")
 }
 /// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix and Git Bash.
 /// Also supports files with UTF-8 BOM and clears Windows read-only flags if necessary.
@@ -292,11 +309,7 @@ pub fn create_shims(
 }
 
 /// Creates shims for all binary targets declared in a package's manifest.
-pub fn create_package_shims(
-    pkg_dir: &Path,
-    bin_dir: &Path,
-    manifest: &Manifest,
-) -> Result<()> {
+pub fn create_package_shims(pkg_dir: &Path, bin_dir: &Path, manifest: &Manifest) -> Result<()> {
     for (bin_name, rel_script) in manifest.bin_entries() {
         let script_full_path = pkg_dir.join(&rel_script);
         let _ = normalize_shebang(&script_full_path);
@@ -314,6 +327,3 @@ pub fn create_package_shims(
     }
     Ok(())
 }
-
-
-

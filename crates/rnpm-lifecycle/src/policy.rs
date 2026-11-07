@@ -1,7 +1,7 @@
-use std::collections::HashSet;
-use std::time::Duration;
 use crate::error::LifecycleError;
 use crate::sandbox::check_dangerous_command_patterns;
+use std::collections::HashSet;
+use std::time::Duration;
 
 /// Policy enforcement level for lifecycle script execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -112,7 +112,10 @@ impl ScriptSandboxPolicy {
         self
     }
 
-    pub fn with_allowlist(mut self, allowlist: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn with_allowlist(
+        mut self,
+        allowlist: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         self.allowlist = allowlist.into_iter().map(Into::into).collect();
         self
     }
@@ -143,7 +146,11 @@ impl ScriptSandboxPolicy {
     }
 
     /// Validates whether a lifecycle script is permitted to execute according to this policy.
-    pub fn check_execution_allowed(&self, package_name: &str, script_cmd: &str) -> Result<(), LifecycleError> {
+    pub fn check_execution_allowed(
+        &self,
+        package_name: &str,
+        script_cmd: &str,
+    ) -> Result<(), LifecycleError> {
         // 1. Check if disabled
         if self.level == SandboxLevel::Disabled {
             return Err(LifecycleError::ScriptsDisabled);
@@ -157,10 +164,14 @@ impl ScriptSandboxPolicy {
         // 3. Check allowlist (in Strict mode, or when allowlist is populated)
         if self.level == SandboxLevel::Strict {
             if !self.allowlist.contains(package_name) {
-                return Err(LifecycleError::PackageNotAllowlisted(package_name.to_string()));
+                return Err(LifecycleError::PackageNotAllowlisted(
+                    package_name.to_string(),
+                ));
             }
         } else if !self.allowlist.is_empty() && !self.allowlist.contains(package_name) {
-            return Err(LifecycleError::PackageNotAllowlisted(package_name.to_string()));
+            return Err(LifecycleError::PackageNotAllowlisted(
+                package_name.to_string(),
+            ));
         }
 
         // 4. Check dangerous command patterns if not permissive

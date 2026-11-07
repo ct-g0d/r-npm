@@ -1,6 +1,6 @@
 use crate::*;
-use tempfile::tempdir;
 use std::fs;
+use tempfile::tempdir;
 
 #[test]
 fn test_generate_shims_content() {
@@ -71,7 +71,10 @@ fn test_path_and_argument_escaping_special_chars() {
     assert_eq!(escape_ps1_arg("single 'quote'"), "'single ''quote'''");
 
     // Arguments with spaces and trailing backslash before quote
-    assert_eq!(escape_cmd_arg(r#"C:\path with space\to\"#), r#""C:\path with space\to\\""#);
+    assert_eq!(
+        escape_cmd_arg(r#"C:\path with space\to\"#),
+        r#""C:\path with space\to\\""#
+    );
 
     // 3. Shell metacharacters and injection vectors
     // Batch variable / parameter expansions (%VAR%, %1, !VAR!)
@@ -96,7 +99,10 @@ fn test_path_and_argument_escaping_special_chars() {
     assert_eq!(escape_ps1_arg("$(calc.exe)"), "'$(calc.exe)'");
     assert_eq!(escape_ps1_arg("$env:PATH"), "'$env:PATH'");
     assert_eq!(escape_ps1_arg("`whoami`"), "'`whoami`'");
-    assert_eq!(escape_ps1_arg("foo; Start-Process calc"), "'foo; Start-Process calc'");
+    assert_eq!(
+        escape_ps1_arg("foo; Start-Process calc"),
+        "'foo; Start-Process calc'"
+    );
     assert_eq!(escape_ps1_arg("foo | Out-File"), "'foo | Out-File'");
 
     // Safe flags preserved without extra quotes
@@ -126,7 +132,11 @@ fn test_normalize_shebang_with_bom_and_crlf() {
 
     // 1. Shebang with UTF-8 BOM and CRLF
     let bom_script = dir.path().join("bom_script.js");
-    fs::write(&bom_script, b"\xEF\xBB\xBF#!/usr/bin/env node\r\nconsole.log(1);\r\n").unwrap();
+    fs::write(
+        &bom_script,
+        b"\xEF\xBB\xBF#!/usr/bin/env node\r\nconsole.log(1);\r\n",
+    )
+    .unwrap();
     normalize_shebang(&bom_script).unwrap();
     let content = fs::read(&bom_script).unwrap();
     assert_eq!(&content[..23], b"\xEF\xBB\xBF#!/usr/bin/env node\n");
@@ -158,7 +168,10 @@ fn test_workspace_directory_junction_linking_unprivileged() {
 
     // Create junction without elevation
     rnpm_fs::create_junction(&link_dir, &member_dir).unwrap();
-    assert!(rnpm_fs::is_junction(&link_dir).unwrap(), "Junction reparse point must be detected");
+    assert!(
+        rnpm_fs::is_junction(&link_dir).unwrap(),
+        "Junction reparse point must be detected"
+    );
 
     // Reading through junction
     let read_file = fs::read_to_string(link_dir.join("index.js")).unwrap();
@@ -167,8 +180,14 @@ fn test_workspace_directory_junction_linking_unprivileged() {
     // Safe deletion: removes junction, keeps source files intact
     rnpm_fs::remove_junction(&link_dir).unwrap();
     assert!(!link_dir.exists(), "Junction link should be gone");
-    assert!(member_dir.exists(), "Target workspace package must remain intact");
-    assert!(member_dir.join("index.js").exists(), "Target files must remain intact");
+    assert!(
+        member_dir.exists(),
+        "Target workspace package must remain intact"
+    );
+    assert!(
+        member_dir.join("index.js").exists(),
+        "Target files must remain intact"
+    );
 }
 
 #[test]
@@ -185,10 +204,16 @@ fn test_extreme_shim_argument_escaping_nested_quotes_and_backticks() {
     // 2. Mixed single and double quotes
     let mixed = r#"He said, "It's dangerous to go alone; take 'this' & that!""#;
     let escaped_posix = escape_posix_arg(mixed);
-    assert_eq!(escaped_posix, r#"'He said, "It'\''s dangerous to go alone; take '\''this'\'' & that!"'"#);
+    assert_eq!(
+        escaped_posix,
+        r#"'He said, "It'\''s dangerous to go alone; take '\''this'\'' & that!"'"#
+    );
 
     let escaped_ps1 = escape_ps1_arg(mixed);
-    assert_eq!(escaped_ps1, r#"'He said, "It''s dangerous to go alone; take ''this'' & that!"'"#);
+    assert_eq!(
+        escaped_ps1,
+        r#"'He said, "It''s dangerous to go alone; take ''this'' & that!"'"#
+    );
 
     let escaped_cmd_mixed = escape_cmd_arg(mixed);
     assert!(escaped_cmd_mixed.contains(r#"\"It's dangerous"#));
@@ -211,8 +236,14 @@ fn test_extreme_shim_argument_escaping_nested_quotes_and_backticks() {
 
     // 4. Multi-line arguments with \n and \r\n
     let multiline_unix = "SELECT * FROM users\nWHERE active = 1\nORDER BY id DESC;";
-    assert_eq!(escape_posix_arg(multiline_unix), format!("'{multiline_unix}'"));
-    assert_eq!(escape_ps1_arg(multiline_unix), format!("'{multiline_unix}'"));
+    assert_eq!(
+        escape_posix_arg(multiline_unix),
+        format!("'{multiline_unix}'")
+    );
+    assert_eq!(
+        escape_ps1_arg(multiline_unix),
+        format!("'{multiline_unix}'")
+    );
     let cmd_multi = escape_cmd_arg(multiline_unix);
     assert!(cmd_multi.starts_with('"') && cmd_multi.ends_with('"'));
     assert!(cmd_multi.contains("SELECT * FROM usersWHERE active = 1"));
@@ -240,13 +271,19 @@ fn test_extreme_shim_path_spaces_and_special_characters() {
     let complex_path = "nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js";
 
     let posix = generate_posix_shim(complex_path);
-    assert!(posix.contains(r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#));
+    assert!(posix.contains(
+        r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#
+    ));
 
     let cmd = generate_cmd_shim(complex_path);
-    assert!(cmd.contains(r#""%dp0%\..\nested dir\Program Files (x86)\Acme & Sons\C++ Tools\bin\my tool.js""#));
+    assert!(cmd.contains(
+        r#""%dp0%\..\nested dir\Program Files (x86)\Acme & Sons\C++ Tools\bin\my tool.js""#
+    ));
 
     let ps1 = generate_ps1_shim(complex_path);
-    assert!(ps1.contains(r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#));
+    assert!(ps1.contains(
+        r#""$basedir/../nested dir/Program Files (x86)/Acme & Sons/C++ Tools/bin/my tool.js""#
+    ));
 
     // 2. Target path with backticks and PowerShell subexpressions
     let bt_path = "packages/my`tool`/lib/$(subexpr)/index.js";
@@ -270,7 +307,10 @@ fn test_extreme_shim_live_invocation_on_disk() {
     // Path containing spaces and parentheses mirroring realistic Windows directories
     let project_root = dir.path().join("My Projects (x86)").join("Test Suite");
     let bin_dir = project_root.join("node_modules").join(".bin");
-    let tool_dir = project_root.join("node_modules").join("spaced tool").join("bin");
+    let tool_dir = project_root
+        .join("node_modules")
+        .join("spaced tool")
+        .join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&tool_dir).unwrap();
 
@@ -286,11 +326,7 @@ fn test_extreme_shim_live_invocation_on_disk() {
     fs::write(&script_file, script_code).unwrap();
 
     // Create shims pointing to the tool across relative directories with spaces
-    create_shims(
-        &bin_dir,
-        "spaced-tool",
-        "spaced tool/bin/cli.js",
-    ).unwrap();
+    create_shims(&bin_dir, "spaced-tool", "spaced tool/bin/cli.js").unwrap();
 
     let cmd_shim = bin_dir.join("spaced-tool.cmd");
     let ps1_shim = bin_dir.join("spaced-tool.ps1");
@@ -318,7 +354,10 @@ fn test_extreme_shim_live_invocation_on_disk() {
             .expect("Failed to execute cmd shim");
 
         assert!(status.success(), "CMD shim execution must succeed");
-        assert!(output_file.exists(), "CMD shim must have executed target node script");
+        assert!(
+            output_file.exists(),
+            "CMD shim must have executed target node script"
+        );
 
         let content = fs::read_to_string(&output_file).unwrap();
         let parsed_args: Vec<String> = serde_json::from_str(&content).unwrap();
@@ -386,7 +425,11 @@ fn test_shim_exit_code_fidelity() {
             .status()
             .expect("Failed to execute cmd shim");
 
-        assert_eq!(status.code(), Some(42), "CMD shim must faithfully propagate exit code 42");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "CMD shim must faithfully propagate exit code 42"
+        );
     }
 
     #[cfg(not(windows))]
@@ -399,7 +442,11 @@ fn test_shim_exit_code_fidelity() {
             .status()
             .expect("Failed to execute posix shim");
 
-        assert_eq!(status.code(), Some(42), "POSIX shim must faithfully propagate exit code 42");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "POSIX shim must faithfully propagate exit code 42"
+        );
     }
 }
 
@@ -423,11 +470,7 @@ fn test_cmd_ps1_bash_shim_live_execution_all_shells() {
     );
     fs::write(&script_file, script_code).unwrap();
 
-    create_shims(
-        &bin_dir,
-        "multi-tool",
-        "multi-tool/cli.js",
-    ).unwrap();
+    create_shims(&bin_dir, "multi-tool", "multi-tool/cli.js").unwrap();
 
     let cmd_shim = bin_dir.join("multi-tool.cmd");
     let ps1_shim = bin_dir.join("multi-tool.ps1");
@@ -549,7 +592,10 @@ fn which_tool(name: &str) -> std::io::Result<std::path::PathBuf> {
             }
         }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "tool not found"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "tool not found",
+    ))
 }
 
 #[test]
@@ -566,7 +612,12 @@ fn test_shim_exit_code_fidelity_all_codes() {
         fs::write(&script_file, format!("process.exit({code});\n")).unwrap();
 
         let bin_name = format!("exit-{code}");
-        create_shims(&bin_dir, &bin_name, &format!("exit-codes-pkg/exit_{code}.js")).unwrap();
+        create_shims(
+            &bin_dir,
+            &bin_name,
+            &format!("exit-codes-pkg/exit_{code}.js"),
+        )
+        .unwrap();
 
         #[cfg(windows)]
         {
@@ -579,7 +630,11 @@ fn test_shim_exit_code_fidelity_all_codes() {
                 .arg(format!(".\\{bin_name}.cmd"))
                 .status()
                 .expect("Failed to execute cmd shim");
-            assert_eq!(status.code(), Some(code), "CMD shim must faithfully exit with code {code}");
+            assert_eq!(
+                status.code(),
+                Some(code),
+                "CMD shim must faithfully exit with code {code}"
+            );
 
             // PS1 shim exit code fidelity
             let ps_status = std::process::Command::new("powershell.exe")
@@ -594,7 +649,11 @@ fn test_shim_exit_code_fidelity_all_codes() {
                 .status();
 
             if let Ok(st) = ps_status {
-                assert_eq!(st.code(), Some(code), "PS1 shim must faithfully exit with code {code}");
+                assert_eq!(
+                    st.code(),
+                    Some(code),
+                    "PS1 shim must faithfully exit with code {code}"
+                );
             }
         }
 
@@ -608,11 +667,13 @@ fn test_shim_exit_code_fidelity_all_codes() {
                 let mut cmd = std::process::Command::new(sh);
                 cmd.current_dir(&bin_dir);
                 cmd.stdin(std::process::Stdio::null());
-                let status = cmd
-                    .arg(format!("./{bin_name}"))
-                    .status();
+                let status = cmd.arg(format!("./{bin_name}")).status();
                 if let Ok(st) = status {
-                    assert_eq!(st.code(), Some(code), "POSIX shim must faithfully exit with code {code}");
+                    assert_eq!(
+                        st.code(),
+                        Some(code),
+                        "POSIX shim must faithfully exit with code {code}"
+                    );
                     break;
                 }
             }
@@ -634,7 +695,6 @@ fn test_shebang_parsing_with_quotes_and_flags() {
     assert_eq!(info2.program, "sh");
     assert_eq!(info2.args, vec!["-e", "-x"]);
 }
-
 
 #[test]
 fn test_compute_relative_path_case_insensitivity_windows() {

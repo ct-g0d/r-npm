@@ -1,7 +1,7 @@
+use crate::error::ShimError;
+use path_clean::clean;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf, Prefix};
-use path_clean::clean;
-use crate::error::ShimError;
 
 /// Strips Windows verbatim prefix (`\\?\` or `\\?\UNC\`) if present.
 pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
@@ -19,15 +19,9 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 fn prefixes_equal(a: &Prefix, b: &Prefix) -> bool {
     match (a, b) {
         (Prefix::Disk(d1), Prefix::Disk(d2)) => d1.eq_ignore_ascii_case(d2),
-        (Prefix::VerbatimDisk(d1), Prefix::VerbatimDisk(d2)) => {
-            d1.eq_ignore_ascii_case(d2)
-        }
-        (Prefix::Disk(d1), Prefix::VerbatimDisk(d2)) => {
-            d1.eq_ignore_ascii_case(d2)
-        }
-        (Prefix::VerbatimDisk(d1), Prefix::Disk(d2)) => {
-            d1.eq_ignore_ascii_case(d2)
-        }
+        (Prefix::VerbatimDisk(d1), Prefix::VerbatimDisk(d2)) => d1.eq_ignore_ascii_case(d2),
+        (Prefix::Disk(d1), Prefix::VerbatimDisk(d2)) => d1.eq_ignore_ascii_case(d2),
+        (Prefix::VerbatimDisk(d1), Prefix::Disk(d2)) => d1.eq_ignore_ascii_case(d2),
         (Prefix::UNC(s1, p1), Prefix::UNC(s2, p2))
         | (Prefix::VerbatimUNC(s1, p1), Prefix::VerbatimUNC(s2, p2))
         | (Prefix::UNC(s1, p1), Prefix::VerbatimUNC(s2, p2))
@@ -138,14 +132,8 @@ pub fn compute_relative_path(from: &Path, to: &Path) -> Result<String, ShimError
     }
 
     // Normal components
-    let from_normal: Vec<&OsStr> = from_components[i..]
-        .iter()
-        .map(|c| c.as_os_str())
-        .collect();
-    let to_normal: Vec<&OsStr> = to_components[j..]
-        .iter()
-        .map(|c| c.as_os_str())
-        .collect();
+    let from_normal: Vec<&OsStr> = from_components[i..].iter().map(|c| c.as_os_str()).collect();
+    let to_normal: Vec<&OsStr> = to_components[j..].iter().map(|c| c.as_os_str()).collect();
 
     // Find common prefix
     let mut common = 0;

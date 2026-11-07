@@ -1,9 +1,9 @@
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use serde_json::Value;
 
-use rnpm_core::semver::{Range, Version};
 use crate::inspect_tree::{build_dependency_tree, InspectedNode, TreeOptions};
+use rnpm_core::semver::{Range, Version};
 
 /// Options for query command.
 #[derive(Debug, Clone, Default)]
@@ -231,7 +231,9 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
                     if paren_depth == 0 {
                         break;
                     }
-                } else if paren_depth == 0 && (p == ' ' || p == '>' || p == '[' || p == ':' || p == '.') {
+                } else if paren_depth == 0
+                    && (p == ' ' || p == '>' || p == '[' || p == ':' || p == '.')
+                {
                     break;
                 } else {
                     pseudo.push(chars.next().unwrap());
@@ -318,13 +320,21 @@ fn parse_compound_selector(tokens: &[String]) -> Result<CompoundSelector, String
 }
 
 fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
-    let ops = [("^=", AttrOp::Prefix), ("$=", AttrOp::Suffix), ("*=", AttrOp::Substring), ("~=", AttrOp::Tilde), ("=", AttrOp::Exact)];
+    let ops = [
+        ("^=", AttrOp::Prefix),
+        ("$=", AttrOp::Suffix),
+        ("*=", AttrOp::Substring),
+        ("~=", AttrOp::Tilde),
+        ("=", AttrOp::Exact),
+    ];
 
     for (op_str, op_enum) in ops {
         if let Some((name_part, val_part)) = s.split_once(op_str) {
             let name = name_part.trim().to_string();
             let mut val = val_part.trim().to_string();
-            if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+            if (val.starts_with('"') && val.ends_with('"'))
+                || (val.starts_with('\'') && val.ends_with('\''))
+            {
                 val = val[1..val.len() - 1].to_string();
             }
             return Ok(SimpleSelector::Attribute {
@@ -355,7 +365,11 @@ fn get_nested_json_val<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(curr)
 }
 
-fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map: &HashMap<String, &InspectedNode>) -> bool {
+fn matches_simple(
+    selector: &SimpleSelector,
+    node: &InspectedNode,
+    all_nodes_map: &HashMap<String, &InspectedNode>,
+) -> bool {
     match selector {
         SimpleSelector::Universal => true,
         SimpleSelector::Type(name) => node.name == *name,
@@ -364,7 +378,9 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
             "optional" => node.optional,
             "peer" => node.peer,
             "prod" => !node.dev && !node.optional && !node.peer,
-            "workspace" => node.location.starts_with("packages/") || node.location.starts_with("workspaces/"),
+            "workspace" => {
+                node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
+            }
             _ => false,
         },
         SimpleSelector::PseudoClass { name, arg } => match name.as_str() {
@@ -372,9 +388,11 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
             "extraneous" => node.extraneous,
             "invalid" => node.invalid.is_some(),
             "missing" => node.missing,
-            "outdated" => {
-                node.query_context.get("outdated").and_then(|v| v.as_bool()).unwrap_or(false)
-            }
+            "outdated" => node
+                .query_context
+                .get("outdated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             "dev" => node.dev,
             "prod" => !node.dev && !node.optional && !node.peer,
             "optional" => node.optional,
@@ -382,11 +400,15 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
             "empty" => node.to.is_empty(),
             "deduped" => node.deduped,
             "overridden" => node.overridden,
-            "workspace" => node.location.starts_with("packages/") || node.location.starts_with("workspaces/"),
+            "workspace" => {
+                node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
+            }
             "project" => node.location.is_empty(),
             "semver" => {
                 if let (Some(range_str), Some(ver_str)) = (arg, &node.version) {
-                    if let (Ok(r), Ok(v)) = (Range::parse(range_str.trim()), Version::parse(ver_str)) {
+                    if let (Ok(r), Ok(v)) =
+                        (Range::parse(range_str.trim()), Version::parse(ver_str))
+                    {
                         r.satisfies(&v)
                     } else {
                         false
@@ -435,7 +457,10 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
                 "homepage" => node.homepage.clone(),
                 "location" => Some(node.location.clone()),
                 "path" => node.path.as_ref().map(|p| p.to_string_lossy().to_string()),
-                "realpath" => node.realpath.as_ref().map(|p| p.to_string_lossy().to_string()),
+                "realpath" => node
+                    .realpath
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
                 "resolved" => node.resolved.clone(),
                 "integrity" => node.integrity.clone(),
                 "dev" => Some(node.dev.to_string()),
@@ -479,7 +504,9 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
                     if name == "version" {
                         if let Some(v_str) = &node.version {
                             let range_str = format!("^{expected}");
-                            if let (Ok(r), Ok(v)) = (Range::parse(&range_str), Version::parse(v_str)) {
+                            if let (Ok(r), Ok(v)) =
+                                (Range::parse(&range_str), Version::parse(v_str))
+                            {
                                 return r.satisfies(&v);
                             }
                         }
@@ -490,12 +517,16 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
                     if name == "version" {
                         if let Some(v_str) = &node.version {
                             let range_str = format!("~{expected}");
-                            if let (Ok(r), Ok(v)) = (Range::parse(&range_str), Version::parse(v_str)) {
+                            if let (Ok(r), Ok(v)) =
+                                (Range::parse(&range_str), Version::parse(v_str))
+                            {
                                 return r.satisfies(&v);
                             }
                         }
                     }
-                    actual_str.map(|s| s.split_whitespace().any(|w| w == expected)).unwrap_or(false)
+                    actual_str
+                        .map(|s| s.split_whitespace().any(|w| w == expected))
+                        .unwrap_or(false)
                 }
                 (Some(AttrOp::Substring), Some(expected)) => {
                     actual_str.map(|s| s.contains(expected)).unwrap_or(false)
@@ -509,8 +540,15 @@ fn matches_simple(selector: &SimpleSelector, node: &InspectedNode, all_nodes_map
     }
 }
 
-fn matches_compound(compound: &CompoundSelector, node: &InspectedNode, all_nodes_map: &HashMap<String, &InspectedNode>) -> bool {
-    compound.simple.iter().all(|s| matches_simple(s, node, all_nodes_map))
+fn matches_compound(
+    compound: &CompoundSelector,
+    node: &InspectedNode,
+    all_nodes_map: &HashMap<String, &InspectedNode>,
+) -> bool {
+    compound
+        .simple
+        .iter()
+        .all(|s| matches_simple(s, node, all_nodes_map))
 }
 
 fn matches_complex(
@@ -579,7 +617,10 @@ pub fn matches_query(
     node: &InspectedNode,
     all_nodes_map: &HashMap<String, &InspectedNode>,
 ) -> bool {
-    query.selectors.iter().any(|complex| matches_complex(complex, node, all_nodes_map))
+    query
+        .selectors
+        .iter()
+        .any(|complex| matches_complex(complex, node, all_nodes_map))
 }
 
 /// Main entrypoint for `rnpm query`.
@@ -677,10 +718,18 @@ mod tests {
 
     #[test]
     fn test_matches_query_node() {
-        let mut root = InspectedNode::new_root("my-app".to_string(), Some("1.0.0".to_string()), Path::new("."));
+        let mut root = InspectedNode::new_root(
+            "my-app".to_string(),
+            Some("1.0.0".to_string()),
+            Path::new("."),
+        );
         root.location = String::new();
 
-        let mut child = InspectedNode::new_root("react".to_string(), Some("18.2.0".to_string()), Path::new("."));
+        let mut child = InspectedNode::new_root(
+            "react".to_string(),
+            Some("18.2.0".to_string()),
+            Path::new("."),
+        );
         child.location = "node_modules/react".to_string();
         child.from.push(String::new());
         root.to.push("node_modules/react".to_string());

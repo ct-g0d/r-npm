@@ -1,30 +1,28 @@
 #![allow(clippy::field_reassign_with_default)]
 
+use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info, warn};
 use url::Url;
 
-use rnpm_cache::Cache;
+use rnpm_cache::{Cache, CacheError, PackStore};
 use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
 use rnpm_core::spec::{PackageSpec, PackageTarget};
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
-use std::sync::Arc;
-use rnpm_fs::atomic::extract_and_replace;
 use rnpm_fs::junction::{is_junction, remove_junction};
-use rnpm_lifecycle::{
-    execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource,
-};
+use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
+use rnpm_lifecycle::{execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
+use rnpm_registry::client::{RegistryClient, RegistryClientConfig, NPM_INSTALL_V1_JSON};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
+use std::sync::Arc;
 pub mod git;
 pub use git::GitFetcher;
 
@@ -34,8 +32,8 @@ pub use link::*;
 pub mod prune;
 pub use prune::{
     analyze_reachability, discover_extraneous_packages, execute_prune,
-    extract_package_name_from_path, scan_node_modules, ExtraneousPackage,
-    PruneAnalysis, PruneOptions, PruneSummary,
+    extract_package_name_from_path, scan_node_modules, ExtraneousPackage, PruneAnalysis,
+    PruneOptions, PruneSummary,
 };
 
 pub mod rebuild;
@@ -43,9 +41,42 @@ pub use rebuild::{execute_rebuild, matches_rebuild_filter, RebuildOptions, Rebui
 
 pub mod dedupe;
 pub use dedupe::{
-    execute_dedupe, version_matches_range, DedupeAction, DedupeActionType,
-    DedupeOptions, DedupeSummary,
+    execute_dedupe, version_matches_range, DedupeAction, DedupeActionType, DedupeOptions,
+    DedupeSummary,
 };
+
+pub mod fast_path;
+pub use fast_path::{
+    compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
+};
+
+pub mod timing;
+pub use timing::{Phase, PhaseGuard, TimingCollector, TimingMetrics, TimingPhase};
+
+pub mod diff;
+pub use diff::*;
+
+pub mod trash;
+pub use trash::*;
+
+pub mod linked;
+pub use linked::*;
+
+/// Resolves the committed lockfile path for a project directory, giving `npm-shrinkwrap.json` precedence over `package-lock.json`.
+/// Returns `(lockfile_path, is_shrinkwrap)`.
+pub fn resolve_lockfile_path(project_dir: &Path) -> (PathBuf, bool) {
+    let shrinkwrap = project_dir.join("npm-shrinkwrap.json");
+    if shrinkwrap.exists() {
+        (shrinkwrap, true)
+    } else {
+        (project_dir.join("package-lock.json"), false)
+    }
+}
+
+/// Returns the lockfile path to read or write, giving `npm-shrinkwrap.json` precedence if it exists.
+pub fn project_lockfile_path(project_dir: &Path) -> PathBuf {
+    resolve_lockfile_path(project_dir).0
+}
 
 use rnpm_solver::{
     resolve_workspace_graph, Overrides, PackageMetadata, PackageMetadataProvider,
@@ -90,8 +121,12 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
         }
 
         let bin = ver_info.bin.as_ref().map(|b| match b {
-            rnpm_registry::metadata::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
-            rnpm_registry::metadata::PackageBin::Map(m) => rnpm_lockfile::PackageBin::Map(m.clone()),
+            rnpm_registry::metadata::PackageBin::Single(s) => {
+                rnpm_lockfile::PackageBin::Single(s.clone())
+            }
+            rnpm_registry::metadata::PackageBin::Map(m) => {
+                rnpm_lockfile::PackageBin::Map(m.clone())
+            }
         });
 
         versions.insert(
@@ -107,12 +142,28 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_meta,
                 optional_dependencies: opt_deps,
-                os: if ver_info.os.is_empty() { None } else { Some(ver_info.os.clone()) },
-                cpu: if ver_info.cpu.is_empty() { None } else { Some(ver_info.cpu.clone()) },
-                libc: if ver_info.libc.is_empty() { None } else { Some(ver_info.libc.clone()) },
+                os: if ver_info.os.is_empty() {
+                    None
+                } else {
+                    Some(ver_info.os.clone())
+                },
+                cpu: if ver_info.cpu.is_empty() {
+                    None
+                } else {
+                    Some(ver_info.cpu.clone())
+                },
+                libc: if ver_info.libc.is_empty() {
+                    None
+                } else {
+                    Some(ver_info.libc.clone())
+                },
                 bin,
                 license: ver_info.license.clone(),
-                engines: ver_info.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                engines: ver_info
+                    .engines
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
                 has_install_script: ver_info.has_install_script,
                 deprecated: ver_info.deprecated.clone(),
                 extra: ver_info.extra.clone(),
@@ -144,7 +195,21 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
-        if let Ok(Some((_entry, data))) = self.cache.get(name) {
+        let registry_url = self.client.registry_for_package(name).as_str().to_string();
+
+        let cached_data = self
+            .cache
+            .get_packument_with_accept(&registry_url, name, Some(NPM_INSTALL_V1_JSON))
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.cache
+                    .get(&format!("pacote:packument:{name}"))
+                    .ok()
+                    .flatten()
+            });
+
+        if let Some((_entry, data)) = cached_data {
             if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                 let meta = abbreviated_to_package_metadata(&abbrev);
                 if let Ok(mut cache) = self.metadata_cache.lock() {
@@ -156,7 +221,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
 
         if name.starts_with("git+")
             || name.starts_with("git:")
-            || PackageTarget::parse(name).map(|t| t.is_git()).unwrap_or(false)
+            || PackageTarget::parse(name)
+                .map(|t| t.is_git())
+                .unwrap_or(false)
         {
             if let Ok(target) = PackageTarget::parse(name) {
                 let fetcher = self.git_fetcher.clone();
@@ -169,8 +236,12 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                         let m = resolved.manifest;
                         let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
                         let bin = m.bin.as_ref().map(|b| match b {
-                            rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
-                            rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                            rnpm_core::manifest::PackageBin::Single(s) => {
+                                rnpm_lockfile::PackageBin::Single(s.clone())
+                            }
+                            rnpm_core::manifest::PackageBin::Map(map) => {
+                                rnpm_lockfile::PackageBin::Map(map.clone())
+                            }
                         });
 
                         let ver_meta = PackageVersionMetadata {
@@ -188,7 +259,11 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             cpu: m.cpu.clone(),
                             libc: m.libc.clone(),
                             bin,
-                            license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                            license: m
+                                .extra
+                                .get("license")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
                             engines: m.engines.clone(),
                             has_install_script: m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -213,7 +288,10 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                         return Ok(Some(meta));
                     }
                     Err(e) => {
-                        return Err(SolverError::PackageMetadata(name.to_string(), e.to_string()));
+                        return Err(SolverError::PackageMetadata(
+                            name.to_string(),
+                            e.to_string(),
+                        ));
                     }
                 }
             }
@@ -230,16 +308,22 @@ impl PackageMetadataProvider for RegistryPackageProvider {
 
         let client = self.client.clone();
         let pkg_name = name.to_string();
-        let res = self.handle.block_on(async move {
-            client.get_package_metadata(&pkg_name).await
-        });
+        let res = self
+            .handle
+            .block_on(async move { client.get_package_metadata(&pkg_name).await });
         match res {
             Ok(abbrev) => {
-                // Persist the abbreviated packument under the package name so
-                // a later invocation can resolve from disk without repeating
-                // metadata requests. Tarballs remain keyed by their URL.
+                // Persist the abbreviated packument under the registry-scoped key
+                // so a later invocation can resolve from disk without repeating
+                // metadata requests and metadata from different registries is completely isolated.
                 if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                    let _ = self.cache.put(name, &bytes, None);
+                    let _ = self.cache.put_packument_with_accept(
+                        &registry_url,
+                        name,
+                        Some(NPM_INSTALL_V1_JSON),
+                        &bytes,
+                        None,
+                    );
                 }
                 let meta = abbreviated_to_package_metadata(&abbrev);
                 if let Ok(mut cache) = self.metadata_cache.lock() {
@@ -251,7 +335,10 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 if e.is_not_found() {
                     Ok(None)
                 } else {
-                    Err(SolverError::PackageMetadata(name.to_string(), e.to_string()))
+                    Err(SolverError::PackageMetadata(
+                        name.to_string(),
+                        e.to_string(),
+                    ))
                 }
             }
         }
@@ -353,24 +440,225 @@ pub fn link_workspace_member(node_modules_dir: &Path, member: &WorkspaceMember) 
         }
     }
 
-    rnpm_fs::create_junction(&link_path, &member.path)
-        .map_err(|e| anyhow!("Failed to link workspace package '{}' at '{}' -> '{}': {e}", member.name, link_path.display(), member.path.display()))?;
+    rnpm_fs::create_junction(&link_path, &member.path).map_err(|e| {
+        anyhow!(
+            "Failed to link workspace package '{}' at '{}' -> '{}': {e}",
+            member.name,
+            link_path.display(),
+            member.path.display()
+        )
+    })?;
 
     Ok(())
 }
 
-fn find_enclosing_bin_dir(dest_dir: &Path, root_bin_dir: &Path, root_node_modules: &Path) -> PathBuf {
+fn is_same_or_matching_root_nm(p: &Path, root_nm: &Path) -> bool {
+    let clean_p = path_clean::clean(p);
+    let clean_root = path_clean::clean(root_nm);
+    let s_p = clean_p.to_string_lossy().replace('\\', "/");
+    let s_root = clean_root.to_string_lossy().replace('\\', "/");
+
+    #[cfg(windows)]
+    let eq = s_p.eq_ignore_ascii_case(&s_root);
+    #[cfg(not(windows))]
+    let eq = s_p == s_root;
+
+    if eq {
+        return true;
+    }
+
+    if (clean_p.is_relative()
+        && clean_root.is_absolute()
+        && s_p == "node_modules"
+        && s_root.ends_with("/node_modules"))
+        || (clean_p.is_absolute()
+            && clean_root.is_relative()
+            && s_root == "node_modules"
+            && s_p.ends_with("/node_modules"))
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn find_enclosing_bin_dir(
+    dest_dir: &Path,
+    root_bin_dir: &Path,
+    root_node_modules: &Path,
+) -> PathBuf {
     let mut curr = dest_dir.parent();
     while let Some(p) = curr {
-        if p == root_node_modules {
-            return root_bin_dir.to_path_buf();
-        }
         if p.file_name().map(|n| n == "node_modules").unwrap_or(false) {
+            if is_same_or_matching_root_nm(p, root_node_modules) {
+                return root_bin_dir.to_path_buf();
+            }
             return p.join(".bin");
         }
         curr = p.parent();
     }
     root_bin_dir.to_path_buf()
+}
+
+pub(crate) fn compute_bin_target_rel(pkg_dir: &Path, bin_dir: &Path, script_rel: &str) -> String {
+    let script_abs = pkg_dir.join(script_rel);
+    let clean_bin = path_clean::clean(bin_dir);
+    if clean_bin.file_name().map(|n| n == ".bin").unwrap_or(false) {
+        if let Some(enclosing_nm) = clean_bin.parent() {
+            if let Ok(rel) = rnpm_shim::path::compute_relative_path(enclosing_nm, &script_abs) {
+                return rel.replace('\\', "/");
+            }
+        }
+    }
+    // Fallback or global install: package name relative to node_modules
+    let clean_pkg = path_clean::clean(pkg_dir);
+    let pkg_name = if let Some(parent) = clean_pkg.parent() {
+        if parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with('@'))
+            .unwrap_or(false)
+        {
+            format!(
+                "{}/{}",
+                parent.file_name().unwrap().to_string_lossy(),
+                clean_pkg.file_name().unwrap().to_string_lossy()
+            )
+        } else {
+            clean_pkg
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        }
+    } else {
+        clean_pkg
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    format!("{pkg_name}/{script_rel}")
+}
+
+/// Cleans up any empty `.bin` directories under `node_modules` (including nested `node_modules` and root `.bin`).
+pub(crate) fn clean_empty_bin_dirs(root_nm: &Path) {
+    if !root_nm.is_dir() {
+        return;
+    }
+    fn visit(dir: &Path, is_root: bool) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let file_name = entry.file_name();
+                    if file_name == ".bin" {
+                        if let Ok(mut bin_entries) = std::fs::read_dir(&path) {
+                            if bin_entries.next().is_none() {
+                                let _ = std::fs::remove_dir(&path);
+                            }
+                        }
+                    } else if file_name == "node_modules" {
+                        visit(&path, false);
+                    } else if file_name.to_string_lossy().starts_with('@') {
+                        if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                            for scoped_entry in scoped_entries.flatten() {
+                                let scoped_pkg_path = scoped_entry.path();
+                                if scoped_pkg_path.is_dir() {
+                                    let nested_nm = scoped_pkg_path.join("node_modules");
+                                    if nested_nm.is_dir() {
+                                        visit(&nested_nm, false);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let nested_nm = path.join("node_modules");
+                        if nested_nm.is_dir() {
+                            visit(&nested_nm, false);
+                        }
+                    }
+                }
+            }
+        }
+        if !is_root {
+            if let Ok(mut entries) = std::fs::read_dir(dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+        }
+    }
+    let root_bin = root_nm.join(".bin");
+    if root_bin.is_dir() {
+        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
+            if bin_entries.next().is_none() {
+                let _ = std::fs::remove_dir(&root_bin);
+            }
+        }
+    }
+    visit(root_nm, true);
+}
+
+/// Cleans up a specific `.bin` directory if it exists and is empty.
+pub(crate) fn clean_empty_bin_dir_at(bin_dir: &Path) {
+    if bin_dir.exists() && bin_dir.file_name().map(|n| n == ".bin").unwrap_or(false) {
+        if let Ok(mut entries) = std::fs::read_dir(bin_dir) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(bin_dir);
+            }
+        }
+    }
+}
+
+pub(crate) fn process_installed_pkg_manifest(
+    target_path: &Path,
+    pkg_bin_dir: &Path,
+    pkg_key: &str,
+    resolved_url: &str,
+    declared_dependencies: &[String],
+    is_optional: bool,
+    collector: &TimingCollector,
+) -> Option<LifecyclePackageNode> {
+    let pkg_manifest_path = target_path.join("package.json");
+    if !pkg_manifest_path.exists() {
+        return None;
+    }
+    let pkg_manifest = Manifest::from_file(&pkg_manifest_path).ok()?;
+    let t_bins = std::time::Instant::now();
+    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+        let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, &script_rel);
+        let script_path = target_path.join(&script_rel);
+        let _ = normalize_shebang(&script_path);
+        let _ = create_shims(pkg_bin_dir, &bin_name, &target_rel);
+    }
+    collector.record_phase(Phase::Bins, t_bins.elapsed());
+
+    let is_file_archive = resolved_url.starts_with("file:");
+    let source = if is_file_archive {
+        PackageSource::LocalTarball
+    } else {
+        PackageSource::Registry
+    };
+    let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+        || pkg_manifest.scripts.contains_key("install")
+        || pkg_manifest.scripts.contains_key("postinstall")
+        || (source.runs_prepare() && pkg_manifest.scripts.contains_key("prepare"));
+
+    if has_scripts {
+        let deps = if !declared_dependencies.is_empty() {
+            declared_dependencies.to_vec()
+        } else {
+            pkg_manifest.dependencies.keys().cloned().collect()
+        };
+        Some(LifecyclePackageNode {
+            package_path: pkg_key.to_string(),
+            disk_path: target_path.to_path_buf(),
+            manifest: pkg_manifest,
+            source,
+            dependencies: deps,
+            optional: is_optional,
+        })
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +667,7 @@ pub struct InstallOptions {
     pub registry_url: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
+    pub force: bool,
     pub ignore_scripts: bool,
     pub foreground_scripts: bool,
     pub strict_sandbox: bool,
@@ -410,6 +699,16 @@ pub struct InstallOptions {
     pub workspaces: bool,
     /// Public package-lock serialization version (1, 2, or 3). Hidden lockfiles remain v3.
     pub lockfile_version: u32,
+    /// High-resolution phase instrumentation and timing output.
+    pub timing: bool,
+    /// Installation layout strategy: hoisted (default), linked, or nested.
+    pub install_strategy: InstallStrategy,
+    /// Optional custom global store directory override.
+    pub store_dir: Option<PathBuf>,
+    /// Whether background trash deletions run detached without blocking command exit (default: true).
+    pub detached_trash: bool,
+    /// Whether to wait for all background trash deletions to complete before command exit (default: false).
+    pub wait_for_trash: bool,
 }
 
 impl InstallOptions {
@@ -441,6 +740,7 @@ impl Default for InstallOptions {
             registry_url: None,
             cache_dir: None,
             offline: false,
+            force: false,
             ignore_scripts: false,
             foreground_scripts: false,
             strict_sandbox: false,
@@ -471,6 +771,11 @@ impl Default for InstallOptions {
             workspace: Vec::new(),
             workspaces: false,
             lockfile_version: 3,
+            timing: false,
+            install_strategy: InstallStrategy::Hoisted,
+            store_dir: None,
+            detached_trash: true,
+            wait_for_trash: false,
         }
     }
 }
@@ -482,6 +787,7 @@ pub struct InstallSummary {
     pub cache_hits: usize,
     pub cache_misses: usize,
     pub lockfile_path: PathBuf,
+    pub timing: Option<TimingMetrics>,
 }
 
 /// Result of an update run.
@@ -580,13 +886,18 @@ pub fn inspect_manifest_from_tarball(bytes: &[u8]) -> Result<Manifest> {
 pub struct Installer {
     options: InstallOptions,
     cache: Cache,
+    pack_store: Arc<PackStore>,
     registry_client: RegistryClient,
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
+    writer_cfg: Arc<rnpm_fs::ParallelWriterConfig>,
+    io_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Installer {
     pub fn new(options: InstallOptions) -> Result<Self> {
+        let mut options = options;
         let root_dir = &options.project_dir;
+        crate::trash::cleanup_leftover_trash(root_dir);
         if options.is_global && !root_dir.join("package.json").exists() {
             let _ = std::fs::create_dir_all(root_dir);
             let minimal_pkg = serde_json::json!({
@@ -595,9 +906,23 @@ impl Installer {
                 "private": true,
                 "dependencies": {}
             });
-            let _ = std::fs::write(root_dir.join("package.json"), serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default());
+            let _ = std::fs::write(
+                root_dir.join("package.json"),
+                serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default(),
+            );
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
+
+        if options.install_strategy == InstallStrategy::Hoisted {
+            if let Some(strat_str) = config
+                .get("install-strategy")
+                .or_else(|| config.get("install_strategy"))
+            {
+                if let Ok(strat) = strat_str.parse::<InstallStrategy>() {
+                    options.install_strategy = strat;
+                }
+            }
+        }
 
         let registry_url = if let Some(ref reg_str) = options.registry_url {
             Url::parse(reg_str).context("Invalid registry URL")?
@@ -616,6 +941,29 @@ impl Installer {
         });
 
         let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
+
+        let pack_store_path = if let Some(ref s) = options.store_dir {
+            s.clone()
+        } else if let Ok(store_env) = std::env::var("RNPM_STORE_DIR") {
+            if !store_env.trim().is_empty() {
+                PathBuf::from(store_env)
+            } else if let Some(ref c) = options.cache_dir {
+                c.join("store-v1")
+            } else if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(appdata).join("rnpm").join("store-v1")
+            } else {
+                cache_path.join("store-v1")
+            }
+        } else if let Some(ref c) = options.cache_dir {
+            c.join("store-v1")
+        } else if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            PathBuf::from(appdata).join("rnpm").join("store-v1")
+        } else {
+            cache_path.join("store-v1")
+        };
+
+        let pack_store =
+            Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
 
         let mut trusted_hosts = HashSet::new();
         if let Some(host) = registry_url.host_str() {
@@ -665,12 +1013,33 @@ impl Installer {
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;
 
+        let writer_cfg = Arc::new(determine_writer_config(&options.project_dir, concurrency));
+        let io_concurrency = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            * 2)
+        .clamp(16, 64);
+        let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
+
         Ok(Self {
             options,
             cache,
+            pack_store,
             registry_client,
             metadata_cache: HashMap::new(),
+            writer_cfg,
+            io_semaphore,
         })
+    }
+
+    /// Access the underlying PackStore.
+    pub fn pack_store(&self) -> &PackStore {
+        &self.pack_store
+    }
+
+    /// Access the underlying PackStore Arc.
+    pub fn pack_store_arc(&self) -> Arc<PackStore> {
+        Arc::clone(&self.pack_store)
     }
 
     /// Reconfigure maximum network worker concurrency (bounded semaphore).
@@ -679,7 +1048,32 @@ impl Installer {
         cfg.max_concurrent_requests = concurrency;
         self.registry_client = RegistryClient::with_config(cfg)
             .context("Failed to reconfigure registry client with concurrency")?;
+        self.writer_cfg = Arc::new(determine_writer_config(
+            &self.options.project_dir,
+            Some(concurrency),
+        ));
+        let io_concurrency = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            * 2)
+        .clamp(16, 64);
+        self.io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
         Ok(self)
+    }
+
+    /// Access the shared ParallelWriterConfig.
+    pub fn writer_config(&self) -> &rnpm_fs::ParallelWriterConfig {
+        &self.writer_cfg
+    }
+
+    /// Access the shared ParallelWriterConfig Arc.
+    pub fn writer_config_arc(&self) -> Arc<rnpm_fs::ParallelWriterConfig> {
+        Arc::clone(&self.writer_cfg)
+    }
+
+    /// Access the shared I/O semaphore.
+    pub fn io_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.io_semaphore)
     }
 
     /// Access the underlying registry client.
@@ -705,17 +1099,94 @@ impl Installer {
 
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
-        self.install_internal().await
+        let res = self.install_internal().await;
+        if self.options.wait_for_trash || !self.options.detached_trash {
+            crate::trash::wait_all_trash_deletions();
+        }
+        res
     }
 
     async fn install_internal(&mut self) -> Result<InstallSummary> {
+        crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        let collector = TimingCollector::new();
+        let plan_start = std::time::Instant::now();
+        let _plan_span = tracing::info_span!("plan").entered();
+
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
-            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+            return Err(anyhow!(
+                "package.json not found in {}",
+                self.options.project_dir.display()
+            ));
         }
 
-        let mut manifest = Manifest::from_file(&manifest_path)
-            .context("Failed to parse project package.json")?;
+        // Fast path check when nothing changed (Milestone M2, fixes Bug B7)
+        if self.options.packages.is_empty()
+            && !self.options.force
+            && !self.options.dry_run
+            && !self.options.package_lock_only
+        {
+            if let Ok(current_fingerprint) =
+                compute_project_fingerprint(&self.options.project_dir, &self.options)
+            {
+                if let Ok(Some(stored_fingerprint)) = self
+                    .cache
+                    .get_project_fingerprint(&self.options.project_dir)
+                {
+                    if current_fingerprint == stored_fingerprint
+                        && validate_hidden_lockfile(&self.options.project_dir, Some(&self.options))
+                    {
+                        info!("Fast path hit: inputs unchanged and hidden lockfile valid");
+                        let lockfile_path = project_lockfile_path(&self.options.project_dir);
+                        drop(_plan_span);
+                        collector.record_phase(Phase::Plan, plan_start.elapsed());
+                        return Ok(InstallSummary {
+                            packages_installed: 0,
+                            cache_hits: 0,
+                            cache_misses: 0,
+                            lockfile_path,
+                            timing: Some(collector.finish()),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut manifest =
+            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
+
+        // Fast path: if package.json matches existing committed lockfile and no package args were passed,
+        // take the exact same reification fast path as `ci` without re-resolving through network metadata or calling solver!
+        if self.options.packages.is_empty()
+            && !self.options.force
+            && !self.options.package_lock_only
+            && self.options.workspace.is_empty()
+            && self.options.package_lock_enabled()
+        {
+            let (lockfile_path, _) = resolve_lockfile_path(&self.options.project_dir);
+            if lockfile_path.exists() {
+                if let Ok(lockfile_str) = std::fs::read_to_string(&lockfile_path) {
+                    if let Ok(existing_lockfile) = rnpm_lockfile::parse_and_migrate(&lockfile_str) {
+                        if existing_lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
+                            info!(
+                                "Lockfile matches manifest: taking lockfile reification fast path"
+                            );
+                            match self.run_ci_internal().await {
+                                Ok(summary) => return Ok(summary),
+                                Err(err) => {
+                                    let err_msg = err.to_string();
+                                    if err_msg.contains("ELOCKFILE_DRIFT") {
+                                        warn!("Lockfile drift detected during fast path; falling back to full solver: {err_msg}");
+                                    } else {
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Track added packages and their original requested specifiers
         struct AddedPkgInfo {
@@ -749,8 +1220,15 @@ impl Installer {
             let spec = PackageSpec::parse(&formatted_input)
                 .map_err(|e| anyhow!("Failed to parse package specifier '{trimmed}': {e}"))?;
 
-            if spec.name.contains("..") || spec.name.contains(':') || spec.name.contains('\\') || spec.name.contains('\0') {
-                return Err(anyhow!("Package name '{}' contains illegal path characters", spec.name));
+            if spec.name.contains("..")
+                || spec.name.contains(':')
+                || spec.name.contains('\\')
+                || spec.name.contains('\0')
+            {
+                return Err(anyhow!(
+                    "Package name '{}' contains illegal path characters",
+                    spec.name
+                ));
             }
             rnpm_fs::validate_entry_path(Path::new(&spec.name))
                 .map_err(|e| anyhow!("Invalid package name '{}': {e}", spec.name))?;
@@ -770,29 +1248,47 @@ impl Installer {
                 PackageTarget::Tag(t) => t.clone(),
                 PackageTarget::Range(r) => user_spec.clone().unwrap_or_else(|| r.to_string()),
                 PackageTarget::Version(v) => v.to_string(),
-                PackageTarget::File(p) => format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy())),
+                PackageTarget::File(p) => {
+                    format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
+                }
                 PackageTarget::Git { url, committish } => {
-                    format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                    format!(
+                        "{}{}",
+                        url,
+                        committish
+                            .as_ref()
+                            .map(|c| format!("#{c}"))
+                            .unwrap_or_default()
+                    )
                 }
                 PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
-                PackageTarget::Alias { name: real_name, target } => {
+                PackageTarget::Alias {
+                    name: real_name,
+                    target,
+                } => {
                     format!("npm:{}@{}", real_name, target)
                 }
                 PackageTarget::Url(u) => u.to_string(),
             };
 
             if self.options.save_dev {
-                manifest.dev_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest
+                    .dev_dependencies
+                    .insert(spec.name.clone(), solver_spec);
                 manifest.dependencies.remove(&spec.name);
                 manifest.optional_dependencies.remove(&spec.name);
                 manifest.peer_dependencies.remove(&spec.name);
             } else if self.options.save_optional {
-                manifest.optional_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest
+                    .optional_dependencies
+                    .insert(spec.name.clone(), solver_spec);
                 manifest.dependencies.remove(&spec.name);
                 manifest.dev_dependencies.remove(&spec.name);
                 manifest.peer_dependencies.remove(&spec.name);
             } else if self.options.save_peer {
-                manifest.peer_dependencies.insert(spec.name.clone(), solver_spec);
+                manifest
+                    .peer_dependencies
+                    .insert(spec.name.clone(), solver_spec);
                 manifest.dependencies.remove(&spec.name);
                 manifest.dev_dependencies.remove(&spec.name);
                 manifest.optional_dependencies.remove(&spec.name);
@@ -810,27 +1306,37 @@ impl Installer {
             });
         }
 
-        let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
+        let project_name = manifest
+            .name
+            .clone()
+            .unwrap_or_else(|| "project".to_string());
         let project_version = manifest.version.clone();
 
         // Validate dependency names for path containment
-        for dep_name in manifest.dependencies.keys()
+        for dep_name in manifest
+            .dependencies
+            .keys()
             .chain(manifest.dev_dependencies.keys())
             .chain(manifest.optional_dependencies.keys())
             .chain(manifest.peer_dependencies.keys())
         {
-            if dep_name.contains("..") || dep_name.contains(':') || dep_name.contains('\\') || dep_name.contains('\0') {
-                return Err(anyhow!("Package name '{dep_name}' contains illegal path characters"));
+            if dep_name.contains("..")
+                || dep_name.contains(':')
+                || dep_name.contains('\\')
+                || dep_name.contains('\0')
+            {
+                return Err(anyhow!(
+                    "Package name '{dep_name}' contains illegal path characters"
+                ));
             }
             rnpm_fs::validate_entry_path(Path::new(dep_name))
                 .map_err(|e| anyhow!("Invalid package name '{dep_name}': {e}"))?;
         }
 
         // 0. Discover workspace members (if any)
-        let mut workspace_members = discover_workspaces_from_manifest(
-            &self.options.project_dir,
-            &manifest,
-        ).map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
+        let mut workspace_members =
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
 
         if !self.options.workspace.is_empty() {
             workspace_members.retain(|m| {
@@ -864,18 +1370,28 @@ impl Installer {
         }
 
         let ws_graph_opt = if !workspace_members.is_empty() {
-            Some(WorkspaceDependencyGraph::construct(&workspace_members)
-                .map_err(|e| anyhow!("Workspace dependency error: {e}"))?)
+            Some(
+                WorkspaceDependencyGraph::construct(&workspace_members)
+                    .map_err(|e| anyhow!("Workspace dependency error: {e}"))?,
+            )
         } else {
             None
         };
 
+        drop(_plan_span);
+        collector.record_phase(Phase::Plan, plan_start.elapsed());
+
+        let metadata_start = std::time::Instant::now();
+        let _meta_span = tracing::info_span!("metadata").entered();
+
         // 1. Resolve dependency graph via Solver directly
         let handle = tokio::runtime::Handle::current();
         let metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        self.populate_custom_target_metadata(&manifest, &metadata_cache).await?;
+        self.populate_custom_target_metadata(&manifest, &metadata_cache)
+            .await?;
         for member in &workspace_members {
-            self.populate_custom_target_metadata(&member.manifest, &metadata_cache).await?;
+            self.populate_custom_target_metadata(&member.manifest, &metadata_cache)
+                .await?;
         }
 
         let provider = RegistryPackageProvider {
@@ -887,7 +1403,7 @@ impl Installer {
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
         };
 
-        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let existing_lockfile = if !self.options.package_lock_enabled() {
             None
         } else if lockfile_path.exists() {
@@ -912,43 +1428,61 @@ impl Installer {
             let members = workspace_members.clone();
             let root_m = manifest.clone();
             tokio::task::spawn_blocking(move || {
-                resolve_workspace_graph(
-                    &root_m,
-                    &members,
-                    &provider,
-                    &resolver_options,
-                ).map_err(|e| anyhow!("Workspace dependency error: {e}"))
-            }).await.map_err(|e| anyhow!("Solver task panicked: {e}"))??
+                resolve_workspace_graph(&root_m, &members, &provider, &resolver_options)
+                    .map_err(|e| anyhow!("Workspace dependency error: {e}"))
+            })
+            .await
+            .map_err(|e| anyhow!("Solver task panicked: {e}"))??
         } else {
             let root_m = manifest.clone();
             tokio::task::spawn_blocking(move || {
                 let overrides = Overrides::from_manifest(&root_m)
                     .map_err(|e| anyhow!("Failed to parse overrides: {e}"))?;
                 let solver = Solver::new(&provider, resolver_options, overrides);
-                solver.resolve(&root_m)
-                    .map_err(|e| anyhow!("{e}"))
-            }).await.map_err(|e| anyhow!("Solver task panicked: {e}"))??
+                solver.resolve(&root_m).map_err(|e| anyhow!("{e}"))
+            })
+            .await
+            .map_err(|e| anyhow!("Solver task panicked: {e}"))??
         };
+
+        drop(_meta_span);
+        collector.record_phase(Phase::Metadata, metadata_start.elapsed());
 
         // 2. Post-solve: finalize versions for added packages in manifest
         if !added_pkgs.is_empty() {
             for added in &added_pkgs {
-                let resolved_version_opt = graph.nodes.get(&format!("node_modules/{}", added.name))
-                    .or_else(|| graph.nodes.values().find(|n| n.install_name == added.name || n.name == added.name))
+                let resolved_version_opt = graph
+                    .nodes
+                    .get(&format!("node_modules/{}", added.name))
+                    .or_else(|| {
+                        graph
+                            .nodes
+                            .values()
+                            .find(|n| n.install_name == added.name || n.name == added.name)
+                    })
                     .map(|n| n.version.clone());
 
                 let resolved_ver = resolved_version_opt.unwrap_or_else(|| "1.0.0".to_string());
 
                 let final_spec = if self.options.save_exact {
                     match &added.target {
-                        PackageTarget::Alias { name: real_name, .. } => {
+                        PackageTarget::Alias {
+                            name: real_name, ..
+                        } => {
                             format!("npm:{}@{}", real_name, resolved_ver)
                         }
                         PackageTarget::File(p) => {
                             format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
                         }
                         PackageTarget::Git { url, committish } => {
-                            format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                            format!(
+                                "{}{}",
+                                url,
+                                committish
+                                    .as_ref()
+                                    .map(|c| format!("#{c}"))
+                                    .unwrap_or_default()
+                            )
                         }
                         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
                         PackageTarget::Url(u) => u.to_string(),
@@ -970,7 +1504,9 @@ impl Installer {
                         PackageTarget::Tag(_) | PackageTarget::Version(_) => {
                             format!("^{}", resolved_ver)
                         }
-                        PackageTarget::Alias { name: real_name, .. } => {
+                        PackageTarget::Alias {
+                            name: real_name, ..
+                        } => {
                             if let Some(ref u_spec) = added.user_spec {
                                 format!("npm:{}@{}", real_name, u_spec)
                             } else {
@@ -981,7 +1517,14 @@ impl Installer {
                             format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
                         }
                         PackageTarget::Git { url, committish } => {
-                            format!("{}{}", url, committish.as_ref().map(|c| format!("#{c}")).unwrap_or_default())
+                            format!(
+                                "{}{}",
+                                url,
+                                committish
+                                    .as_ref()
+                                    .map(|c| format!("#{c}"))
+                                    .unwrap_or_default()
+                            )
                         }
                         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
                         PackageTarget::Url(u) => u.to_string(),
@@ -989,11 +1532,17 @@ impl Installer {
                 };
 
                 if self.options.save_dev {
-                    manifest.dev_dependencies.insert(added.name.clone(), final_spec);
+                    manifest
+                        .dev_dependencies
+                        .insert(added.name.clone(), final_spec);
                 } else if self.options.save_optional {
-                    manifest.optional_dependencies.insert(added.name.clone(), final_spec);
+                    manifest
+                        .optional_dependencies
+                        .insert(added.name.clone(), final_spec);
                 } else if self.options.save_peer {
-                    manifest.peer_dependencies.insert(added.name.clone(), final_spec);
+                    manifest
+                        .peer_dependencies
+                        .insert(added.name.clone(), final_spec);
                 } else {
                     manifest.dependencies.insert(added.name.clone(), final_spec);
                 }
@@ -1001,7 +1550,8 @@ impl Installer {
 
             // Save package.json unless --no-save was passed
             if !self.options.no_save && !self.options.dry_run {
-                manifest.save_to_file(&manifest_path)
+                manifest
+                    .save_to_file(&manifest_path)
                     .context("Failed to save updated package.json")?;
             } else if self.options.dry_run {
                 for added in &added_pkgs {
@@ -1065,10 +1615,13 @@ impl Installer {
                 }
             }
 
-            let lockfile_path = self.options.project_dir.join("package-lock.json");
-            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save {
-                lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
-                    .context("Failed to save package-lock.json")?;
+            let lockfile_path = project_lockfile_path(&self.options.project_dir);
+            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save
+            {
+                let _lock_guard = collector.enter_phase(Phase::Lockfile);
+                lockfile
+                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
             return Ok(InstallSummary {
@@ -1076,6 +1629,7 @@ impl Installer {
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
+                timing: Some(collector.finish()),
             });
         }
 
@@ -1101,7 +1655,23 @@ impl Installer {
                 if node.flags.skipped {
                     continue;
                 }
-                println!("rnpm: would install {}@{} at {}", node.name, node.version, loc);
+                let is_optional = node.flags.optional || node.flags.dev_optional;
+                if is_optional {
+                    let host_platform = self.options.platform();
+                    let is_compat = rnpm_solver::is_platform_compatible(
+                        &host_platform,
+                        node.os.as_deref(),
+                        node.cpu.as_deref(),
+                        node.libc.as_deref(),
+                    );
+                    if !is_compat {
+                        continue;
+                    }
+                }
+                println!(
+                    "rnpm: would install {}@{} at {}",
+                    node.name, node.version, loc
+                );
                 packages_installed += 1;
             }
 
@@ -1110,6 +1680,7 @@ impl Installer {
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
+                timing: Some(collector.finish()),
             });
         }
 
@@ -1132,9 +1703,132 @@ impl Installer {
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
         std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
 
+        // Milestone M3: Diff ideal tree against actual tree (node_modules/.package-lock.json)
+        let actual_lockfile_opt = if !self.options.force
+            && validate_hidden_lockfile(&self.options.project_dir, Some(&self.options))
+        {
+            LockfileV3::load_hidden(&self.options.project_dir).ok()
+        } else {
+            None
+        };
+
+        let tree_diff_opt = actual_lockfile_opt
+            .as_ref()
+            .map(|actual| diff_trees(&lockfile, actual));
+
+        // Fast trash deletion for removed packages off the critical path
+        if let Some(ref diff) = tree_diff_opt {
+            for (rel_path, _pkg) in diff.removes() {
+                if !is_node_modules_package_path(rel_path) {
+                    continue;
+                }
+                let target_path = loc_base_dir.join(rel_path);
+                let clean_target = path_clean::clean(&target_path);
+                let clean_nm = path_clean::clean(&node_modules_dir);
+                if !clean_target.starts_with(&clean_nm) {
+                    continue;
+                }
+                if target_path.exists() || rnpm_fs::is_junction(&target_path).unwrap_or(false) {
+                    let pkg_manifest_path = target_path.join("package.json");
+                    if let Ok(pkg_m) = Manifest::from_file(&pkg_manifest_path) {
+                        let bin_dir =
+                            find_enclosing_bin_dir(&target_path, &root_bin_dir, &node_modules_dir);
+                        for (bin_name, _) in pkg_m.bin_entries() {
+                            let _ = std::fs::remove_file(bin_dir.join(&bin_name));
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
+                        }
+                        clean_empty_bin_dir_at(&bin_dir);
+                    }
+                    fast_trash_delete(&target_path, &node_modules_dir).with_context(|| {
+                        format!(
+                            "Failed to remove package directory {}",
+                            target_path.display()
+                        )
+                    })?;
+                    if let Some(parent) = target_path.parent() {
+                        if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                            if parent_name.starts_with('@') && parent.is_dir() {
+                                if let Ok(mut entries) = std::fs::read_dir(parent) {
+                                    if entries.next().is_none() {
+                                        let _ = std::fs::remove_dir(parent);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.options.install_strategy == InstallStrategy::Linked {
+            return self
+                .execute_linked_install(
+                    &manifest,
+                    &graph,
+                    &lockfile,
+                    &node_modules_dir,
+                    &root_bin_dir,
+                    collector,
+                    plan_start,
+                )
+                .await;
+        }
+
         let mut cache_hits = 0;
         let mut cache_misses = 0;
         let mut packages_installed = 0;
+
+        // Milestone M3: Clean up stale files in replaced packages, preserving unchanged nested node_modules
+        if let Some(ref diff) = tree_diff_opt {
+            for (rel_path, _, _) in diff.replaces() {
+                if !is_node_modules_package_path(rel_path) {
+                    continue;
+                }
+                let target_path = loc_base_dir.join(rel_path);
+                let clean_target = path_clean::clean(&target_path);
+                let clean_nm = path_clean::clean(&node_modules_dir);
+                if !clean_target.starts_with(&clean_nm) {
+                    continue;
+                }
+                clean_stale_package_dir(&target_path, rel_path, Some(diff));
+            }
+        }
+
+        // Pre-create all package parent directories and bin directories in one breadth-first pass
+        {
+            let mut dirs_to_precreate = Vec::with_capacity(graph.nodes.len() * 2);
+            for (loc, node) in &graph.nodes {
+                if loc.is_empty() {
+                    continue;
+                }
+                let dest_dir = loc_base_dir.join(loc);
+                if let Some(parent) = dest_dir.parent() {
+                    dirs_to_precreate.push(parent.to_path_buf());
+                }
+                let has_bin = match &node.bin {
+                    Some(rnpm_lockfile::PackageBin::Single(_)) => true,
+                    Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
+                    None => {
+                        let pkg_manifest_path = dest_dir.join("package.json");
+                        if pkg_manifest_path.exists() {
+                            Manifest::from_file(&pkg_manifest_path)
+                                .map(|m| !m.bin_entries().is_empty())
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if has_bin {
+                    let bin_dir =
+                        find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
+                    dirs_to_precreate.push(bin_dir);
+                }
+            }
+            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+            let _ = precreate_directories(dir_refs);
+        }
 
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
         let mut packages_to_download = Vec::new();
@@ -1154,6 +1848,22 @@ impl Installer {
                 continue;
             }
 
+            // Milestone M3: Partial install optimization - only touch what changed
+            if let Some(ref diff) = tree_diff_opt {
+                if let Some(action) = diff.get(loc) {
+                    if action.is_unchanged() {
+                        let dest_dir = loc_base_dir.join(loc);
+                        if dest_dir.is_dir() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            debug!("Skipping unchanged package: {}", loc);
+                            continue;
+                        }
+                    } else if action.is_replace() {
+                        let dest_dir = loc_base_dir.join(loc);
+                        clean_stale_package_dir(&dest_dir, loc, Some(diff));
+                    }
+                }
+            }
+
             if node.flags.link {
                 let link_target = loc_base_dir.join(loc);
                 if let Some(parent) = link_target.parent() {
@@ -1161,7 +1871,8 @@ impl Installer {
                 }
                 if link_target.exists() || rnpm_fs::is_junction(&link_target).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&link_target);
-                    if link_target.exists() && !rnpm_fs::is_junction(&link_target).unwrap_or(false) {
+                    if link_target.exists() && !rnpm_fs::is_junction(&link_target).unwrap_or(false)
+                    {
                         let _ = std::fs::remove_dir_all(&link_target);
                     }
                 }
@@ -1171,20 +1882,29 @@ impl Installer {
                     self.options.project_dir.join(&node.name)
                 };
 
-                rnpm_fs::create_junction(&link_target, &source_path)
-                    .map_err(|e| anyhow!("Failed to link package at '{}' -> '{}': {e}", link_target.display(), source_path.display()))?;
+                rnpm_fs::create_junction(&link_target, &source_path).map_err(|e| {
+                    anyhow!(
+                        "Failed to link package at '{}' -> '{}': {e}",
+                        link_target.display(),
+                        source_path.display()
+                    )
+                })?;
 
                 packages_installed += 1;
 
-                let bin_dir = find_enclosing_bin_dir(&link_target, &root_bin_dir, &node_modules_dir);
-                std::fs::create_dir_all(&bin_dir)?;
                 let manifest_path = source_path.join("package.json");
                 if let Ok(m) = Manifest::from_file(&manifest_path) {
-                    for (bin_name, script_rel) in m.bin_entries() {
-                        let target_rel = format!("{}/{}", node.install_name, script_rel);
-                        let script_path = source_path.join(&script_rel);
-                        let _ = normalize_shebang(&script_path);
-                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                    let bin_entries = m.bin_entries();
+                    if !bin_entries.is_empty() {
+                        let bin_dir =
+                            find_enclosing_bin_dir(&link_target, &root_bin_dir, &node_modules_dir);
+                        for (bin_name, script_rel) in bin_entries {
+                            let target_rel =
+                                compute_bin_target_rel(&link_target, &bin_dir, &script_rel);
+                            let script_path = source_path.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                        }
                     }
                 }
                 continue;
@@ -1195,21 +1915,36 @@ impl Installer {
             }
 
             if node.flags.skipped {
-                debug!("Package at {} is marked skipped, bypassing download and extraction", loc);
+                debug!(
+                    "Package at {} is marked skipped, bypassing download and extraction",
+                    loc
+                );
                 continue;
+            }
+            let is_optional = node.flags.optional || node.flags.dev_optional;
+            if is_optional {
+                let host_platform = self.options.platform();
+                let is_compat = rnpm_solver::is_platform_compatible(
+                    &host_platform,
+                    node.os.as_deref(),
+                    node.cpu.as_deref(),
+                    node.libc.as_deref(),
+                );
+                if !is_compat {
+                    debug!("Package at {} is incompatible optional package on this platform, bypassing download and extraction", loc);
+                    continue;
+                }
             }
 
             let dest_dir = loc_base_dir.join(loc);
-            if let Some(parent) = dest_dir.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
-            std::fs::create_dir_all(&bin_dir)?;
 
             if let Some(ref res) = node.resolved {
                 let is_git = res.starts_with("git+")
                     || res.starts_with("git:")
-                    || PackageTarget::parse(res).map(|t| t.is_git()).unwrap_or(false);
+                    || PackageTarget::parse(res)
+                        .map(|t| t.is_git())
+                        .unwrap_or(false);
 
                 if is_git {
                     let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
@@ -1227,7 +1962,8 @@ impl Installer {
                     if pkg_manifest_path.exists() {
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                             for (bin_name, script_rel) in m.bin_entries() {
-                                let target_rel = format!("{}/{}", node.install_name, script_rel);
+                                let target_rel =
+                                    compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                 let script_path = dest_dir.join(&script_rel);
                                 let _ = normalize_shebang(&script_path);
                                 let _ = create_shims(&bin_dir, &bin_name, &target_rel);
@@ -1235,12 +1971,13 @@ impl Installer {
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
+                                || m.scripts.contains_key("prepare")
                             {
                                 lifecycle_nodes.push(LifecyclePackageNode {
                                     package_path: loc.clone(),
                                     disk_path: dest_dir.clone(),
                                     manifest: m,
-                                    source: PackageSource::Registry,
+                                    source: PackageSource::Git,
                                     dependencies: node.dependencies.keys().cloned().collect(),
                                     optional: node.flags.optional,
                                 });
@@ -1255,17 +1992,97 @@ impl Installer {
                     let abs_file = self.options.project_dir.join(rel_file);
                     if abs_file.is_file() {
                         let archive_bytes = std::fs::read(&abs_file)?;
-                        extract_and_replace(Cursor::new(&archive_bytes), &dest_dir, None)
-                            .map_err(|e| anyhow!("Failed to extract local archive {}: {e}", loc))?;
+                        let computed_integrity = if let Some(ref integ) = node.integrity {
+                            if !integ.is_empty() {
+                                let expected_integrity: Integrity = integ
+                                    .parse()
+                                    .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+                                if let Err(e) = expected_integrity.verify(&archive_bytes) {
+                                    if node.flags.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {loc}: {e}"
+                                        );
+                                        continue;
+                                    } else {
+                                        return Err(anyhow!("Integrity verification failed for local archive {loc}: {e}"));
+                                    }
+                                }
+                            }
+                            integ.clone()
+                        } else {
+                            use sha2::Digest;
+                            let hash = sha2::Sha512::digest(&archive_bytes);
+                            format!("sha512-{}", data_encoding::BASE64.encode(&hash))
+                        };
+
+                        if !computed_integrity.is_empty()
+                            && !self.pack_store.has_package_pack(&computed_integrity)
+                        {
+                            let _ = self
+                                .pack_store
+                                .put_package_from_tarball(&computed_integrity, &archive_bytes);
+                        }
+
+                        if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_junction(&dest_dir);
+                        }
+
+                        let extracted = if !computed_integrity.is_empty()
+                            && self.pack_store.has_package_pack(&computed_integrity)
+                        {
+                            match self.pack_store.materialize_pack(
+                                &computed_integrity,
+                                &dest_dir,
+                                Some(&self.writer_cfg),
+                            ) {
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    if e.is_pack_corruption() {
+                                        warn!("materialize_pack failed for {computed_integrity}: {e}, purging pack and falling back to tarball extraction");
+                                        let _ = self.pack_store.purge(&computed_integrity);
+                                        let _ = std::fs::remove_dir_all(&dest_dir);
+                                        extract_tarball_direct(
+                                            Cursor::new(&archive_bytes),
+                                            &dest_dir,
+                                            None,
+                                            Some(&self.writer_cfg),
+                                        )
+                                        .map(|_| ())
+                                        .map_err(|e| {
+                                            anyhow!("Failed to extract local archive {}: {e}", loc)
+                                        })
+                                    } else {
+                                        return Err(anyhow!("Failed to materialize pack for {computed_integrity}: {e}"));
+                                    }
+                                }
+                            }
+                        } else {
+                            extract_tarball_direct(
+                                Cursor::new(&archive_bytes),
+                                &dest_dir,
+                                None,
+                                Some(&self.writer_cfg),
+                            )
+                            .map(|_| ())
+                            .map_err(|e| anyhow!("Failed to extract local archive {}: {e}", loc))
+                        };
+                        extracted?;
 
                         packages_installed += 1;
                         cache_hits += 1;
+
+                        if let Some(pkg) = lockfile.packages.get_mut(loc) {
+                            if pkg.integrity.is_none() {
+                                pkg.integrity = Some(computed_integrity);
+                            }
+                        }
 
                         let pkg_manifest_path = dest_dir.join("package.json");
                         if pkg_manifest_path.exists() {
                             if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                                 for (bin_name, script_rel) in m.bin_entries() {
-                                    let target_rel = format!("{}/{}", node.install_name, script_rel);
+                                    let target_rel =
+                                        compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                     let script_path = dest_dir.join(&script_rel);
                                     let _ = normalize_shebang(&script_path);
                                     let _ = create_shims(&bin_dir, &bin_name, &target_rel);
@@ -1273,12 +2090,13 @@ impl Installer {
                                 if m.scripts.contains_key("preinstall")
                                     || m.scripts.contains_key("install")
                                     || m.scripts.contains_key("postinstall")
+                                    || m.scripts.contains_key("prepare")
                                 {
                                     lifecycle_nodes.push(LifecyclePackageNode {
                                         package_path: loc.clone(),
                                         disk_path: dest_dir.clone(),
                                         manifest: m,
-                                        source: PackageSource::Registry,
+                                        source: PackageSource::LocalTarball,
                                         dependencies: node.dependencies.keys().cloned().collect(),
                                         optional: node.flags.optional,
                                     });
@@ -1289,7 +2107,9 @@ impl Installer {
                     } else if abs_file.is_dir() {
                         if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                             let _ = rnpm_fs::remove_junction(&dest_dir);
-                            if dest_dir.exists() && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            if dest_dir.exists()
+                                && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false)
+                            {
                                 let _ = std::fs::remove_dir_all(&dest_dir);
                             }
                         }
@@ -1299,10 +2119,25 @@ impl Installer {
                         let pkg_manifest_path = abs_file.join("package.json");
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                             for (bin_name, script_rel) in m.bin_entries() {
-                                let target_rel = format!("{}/{}", node.install_name, script_rel);
+                                let target_rel =
+                                    compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                 let script_path = abs_file.join(&script_rel);
                                 let _ = normalize_shebang(&script_path);
                                 let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                            }
+                            if m.scripts.contains_key("preinstall")
+                                || m.scripts.contains_key("install")
+                                || m.scripts.contains_key("postinstall")
+                                || m.scripts.contains_key("prepare")
+                            {
+                                lifecycle_nodes.push(LifecyclePackageNode {
+                                    package_path: loc.clone(),
+                                    disk_path: abs_file.clone(),
+                                    manifest: m,
+                                    source: PackageSource::Local,
+                                    dependencies: node.dependencies.keys().cloned().collect(),
+                                    optional: node.flags.optional,
+                                });
                             }
                         }
 
@@ -1337,9 +2172,13 @@ impl Installer {
                 || member.manifest.scripts.contains_key("prepare");
 
             if has_scripts {
-                let mut member_deps: Vec<String> = member.manifest.dependencies.keys().cloned().collect();
+                let mut member_deps: Vec<String> =
+                    member.manifest.dependencies.keys().cloned().collect();
                 for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
-                    let is_sibling = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
+                    let is_sibling = ws_graph_opt
+                        .as_ref()
+                        .map(|g| g.is_member(dep_name))
+                        .unwrap_or(false)
                         || dep_spec.starts_with("workspace:")
                         || workspace_members.iter().any(|m| &m.name == dep_name);
                     if is_sibling && !member_deps.contains(dep_name) {
@@ -1372,119 +2211,177 @@ impl Installer {
             }
         }
 
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(4, 16);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let writer_cfg = Arc::clone(&self.writer_cfg);
+        let semaphore = Arc::clone(&self.io_semaphore);
 
-        let mut tiers: BTreeMap<usize, Vec<(String, rnpm_solver::Node)>> = BTreeMap::new();
-        for (loc, node) in packages_to_download {
-            let depth = loc.matches("node_modules").count();
-            tiers.entry(depth).or_default().push((loc, node));
+        // Early path containment check on all packages to download before precreating dirs
+        for (loc, _) in &packages_to_download {
+            if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
+                return Err(anyhow!(
+                    "Package path '{loc}' contains illegal path characters"
+                ));
+            }
+            rnpm_fs::validate_entry_path(Path::new(loc))
+                .map_err(|e| anyhow!("Invalid package path '{loc}': {e}"))?;
+            let dest_dir = loc_base_dir.join(loc);
+            let cleaned_dest = path_clean::clean(&dest_dir);
+            let cleaned_project = path_clean::clean(&loc_base_dir);
+            if !cleaned_dest.starts_with(&cleaned_project) {
+                return Err(anyhow!(
+                    "Package installation path '{cleaned_dest:?}' escapes project root"
+                ));
+            }
         }
 
-        for (_depth, tier_packages) in tiers {
-            let mut join_set = tokio::task::JoinSet::new();
+        let mut join_set = tokio::task::JoinSet::new();
 
-            for (loc, node) in tier_packages {
-                let sem = Arc::clone(&semaphore);
-                let cache = self.cache.clone();
-                let registry_client = self.registry_client.clone();
-                let project_dir = loc_base_dir.clone();
-                let root_bin = root_bin_dir.clone();
-                let root_nm = node_modules_dir.clone();
-                let offline = self.options.offline;
+        for (loc, node) in packages_to_download {
+            let sem = Arc::clone(&semaphore);
+            let cache = self.cache.clone();
+            let pack_store = Arc::clone(&self.pack_store);
+            let registry_client = self.registry_client.clone();
+            let project_dir = loc_base_dir.clone();
+            let root_bin = root_bin_dir.clone();
+            let root_nm = node_modules_dir.clone();
+            let offline = self.options.offline;
+            let worker_collector = collector.clone();
+            let pkg_writer_cfg = Arc::clone(&writer_cfg);
 
-                join_set.spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
-                    let dest_dir = project_dir.join(&loc);
-                    if let Some(parent) = dest_dir.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin, &root_nm);
-                    std::fs::create_dir_all(&bin_dir)?;
+                // Early path containment defense: validate loc before warm pack check or junction removal
+                if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
+                    return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
+                }
+                rnpm_fs::validate_entry_path(Path::new(&loc))
+                    .map_err(|e| anyhow!("Invalid package path '{loc}': {e}"))?;
 
-                    let resolved_url = node.resolved.as_ref().ok_or_else(|| {
-                        anyhow!("Missing resolved URL for package at {loc}")
-                    })?;
+                let dest_dir = project_dir.join(&loc);
+                let cleaned_dest = path_clean::clean(&dest_dir);
+                let cleaned_project = path_clean::clean(&project_dir);
+                if !cleaned_dest.starts_with(&cleaned_project) {
+                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
+                }
 
-                    let expected_integrity: Option<Integrity> = if let Some(ref integ_str) = node.integrity {
-                        if !integ_str.is_empty() {
-                            match integ_str.parse::<Integrity>() {
-                                Ok(i) => Some(i),
-                                Err(e) => {
-                                    if node.flags.optional {
-                                        warn!(
-                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
-                                            loc, e
-                                        );
-                                        return Ok(None);
-                                    } else {
-                                        return Err(anyhow!("Invalid integrity string for {loc}: {e}"));
+                let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin, &root_nm);
+
+                if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&dest_dir);
+                }
+
+                // Warm Pack Store fast path: if package pack already exists, materialize directly without downloading/parsing!
+                if let Some(ref integ_str) = node.integrity {
+                    if !integ_str.is_empty() && pack_store.has_package_pack(integ_str) {
+                        let t_mat = std::time::Instant::now();
+                        let dest_dir_clone = dest_dir.clone();
+                        let ps_clone = Arc::clone(&pack_store);
+                        let integ_clone = integ_str.clone();
+                        let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                        let loc_clone = loc.clone();
+                        let mat_res = tokio::task::spawn_blocking(move || {
+                            let _mat_span = tracing::info_span!("materialize-pack", package = %loc_clone).entered();
+                            let res = ps_clone.materialize_pack(&integ_clone, &dest_dir_clone, Some(&cfg_clone));
+                            drop(_mat_span);
+                            res
+                        }).await?;
+                        worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
+
+                        match mat_res {
+                            Ok(_) => {
+                                let pkg_manifest_path = dest_dir.join("package.json");
+                                let mut lifecycle_node = None;
+                                if pkg_manifest_path.exists() {
+                                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                                            let target_rel = compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
+                                            let script_path = dest_dir.join(&script_rel);
+                                            let _ = normalize_shebang(&script_path);
+                                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                                        }
+
+                                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                                            || pkg_manifest.scripts.contains_key("install")
+                                            || pkg_manifest.scripts.contains_key("postinstall");
+
+                                        if has_scripts {
+                                            let lifecycle_deps = node.dependencies.clone().into_keys().collect();
+                                            lifecycle_node = Some(LifecyclePackageNode {
+                                                package_path: loc.clone(),
+                                                disk_path: dest_dir.clone(),
+                                                manifest: pkg_manifest,
+                                                source: PackageSource::Registry,
+                                                dependencies: lifecycle_deps,
+                                                optional: node.flags.optional,
+                                            });
+                                        }
                                     }
                                 }
+                                return Ok(Some((true, lifecycle_node)));
                             }
-                        } else {
-                            None
+                            Err(e) => {
+                                if e.is_pack_corruption() {
+                                    warn!("Failed to materialize package {loc} from pack: {e}. Purging pack and falling back to tarball fetch.");
+                                    let _ = pack_store.purge(integ_str);
+                                    let _ = std::fs::remove_dir_all(&dest_dir);
+                                } else {
+                                    return Err(anyhow!("Failed to materialize package {loc} from pack: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let resolved_url = node.resolved.as_ref().ok_or_else(|| {
+                    anyhow!("Missing resolved URL for package at {loc}")
+                })?;
+
+                let expected_integrity: Option<Integrity> = if let Some(ref integ_str) = node.integrity {
+                    if !integ_str.is_empty() {
+                        match integ_str.parse::<Integrity>() {
+                            Ok(i) => Some(i),
+                            Err(e) => {
+                                if node.flags.optional {
+                                    warn!(
+                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                        loc, e
+                                    );
+                                    return Ok(None);
+                                } else {
+                                    return Err(anyhow!("Invalid integrity string for {loc}: {e}"));
+                                }
+                            }
                         }
                     } else {
                         None
+                    }
+                } else {
+                    None
+                };
+
+                let t_fetch = std::time::Instant::now();
+                let _fetch_span = tracing::info_span!("fetch", package = %loc);
+                let fetch_res = if let Ok(Some((_entry, data))) = cache.get(resolved_url) {
+                    let is_valid = if let Some(ref exp) = expected_integrity {
+                        exp.verify(&data).is_ok()
+                    } else {
+                        true
                     };
 
-                    let fetch_res = if let Ok(Some((_entry, data))) = cache.get(resolved_url) {
-                        let is_valid = if let Some(ref exp) = expected_integrity {
-                            exp.verify(&data).is_ok()
-                        } else {
-                            true
-                        };
-
-                        if is_valid {
-                            debug!("Cache hit for {}", resolved_url);
-                            Ok((data, true))
-                        } else {
-                            debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
-                            let _ = cache.purge_key(resolved_url);
-                            if offline {
-                                if node.flags.optional {
-                                    return Ok(None);
-                                }
-                                return Err(anyhow!(
-                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
-                                ));
-                            }
-                            match registry_client.download_tarball_bytes(resolved_url).await {
-                                Ok(bytes) => {
-                                    if let Some(ref exp) = expected_integrity {
-                                        if let Err(e) = exp.verify(&bytes) {
-                                            if node.flags.optional {
-                                                warn!(
-                                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                                    loc, e
-                                                );
-                                                return Ok(None);
-                                            } else {
-                                                return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
-                                            }
-                                        }
-                                    }
-                                    let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
-                                    Ok((bytes, false))
-                                }
-                                Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
-                            }
-                        }
-                    } else if offline {
-                        if node.flags.optional {
-                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
-                            return Ok(None);
-                        }
-                        return Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
-                        ));
+                    if is_valid {
+                        debug!("Cache hit for {}", resolved_url);
+                        Ok((data, true))
                     } else {
-                        info!("Downloading {}", resolved_url);
+                        debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
+                        let _ = cache.purge_key(resolved_url);
+                        if offline {
+                            if node.flags.optional {
+                                return Ok(None);
+                            }
+                            return Err(anyhow!(
+                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
+                            ));
+                        }
                         match registry_client.download_tarball_bytes(resolved_url).await {
                             Ok(bytes) => {
                                 if let Some(ref exp) = expected_integrity {
@@ -1500,70 +2397,155 @@ impl Installer {
                                         }
                                     }
                                 }
+                                let t_sw = std::time::Instant::now();
+                                let _sw_span = tracing::info_span!("store-write", package = %loc).entered();
                                 let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
+                                drop(_sw_span);
+                                worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
                                 Ok((bytes, false))
                             }
                             Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
                         }
-                    };
+                    }
+                } else if offline {
+                    if node.flags.optional {
+                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
+                        return Ok(None);
+                    }
+                    return Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                    ));
+                } else {
+                    info!("Downloading {}", resolved_url);
+                    match registry_client.download_tarball_bytes(resolved_url).await {
+                        Ok(bytes) => {
+                            if let Some(ref exp) = expected_integrity {
+                                if let Err(e) = exp.verify(&bytes) {
+                                    if node.flags.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                            loc, e
+                                        );
+                                        return Ok(None);
+                                    } else {
+                                        return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
+                                    }
+                                }
+                            }
+                            let t_sw = std::time::Instant::now();
+                            let _sw_span = tracing::info_span!("store-write", package = %loc).entered();
+                            let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
+                            drop(_sw_span);
+                            worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                            Ok((bytes, false))
+                        }
+                        Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
+                    }
+                };
+                worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
-                    let (bytes, was_hit) = match fetch_res {
-                        Ok(res) => res,
-                        Err(err) => {
-                            if node.flags.optional {
-                                warn!(
-                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
-                                    loc, err
-                                );
-                                return Ok(None);
-                            } else {
-                                return Err(err);
+                let (bytes, was_hit) = match fetch_res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        if node.flags.optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
+                                loc, err
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                };
+
+                // Verify integrity in memory (defense in depth)
+                let t_verify = std::time::Instant::now();
+                let _v_span = tracing::info_span!("verify", package = %loc).entered();
+                if let Some(ref exp) = expected_integrity {
+                    if let Err(e) = exp.verify(&bytes) {
+                        if node.flags.optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                loc, e
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(anyhow!("Integrity verification failed for {}: {e}", loc));
+                        }
+                    }
+                }
+                drop(_v_span);
+                worker_collector.record_phase(Phase::Verify, t_verify.elapsed());
+
+                // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
+                const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
+                if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
+                    return Err(anyhow!(
+                        "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
+                        loc, MAX_COMPRESSED_TARBALL_BYTES
+                    ));
+                }
+
+                // Path containment defense: ensure loc has no traversal or device escaping
+                if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
+                    return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
+                }
+
+                let cleaned_dest = path_clean::clean(&dest_dir);
+                let cleaned_project = path_clean::clean(&project_dir);
+                if !cleaned_dest.starts_with(&cleaned_project) {
+                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
+                }
+
+                // Construct and write pack to store if not already present
+                if let Some(ref integ_str) = node.integrity {
+                    if !integ_str.is_empty() && !pack_store.has_package_pack(integ_str) {
+                        let _ = pack_store.put_package_from_tarball(integ_str, &bytes);
+                    }
+                }
+
+                // Parallel native materialization straight into place without staging dirs or renames
+                let dest_dir_clone = dest_dir.clone();
+                let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                let ps_clone = Arc::clone(&pack_store);
+                let integ_opt = node.integrity.clone();
+                let extract_res = tokio::task::spawn_blocking(move || {
+                    if rnpm_fs::is_junction(&dest_dir_clone).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_junction(&dest_dir_clone);
+                    }
+                    if let Some(ref integ) = integ_opt {
+                        if !integ.is_empty() && ps_clone.has_package_pack(integ) {
+                            match ps_clone.materialize_pack(integ, &dest_dir_clone, Some(&cfg_clone)) {
+                                Ok(sum) => return Ok(sum),
+                                Err(e) => {
+                                    if e.is_pack_corruption() {
+                                        warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
+                                        let _ = ps_clone.purge(integ);
+                                        let _ = std::fs::remove_dir_all(&dest_dir_clone);
+                                    } else {
+                                        return Err(rnpm_fs::FsError::Io(match e {
+                                            CacheError::Io(io_err) => io_err,
+                                            other => std::io::Error::other(other.to_string()),
+                                        }));
+                                    }
+                                }
                             }
                         }
-                    };
-
-                    // Verify integrity in memory (defense in depth)
-                    if let Some(ref exp) = expected_integrity {
-                        if let Err(e) = exp.verify(&bytes) {
-                            if node.flags.optional {
-                                warn!(
-                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                    loc, e
-                                );
-                                return Ok(None);
-                            } else {
-                                return Err(anyhow!("Integrity verification failed for {}: {e}", loc));
-                            }
-                        }
                     }
+                    extract_tarball_direct(Cursor::new(bytes), &dest_dir_clone, None, Some(&cfg_clone))
+                }).await?;
 
-                    // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
-                    const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
-                    if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
-                        return Err(anyhow!(
-                            "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
-                            loc, MAX_COMPRESSED_TARBALL_BYTES
-                        ));
+                match extract_res {
+                    Ok(sum) => {
+                        let _inf = tracing::info_span!("inflate", package = %loc).entered();
+                        worker_collector.record_phase(Phase::Inflate, sum.inflate_duration);
+                        drop(_inf);
+                        let _mat = tracing::info_span!("materialize", package = %loc).entered();
+                        worker_collector.record_phase(Phase::Materialize, sum.materialize_duration);
+                        drop(_mat);
                     }
-
-                    // Path containment defense: ensure loc has no traversal or device escaping
-                    if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
-                        return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
-                    }
-
-                    let cleaned_dest = path_clean::clean(&dest_dir);
-                    let cleaned_project = path_clean::clean(&project_dir);
-                    if !cleaned_dest.starts_with(&cleaned_project) {
-                        return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
-                    }
-
-                    // Decompress directly through memory buffer and extract with atomic replacement & backoff retries
-                    let dest_dir_clone = dest_dir.clone();
-                    let extract_res = tokio::task::spawn_blocking(move || {
-                        extract_and_replace(Cursor::new(bytes), &dest_dir_clone, None)
-                    }).await?;
-
-                    if let Err(e) = extract_res {
+                    Err(e) => {
                         if node.flags.optional {
                             warn!(
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
@@ -1575,62 +2557,69 @@ impl Installer {
                             return Err(anyhow!("Failed to extract package {}: {e}", loc));
                         }
                     }
+                }
 
-                    // Generate shims if package declares bin and collect lifecycle node
-                    let pkg_manifest_path = dest_dir.join("package.json");
-                    let mut lifecycle_node = None;
+                // Generate shims if package declares bin and collect lifecycle node
+                let pkg_manifest_path = dest_dir.join("package.json");
+                let mut lifecycle_node = None;
 
-                    if pkg_manifest_path.exists() {
-                        if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                            for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                                let target_rel = format!("{}/{}", node.install_name, script_rel);
-                                let script_path = dest_dir.join(&script_rel);
-                                let _ = normalize_shebang(&script_path);
-                                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
-                            }
+                if pkg_manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                        let t_bins = std::time::Instant::now();
+                        let _bins_span = tracing::info_span!("bins", package = %loc).entered();
+                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                            let target_rel = compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
+                            let script_path = dest_dir.join(&script_rel);
+                            let _ = normalize_shebang(&script_path);
+                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                        }
+                        drop(_bins_span);
+                        worker_collector.record_phase(Phase::Bins, t_bins.elapsed());
 
-                            let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
-                                || pkg_manifest.scripts.contains_key("install")
-                                || pkg_manifest.scripts.contains_key("postinstall");
+                        let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall");
 
-                            if has_install_script {
-                                lifecycle_node = Some(LifecyclePackageNode {
-                                    package_path: loc.clone(),
-                                    disk_path: dest_dir.clone(),
-                                    manifest: pkg_manifest,
-                                    source: PackageSource::Registry,
-                                    dependencies: node.dependencies.keys().cloned().collect(),
-                                    optional: node.flags.optional,
-                                });
-                            }
+                        if has_install_script {
+                            lifecycle_node = Some(LifecyclePackageNode {
+                                package_path: loc.clone(),
+                                disk_path: dest_dir.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Registry,
+                                dependencies: node.dependencies.keys().cloned().collect(),
+                                optional: node.flags.optional,
+                            });
                         }
                     }
+                }
 
-                    Ok(Some((
-                        was_hit,
-                        lifecycle_node,
-                    )))
-                });
-            }
+                Ok(Some((
+                    was_hit,
+                    lifecycle_node,
+                )))
+            });
+        }
 
-            while let Some(join_res) = join_set.join_next().await {
-                let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
-                if let Some((was_hit, lifecycle_node)) = item_opt {
-                    if was_hit {
-                        cache_hits += 1;
-                    } else {
-                        cache_misses += 1;
-                    }
-                    packages_installed += 1;
-                    if let Some(l_node) = lifecycle_node {
-                        lifecycle_nodes.push(l_node);
-                    }
+        while let Some(join_res) = join_set.join_next().await {
+            let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
+            if let Some((was_hit, lifecycle_node)) = item_opt {
+                if was_hit {
+                    cache_hits += 1;
+                    collector.record_cache_hit();
+                } else {
+                    cache_misses += 1;
+                    collector.record_cache_miss();
+                }
+                packages_installed += 1;
+                if let Some(l_node) = lifecycle_node {
+                    lifecycle_nodes.push(l_node);
                 }
             }
         }
 
         // 3. Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
+            let _life_guard = collector.enter_phase(Phase::Lifecycle);
             let sandbox_policy = if self.options.strict_sandbox {
                 rnpm_lifecycle::ScriptSandboxPolicy::restricted()
             } else {
@@ -1648,49 +2637,94 @@ impl Installer {
             execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
         }
 
-        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
         if !self.options.no_save && self.options.package_lock_enabled() {
+            let _lock_guard = collector.enter_phase(Phase::Lockfile);
             enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
-            // 4. Write deterministic package-lock.json
-            lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
-                .context("Failed to save package-lock.json")?;
+            // 4. Write deterministic lockfile
+            lockfile
+                .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
-            lockfile.save_hidden(&self.options.project_dir)
+            lockfile
+                .save_hidden(&self.options.project_dir)
                 .context("Failed to save hidden package-lock.json")?;
         }
+
+        if !self.options.dry_run && !self.options.package_lock_only {
+            if let Ok(fingerprint) =
+                compute_project_fingerprint(&self.options.project_dir, &self.options)
+            {
+                let _ = self
+                    .cache
+                    .set_project_fingerprint(&self.options.project_dir, &fingerprint);
+            }
+        }
+
+        clean_empty_bin_dirs(&node_modules_dir);
 
         Ok(InstallSummary {
             packages_installed,
             cache_hits,
             cache_misses,
             lockfile_path,
+            timing: Some(collector.finish()),
         })
     }
 
     /// Run strict CI installation from committed package-lock.json.
     pub async fn run_ci(&mut self) -> Result<InstallSummary> {
+        let res = self.run_ci_internal().await;
+        if self.options.wait_for_trash || !self.options.detached_trash {
+            crate::trash::wait_all_trash_deletions();
+        }
+        res
+    }
+
+    async fn run_ci_internal(&mut self) -> Result<InstallSummary> {
+        crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        let collector = TimingCollector::new();
+        let plan_start = std::time::Instant::now();
+        let _plan_span = tracing::info_span!("plan").entered();
+
         let manifest_path = self.options.project_dir.join("package.json");
-        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let (lockfile_path, is_shrinkwrap) = resolve_lockfile_path(&self.options.project_dir);
+        let lockfile_name = if is_shrinkwrap {
+            "npm-shrinkwrap.json"
+        } else {
+            "package-lock.json"
+        };
 
         if !manifest_path.exists() {
-            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+            return Err(anyhow!(
+                "package.json not found in {}",
+                self.options.project_dir.display()
+            ));
         }
         if !lockfile_path.exists() {
-            return Err(anyhow!("package-lock.json not found: rnpm ci requires a committed lockfile"));
+            return Err(anyhow!(
+                "{lockfile_name} not found: rnpm ci requires a committed lockfile"
+            ));
         }
 
         let manifest = Manifest::from_file(&manifest_path)?;
+        drop(_plan_span);
+        collector.record_phase(Phase::Plan, plan_start.elapsed());
+
+        let metadata_start = std::time::Instant::now();
+        let _meta_span = tracing::info_span!("metadata").entered();
+
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
         let lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
-            .context("Failed to parse package-lock.json")?;
-        let platform_skipped_packages = lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
+            .with_context(|| format!("Failed to parse {lockfile_name}"))?;
+        let platform_skipped_packages =
+            lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
 
         // 0. Discover workspace members (if any)
-        let workspace_members = discover_workspaces_from_manifest(
-            &self.options.project_dir,
-            &manifest,
-        ).unwrap_or_default();
+        let workspace_members =
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default();
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             WorkspaceDependencyGraph::construct(&workspace_members).ok()
@@ -1700,7 +2734,7 @@ impl Installer {
 
         // Comprehensive bidirectional drift check between manifest and lockfile
         let root_pkg = lockfile.packages.get("").ok_or_else(|| {
-            anyhow!("rnpm ERR! code ELOCKFILE_DRIFT: package-lock.json missing root package descriptor (EUSAGE)")
+            anyhow!("rnpm ERR! code ELOCKFILE_DRIFT: {lockfile_name} missing root package descriptor (EUSAGE)")
         })?;
 
         // 1. Production dependencies drift check
@@ -1720,7 +2754,7 @@ impl Installer {
                         false
                     };
                     if !satisfies {
-                    return Err(anyhow!(
+                        return Err(anyhow!(
                         "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {}@{} does not match lockfile spec {} (EUSAGE)",
                         dep_name, dep_spec, lock_spec
                     ));
@@ -1728,16 +2762,18 @@ impl Installer {
                 }
             } else {
                 return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {} missing from package-lock.json (EUSAGE)",
-                    dep_name
+                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {} missing from {} (EUSAGE)",
+                    dep_name,
+                    lockfile_name
                 ));
             }
         }
         for dep_name in lock_deps.keys() {
             if !manifest.dependencies.contains_key(dep_name) {
                 return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: dependency {} present in package-lock.json but removed from package.json (EUSAGE)",
-                    dep_name
+                    "rnpm ERR! code ELOCKFILE_DRIFT: dependency {} present in {} but removed from package.json (EUSAGE)",
+                    dep_name,
+                    lockfile_name
                 ));
             }
         }
@@ -1746,88 +2782,98 @@ impl Installer {
         let lock_dev_deps = root_pkg.dev_dependencies.as_ref().unwrap_or(&empty_deps);
 
         if !self.options.omit_dev {
-        for (dep_name, dep_spec) in &manifest.dev_dependencies {
-            if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
-                if lock_spec != dep_spec {
-                    let satisfies = if let Ok(v) = Version::parse(lock_spec) {
-                        if let Ok(r) = Range::parse(dep_spec) {
-                            r.satisfies(&v)
+            for (dep_name, dep_spec) in &manifest.dev_dependencies {
+                if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
+                    if lock_spec != dep_spec {
+                        let satisfies = if let Ok(v) = Version::parse(lock_spec) {
+                            if let Ok(r) = Range::parse(dep_spec) {
+                                r.satisfies(&v)
+                            } else {
+                                false
+                            }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
-                    if !satisfies {
-                    return Err(anyhow!(
+                        };
+                        if !satisfies {
+                            return Err(anyhow!(
                         "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {}@{} does not match lockfile spec {} (EUSAGE)",
                         dep_name, dep_spec, lock_spec
                     ));
+                        }
                     }
+                } else {
+                    return Err(anyhow!(
+                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from {} (EUSAGE)",
+                    dep_name,
+                    lockfile_name
+                ));
                 }
-            } else {
-                return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from package-lock.json (EUSAGE)",
-                    dep_name
-                ));
             }
-        }
-        for dep_name in lock_dev_deps.keys() {
-            if !manifest.dev_dependencies.contains_key(dep_name) {
-                return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: devDependency {} present in package-lock.json but removed from package.json (EUSAGE)",
-                    dep_name
+            for dep_name in lock_dev_deps.keys() {
+                if !manifest.dev_dependencies.contains_key(dep_name) {
+                    return Err(anyhow!(
+                    "rnpm ERR! code ELOCKFILE_DRIFT: devDependency {} present in {} but removed from package.json (EUSAGE)",
+                    dep_name,
+                    lockfile_name
                 ));
+                }
             }
-        }
         }
 
         // 3. Optional dependencies drift check
-        let lock_opt_deps = root_pkg.optional_dependencies.as_ref().unwrap_or(&empty_deps);
+        let lock_opt_deps = root_pkg
+            .optional_dependencies
+            .as_ref()
+            .unwrap_or(&empty_deps);
 
         if !self.options.omit_optional {
-        for (dep_name, dep_spec) in &manifest.optional_dependencies {
-            if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
-                if lock_spec != dep_spec {
-                    let satisfies = if let Ok(v) = Version::parse(lock_spec) {
-                        if let Ok(r) = Range::parse(dep_spec) {
-                            r.satisfies(&v)
+            for (dep_name, dep_spec) in &manifest.optional_dependencies {
+                if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
+                    if lock_spec != dep_spec {
+                        let satisfies = if let Ok(v) = Version::parse(lock_spec) {
+                            if let Ok(r) = Range::parse(dep_spec) {
+                                r.satisfies(&v)
+                            } else {
+                                false
+                            }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
-                    if !satisfies {
-                    return Err(anyhow!(
+                        };
+                        if !satisfies {
+                            return Err(anyhow!(
                         "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {}@{} does not match lockfile spec {} (EUSAGE)",
                         dep_name, dep_spec, lock_spec
                     ));
+                        }
                     }
+                } else {
+                    return Err(anyhow!(
+                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {} missing from {} (EUSAGE)",
+                    dep_name,
+                    lockfile_name
+                ));
                 }
-            } else {
-                return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {} missing from package-lock.json (EUSAGE)",
-                    dep_name
-                ));
             }
-        }
-        for dep_name in lock_opt_deps.keys() {
-            if !manifest.optional_dependencies.contains_key(dep_name) {
-                return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: optionalDependency {} present in package-lock.json but removed from package.json (EUSAGE)",
-                    dep_name
+            for dep_name in lock_opt_deps.keys() {
+                if !manifest.optional_dependencies.contains_key(dep_name) {
+                    return Err(anyhow!(
+                    "rnpm ERR! code ELOCKFILE_DRIFT: optionalDependency {} present in {} but removed from package.json (EUSAGE)",
+                    dep_name,
+                    lockfile_name
                 ));
+                }
             }
-        }
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest
         if !lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
             return Err(anyhow!(
-                "rnpm ERR! code ELOCKFILE_DRIFT: package.json and package-lock.json are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)"
+                "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
+                lockfile_name
             ));
         }
+        drop(_meta_span);
+        collector.record_phase(Phase::Metadata, metadata_start.elapsed());
 
         if self.options.dry_run {
             let host_platform = self.options.platform();
@@ -1837,9 +2883,12 @@ impl Installer {
                     continue;
                 }
                 let is_dev = pkg_info.dev.unwrap_or(false);
-                let is_optional = pkg_info.optional.unwrap_or(false);
+                let is_optional = pkg_info.optional.unwrap_or(false)
+                    || pkg_info.is_effective_optional()
+                    || pkg_info.is_peer_optional();
                 let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-                let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
+                let is_peer =
+                    pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
 
                 if self.options.omit_dev && (is_dev || is_dev_optional) {
                     continue;
@@ -1854,7 +2903,8 @@ impl Installer {
                     continue;
                 }
                 if is_optional {
-                    let os_match = host_platform.matches_with_libc(
+                    let os_match = rnpm_solver::is_platform_compatible(
+                        &host_platform,
                         pkg_info.os.as_deref(),
                         pkg_info.cpu.as_deref(),
                         pkg_info.libc.as_deref(),
@@ -1874,8 +2924,12 @@ impl Installer {
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
+                timing: Some(collector.finish()),
             });
         }
+
+        let plan2_start = std::time::Instant::now();
+        let _plan2_span = tracing::info_span!("plan").entered();
 
         // Clean-slate: remove node_modules completely using junction-safe removal
         let (node_modules_dir, bin_dir, loc_base_dir) = if self.options.is_global {
@@ -1894,10 +2948,75 @@ impl Installer {
             (nm, bin, base)
         };
         if node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false) {
-            rnpm_fs::remove_dir_all_safe(&node_modules_dir)?;
+            fast_trash_wipe_dir(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
         std::fs::create_dir_all(&bin_dir)?;
+
+        // Pre-create all package parent directories and bin directories in one breadth-first pass
+        {
+            let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
+            for (pkg_key, pkg_info) in &lockfile.packages {
+                if pkg_key.is_empty() || platform_skipped_packages.contains(pkg_key) {
+                    continue;
+                }
+                let is_dev = pkg_info.dev.unwrap_or(false);
+                let is_optional = pkg_info.optional.unwrap_or(false)
+                    || pkg_info.is_effective_optional()
+                    || pkg_info.is_peer_optional();
+                let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
+                if self.options.omit_dev && (is_dev || is_dev_optional) {
+                    continue;
+                }
+                if self.options.omit_optional && (is_optional || is_dev_optional) {
+                    continue;
+                }
+                if is_optional {
+                    let host_platform = self.options.platform();
+                    if !rnpm_solver::is_platform_compatible(
+                        &host_platform,
+                        pkg_info.os.as_deref(),
+                        pkg_info.cpu.as_deref(),
+                        pkg_info.libc.as_deref(),
+                    ) {
+                        continue;
+                    }
+                }
+                let target_path = self.options.project_dir.join(pkg_key);
+                if let Some(parent) = target_path.parent() {
+                    dirs_to_precreate.push(parent.to_path_buf());
+                }
+                let has_bin = match &pkg_info.bin {
+                    Some(rnpm_lockfile::PackageBin::Single(_)) => true,
+                    Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
+                    None => {
+                        let pkg_manifest_path = target_path.join("package.json");
+                        if pkg_manifest_path.exists() {
+                            Manifest::from_file(&pkg_manifest_path)
+                                .map(|m| !m.bin_entries().is_empty())
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if has_bin {
+                    let pkg_bin_dir =
+                        find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
+                    dirs_to_precreate.push(pkg_bin_dir);
+                }
+            }
+            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+            let _ = precreate_directories(dir_refs);
+        }
+        drop(_plan2_span);
+        collector.record_phase(Phase::Plan, plan2_start.elapsed());
+
+        if self.options.install_strategy == InstallStrategy::Linked {
+            return self
+                .execute_linked_ci(&manifest, &lockfile, &node_modules_dir, &bin_dir, collector)
+                .await;
+        }
 
         let mut cache_hits = 0;
         let mut cache_misses = 0;
@@ -1913,16 +3032,20 @@ impl Installer {
                 || member.manifest.scripts.contains_key("prepare");
 
             if has_scripts {
-                let mut member_deps: Vec<String> = member.manifest.dependencies.keys().cloned().collect();
+                let mut member_deps: Vec<String> =
+                    member.manifest.dependencies.keys().cloned().collect();
                 if !self.options.omit_dev {
-                for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
-                    let is_sibling = ws_graph_opt.as_ref().map(|g| g.is_member(dep_name)).unwrap_or(false)
-                        || dep_spec.starts_with("workspace:")
-                        || workspace_members.iter().any(|m| &m.name == dep_name);
-                    if is_sibling && !member_deps.contains(dep_name) {
-                        member_deps.push(dep_name.clone());
+                    for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
+                        let is_sibling = ws_graph_opt
+                            .as_ref()
+                            .map(|g| g.is_member(dep_name))
+                            .unwrap_or(false)
+                            || dep_spec.starts_with("workspace:")
+                            || workspace_members.iter().any(|m| &m.name == dep_name);
+                        if is_sibling && !member_deps.contains(dep_name) {
+                            member_deps.push(dep_name.clone());
+                        }
                     }
-                }
                 }
                 if let Some(ref ws_graph) = ws_graph_opt {
                     if let Some(sibling_map) = ws_graph.dependencies.get(&member.name) {
@@ -1950,7 +3073,7 @@ impl Installer {
             }
         }
 
-        let mut packages_to_download: Vec<(&String, &String, &str, bool)> = Vec::new();
+        let mut packages_to_process: Vec<(String, String, String, bool, Vec<String>)> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
@@ -1970,10 +3093,10 @@ impl Installer {
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
                     if !clean_name.contains('/')
                         && manifest.dev_dependencies.contains_key(clean_name)
-                            && !manifest.dependencies.contains_key(clean_name)
-                        {
-                            continue;
-                        }
+                        && !manifest.dependencies.contains_key(clean_name)
+                    {
+                        continue;
+                    }
                 }
             }
             if self.options.omit_optional {
@@ -1983,10 +3106,10 @@ impl Installer {
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
                     if !clean_name.contains('/')
                         && manifest.optional_dependencies.contains_key(clean_name)
-                            && !manifest.dependencies.contains_key(clean_name)
-                        {
-                            continue;
-                        }
+                        && !manifest.dependencies.contains_key(clean_name)
+                    {
+                        continue;
+                    }
                 }
             }
             if self.options.omit_peer || self.options.legacy_peer_deps {
@@ -1996,10 +3119,10 @@ impl Installer {
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
                     if !clean_name.contains('/')
                         && manifest.peer_dependencies.contains_key(clean_name)
-                            && !manifest.dependencies.contains_key(clean_name)
-                        {
-                            continue;
-                        }
+                        && !manifest.dependencies.contains_key(clean_name)
+                    {
+                        continue;
+                    }
                 }
             }
 
@@ -2011,8 +3134,14 @@ impl Installer {
             // Handle workspace links
             if pkg_info.link == Some(true) {
                 // Path containment defense: ensure pkg_key has no traversal, device names, or escapes
-                if pkg_key.contains("..") || pkg_key.contains(':') || pkg_key.contains('\\') || pkg_key.contains('\0') {
-                    return Err(anyhow!("Package lock entry '{pkg_key}' contains illegal path characters"));
+                if pkg_key.contains("..")
+                    || pkg_key.contains(':')
+                    || pkg_key.contains('\\')
+                    || pkg_key.contains('\0')
+                {
+                    return Err(anyhow!(
+                        "Package lock entry '{pkg_key}' contains illegal path characters"
+                    ));
                 }
                 rnpm_fs::validate_entry_path(Path::new(pkg_key))
                     .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
@@ -2020,10 +3149,14 @@ impl Installer {
                 let full_target = self.options.project_dir.join(pkg_key);
                 let cleaned = path_clean::clean(&full_target);
                 if !cleaned.starts_with(&self.options.project_dir) {
-                    return Err(anyhow!("Package path '{cleaned:?}' escapes project boundary"));
+                    return Err(anyhow!(
+                        "Package path '{cleaned:?}' escapes project boundary"
+                    ));
                 }
                 if pkg_key.starts_with("node_modules/") && !cleaned.starts_with(&node_modules_dir) {
-                    return Err(anyhow!("Package path '{cleaned:?}' escapes node_modules boundary"));
+                    return Err(anyhow!(
+                        "Package path '{cleaned:?}' escapes node_modules boundary"
+                    ));
                 }
 
                 let target_rel = pkg_info.resolved.as_ref().ok_or_else(|| {
@@ -2040,23 +3173,38 @@ impl Installer {
                         let _ = std::fs::remove_dir_all(&link_path);
                     }
                 }
-                rnpm_fs::create_junction(&link_path, &target_dir)
-                    .map_err(|e| anyhow!("Failed to link workspace package at '{}': {e}", link_path.display()))?;
+                rnpm_fs::create_junction(&link_path, &target_dir).map_err(|e| {
+                    anyhow!(
+                        "Failed to link workspace package at '{}': {e}",
+                        link_path.display()
+                    )
+                })?;
 
                 packages_installed += 1;
 
                 let pkg_manifest_path = target_dir.join("package.json");
                 if pkg_manifest_path.exists() {
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                            let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
-                            let target_rel_bin = format!("{clean_pkg_name}/{script_rel}");
-                            let script_path = target_dir.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
+                        let bin_entries = pkg_manifest.bin_entries();
+                        if !bin_entries.is_empty() {
+                            let pkg_bin_dir =
+                                find_enclosing_bin_dir(&link_path, &bin_dir, &node_modules_dir);
+                            let t_bins = std::time::Instant::now();
+                            let _bins_span =
+                                tracing::info_span!("bins", package = %pkg_key).entered();
+                            for (bin_name, script_rel) in bin_entries {
+                                let target_rel_bin =
+                                    compute_bin_target_rel(&link_path, &pkg_bin_dir, &script_rel);
+                                let script_path = target_dir.join(&script_rel);
+                                let _ = normalize_shebang(&script_path);
+                                let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel_bin);
+                            }
+                            drop(_bins_span);
+                            collector.record_phase(Phase::Bins, t_bins.elapsed());
                         }
 
-                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
+                        let clean_pkg_name =
+                            pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
                         if !workspace_members.iter().any(|m| m.name == clean_pkg_name) {
                             let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                                 || pkg_manifest.scripts.contains_key("install")
@@ -2064,10 +3212,13 @@ impl Installer {
                                 || pkg_manifest.scripts.contains_key("prepare");
 
                             if has_scripts {
-                                let mut member_deps: Vec<String> = pkg_manifest.dependencies.keys().cloned().collect();
+                                let mut member_deps: Vec<String> =
+                                    pkg_manifest.dependencies.keys().cloned().collect();
                                 for (dep_name, dep_spec) in &pkg_manifest.dev_dependencies {
                                     let is_sibling = dep_spec.starts_with("workspace:")
-                                        || lockfile.packages.contains_key(&format!("node_modules/{dep_name}"));
+                                        || lockfile
+                                            .packages
+                                            .contains_key(&format!("node_modules/{dep_name}"));
                                     if is_sibling && !member_deps.contains(dep_name) {
                                         member_deps.push(dep_name.clone());
                                     }
@@ -2099,8 +3250,14 @@ impl Installer {
             }
 
             // Path containment defense: ensure pkg_key has no traversal, device names, or escapes
-            if pkg_key.contains("..") || pkg_key.contains(':') || pkg_key.contains('\\') || pkg_key.contains('\0') {
-                return Err(anyhow!("Package lock entry '{pkg_key}' contains illegal path characters"));
+            if pkg_key.contains("..")
+                || pkg_key.contains(':')
+                || pkg_key.contains('\\')
+                || pkg_key.contains('\0')
+            {
+                return Err(anyhow!(
+                    "Package lock entry '{pkg_key}' contains illegal path characters"
+                ));
             }
             rnpm_fs::validate_entry_path(Path::new(pkg_key))
                 .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
@@ -2108,18 +3265,25 @@ impl Installer {
             let full_target = loc_base_dir.join(pkg_key);
             let cleaned = path_clean::clean(&full_target);
             if !cleaned.starts_with(&loc_base_dir) {
-                return Err(anyhow!("Package path '{cleaned:?}' escapes project boundary"));
+                return Err(anyhow!(
+                    "Package path '{cleaned:?}' escapes project boundary"
+                ));
             }
             if !cleaned.starts_with(&node_modules_dir) {
-                return Err(anyhow!("Package path '{cleaned:?}' escapes node_modules boundary"));
+                return Err(anyhow!(
+                    "Package path '{cleaned:?}' escapes node_modules boundary"
+                ));
             }
 
-            let is_optional = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
+            let is_optional = pkg_info.is_effective_optional()
+                || pkg_info.is_peer_optional()
+                || pkg_info.optional == Some(true);
 
             // Filter optional dependencies by platform: os, cpu, libc
             if is_optional {
                 let host_platform = self.options.platform();
-                let os_match = host_platform.matches_with_libc(
+                let os_match = rnpm_solver::is_platform_compatible(
+                    &host_platform,
                     pkg_info.os.as_deref(),
                     pkg_info.cpu.as_deref(),
                     pkg_info.libc.as_deref(),
@@ -2140,39 +3304,86 @@ impl Installer {
                         );
                         continue;
                     } else {
-                        return Err(anyhow!("Package {} missing resolved URL in lockfile", pkg_key));
+                        return Err(anyhow!(
+                            "Package {} missing resolved URL in lockfile",
+                            pkg_key
+                        ));
                     }
                 }
             };
 
             let is_git = resolved_url.starts_with("git+")
                 || resolved_url.starts_with("git:")
-                || PackageTarget::parse(resolved_url).map(|t| t.is_git()).unwrap_or(false);
+                || PackageTarget::parse(resolved_url)
+                    .map(|t| t.is_git())
+                    .unwrap_or(false);
 
             if is_git {
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                 let target = PackageTarget::parse(resolved_url)
                     .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
+                let t_fetch = std::time::Instant::now();
+                let _f_span = tracing::info_span!("fetch", package = %pkg_key).entered();
                 let checkout_dir = git_fetcher
                     .checkout_git_dependency(&target, self.options.offline)
                     .await?;
+                drop(_f_span);
+                collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
+                let t_mat = std::time::Instant::now();
+                let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
                 crate::git::copy_dir_all(&checkout_dir, &full_target)?;
+                drop(_mat_span);
+                collector.record_phase(Phase::Materialize, t_mat.elapsed());
+
                 packages_installed += 1;
                 cache_hits += 1;
-
-                let target_bin_dir = find_enclosing_bin_dir(&full_target, &bin_dir, &node_modules_dir);
-                let _ = std::fs::create_dir_all(&target_bin_dir);
+                collector.record_cache_hit();
 
                 let pkg_manifest_path = full_target.join("package.json");
                 if pkg_manifest_path.exists() {
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
-                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                            let target_rel = format!("{clean_pkg_name}/{script_rel}");
-                            let script_path = full_target.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&target_bin_dir, &bin_name, &target_rel);
+                        let bin_entries = pkg_manifest.bin_entries();
+                        if !bin_entries.is_empty() {
+                            let target_bin_dir =
+                                find_enclosing_bin_dir(&full_target, &bin_dir, &node_modules_dir);
+                            let t_bins = std::time::Instant::now();
+                            let _bins_span =
+                                tracing::info_span!("bins", package = %pkg_key).entered();
+                            for (bin_name, script_rel) in bin_entries {
+                                let target_rel = compute_bin_target_rel(
+                                    &full_target,
+                                    &target_bin_dir,
+                                    &script_rel,
+                                );
+                                let script_path = full_target.join(&script_rel);
+                                let _ = normalize_shebang(&script_path);
+                                let _ = create_shims(&target_bin_dir, &bin_name, &target_rel);
+                            }
+                            drop(_bins_span);
+                            collector.record_phase(Phase::Bins, t_bins.elapsed());
+                        }
+
+                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall")
+                            || pkg_manifest.scripts.contains_key("prepare");
+                        if has_scripts {
+                            let deps = pkg_info
+                                .dependencies
+                                .as_ref()
+                                .map(|d| d.keys().cloned().collect())
+                                .unwrap_or_else(|| {
+                                    pkg_manifest.dependencies.keys().cloned().collect()
+                                });
+                            lifecycle_nodes.push(LifecyclePackageNode {
+                                package_path: pkg_key.clone(),
+                                disk_path: full_target.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Git,
+                                dependencies: deps,
+                                optional: is_optional,
+                            });
                         }
                     }
                 }
@@ -2190,7 +3401,11 @@ impl Installer {
                             );
                             continue;
                         } else {
-                            return Err(anyhow!("Package {} has invalid integrity in lockfile: {}", pkg_key, e));
+                            return Err(anyhow!(
+                                "Package {} has invalid integrity in lockfile: {}",
+                                pkg_key,
+                                e
+                            ));
                         }
                     }
                     i.trim()
@@ -2203,113 +3418,37 @@ impl Installer {
                         );
                         continue;
                     } else {
-                        return Err(anyhow!("Package {} missing or empty integrity in lockfile", pkg_key));
+                        return Err(anyhow!(
+                            "Package {} missing or empty integrity in lockfile",
+                            pkg_key
+                        ));
                     }
                 }
             };
 
-            if resolved_url.starts_with("file:") {
-                let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
-                if file_path.contains('\0') {
-                    return Err(anyhow!("Resolved file URL contains null bytes: {resolved_url}"));
-                }
-                let project_dir_abs = if self.options.project_dir.is_absolute() {
-                    self.options.project_dir.clone()
-                } else {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(&self.options.project_dir)
-                };
-                let clean_project_dir = path_clean::clean(&project_dir_abs);
-                let candidate_path = if Path::new(file_path).is_absolute() {
-                    PathBuf::from(file_path)
-                } else {
-                    clean_project_dir.join(file_path)
-                };
-                let clean_file_path = path_clean::clean(&candidate_path);
-                if !clean_file_path.starts_with(&clean_project_dir) {
-                    return Err(anyhow!(
-                        "Security error: resolved file URL '{}' escapes project directory '{}'",
-                        resolved_url,
-                        clean_project_dir.display()
-                    ));
-                }
-                if let (Ok(canon_proj), Ok(canon_file)) = (clean_project_dir.canonicalize(), clean_file_path.canonicalize()) {
-                    if !canon_file.starts_with(&canon_proj) {
-                        return Err(anyhow!(
-                            "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
-                            resolved_url,
-                            canon_file.display(),
-                            canon_proj.display()
-                        ));
-                    }
-                }
-                if !clean_file_path.exists() {
-                    if is_optional {
-                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", clean_file_path.display());
-                        continue;
-                    } else {
-                        return Err(anyhow!("Archive file not found: {}", clean_file_path.display()));
-                    }
-                }
-                let bytes = std::fs::read(&clean_file_path)
-                    .with_context(|| format!("Failed to read local archive file '{}'", clean_file_path.display()))?;
+            let deps = pkg_info
+                .dependencies
+                .as_ref()
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default();
 
-                let expected_integrity: Integrity = integrity_str
-                    .parse()
-                    .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
-                if let Err(e) = expected_integrity.verify(&bytes) {
-                    if is_optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
-                        );
-                        continue;
-                    } else {
-                        return Err(anyhow!("Integrity verification failed for local archive {pkg_key}: {e}"));
-                    }
-                }
-
-                let target_path = loc_base_dir.join(pkg_key);
-                extract_and_replace(Cursor::new(&bytes), &target_path, None)
-                    .map_err(|e| anyhow!("Failed to extract local archive {pkg_key}: {e}"))?;
-
-                let manifest_path = target_path.join("package.json");
-                if manifest_path.exists() {
-                    if let Ok(pkg_manifest) = Manifest::from_file(&manifest_path) {
-                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                            let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
-                            let target_rel_bin = format!("{clean_pkg_name}/{script_rel}");
-                            let script_path = target_path.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&bin_dir, &bin_name, &target_rel_bin);
-                        }
-
-                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
-                            || pkg_manifest.scripts.contains_key("install")
-                            || pkg_manifest.scripts.contains_key("postinstall");
-                        if has_scripts {
-                            let deps = pkg_info.dependencies.as_ref()
-                                .map(|d| d.keys().cloned().collect())
-                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect());
-                            lifecycle_nodes.push(LifecyclePackageNode {
-                                package_path: pkg_key.clone(),
-                                disk_path: target_path.clone(),
-                                manifest: pkg_manifest,
-                                source: PackageSource::Registry,
-                                dependencies: deps,
-                                optional: is_optional,
-                            });
-                        }
-                    }
-                }
-                packages_installed += 1;
-                cache_hits += 1;
-                continue;
-            }
-
-            packages_to_download.push((pkg_key, resolved_url, integrity_str, is_optional));
+            packages_to_process.push((
+                pkg_key.clone(),
+                resolved_url.clone(),
+                integrity_str.to_string(),
+                is_optional,
+                deps,
+            ));
         }
 
         if self.options.offline {
-            for (pkg_key, resolved_url, integrity_str, is_optional) in &packages_to_download {
+            for (pkg_key, resolved_url, integrity_str, is_optional, _) in &packages_to_process {
+                if resolved_url.starts_with("file:") {
+                    continue;
+                }
+                if !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str) {
+                    continue;
+                }
                 match self.cache.get(resolved_url) {
                     Ok(Some((_entry, data))) => {
                         if let Ok(expected) = integrity_str.parse::<Integrity>() {
@@ -2342,164 +3481,289 @@ impl Installer {
             }
         }
 
-        let ci_urls: Vec<&str> = packages_to_download
-            .iter()
-            .map(|(_, url, _, _)| url.as_str())
-            .collect();
-        let ci_download_results = self.fetch_tarballs_concurrent(&ci_urls).await;
+        let ci_writer_cfg = Arc::clone(&self.writer_cfg);
+        let semaphore = Arc::clone(&self.io_semaphore);
+        let mut join_set = tokio::task::JoinSet::new();
 
-        for ((pkg_key, _resolved_url, integrity_str, is_optional), fetch_res) in packages_to_download.into_iter().zip(ci_download_results) {
-            let (bytes, was_hit) = match fetch_res {
-                Ok(res) => res,
-                Err(err) => {
-                    if is_optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
-                            pkg_key, err
-                        );
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
+        for (pkg_key, resolved_url, integrity_str, is_optional, declared_dependencies) in
+            packages_to_process
+        {
+            let sem = Arc::clone(&semaphore);
+            let cache = self.cache.clone();
+            let pack_store = Arc::clone(&self.pack_store);
+            let registry_client = self.registry_client.clone();
+            let project_dir = loc_base_dir.clone();
+            let root_bin = bin_dir.clone();
+            let root_nm = node_modules_dir.clone();
+            let offline = self.options.offline;
+            let worker_collector = collector.clone();
+            let pkg_writer_cfg = Arc::clone(&ci_writer_cfg);
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+
+                let target_path = project_dir.join(&pkg_key);
+                let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &root_bin, &root_nm);
+
+                if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&target_path);
                 }
-            };
 
-            if was_hit {
-                cache_hits += 1;
-            } else {
-                cache_misses += 1;
-            }
+                // 1. Warm CI Pack Store check: if pack exists, materialize directly from pack!
+                if !integrity_str.is_empty() && pack_store.has_package_pack(&integrity_str) {
+                    let t_mat = std::time::Instant::now();
+                    let target_clone = target_path.clone();
+                    let ps_clone = Arc::clone(&pack_store);
+                    let integ_clone = integrity_str.clone();
+                    let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                    let key_clone = pkg_key.clone();
 
-            let expected_integrity: Result<Integrity, _> = integrity_str.parse()
-                .map_err(|e| anyhow!("Invalid integrity hash: {e}"));
-            let expected_integrity = match expected_integrity {
-                Ok(i) => i,
-                Err(e) => {
-                    if is_optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
-                            pkg_key, e
-                        );
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+                    let mat_res = tokio::task::spawn_blocking(move || {
+                        let _mat_span = tracing::info_span!("materialize", package = %key_clone).entered();
+                        let res = ps_clone.materialize_pack(&integ_clone, &target_clone, Some(&cfg_clone));
+                        drop(_mat_span);
+                        res
+                    }).await?;
+                    worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
-            let bytes = if let Err(e) = expected_integrity.verify(&bytes) {
-                if was_hit {
-                    debug!("Cached blob for {pkg_key} failed integrity ({e}), re-fetching from registry");
-                    let _ = self.cache.purge_key(_resolved_url);
-                    if self.options.offline {
-                        if is_optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
+                    match mat_res {
+                        Ok(_) => {
+                            let lifecycle_node = process_installed_pkg_manifest(
+                                &target_path,
+                                &pkg_bin_dir,
+                                &pkg_key,
+                                &resolved_url,
+                                &declared_dependencies,
+                                is_optional,
+                                &worker_collector,
                             );
-                            continue;
-                        } else {
+                            return Ok(Some((true, lifecycle_node)));
+                        }
+                        Err(e) => {
+                            if e.is_pack_corruption() {
+                                warn!("Warm CI materialize_pack failed for {pkg_key}: {e}. Purging pack and falling back to tarball fetch.");
+                                let _ = pack_store.purge(&integrity_str);
+                                let _ = std::fs::remove_dir_all(&target_path);
+                            } else {
+                                return Err(anyhow!("Warm CI materialize_pack failed for {pkg_key}: {e}"));
+                            }
+                        }
+                    }
+                }
+
+                // 2. Local archive or registry download
+                let (bytes, was_hit) = if resolved_url.starts_with("file:") {
+                    let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
+                    if file_path.contains('\0') {
+                        return Err(anyhow!("Resolved file URL contains null bytes: {resolved_url}"));
+                    }
+                    let clean_project_dir = path_clean::clean(&project_dir);
+                    let candidate_path = if Path::new(file_path).is_absolute() {
+                        PathBuf::from(file_path)
+                    } else {
+                        clean_project_dir.join(file_path)
+                    };
+                    let clean_file_path = path_clean::clean(&candidate_path);
+                    if !clean_file_path.starts_with(&clean_project_dir) {
+                        return Err(anyhow!(
+                            "Security error: resolved file URL '{}' escapes project directory '{}'",
+                            resolved_url,
+                            clean_project_dir.display()
+                        ));
+                    }
+                    if let (Ok(canon_proj), Ok(canon_file)) = (clean_project_dir.canonicalize(), clean_file_path.canonicalize()) {
+                        if !canon_file.starts_with(&canon_proj) {
                             return Err(anyhow!(
-                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for {pkg_key}: {e}"
+                                "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
+                                resolved_url,
+                                canon_file.display(),
+                                canon_proj.display()
                             ));
                         }
                     }
-                    match self.registry_client.download_tarball_bytes(_resolved_url).await {
-                        Ok(fresh_bytes) => {
-                            if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                    if !clean_file_path.exists() {
+                        if is_optional {
+                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found", clean_file_path.display());
+                            return Ok(None);
+                        } else {
+                            return Err(anyhow!("Archive file not found: {}", clean_file_path.display()));
+                        }
+                    }
+                    let bytes = std::fs::read(&clean_file_path)
+                        .with_context(|| format!("Failed to read local archive file '{}'", clean_file_path.display()))?;
+
+                    let expected_integrity: Integrity = integrity_str
+                        .parse()
+                        .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+                    if let Err(e) = expected_integrity.verify(&bytes) {
+                        if is_optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(anyhow!("Integrity verification failed for local archive {pkg_key}: {e}"));
+                        }
+                    }
+                    (bytes, true)
+                } else {
+                    let expected_integrity: Integrity = integrity_str
+                        .parse()
+                        .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+
+                    let t_fetch = std::time::Instant::now();
+                    let fetch_res = if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                        if expected_integrity.verify(&data).is_ok() {
+                            Ok((data, true))
+                        } else {
+                            debug!("Cached blob for {pkg_key} failed integrity, purging and re-fetching");
+                            let _ = cache.purge_key(&resolved_url);
+                            if offline {
                                 if is_optional {
-                                    warn!(
-                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
-                                    );
-                                    continue;
+                                    return Ok(None);
+                                }
+                                return Err(anyhow!(
+                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}"
+                                ));
+                            }
+                            match registry_client.download_tarball_bytes(&resolved_url).await {
+                                Ok(fresh_bytes) => {
+                                    if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                        if is_optional {
+                                            warn!(
+                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                            );
+                                            return Ok(None);
+                                        } else {
+                                            return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                        }
+                                    }
+                                    let t_sw = std::time::Instant::now();
+                                    let _ = cache.put_with_integrity(&resolved_url, &fresh_bytes, Some(&expected_integrity), None);
+                                    worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                    Ok((fresh_bytes, false))
+                                }
+                                Err(e) => Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                            }
+                        }
+                    } else if offline {
+                        if is_optional {
+                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {pkg_key} not found in local cache (--offline)");
+                            return Ok(None);
+                        }
+                        return Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        ));
+                    } else {
+                        match registry_client.download_tarball_bytes(&resolved_url).await {
+                            Ok(fresh_bytes) => {
+                                if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                    if is_optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                        );
+                                        return Ok(None);
+                                    } else {
+                                        return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                    }
+                                }
+                                let t_sw = std::time::Instant::now();
+                                let _ = cache.put_with_integrity(&resolved_url, &fresh_bytes, Some(&expected_integrity), None);
+                                worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                Ok((fresh_bytes, false))
+                            }
+                            Err(e) => Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                        }
+                    };
+                    worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
+
+                    match fetch_res {
+                        Ok(res) => res,
+                        Err(err) => {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {pkg_key}: {err}");
+                                return Ok(None);
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
+                };
+
+                // Construct pack in pack store if not present
+                if !integrity_str.is_empty() && !pack_store.has_package_pack(&integrity_str) {
+                    let t_sw = std::time::Instant::now();
+                    let _ = pack_store.put_package_from_tarball(&integrity_str, &bytes);
+                    worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                }
+
+                // Materialize via spawn_blocking
+                let target_clone = target_path.clone();
+                let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                let ps_clone = Arc::clone(&pack_store);
+                let integ_clone = integrity_str.clone();
+                let key_clone = pkg_key.clone();
+
+                let extract_res = tokio::task::spawn_blocking(move || {
+                    if !integ_clone.is_empty() && ps_clone.has_package_pack(&integ_clone) {
+                        match ps_clone.materialize_pack(&integ_clone, &target_clone, Some(&cfg_clone)) {
+                            Ok(sum) => Ok(sum),
+                            Err(e) => {
+                                if e.is_pack_corruption() {
+                                    warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
+                                    let _ = ps_clone.purge(&integ_clone);
+                                    let _ = std::fs::remove_dir_all(&target_clone);
+                                    extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
+                                        .map_err(|e| anyhow!("{e}"))
                                 } else {
-                                    return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                    Err(anyhow!("Failed to materialize package {key_clone}: {e}"))
                                 }
                             }
-                            let _ = self.cache.put_with_integrity(_resolved_url, &fresh_bytes, Some(&expected_integrity), None);
-                            fresh_bytes
                         }
-                        Err(fetch_err) => {
-                            if is_optional {
-                                warn!(
-                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download {}: {:#}",
-                                    pkg_key, fetch_err
-                                );
-                                continue;
-                            } else {
-                                return Err(fetch_err.into());
-                            }
-                        }
-                    }
-                } else {
-                    if is_optional {
-                        warn!(
-                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {e}"
-                        );
-                        continue;
                     } else {
-                        return Err(anyhow!("Integrity verification failed for {pkg_key}: {e}"));
+                        extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
+                            .map_err(|e| anyhow!("{e}"))
                     }
-                }
-            } else {
-                if !was_hit {
-                    let _ = self.cache.put_with_integrity(_resolved_url, &bytes, Some(&expected_integrity), None);
-                }
-                bytes
-            };
+                }).await??;
 
-            let target_path = self.options.project_dir.join(pkg_key);
-            if let Err(e) = extract_and_replace(Cursor::new(&bytes), &target_path, None) {
-                if is_optional {
-                    warn!(
-                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract {pkg_key}: {e}"
-                    );
-                    let _ = std::fs::remove_dir_all(&target_path);
-                    continue;
+                worker_collector.record_phase(Phase::Materialize, extract_res.materialize_duration);
+                worker_collector.record_phase(Phase::Inflate, extract_res.inflate_duration);
+
+                let lifecycle_node = process_installed_pkg_manifest(
+                    &target_path,
+                    &pkg_bin_dir,
+                    &pkg_key,
+                    &resolved_url,
+                    &declared_dependencies,
+                    is_optional,
+                    &worker_collector,
+                );
+
+                Ok(Some((was_hit, lifecycle_node)))
+            });
+        }
+
+        while let Some(join_res) = join_set.join_next().await {
+            let item_opt =
+                join_res.map_err(|e| anyhow!("CI reification worker panicked: {e}"))??;
+            if let Some((was_hit, lifecycle_node)) = item_opt {
+                if was_hit {
+                    cache_hits += 1;
+                    collector.record_cache_hit();
                 } else {
-                    return Err(anyhow!("Failed to extract {pkg_key}: {e}"));
+                    cache_misses += 1;
+                    collector.record_cache_miss();
                 }
-            }
-
-            packages_installed += 1;
-
-            let pkg_manifest_path = target_path.join("package.json");
-            if pkg_manifest_path.exists() {
-                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                        let clean_pkg_name = pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
-                        let target_rel = format!("{clean_pkg_name}/{script_rel}");
-                        let script_path = target_path.join(&script_rel);
-                        let _ = normalize_shebang(&script_path);
-                        let _ = create_shims(&bin_dir, &bin_name, &target_rel);
-                    }
-
-                    let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
-                        || pkg_manifest.scripts.contains_key("install")
-                        || pkg_manifest.scripts.contains_key("postinstall");
-
-                    if has_scripts {
-                        let deps = if let Some(pkg_info) = lockfile.packages.get(pkg_key) {
-                            pkg_info.dependencies.as_ref()
-                                .map(|d| d.keys().cloned().collect())
-                                .unwrap_or_else(|| pkg_manifest.dependencies.keys().cloned().collect())
-                        } else {
-                            pkg_manifest.dependencies.keys().cloned().collect()
-                        };
-                        lifecycle_nodes.push(LifecyclePackageNode {
-                            package_path: pkg_key.clone(),
-                            disk_path: target_path.clone(),
-                            manifest: pkg_manifest,
-                            source: PackageSource::Registry,
-                            dependencies: deps,
-                            optional: is_optional,
-                        });
-                    }
+                packages_installed += 1;
+                if let Some(l_node) = lifecycle_node {
+                    lifecycle_nodes.push(l_node);
                 }
             }
         }
 
         // Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
+            let _life_guard = collector.enter_phase(Phase::Lifecycle);
             let sandbox_policy = if self.options.strict_sandbox {
                 rnpm_lifecycle::ScriptSandboxPolicy::restricted()
             } else {
@@ -2519,15 +3783,30 @@ impl Installer {
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         if self.options.package_lock_enabled() && !self.options.dry_run {
-            lockfile.save_hidden(&self.options.project_dir)
+            let _lock_guard = collector.enter_phase(Phase::Lockfile);
+            lockfile
+                .save_hidden(&self.options.project_dir)
                 .context("Failed to save hidden package-lock.json")?;
         }
+
+        if !self.options.dry_run && !self.options.package_lock_only {
+            if let Ok(fingerprint) =
+                compute_project_fingerprint(&self.options.project_dir, &self.options)
+            {
+                let _ = self
+                    .cache
+                    .set_project_fingerprint(&self.options.project_dir, &fingerprint);
+            }
+        }
+
+        clean_empty_bin_dirs(&node_modules_dir);
 
         Ok(InstallSummary {
             packages_installed,
             cache_hits,
             cache_misses,
             lockfile_path,
+            timing: Some(collector.finish()),
         })
     }
 
@@ -2566,7 +3845,8 @@ impl Installer {
         }
 
         while let Some(result) = jobs.join_next().await {
-            let (name, metadata) = result.map_err(|e| anyhow!("metadata enrichment task failed: {e}"))?;
+            let (name, metadata) =
+                result.map_err(|e| anyhow!("metadata enrichment task failed: {e}"))?;
             if let Ok(metadata) = metadata {
                 self.metadata_cache.insert(name, metadata);
             }
@@ -2578,18 +3858,35 @@ impl Installer {
             }
             let Some(name) = package.name.clone().or_else(|| {
                 location.strip_prefix("node_modules/").map(|leaf| {
-                    leaf.rsplit("/node_modules/").next().unwrap_or(leaf).to_string()
+                    leaf.rsplit("/node_modules/")
+                        .next()
+                        .unwrap_or(leaf)
+                        .to_string()
                 })
-            }) else { continue };
-            let Some(version) = package.version.as_deref() else { continue };
-            let Some(metadata) = self.metadata_cache.get(&name) else { continue };
-            let Some(version_meta) = metadata.versions.get(version) else { continue };
+            }) else {
+                continue;
+            };
+            let Some(version) = package.version.as_deref() else {
+                continue;
+            };
+            let Some(metadata) = self.metadata_cache.get(&name) else {
+                continue;
+            };
+            let Some(version_meta) = metadata.versions.get(version) else {
+                continue;
+            };
 
             if package.license.is_none() {
                 package.license = version_meta.license.clone();
             }
             if package.engines.is_none() && !version_meta.engines.is_empty() {
-                package.engines = Some(version_meta.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+                package.engines = Some(rnpm_lockfile::PackageEngines::Map(
+                    version_meta
+                        .engines
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ));
             }
             if package.os.is_none() && !version_meta.os.is_empty() {
                 package.os = Some(version_meta.os.clone());
@@ -2600,8 +3897,15 @@ impl Installer {
             if package.libc.is_none() && !version_meta.libc.is_empty() {
                 package.libc = Some(version_meta.libc.clone());
             }
-            for key in ["funding", "deprecated", "directories"] {
+            for key in ["funding", "deprecated"] {
                 if let Some(value) = version_meta.extra.get(key) {
+                    if key == "deprecated"
+                        && (value == &serde_json::Value::Bool(false)
+                            || value.is_null()
+                            || value == "")
+                    {
+                        continue;
+                    }
                     package.extra.insert(key.to_string(), value.clone());
                 }
             }
@@ -2657,8 +3961,12 @@ impl Installer {
                 let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
 
                 let bin = m.bin.as_ref().map(|b| match b {
-                    rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
-                    rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                    rnpm_core::manifest::PackageBin::Single(s) => {
+                        rnpm_lockfile::PackageBin::Single(s.clone())
+                    }
+                    rnpm_core::manifest::PackageBin::Map(map) => {
+                        rnpm_lockfile::PackageBin::Map(map.clone())
+                    }
                 });
 
                 let ver_meta = PackageVersionMetadata {
@@ -2676,7 +3984,11 @@ impl Installer {
                     cpu: m.cpu.clone(),
                     libc: m.libc.clone(),
                     bin,
-                    license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                    license: m
+                        .extra
+                        .get("license")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
                     engines: m.engines.clone(),
                     has_install_script: m.scripts.contains_key("install")
                         || m.scripts.contains_key("postinstall")
@@ -2691,11 +4003,14 @@ impl Installer {
                 versions.insert(version.clone(), ver_meta);
 
                 if let Ok(mut locked) = cache.lock() {
-                    locked.insert(name.clone(), PackageMetadata {
-                        name: name.clone(),
-                        dist_tags: dist_tags.clone(),
-                        versions: versions.clone(),
-                    });
+                    locked.insert(
+                        name.clone(),
+                        PackageMetadata {
+                            name: name.clone(),
+                            dist_tags: dist_tags.clone(),
+                            versions: versions.clone(),
+                        },
+                    );
                 }
 
                 Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
@@ -2721,16 +4036,22 @@ impl Installer {
                             let integrity = Integrity::from_bytes(
                                 &archive_bytes,
                                 rnpm_core::integrity::Algorithm::Sha512,
-                            ).to_string();
+                            )
+                            .to_string();
 
-                            let m = inspect_manifest_from_tarball(&archive_bytes).unwrap_or_default();
+                            let m =
+                                inspect_manifest_from_tarball(&archive_bytes).unwrap_or_default();
                             let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
                             let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
                             let resolved_url = format!("file:{posix_rel}");
 
                             let bin = m.bin.as_ref().map(|b| match b {
-                                rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
-                                rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                                rnpm_core::manifest::PackageBin::Single(s) => {
+                                    rnpm_lockfile::PackageBin::Single(s.clone())
+                                }
+                                rnpm_core::manifest::PackageBin::Map(map) => {
+                                    rnpm_lockfile::PackageBin::Map(map.clone())
+                                }
                             });
 
                             let ver_meta = PackageVersionMetadata {
@@ -2748,7 +4069,11 @@ impl Installer {
                                 cpu: m.cpu.clone(),
                                 libc: m.libc.clone(),
                                 bin,
-                                license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                                license: m
+                                    .extra
+                                    .get("license")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned),
                                 engines: m.engines.clone(),
                                 has_install_script: m.scripts.contains_key("install")
                                     || m.scripts.contains_key("postinstall")
@@ -2763,11 +4088,14 @@ impl Installer {
                             versions.insert(version, ver_meta);
 
                             if let Ok(mut locked) = cache.lock() {
-                                locked.insert(name.clone(), PackageMetadata {
-                                    name: name.clone(),
-                                    dist_tags,
-                                    versions,
-                                });
+                                locked.insert(
+                                    name.clone(),
+                                    PackageMetadata {
+                                        name: name.clone(),
+                                        dist_tags,
+                                        versions,
+                                    },
+                                );
                             }
 
                             Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
@@ -2785,8 +4113,12 @@ impl Installer {
                         let resolved_url = format!("file:{posix_rel}");
 
                         let bin = m.bin.as_ref().map(|b| match b {
-                            rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
-                            rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
+                            rnpm_core::manifest::PackageBin::Single(s) => {
+                                rnpm_lockfile::PackageBin::Single(s.clone())
+                            }
+                            rnpm_core::manifest::PackageBin::Map(map) => {
+                                rnpm_lockfile::PackageBin::Map(map.clone())
+                            }
                         });
 
                         let ver_meta = PackageVersionMetadata {
@@ -2804,7 +4136,11 @@ impl Installer {
                             cpu: m.cpu.clone(),
                             libc: m.libc.clone(),
                             bin,
-                            license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+                            license: m
+                                .extra
+                                .get("license")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
                             engines: m.engines.clone(),
                             has_install_script: m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -2819,11 +4155,14 @@ impl Installer {
                         versions.insert(version, ver_meta);
 
                         if let Ok(mut locked) = cache.lock() {
-                            locked.insert(name.clone(), PackageMetadata {
-                                name: name.clone(),
-                                dist_tags,
-                                versions,
-                            });
+                            locked.insert(
+                                name.clone(),
+                                PackageMetadata {
+                                    name: name.clone(),
+                                    dist_tags,
+                                    versions,
+                                },
+                            );
                         }
 
                         Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
@@ -2858,11 +4197,14 @@ impl Installer {
                     versions.insert(version, ver_meta);
 
                     if let Ok(mut locked) = cache.lock() {
-                        locked.insert(name.clone(), PackageMetadata {
-                            name: name.clone(),
-                            dist_tags,
-                            versions,
-                        });
+                        locked.insert(
+                            name.clone(),
+                            PackageMetadata {
+                                name: name.clone(),
+                                dist_tags,
+                                versions,
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -2911,16 +4253,17 @@ impl Installer {
 
                     let manifest = match inspect_manifest_from_tarball(&archive_bytes) {
                         Ok(m) => m,
-                        Err(_) => {
-                            Manifest {
-                                name: Some(name.to_string()),
-                                version: Some("1.0.0".to_string()),
-                                ..Default::default()
-                            }
-                        }
+                        Err(_) => Manifest {
+                            name: Some(name.to_string()),
+                            version: Some("1.0.0".to_string()),
+                            ..Default::default()
+                        },
                     };
 
-                    let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                    let version = manifest
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| "1.0.0".to_string());
                     let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
                     let resolved_url = format!("file:{posix_rel}");
 
@@ -2950,10 +4293,16 @@ impl Installer {
                         ));
                     }
                     let manifest = Manifest::from_file(&manifest_path).with_context(|| {
-                        format!("Failed to parse package.json at '{}'", manifest_path.display())
+                        format!(
+                            "Failed to parse package.json at '{}'",
+                            manifest_path.display()
+                        )
                     })?;
 
-                    let version = manifest.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                    let version = manifest
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| "1.0.0".to_string());
                     let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
                     let resolved_url = format!("file:{posix_rel}");
 
@@ -3016,16 +4365,23 @@ impl Installer {
         }
 
         let (lookup_name, target_to_match) = match parsed_target {
-            PackageTarget::Alias { ref name, ref target } => (name.as_str(), target.as_ref()),
+            PackageTarget::Alias {
+                ref name,
+                ref target,
+            } => (name.as_str(), target.as_ref()),
             ref other => (name, other),
         };
 
         let metadata = if let Some(cached) = self.metadata_cache.get(lookup_name) {
             cached.clone()
         } else {
-            let meta = self.registry_client.get_package_metadata(lookup_name).await
+            let meta = self
+                .registry_client
+                .get_package_metadata(lookup_name)
+                .await
                 .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
-            self.metadata_cache.insert(lookup_name.to_string(), meta.clone());
+            self.metadata_cache
+                .insert(lookup_name.to_string(), meta.clone());
             meta
         };
 
@@ -3046,7 +4402,12 @@ impl Installer {
             PackageTarget::Range(range) => {
                 let latest_match = metadata.dist_tags.get("latest").and_then(|latest_version| {
                     metadata.versions.get(latest_version).and_then(|latest| {
-                        latest.version.parse::<Version>().ok().filter(|v| range.satisfies(v)).map(|_| latest_version.clone())
+                        latest
+                            .version
+                            .parse::<Version>()
+                            .ok()
+                            .filter(|v| range.satisfies(v))
+                            .map(|_| latest_version.clone())
                     })
                 });
                 if let Some(latest) = latest_match {
@@ -3061,7 +4422,11 @@ impl Installer {
                         }
                     }
                     if matching.is_empty() {
-                        return Err(anyhow!("No matching version found for {}@{}", lookup_name, range));
+                        return Err(anyhow!(
+                            "No matching version found for {}@{}",
+                            lookup_name,
+                            range
+                        ));
                     }
                     matching.sort_by(|a, b| a.0.cmp(&b.0));
                     matching.last().unwrap().1.clone()
@@ -3078,11 +4443,12 @@ impl Installer {
             }
         };
 
-        let ver_info = metadata.versions.get(&best_ver_str)
+        let ver_info = metadata
+            .versions
+            .get(&best_ver_str)
             .ok_or_else(|| anyhow!("Version info missing for {}", best_ver_str))?;
 
-        let integrity = ver_info.dist.integrity.clone()
-            .unwrap_or_default();
+        let integrity = ver_info.dist.integrity.clone().unwrap_or_default();
 
         let mut deps = BTreeMap::new();
         for (d_name, d_range) in &ver_info.dependencies {
@@ -3094,9 +4460,21 @@ impl Installer {
             opt_deps.insert(d_name.clone(), d_range.clone());
         }
 
-        let os_list = if ver_info.os.is_empty() { None } else { Some(ver_info.os.as_slice()) };
-        let cpu_list = if ver_info.cpu.is_empty() { None } else { Some(ver_info.cpu.as_slice()) };
-        let libc_list = if ver_info.libc.is_empty() { None } else { Some(ver_info.libc.as_slice()) };
+        let os_list = if ver_info.os.is_empty() {
+            None
+        } else {
+            Some(ver_info.os.as_slice())
+        };
+        let cpu_list = if ver_info.cpu.is_empty() {
+            None
+        } else {
+            Some(ver_info.cpu.as_slice())
+        };
+        let libc_list = if ver_info.libc.is_empty() {
+            None
+        } else {
+            Some(ver_info.libc.as_slice())
+        };
 
         let host_platform = self.options.platform();
         let compatible = host_platform.matches_with_libc(os_list, cpu_list, libc_list);
@@ -3155,19 +4533,19 @@ impl Installer {
     /// Fetch multiple tarballs concurrently with bounded semaphore limits and local disk cache.
     /// Does NOT write unverified tarballs into the cache. Cache writing must be performed
     /// by callers only after SSRI integrity verification.
-    pub async fn fetch_tarballs_concurrent(
-        &self,
-        urls: &[&str],
-    ) -> Vec<Result<(Vec<u8>, bool)>> {
+    pub async fn fetch_tarballs_concurrent(&self, urls: &[&str]) -> Vec<Result<(Vec<u8>, bool)>> {
         let mut join_set = tokio::task::JoinSet::new();
         let offline = self.options.offline;
 
+        let sem = Arc::clone(&self.io_semaphore);
         for (idx, url) in urls.iter().enumerate() {
             let cache = self.cache.clone();
             let registry_client = self.registry_client.clone();
             let url_str = url.to_string();
+            let task_sem = Arc::clone(&sem);
 
             join_set.spawn(async move {
+                let _permit = task_sem.acquire().await;
                 if let Ok(Some((_entry, data))) = cache.get(&url_str) {
                     debug!("Cache hit for {}", url_str);
                     return (idx, Ok((data, true)));
@@ -3216,7 +4594,10 @@ impl Installer {
         }
 
         info!("Downloading {}", tarball_url);
-        let bytes = self.registry_client.download_tarball_bytes(tarball_url).await
+        let bytes = self
+            .registry_client
+            .download_tarball_bytes(tarball_url)
+            .await
             .map_err(|e| anyhow!("Failed to download tarball from {tarball_url}: {e}"))?;
 
         // Do not pollute the cache with unverified bytes!
@@ -3236,29 +4617,83 @@ impl Installer {
         let cache_hits = if was_hit { 1 } else { 0 };
         let cache_misses = if was_hit { 0 } else { 1 };
 
-        let expected_integrity: Integrity = node.integrity.parse()
+        let expected_integrity: Integrity = node
+            .integrity
+            .parse()
             .map_err(|e| anyhow!("Invalid integrity string: {e}"))?;
-        expected_integrity.verify(bytes)
+        expected_integrity
+            .verify(bytes)
             .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
 
         if !was_hit {
-            let _ = self.cache.put_with_integrity(&node.resolved_url, bytes, Some(&expected_integrity), None);
+            let _ = self.cache.put_with_integrity(
+                &node.resolved_url,
+                bytes,
+                Some(&expected_integrity),
+                None,
+            );
         }
 
         // Path containment defense: ensure node.name has no traversal, device names, or escapes
-        if node.name.contains("..") || node.name.contains(':') || node.name.contains('\\') || node.name.contains('\0') {
-            return Err(anyhow!("Package name '{}' contains illegal path characters", node.name));
+        if node.name.contains("..")
+            || node.name.contains(':')
+            || node.name.contains('\\')
+            || node.name.contains('\0')
+        {
+            return Err(anyhow!(
+                "Package name '{}' contains illegal path characters",
+                node.name
+            ));
         }
         rnpm_fs::validate_entry_path(Path::new(&node.name))
             .map_err(|e| anyhow!("Invalid package name '{}': {e}", node.name))?;
 
         let dest_dir = node_modules_dir.join(&node.name);
+        if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+            let _ = rnpm_fs::remove_junction(&dest_dir);
+        }
         let cleaned_dest = path_clean::clean(&dest_dir);
         if !cleaned_dest.starts_with(node_modules_dir) {
-            return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes node_modules"));
+            return Err(anyhow!(
+                "Package installation path '{cleaned_dest:?}' escapes node_modules"
+            ));
         }
-        extract_and_replace(Cursor::new(bytes), &dest_dir, None)
-            .map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
+        let writer_cfg = Arc::clone(&self.writer_cfg);
+        if !self.pack_store.has_package_pack(&node.integrity) {
+            let _ = self
+                .pack_store
+                .put_package_from_tarball(&node.integrity, bytes);
+        }
+        let extract_res = if self.pack_store.has_package_pack(&node.integrity) {
+            match self
+                .pack_store
+                .materialize_pack(&node.integrity, &dest_dir, Some(&writer_cfg))
+            {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if e.is_pack_corruption() {
+                        warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
+                        let _ = self.pack_store.purge(&node.integrity);
+                        let _ = std::fs::remove_dir_all(&dest_dir);
+                        extract_tarball_direct(
+                            Cursor::new(bytes),
+                            &dest_dir,
+                            None,
+                            Some(&writer_cfg),
+                        )
+                        .map(|_| ())
+                        .map_err(|e| anyhow!("{e}"))
+                    } else {
+                        return Err(anyhow!("Failed to materialize package {}: {e}", node.name));
+                    }
+                }
+            }
+        } else {
+            extract_tarball_direct(Cursor::new(bytes), &dest_dir, None, Some(&writer_cfg))
+                .map(|_| ())
+                .map_err(|e| anyhow!("{e}"))
+        };
+        extract_res.map_err(|e| anyhow!("Failed to extract package {}: {e}", node.name))?;
 
         let pkg_manifest_path = dest_dir.join("package.json");
         let mut has_install_script = false;
@@ -3266,22 +4701,39 @@ impl Installer {
 
         if pkg_manifest_path.exists() {
             if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                let pkg_bin_dir = find_enclosing_bin_dir(&dest_dir, bin_dir, node_modules_dir);
+                let _ = std::fs::create_dir_all(&pkg_bin_dir);
                 for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                    let target_rel = format!("{}/{script_rel}", node.name);
+                    let target_rel = compute_bin_target_rel(&dest_dir, &pkg_bin_dir, &script_rel);
                     let script_path = dest_dir.join(&script_rel);
                     let _ = normalize_shebang(&script_path);
-                    let _ = create_shims(bin_dir, &bin_name, &target_rel);
+                    let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel);
                 }
+
+                let is_git = node.resolved_url.starts_with("git+")
+                    || node.resolved_url.starts_with("git:")
+                    || PackageTarget::parse(&node.resolved_url)
+                        .map(|t| t.is_git())
+                        .unwrap_or(false);
+                let is_file_archive = node.resolved_url.starts_with("file:");
+                let source = if is_git {
+                    PackageSource::Git
+                } else if is_file_archive {
+                    PackageSource::LocalTarball
+                } else {
+                    PackageSource::Registry
+                };
 
                 has_install_script = pkg_manifest.scripts.contains_key("preinstall")
                     || pkg_manifest.scripts.contains_key("install")
-                    || pkg_manifest.scripts.contains_key("postinstall");
+                    || pkg_manifest.scripts.contains_key("postinstall")
+                    || (source.runs_prepare() && pkg_manifest.scripts.contains_key("prepare"));
 
                 lifecycle_node = Some(LifecyclePackageNode {
                     package_path: format!("node_modules/{}", node.name),
                     disk_path: dest_dir.clone(),
                     manifest: pkg_manifest,
-                    source: PackageSource::Registry,
+                    source,
                     dependencies: node.dependencies.keys().cloned().collect(),
                     optional: false,
                 });
@@ -3324,16 +4776,22 @@ impl Installer {
     pub async fn update(&mut self, targets: &[String]) -> Result<UpdateSummary> {
         let manifest_path = self.options.project_dir.join("package.json");
         if !manifest_path.exists() {
-            return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+            return Err(anyhow!(
+                "package.json not found in {}",
+                self.options.project_dir.display()
+            ));
         }
 
-        let manifest = Manifest::from_file(&manifest_path)
-            .context("Failed to parse project package.json")?;
+        let manifest =
+            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
 
-        let project_name = manifest.name.clone().unwrap_or_else(|| "project".to_string());
+        let project_name = manifest
+            .name
+            .clone()
+            .unwrap_or_else(|| "project".to_string());
         let project_version = manifest.version.clone();
 
-        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut lockfile = if lockfile_path.exists() {
             LockfileV3::load_from_file(&lockfile_path)?
         } else {
@@ -3369,7 +4827,10 @@ impl Installer {
                 } else if let Some(range) = manifest.dev_dependencies.get(target) {
                     deps_to_update.insert(target.clone(), range.clone());
                 } else {
-                    return Err(anyhow!("Package '{}' is not a dependency in package.json", target));
+                    return Err(anyhow!(
+                        "Package '{}' is not a dependency in package.json",
+                        target
+                    ));
                 }
             }
         }
@@ -3386,7 +4847,8 @@ impl Installer {
         let mut newly_resolved_roots: BTreeMap<String, ResolvedNode> = BTreeMap::new();
         for (pkg_name, range_str) in &deps_to_update {
             let lock_key = format!("node_modules/{pkg_name}");
-            let current_locked_ver = lockfile.get_package(&lock_key)
+            let current_locked_ver = lockfile
+                .get_package(&lock_key)
                 .and_then(|p| p.version.clone());
 
             let resolved = self.resolve_package(pkg_name, range_str, false).await?;
@@ -3440,7 +4902,9 @@ impl Installer {
                         let lock_key = format!("node_modules/{sub_name}");
                         if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
                             if let Some(ref ver_str) = existing_pkg.version {
-                                if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range)) {
+                                if let (Ok(ver), Ok(range)) =
+                                    (ver_str.parse::<Version>(), Range::parse(sub_range))
+                                {
                                     !range.satisfies(&ver)
                                 } else {
                                     true
@@ -3473,7 +4937,9 @@ impl Installer {
                             let lock_key = format!("node_modules/{sub_name}");
                             if let Some(existing_pkg) = lockfile.get_package(&lock_key) {
                                 if let Some(ref ver_str) = existing_pkg.version {
-                                    if let (Ok(ver), Ok(range)) = (ver_str.parse::<Version>(), Range::parse(sub_range)) {
+                                    if let (Ok(ver), Ok(range)) =
+                                        (ver_str.parse::<Version>(), Range::parse(sub_range))
+                                    {
                                         !range.satisfies(&ver)
                                     } else {
                                         true
@@ -3510,10 +4976,17 @@ impl Installer {
                 .collect();
             let download_results = self.fetch_tarballs_concurrent(&download_urls).await;
 
-            for ((pkg_name, node), fetch_res) in packages_to_download.into_iter().zip(download_results) {
+            for ((pkg_name, node), fetch_res) in
+                packages_to_download.into_iter().zip(download_results)
+            {
                 let (bytes, was_hit) = fetch_res?;
-                let (hits, misses, lock_entry, l_node) = self
-                    .reify_package_with_bytes(node, &bytes, was_hit, &node_modules_dir, &bin_dir)?;
+                let (hits, misses, lock_entry, l_node) = self.reify_package_with_bytes(
+                    node,
+                    &bytes,
+                    was_hit,
+                    &node_modules_dir,
+                    &bin_dir,
+                )?;
                 cache_hits += hits;
                 cache_misses += misses;
                 if let Some(ln) = l_node {
@@ -3601,14 +5074,27 @@ impl Installer {
                     continue;
                 }
                 let pkg_name = key.strip_prefix("node_modules/").unwrap_or(&key);
-                if (!pkg_name.contains('/') || (pkg_name.starts_with('@') && pkg_name.matches('/').count() == 1))
-                    && !reachable.contains(pkg_name) {
-                        lockfile.remove_package(&key);
-                        let path_to_remove = self.options.project_dir.join(&key);
-                        if path_to_remove.exists() {
-                            let _ = std::fs::remove_dir_all(&path_to_remove);
-                        }
+                if (!pkg_name.contains('/')
+                    || (pkg_name.starts_with('@') && pkg_name.matches('/').count() == 1))
+                    && !reachable.contains(pkg_name)
+                {
+                    lockfile.remove_package(&key);
+                    let path_to_remove = self.options.project_dir.join(&key);
+                    if path_to_remove.exists()
+                        || rnpm_fs::is_junction(&path_to_remove).unwrap_or(false)
+                    {
+                        fast_trash_delete(
+                            &path_to_remove,
+                            &self.options.project_dir.join("node_modules"),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "Failed to remove package directory {}",
+                                path_to_remove.display()
+                            )
+                        })?;
                     }
+                }
             }
 
             // 5. Run lifecycle scripts if needed
@@ -3631,12 +5117,14 @@ impl Installer {
             }
         }
 
-        // 6. Rewrite package-lock.json deterministically
-        lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
-            .context("Failed to save package-lock.json")?;
+        // 6. Rewrite lockfile deterministically
+        lockfile
+            .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+            .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
 
         // 7. Persist hidden lockfile to node_modules/.package-lock.json
-        lockfile.save_hidden(&self.options.project_dir)
+        lockfile
+            .save_hidden(&self.options.project_dir)
             .context("Failed to save hidden package-lock.json")?;
 
         Ok(UpdateSummary {
@@ -3666,14 +5154,20 @@ impl Installer {
                     "dependencies": {}
                 });
                 let _ = std::fs::create_dir_all(&self.options.project_dir);
-                let _ = std::fs::write(&manifest_path, serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default());
+                let _ = std::fs::write(
+                    &manifest_path,
+                    serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default(),
+                );
             } else {
-                return Err(anyhow!("package.json not found in {}", self.options.project_dir.display()));
+                return Err(anyhow!(
+                    "package.json not found in {}",
+                    self.options.project_dir.display()
+                ));
             }
         }
 
-        let mut manifest = Manifest::from_file(&manifest_path)
-            .context("Failed to parse project package.json")?;
+        let mut manifest =
+            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
 
         // Validate package names against malformed inputs or path traversal attacks
         for pkg in &options.packages {
@@ -3682,7 +5176,9 @@ impl Installer {
                 continue;
             }
             if trimmed.contains("..") || trimmed.contains('\\') || trimmed.starts_with('/') {
-                return Err(anyhow!("Invalid package name '{trimmed}': path traversal not permitted"));
+                return Err(anyhow!(
+                    "Invalid package name '{trimmed}': path traversal not permitted"
+                ));
             }
         }
 
@@ -3699,20 +5195,19 @@ impl Installer {
 
             let mut removed = false;
 
-            if (options.save_dev || target_all)
-                && manifest.dev_dependencies.remove(pkg).is_some() {
-                    removed = true;
-                }
+            if (options.save_dev || target_all) && manifest.dev_dependencies.remove(pkg).is_some() {
+                removed = true;
+            }
 
             if (options.save_optional || target_all)
-                && manifest.optional_dependencies.remove(pkg).is_some() {
-                    removed = true;
-                }
+                && manifest.optional_dependencies.remove(pkg).is_some()
+            {
+                removed = true;
+            }
 
-            if (options.save_prod || target_all)
-                && manifest.dependencies.remove(pkg).is_some() {
-                    removed = true;
-                }
+            if (options.save_prod || target_all) && manifest.dependencies.remove(pkg).is_some() {
+                removed = true;
+            }
 
             if removed || options.is_global || self.options.is_global {
                 removed_packages.push(pkg.to_string());
@@ -3720,17 +5215,18 @@ impl Installer {
         }
 
         // Save updated package.json deterministically
-        manifest.save_to_file(&manifest_path)
+        manifest
+            .save_to_file(&manifest_path)
             .context("Failed to save updated package.json")?;
 
-        let lockfile_path = self.options.project_dir.join("package-lock.json");
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut pruned_nodes: HashSet<String> = HashSet::new();
 
         if lockfile_path.exists() {
             let lockfile_str = std::fs::read_to_string(&lockfile_path)
-                .context("Failed to read package-lock.json")?;
+                .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
             let mut lockfile = LockfileV3::from_json_str(&lockfile_str)
-                .context("Failed to parse package-lock.json")?;
+                .with_context(|| format!("Failed to parse {}", lockfile_path.display()))?;
 
             // Build and prune in-memory dependency graph
             let mut in_memory_graph = DependencyGraph::from_lockfile_v3(&lockfile);
@@ -3764,30 +5260,32 @@ impl Installer {
             pruned_nodes = prune_lockfile(&mut lockfile, &manifest);
             pruned_nodes.extend(graph_pruned);
 
-            // Write updated deterministic package-lock.json
-            lockfile.save_to_file_version(&lockfile_path, self.options.lockfile_version)
-                .context("Failed to save updated package-lock.json")?;
+            // Write updated deterministic lockfile
+            lockfile
+                .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                .with_context(|| format!("Failed to save updated {}", lockfile_path.display()))?;
 
             // Persist hidden lockfile to node_modules/.package-lock.json
             let _ = lockfile.save_hidden(&self.options.project_dir);
         }
 
         // Remove deleted package directories from node_modules
-        let (_node_modules_dir, bin_dir, loc_base_dir) = if options.is_global || self.options.is_global {
-            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
-            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
-            let base = if cfg!(windows) {
-                self.options.project_dir.clone()
+        let (node_modules_dir, bin_dir, loc_base_dir) =
+            if options.is_global || self.options.is_global {
+                let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+                let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+                let base = if cfg!(windows) {
+                    self.options.project_dir.clone()
+                } else {
+                    self.options.project_dir.join("lib")
+                };
+                (nm, bin, base)
             } else {
-                self.options.project_dir.join("lib")
+                let nm = self.options.project_dir.join("node_modules");
+                let bin = nm.join(".bin");
+                let base = self.options.project_dir.clone();
+                (nm, bin, base)
             };
-            (nm, bin, base)
-        } else {
-            let nm = self.options.project_dir.join("node_modules");
-            let bin = nm.join(".bin");
-            let base = self.options.project_dir.clone();
-            (nm, bin, base)
-        };
 
         // Clean direct removed packages and all pruned lockfile nodes
         let mut dirs_to_remove = HashSet::new();
@@ -3851,6 +5349,11 @@ impl Installer {
                 }
             }
         }
+        clean_empty_bin_dirs(&node_modules_dir);
+
+        if self.options.wait_for_trash || !self.options.detached_trash {
+            crate::trash::wait_all_trash_deletions();
+        }
 
         Ok(UninstallSummary {
             removed_packages,
@@ -3863,7 +5366,12 @@ impl Installer {
         let mut opts = options.clone();
         opts.project_dir = self.options.project_dir.clone();
         let analysis = prune::discover_extraneous_packages(&self.options.project_dir, &opts)?;
-        prune::execute_prune(&self.options.project_dir, &analysis.extraneous_packages)
+        let summary =
+            prune::execute_prune(&self.options.project_dir, &analysis.extraneous_packages)?;
+        if self.options.wait_for_trash || !self.options.detached_trash {
+            crate::trash::wait_all_trash_deletions();
+        }
+        Ok(summary)
     }
 
     /// Discovers extraneous dependencies in node_modules without modifying the filesystem.
@@ -3900,7 +5408,6 @@ impl Installer {
         opts.dry_run = true;
         dedupe::execute_dedupe(&opts)
     }
-
 }
 
 /// npm copies selected package.json metadata into every package-lock v3 entry.
@@ -3915,7 +5422,9 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
         } else {
             project_dir.join(location).join("package.json")
         };
-        let Ok(manifest) = Manifest::from_file(&manifest_path) else { continue };
+        let Ok(manifest) = Manifest::from_file(&manifest_path) else {
+            continue;
+        };
 
         package.license = manifest
             .extra
@@ -3924,13 +5433,18 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
             .map(str::to_owned)
             .or_else(|| package.license.clone());
         if !manifest.engines.is_empty() {
-            package.engines = Some(manifest.engines.clone());
+            package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
         }
         if let Some(libc) = &manifest.libc {
             package.libc = Some(libc.clone());
         }
-        for key in ["funding", "deprecated", "directories"] {
+        for key in ["funding", "deprecated"] {
             if let Some(value) = manifest.extra.get(key) {
+                if key == "deprecated"
+                    && (value == &serde_json::Value::Bool(false) || value.is_null() || value == "")
+                {
+                    continue;
+                }
                 package.extra.insert(key.to_string(), value.clone());
             }
         }
@@ -3955,40 +5469,186 @@ pub struct UninstallSummary {
     pub lockfile_path: PathBuf,
 }
 
-/// Computes lockfile entries that must be skipped because they are reachable
-/// only below an incompatible optional platform package. npm retains these
-/// records for cross-platform lockfile parity but does not extract their
+/// Cleans up stale files and directories in a package directory that is being replaced,
+/// while preserving any nested `node_modules` packages that are marked `Unchanged`.
+///
+/// If `dest_dir` is an NTFS junction or symlink (e.g. leftover from `--install-strategy=linked`),
+/// it is unlinked/removed immediately to prevent writing through into the linked store.
+fn clean_stale_package_dir(dest_dir: &Path, loc: &str, tree_diff_opt: Option<&TreeDiff>) {
+    if rnpm_fs::is_junction(dest_dir).unwrap_or(false) {
+        let _ = rnpm_fs::remove_junction(dest_dir);
+        return;
+    }
+    if !dest_dir.is_dir() {
+        return;
+    }
+
+    let nested_nm = dest_dir.join("node_modules");
+    if nested_nm.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&nested_nm) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let sub_path = entry.path();
+                if name_str.starts_with('@') && sub_path.is_dir() {
+                    // Scoped package directory
+                    if let Ok(scoped_entries) = std::fs::read_dir(&sub_path) {
+                        for scoped_entry in scoped_entries.flatten() {
+                            let scoped_name = scoped_entry.file_name();
+                            let scoped_name_str = scoped_name.to_string_lossy();
+                            let child_loc =
+                                format!("{loc}/node_modules/{name_str}/{scoped_name_str}");
+                            let is_unchanged = tree_diff_opt
+                                .and_then(|diff| diff.get(&child_loc))
+                                .map(|action| action.is_unchanged())
+                                .unwrap_or(false);
+                            if !is_unchanged {
+                                let child_path = scoped_entry.path();
+                                if rnpm_fs::is_junction(&child_path).unwrap_or(false) {
+                                    let _ = rnpm_fs::remove_junction(&child_path);
+                                } else {
+                                    let _ = rnpm_fs::remove_dir_all_safe(&child_path);
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(mut remaining) = std::fs::read_dir(&sub_path) {
+                        if remaining.next().is_none() {
+                            let _ = std::fs::remove_dir(&sub_path);
+                        }
+                    }
+                } else {
+                    let child_loc = format!("{loc}/node_modules/{name_str}");
+                    let is_unchanged = tree_diff_opt
+                        .and_then(|diff| diff.get(&child_loc))
+                        .map(|action| action.is_unchanged())
+                        .unwrap_or(false);
+                    if !is_unchanged {
+                        if rnpm_fs::is_junction(&sub_path).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_junction(&sub_path);
+                        } else {
+                            let _ = rnpm_fs::remove_dir_all_safe(&sub_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove all non-node_modules files and directories in dest_dir
+    if let Ok(entries) = std::fs::read_dir(dest_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name() == "node_modules" {
+                continue;
+            }
+            let path = entry.path();
+            if rnpm_fs::is_junction(&path).unwrap_or(false) {
+                let _ = rnpm_fs::remove_junction(&path);
+            } else if path.is_dir() {
+                let _ = rnpm_fs::remove_dir_all_safe(&path);
+            } else {
+                #[cfg(windows)]
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(&path, perms);
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    if nested_nm.is_dir() {
+        clean_empty_bin_dirs(&nested_nm);
+        if let Ok(mut remaining) = std::fs::read_dir(&nested_nm) {
+            if remaining.next().is_none() {
+                let _ = std::fs::remove_dir(&nested_nm);
+            }
+        }
+    }
+}
+
+/// Computes lockfile entries that must be skipped because they are incompatible optional
+/// platform packages or reachable only below an incompatible optional platform package.
+/// npm retains these records for cross-platform lockfile parity but does not extract their
 /// tarballs on the current host.
-fn lockfile_platform_skipped_packages(lockfile: &LockfileV3, platform: &Platform) -> HashSet<String> {
+pub fn lockfile_platform_skipped_packages(
+    lockfile: &LockfileV3,
+    platform: &Platform,
+) -> HashSet<String> {
     const ACTIVE: u8 = 0b01;
     const SKIPPED: u8 = 0b10;
 
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut children: HashMap<String, Vec<(String, bool)>> = HashMap::new();
     for (parent_key, parent_pkg) in &lockfile.packages {
-        let mut dependency_names = Vec::new();
+        let mut dep_entries: Vec<(&String, bool)> = Vec::new();
+
         if let Some(deps) = &parent_pkg.dependencies {
-            dependency_names.extend(deps.keys().cloned());
-        }
-        if let Some(deps) = &parent_pkg.optional_dependencies {
-            dependency_names.extend(deps.keys().cloned());
+            for dep_name in deps.keys() {
+                dep_entries.push((dep_name, false));
+            }
         }
         if let Some(deps) = &parent_pkg.dev_dependencies {
-            dependency_names.extend(deps.keys().cloned());
+            for dep_name in deps.keys() {
+                dep_entries.push((dep_name, false));
+            }
         }
-        for dependency_name in dependency_names {
-            if let Some(child_key) = resolve_lockfile_dependency_path(lockfile, parent_key, &dependency_name) {
-                children.entry(parent_key.clone()).or_default().push(child_key);
+        if let Some(deps) = &parent_pkg.optional_dependencies {
+            for dep_name in deps.keys() {
+                dep_entries.push((dep_name, true));
+            }
+        }
+        if let Some(deps) = &parent_pkg.peer_dependencies {
+            for dep_name in deps.keys() {
+                let is_opt_peer = parent_pkg
+                    .peer_dependencies_meta
+                    .as_ref()
+                    .and_then(|m| m.get(dep_name))
+                    .is_some_and(|v| v.get("optional").and_then(|o| o.as_bool()).unwrap_or(false));
+                dep_entries.push((dep_name, is_opt_peer));
+            }
+        }
+
+        for (dep_name, is_opt_edge) in dep_entries {
+            if let Some(child_key) =
+                resolve_lockfile_dependency_path(lockfile, parent_key, dep_name)
+            {
+                children
+                    .entry(parent_key.clone())
+                    .or_default()
+                    .push((child_key, is_opt_edge));
             }
         }
     }
 
     let mut states: HashMap<String, u8> = HashMap::new();
+    // Entry points: root package "" and any workspace members
     states.insert(String::new(), ACTIVE);
+    for key in lockfile.packages.keys() {
+        if !key.is_empty() && !key.starts_with("node_modules/") {
+            states.insert(key.clone(), ACTIVE);
+        }
+    }
+
+    // Direct platform compatibility check: mark incompatible optional packages as SKIPPED
     for (key, pkg) in &lockfile.packages {
-        if key.is_empty() || !pkg.is_effective_optional() && !pkg.is_peer_optional() {
+        if key.is_empty() {
             continue;
         }
-        let compatible = platform.matches_with_libc(pkg.os.as_deref(), pkg.cpu.as_deref(), pkg.libc.as_deref());
+        let is_optional =
+            pkg.is_effective_optional() || pkg.is_peer_optional() || pkg.optional == Some(true);
+        if !is_optional {
+            continue;
+        }
+        let compatible = rnpm_solver::is_platform_compatible(
+            platform,
+            pkg.os.as_deref(),
+            pkg.cpu.as_deref(),
+            pkg.libc.as_deref(),
+        );
         if !compatible {
             *states.entry(key.clone()).or_default() |= SKIPPED;
         }
@@ -3997,16 +5657,39 @@ fn lockfile_platform_skipped_packages(lockfile: &LockfileV3, platform: &Platform
     let mut queue: VecDeque<String> = states.keys().cloned().collect();
     while let Some(parent_key) = queue.pop_front() {
         let parent_state = states.get(&parent_key).copied().unwrap_or(0);
-        let Some(dependent_keys) = children.get(&parent_key) else { continue };
-        for child_key in dependent_keys {
+        let Some(dependent_entries) = children.get(&parent_key) else {
+            continue;
+        };
+        for (child_key, is_opt_edge) in dependent_entries {
+            let child_pkg = match lockfile.packages.get(child_key) {
+                Some(p) => p,
+                None => continue,
+            };
+            let child_is_optional = *is_opt_edge
+                || child_pkg.is_effective_optional()
+                || child_pkg.is_peer_optional()
+                || child_pkg.optional == Some(true);
+            let child_compatible = rnpm_solver::is_platform_compatible(
+                platform,
+                child_pkg.os.as_deref(),
+                child_pkg.cpu.as_deref(),
+                child_pkg.libc.as_deref(),
+            );
+
             let child_state = states.entry(child_key.clone()).or_default();
             let mut next = 0;
+
             if parent_state & ACTIVE != 0 {
-                next |= ACTIVE;
+                if child_is_optional && !child_compatible {
+                    next |= SKIPPED;
+                } else {
+                    next |= ACTIVE;
+                }
             }
             if parent_state & SKIPPED != 0 {
                 next |= SKIPPED;
             }
+
             let changed = (*child_state | next) != *child_state;
             *child_state |= next;
             if changed {
@@ -4017,11 +5700,15 @@ fn lockfile_platform_skipped_packages(lockfile: &LockfileV3, platform: &Platform
 
     states
         .into_iter()
-        .filter_map(|(key, state)| (state == SKIPPED).then_some(key))
+        .filter_map(|(key, state)| ((state & SKIPPED != 0) && (state & ACTIVE == 0)).then_some(key))
         .collect()
 }
 
-fn resolve_lockfile_dependency_path(lockfile: &LockfileV3, parent_key: &str, dependency_name: &str) -> Option<String> {
+pub fn resolve_lockfile_dependency_path(
+    lockfile: &LockfileV3,
+    parent_key: &str,
+    dependency_name: &str,
+) -> Option<String> {
     let mut scope = parent_key.to_string();
     loop {
         let candidate = if scope.is_empty() {

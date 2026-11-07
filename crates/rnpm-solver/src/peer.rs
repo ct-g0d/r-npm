@@ -27,9 +27,7 @@ impl PeerContext {
         peer: &str,
         peer_alias: Option<&str>,
     ) -> bool {
-        let dep_matches = |name: &str| -> bool {
-            name == dependent || (dep_alias == Some(name))
-        };
+        let dep_matches = |name: &str| -> bool { name == dependent || (dep_alias == Some(name)) };
 
         if dep_matches(peer) || peer_alias.is_some_and(dep_matches) {
             return true;
@@ -77,9 +75,7 @@ impl PeerContext {
         peer: &str,
         peer_alias: Option<&str>,
     ) -> Option<Vec<String>> {
-        let dep_matches = |name: &str| -> bool {
-            name == dependent || (dep_alias == Some(name))
-        };
+        let dep_matches = |name: &str| -> bool { name == dependent || (dep_alias == Some(name)) };
 
         if dep_matches(peer) {
             return Some(vec![dependent.to_string(), peer.to_string()]);
@@ -155,9 +151,8 @@ impl PeerContext {
         peer: &str,
         peer_alias: Option<&str>,
     ) -> bool {
-        path.iter().any(|ancestor| {
-            ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa)
-        })
+        path.iter()
+            .any(|ancestor| ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa))
     }
 
     /// Finds the cycle path from the matching ancestor along `path` to `peer`.
@@ -167,9 +162,9 @@ impl PeerContext {
         peer: &str,
         peer_alias: Option<&str>,
     ) -> Option<Vec<String>> {
-        let idx = path.iter().position(|ancestor| {
-            ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa)
-        })?;
+        let idx = path
+            .iter()
+            .position(|ancestor| ancestor == peer || peer_alias.is_some_and(|pa| ancestor == pa))?;
         let mut cycle = path[idx..].to_vec();
         cycle.push(peer.to_string());
         Some(cycle)
@@ -222,13 +217,16 @@ mod tests {
 
         // Self-cycle: A -> A
         assert!(ctx.is_cycle("a", "a"));
-        assert_eq!(ctx.find_cycle_path("a", "a"), Some(vec!["a".to_string(), "a".to_string()]));
+        assert_eq!(
+            ctx.find_cycle_path("a", "a"),
+            Some(vec!["a".to_string(), "a".to_string()])
+        );
 
         // 3-node cycle: A -> B -> C -> A
         ctx.enter("a", "b");
         ctx.enter("b", "c");
         assert!(!ctx.is_cycle("a", "c")); // A -> C is forward, not cyclic
-        assert!(ctx.is_cycle("c", "a"));  // C -> A completes cycle A -> B -> C -> A!
+        assert!(ctx.is_cycle("c", "a")); // C -> A completes cycle A -> B -> C -> A!
         let cycle_path = ctx.find_cycle_path("c", "a").unwrap();
         assert_eq!(cycle_path, vec!["c", "a", "b", "c"]);
 

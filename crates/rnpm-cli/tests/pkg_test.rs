@@ -1,6 +1,6 @@
+use serde_json::Value;
 use std::process::Command;
 use tempfile::tempdir;
-use serde_json::Value;
 
 fn setup_simple_package(dir: &std::path::Path) {
     let manifest = serde_json::json!({
@@ -19,7 +19,8 @@ fn setup_simple_package(dir: &std::path::Path) {
     std::fs::write(
         dir.join("package.json"),
         serde_json::to_string_pretty(&manifest).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 fn setup_workspace_monorepo(dir: &std::path::Path) {
@@ -31,7 +32,8 @@ fn setup_workspace_monorepo(dir: &std::path::Path) {
     std::fs::write(
         dir.join("package.json"),
         serde_json::to_string_pretty(&root_manifest).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let pkg_a_dir = dir.join("packages").join("pkg-a");
     std::fs::create_dir_all(&pkg_a_dir).unwrap();
@@ -45,7 +47,8 @@ fn setup_workspace_monorepo(dir: &std::path::Path) {
     std::fs::write(
         pkg_a_dir.join("package.json"),
         serde_json::to_string_pretty(&pkg_a).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let pkg_b_dir = dir.join("packages").join("pkg-b");
     std::fs::create_dir_all(&pkg_b_dir).unwrap();
@@ -59,7 +62,8 @@ fn setup_workspace_monorepo(dir: &std::path::Path) {
     std::fs::write(
         pkg_b_dir.join("package.json"),
         serde_json::to_string_pretty(&pkg_b).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 #[test]
@@ -219,7 +223,11 @@ fn test_pkg_set_multiple_assignments_and_coercion() {
         .output()
         .expect("Failed to execute rnpm pkg set");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let content = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
@@ -250,13 +258,20 @@ fn test_pkg_set_bracket_keys_and_arrays() {
         .output()
         .expect("Failed to execute rnpm pkg set with brackets");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let content = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
 
     assert_eq!(json["dependencies"]["@scope/pkg"], "^1.0.0");
-    assert_eq!(json["keywords"], serde_json::json!(["first", "second", "third"]));
+    assert_eq!(
+        json["keywords"],
+        serde_json::json!(["first", "second", "third"])
+    );
 }
 
 #[test]
@@ -276,7 +291,11 @@ fn test_pkg_delete_single_and_multiple() {
         .output()
         .expect("Failed to execute rnpm pkg delete");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let content = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let json: Value = serde_json::from_str(&content).unwrap();
@@ -334,7 +353,11 @@ fn test_pkg_workspaces_get() {
         .output()
         .expect("Failed to execute rnpm pkg get name --workspaces");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(json["pkg-a"], "pkg-a");
@@ -408,7 +431,11 @@ fn test_pkg_workspace_filter_flags() {
         .output()
         .expect("Failed to execute rnpm pkg get name --workspace=pkg-a");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(json["pkg-a"], "pkg-a");
@@ -425,7 +452,11 @@ fn test_pkg_workspace_filter_flags() {
         .output()
         .expect("Failed to execute rnpm pkg get version -w packages/pkg-b");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(json["pkg-b"], "2.0.0");
@@ -469,13 +500,19 @@ fn test_pkg_workspaces_set_and_delete() {
         .output()
         .expect("Failed to execute rnpm pkg set -w pkg-a");
 
-    assert!(output.status.success(), "Stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let pkg_a_content = std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap();
+    let pkg_a_content =
+        std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap();
     let pkg_a_json: Value = serde_json::from_str(&pkg_a_content).unwrap();
     assert_eq!(pkg_a_json["customProp"], "hello");
 
-    let pkg_b_content = std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap();
+    let pkg_b_content =
+        std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap();
     let pkg_b_json: Value = serde_json::from_str(&pkg_b_content).unwrap();
     assert!(pkg_b_json.get("customProp").is_none());
 
@@ -491,8 +528,14 @@ fn test_pkg_workspaces_set_and_delete() {
 
     assert!(output.status.success());
 
-    let pkg_a_json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap()).unwrap();
-    let pkg_b_json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap()).unwrap();
+    let pkg_a_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap(),
+    )
+    .unwrap();
+    let pkg_b_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(pkg_a_json["sharedFlag"], true);
     assert_eq!(pkg_b_json["sharedFlag"], true);
 
@@ -508,8 +551,14 @@ fn test_pkg_workspaces_set_and_delete() {
 
     assert!(output.status.success());
 
-    let pkg_a_json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap()).unwrap();
-    let pkg_b_json: Value = serde_json::from_str(&std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap()).unwrap();
+    let pkg_a_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap(),
+    )
+    .unwrap();
+    let pkg_b_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(project_dir.join("packages/pkg-b/package.json")).unwrap(),
+    )
+    .unwrap();
     assert!(pkg_a_json.get("sharedFlag").is_none());
     assert!(pkg_b_json.get("sharedFlag").is_none());
 }
@@ -534,7 +583,10 @@ fn test_pkg_workspace_error_handling() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ENOWORKSPACE"), "Expected ENOWORKSPACE in stderr: {stderr}");
+    assert!(
+        stderr.contains("ENOWORKSPACE"),
+        "Expected ENOWORKSPACE in stderr: {stderr}"
+    );
 
     // Project without workspaces passing --workspaces
     let tmp2 = tempdir().unwrap();
@@ -550,7 +602,10 @@ fn test_pkg_workspace_error_handling() {
 
     assert!(!output2.status.success());
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
-    assert!(stderr2.contains("ENOWORKSPACES"), "Expected ENOWORKSPACES in stderr: {stderr2}");
+    assert!(
+        stderr2.contains("ENOWORKSPACES"),
+        "Expected ENOWORKSPACES in stderr: {stderr2}"
+    );
 }
 
 #[test]

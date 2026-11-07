@@ -70,14 +70,46 @@ fn flatten_legacy_dependencies(
             version: Some(dep.version.clone()),
             resolved: dep.resolved.clone(),
             integrity: dep.integrity.clone(),
-            dev: if dep.dev == Some(true) { Some(true) } else { None },
-            optional: if dep.optional == Some(true) { Some(true) } else { None },
-            dev_optional: if dep.dev_optional == Some(true) { Some(true) } else { None },
-            peer: if dep.peer == Some(true) { Some(true) } else { None },
-            peer_optional: if dep.peer_optional == Some(true) { Some(true) } else { None },
-            in_bundle: if dep.bundled == Some(true) { Some(true) } else { None },
-            has_install_script: if dep.has_install_script == Some(true) { Some(true) } else { None },
-            has_shrinkwrap: if dep.has_shrinkwrap == Some(true) { Some(true) } else { None },
+            dev: if dep.dev == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            optional: if dep.optional == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            dev_optional: if dep.dev_optional == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            peer: if dep.peer == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            peer_optional: if dep.peer_optional == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            in_bundle: if dep.bundled == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            has_install_script: if dep.has_install_script == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
+            has_shrinkwrap: if dep.has_shrinkwrap == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
             dependencies: dep.requires.clone(),
             ..Default::default()
         };
@@ -164,7 +196,8 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
                     if dep.peer == Some(true) {
                         root_peer_deps.insert(name.clone(), dep.version.clone());
                         if dep.peer_optional == Some(true) {
-                            root_peer_meta.insert(name.clone(), serde_json::json!({ "optional": true }));
+                            root_peer_meta
+                                .insert(name.clone(), serde_json::json!({ "optional": true }));
                         }
                     }
                     if dep.bundled == Some(true) {
@@ -250,11 +283,13 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
             };
 
             // Ensure root package `""` is present
-            let root = packages.entry("".to_string()).or_insert_with(|| LockfilePackage {
-                name: Some(raw.name.clone()),
-                version: raw.version.clone(),
-                ..Default::default()
-            });
+            let root = packages
+                .entry("".to_string())
+                .or_insert_with(|| LockfilePackage {
+                    name: Some(raw.name.clone()),
+                    version: raw.version.clone(),
+                    ..Default::default()
+                });
             root.normalize_flags();
 
             Ok(LockfileV3 {
@@ -275,11 +310,13 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
             }
 
             // Ensure root package `""` exists
-            let root = packages.entry("".to_string()).or_insert_with(|| LockfilePackage {
-                name: Some(raw.name.clone()),
-                version: raw.version.clone(),
-                ..Default::default()
-            });
+            let root = packages
+                .entry("".to_string())
+                .or_insert_with(|| LockfilePackage {
+                    name: Some(raw.name.clone()),
+                    version: raw.version.clone(),
+                    ..Default::default()
+                });
             root.normalize_flags();
 
             Ok(LockfileV3 {

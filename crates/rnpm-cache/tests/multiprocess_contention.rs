@@ -8,7 +8,11 @@ use std::time::Duration;
 fn test_multiprocess_stress_cache_contention_16_workers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let cache_root = temp_dir.path().join("stress-shared-cache");
-    let cache = Arc::new(Cache::new(&cache_root).unwrap().with_lock_timeout(Duration::from_secs(30)));
+    let cache = Arc::new(
+        Cache::new(&cache_root)
+            .unwrap()
+            .with_lock_timeout(Duration::from_secs(30)),
+    );
 
     let num_workers = 16;
     let iterations_per_worker = 15;
@@ -161,9 +165,18 @@ fn test_multiprocess_stress_cache_contention_16_workers() {
 
     // Final strict verification
     let report = cache.verify().unwrap();
-    assert_eq!(report.corrupted_blobs, 0, "Final check: zero corrupted blobs");
-    assert_eq!(report.corrupted_indices, 0, "Final check: zero corrupted indices");
-    assert_eq!(report.orphaned_indices, 0, "Final check: zero orphaned indices");
+    assert_eq!(
+        report.corrupted_blobs, 0,
+        "Final check: zero corrupted blobs"
+    );
+    assert_eq!(
+        report.corrupted_indices, 0,
+        "Final check: zero corrupted indices"
+    );
+    assert_eq!(
+        report.orphaned_indices, 0,
+        "Final check: zero orphaned indices"
+    );
     assert!(report.verified_blobs > 0, "Expected verified blobs");
     assert!(report.verified_indices > 0, "Expected verified indices");
 }

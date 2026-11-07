@@ -1,9 +1,9 @@
 //! Workspace discovery and monorepo manifest loading.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::error::WorkspaceError;
 use crate::manifest::Manifest;
@@ -61,7 +61,8 @@ pub fn discover_workspaces_from_manifest(
             continue;
         }
 
-        let member_manifest = Manifest::from_file(&manifest_path).map_err(WorkspaceError::Manifest)?;
+        let member_manifest =
+            Manifest::from_file(&manifest_path).map_err(WorkspaceError::Manifest)?;
         let name = member_manifest.name.clone().unwrap_or_else(|| {
             dir.file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -93,7 +94,10 @@ pub fn discover_workspaces_from_manifest(
 }
 
 /// Match directory glob patterns relative to root_dir.
-pub fn match_glob_patterns(root_dir: &Path, patterns: &[String]) -> Result<Vec<PathBuf>, std::io::Error> {
+pub fn match_glob_patterns(
+    root_dir: &Path,
+    patterns: &[String],
+) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut matched_dirs = HashSet::new();
 
     let (negative_patterns, positive_patterns): (Vec<_>, Vec<_>) =
@@ -105,10 +109,7 @@ pub fn match_glob_patterns(root_dir: &Path, patterns: &[String]) -> Result<Vec<P
         let clean_pattern = clean_pattern.strip_prefix(".\\").unwrap_or(clean_pattern);
         let posix_pattern = clean_pattern.replace('\\', "/");
 
-        let segments: Vec<&str> = posix_pattern
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let segments: Vec<&str> = posix_pattern.split('/').filter(|s| !s.is_empty()).collect();
 
         if segments.is_empty() {
             continue;
@@ -282,7 +283,9 @@ fn matches_neg_pattern(neg_pattern: &str, rel_path: &str) -> bool {
     }
     // If neg_pattern ends with /**
     if let Some(prefix) = neg_pattern.strip_suffix("/**") {
-        if rel_path == prefix || (rel_path.starts_with(prefix) && rel_path[prefix.len()..].starts_with('/')) {
+        if rel_path == prefix
+            || (rel_path.starts_with(prefix) && rel_path[prefix.len()..].starts_with('/'))
+        {
             return true;
         }
     }

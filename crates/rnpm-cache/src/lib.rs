@@ -11,12 +11,16 @@
 pub mod error;
 pub mod index;
 pub mod lock;
+pub mod pack_store;
 pub mod storage;
 
-pub use error::CacheError;
+pub use error::{CacheError, PackError};
 pub use index::IndexEntry;
 pub use lock::CacheLock;
-pub use storage::{Cache, VerifyReport};
+pub use pack_store::{
+    PackFileEntry, PackIndex, PackInputFile, PackStore, PackagePack, PACK_ALIGNMENT,
+};
+pub use storage::{packument_key, Cache, VerifyReport};
 
 #[cfg(test)]
 mod tests {
@@ -38,7 +42,8 @@ mod tests {
         assert_eq!(entry.size, data.len() as u64);
 
         // Verify retrieval by key
-        let (retrieved_entry, retrieved_data) = cache.get(key).unwrap().expect("Cache hit expected");
+        let (retrieved_entry, retrieved_data) =
+            cache.get(key).unwrap().expect("Cache hit expected");
         assert_eq!(retrieved_entry.integrity, entry.integrity);
         assert_eq!(retrieved_data, data);
 
@@ -67,7 +72,10 @@ mod tests {
 
         // Calling get() should detect corruption, purge the corrupted file, and return None (miss)
         let result = cache.get(key).unwrap();
-        assert!(result.is_none(), "Corrupted entry should return None (miss)");
+        assert!(
+            result.is_none(),
+            "Corrupted entry should return None (miss)"
+        );
 
         // Verify the corrupted blob file was PURGED from disk!
         assert!(
@@ -106,7 +114,11 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(tmp_entries.len(), 0, "No temp files should remain after atomic rename");
+        assert_eq!(
+            tmp_entries.len(),
+            0,
+            "No temp files should remain after atomic rename"
+        );
     }
 
     #[test]
@@ -166,7 +178,10 @@ mod tests {
                 assert_eq!(entry2.size, unique_data.len() as u64);
 
                 // Verify immediate retrieval
-                let (_, retrieved) = cache_clone.get(&unique_key).unwrap().expect("Cache hit expected");
+                let (_, retrieved) = cache_clone
+                    .get(&unique_key)
+                    .unwrap()
+                    .expect("Cache hit expected");
                 assert_eq!(retrieved, unique_data);
             });
             handles.push(handle);
@@ -177,7 +192,10 @@ mod tests {
         }
 
         // Verify shared key is consistent and valid
-        let (_, retrieved_shared) = cache.get("https://registry.npmjs.org/shared/-/shared-1.0.0.tgz").unwrap().expect("Shared cache hit");
+        let (_, retrieved_shared) = cache
+            .get("https://registry.npmjs.org/shared/-/shared-1.0.0.tgz")
+            .unwrap()
+            .expect("Shared cache hit");
         assert_eq!(retrieved_shared, b"shared content written concurrently");
 
         // Verify no leftover .tmp files
@@ -185,7 +203,11 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(tmp_entries.len(), 0, "No orphaned temporary files in cache tmp directory");
+        assert_eq!(
+            tmp_entries.len(),
+            0,
+            "No orphaned temporary files in cache tmp directory"
+        );
     }
 
     #[test]
@@ -225,8 +247,14 @@ mod tests {
         std::fs::write(&index_path, [0xFF, 0xFE, 0xFD, 0x00, 0x80]).unwrap();
 
         let res = cache.get(key).unwrap();
-        assert!(res.is_none(), "Non-UTF8 corrupt index must return cache miss");
-        assert!(!index_path.exists(), "Non-UTF8 corrupt index must be purged");
+        assert!(
+            res.is_none(),
+            "Non-UTF8 corrupt index must return cache miss"
+        );
+        assert!(
+            !index_path.exists(),
+            "Non-UTF8 corrupt index must be purged"
+        );
     }
 
     #[test]
@@ -243,7 +271,8 @@ mod tests {
 
         // Attempting to acquire with a very short timeout should fail with TimedOut / LockFailed
         let start = std::time::Instant::now();
-        let err = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(50)).unwrap_err();
+        let err = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(50))
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(start.elapsed() >= Duration::from_millis(45));
 
@@ -268,7 +297,9 @@ mod tests {
         std::fs::write(&tmp2, b"fresh temp").unwrap();
 
         // Clean files older than 0 seconds (all files)
-        let cleaned = cache.clean_stale_temp_files(Duration::from_secs(0)).unwrap();
+        let cleaned = cache
+            .clean_stale_temp_files(Duration::from_secs(0))
+            .unwrap();
         assert_eq!(cleaned, 2);
         assert!(!tmp1.exists());
         assert!(!tmp2.exists());
@@ -294,7 +325,10 @@ mod tests {
 
         // Run sweep
         let purged = cache.purge_corrupted().unwrap();
-        assert!(purged >= 2, "Sweep must purge both corrupted blob and corrupted index");
+        assert!(
+            purged >= 2,
+            "Sweep must purge both corrupted blob and corrupted index"
+        );
         assert!(!blob_path.exists());
         assert!(!index_path.exists());
     }
@@ -306,16 +340,23 @@ mod tests {
         for item in 0..15 {
             let key = format!("https://registry.npmjs.org/{worker_id}-pkg-{item}/-/{worker_id}-pkg-{item}-1.0.0.tgz");
             let data = format!("{worker_id} payload data {item}").into_bytes();
-            cache.put(&key, &data, None).expect("Worker failed to put unique key");
+            cache
+                .put(&key, &data, None)
+                .expect("Worker failed to put unique key");
 
-            let (_, read_back) = cache.get(&key).expect("Worker failed get").expect("Must hit cache");
+            let (_, read_back) = cache
+                .get(&key)
+                .expect("Worker failed get")
+                .expect("Must hit cache");
             assert_eq!(read_back, data);
         }
 
         // 2. Contend on shared keys across all workers
-        let shared_key = "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
+        let shared_key =
+            "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
         for i in 0..5 {
-            let shared_data = format!("shared multiprocess payload from {worker_id} iter {i}").into_bytes();
+            let shared_data =
+                format!("shared multiprocess payload from {worker_id} iter {i}").into_bytes();
             let _ = cache.put(shared_key, &shared_data, None);
             let _ = cache.get(shared_key);
         }
@@ -339,7 +380,10 @@ mod tests {
         let mut children = Vec::new();
         for i in 0..4 {
             let child = std::process::Command::new(&current_exe)
-                .args(["--nocapture", "tests::test_concurrent_multiprocess_cache_reads_writes"])
+                .args([
+                    "--nocapture",
+                    "tests::test_concurrent_multiprocess_cache_reads_writes",
+                ])
                 .env("RNPM_CACHE_WORKER_ID", format!("worker-{i}"))
                 .env("RNPM_CACHE_DIR", &cache_dir_str)
                 .spawn()
@@ -360,7 +404,11 @@ mod tests {
         // Wait for all child processes and assert they exited successfully
         for mut child in children {
             let status = child.wait().expect("Failed to wait on child process");
-            assert!(status.success(), "Child worker process exited with failure: {:?}", status);
+            assert!(
+                status.success(),
+                "Child worker process exited with failure: {:?}",
+                status
+            );
         }
 
         // Verify all keys written by workers are present and uncorrupted
@@ -368,14 +416,21 @@ mod tests {
             for item in 0..15 {
                 let key = format!("https://registry.npmjs.org/worker-{w}-pkg-{item}/-/worker-{w}-pkg-{item}-1.0.0.tgz");
                 let expected_data = format!("worker-{w} payload data {item}").into_bytes();
-                let (_, retrieved) = cache.get(&key).unwrap().expect("Worker key should be in cache");
+                let (_, retrieved) = cache
+                    .get(&key)
+                    .unwrap()
+                    .expect("Worker key should be in cache");
                 assert_eq!(retrieved, expected_data, "Data mismatch for key {key}");
             }
         }
 
         // Verify shared key written by all workers concurrently
-        let shared_key = "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
-        let (_, shared_data) = cache.get(shared_key).unwrap().expect("Shared key must exist");
+        let shared_key =
+            "https://registry.npmjs.org/multiprocess-shared/-/multiprocess-shared-1.0.0.tgz";
+        let (_, shared_data) = cache
+            .get(shared_key)
+            .unwrap()
+            .expect("Shared key must exist");
         assert!(shared_data.starts_with(b"shared multiprocess payload"));
 
         // Verify no temporary files remain in tmp directory
@@ -383,7 +438,11 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(tmp_entries.len(), 0, "No orphaned temp files after multiprocess stress");
+        assert_eq!(
+            tmp_entries.len(),
+            0,
+            "No orphaned temp files after multiprocess stress"
+        );
     }
 
     #[test]
@@ -392,7 +451,8 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempdir().unwrap();
-        let cache = Cache::new(dir.path()).unwrap()
+        let cache = Cache::new(dir.path())
+            .unwrap()
             .with_lock_timeout(Duration::from_millis(150))
             .with_stale_threshold(Duration::from_millis(40));
 
@@ -438,14 +498,18 @@ mod tests {
 
     #[test]
     fn test_dead_pid_stale_lock_breaking_immediate() {
-        use std::time::Duration;
         use crate::lock::is_process_alive;
+        use std::time::Duration;
 
         let dead_pid = 9999999u32;
-        assert!(!is_process_alive(dead_pid), "PID {dead_pid} must be confirmed dead");
+        assert!(
+            !is_process_alive(dead_pid),
+            "PID {dead_pid} must be confirmed dead"
+        );
 
         let dir = tempdir().unwrap();
-        let cache = Cache::new(dir.path()).unwrap()
+        let cache = Cache::new(dir.path())
+            .unwrap()
             .with_lock_timeout(Duration::from_millis(500))
             .with_stale_threshold(Duration::from_secs(3600)); // Very large stale threshold
 
@@ -466,8 +530,15 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        assert!(lock_res.is_ok(), "Must break and reclaim lock held by dead PID: {:?}", lock_res.err());
-        assert!(start.elapsed() < Duration::from_millis(250), "Reclamation must be immediate");
+        assert!(
+            lock_res.is_ok(),
+            "Must break and reclaim lock held by dead PID: {:?}",
+            lock_res.err()
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "Reclamation must be immediate"
+        );
 
         let lock = lock_res.unwrap();
         drop(lock);
@@ -485,7 +556,9 @@ mod tests {
         let original_data = b"production-ready-cached-tarball-data-bytes";
 
         // 1. Put valid item
-        let entry = cache.put(key, original_data, None).expect("put must succeed");
+        let entry = cache
+            .put(key, original_data, None)
+            .expect("put must succeed");
         assert_eq!(entry.key, key);
 
         // Verify clean get
@@ -501,32 +574,69 @@ mod tests {
         std::fs::write(&blob_path, b"completely corrupted garbage bytes").unwrap();
 
         // 3. get(key) should detect SSRI / SHA-512 mismatch, auto-purge corrupt blob & index, and return None
-        let miss_res = cache.get(key).expect("get on corrupted blob must not error");
-        assert!(miss_res.is_none(), "Must treat corrupted blob as cache miss");
-        assert!(!blob_path.exists(), "Corrupt blob must be auto-purged from disk");
+        let miss_res = cache
+            .get(key)
+            .expect("get on corrupted blob must not error");
+        assert!(
+            miss_res.is_none(),
+            "Must treat corrupted blob as cache miss"
+        );
+        assert!(
+            !blob_path.exists(),
+            "Corrupt blob must be auto-purged from disk"
+        );
 
         let index_path = IndexEntry::path_for_key(cache.root(), key);
-        assert!(!index_path.exists(), "Index referencing corrupt blob must be auto-purged");
+        assert!(
+            !index_path.exists(),
+            "Index referencing corrupt blob must be auto-purged"
+        );
 
         // 4. Caller re-fetches cleanly and stores again
-        let entry2 = cache.put(key, original_data, None).expect("re-fetch put must succeed");
+        let entry2 = cache
+            .put(key, original_data, None)
+            .expect("re-fetch put must succeed");
         assert_eq!(entry2.sha512_hex, entry.sha512_hex);
         assert!(blob_path.exists());
 
         // 5. Corrupt index entry with unparseable JSON
-        std::fs::write(&index_path, b"{ this is definitely not valid json syntax }}}").unwrap();
-        let index_miss = cache.get(key).expect("get on invalid JSON index must not error");
-        assert!(index_miss.is_none(), "Must treat invalid JSON index as cache miss");
-        assert!(!index_path.exists(), "Corrupted index file must be auto-purged");
+        std::fs::write(
+            &index_path,
+            b"{ this is definitely not valid json syntax }}}",
+        )
+        .unwrap();
+        let index_miss = cache
+            .get(key)
+            .expect("get on invalid JSON index must not error");
+        assert!(
+            index_miss.is_none(),
+            "Must treat invalid JSON index as cache miss"
+        );
+        assert!(
+            !index_path.exists(),
+            "Corrupted index file must be auto-purged"
+        );
 
         // 6. Test corrupt index entry with invalid SSRI integrity string
         let mut malformed_entry = entry.clone();
         malformed_entry.integrity = "invalid_not_ssri_format".to_string();
-        std::fs::write(&index_path, serde_json::to_string(&malformed_entry).unwrap()).unwrap();
+        std::fs::write(
+            &index_path,
+            serde_json::to_string(&malformed_entry).unwrap(),
+        )
+        .unwrap();
 
-        let unparseable_miss = cache.get(key).expect("get on unparseable integrity must not error");
-        assert!(unparseable_miss.is_none(), "Must treat unparseable integrity as cache miss");
-        assert!(!index_path.exists(), "Index with unparseable integrity must be auto-purged");
+        let unparseable_miss = cache
+            .get(key)
+            .expect("get on unparseable integrity must not error");
+        assert!(
+            unparseable_miss.is_none(),
+            "Must treat unparseable integrity as cache miss"
+        );
+        assert!(
+            !index_path.exists(),
+            "Index with unparseable integrity must be auto-purged"
+        );
     }
 
     #[test]
@@ -538,9 +648,10 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cache = Arc::new(
-            Cache::new(dir.path()).unwrap()
+            Cache::new(dir.path())
+                .unwrap()
                 .with_lock_timeout(Duration::from_millis(20))
-                .with_stale_threshold(Duration::from_secs(60))
+                .with_stale_threshold(Duration::from_secs(60)),
         );
 
         let lock_path = cache.lock_path("rapid_contention_lock");
@@ -573,7 +684,9 @@ mod tests {
 
         // Let workers hammer the lock and experience rapid timeouts
         let hammer_start = std::time::Instant::now();
-        while hammer_start.elapsed() < Duration::from_secs(3) && timeout_count.load(Ordering::Relaxed) <= 10 {
+        while hammer_start.elapsed() < Duration::from_secs(3)
+            && timeout_count.load(Ordering::Relaxed) <= 10
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -592,8 +705,12 @@ mod tests {
         drop(primary_lock);
 
         // Now rapid acquisition must immediately succeed
-        let fresh_lock = CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(200));
-        assert!(fresh_lock.is_ok(), "Lock must be immediately acquirable after release");
+        let fresh_lock =
+            CacheLock::acquire_exclusive_timeout(&lock_path, Duration::from_millis(200));
+        assert!(
+            fresh_lock.is_ok(),
+            "Lock must be immediately acquirable after release"
+        );
     }
 
     #[test]
@@ -611,13 +728,18 @@ mod tests {
             let h = thread::spawn(move || {
                 for iter in 0..10 {
                     // Contended shared key
-                    let shared_key = format!("https://registry.npmjs.org/contended-{}/-/contended.tgz", iter % 3);
+                    let shared_key = format!(
+                        "https://registry.npmjs.org/contended-{}/-/contended.tgz",
+                        iter % 3
+                    );
                     let payload = format!("contended-payload-{thread_idx}-{iter}").into_bytes();
                     let _ = c.put(&shared_key, &payload, None);
                     let _ = c.get(&shared_key);
 
                     // Thread-local unique key
-                    let unique_key = format!("https://registry.npmjs.org/unique-{thread_idx}-{iter}/-/unique.tgz");
+                    let unique_key = format!(
+                        "https://registry.npmjs.org/unique-{thread_idx}-{iter}/-/unique.tgz"
+                    );
                     let unique_data = format!("unique-data-{thread_idx}-{iter}").into_bytes();
                     c.put(&unique_key, &unique_data, None).unwrap();
                     let (_, retrieved) = c.get(&unique_key).unwrap().expect("Must hit cache");
@@ -628,11 +750,14 @@ mod tests {
         }
 
         for h in handles {
-            h.join().expect("Worker thread panicked under cache hammering");
+            h.join()
+                .expect("Worker thread panicked under cache hammering");
         }
 
         // Clean temp sweep
-        let remaining_tmp = cache.clean_stale_temp_files(std::time::Duration::from_secs(0)).unwrap();
+        let remaining_tmp = cache
+            .clean_stale_temp_files(std::time::Duration::from_secs(0))
+            .unwrap();
         assert_eq!(remaining_tmp, 0, "No temporary files should be orphaned");
     }
 
@@ -690,20 +815,35 @@ mod tests {
         std::fs::write(&blob1_path, b"bad checksum bytes").unwrap();
 
         let report = cache.verify().unwrap();
-        assert_eq!(report.corrupted_blobs, 1, "Blob 1 must be detected as corrupted and purged");
-        assert_eq!(report.verified_blobs, 1, "Blob 2 must be verified successfully");
-        assert_eq!(report.orphaned_indices, 1, "Index 1 must be purged as orphan since its blob was purged");
+        assert_eq!(
+            report.corrupted_blobs, 1,
+            "Blob 1 must be detected as corrupted and purged"
+        );
+        assert_eq!(
+            report.verified_blobs, 1,
+            "Blob 2 must be verified successfully"
+        );
+        assert_eq!(
+            report.orphaned_indices, 1,
+            "Index 1 must be purged as orphan since its blob was purged"
+        );
         assert_eq!(report.verified_indices, 1, "Index 2 must remain verified");
         assert_eq!(report.corrupted_indices, 0);
         assert_eq!(report.stale_temp_files_cleaned, 0);
         assert!(!report.is_clean());
 
         // Blob 1 must be deleted from disk
-        assert!(!blob1_path.exists(), "Corrupted blob 1 must no longer exist");
+        assert!(
+            !blob1_path.exists(),
+            "Corrupted blob 1 must no longer exist"
+        );
 
         // Index 1 must be deleted from disk
         let index1_path = IndexEntry::path_for_key(cache.root(), key1);
-        assert!(!index1_path.exists(), "Orphaned index 1 must no longer exist");
+        assert!(
+            !index1_path.exists(),
+            "Orphaned index 1 must no longer exist"
+        );
 
         // get(key1) should now return None (miss)
         let get1 = cache.get(key1).unwrap();
@@ -733,14 +873,20 @@ mod tests {
         let report = cache.verify().unwrap();
         assert_eq!(report.verified_blobs, 2, "Both blobs are intact");
         assert_eq!(report.corrupted_blobs, 0);
-        assert_eq!(report.corrupted_indices, 1, "Index 1 must be purged as corrupted");
+        assert_eq!(
+            report.corrupted_indices, 1,
+            "Index 1 must be purged as corrupted"
+        );
         assert_eq!(report.verified_indices, 1, "Index 2 must be verified");
         assert_eq!(report.orphaned_indices, 0);
 
         assert!(!index1_path.exists(), "Corrupt index 1 must be purged");
         // But blob 1 is still preserved in CAS storage
         let blob1_path = cache.blob_path(&entry1.sha512_hex);
-        assert!(blob1_path.exists(), "Intact blob 1 must be preserved in content-v2");
+        assert!(
+            blob1_path.exists(),
+            "Intact blob 1 must be preserved in content-v2"
+        );
 
         // get(key1) is a miss, get(key2) is a hit
         assert!(cache.get(key1).unwrap().is_none());
@@ -766,9 +912,15 @@ mod tests {
         let report = cache.verify().unwrap();
         assert_eq!(report.verified_blobs, 0);
         assert_eq!(report.corrupted_blobs, 0);
-        assert_eq!(report.orphaned_indices, 1, "Index pointing to missing blob must be purged");
+        assert_eq!(
+            report.orphaned_indices, 1,
+            "Index pointing to missing blob must be purged"
+        );
         assert_eq!(report.verified_indices, 0);
-        assert!(!index_path.exists(), "Orphaned index must be purged from disk");
+        assert!(
+            !index_path.exists(),
+            "Orphaned index must be purged from disk"
+        );
     }
 
     #[test]
@@ -818,13 +970,17 @@ mod tests {
         cache.put("key-healthy-2", b"healthy-data-2", None).unwrap();
 
         // 2. Corrupted blob entry
-        let corrupt_entry = cache.put("key-corrupt-blob", b"original data before corruption", None).unwrap();
+        let corrupt_entry = cache
+            .put("key-corrupt-blob", b"original data before corruption", None)
+            .unwrap();
         let corrupt_blob_path = cache.blob_path(&corrupt_entry.sha512_hex);
         std::fs::write(&corrupt_blob_path, b"totally mismatched digest content").unwrap();
 
         // 3. Corrupted index entry (garbage UTF-8)
         let corrupt_idx_key = "key-corrupt-index";
-        cache.put(corrupt_idx_key, b"valid blob but broken index", None).unwrap();
+        cache
+            .put(corrupt_idx_key, b"valid blob but broken index", None)
+            .unwrap();
         let corrupt_idx_path = IndexEntry::path_for_key(cache.root(), corrupt_idx_key);
         std::fs::write(&corrupt_idx_path, [0x80, 0x81, 0xFF, 0xFE, 0x00]).unwrap();
 
@@ -840,12 +996,24 @@ mod tests {
         std::fs::write(&tmp_file2, b"abandoned write").unwrap();
 
         let report = cache.verify().unwrap();
-        assert_eq!(report.verified_blobs, 3, "2 healthy blobs + 1 orphan-index blob");
+        assert_eq!(
+            report.verified_blobs, 3,
+            "2 healthy blobs + 1 orphan-index blob"
+        );
         assert_eq!(report.corrupted_blobs, 1, "1 corrupted blob purged");
         assert_eq!(report.verified_indices, 2, "2 healthy indices");
-        assert_eq!(report.corrupted_indices, 1, "1 non-utf8 corrupted index purged");
-        assert_eq!(report.orphaned_indices, 2, "1 orphan-key + 1 corrupt-blob-key orphaned indices");
-        assert_eq!(report.stale_temp_files_cleaned, 2, "2 stale temp files cleaned");
+        assert_eq!(
+            report.corrupted_indices, 1,
+            "1 non-utf8 corrupted index purged"
+        );
+        assert_eq!(
+            report.orphaned_indices, 2,
+            "1 orphan-key + 1 corrupt-blob-key orphaned indices"
+        );
+        assert_eq!(
+            report.stale_temp_files_cleaned, 2,
+            "2 stale temp files cleaned"
+        );
         assert_eq!(report.total_purged(), 6);
         assert!(!report.is_clean());
 
@@ -857,8 +1025,14 @@ mod tests {
         assert_eq!(second_report.total_purged(), 0);
 
         // Healthy entries still retrieve correctly
-        assert_eq!(cache.get("key-healthy-1").unwrap().unwrap().1, b"healthy-data-1");
-        assert_eq!(cache.get("key-healthy-2").unwrap().unwrap().1, b"healthy-data-2");
+        assert_eq!(
+            cache.get("key-healthy-1").unwrap().unwrap().1,
+            b"healthy-data-1"
+        );
+        assert_eq!(
+            cache.get("key-healthy-2").unwrap().unwrap().1,
+            b"healthy-data-2"
+        );
     }
 
     #[test]
@@ -898,7 +1072,9 @@ mod tests {
         std::fs::write(&lock_path, b"dummy lock").unwrap();
 
         // Execute cache clean
-        cache.clean().expect("Cache clean must succeed even with readonly files");
+        cache
+            .clean()
+            .expect("Cache clean must succeed even with readonly files");
 
         // Verify content-v2, index-v5, tmp, locks directories exist but are empty
         assert!(cache.root().join("content-v2").join("sha512").exists());
@@ -909,7 +1085,9 @@ mod tests {
         let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir()).unwrap().collect();
         assert_eq!(tmp_entries.len(), 0);
 
-        let index_entries: Vec<_> = std::fs::read_dir(cache.root().join("index-v5")).unwrap().collect();
+        let index_entries: Vec<_> = std::fs::read_dir(cache.root().join("index-v5"))
+            .unwrap()
+            .collect();
         assert_eq!(index_entries.len(), 0);
 
         // Verify cache is immediately usable for put and get
@@ -918,7 +1096,10 @@ mod tests {
         let entry = cache.put(post_clean_key, post_clean_data, None).unwrap();
         assert_eq!(entry.size, post_clean_data.len() as u64);
 
-        let (_, retrieved) = cache.get(post_clean_key).unwrap().expect("Must retrieve post-clean entry");
+        let (_, retrieved) = cache
+            .get(post_clean_key)
+            .unwrap()
+            .expect("Must retrieve post-clean entry");
         assert_eq!(retrieved, post_clean_data);
 
         // Verification on post-clean cache is clean
@@ -949,7 +1130,10 @@ mod tests {
                     let key = format!("https://registry.npmjs.org/stress-w{w}-{iter}/-/pkg.tgz");
                     let data = format!("stress payload w{w} iter {iter}").into_bytes();
                     c.put(&key, &data, None).expect("Worker put failed");
-                    let (_, retrieved) = c.get(&key).expect("Worker get failed").expect("Must hit cache");
+                    let (_, retrieved) = c
+                        .get(&key)
+                        .expect("Worker get failed")
+                        .expect("Must hit cache");
                     assert_eq!(retrieved, data);
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -989,7 +1173,10 @@ mod tests {
         // Cache must be usable again
         let final_entry = cache.put("final-key", b"final data", None).unwrap();
         assert_eq!(final_entry.size, 10);
-        let (_, final_data) = cache.get("final-key").unwrap().expect("Must retrieve final entry");
+        let (_, final_data) = cache
+            .get("final-key")
+            .unwrap()
+            .expect("Must retrieve final entry");
         assert_eq!(final_data, b"final data");
     }
 
@@ -1003,7 +1190,8 @@ mod tests {
 
         // sha1 matches data, but sha512 is mismatched / tampered
         let matching_sha1 = Integrity::from_bytes(data, Algorithm::Sha1);
-        let wrong_sha512 = Integrity::from_bytes(b"corrupted or tampered content", Algorithm::Sha512);
+        let wrong_sha512 =
+            Integrity::from_bytes(b"corrupted or tampered content", Algorithm::Sha512);
 
         let multi_integrity = Integrity::parse(&format!("{matching_sha1} {wrong_sha512}")).unwrap();
 
@@ -1016,23 +1204,33 @@ mod tests {
         );
 
         // Verify cache remains completely clean (no index entry, no blob written)
-        assert!(cache.get(key).unwrap().is_none(), "Cache must have no entry for key");
+        assert!(
+            cache.get(key).unwrap().is_none(),
+            "Cache must have no entry for key"
+        );
 
         // Verify content-v2 directory has no blobs
         let content_dir = cache.root().join("content-v2").join("sha512");
         let mut blobs = Vec::new();
         collect_files_recursive(&content_dir, &mut blobs);
-        assert_eq!(blobs.len(), 0, "No content-addressable blobs should be created on integrity mismatch");
+        assert_eq!(
+            blobs.len(),
+            0,
+            "No content-addressable blobs should be created on integrity mismatch"
+        );
 
         // Now test matching multi-hash: both sha1 and sha512 match data
         let matching_sha512 = Integrity::from_bytes(data, Algorithm::Sha512);
         let valid_multi = Integrity::parse(&format!("{matching_sha1} {matching_sha512}")).unwrap();
 
-        let entry = cache.put_with_integrity(key, data, Some(&valid_multi), None).unwrap();
+        let entry = cache
+            .put_with_integrity(key, data, Some(&valid_multi), None)
+            .unwrap();
         assert_eq!(entry.key, key);
         assert_eq!(entry.size, data.len() as u64);
 
-        let (retrieved_entry, retrieved_data) = cache.get(key).unwrap().expect("Cache hit expected");
+        let (retrieved_entry, retrieved_data) =
+            cache.get(key).unwrap().expect("Cache hit expected");
         assert_eq!(retrieved_data, data);
         assert!(retrieved_entry.integrity.contains("sha512-"));
     }
@@ -1046,18 +1244,28 @@ mod tests {
         let key = "https://registry.npmjs.org/reject-test/-/reject-1.0.0.tgz";
         let wrong_integrity = Integrity::from_bytes(b"completely different", Algorithm::Sha512);
 
-        let err = cache.put_with_integrity(key, data, Some(&wrong_integrity), None).unwrap_err();
+        let err = cache
+            .put_with_integrity(key, data, Some(&wrong_integrity), None)
+            .unwrap_err();
         assert!(matches!(err, CacheError::IntegrityMismatch { .. }));
 
         // Check index directory is empty
         let index_dir = cache.root().join("index-v5");
         let mut indices = Vec::new();
         collect_files_recursive(&index_dir, &mut indices);
-        assert_eq!(indices.len(), 0, "No index entries must be created on rejection");
+        assert_eq!(
+            indices.len(),
+            0,
+            "No index entries must be created on rejection"
+        );
 
         // Check tmp directory is empty
         let tmp_entries: Vec<_> = std::fs::read_dir(cache.tmp_dir()).unwrap().collect();
-        assert_eq!(tmp_entries.len(), 0, "No temp files must remain in tmp directory");
+        assert_eq!(
+            tmp_entries.len(),
+            0,
+            "No temp files must remain in tmp directory"
+        );
     }
 
     #[test]
@@ -1074,7 +1282,10 @@ mod tests {
         assert_eq!(entry.size, data.len() as u64);
 
         // Lookup by raw tarball URL should resolve the entry via alias
-        let (found_entry, found_data) = cache.get(tarball_url).unwrap().expect("Must resolve via cacache alias");
+        let (found_entry, found_data) = cache
+            .get(tarball_url)
+            .unwrap()
+            .expect("Must resolve via cacache alias");
         assert_eq!(found_data, data);
         assert_eq!(found_entry.key, cacache_key);
 
@@ -1084,7 +1295,10 @@ mod tests {
         let meta_data = b"{\"name\":\"my-library\",\"dist-tags\":{\"latest\":\"1.0.0\"}}";
         cache.put(&pacote_key, meta_data, None).unwrap();
 
-        let (_, found_meta) = cache.get(pkg_name).unwrap().expect("Must resolve pacote:packument alias");
+        let (_, found_meta) = cache
+            .get(pkg_name)
+            .unwrap()
+            .expect("Must resolve pacote:packument alias");
         assert_eq!(found_meta, meta_data);
     }
 
@@ -1097,15 +1311,173 @@ mod tests {
         let sha1_integrity = Integrity::from_bytes(data, Algorithm::Sha1);
 
         // Write a blob into content-v2/sha1/...
-        let sha1_entry = sha1_integrity.entries.iter().find(|e| e.algorithm == Algorithm::Sha1).unwrap();
+        let sha1_entry = sha1_integrity
+            .entries
+            .iter()
+            .find(|e| e.algorithm == Algorithm::Sha1)
+            .unwrap();
         let hex = data_encoding::HEXLOWER.encode(&sha1_entry.digest);
         let blob_path = cache.blob_path_for_algo(Algorithm::Sha1, &hex);
         std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
         std::fs::write(&blob_path, data).unwrap();
 
         // Fetch by integrity should find it in content-v2/sha1/...
-        let found = cache.get_by_integrity(&sha1_integrity).unwrap().expect("Must resolve sha1 blob");
+        let found = cache
+            .get_by_integrity(&sha1_integrity)
+            .unwrap()
+            .expect("Must resolve sha1 blob");
         assert_eq!(found, data);
     }
-}
 
+    #[test]
+    fn test_registry_scoped_packument_isolation() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let official_registry = "https://registry.npmjs.org/";
+        let test_registry = "http://localhost:4873/";
+        let pkg_name = "shared-component";
+
+        let official_data = br#"{"name":"shared-component","versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/shared-component/-/shared-component-1.0.0.tgz"}}}}"#;
+        let test_data = br#"{"name":"shared-component","versions":{"1.0.0-test.1":{"dist":{"tarball":"http://localhost:4873/shared-component/-/shared-component-1.0.0-test.1.tgz"}}}}"#;
+
+        // Store for both registries
+        cache
+            .put_packument(official_registry, pkg_name, official_data, None)
+            .unwrap();
+        cache
+            .put_packument(test_registry, pkg_name, test_data, None)
+            .unwrap();
+
+        // Retrieve from official registry - must not return test registry data!
+        let (official_entry, retrieved_official) = cache
+            .get_packument(official_registry, pkg_name)
+            .unwrap()
+            .expect("Official registry packument must hit");
+        assert_eq!(retrieved_official, official_data);
+        assert_eq!(
+            official_entry.key,
+            packument_key("https://registry.npmjs.org", pkg_name, None)
+        );
+
+        // Retrieve from test registry - must return test registry data
+        let (_test_entry, retrieved_test) = cache
+            .get_packument(test_registry, pkg_name)
+            .unwrap()
+            .expect("Test registry packument must hit");
+        assert_eq!(retrieved_test, test_data);
+
+        // Verification of trailing slash normalization:
+        // Stored with trailing slash "https://registry.npmjs.org/", query without trailing slash "https://registry.npmjs.org"
+        let (_, retrieved_no_slash) = cache
+            .get_packument("https://registry.npmjs.org", pkg_name)
+            .unwrap()
+            .expect("Trailing slash normalization must hit");
+        assert_eq!(retrieved_no_slash, official_data);
+
+        // Registry isolation check: unpopulated registry must return None (miss)
+        let unpopulated_registry = "https://npm.pkg.github.com/";
+        let miss = cache.get_packument(unpopulated_registry, pkg_name).unwrap();
+        assert!(
+            miss.is_none(),
+            "Querying another registry must return None and not leak cached data"
+        );
+
+        // Blob path inspection
+        let (blob_entry, blob_path) = cache
+            .get_packument_blob_path(official_registry, pkg_name, None)
+            .unwrap()
+            .expect("Packument blob path should exist");
+        assert_eq!(blob_entry.key, official_entry.key);
+        assert!(blob_path.exists());
+
+        // Purge scoped packument
+        cache
+            .purge_packument(test_registry, pkg_name, None)
+            .unwrap();
+        assert!(cache
+            .get_packument(test_registry, pkg_name)
+            .unwrap()
+            .is_none());
+        // Official registry entry should still remain intact!
+        assert!(cache
+            .get_packument(official_registry, pkg_name)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_registry_scoped_packument_with_accept_header() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let registry = "https://registry.npmjs.org";
+        let pkg_name = "lodash";
+
+        let abbrev_accept = "application/vnd.npm.install-v1+json";
+        let full_accept = "application/json";
+
+        let abbrev_data =
+            br#"{"name":"lodash","dist-tags":{"latest":"4.17.21"},"modified":"2023-01-01"}"#;
+        let full_data =
+            br#"{"name":"lodash","readme":"Full lodash documentation","versions":{"4.17.21":{}}}"#;
+
+        // Store abbreviated packument
+        cache
+            .put_packument_with_accept(registry, pkg_name, Some(abbrev_accept), abbrev_data, None)
+            .unwrap();
+
+        // Store full packument
+        cache
+            .put_packument_with_accept(registry, pkg_name, Some(full_accept), full_data, None)
+            .unwrap();
+
+        // Retrieval with specific accept header
+        let (_, ret_abbrev) = cache
+            .get_packument_with_accept(registry, pkg_name, Some(abbrev_accept))
+            .unwrap()
+            .expect("Abbreviated packument must hit");
+        assert_eq!(ret_abbrev, abbrev_data);
+
+        let (_, ret_full) = cache
+            .get_packument_with_accept(registry, pkg_name, Some(full_accept))
+            .unwrap()
+            .expect("Full packument must hit");
+        assert_eq!(ret_full, full_data);
+    }
+
+    #[test]
+    fn test_project_fingerprint_storage() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let proj1 = tempdir().unwrap();
+        let proj2 = tempdir().unwrap();
+
+        assert_eq!(cache.get_project_fingerprint(proj1.path()).unwrap(), None);
+
+        let fp1 = "abcdef1234567890";
+        cache.set_project_fingerprint(proj1.path(), fp1).unwrap();
+        assert_eq!(
+            cache.get_project_fingerprint(proj1.path()).unwrap(),
+            Some(fp1.to_string())
+        );
+
+        // Different project path must not hit
+        assert_eq!(cache.get_project_fingerprint(proj2.path()).unwrap(), None);
+
+        // Update fingerprint
+        let fp1_updated = "9876543210fedcba";
+        cache
+            .set_project_fingerprint(proj1.path(), fp1_updated)
+            .unwrap();
+        assert_eq!(
+            cache.get_project_fingerprint(proj1.path()).unwrap(),
+            Some(fp1_updated.to_string())
+        );
+
+        // Clean cache wipes fingerprints
+        cache.clean().unwrap();
+        assert_eq!(cache.get_project_fingerprint(proj1.path()).unwrap(), None);
+    }
+}

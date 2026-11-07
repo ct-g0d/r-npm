@@ -96,25 +96,46 @@ fn test_version_bump_types_and_preid() {
 
     // 4. premajor with preid=alpha: 2.0.0 -> 3.0.0-alpha.0
     let out = Command::new(rnpm_bin())
-        .args(["version", "premajor", "--preid=alpha", "--no-git-tag-version"])
+        .args([
+            "version",
+            "premajor",
+            "--preid=alpha",
+            "--no-git-tag-version",
+        ])
         .current_dir(project_dir)
         .output()
         .unwrap();
     assert!(out.status.success(), "premajor failed: {:?}", out);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v3.0.0-alpha.0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v3.0.0-alpha.0"
+    );
 
     // 5. prerelease with preid=alpha: 3.0.0-alpha.0 -> 3.0.0-alpha.1
     let out = Command::new(rnpm_bin())
-        .args(["version", "prerelease", "--preid=alpha", "--no-git-tag-version"])
+        .args([
+            "version",
+            "prerelease",
+            "--preid=alpha",
+            "--no-git-tag-version",
+        ])
         .current_dir(project_dir)
         .output()
         .unwrap();
     assert!(out.status.success(), "prerelease failed: {:?}", out);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v3.0.0-alpha.1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v3.0.0-alpha.1"
+    );
 
     // 6. preminor with preid=beta: 3.0.0-alpha.1 -> 3.1.0-beta.0
     let out = Command::new(rnpm_bin())
-        .args(["version", "preminor", "--preid=beta", "--no-git-tag-version"])
+        .args([
+            "version",
+            "preminor",
+            "--preid=beta",
+            "--no-git-tag-version",
+        ])
         .current_dir(project_dir)
         .output()
         .unwrap();
@@ -186,18 +207,30 @@ fn test_version_updates_package_json_and_package_lock() {
 
     // Verify package.json
     let pkg_content = fs::read_to_string(project_dir.join("package.json")).unwrap();
-    assert!(pkg_content.ends_with('\n'), "package.json must end with trailing newline");
+    assert!(
+        pkg_content.ends_with('\n'),
+        "package.json must end with trailing newline"
+    );
     let parsed_pkg: serde_json::Value = serde_json::from_str(&pkg_content).unwrap();
     assert_eq!(parsed_pkg["version"], "1.1.0");
-    assert!(pkg_content.contains("  \"version\": \"1.1.0\""), "Must have 2-space indentation");
+    assert!(
+        pkg_content.contains("  \"version\": \"1.1.0\""),
+        "Must have 2-space indentation"
+    );
 
     // Verify package-lock.json
     let lock_content = fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
-    assert!(lock_content.ends_with('\n'), "package-lock.json must end with trailing newline");
+    assert!(
+        lock_content.ends_with('\n'),
+        "package-lock.json must end with trailing newline"
+    );
     let parsed_lock: serde_json::Value = serde_json::from_str(&lock_content).unwrap();
     assert_eq!(parsed_lock["version"], "1.1.0");
     assert_eq!(parsed_lock["packages"][""]["version"], "1.1.0");
-    assert!(lock_content.contains("  \"version\": \"1.1.0\""), "Must have 2-space indentation");
+    assert!(
+        lock_content.contains("  \"version\": \"1.1.0\""),
+        "Must have 2-space indentation"
+    );
 }
 
 #[test]
@@ -241,12 +274,24 @@ fn test_version_lifecycle_scripts_order_and_ignore() {
     // Test --ignore-scripts
     fs::remove_file(&events_file).unwrap();
     let out_ignore = Command::new(rnpm_bin())
-        .args(["version", "minor", "--no-git-tag-version", "--ignore-scripts"])
+        .args([
+            "version",
+            "minor",
+            "--no-git-tag-version",
+            "--ignore-scripts",
+        ])
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(out_ignore.status.success(), "Failed with --ignore-scripts: {:?}", out_ignore);
-    assert!(!events_file.exists(), "Lifecycle scripts must not run when --ignore-scripts is set");
+    assert!(
+        out_ignore.status.success(),
+        "Failed with --ignore-scripts: {:?}",
+        out_ignore
+    );
+    assert!(
+        !events_file.exists(),
+        "Lifecycle scripts must not run when --ignore-scripts is set"
+    );
 }
 
 #[test]
@@ -280,7 +325,11 @@ fn test_version_git_integration_commit_and_tag() {
         .output()
         .unwrap();
     let commit_msg = String::from_utf8_lossy(&log_out.stdout);
-    assert!(commit_msg.contains("Release 1.0.1"), "Expected message 'Release 1.0.1', got: {}", commit_msg);
+    assert!(
+        commit_msg.contains("Release 1.0.1"),
+        "Expected message 'Release 1.0.1', got: {}",
+        commit_msg
+    );
 
     // Verify annotated git tag
     let describe_out = Command::new("git")
@@ -289,7 +338,10 @@ fn test_version_git_integration_commit_and_tag() {
         .output()
         .unwrap();
     assert!(describe_out.status.success());
-    assert_eq!(String::from_utf8_lossy(&describe_out.stdout).trim(), "v1.0.1");
+    assert_eq!(
+        String::from_utf8_lossy(&describe_out.stdout).trim(),
+        "v1.0.1"
+    );
 
     // Verify tag annotation message
     let tag_out = Command::new("git")
@@ -298,7 +350,10 @@ fn test_version_git_integration_commit_and_tag() {
         .output()
         .unwrap();
     let tag_annotation = String::from_utf8_lossy(&tag_out.stdout);
-    assert!(tag_annotation.contains("Release 1.0.1"), "Expected tag annotation to contain message");
+    assert!(
+        tag_annotation.contains("Release 1.0.1"),
+        "Expected tag annotation to contain message"
+    );
 
     // Verify working copy is clean
     let status_out = Command::new("git")
@@ -306,12 +361,25 @@ fn test_version_git_integration_commit_and_tag() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&status_out.stdout).trim().is_empty(), "Working directory must be clean");
+    assert!(
+        String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty(),
+        "Working directory must be clean"
+    );
 
     // Test dirty working copy check
     fs::write(project_dir.join("tracked.txt"), "hello").unwrap();
-    Command::new("git").args(["add", "tracked.txt"]).current_dir(project_dir).output().unwrap();
-    Command::new("git").args(["commit", "-m", "add tracked"]).current_dir(project_dir).output().unwrap();
+    Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(project_dir)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "add tracked"])
+        .current_dir(project_dir)
+        .output()
+        .unwrap();
     fs::write(project_dir.join("tracked.txt"), "hello world modified").unwrap();
 
     let dirty_out = Command::new(rnpm_bin())
@@ -319,9 +387,16 @@ fn test_version_git_integration_commit_and_tag() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(!dirty_out.status.success(), "Must fail when working copy is dirty");
+    assert!(
+        !dirty_out.status.success(),
+        "Must fail when working copy is dirty"
+    );
     let stderr = String::from_utf8_lossy(&dirty_out.stderr);
-    assert!(stderr.contains("Git working directory not clean"), "Expected clean working dir error, got: {}", stderr);
+    assert!(
+        stderr.contains("Git working directory not clean"),
+        "Expected clean working dir error, got: {}",
+        stderr
+    );
 
     // Test force overrides dirty working copy
     let force_out = Command::new(rnpm_bin())
@@ -329,7 +404,11 @@ fn test_version_git_integration_commit_and_tag() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(force_out.status.success(), "Must succeed with --force on dirty working copy: {:?}", force_out);
+    assert!(
+        force_out.status.success(),
+        "Must succeed with --force on dirty working copy: {:?}",
+        force_out
+    );
 }
 
 #[test]
@@ -362,7 +441,10 @@ fn test_version_no_git_tag_version_skips_git() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(!describe_out.status.success(), "No git tag should have been created");
+    assert!(
+        !describe_out.status.success(),
+        "No git tag should have been created"
+    );
 
     // Verify working copy shows uncommitted change
     let status_out = Command::new("git")
@@ -371,7 +453,10 @@ fn test_version_no_git_tag_version_skips_git() {
         .output()
         .unwrap();
     let status_str = String::from_utf8_lossy(&status_out.stdout);
-    assert!(status_str.contains("package.json"), "package.json should be modified but uncommitted");
+    assert!(
+        status_str.contains("package.json"),
+        "package.json should be modified but uncommitted"
+    );
 
     // 2. Using --git-tag-version=false
     git_commit_all(project_dir, "commit 1.1.0");
@@ -380,7 +465,11 @@ fn test_version_no_git_tag_version_skips_git() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(out2.status.success(), "Failed with --git-tag-version=false: {:?}", out2);
+    assert!(
+        out2.status.success(),
+        "Failed with --git-tag-version=false: {:?}",
+        out2
+    );
     assert_eq!(String::from_utf8_lossy(&out2.stdout).trim(), "v1.1.1");
 
     let describe_out2 = Command::new("git")
@@ -388,7 +477,10 @@ fn test_version_no_git_tag_version_skips_git() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(!describe_out2.status.success(), "No git tag should have been created with --git-tag-version=false");
+    assert!(
+        !describe_out2.status.success(),
+        "No git tag should have been created with --git-tag-version=false"
+    );
 }
 
 #[test]
@@ -411,9 +503,21 @@ fn test_bare_version_display_map_and_json() {
         .unwrap();
     assert!(out.status.success(), "Bare version failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("sample-bare-app': '3.2.1'"), "Output should contain package name and version: {}", stdout);
-    assert!(stdout.contains("npm: '11.20.0'"), "Output should contain npm version: {}", stdout);
-    assert!(stdout.contains("node: '"), "Output should contain node version: {}", stdout);
+    assert!(
+        stdout.contains("sample-bare-app': '3.2.1'"),
+        "Output should contain package name and version: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("npm: '11.20.0'"),
+        "Output should contain npm version: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("node: '"),
+        "Output should contain node version: {}",
+        stdout
+    );
 
     // 2. Bare rnpm version --json
     let out_json = Command::new(rnpm_bin())
@@ -421,8 +525,13 @@ fn test_bare_version_display_map_and_json() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(out_json.status.success(), "Bare version --json failed: {:?}", out_json);
-    let parsed: serde_json::Value = serde_json::from_slice(&out_json.stdout).expect("Output must be valid JSON");
+    assert!(
+        out_json.status.success(),
+        "Bare version --json failed: {:?}",
+        out_json
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("Output must be valid JSON");
     assert_eq!(parsed["sample-bare-app"], "3.2.1");
     assert_eq!(parsed["npm"], "11.20.0");
     assert!(parsed.get("node").is_some());
@@ -446,17 +555,33 @@ fn test_version_allow_same_version() {
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(!out.status.success(), "Should fail when version is not changed without flag");
+    assert!(
+        !out.status.success(),
+        "Should fail when version is not changed without flag"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Version not changed"), "Expected 'Version not changed', got: {}", stderr);
+    assert!(
+        stderr.contains("Version not changed"),
+        "Expected 'Version not changed', got: {}",
+        stderr
+    );
 
     // With --allow-same-version, it should succeed
     let out_allow = Command::new(rnpm_bin())
-        .args(["version", "1.0.0", "--no-git-tag-version", "--allow-same-version"])
+        .args([
+            "version",
+            "1.0.0",
+            "--no-git-tag-version",
+            "--allow-same-version",
+        ])
         .current_dir(project_dir)
         .output()
         .unwrap();
-    assert!(out_allow.status.success(), "Should succeed with --allow-same-version: {:?}", out_allow);
+    assert!(
+        out_allow.status.success(),
+        "Should succeed with --allow-same-version: {:?}",
+        out_allow
+    );
     assert_eq!(String::from_utf8_lossy(&out_allow.stdout).trim(), "v1.0.0");
 }
 
