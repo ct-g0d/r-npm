@@ -552,7 +552,6 @@ pub async fn build_audit_report_with_advisories(
 
     // Scan for vulnerabilities
     let mut vulnerabilities: BTreeMap<String, PackageVulnerability> = BTreeMap::new();
-    let mut vuln_counts = VulnerabilitiesCount::default();
     let mut highest_severity: Option<Severity> = None;
     let mut advisories_found: Vec<AuditAdvisory> = Vec::new();
 
@@ -578,15 +577,6 @@ pub async fn build_audit_report_with_advisories(
                         Some(current) => Some(current.max(sev)),
                         None => Some(sev),
                     };
-
-                    match sev {
-                        Severity::Info => vuln_counts.info += 1,
-                        Severity::Low => vuln_counts.low += 1,
-                        Severity::Moderate => vuln_counts.moderate += 1,
-                        Severity::High => vuln_counts.high += 1,
-                        Severity::Critical => vuln_counts.critical += 1,
-                    }
-                    vuln_counts.total += 1;
 
                     advisories_found.push(AuditAdvisory {
                         id: adv.id.clone(),
@@ -650,11 +640,25 @@ pub async fn build_audit_report_with_advisories(
         }
     }
 
+    // npm 11 counts vulnerable packages using each package's highest severity
+    let mut pkg_vuln_counts = VulnerabilitiesCount::default();
+    for pkg_vuln in vulnerabilities.values() {
+        match pkg_vuln.severity.as_str() {
+            "info" => pkg_vuln_counts.info += 1,
+            "low" => pkg_vuln_counts.low += 1,
+            "moderate" => pkg_vuln_counts.moderate += 1,
+            "high" => pkg_vuln_counts.high += 1,
+            "critical" => pkg_vuln_counts.critical += 1,
+            _ => pkg_vuln_counts.low += 1,
+        }
+        pkg_vuln_counts.total += 1;
+    }
+
     let report = AuditReport {
         audit_report_version: 2,
         vulnerabilities,
         metadata: AuditMetadata {
-            vulnerabilities: vuln_counts.clone(),
+            vulnerabilities: pkg_vuln_counts,
             dependencies: dep_counts,
         },
     };

@@ -3772,96 +3772,139 @@ async fn run_audit_fix(
         advs_by_pkg.entry(adv.name.clone()).or_default().push(adv);
     }
 
+    let lockfile_raw = std::fs::read_to_string(&lock_path)?;
+    let existing_lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_raw)?;
+
     let mut targets_to_update: Vec<String> = Vec::new();
     let mut packages_to_upgrade: BTreeMap<String, (rnpm_core::semver::Version, String)> =
         BTreeMap::new();
-    let mut fixed_advisory_ids: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
-    let mut fixed_counts = audit::VulnerabilitiesCount::default();
     let mut packages_needing_force = 0usize;
     let mut manifest_updates: Vec<(String, String)> = Vec::new();
 
     for (pkg_name, pkg_advs) in &advs_by_pkg {
-        let mut highest_target_ver: Option<rnpm_core::semver::Version> = None;
         let mut old_ver_str = String::new();
-
         for adv in pkg_advs {
             if old_ver_str.is_empty() {
                 old_ver_str = adv.installed_version.clone();
             }
-
-            if let Some(target) = audit::resolve_target_patched_version(
-                adv.patched_versions.as_deref(),
-                &adv.vulnerable_versions,
-            ) {
-                highest_target_ver = match highest_target_ver {
-                    Some(cur) => Some(cur.max(target)),
-                    None => Some(target),
-                };
-            }
         }
+        let installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
+            .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
 
-        let target_ver = match highest_target_ver {
-            Some(v) => v,
-            None => {
-                packages_needing_force += 1;
-                continue;
-            }
-        };
+        let mut in_range_candidates: Vec<rnpm_core::semver::Version> = Vec::new();
+        let mut out_of_range_candidates: Vec<rnpm_core::semver::Version> = Vec::new();
 
-        // Semver compatibility check against declared range
-        let is_compatible = if let Some(declared_range_str) = declared_direct.get(pkg_name) {
-            if let Ok(declared_range) = rnpm_core::semver::Range::parse(declared_range_str) {
-                declared_range.satisfies(&target_ver)
-            } else {
-                false
-            }
-        } else {
-            // Transitive dependency: compatible if not major bump
-            let installed_ver = rnpm_core::semver::Version::parse(&old_ver_str)
-                .unwrap_or_else(|_| rnpm_core::semver::Version::new(0, 0, 0));
-            if installed_ver.major == 0 {
-                target_ver.major == 0 && target_ver.minor == installed_ver.minor
-            } else {
-                target_ver.major == installed_ver.major
-            }
-        };
-
-        if is_compatible || force {
-            packages_to_upgrade.insert(pkg_name.clone(), (target_ver.clone(), old_ver_str.clone()));
+        // 1. Direct dependency in package.json
+        if let Some(declared_range_str) = declared_direct.get(pkg_name) {
+            let declared_range_opt = rnpm_core::semver::Range::parse(declared_range_str).ok();
             for adv in pkg_advs {
-                let is_still_vuln = match rnpm_core::semver::Range::parse(&adv.vulnerable_versions)
-                {
-                    Ok(r) => r.satisfies(&target_ver),
-                    Err(_) => false,
-                };
-                if !is_still_vuln {
-                    let adv_key = format!("{}:{:?}", adv.name, adv.id);
-                    if fixed_advisory_ids.insert(adv_key) {
-                        match adv.severity {
-                            audit::Severity::Info => fixed_counts.info += 1,
-                            audit::Severity::Low => fixed_counts.low += 1,
-                            audit::Severity::Moderate => fixed_counts.moderate += 1,
-                            audit::Severity::High => fixed_counts.high += 1,
-                            audit::Severity::Critical => fixed_counts.critical += 1,
+                if let Some(target) = audit::resolve_target_patched_version(
+                    adv.patched_versions.as_deref(),
+                    &adv.vulnerable_versions,
+                ) {
+                    if let Some(ref r) = declared_range_opt {
+                        if r.satisfies(&target) {
+                            in_range_candidates.push(target);
+                        } else {
+                            out_of_range_candidates.push(target);
                         }
-                        fixed_counts.total += 1;
+                    } else {
+                        out_of_range_candidates.push(target);
                     }
                 }
             }
 
-            if is_compatible {
-                // Compatible fix within current range: install target version
-                // (package.json declared range already allows target_ver, so package.json remains unchanged)
+            if let Some(best_in_range) = in_range_candidates.into_iter().max() {
+                packages_to_upgrade.insert(pkg_name.clone(), (best_in_range, old_ver_str.clone()));
                 targets_to_update.push(pkg_name.clone());
+            } else if force {
+                if let Some(best_out_of_range) = out_of_range_candidates.into_iter().max() {
+                    let target_ver = best_out_of_range;
+                    packages_to_upgrade
+                        .insert(pkg_name.clone(), (target_ver.clone(), old_ver_str.clone()));
+                    let new_range = format!("^{target_ver}");
+                    manifest_updates.push((pkg_name.clone(), new_range));
+                    targets_to_update.push(format!("{pkg_name}@^{target_ver}"));
+                } else {
+                    packages_needing_force += 1;
+                }
             } else {
-                // Incompatible fix with --force: upgrade package.json dependency and install
-                let new_range = format!("^{target_ver}");
-                manifest_updates.push((pkg_name.clone(), new_range));
-                targets_to_update.push(format!("{pkg_name}@^{target_ver}"));
+                packages_needing_force += 1;
             }
         } else {
-            packages_needing_force += 1;
+            // 2. Transitive dependency: must strictly respect what ALL parent packages require
+            let mut parent_ranges: Vec<(String, rnpm_core::semver::Range)> = Vec::new();
+            for parent in existing_lockfile.packages.values() {
+                let empty = BTreeMap::new();
+                let deps = parent.dependencies.as_ref().unwrap_or(&empty);
+                if let Some(r_str) = deps.get(pkg_name) {
+                    if let Ok(r) = rnpm_core::semver::Range::parse(r_str) {
+                        parent_ranges.push((r_str.clone(), r));
+                    }
+                }
+                let opt_deps = parent.optional_dependencies.as_ref().unwrap_or(&empty);
+                if let Some(r_str) = opt_deps.get(pkg_name) {
+                    if let Ok(r) = rnpm_core::semver::Range::parse(r_str) {
+                        parent_ranges.push((r_str.clone(), r));
+                    }
+                }
+            }
+
+            if parent_ranges.is_empty() {
+                continue;
+            }
+
+            for adv in pkg_advs {
+                if let Some(target) = audit::resolve_target_patched_version(
+                    adv.patched_versions.as_deref(),
+                    &adv.vulnerable_versions,
+                ) {
+                    let all_parents_allow = parent_ranges.iter().all(|(_, r)| r.satisfies(&target));
+                    if all_parents_allow && target > installed_ver {
+                        in_range_candidates.push(target);
+                    } else {
+                        out_of_range_candidates.push(target);
+                    }
+                }
+            }
+
+            if let Some(best_in_range) = in_range_candidates.into_iter().max() {
+                packages_to_upgrade.insert(pkg_name.clone(), (best_in_range, old_ver_str.clone()));
+                let allowed_spec = &parent_ranges[0].0;
+                targets_to_update.push(format!("{pkg_name}@{allowed_spec}"));
+            } else {
+                packages_needing_force += 1;
+            }
+        }
+    }
+
+    let mut fixed_counts = audit::VulnerabilitiesCount::default();
+    for (pkg_name, (target_ver, _old_ver)) in &packages_to_upgrade {
+        let mut highest_sev: Option<audit::Severity> = None;
+        if let Some(advs) = advs_by_pkg.get(pkg_name) {
+            for adv in advs {
+                let is_still_vuln = match rnpm_core::semver::Range::parse(&adv.vulnerable_versions)
+                {
+                    Ok(r) => r.satisfies(target_ver),
+                    Err(_) => false,
+                };
+                if !is_still_vuln {
+                    highest_sev = match highest_sev {
+                        Some(cur) => Some(cur.max(adv.severity)),
+                        None => Some(adv.severity),
+                    };
+                }
+            }
+        }
+        if let Some(sev) = highest_sev {
+            match sev {
+                audit::Severity::Info => fixed_counts.info += 1,
+                audit::Severity::Low => fixed_counts.low += 1,
+                audit::Severity::Moderate => fixed_counts.moderate += 1,
+                audit::Severity::High => fixed_counts.high += 1,
+                audit::Severity::Critical => fixed_counts.critical += 1,
+            }
+            fixed_counts.total += 1;
         }
     }
 

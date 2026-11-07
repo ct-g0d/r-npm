@@ -507,4 +507,29 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         "rnpm ci must succeed on fixed project: {:?}",
         ci_out
     );
+
+    // 4. Verify npm ls --all and npm ci succeed if npm is installed on machine
+    let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    if let Ok(npm_ls) = Command::new(npm_cmd)
+        .args(["ls", "--all"])
+        .current_dir(project_dir)
+        .output()
+    {
+        assert!(
+            npm_ls.status.success(),
+            "npm ls --all must succeed on fixed project: {}",
+            String::from_utf8_lossy(&npm_ls.stderr)
+        );
+    }
+    if let Ok(npm_ci) = Command::new(npm_cmd)
+        .args(["ci"])
+        .current_dir(project_dir)
+        .output()
+    {
+        assert!(
+            npm_ci.status.success(),
+            "npm ci must succeed on fixed project: {}",
+            String::from_utf8_lossy(&npm_ci.stderr)
+        );
+    }
 }

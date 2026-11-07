@@ -2872,6 +2872,72 @@ impl Installer {
                 lockfile_name
             ));
         }
+
+        // 5. Internal lockfile consistency check: every dependency declared in the lockfile
+        // must be satisfied by a package resolved according to node_modules lookup rules.
+        let mut missing_dependencies = Vec::new();
+        for (pkg_key, pkg_info) in &lockfile.packages {
+            if platform_skipped_packages.contains(pkg_key) {
+                continue;
+            }
+            if self.options.omit_dev && pkg_info.dev == Some(true) {
+                continue;
+            }
+            if let Some(deps) = &pkg_info.dependencies {
+                for (dep_name, range_str) in deps {
+                    let mut found_node: Option<&LockfilePackage> = None;
+                    let mut curr = pkg_key.as_str();
+                    loop {
+                        let candidate_key = if curr.is_empty() {
+                            format!("node_modules/{dep_name}")
+                        } else {
+                            format!("{curr}/node_modules/{dep_name}")
+                        };
+                        if let Some(p) = lockfile.packages.get(&candidate_key) {
+                            found_node = Some(p);
+                            break;
+                        }
+                        if curr.is_empty() {
+                            break;
+                        }
+                        if let Some(idx) = curr.rfind("/node_modules/") {
+                            curr = &curr[..idx];
+                        } else {
+                            curr = "";
+                        }
+                    }
+
+                    let is_satisfied = if let Some(resolved_pkg) = found_node {
+                        if let Some(ref ver_str) = resolved_pkg.version {
+                            if let (Ok(ver), Ok(range)) =
+                                (Version::parse(ver_str), Range::parse(range_str))
+                            {
+                                range.satisfies(&ver)
+                            } else {
+                                ver_str == range_str
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !is_satisfied {
+                        missing_dependencies.push(format!("{dep_name}@{range_str}"));
+                    }
+                }
+            }
+        }
+
+        if !missing_dependencies.is_empty() {
+            missing_dependencies.sort();
+            missing_dependencies.dedup();
+            return Err(anyhow!(
+                "npm error code EUSAGE\nnpm error Missing: {} from lock file",
+                missing_dependencies.join(", ")
+            ));
+        }
         drop(_meta_span);
         collector.record_phase(Phase::Metadata, metadata_start.elapsed());
 

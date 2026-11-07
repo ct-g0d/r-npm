@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::sleep;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// 4 KiB byte alignment for every file payload inside a `.pack` file.
 pub const PACK_ALIGNMENT: usize = 4096;
@@ -179,6 +179,7 @@ impl<'a> PackInputFile<'a> {
 /// Memory-mapped file buffer or buffered bytes fallback.
 #[derive(Debug)]
 enum PackBuffer {
+    #[allow(dead_code)]
     Mmap(Arc<Mmap>),
     Bytes(Arc<Vec<u8>>),
     Empty,
@@ -714,17 +715,8 @@ impl PackStore {
         let buffer = if pack_len == 0 {
             Arc::new(PackBuffer::Empty)
         } else {
-            match unsafe { Mmap::map(&file) } {
-                Ok(mmap) => Arc::new(PackBuffer::Mmap(Arc::new(mmap))),
-                Err(e) => {
-                    debug!(
-                        "mmap failed for '{}': {e}, falling back to buffered read",
-                        pack_path.display()
-                    );
-                    let bytes = fs::read(&pack_path)?;
-                    Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
-                }
-            }
+            let bytes = fs::read(&pack_path)?;
+            Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
         };
 
         let pack = PackagePack {
@@ -922,11 +914,6 @@ impl PackStore {
         // 4. Update memory-map cache
         let buffer = if pack_bytes.is_empty() {
             Arc::new(PackBuffer::Empty)
-        } else if let Ok(file) = OpenOptions::new().read(true).open(&final_pack) {
-            match unsafe { Mmap::map(&file) } {
-                Ok(mmap) => Arc::new(PackBuffer::Mmap(Arc::new(mmap))),
-                Err(_) => Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes))),
-            }
         } else {
             Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes)))
         };
