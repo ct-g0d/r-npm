@@ -186,8 +186,8 @@ pub(crate) enum Commands {
         #[arg(long = "timing")]
         timing: bool,
 
-        /// Installation layout strategy: hoisted (default npm layout), linked (NTFS junctions to global store), or nested
-        #[arg(long = "install-strategy", value_parser = ["hoisted", "linked", "nested"])]
+        /// Installation layout strategy: hoisted (default npm layout), linked (NTFS junctions to global store), nested, or shallow
+        #[arg(long = "install-strategy", value_parser = ["hoisted", "linked", "nested", "shallow"])]
         install_strategy: Option<String>,
 
         /// Wait for background trash deletions to finish before exiting (default: false)
@@ -310,8 +310,8 @@ pub(crate) enum Commands {
         #[arg(long = "timing")]
         timing: bool,
 
-        /// Installation layout strategy: hoisted (default npm layout), linked (NTFS junctions to global store), or nested
-        #[arg(long = "install-strategy", value_parser = ["hoisted", "linked", "nested"])]
+        /// Installation layout strategy: hoisted (default npm layout), linked (NTFS junctions to global store), nested, or shallow
+        #[arg(long = "install-strategy", value_parser = ["hoisted", "linked", "nested", "shallow"])]
         install_strategy: Option<String>,
 
         /// Wait for background trash deletions to finish before exiting (default: false)
@@ -472,6 +472,10 @@ pub(crate) enum Commands {
         /// Remove from global prefix
         #[arg(short = 'g', long = "global")]
         global: bool,
+
+        /// Custom installation prefix directory
+        #[arg(long = "prefix")]
+        prefix: Option<PathBuf>,
     },
 
     /// Update packages
@@ -784,6 +788,14 @@ pub(crate) enum Commands {
         /// Dependency types to omit (dev, optional, peer)
         #[arg(long, value_delimiter = ',')]
         omit: Vec<String>,
+
+        /// List packages in the global install prefix
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+
+        /// Custom prefix directory
+        #[arg(long = "prefix")]
+        prefix: Option<PathBuf>,
     },
 
     /// Check for outdated packages
@@ -1383,10 +1395,10 @@ pub(crate) enum ConfigAction {
         #[arg(long)]
         location: Option<String>,
     },
-    /// Retrieve a configuration key value
+    /// Retrieve a configuration key value (or list all settings if no key is provided)
     Get {
         /// Configuration key to retrieve
-        key: String,
+        key: Option<String>,
     },
     /// Delete a configuration key
     #[command(alias = "rm", alias = "del")]
@@ -2064,6 +2076,10 @@ where
             // npm accepts the lowercase short form as an alias for --version.
             // clap's generated version flag is -V, so normalize it before parsing.
             result.push("--version".to_string());
+        } else if arg == "--legacy-bundling" {
+            result.push("--install-strategy=nested".to_string());
+        } else if arg == "--global-style" {
+            result.push("--install-strategy=shallow".to_string());
         } else if arg == "-ws" {
             result.push("--workspaces".to_string());
         } else if let Some(rest) = arg.strip_prefix("-ws=") {
@@ -4714,15 +4730,23 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_optional,
             save_prod,
             global,
+            prefix,
         } => {
-            let target_dir = if global {
+            let is_global = global || prefix.is_some();
+            let target_dir = if let Some(p) = prefix {
+                if p.is_absolute() {
+                    p
+                } else {
+                    current_dir.join(p)
+                }
+            } else if global {
                 rnpm_config::find_global_prefix()
             } else {
                 current_dir
             };
             let options = InstallOptions {
                 project_dir: target_dir,
-                is_global: global,
+                is_global,
                 ..Default::default()
             };
             let installer = Installer::new(options)?;
@@ -4731,7 +4755,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_dev,
                 save_optional,
                 save_prod,
-                is_global: global,
+                is_global,
             };
             let summary = installer.uninstall(&uninstall_options)?;
             println!(
@@ -5255,7 +5279,21 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             parseable,
             package_lock_only,
             omit,
+            global,
+            prefix,
         } => {
+            let is_global = global || prefix.is_some();
+            let target_dir = if let Some(p) = prefix {
+                if p.is_absolute() {
+                    p
+                } else {
+                    current_dir.join(p)
+                }
+            } else if global {
+                rnpm_config::find_global_prefix()
+            } else {
+                current_dir
+            };
             let opts = list::ListOptions {
                 packages,
                 depth,
@@ -5265,8 +5303,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 parseable,
                 package_lock_only,
                 omit,
+                is_global,
             };
-            let code = list::run_list(&current_dir, &opts)?;
+            let code = list::run_list(&target_dir, &opts)?;
             if code != 0 {
                 return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
                     exit_code: code,
@@ -6182,11 +6221,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
             }
             ConfigAction::Get { key } => {
-                let config = rnpm_config::Config::load(Some(&current_dir))?;
-                if let Some(val) = config.get(&key) {
-                    println!("{val}");
+                if let Some(key_str) = key {
+                    let config = rnpm_config::Config::load(Some(&current_dir))?;
+                    if let Some(val) = config.get(&key_str) {
+                        println!("{val}");
+                    } else {
+                        println!("undefined");
+                    }
                 } else {
-                    println!("undefined");
+                    let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
+                    let detailed = rnpm_config::Config::load_detailed(opts)?;
+                    print!("{}", detailed.format_text());
                 }
             }
             ConfigAction::Delete {

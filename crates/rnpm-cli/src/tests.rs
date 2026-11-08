@@ -2451,9 +2451,20 @@ fn test_thread5_cli_command_parsing() {
         Commands::Config {
             action: ConfigAction::Get { key },
         } => {
-            assert_eq!(key, "foo");
+            assert_eq!(key, Some("foo".to_string()));
         }
         _ => panic!("Expected Config Get"),
+    }
+
+    // Bare config get (no key specified)
+    let cli = Cli::try_parse_from(["rnpm", "config", "get"]).unwrap();
+    match cli.command {
+        Commands::Config {
+            action: ConfigAction::Get { key },
+        } => {
+            assert!(key.is_none());
+        }
+        _ => panic!("Expected Config Get with no key"),
     }
 
     let cli = Cli::try_parse_from(["rnpm", "config", "delete", "foo", "-g"]).unwrap();
@@ -2626,5 +2637,87 @@ fn test_should_cleanup_trash_gating() {
             "Read-only command '{:?}' must NOT trigger trash cleanup",
             args
         );
+    }
+}
+
+#[test]
+fn test_cli_install_strategy_shallow_and_legacy_aliases() {
+    // 1. Direct shallow install strategy
+    let cli = Cli::try_parse_from(["rnpm", "install", "--install-strategy=shallow"]).unwrap();
+    match cli.command {
+        Commands::Install {
+            install_strategy, ..
+        } => assert_eq!(install_strategy.as_deref(), Some("shallow")),
+        _ => panic!("Expected Commands::Install"),
+    }
+
+    // 2. Normalization of --legacy-bundling -> --install-strategy=nested
+    assert_eq!(
+        normalize_cli_args(["rnpm", "install", "--legacy-bundling"]),
+        vec!["rnpm", "install", "--install-strategy=nested"]
+    );
+    let normalized = normalize_cli_args(["rnpm", "install", "--legacy-bundling"]);
+    let cli = Cli::try_parse_from(&normalized).unwrap();
+    match cli.command {
+        Commands::Install {
+            install_strategy, ..
+        } => assert_eq!(install_strategy.as_deref(), Some("nested")),
+        _ => panic!("Expected Commands::Install with nested strategy"),
+    }
+
+    // 3. Normalization of --global-style -> --install-strategy=shallow
+    assert_eq!(
+        normalize_cli_args(["rnpm", "install", "--global-style"]),
+        vec!["rnpm", "install", "--install-strategy=shallow"]
+    );
+    let normalized = normalize_cli_args(["rnpm", "install", "--global-style"]);
+    let cli = Cli::try_parse_from(&normalized).unwrap();
+    match cli.command {
+        Commands::Install {
+            install_strategy, ..
+        } => assert_eq!(install_strategy.as_deref(), Some("shallow")),
+        _ => panic!("Expected Commands::Install with shallow strategy"),
+    }
+}
+
+#[test]
+fn test_cli_list_uninstall_prefix_and_global() {
+    // 1. list -g and --prefix
+    let cli = Cli::try_parse_from(["rnpm", "list", "-g"]).unwrap();
+    match cli.command {
+        Commands::List {
+            global, prefix, ..
+        } => {
+            assert!(global);
+            assert!(prefix.is_none());
+        }
+        _ => panic!("Expected Commands::List with -g"),
+    }
+
+    let cli = Cli::try_parse_from(["rnpm", "ls", "--prefix", "/custom/prefix"]).unwrap();
+    match cli.command {
+        Commands::List {
+            global, prefix, ..
+        } => {
+            assert!(!global);
+            assert_eq!(prefix, Some(PathBuf::from("/custom/prefix")));
+        }
+        _ => panic!("Expected Commands::List via ls with --prefix"),
+    }
+
+    // 2. uninstall --prefix
+    let cli = Cli::try_parse_from(["rnpm", "uninstall", "--prefix", "/custom/prefix", "cowsay"]).unwrap();
+    match cli.command {
+        Commands::Uninstall {
+            global,
+            prefix,
+            packages,
+            ..
+        } => {
+            assert!(!global);
+            assert_eq!(prefix, Some(PathBuf::from("/custom/prefix")));
+            assert_eq!(packages, vec!["cowsay"]);
+        }
+        _ => panic!("Expected Commands::Uninstall with --prefix"),
     }
 }

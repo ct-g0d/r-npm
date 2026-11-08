@@ -30,6 +30,7 @@ pub enum InstallStrategy {
     Hoisted,
     Linked,
     Nested,
+    Shallow,
 }
 
 impl std::str::FromStr for InstallStrategy {
@@ -40,8 +41,9 @@ impl std::str::FromStr for InstallStrategy {
             "hoisted" => Ok(InstallStrategy::Hoisted),
             "linked" => Ok(InstallStrategy::Linked),
             "nested" => Ok(InstallStrategy::Nested),
+            "shallow" => Ok(InstallStrategy::Shallow),
             other => Err(anyhow!(
-                "Unknown install strategy: '{other}'. Valid strategies are: hoisted, linked, nested"
+                "Unknown install strategy: '{other}'. Valid strategies are: hoisted, linked, nested, shallow"
             )),
         }
     }
@@ -53,6 +55,7 @@ impl std::fmt::Display for InstallStrategy {
             InstallStrategy::Hoisted => write!(f, "hoisted"),
             InstallStrategy::Linked => write!(f, "linked"),
             InstallStrategy::Nested => write!(f, "nested"),
+            InstallStrategy::Shallow => write!(f, "shallow"),
         }
     }
 }

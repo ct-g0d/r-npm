@@ -229,6 +229,8 @@ pub struct TreeOptions {
     pub omit_optional: bool,
     /// Omit peer dependencies.
     pub omit_peer: bool,
+    /// Inspect tree in global prefix (where root node_modules contains installed global packages without root package.json)
+    pub is_global: bool,
 }
 
 /// Discovered package on disk.
@@ -477,6 +479,14 @@ pub fn build_dependency_tree(
                 direct_deps
                     .entry(name.clone())
                     .or_insert((req.clone(), "peer"));
+            }
+        }
+    } else if options.is_global {
+        // In global prefix, the top-level packages directly under node_modules constitute the installed packages
+        for (loc, pkg) in &disk_packages {
+            if loc.starts_with("node_modules/") && loc.matches("node_modules/").count() == 1 {
+                let ver_req = pkg.version.clone().unwrap_or_else(|| "*".to_string());
+                direct_deps.insert(pkg.name.clone(), (ver_req, "prod"));
             }
         }
     }

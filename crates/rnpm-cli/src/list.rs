@@ -23,6 +23,8 @@ pub struct ListOptions {
     pub package_lock_only: bool,
     /// Dependency types to omit (dev, optional, peer)
     pub omit: Vec<String>,
+    /// List packages in the global environment
+    pub is_global: bool,
 }
 
 /// Executes package inspection and prints the dependency tree.
@@ -35,6 +37,7 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
         omit_dev,
         omit_optional,
         omit_peer,
+        is_global: options.is_global,
     };
 
     let mut root_node = build_dependency_tree(project_dir, &tree_opts)?;
