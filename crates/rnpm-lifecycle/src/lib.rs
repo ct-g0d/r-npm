@@ -720,6 +720,39 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
     out
 }
 
+fn flatten_package_json_to_env(
+    prefix: &str,
+    key: &str,
+    val: &serde_json::Value,
+    env: &mut HashMap<String, String>,
+) {
+    let sanitized_key = key.replace('-', "_");
+    let full_key = format!("{prefix}_{sanitized_key}");
+
+    match val {
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(b) => {
+            env.insert(full_key, b.to_string());
+        }
+        serde_json::Value::Number(n) => {
+            env.insert(full_key, n.to_string());
+        }
+        serde_json::Value::String(s) => {
+            env.insert(full_key, s.clone());
+        }
+        serde_json::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                flatten_package_json_to_env(&full_key, &idx.to_string(), item, env);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            for (child_k, child_v) in obj {
+                flatten_package_json_to_env(&full_key, child_k, child_v, env);
+            }
+        }
+    }
+}
+
 /// Builds the scrubbed and populated environment map for the lifecycle script.
 pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
@@ -842,6 +875,19 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         "npm_package_json".to_string(),
         pkg_json.to_string_lossy().to_string(),
     );
+
+    // Populate full npm_package_* environment hierarchy from package.json if present
+    if pkg_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = val.as_object() {
+                    for (k, v) in obj {
+                        flatten_package_json_to_env("npm_package", k, v, &mut env);
+                    }
+                }
+            }
+        }
+    }
 
     let node_str = node_bin.to_string_lossy().to_string();
     env.insert("NODE".to_string(), node_str.clone());
