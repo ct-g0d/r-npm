@@ -24,8 +24,9 @@ pub use block_clone::{
 };
 pub use error::FsError;
 pub use junction::{
-    create_junction, is_junction, junction_points_to, junctions_created, read_junction_target,
-    record_junction_created, remove_dir_all_safe, remove_junction, reset_junctions_created,
+    create_junction, create_link_or_copy, is_junction, junction_points_to, junctions_created,
+    read_junction_target, record_junction_created, remove_dir_all_safe, remove_junction,
+    reset_junctions_created,
 };
 pub use parallel::{extract_batch_parallel, BatchExtractionItem};
 pub use path::{strip_verbatim_prefix, to_verbatim_path};
@@ -36,7 +37,7 @@ pub use tarball::{
     TarLimits, NPM_DEFAULT_FILE_MODE, NPM_EXECUTABLE_FILE_MODE, NPM_PACK_EPOCH_MTIME,
 };
 pub use writer::{
-    decode_tar_entries, detect_seek_penalty, determine_writer_config,
+    copy_file_fast, decode_tar_entries, detect_seek_penalty, determine_writer_config,
     extract_packages_direct_parallel, extract_tarball_direct, materialize_files_parallel,
     materialize_files_parallel_refs, precreate_directories, write_file_fast, BatchDirectItem,
     DecodedTarball, DriveType, MaterializeFile, MaterializeFileRef, ParallelWriterConfig,

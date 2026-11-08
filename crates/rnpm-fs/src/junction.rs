@@ -42,6 +42,43 @@ pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     res
 }
 
+/// Create a directory junction (if target is a directory) or a file symlink/copy (if target is a file).
+pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
+    if let Some(parent) = link.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // If link already exists, remove it first
+    if link.is_symlink() || link.is_file() {
+        let _ = fs::remove_file(link);
+    } else if is_junction(link).unwrap_or(false) {
+        let _ = remove_junction(link);
+    }
+
+    #[cfg(windows)]
+    {
+        if target.is_dir() {
+            create_junction(link, target)
+        } else if target.is_file() {
+            // Target is a file: try symlink_file first, fall back to copy
+            if std::os::windows::fs::symlink_file(target, link).is_err() {
+                fs::copy(target, link).map_err(FsError::Io)?;
+            }
+            Ok(())
+        } else {
+            // Target does not exist yet: try junction first, then symlink_file
+            if let Err(_) = create_junction(link, target) {
+                let _ = std::os::windows::fs::symlink_file(target, link);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).map_err(FsError::Io)
+    }
+}
+
 /// Safely remove a junction or symlink.
 /// Ensures deleting the junction removes ONLY the reparse point, never target contents!
 /// Returns an error if the path exists but is not a junction or symlink.

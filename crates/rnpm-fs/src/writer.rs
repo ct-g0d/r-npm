@@ -522,6 +522,55 @@ pub fn write_file_fast(
     }
 }
 
+/// Copies a file using native OS primitives (CopyFileExW on Windows).
+pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        extern "system" {
+            fn CopyFileExW(
+                lpExistingFileName: *const u16,
+                lpNewFileName: *const u16,
+                lpProgressRoutine: *mut std::ffi::c_void,
+                lpData: *mut std::ffi::c_void,
+                pbCancel: *mut i32,
+                dwCopyFlags: u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        let src_v = crate::path::to_verbatim_path(source);
+        let dst_v = crate::path::to_verbatim_path(destination);
+
+        let src_wide: Vec<u16> = src_v.as_os_str().encode_wide().chain(Some(0)).collect();
+        let dst_wide: Vec<u16> = dst_v.as_os_str().encode_wide().chain(Some(0)).collect();
+
+        let ret = unsafe {
+            CopyFileExW(
+                src_wide.as_ptr(),
+                dst_wide.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if ret == 0 {
+            let err = unsafe { GetLastError() };
+            Err(std::io::Error::from_raw_os_error(err as i32))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::copy(source, destination).map(|_| ())
+    }
+}
+
 /// A file to be materialized into place.
 #[derive(Debug, Clone)]
 pub struct MaterializeFile {
@@ -559,6 +608,7 @@ pub struct MaterializeFileRef<'a> {
     pub data: &'a [u8],
     pub mode: u32,
     pub package_id: Option<&'a str>,
+    pub source_path: Option<&'a Path>,
 }
 
 fn file_ref_lpt_priority(file: &MaterializeFileRef<'_>) -> u64 {
@@ -590,75 +640,127 @@ pub fn materialize_files_parallel_refs<'a>(
 
     let prealloc_thresh = config.preallocate_threshold;
 
-    // Group files by package to maintain directory locality and eliminate cross-thread directory contention
-    let mut package_groups: BTreeMap<String, Vec<MaterializeFileRef<'a>>> = BTreeMap::new();
-    let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
-
-    for file in files {
-        if let Some(pkg) = file.package_id {
-            package_groups
-                .entry(pkg.to_string())
-                .or_default()
-                .push(file);
-        } else {
-            ungrouped.push(file);
-        }
-    }
-
-    // Each package group sorted internally by LPT
-    for group in package_groups.values_mut() {
-        group.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
-    }
-
-    let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
-    batches.sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
-
-    if !ungrouped.is_empty() {
-        ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
-        batches.push(ungrouped);
-    }
-
-    let total_batches = batches.len();
-    let next_pkg = std::sync::atomic::AtomicUsize::new(0);
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
+    } else if std::env::var("RNPM_CONCURRENCY").is_err() {
+        16
     } else {
         config.worker_threads.clamp(1, 32)
     };
-    tracing::debug!(
-        "Materializing {} package batches across {} worker threads",
-        total_batches,
-        num_threads
-    );
-    let batches_slice = &batches[..];
 
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
+    if !config.is_hdd {
+        // On SSD: chunk-level lock-free atomic scheduling across all files to eliminate thread starvation
+        let total_files = files.len();
+        let chunk_size = 64;
+        let next_file = std::sync::atomic::AtomicUsize::new(0);
+        let files_slice = &files[..];
 
-        for _ in 0..num_threads {
-            handles.push(scope.spawn(|| -> Result<(), FsError> {
-                loop {
-                    let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= total_batches {
-                        break;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    loop {
+                        let start = next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                        if start >= total_files {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(total_files);
+                        for file in &files_slice[start..end] {
+                            let mut copied = false;
+                            if let Some(src) = file.source_path {
+                                if copy_file_fast(src, &file.path).is_ok() {
+                                    copied = true;
+                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                }
+                            }
+                            if !copied {
+                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
+                                    .map_err(FsError::Io)?;
+                            }
+                        }
                     }
-                    for file in &batches_slice[idx] {
-                        write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
-                            .map_err(FsError::Io)?;
-                    }
-                }
-                Ok(())
-            }));
+                    Ok(())
+                }));
+            }
+
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
+                })??;
+            }
+
+            Ok(())
+        })
+    } else {
+        // Group files by package to maintain directory locality on HDD
+        let mut package_groups: BTreeMap<String, Vec<MaterializeFileRef<'a>>> = BTreeMap::new();
+        let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
+
+        for file in files {
+            if let Some(pkg) = file.package_id {
+                package_groups
+                    .entry(pkg.to_string())
+                    .or_default()
+                    .push(file);
+            } else {
+                ungrouped.push(file);
+            }
         }
 
-        for handle in handles {
-            handle.join().map_err(|_| {
-                FsError::Io(std::io::Error::other("Materialization worker panicked"))
-            })??;
+        for group in package_groups.values_mut() {
+            group.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
         }
 
-        Ok(())
-    })
+        let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
+        batches.sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
+
+        if !ungrouped.is_empty() {
+            ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+            batches.push(ungrouped);
+        }
+
+        let total_batches = batches.len();
+        let next_pkg = std::sync::atomic::AtomicUsize::new(0);
+        let batches_slice = &batches[..];
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    loop {
+                        let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= total_batches {
+                            break;
+                        }
+                        for file in &batches_slice[idx] {
+                            let mut copied = false;
+                            if let Some(src) = file.source_path {
+                                if copy_file_fast(src, &file.path).is_ok() {
+                                    copied = true;
+                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                }
+                            }
+                            if !copied {
+                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
+                                    .map_err(FsError::Io)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
+                })??;
+            }
+
+            Ok(())
+        })
+    }
 }
 
 /// Writes a batch of files in parallel according to the optimal disk policy:
@@ -675,6 +777,7 @@ pub fn materialize_files_parallel(
             data: &f.data,
             mode: f.mode,
             package_id: f.package_id.as_deref(),
+            source_path: None,
         })
         .collect();
     materialize_files_parallel_refs(refs, config)

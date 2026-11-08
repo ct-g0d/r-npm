@@ -3246,7 +3246,9 @@ impl Installer {
                 }
             }
             let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            let _ = precreate_directories(dir_refs);
+            if let Err(e) = precreate_directories(dir_refs) {
+                warn!("precreate_directories warning: {e}");
+            }
         }
         drop(_plan2_span);
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
@@ -3793,6 +3795,7 @@ impl Installer {
                                 data: slice,
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
+                                source_path: entry.cas_path.as_deref(),
                             });
                         } else {
                             warn!(
@@ -3813,21 +3816,19 @@ impl Installer {
 
                     // 1. Precreate all directories breadth-first in a single pass
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
-                    let _ = precreate_directories(dir_refs);
+                    precreate_directories(dir_refs)
+                        .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
 
                     // 2. Materialize all files globally parallel across threads
                     rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
                         .map_err(|e| anyhow!("{e}"))?;
                     collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
-                    // 3. Recreate symlinks
+                    // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                     for (link_path, target_path) in all_symlinks {
-                        if let Some(parent) = link_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if let Err(e) = rnpm_fs::create_junction(&link_path, &target_path) {
+                        if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
                             warn!(
-                                "Failed to create junction from '{}' to '{}': {e}",
+                                "Failed to create link or copy from '{}' to '{}': {e}",
                                 link_path.display(),
                                 target_path.display()
                             );
@@ -3865,6 +3866,9 @@ impl Installer {
                         collector.record_cache_hit();
                     }
                 }
+            }
+            if !used_fast_path {
+                collector.record_phase(Phase::Materialize, t_mat.elapsed());
             }
         }
 

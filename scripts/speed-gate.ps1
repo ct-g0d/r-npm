@@ -48,48 +48,6 @@ function Get-Median {
     }
 }
 
-# Step 0: Antivirus Asymmetry Probe
-Write-Host "`n[Probe] Running Antivirus Asymmetry Probe (2,000 files in %TEMP%)..." -ForegroundColor Gray
-$probeDirNode = Join-Path $env:TEMP "probe-node-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
-$probeDirNative = Join-Path $env:TEMP "probe-native-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
-New-Item -ItemType Directory -Path $probeDirNode -Force | Out-Null
-New-Item -ItemType Directory -Path $probeDirNative -Force | Out-Null
-
-$nodeScript = @"
-const fs = require('fs');
-const path = require('path');
-const dir = process.argv[1];
-const buf = Buffer.alloc(4096, 65);
-const t0 = Date.now();
-for (let i = 0; i < 2000; i++) {
-  fs.writeFileSync(path.join(dir, 'file-' + i + '.dat'), buf);
-}
-console.log(Date.now() - t0);
-"@
-
-$nodeProbeMs = [double](& node -e $nodeScript $probeDirNode)
-
-$nativeProbeMs = Measure-CommandMs {
-    $buf = [byte[]]::new(4096)
-    for ($i = 0; $i -lt 2000; $i++) {
-        [System.IO.File]::WriteAllBytes((Join-Path $probeDirNative "file-$i.dat"), $buf)
-    }
-}
-
-Remove-Item $probeDirNode -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item $probeDirNative -Recurse -Force -ErrorAction SilentlyContinue
-
-$probeRatio = if ($nodeProbeMs -gt 0) { $nativeProbeMs / $nodeProbeMs } else { 1.0 }
-Write-Host ("  Node.js probe (2k files):   {0,8:N1} ms" -f $nodeProbeMs) -ForegroundColor Gray
-Write-Host ("  Native probe (2k files):    {0,8:N1} ms" -f $nativeProbeMs) -ForegroundColor Gray
-Write-Host ("  Probe penalty ratio:        {0,8:N2}x" -f $probeRatio) -ForegroundColor Gray
-
-$antivirusAsymmetryDetected = ($probeRatio -gt 1.30)
-if ($antivirusAsymmetryDetected) {
-    Write-Host "  [!] Asymmetric antivirus inspection detected (probe penalty ratio > 1.30x)." -ForegroundColor Yellow
-    Write-Host "      node.exe has process/path exclusion, adding ~1.5ms overhead per CreateFile/CloseHandle on non-excluded binaries." -ForegroundColor Yellow
-}
-
 # Step 1: Ensure a warm baseline node_modules exists for robocopy measurement
 $warmBaselineDir = Join-Path $env:TEMP "rnpm-warm-baseline-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
 New-Item -ItemType Directory -Path $warmBaselineDir -Force | Out-Null
@@ -177,12 +135,7 @@ Write-Host (" npm ci median:           {0,8:N1} ms ({1:N2} s)" -f $npmMedian, ($
 Write-Host (" Speedup vs npm:          {0:N2}x faster" -f $ratioVsNpm)
 Write-Host (" Ratio vs robocopy:       {0:N2}x" -f $ratioVsRobo)
 
-if ($antivirusAsymmetryDetected) {
-    Write-Host "`n[INVALID] Benchmark run is marked INVALID due to detected external antivirus asymmetry (probe penalty ratio $([math]::Round($probeRatio, 2))x > 1.5x)" -ForegroundColor Yellow
-    Write-Host "          node.exe has process/path exclusion, adding ~1.5ms overhead per CreateFile/CloseHandle on non-excluded binaries." -ForegroundColor Yellow
-    Write-Host "          Equalize treatment by adding rnpm exclusion (Add-MpPreference -ExclusionProcess $rnpmBin), or running on Dev Drive / clean CI runner." -ForegroundColor Yellow
-    exit 0
-}
+
 
 $gatePassed = $true
 if ($rnpmMedian -gt $npmMedian) {

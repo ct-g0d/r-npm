@@ -58,6 +58,12 @@ pub struct PackFileEntry {
     /// Explicit 4 KiB aligned offset.
     #[serde(default)]
     pub aligned_offset: u64,
+    /// SHA-256 digest hex of the file payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Content-addressed storage path on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cas_path: Option<PathBuf>,
 }
 
 impl PackFileEntry {
@@ -387,23 +393,34 @@ impl PackagePack {
             #[cfg(not(windows))]
             let src_h = None;
 
-            clone_or_write_pack_file(
-                src_h,
-                &full_path,
-                slice,
-                entry.offset,
-                entry.size,
-                entry.mode,
-                prealloc_thresh,
-            )
-            .map_err(CacheError::Io)?;
+            let mut copied = false;
+            if !can_block_clone {
+                if let Some(ref cas_path) = entry.cas_path {
+                    if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                        copied = true;
+                        rnpm_fs::record_file_created(entry.size);
+                    }
+                }
+            }
+            if !copied {
+                clone_or_write_pack_file(
+                    src_h,
+                    &full_path,
+                    slice,
+                    entry.offset,
+                    entry.size,
+                    entry.mode,
+                    prealloc_thresh,
+                )
+                .map_err(CacheError::Io)?;
+            }
         }
 
         // 3. Recreate symlinks if any
         for (link_rel, target_rel) in &self.index.symlinks {
             let link_path = target_dir.join(link_rel);
             let target_path = target_dir.join(target_rel);
-            let _ = rnpm_fs::junction::create_junction(&link_path, &target_path);
+            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
         }
 
         let elapsed = start_time.elapsed();
@@ -481,6 +498,57 @@ impl PackStore {
     /// Directory for atomic write temporary files: `<root>/tmp`.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+
+    /// Directory storing extracted Content-Addressed files: `<root>/cas`.
+    pub fn cas_dir(&self) -> PathBuf {
+        self.root.join("cas")
+    }
+
+    /// Returns the CAS file path for a given SHA-256 hex digest: `<root>/cas/<sha256[0..2]>/<sha256>`.
+    pub fn cas_file_path(&self, sha256_hex: &str) -> PathBuf {
+        let prefix = if sha256_hex.len() >= 2 {
+            &sha256_hex[0..2]
+        } else {
+            "00"
+        };
+        self.cas_dir().join(prefix).join(sha256_hex)
+    }
+
+    /// Atomically writes file data into CAS if not already present.
+    pub fn write_cas_file(&self, cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if cas_path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = cas_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let tmp_dir = self.tmp_dir();
+        let _ = fs::create_dir_all(&tmp_dir);
+        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let tmp_path = tmp_dir.join(format!("cas_{pid}_{count}.tmp"));
+
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            f.write_all(data)?;
+            f.flush()?;
+        }
+
+        match rename_atomic(&tmp_path, cas_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                if cas_path.exists() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Returns the (pack_path, idx_path) tuple for an integrity hash.
@@ -738,6 +806,34 @@ impl PackStore {
             }
         };
 
+        let mut index = index;
+        let buf_data = buffer.data();
+        for entry in &mut index.files {
+            let sha = match entry.sha256 {
+                Some(ref s) => s.clone(),
+                None => {
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    if end <= buf_data.len() {
+                        let h = HEXLOWER.encode(&Sha256::digest(&buf_data[start..end]));
+                        entry.sha256 = Some(h.clone());
+                        h
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let cas_file = self.cas_file_path(&sha);
+            if !cas_file.exists() {
+                let start = entry.offset as usize;
+                let end = start + entry.size as usize;
+                if end <= buf_data.len() {
+                    let _ = self.write_cas_file(&cas_file, &buf_data[start..end]);
+                }
+            }
+            entry.cas_path = Some(cas_file);
+        }
+
         let pack = PackagePack {
             index,
             buffer,
@@ -868,12 +964,18 @@ impl PackStore {
                 }));
             }
 
+            let sha256_hex = HEXLOWER.encode(&Sha256::digest(file.data));
+            let cas_path = self.cas_file_path(&sha256_hex);
+            let _ = self.write_cas_file(&cas_path, file.data);
+
             index_files.push(PackFileEntry {
                 path: file.path,
                 mode: file.mode,
                 size: file.data.len() as u64,
                 offset: aligned_offset as u64,
                 aligned_offset: aligned_offset as u64,
+                sha256: Some(sha256_hex),
+                cas_path: Some(cas_path),
             });
         }
 
