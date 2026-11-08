@@ -450,6 +450,8 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
             if let Some(rest) = url.strip_prefix("github:") {
                 let repo = rest.trim_end_matches(".git");
                 format!("git+ssh://git@github.com/{repo}.git#{commit_sha}")
+            } else if url.starts_with("git://") {
+                format!("git+{url}#{commit_sha}")
             } else if let Some(idx) = url.find("github.com/") {
                 let repo = url[idx + "github.com/".len()..].trim_end_matches(".git");
                 format!("git+ssh://git@github.com/{repo}.git#{commit_sha}")
@@ -498,6 +500,16 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
 }
 
 /// Recursively copies directory tree from `src` to `dst`, respecting npm packaging rules when package.json is present.
+fn copy_git_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let bytes = std::fs::read(source)?;
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        std::fs::write(destination, normalized.as_bytes())
+    } else {
+        std::fs::write(destination, bytes)
+    }
+}
+
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
@@ -511,7 +523,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
                     if let Some(p) = to.parent() {
                         let _ = std::fs::create_dir_all(p);
                     }
-                    std::fs::copy(&file_path, &to).with_context(|| {
+                    copy_git_file(&file_path, &to).with_context(|| {
                         format!(
                             "Failed to copy '{}' -> '{}'",
                             file_path.display(),
@@ -545,10 +557,10 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             }
             #[cfg(windows)]
             {
-                let _ = std::fs::copy(&from, &to);
+                let _ = copy_git_file(&from, &to);
             }
         } else {
-            std::fs::copy(&from, &to).with_context(|| {
+            copy_git_file(&from, &to).with_context(|| {
                 format!("Failed to copy '{}' -> '{}'", from.display(), to.display())
             })?;
         }

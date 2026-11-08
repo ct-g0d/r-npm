@@ -45,7 +45,7 @@ pub const PACK_ALIGNMENT: usize = 4096;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A single file entry inside the `.idx` pack index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackFileEntry {
     /// Relative path within the package (e.g. "package.json", "lib/index.js").
     pub path: String,
@@ -64,7 +64,23 @@ pub struct PackFileEntry {
     /// Content-addressed storage path on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cas_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub cas_verified: bool,
 }
+
+impl PartialEq for PackFileEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.mode == other.mode
+            && self.size == other.size
+            && self.offset == other.offset
+            && self.aligned_offset == other.aligned_offset
+            && self.sha256 == other.sha256
+            && self.cas_path == other.cas_path
+    }
+}
+
+impl Eq for PackFileEntry {}
 
 impl PackFileEntry {
     /// Check whether the file payload offset satisfies 4 KiB alignment.
@@ -396,9 +412,31 @@ impl PackagePack {
             let mut copied = false;
             if !can_block_clone {
                 if let Some(ref cas_path) = entry.cas_path {
-                    if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                    let cas_valid = cas_path.is_file()
+                        && cas_path
+                            .metadata()
+                            .map(|metadata| metadata.len() == entry.size)
+                            .unwrap_or(false)
+                        && entry.sha256.as_deref().is_some_and(|expected| {
+                            fs::read(cas_path)
+                                .map(|bytes| HEXLOWER.encode(&Sha256::digest(&bytes)) == expected)
+                                .unwrap_or(false)
+                        });
+                    if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
                         copied = true;
                         rnpm_fs::record_file_created(entry.size);
+                    } else if cas_path.exists() {
+                        // A stale or corrupted CAS entry must never be trusted. Rebuild it from
+                        // the verified pack slice, then materialize the destination from memory.
+                        let _ = fs::remove_file(cas_path);
+                        if let Some(parent) = cas_path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        rnpm_fs::write_file_fast(cas_path, slice, entry.mode, prealloc_thresh)
+                            .map_err(CacheError::Io)?;
+                        rnpm_fs::write_file_fast(&full_path, slice, entry.mode, prealloc_thresh)
+                            .map_err(CacheError::Io)?;
+                        copied = true;
                     }
                 }
             }
@@ -824,14 +862,26 @@ impl PackStore {
                 }
             };
             let cas_file = self.cas_file_path(&sha);
-            if !cas_file.exists() {
+            let mut cas_verified = cas_file
+                .metadata()
+                .map(|metadata| metadata.len() == entry.size)
+                .unwrap_or(false)
+                && fs::read(&cas_file)
+                    .map(|bytes| HEXLOWER.encode(&Sha256::digest(&bytes)) == sha)
+                    .unwrap_or(false);
+            if !cas_verified {
+                if cas_file.exists() {
+                    let _ = fs::remove_file(&cas_file);
+                }
                 let start = entry.offset as usize;
                 let end = start + entry.size as usize;
                 if end <= buf_data.len() {
                     let _ = self.write_cas_file(&cas_file, &buf_data[start..end]);
+                    cas_verified = cas_file.is_file();
                 }
             }
             entry.cas_path = Some(cas_file);
+            entry.cas_verified = cas_verified;
         }
 
         let pack = PackagePack {
@@ -877,6 +927,26 @@ impl PackStore {
         &self,
         integrity: &str,
         files: &[PackInputFile<'_>],
+    ) -> Result<PackIndex, CacheError> {
+        self.put_package_pack_with_cas(integrity, files, true)
+    }
+
+    /// Builds a pack/index without synchronously creating one CAS file per entry.
+    /// The pack is immediately usable for direct materialization; callers can populate CAS
+    /// asynchronously when the install path must not wait on thousands of small writes.
+    pub fn put_package_pack_deferred(
+        &self,
+        integrity: &str,
+        files: &[PackInputFile<'_>],
+    ) -> Result<PackIndex, CacheError> {
+        self.put_package_pack_with_cas(integrity, files, false)
+    }
+
+    fn put_package_pack_with_cas(
+        &self,
+        integrity: &str,
+        files: &[PackInputFile<'_>],
+        populate_cas: bool,
     ) -> Result<PackIndex, CacheError> {
         let (prefix, safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
 
@@ -966,8 +1036,6 @@ impl PackStore {
 
             let sha256_hex = HEXLOWER.encode(&Sha256::digest(file.data));
             let cas_path = self.cas_file_path(&sha256_hex);
-            let _ = self.write_cas_file(&cas_path, file.data);
-
             index_files.push(PackFileEntry {
                 path: file.path,
                 mode: file.mode,
@@ -976,6 +1044,7 @@ impl PackStore {
                 aligned_offset: aligned_offset as u64,
                 sha256: Some(sha256_hex),
                 cas_path: Some(cas_path),
+                cas_verified: populate_cas,
             });
         }
 
@@ -991,6 +1060,10 @@ impl PackStore {
         };
         if padded_len > unpadded_len {
             pack_bytes.resize(padded_len, 0u8);
+        }
+
+        if populate_cas && !index_files.is_empty() {
+            self.populate_cas_parallel(&index_files, &pack_bytes);
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
@@ -1072,11 +1145,53 @@ impl PackStore {
         Ok(index)
     }
 
+    fn populate_cas_parallel(&self, entries: &[PackFileEntry], pack_bytes: &[u8]) {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = entries.len().min(16);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= entries.len() {
+                        break;
+                    }
+                    let entry = &entries[index];
+                    let start = entry.offset as usize;
+                    let end = start.saturating_add(entry.size as usize);
+                    if end <= pack_bytes.len() {
+                        let _ = self.write_cas_file(
+                            entry.cas_path.as_ref().expect("CAS path is indexed"),
+                            &pack_bytes[start..end],
+                        );
+                    }
+                });
+            }
+        });
+    }
+
     /// Extract a tarball into the pack store atomically.
     pub fn put_package_from_tarball(
         &self,
         integrity: &str,
         tarball_bytes: &[u8],
+    ) -> Result<PackIndex, CacheError> {
+        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, true)
+    }
+
+    /// Cold-install variant that defers per-file CAS writes.
+    pub fn put_package_from_tarball_deferred(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+    ) -> Result<PackIndex, CacheError> {
+        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, false)
+    }
+
+    fn put_package_from_tarball_with_cas(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        populate_cas: bool,
     ) -> Result<PackIndex, CacheError> {
         let trimmed = integrity.trim();
         if !trimmed.is_empty() {
@@ -1259,7 +1374,37 @@ impl PackStore {
             })
             .collect();
 
-        self.put_package_pack(integrity, &input_files)
+        self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
+    }
+
+    /// Populate missing CAS entries without blocking the caller.
+    pub fn populate_cas_async(&self, integrity: &str) {
+        let store = self.clone();
+        let integrity = integrity.to_string();
+        std::thread::spawn(move || {
+            let Ok(Some(pack)) = store.get_package_pack(&integrity) else {
+                return;
+            };
+            let data = pack.data();
+            for entry in &pack.index.files {
+                let Some(cas_path) = entry.cas_path.as_ref() else {
+                    continue;
+                };
+                if cas_path.is_file()
+                    && cas_path
+                        .metadata()
+                        .map(|m| m.len() == entry.size)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let start = entry.offset as usize;
+                let end = start.saturating_add(entry.size as usize);
+                if end <= data.len() {
+                    let _ = store.write_cas_file(cas_path, &data[start..end]);
+                }
+            }
+        });
     }
 
     /// Checks whether block cloning from this store into `target_dir` is supported,
@@ -1649,6 +1794,28 @@ mod tests {
 
         let file_js = fs::read_to_string(target_dir.path().join("nested/deep/file.js")).unwrap();
         assert_eq!(file_js, "module.exports = true;");
+    }
+
+    #[test]
+    fn test_corrupted_cas_blob_auto_repair() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-casrepair1234567890==";
+        let files = [PackInputFile::new("index.js", 0o644, b"original content")];
+        let index = store.put_package_pack(integrity, &files).unwrap();
+        let cas_path = index.files[0].cas_path.clone().unwrap();
+        fs::write(&cas_path, b"CORRUPTED").unwrap();
+
+        let target = tempdir().unwrap();
+        store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(target.path().join("index.js")).unwrap(),
+            b"original content"
+        );
+        assert_eq!(fs::read(cas_path).unwrap(), b"original content");
     }
 
     #[test]

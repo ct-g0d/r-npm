@@ -705,15 +705,48 @@ pub(crate) fn process_installed_pkg_manifest(
         return None;
     }
     let pkg_manifest = Manifest::from_file(&pkg_manifest_path).ok()?;
+    link_installed_pkg_bins(target_path, pkg_bin_dir, &pkg_manifest, collector);
+
+    lifecycle_node_for_manifest(
+        target_path,
+        pkg_key,
+        resolved_url,
+        declared_dependencies,
+        is_optional,
+        pkg_manifest,
+    )
+}
+
+fn link_installed_pkg_bins(
+    target_path: &Path,
+    pkg_bin_dir: &Path,
+    pkg_manifest: &Manifest,
+    collector: &TimingCollector,
+) {
     let t_bins = std::time::Instant::now();
     for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+        if pkg_bin_dir.join(&bin_name).exists()
+            || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
+            || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
+        {
+            continue;
+        }
         let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, &script_rel);
         let script_path = target_path.join(&script_rel);
         let _ = normalize_shebang(&script_path);
         let _ = create_shims(pkg_bin_dir, &bin_name, &target_rel);
     }
     collector.record_phase(Phase::Bins, t_bins.elapsed());
+}
 
+fn lifecycle_node_for_manifest(
+    target_path: &Path,
+    pkg_key: &str,
+    resolved_url: &str,
+    declared_dependencies: &[String],
+    is_optional: bool,
+    pkg_manifest: Manifest,
+) -> Option<LifecyclePackageNode> {
     let is_file_archive = resolved_url.starts_with("file:");
     let source = if is_file_archive {
         PackageSource::LocalTarball
@@ -742,6 +775,34 @@ pub(crate) fn process_installed_pkg_manifest(
     } else {
         None
     }
+}
+
+fn process_installed_pkg_manifest_without_bins(
+    target_path: &Path,
+    pkg_key: &str,
+    resolved_url: &str,
+    declared_dependencies: &[String],
+    is_optional: bool,
+) -> Option<LifecyclePackageNode> {
+    let pkg_manifest = Manifest::from_file(target_path.join("package.json")).ok()?;
+    lifecycle_node_for_manifest(
+        target_path,
+        pkg_key,
+        resolved_url,
+        declared_dependencies,
+        is_optional,
+        pkg_manifest,
+    )
+}
+
+type CiPackage = (String, String, String, bool, Vec<String>, bool);
+
+fn sort_packages_for_bin_linking(packages: &mut [CiPackage]) {
+    packages.sort_by(|a, b| {
+        let depth_a = a.0.split('/').count();
+        let depth_b = b.0.split('/').count();
+        depth_a.cmp(&depth_b).then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -2385,6 +2446,14 @@ impl Installer {
         }
 
         let mut join_set = tokio::task::JoinSet::new();
+        let mut bin_download_order = packages_to_download.clone();
+        bin_download_order.sort_by(|a, b| {
+            a.0.split('/')
+                .count()
+                .cmp(&b.0.split('/').count())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let unlocked_packages = self.options.unlocked_packages.clone();
 
         for (loc, node) in packages_to_download {
             let sem = Arc::clone(&semaphore);
@@ -2392,8 +2461,7 @@ impl Installer {
             let pack_store = Arc::clone(&self.pack_store);
             let registry_client = self.registry_client.clone();
             let project_dir = loc_base_dir.clone();
-            let root_bin = root_bin_dir.clone();
-            let root_nm = node_modules_dir.clone();
+            let worker_unlocked_packages = unlocked_packages.clone();
             let offline = self.options.offline;
             let worker_collector = collector.clone();
             let pkg_writer_cfg = Arc::clone(&writer_cfg);
@@ -2414,8 +2482,6 @@ impl Installer {
                 if !cleaned_dest.starts_with(&cleaned_project) {
                     return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
                 }
-
-                let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin, &root_nm);
 
                 if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&dest_dir);
@@ -2444,13 +2510,6 @@ impl Installer {
                                 let mut lifecycle_node = None;
                                 if pkg_manifest_path.exists() {
                                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                                            let target_rel = compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
-                                            let script_path = dest_dir.join(&script_rel);
-                                            let _ = normalize_shebang(&script_path);
-                                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
-                                        }
-
                                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
                                             || pkg_manifest.scripts.contains_key("postinstall");
@@ -2492,6 +2551,21 @@ impl Installer {
                         match integ_str.parse::<Integrity>() {
                             Ok(i) => Some(i),
                             Err(e) => {
+                                // Targeted updates retain satisfying, already-installed
+                                // transitive packages. Older lockfiles may contain placeholder
+                                // integrity values for those entries; do not refetch or reject a
+                                // package that was not unlocked and is present on disk.
+                                let location_name = loc
+                                    .strip_prefix("node_modules/")
+                                    .unwrap_or(&loc)
+                                    .rsplit("/node_modules/")
+                                    .next()
+                                    .unwrap_or(&loc);
+                                if !worker_unlocked_packages.is_empty()
+                                    && !worker_unlocked_packages.contains(location_name)
+                                {
+                                    return Ok(Some((true, None)));
+                                }
                                 if node.flags.optional {
                                     warn!(
                                         "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
@@ -2716,17 +2790,6 @@ impl Installer {
 
                 if pkg_manifest_path.exists() {
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        let t_bins = std::time::Instant::now();
-                        let _bins_span = tracing::info_span!("bins", package = %loc).entered();
-                        for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                            let target_rel = compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
-                            let script_path = dest_dir.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
-                        }
-                        drop(_bins_span);
-                        worker_collector.record_phase(Phase::Bins, t_bins.elapsed());
-
                         let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
                             || pkg_manifest.scripts.contains_key("postinstall");
@@ -2765,6 +2828,17 @@ impl Installer {
                 if let Some(l_node) = lifecycle_node {
                     lifecycle_nodes.push(l_node);
                 }
+            }
+        }
+
+        // Link package bins after materialization in npm's shallowest-first order. This makes
+        // an already-linked enclosing bin win over a nested package with the same name.
+        for (loc, _node) in &bin_download_order {
+            let target_path = loc_base_dir.join(loc);
+            let pkg_bin_dir =
+                find_enclosing_bin_dir(&target_path, &root_bin_dir, &node_modules_dir);
+            if let Ok(pkg_manifest) = Manifest::from_file(target_path.join("package.json")) {
+                link_installed_pkg_bins(&target_path, &pkg_bin_dir, &pkg_manifest, &collector);
             }
         }
 
@@ -3314,8 +3388,7 @@ impl Installer {
             }
         }
 
-        let mut packages_to_process: Vec<(String, String, String, bool, Vec<String>, bool)> =
-            Vec::new();
+        let mut packages_to_process: Vec<CiPackage> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() {
@@ -3742,6 +3815,8 @@ impl Installer {
                 });
 
         let mut used_fast_path = false;
+        let mut bin_packages = packages_to_process.clone();
+        sort_packages_for_bin_linking(&mut bin_packages);
 
         if all_packs_available {
             let t_mat = std::time::Instant::now();
@@ -3796,6 +3871,8 @@ impl Installer {
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
                                 source_path: entry.cas_path.as_deref(),
+                                expected_sha256: entry.sha256.as_deref(),
+                                source_verified: entry.cas_verified,
                             });
                         } else {
                             warn!(
@@ -3843,7 +3920,7 @@ impl Installer {
                         is_optional,
                         declared_dependencies,
                         has_bins_or_scripts,
-                    ) in &packages_to_process
+                    ) in &bin_packages
                     {
                         let target_path = loc_base_dir.join(pkg_key);
                         let pkg_bin_dir =
@@ -3890,8 +3967,6 @@ impl Installer {
                 let pack_store = Arc::clone(&self.pack_store);
                 let registry_client = self.registry_client.clone();
                 let project_dir = loc_base_dir.clone();
-                let root_bin = bin_dir.clone();
-                let root_nm = node_modules_dir.clone();
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
                 let pkg_writer_cfg = Arc::clone(&ci_writer_cfg);
@@ -3900,8 +3975,6 @@ impl Installer {
                     let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
                     let target_path = project_dir.join(&pkg_key);
-                    let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &root_bin, &root_nm);
-
                     if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
                         let _ = rnpm_fs::remove_junction(&target_path);
                     }
@@ -3933,14 +4006,12 @@ impl Installer {
                         match mat_res {
                             Ok(_) => {
                                 let lifecycle_node = if has_bins_or_scripts {
-                                    process_installed_pkg_manifest(
+                                    process_installed_pkg_manifest_without_bins(
                                         &target_path,
-                                        &pkg_bin_dir,
                                         &pkg_key,
                                         &resolved_url,
                                         &declared_dependencies,
                                         is_optional,
-                                        &worker_collector,
                                     )
                                 } else {
                                     None
@@ -4157,14 +4228,12 @@ impl Installer {
                     worker_collector.record_phase(Phase::Inflate, extract_res.inflate_duration);
 
                     let lifecycle_node = if has_bins_or_scripts {
-                        process_installed_pkg_manifest(
+                        process_installed_pkg_manifest_without_bins(
                             &target_path,
-                            &pkg_bin_dir,
                             &pkg_key,
                             &resolved_url,
                             &declared_dependencies,
                             is_optional,
-                            &worker_collector,
                         )
                     } else {
                         None
@@ -4189,6 +4258,27 @@ impl Installer {
                     if let Some(l_node) = lifecycle_node {
                         lifecycle_nodes.push(l_node);
                     }
+                }
+            }
+
+            // Link bins only after every package has been materialized. npm processes package
+            // locations shallowest-first, so an enclosing bin always wins a later conflict.
+            for (
+                pkg_key,
+                _resolved_url,
+                _integrity,
+                _is_optional,
+                _declared_dependencies,
+                has_bins_or_scripts,
+            ) in &bin_packages
+            {
+                if !has_bins_or_scripts {
+                    continue;
+                }
+                let target_path = loc_base_dir.join(pkg_key);
+                let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
+                if let Ok(pkg_manifest) = Manifest::from_file(target_path.join("package.json")) {
+                    link_installed_pkg_bins(&target_path, &pkg_bin_dir, &pkg_manifest, &collector);
                 }
             }
         }

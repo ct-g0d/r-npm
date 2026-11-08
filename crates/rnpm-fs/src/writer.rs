@@ -5,6 +5,7 @@ use crate::tarball::{
 };
 use flate2::read::GzDecoder;
 use path_clean::clean;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -609,6 +610,34 @@ pub struct MaterializeFileRef<'a> {
     pub mode: u32,
     pub package_id: Option<&'a str>,
     pub source_path: Option<&'a Path>,
+    /// Expected SHA-256 for a source CAS file, when available.
+    pub expected_sha256: Option<&'a str>,
+    /// Set when the owning pack store verified the CAS blob before dispatch.
+    pub source_verified: bool,
+}
+
+fn cas_file_is_valid(path: &Path, data_len: usize, expected_sha256: Option<&str>) -> bool {
+    let Some(expected_sha256) = expected_sha256 else {
+        return path.is_file();
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != data_len as u64 {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes)) == expected_sha256
+}
+
+fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usize) {
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = write_file_fast(path, data, mode, prealloc_threshold);
 }
 
 fn file_ref_lpt_priority(file: &MaterializeFileRef<'_>) -> u64 {
@@ -659,7 +688,8 @@ pub fn materialize_files_parallel_refs<'a>(
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| -> Result<(), FsError> {
                     loop {
-                        let start = next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                        let start =
+                            next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
                         if start >= total_files {
                             break;
                         }
@@ -667,16 +697,42 @@ pub fn materialize_files_parallel_refs<'a>(
                         for file in &files_slice[start..end] {
                             let mut copied = false;
                             if let Some(src) = file.source_path {
-                                if copy_file_fast(src, &file.path).is_ok() {
-                                    copied = true;
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        if file.mode & 0o111 != 0 {
-                                            let _ = std::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(file.mode));
-                                        }
+                                if src.exists() {
+                                    let mut cas_valid = file.source_verified
+                                        && std::fs::metadata(src)
+                                            .map(|metadata| {
+                                                metadata.len() == file.data.len() as u64
+                                            })
+                                            .unwrap_or(false);
+                                    if !cas_valid {
+                                        cas_valid = cas_file_is_valid(
+                                            src,
+                                            file.data.len(),
+                                            file.expected_sha256,
+                                        );
                                     }
-                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                    if !cas_valid {
+                                        repair_cas_file(src, file.data, file.mode, prealloc_thresh);
+                                        cas_valid = cas_file_is_valid(
+                                            src,
+                                            file.data.len(),
+                                            file.expected_sha256,
+                                        );
+                                    }
+                                    if cas_valid && copy_file_fast(src, &file.path).is_ok() {
+                                        copied = true;
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            if file.mode & 0o111 != 0 {
+                                                let _ = std::fs::set_permissions(
+                                                    &file.path,
+                                                    std::fs::Permissions::from_mode(file.mode),
+                                                );
+                                            }
+                                        }
+                                        crate::tarball::record_file_created(file.data.len() as u64);
+                                    }
                                 }
                             }
                             if !copied {
@@ -718,7 +774,8 @@ pub fn materialize_files_parallel_refs<'a>(
         }
 
         let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
-        batches.sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
+        batches
+            .sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
 
         if !ungrouped.is_empty() {
             ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
@@ -742,16 +799,42 @@ pub fn materialize_files_parallel_refs<'a>(
                         for file in &batches_slice[idx] {
                             let mut copied = false;
                             if let Some(src) = file.source_path {
-                                if copy_file_fast(src, &file.path).is_ok() {
-                                    copied = true;
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        if file.mode & 0o111 != 0 {
-                                            let _ = std::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(file.mode));
-                                        }
+                                if src.exists() {
+                                    let mut cas_valid = file.source_verified
+                                        && std::fs::metadata(src)
+                                            .map(|metadata| {
+                                                metadata.len() == file.data.len() as u64
+                                            })
+                                            .unwrap_or(false);
+                                    if !cas_valid {
+                                        cas_valid = cas_file_is_valid(
+                                            src,
+                                            file.data.len(),
+                                            file.expected_sha256,
+                                        );
                                     }
-                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                    if !cas_valid {
+                                        repair_cas_file(src, file.data, file.mode, prealloc_thresh);
+                                        cas_valid = cas_file_is_valid(
+                                            src,
+                                            file.data.len(),
+                                            file.expected_sha256,
+                                        );
+                                    }
+                                    if cas_valid && copy_file_fast(src, &file.path).is_ok() {
+                                        copied = true;
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            if file.mode & 0o111 != 0 {
+                                                let _ = std::fs::set_permissions(
+                                                    &file.path,
+                                                    std::fs::Permissions::from_mode(file.mode),
+                                                );
+                                            }
+                                        }
+                                        crate::tarball::record_file_created(file.data.len() as u64);
+                                    }
                                 }
                             }
                             if !copied {
@@ -790,6 +873,8 @@ pub fn materialize_files_parallel(
             mode: f.mode,
             package_id: f.package_id.as_deref(),
             source_path: None,
+            expected_sha256: None,
+            source_verified: false,
         })
         .collect();
     materialize_files_parallel_refs(refs, config)

@@ -41,19 +41,23 @@ function Compare-Directories {
         return @{ Identical = $false; Reason = "One directory missing (A: $(Test-Path $PathA), B: $(Test-Path $PathB))" }
     }
 
-    $filesA = Get-ChildItem -Path $PathA -Recurse -File | Where-Object { $_.FullName -notmatch [regex]::Escape($PathA) + "[\\/]\.rnpm" }
-    $filesB = Get-ChildItem -Path $PathB -Recurse -File | Where-Object { $_.FullName -notmatch [regex]::Escape($PathB) + "[\\/]\.rnpm" }
+    $filesA = Get-ChildItem -Path $PathA -Recurse -File | Where-Object {
+        $_.FullName.Substring($PathA.Length).TrimStart('\', '/') -notmatch '(^|[\\/])\.rnpm[^\\/]*([\\/]|$)'
+    }
+    $filesB = Get-ChildItem -Path $PathB -Recurse -File | Where-Object {
+        $_.FullName.Substring($PathB.Length).TrimStart('\', '/') -notmatch '(^|[\\/])\.rnpm[^\\/]*([\\/]|$)'
+    }
 
     $mapA = @{}
     foreach ($f in $filesA) {
         $rel = $f.FullName.Substring($PathA.Length).TrimStart('\', '/')
-        $mapA[$rel] = $f.Length
+        $mapA[$rel] = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 
     $mapB = @{}
     foreach ($f in $filesB) {
         $rel = $f.FullName.Substring($PathB.Length).TrimStart('\', '/')
-        $mapB[$rel] = $f.Length
+        $mapB[$rel] = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 
     $missingInB = @()
@@ -70,18 +74,30 @@ function Compare-Directories {
         }
     }
 
-    if ($missingInB.Count -gt 0 -or $missingInA.Count -gt 0) {
+    $hashMismatches = @()
+    foreach ($k in $mapA.Keys) {
+        if ($mapB.ContainsKey($k) -and $mapA[$k] -ne $mapB[$k]) {
+            $hashMismatches += $k
+        }
+    }
+
+    if ($missingInB.Count -gt 0 -or $missingInA.Count -gt 0 -or $hashMismatches.Count -gt 0) {
         $pkgsA = $missingInB | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
         $pkgsB = $missingInA | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
         if ($pkgsA) { Write-Host "    Missing in rnpm: $($pkgsA -join ', ')" -ForegroundColor DarkYellow }
         if ($pkgsB) { Write-Host "    Missing in npm: $($pkgsB -join ', ')" -ForegroundColor DarkYellow }
+        if ($hashMismatches.Count -gt 0) {
+            $hashPkgs = $hashMismatches | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
+            Write-Host "    Content hash mismatch: $($hashMismatches -join ', ')" -ForegroundColor DarkYellow
+        }
         return @{
             Identical = $false
             CountA = $mapA.Count
             CountB = $mapB.Count
             MissingInRnpm = $missingInB
             MissingInNpm = $missingInA
-            Reason = "File count mismatch (npm: $($mapA.Count), rnpm: $($mapB.Count)). Missing in rnpm: $($missingInB.Count), missing in npm: $($missingInA.Count)"
+            HashMismatches = $hashMismatches
+            Reason = "Tree/content mismatch (npm: $($mapA.Count), rnpm: $($mapB.Count)). Missing in rnpm: $($missingInB.Count), missing in npm: $($missingInA.Count), hash mismatches: $($hashMismatches.Count)"
         }
     }
 
