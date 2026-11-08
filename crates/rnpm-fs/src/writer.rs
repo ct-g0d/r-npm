@@ -642,10 +642,8 @@ pub fn materialize_files_parallel_refs<'a>(
 
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
-    } else if std::env::var("RNPM_CONCURRENCY").is_err() {
-        16
     } else {
-        config.worker_threads.clamp(1, 32)
+        config.worker_threads.clamp(1, 16)
     };
 
     if !config.is_hdd {
@@ -671,6 +669,13 @@ pub fn materialize_files_parallel_refs<'a>(
                             if let Some(src) = file.source_path {
                                 if copy_file_fast(src, &file.path).is_ok() {
                                     copied = true;
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if file.mode & 0o111 != 0 {
+                                            let _ = std::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(file.mode));
+                                        }
+                                    }
                                     crate::tarball::record_file_created(file.data.len() as u64);
                                 }
                             }
@@ -739,6 +744,13 @@ pub fn materialize_files_parallel_refs<'a>(
                             if let Some(src) = file.source_path {
                                 if copy_file_fast(src, &file.path).is_ok() {
                                     copied = true;
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if file.mode & 0o111 != 0 {
+                                            let _ = std::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(file.mode));
+                                        }
+                                    }
                                     crate::tarball::record_file_created(file.data.len() as u64);
                                 }
                             }

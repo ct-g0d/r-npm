@@ -56,7 +56,20 @@ Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmBaselineDir
 Write-Host "`n[Setup] Populating warm cache and baseline node_modules..." -ForegroundColor Gray
 Push-Location $warmBaselineDir
 & $rnpmBin ci 2>&1 | Out-Null
+$setupExitCode = $LASTEXITCODE
 Pop-Location
+
+if ($setupExitCode -ne 0) {
+    Write-Host "[FAIL] Setup rnpm ci failed with exit code $setupExitCode" -ForegroundColor Red
+    exit 1
+}
+
+$baselineFileCount = (Get-ChildItem -Path (Join-Path $warmBaselineDir "node_modules") -Recurse -File).Count
+if ($baselineFileCount -lt 1000) {
+    Write-Host "[FAIL] Baseline node_modules has suspiciously few files: $baselineFileCount" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  Baseline file count: $baselineFileCount files" -ForegroundColor Gray
 
 $robocopyTimes = [System.Collections.Generic.List[double]]::new()
 $rnpmTimes = [System.Collections.Generic.List[double]]::new()
@@ -85,13 +98,24 @@ try {
         Copy-Item (Join-Path $fixtureDir "package.json") $rnpmRunDir
         Copy-Item (Join-Path $fixtureDir "package-lock.json") $rnpmRunDir
 
+        $rnpmExitCode = 0
         $rnpmMs = Measure-CommandMs {
             Push-Location $rnpmRunDir
             try {
                 & $rnpmBin ci 2>&1 | Out-Null
+                $rnpmExitCode = $LASTEXITCODE
             } finally {
                 Pop-Location
             }
+        }
+        if ($rnpmExitCode -ne 0) {
+            Write-Host "`n[FAIL] rnpm ci exited with code $rnpmExitCode" -ForegroundColor Red
+            exit 1
+        }
+        $rnpmFileCount = (Get-ChildItem -Path (Join-Path $rnpmRunDir "node_modules") -Recurse -File).Count
+        if ($rnpmFileCount -ne $baselineFileCount) {
+            Write-Host "`n[FAIL] rnpm ci file count mismatch: got $rnpmFileCount, expected $baselineFileCount" -ForegroundColor Red
+            exit 1
         }
         $rnpmTimes.Add($rnpmMs)
         Write-Host ("  rnpm ci:                   {0,8:N1} ms ({1:N2} s)" -f $rnpmMs, ($rnpmMs / 1000.0)) -ForegroundColor Cyan
@@ -103,13 +127,19 @@ try {
         Copy-Item (Join-Path $fixtureDir "package.json") $npmRunDir
         Copy-Item (Join-Path $fixtureDir "package-lock.json") $npmRunDir
 
+        $npmExitCode = 0
         $npmMs = Measure-CommandMs {
             Push-Location $npmRunDir
             try {
                 & npm.cmd ci 2>&1 | Out-Null
+                $npmExitCode = $LASTEXITCODE
             } finally {
                 Pop-Location
             }
+        }
+        if ($npmExitCode -ne 0) {
+            Write-Host "`n[FAIL] npm ci exited with code $npmExitCode" -ForegroundColor Red
+            exit 1
         }
         $npmTimes.Add($npmMs)
         Write-Host ("  npm ci:                    {0,8:N1} ms ({1:N2} s)" -f $npmMs, ($npmMs / 1000.0)) -ForegroundColor Magenta

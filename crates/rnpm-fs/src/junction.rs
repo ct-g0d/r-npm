@@ -66,8 +66,8 @@ pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
             Ok(())
         } else {
             // Target does not exist yet: try junction first, then symlink_file
-            if let Err(_) = create_junction(link, target) {
-                let _ = std::os::windows::fs::symlink_file(target, link);
+            if create_junction(link, target).is_err() {
+                std::os::windows::fs::symlink_file(target, link).map_err(FsError::Io)?;
             }
             Ok(())
         }
