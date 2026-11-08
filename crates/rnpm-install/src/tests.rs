@@ -3016,6 +3016,277 @@ async fn test_global_install_and_uninstall_mode() {
     assert!(!global_bin.join("my-global-bin").exists());
 }
 
+#[tokio::test]
+async fn test_global_sequential_installs_preserve_existing_packages_and_shims() {
+    use rnpm_config::{find_global_bin_dir, find_global_node_modules};
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let global_prefix = root.join("global-env");
+    fs::create_dir_all(&global_prefix).unwrap();
+
+    // 1. Create local package A with bin "bin-a"
+    let pkg_a_dir = root.join("pkg-a");
+    fs::create_dir_all(&pkg_a_dir).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        r#"{
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "bin": {
+                "bin-a": "./cli.js"
+            }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_a_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('pkg-a');\n",
+    )
+    .unwrap();
+
+    // 2. Create local package C (dependency of B)
+    let pkg_c_dir = root.join("pkg-c");
+    fs::create_dir_all(&pkg_c_dir).unwrap();
+    fs::write(
+        pkg_c_dir.join("package.json"),
+        r#"{
+            "name": "pkg-c",
+            "version": "1.0.0",
+            "bin": {
+                "bin-c": "./cli.js"
+            }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_c_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('pkg-c');\n",
+    )
+    .unwrap();
+
+    // 3. Create local package B with bin "bin-b" and dependency on package C
+    let pkg_b_dir = root.join("pkg-b");
+    fs::create_dir_all(&pkg_b_dir).unwrap();
+    let pkg_c_spec = format!("file:{}", rnpm_core::to_posix_path(&pkg_c_dir.to_string_lossy()));
+    fs::write(
+        pkg_b_dir.join("package.json"),
+        format!(
+            r#"{{
+            "name": "pkg-b",
+            "version": "1.0.0",
+            "bin": {{
+                "bin-b": "./cli.js"
+            }},
+            "dependencies": {{
+                "pkg-c": "{pkg_c_spec}"
+            }}
+        }}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        pkg_b_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('pkg-b');\n",
+    )
+    .unwrap();
+
+    let target_spec_a = format!("pkg-a@file:{}", pkg_a_dir.display());
+    let target_spec_b = format!("pkg-b@file:{}", pkg_b_dir.display());
+
+    // 4. Install package A globally
+    let options_a = InstallOptions {
+        project_dir: global_prefix.clone(),
+        packages: vec![target_spec_a],
+        is_global: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer_a = Installer::new(options_a).unwrap();
+    let summary_a = installer_a.run().await.unwrap();
+    assert_eq!(summary_a.packages_installed, 1);
+
+    let global_nm = find_global_node_modules(&global_prefix);
+    let global_bin = find_global_bin_dir(&global_prefix);
+
+    assert!(global_nm.join("pkg-a").exists(), "pkg-a must be installed in global node_modules");
+    #[cfg(windows)]
+    assert!(global_bin.join("bin-a.cmd").exists(), "bin-a shim must exist");
+    #[cfg(not(windows))]
+    assert!(global_bin.join("bin-a").exists(), "bin-a shim must exist");
+
+    // Root package.json / package-lock.json must NOT exist
+    assert!(!global_prefix.join("package.json").exists(), "global install must not write root package.json");
+    assert!(!global_prefix.join("package-lock.json").exists(), "global install must not write root package-lock.json");
+
+    // 5. Install package B globally in the SAME prefix
+    let options_b = InstallOptions {
+        project_dir: global_prefix.clone(),
+        packages: vec![target_spec_b],
+        is_global: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer_b = Installer::new(options_b).unwrap();
+    let summary_b = installer_b.run().await.unwrap();
+    assert!(summary_b.packages_installed >= 1);
+
+    // CRITICAL REQUIREMENT: pkg-a MUST still be present in global node_modules!
+    assert!(
+        global_nm.join("pkg-a").exists(),
+        "pkg-a must be preserved in global node_modules after installing pkg-b"
+    );
+    #[cfg(windows)]
+    assert!(
+        global_bin.join("bin-a.cmd").exists(),
+        "bin-a shim must still exist after installing pkg-b"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        global_bin.join("bin-a").exists(),
+        "bin-a shim must still exist after installing pkg-b"
+    );
+
+    // pkg-b must be installed
+    assert!(global_nm.join("pkg-b").exists(), "pkg-b must be installed");
+    #[cfg(windows)]
+    assert!(global_bin.join("bin-b.cmd").exists(), "bin-b shim must exist");
+    #[cfg(not(windows))]
+    assert!(global_bin.join("bin-b").exists(), "bin-b shim must exist");
+
+    // DEPENDENCY ISOLATION REQUIREMENT:
+    // pkg-c is a transitive dependency of pkg-b.
+    // It MUST be nested under pkg-b/node_modules/pkg-c and NOT at root global node_modules!
+    let nested_pkg_c = global_nm.join("pkg-b").join("node_modules").join("pkg-c");
+    assert!(
+        nested_pkg_c.exists(),
+        "Transitive dependency pkg-c must be nested under pkg-b/node_modules/pkg-c"
+    );
+    assert!(
+        !global_nm.join("pkg-c").exists(),
+        "Transitive dependency pkg-c must NOT be flattened into global root node_modules"
+    );
+    #[cfg(windows)]
+    assert!(
+        !global_bin.join("bin-c.cmd").exists(),
+        "Transitive dependency bin-c must NOT be placed in global bin dir"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        !global_bin.join("bin-c").exists(),
+        "Transitive dependency bin-c must NOT be placed in global bin dir"
+    );
+
+    // Root package.json / package-lock.json must still NOT exist
+    assert!(!global_prefix.join("package.json").exists(), "global install must not write root package.json");
+    assert!(!global_prefix.join("package-lock.json").exists(), "global install must not write root package-lock.json");
+
+    // 6. Global uninstall of pkg-b
+    let uninstall_opts = UninstallOptions {
+        packages: vec!["pkg-b".to_string()],
+        is_global: true,
+        ..Default::default()
+    };
+    let un_summary = installer_b.uninstall(&uninstall_opts).unwrap();
+    assert_eq!(un_summary.removed_packages, vec!["pkg-b"]);
+
+    // pkg-b and its nested dependency must be gone
+    assert!(!global_nm.join("pkg-b").exists(), "pkg-b must be removed");
+    #[cfg(windows)]
+    assert!(!global_bin.join("bin-b.cmd").exists(), "bin-b shim must be removed");
+    #[cfg(not(windows))]
+    assert!(!global_bin.join("bin-b").exists(), "bin-b shim must be removed");
+
+    // CRITICAL REQUIREMENT: pkg-a and its shims MUST still be present after uninstalling pkg-b!
+    assert!(
+        global_nm.join("pkg-a").exists(),
+        "pkg-a must be preserved after uninstalling pkg-b"
+    );
+    #[cfg(windows)]
+    assert!(
+        global_bin.join("bin-a.cmd").exists(),
+        "bin-a shim must be preserved after uninstalling pkg-b"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        global_bin.join("bin-a").exists(),
+        "bin-a shim must be preserved after uninstalling pkg-b"
+    );
+
+    // Root package.json / package-lock.json must still NOT exist
+    assert!(!global_prefix.join("package.json").exists(), "global uninstall must not write root package.json");
+    assert!(!global_prefix.join("package-lock.json").exists(), "global uninstall must not write root package-lock.json");
+}
+
+#[tokio::test]
+async fn test_global_scoped_package_isolation_and_uninstall() {
+    use rnpm_config::{find_global_bin_dir, find_global_node_modules};
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let global_prefix = root.join("global-scoped-env");
+    fs::create_dir_all(&global_prefix).unwrap();
+
+    let pkg_dir = root.join("scoped-tool");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::write(
+        pkg_dir.join("package.json"),
+        r#"{
+            "name": "@my-scope/scoped-tool",
+            "version": "2.1.0",
+            "bin": {
+                "scoped-cmd": "./cli.js"
+            }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        pkg_dir.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('scoped');\n",
+    )
+    .unwrap();
+
+    let target_spec = format!("@my-scope/scoped-tool@file:{}", pkg_dir.display());
+
+    let options = InstallOptions {
+        project_dir: global_prefix.clone(),
+        packages: vec![target_spec],
+        is_global: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    let global_nm = find_global_node_modules(&global_prefix);
+    let installed_pkg = global_nm.join("@my-scope").join("scoped-tool");
+    assert!(installed_pkg.exists());
+
+    let global_bin = find_global_bin_dir(&global_prefix);
+    #[cfg(windows)]
+    assert!(global_bin.join("scoped-cmd.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(global_bin.join("scoped-cmd").exists());
+
+    // Uninstall scoped package
+    let uninstall_opts = UninstallOptions {
+        packages: vec!["@my-scope/scoped-tool".to_string()],
+        is_global: true,
+        ..Default::default()
+    };
+    let un_summary = installer.uninstall(&uninstall_opts).unwrap();
+    assert_eq!(un_summary.removed_packages, vec!["@my-scope/scoped-tool"]);
+
+    assert!(!installed_pkg.exists());
+    assert!(!global_nm.join("@my-scope").exists(), "Empty @my-scope directory must be cleaned up");
+    #[cfg(windows)]
+    assert!(!global_bin.join("scoped-cmd.cmd").exists());
+    #[cfg(not(windows))]
+    assert!(!global_bin.join("scoped-cmd").exists());
+}
+
 #[test]
 fn test_find_enclosing_bin_dir_and_target_rel() {
     use crate::{compute_bin_target_rel, find_enclosing_bin_dir};
@@ -3542,4 +3813,238 @@ async fn test_run_ci_does_not_create_nested_bin_when_no_bins_declared() {
         .exists());
     // Also root .bin should NOT exist because dep-no-bin had no bin
     assert!(!project_dir.join("node_modules/.bin").exists());
+}
+
+#[tokio::test]
+async fn test_upgrade_bin_shim_overwritten() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let local_a_v1 = tmp.path().join("pkg_a_v1");
+    fs::create_dir_all(local_a_v1.join("bin")).unwrap();
+
+    // v1: bin "tool" -> "bin/old.js"
+    let pkg_v1 = serde_json::json!({
+        "name": "pkg-a",
+        "version": "1.0.0",
+        "bin": {
+            "tool": "bin/old.js"
+        }
+    });
+    fs::write(local_a_v1.join("package.json"), pkg_v1.to_string()).unwrap();
+    fs::write(local_a_v1.join("bin/old.js"), "#!/usr/bin/env node\nconsole.log('old');\n").unwrap();
+
+    let root_pkg = serde_json::json!({
+        "name": "consumer",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-a": format!("file:{}", local_a_v1.display().to_string().replace('\\', "/"))
+        }
+    });
+    fs::write(project_dir.join("package.json"), root_pkg.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer.install().await.unwrap();
+
+    let bin_dir = project_dir.join("node_modules/.bin");
+    let cmd_file = bin_dir.join("tool.cmd");
+    assert!(cmd_file.exists(), ".bin/tool.cmd must exist after v1 install");
+    let content_v1 = fs::read_to_string(&cmd_file).unwrap();
+    assert!(
+        content_v1.contains("old.js"),
+        "v1 shim must point to old.js, got:\n{content_v1}"
+    );
+
+    // Now upgrade pkg-a to v2 with bin "tool" -> "bin/new.js"
+    let local_a_v2 = tmp.path().join("pkg_a_v2");
+    fs::create_dir_all(local_a_v2.join("bin")).unwrap();
+    let pkg_v2 = serde_json::json!({
+        "name": "pkg-a",
+        "version": "2.0.0",
+        "bin": {
+            "tool": "bin/new.js"
+        }
+    });
+    fs::write(local_a_v2.join("package.json"), pkg_v2.to_string()).unwrap();
+    fs::write(local_a_v2.join("bin/new.js"), "#!/usr/bin/env node\nconsole.log('new');\n").unwrap();
+
+    let root_pkg_v2 = serde_json::json!({
+        "name": "consumer",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-a": format!("file:{}", local_a_v2.display().to_string().replace('\\', "/"))
+        }
+    });
+    fs::write(project_dir.join("package.json"), root_pkg_v2.to_string()).unwrap();
+
+    let mut installer2 = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer2.install().await.unwrap();
+
+    assert!(cmd_file.exists(), ".bin/tool.cmd must exist after v2 upgrade");
+    let content_v2 = fs::read_to_string(&cmd_file).unwrap();
+    assert!(
+        content_v2.contains("new.js"),
+        "v2 shim must point to new.js, got:\n{content_v2}"
+    );
+    assert!(
+        !content_v2.contains("old.js"),
+        "v2 shim must not point to old.js, got:\n{content_v2}"
+    );
+}
+
+#[tokio::test]
+async fn test_scoped_bin_conflict_precedence() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let local_aa = tmp.path().join("local_aa");
+    fs::create_dir_all(&local_aa).unwrap();
+    let aa_pkg = serde_json::json!({
+        "name": "@aa/tool",
+        "version": "1.0.0",
+        "bin": {
+            "tool": "t.js"
+        }
+    });
+    fs::write(local_aa.join("package.json"), aa_pkg.to_string()).unwrap();
+    fs::write(local_aa.join("t.js"), "#!/usr/bin/env node\nconsole.log('aa');\n").unwrap();
+
+    let local_zz = tmp.path().join("local_zz");
+    fs::create_dir_all(&local_zz).unwrap();
+    let zz_pkg = serde_json::json!({
+        "name": "zz-tool",
+        "version": "1.0.0",
+        "bin": {
+            "tool": "t.js"
+        }
+    });
+    fs::write(local_zz.join("package.json"), zz_pkg.to_string()).unwrap();
+    fs::write(local_zz.join("t.js"), "#!/usr/bin/env node\nconsole.log('zz');\n").unwrap();
+
+    let root_pkg = serde_json::json!({
+        "name": "bin-conflict-fixture",
+        "version": "1.0.0",
+        "dependencies": {
+            "@aa/tool": format!("file:{}", local_aa.display().to_string().replace('\\', "/")),
+            "zz-tool": format!("file:{}", local_zz.display().to_string().replace('\\', "/"))
+        }
+    });
+    fs::write(project_dir.join("package.json"), root_pkg.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer.install().await.unwrap();
+
+    let bin_dir = project_dir.join("node_modules/.bin");
+    let cmd_file = bin_dir.join("tool.cmd");
+    assert!(cmd_file.exists());
+    let content = fs::read_to_string(&cmd_file).unwrap();
+    assert!(
+        content.contains("@aa/tool") || content.contains(r"@aa\tool"),
+        "@aa/tool must win bin conflict over zz-tool, got:\n{content}"
+    );
+    assert!(
+        !content.contains("zz-tool"),
+        "zz-tool must lose bin conflict, got:\n{content}"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_shim_removed_on_upgrade() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let local_a_v1 = tmp.path().join("pkg_a_v1");
+    fs::create_dir_all(local_a_v1.join("bin")).unwrap();
+
+    // v1 has two bins: "tool1" and "tool2"
+    let pkg_v1 = serde_json::json!({
+        "name": "pkg-a",
+        "version": "1.0.0",
+        "bin": {
+            "tool1": "bin/t1.js",
+            "tool2": "bin/t2.js"
+        }
+    });
+    fs::write(local_a_v1.join("package.json"), pkg_v1.to_string()).unwrap();
+    fs::write(local_a_v1.join("bin/t1.js"), "#!/usr/bin/env node\n").unwrap();
+    fs::write(local_a_v1.join("bin/t2.js"), "#!/usr/bin/env node\n").unwrap();
+
+    let root_pkg = serde_json::json!({
+        "name": "consumer",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-a": format!("file:{}", local_a_v1.display().to_string().replace('\\', "/"))
+        }
+    });
+    fs::write(project_dir.join("package.json"), root_pkg.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer.install().await.unwrap();
+
+    let bin_dir = project_dir.join("node_modules/.bin");
+    assert!(bin_dir.join("tool1.cmd").exists());
+    assert!(bin_dir.join("tool2.cmd").exists());
+
+    // v2 only has "tool1", "tool2" removed
+    let local_a_v2 = tmp.path().join("pkg_a_v2");
+    fs::create_dir_all(local_a_v2.join("bin")).unwrap();
+    let pkg_v2 = serde_json::json!({
+        "name": "pkg-a",
+        "version": "2.0.0",
+        "bin": {
+            "tool1": "bin/t1.js"
+        }
+    });
+    fs::write(local_a_v2.join("package.json"), pkg_v2.to_string()).unwrap();
+    fs::write(local_a_v2.join("bin/t1.js"), "#!/usr/bin/env node\n").unwrap();
+
+    let root_pkg_v2 = serde_json::json!({
+        "name": "consumer",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-a": format!("file:{}", local_a_v2.display().to_string().replace('\\', "/"))
+        }
+    });
+    fs::write(project_dir.join("package.json"), root_pkg_v2.to_string()).unwrap();
+
+    let mut installer2 = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    installer2.install().await.unwrap();
+
+    assert!(bin_dir.join("tool1.cmd").exists(), "tool1 shim must be preserved");
+    assert!(!bin_dir.join("tool2.cmd").exists(), "stale tool2.cmd shim must be removed");
+    assert!(!bin_dir.join("tool2.ps1").exists(), "stale tool2.ps1 shim must be removed");
+    assert!(!bin_dir.join("tool2").exists(), "stale tool2 POSIX shim must be removed");
 }

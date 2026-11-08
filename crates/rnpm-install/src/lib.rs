@@ -240,6 +240,244 @@ fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<Package
     })
 }
 
+fn package_metadata_from_manifest(m: &Manifest) -> Option<PackageMetadata> {
+    let name = m.name.clone()?;
+    let ver_str = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+    let bin = m.bin.as_ref().map(|b| match b {
+        rnpm_core::manifest::PackageBin::Single(s) => {
+            rnpm_lockfile::PackageBin::Single(s.clone())
+        }
+        rnpm_core::manifest::PackageBin::Map(map) => {
+            rnpm_lockfile::PackageBin::Map(map.clone())
+        }
+    });
+    let ver_meta = PackageVersionMetadata {
+        name: name.clone(),
+        version: ver_str.clone(),
+        dist_tarball: None,
+        dist_integrity: None,
+        dependencies: m.dependencies.clone(),
+        dependency_order: m.dependencies.keys().cloned().collect(),
+        dev_dependencies: m.dev_dependencies.clone(),
+        peer_dependencies: m.peer_dependencies.clone(),
+        peer_dependencies_meta: m.peer_dependencies_meta.clone(),
+        optional_dependencies: m.optional_dependencies.clone(),
+        os: m.os.clone(),
+        cpu: m.cpu.clone(),
+        libc: m.libc.clone(),
+        bin,
+        license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+        engines: m.engines.clone(),
+        has_install_script: m.scripts.contains_key("install")
+            || m.scripts.contains_key("postinstall")
+            || m.scripts.contains_key("preinstall"),
+        deprecated: None,
+        extra: m.extra.clone(),
+    };
+    let mut dist_tags = BTreeMap::new();
+    dist_tags.insert("latest".to_string(), ver_str.clone());
+    let mut versions = BTreeMap::new();
+    versions.insert(ver_str, ver_meta);
+    Some(PackageMetadata {
+        name,
+        dist_tags,
+        versions,
+    })
+}
+
+/// Scans the global `node_modules` directory for installed top-level packages (including `@scope/*`),
+/// returning a map of package name to version constraint (e.g. `^version`).
+pub(crate) fn scan_global_packages(global_nm: &Path) -> HashMap<String, String> {
+    let mut installed = HashMap::new();
+    if !global_nm.is_dir() {
+        return installed;
+    }
+    let Ok(entries) = std::fs::read_dir(global_nm) else {
+        return installed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if name.starts_with('@') && path.is_dir() {
+            if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                for scoped_entry in scoped_entries.flatten() {
+                    let sub_name = scoped_entry.file_name().to_string_lossy().to_string();
+                    if sub_name.starts_with('.') {
+                        continue;
+                    }
+                    let pkg_dir = scoped_entry.path();
+                    let pkg_json = pkg_dir.join("package.json");
+                    if pkg_json.is_file() {
+                        if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                            let pkg_name = pkg_m.name.unwrap_or_else(|| format!("{name}/{sub_name}"));
+                            let version = pkg_m.version.unwrap_or_else(|| "1.0.0".to_string());
+                            installed.insert(pkg_name, format!("^{version}"));
+                        }
+                    }
+                }
+            }
+        } else if path.is_dir() || rnpm_fs::is_junction(&path).unwrap_or(false) {
+            let pkg_json = path.join("package.json");
+            if pkg_json.is_file() {
+                if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                    let pkg_name = pkg_m.name.unwrap_or(name);
+                    let version = pkg_m.version.unwrap_or_else(|| "1.0.0".to_string());
+                    installed.insert(pkg_name, format!("^{version}"));
+                }
+            }
+        }
+    }
+    installed
+}
+
+fn populate_global_disk_metadata(
+    global_nm: &Path,
+    metadata_cache: &Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
+) {
+    if !global_nm.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(global_nm) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if name.starts_with('@') && path.is_dir() {
+            if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                for scoped_entry in scoped_entries.flatten() {
+                    let sub_name = scoped_entry.file_name().to_string_lossy().to_string();
+                    if sub_name.starts_with('.') {
+                        continue;
+                    }
+                    let pkg_dir = scoped_entry.path();
+                    let pkg_json = pkg_dir.join("package.json");
+                    if pkg_json.is_file() {
+                        if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                            if let Some(meta) = package_metadata_from_manifest(&pkg_m) {
+                                if let Ok(mut cache) = metadata_cache.lock() {
+                                    cache.entry(meta.name.clone()).or_insert(meta);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if path.is_dir() || rnpm_fs::is_junction(&path).unwrap_or(false) {
+            let pkg_json = path.join("package.json");
+            if pkg_json.is_file() {
+                if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                    if let Some(meta) = package_metadata_from_manifest(&pkg_m) {
+                        if let Ok(mut cache) = metadata_cache.lock() {
+                            cache.entry(meta.name.clone()).or_insert(meta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest: &Manifest) {
+    let top_level_packages: HashSet<String> = manifest
+        .dependencies
+        .keys()
+        .chain(manifest.dev_dependencies.keys())
+        .chain(manifest.optional_dependencies.keys())
+        .chain(manifest.peer_dependencies.keys())
+        .cloned()
+        .collect();
+
+    let mut new_nodes = BTreeMap::new();
+    let mut new_edges = Vec::new();
+
+    // Preserve root node if present
+    if let Some(root_node) = graph.nodes.get("") {
+        new_nodes.insert(String::new(), root_node.clone());
+    }
+
+    for top_pkg in &top_level_packages {
+        let top_loc = format!("node_modules/{top_pkg}");
+        let top_node = if let Some(n) = graph.nodes.get(&top_loc) {
+            n.clone()
+        } else if let Some((_, n)) = graph.nodes.iter().find(|(l, n)| {
+            !l.is_empty()
+                && !l.strip_prefix("node_modules/").unwrap_or("").contains("/node_modules/")
+                && (&n.install_name == top_pkg || &n.name == top_pkg)
+        }) {
+            n.clone()
+        } else {
+            continue;
+        };
+
+        new_nodes.insert(top_loc.clone(), top_node);
+
+        // Retain direct edges from root to top_pkg
+        for edge in &graph.edges {
+            if edge.from_location.is_empty() && edge.to_location == top_loc {
+                new_edges.push(edge.clone());
+            }
+        }
+
+        // BFS traversal to discover all transitive dependencies reachable from top_loc
+        let mut loc_map: HashMap<String, String> = HashMap::new();
+        loc_map.insert(top_loc.clone(), top_loc.clone());
+
+        let mut queue = VecDeque::new();
+        queue.push_back(top_loc.clone());
+
+        while let Some(curr_orig_loc) = queue.pop_front() {
+            for edge in graph.get_outgoing_edges(&curr_orig_loc) {
+                let target_orig_loc = &edge.to_location;
+                if target_orig_loc.is_empty() || target_orig_loc == &top_loc {
+                    continue;
+                }
+                if !loc_map.contains_key(target_orig_loc) {
+                    if let Some(target_node) = graph.nodes.get(target_orig_loc) {
+                        // Compute new nested location under top_loc:
+                        // node_modules/<dep> -> node_modules/<top-pkg>/node_modules/<dep>
+                        let rel = target_orig_loc
+                            .strip_prefix("node_modules/")
+                            .unwrap_or(target_orig_loc);
+                        let target_new_loc = format!("{top_loc}/node_modules/{rel}");
+                        loc_map.insert(target_orig_loc.clone(), target_new_loc.clone());
+
+                        let mut new_node = target_node.clone();
+                        new_node.location = target_new_loc.clone();
+                        new_nodes.insert(target_new_loc, new_node);
+
+                        queue.push_back(target_orig_loc.clone());
+                    }
+                }
+            }
+        }
+
+        // Map and retain edges within this top_pkg's component
+        for edge in &graph.edges {
+            if edge.from_location.is_empty() {
+                continue;
+            }
+            if let (Some(from_new), Some(to_new)) =
+                (loc_map.get(&edge.from_location), loc_map.get(&edge.to_location))
+            {
+                let mut new_edge = edge.clone();
+                new_edge.from_location = from_new.clone();
+                new_edge.to_location = to_new.clone();
+                new_edges.push(new_edge);
+            }
+        }
+    }
+
+    graph.nodes = new_nodes;
+    graph.edges = new_edges;
+}
+
 impl PackageMetadataProvider for RegistryPackageProvider {
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
         if let Ok(cache) = self.metadata_cache.lock() {
@@ -691,6 +929,7 @@ pub(crate) fn clean_empty_bin_dir_at(bin_dir: &Path) {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn process_installed_pkg_manifest(
     target_path: &Path,
     pkg_bin_dir: &Path,
@@ -724,17 +963,174 @@ fn link_single_pkg_bin(
     script_rel: &str,
     source_script_path: &Path,
 ) {
-    if pkg_bin_dir.join(bin_name).exists()
-        || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
-        || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
-    {
-        return;
-    }
     let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
     let _ = normalize_shebang(source_script_path);
     let _ = create_shims(pkg_bin_dir, bin_name, &target_rel);
 }
 
+fn collect_all_bin_dirs(
+    root_nm: &Path,
+    wanted_dirs: impl IntoIterator<Item = PathBuf>,
+) -> HashSet<PathBuf> {
+    let mut all_dirs = HashSet::new();
+    for d in wanted_dirs {
+        all_dirs.insert(path_clean::clean(&d));
+    }
+
+    if !root_nm.is_dir() {
+        return all_dirs;
+    }
+
+    let root_bin = root_nm.join(".bin");
+    if root_bin.is_dir() {
+        all_dirs.insert(path_clean::clean(&root_bin));
+    }
+
+    fn visit(dir: &Path, out: &mut HashSet<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let file_name = entry.file_name();
+                    if file_name == ".bin" {
+                        out.insert(path_clean::clean(&path));
+                    } else if file_name == "node_modules" {
+                        visit(&path, out);
+                    } else if file_name.to_string_lossy().starts_with('@') {
+                        if !rnpm_fs::is_junction(&path).unwrap_or(false) {
+                            if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                                for scoped_entry in scoped_entries.flatten() {
+                                    let scoped_pkg_path = scoped_entry.path();
+                                    if scoped_pkg_path.is_dir()
+                                        && !rnpm_fs::is_junction(&scoped_pkg_path).unwrap_or(false)
+                                    {
+                                        let nested_nm = scoped_pkg_path.join("node_modules");
+                                        if nested_nm.is_dir() {
+                                            visit(&nested_nm, out);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if !rnpm_fs::is_junction(&path).unwrap_or(false) {
+                        let nested_nm = path.join("node_modules");
+                        if nested_nm.is_dir() {
+                            visit(&nested_nm, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    visit(root_nm, &mut all_dirs);
+    all_dirs
+}
+
+fn cleanup_stale_shims(
+    node_modules_dir: &Path,
+    wanted_shims: &HashMap<PathBuf, HashSet<String>>,
+) {
+    let all_bin_dirs = collect_all_bin_dirs(node_modules_dir, wanted_shims.keys().cloned());
+    for bin_dir in all_bin_dirs {
+        // Only clean directories ending with ".bin"
+        if bin_dir.file_name().map(|n| n != ".bin").unwrap_or(true) {
+            continue;
+        }
+        if !bin_dir.is_dir() {
+            continue;
+        }
+
+        let clean_path = path_clean::clean(&bin_dir);
+        let wanted_set = wanted_shims.get(&clean_path);
+
+        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let is_wanted = wanted_set.is_some_and(|set| set.contains(&file_name));
+                if !is_wanted {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        clean_empty_bin_dir_at(&bin_dir);
+    }
+
+    clean_empty_bin_dirs(node_modules_dir);
+}
+
+pub(crate) fn link_tree_bins(
+    mut package_locs: Vec<String>,
+    loc_base_dir: &Path,
+    root_bin_dir: &Path,
+    node_modules_dir: &Path,
+    collector: Option<&TimingCollector>,
+) {
+    let t_bins = std::time::Instant::now();
+
+    // 1. Walk packages shallowest first (depth based on `node_modules/` count), sorted according to npm precedence.
+    package_locs.sort_by(|a, b| bin_package_order_cmp(a, b));
+
+    // 2. Track claimed bin names per .bin directory in memory for the current run.
+    let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+
+    for loc in &package_locs {
+        let target_path = loc_base_dir.join(loc);
+        let pkg_manifest_path = target_path.join("package.json");
+        if !pkg_manifest_path.exists() {
+            continue;
+        }
+
+        let pkg_manifest = match Manifest::from_file(&pkg_manifest_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let bin_entries = pkg_manifest.bin_entries();
+        if bin_entries.is_empty() {
+            continue;
+        }
+
+        let pkg_bin_dir = find_enclosing_bin_dir(&target_path, root_bin_dir, node_modules_dir);
+        let clean_bin_dir = path_clean::clean(&pkg_bin_dir);
+
+        let claimed_set = claimed_bins.entry(clean_bin_dir.clone()).or_default();
+        let wanted_set = wanted_shims.entry(clean_bin_dir.clone()).or_default();
+
+        for (bin_name, script_rel) in bin_entries {
+            // First-writer-wins within the current installation run
+            if claimed_set.insert(bin_name.clone()) {
+                let script_path = target_path.join(&script_rel);
+                link_single_pkg_bin(&target_path, &pkg_bin_dir, &bin_name, &script_rel, &script_path);
+
+                wanted_set.insert(bin_name.clone());
+                wanted_set.insert(format!("{bin_name}.cmd"));
+                wanted_set.insert(format!("{bin_name}.ps1"));
+            } else {
+                debug!(
+                    "Bin '{bin_name}' in '{}' already claimed in this run; skipping",
+                    clean_bin_dir.display()
+                );
+            }
+        }
+    }
+
+    // 3. Clean up stale shims: remove any shims in .bin that are not owned by any package in the new tree's wanted bin set.
+    cleanup_stale_shims(node_modules_dir, &wanted_shims);
+
+    if let Some(c) = collector {
+        c.record_phase(Phase::Bins, t_bins.elapsed());
+    }
+}
+
+#[allow(dead_code)]
 fn link_installed_pkg_bins(
     target_path: &Path,
     pkg_bin_dir: &Path,
@@ -1066,6 +1462,10 @@ impl Installer {
         crate::trash::cleanup_leftover_trash(root_dir);
         if options.is_global && !root_dir.join("package.json").exists() {
             let _ = std::fs::create_dir_all(root_dir);
+            let global_nm = rnpm_config::find_global_node_modules(root_dir);
+            let _ = std::fs::create_dir_all(&global_nm);
+            let global_bin = rnpm_config::find_global_bin_dir(root_dir);
+            let _ = std::fs::create_dir_all(&global_bin);
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
 
@@ -1300,14 +1700,27 @@ impl Installer {
             }
         }
 
-        let mut manifest = if manifest_path.exists() {
+        let mut manifest = if manifest_path.exists() && !self.options.is_global {
             Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?
         } else if self.options.is_global {
-            Manifest {
-                name: Some("global-packages".to_string()),
-                version: Some("1.0.0".to_string()),
-                ..Default::default()
+            let mut m = if manifest_path.exists() {
+                Manifest::from_file(&manifest_path).unwrap_or_else(|_| Manifest {
+                    name: Some("global-packages".to_string()),
+                    version: Some("1.0.0".to_string()),
+                    ..Default::default()
+                })
+            } else {
+                Manifest {
+                    name: Some("global-packages".to_string()),
+                    version: Some("1.0.0".to_string()),
+                    ..Default::default()
+                }
+            };
+            let global_nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            for (pkg_name, ver) in scan_global_packages(&global_nm) {
+                m.dependencies.entry(pkg_name).or_insert(ver);
             }
+            m
         } else {
             return Err(anyhow!(
                 "package.json not found in {}",
@@ -1556,6 +1969,21 @@ impl Installer {
                 .await?;
         }
 
+        let loc_base_dir = if self.options.is_global {
+            if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            }
+        } else {
+            self.options.project_dir.clone()
+        };
+
+        if self.options.is_global {
+            let global_nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            populate_global_disk_metadata(&global_nm, &metadata_cache);
+        }
+
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let existing_lockfile = if !self.options.package_lock_enabled() {
             None
@@ -1564,6 +1992,8 @@ impl Installer {
                 .ok()
                 .and_then(|s| rnpm_lockfile::parse_and_migrate(&s).ok())
                 .map(Arc::new)
+        } else if self.options.is_global {
+            LockfileV3::load_hidden(&loc_base_dir).ok().map(Arc::new)
         } else {
             None
         };
@@ -1590,7 +2020,7 @@ impl Installer {
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),
         };
 
-        let graph = if !workspace_members.is_empty() {
+        let mut graph = if !workspace_members.is_empty() {
             let members = workspace_members.clone();
             let root_m = manifest.clone();
             tokio::task::spawn_blocking(move || {
@@ -1726,6 +2156,28 @@ impl Installer {
             }
         }
 
+        // If this is a global install, isolate dependencies so that only top-level
+        // packages live directly under root node_modules, and their transitive
+        // dependencies are nested under node_modules/<top-pkg>/node_modules/...
+        if self.options.is_global {
+            isolate_global_dependencies(&mut graph, &manifest);
+            if let Some(ref existing) = existing_lockfile_for_merge {
+                for (loc, node) in &mut graph.nodes {
+                    if let Some(old_pkg) = existing.packages.get(loc) {
+                        if node.resolved.is_none() {
+                            node.resolved = old_pkg.resolved.clone();
+                        }
+                        if node.integrity.is_none() {
+                            node.integrity = old_pkg.integrity.clone();
+                        }
+                        if old_pkg.link == Some(true) {
+                            node.flags.link = true;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut lockfile = graph.to_lockfile_v3(&project_name, project_version.as_deref());
         if let Some(ref existing) = existing_lockfile_for_merge {
             for (loc, pkg) in &mut lockfile.packages {
@@ -1733,12 +2185,17 @@ impl Installer {
                     continue;
                 }
                 if let Some(old_pkg) = existing.packages.get(loc) {
-                    if pkg.version == old_pkg.version
-                        && pkg.resolved == old_pkg.resolved
-                        && pkg.integrity == old_pkg.integrity
-                        && pkg.dependencies == old_pkg.dependencies
-                        && pkg.peer_dependencies == old_pkg.peer_dependencies
-                        && pkg.optional_dependencies == old_pkg.optional_dependencies
+                    let is_added_pkg = added_pkgs.iter().any(|a| {
+                        loc == &format!("node_modules/{}", a.name)
+                            || loc.starts_with(&format!("node_modules/{}/", a.name))
+                    });
+                    if (self.options.is_global && !is_added_pkg)
+                        || (pkg.version == old_pkg.version
+                            && pkg.resolved == old_pkg.resolved
+                            && pkg.integrity == old_pkg.integrity
+                            && pkg.dependencies == old_pkg.dependencies
+                            && pkg.peer_dependencies == old_pkg.peer_dependencies
+                            && pkg.optional_dependencies == old_pkg.optional_dependencies)
                     {
                         *pkg = old_pkg.clone();
                     }
@@ -1802,7 +2259,7 @@ impl Installer {
             }
 
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
-            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save
+            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global
             {
                 let _lock_guard = collector.enter_phase(Phase::Lockfile);
                 lockfile
@@ -1891,9 +2348,9 @@ impl Installer {
 
         // Milestone M3: Diff ideal tree against actual tree (node_modules/.package-lock.json)
         let actual_lockfile_opt = if !self.options.force
-            && validate_hidden_lockfile(&self.options.project_dir, Some(&self.options))
+            && validate_hidden_lockfile(&loc_base_dir, Some(&self.options))
         {
-            LockfileV3::load_hidden(&self.options.project_dir).ok()
+            LockfileV3::load_hidden(&loc_base_dir).ok()
         } else {
             None
         };
@@ -2092,6 +2549,21 @@ impl Installer {
                 }
             }
 
+            if self.options.is_global {
+                let dest_dir = loc_base_dir.join(loc);
+                let is_junc = rnpm_fs::is_junction(&dest_dir).unwrap_or(false);
+                if dest_dir.join("package.json").is_file() || is_junc {
+                    let is_being_reinstalled = added_pkgs.iter().any(|a| {
+                        loc == &format!("node_modules/{}", a.name)
+                            || loc.starts_with(&format!("node_modules/{}/", a.name))
+                    });
+                    if !is_being_reinstalled {
+                        debug!("Skipping existing untouched global package: {}", loc);
+                        continue;
+                    }
+                }
+            }
+
             if node.flags.link {
                 let link_target = loc_base_dir.join(loc);
                 if let Some(parent) = link_target.parent() {
@@ -2119,19 +2591,6 @@ impl Installer {
                 })?;
 
                 packages_installed += 1;
-
-                let manifest_path = source_path.join("package.json");
-                if let Ok(m) = Manifest::from_file(&manifest_path) {
-                    let bin_entries = m.bin_entries();
-                    if !bin_entries.is_empty() {
-                        let bin_dir =
-                            find_enclosing_bin_dir(&link_target, &root_bin_dir, &node_modules_dir);
-                        for (bin_name, script_rel) in bin_entries {
-                            let script_path = source_path.join(&script_rel);
-                            link_single_pkg_bin(&link_target, &bin_dir, &bin_name, &script_rel, &script_path);
-                        }
-                    }
-                }
                 continue;
             }
 
@@ -2162,7 +2621,7 @@ impl Installer {
             }
 
             let dest_dir = loc_base_dir.join(loc);
-            let bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
+            let _bin_dir = find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
 
             if let Some(ref res) = node.resolved {
                 let is_git = res.starts_with("git+")
@@ -2186,16 +2645,6 @@ impl Installer {
                     let pkg_manifest_path = dest_dir.join("package.json");
                     if pkg_manifest_path.exists() {
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
-                            for (bin_name, script_rel) in m.bin_entries() {
-                                let script_path = dest_dir.join(&script_rel);
-                                link_single_pkg_bin(
-                                    &dest_dir,
-                                    &bin_dir,
-                                    &bin_name,
-                                    &script_rel,
-                                    &script_path,
-                                );
-                            }
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -2308,16 +2757,6 @@ impl Installer {
                         let pkg_manifest_path = dest_dir.join("package.json");
                         if pkg_manifest_path.exists() {
                             if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
-                                for (bin_name, script_rel) in m.bin_entries() {
-                                    let script_path = dest_dir.join(&script_rel);
-                                    link_single_pkg_bin(
-                                        &dest_dir,
-                                        &bin_dir,
-                                        &bin_name,
-                                        &script_rel,
-                                        &script_path,
-                                    );
-                                }
                                 if m.scripts.contains_key("preinstall")
                                     || m.scripts.contains_key("install")
                                     || m.scripts.contains_key("postinstall")
@@ -2349,16 +2788,6 @@ impl Installer {
                         packages_installed += 1;
                         let pkg_manifest_path = abs_file.join("package.json");
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
-                            for (bin_name, script_rel) in m.bin_entries() {
-                                let script_path = abs_file.join(&script_rel);
-                                link_single_pkg_bin(
-                                    &dest_dir,
-                                    &bin_dir,
-                                    &bin_name,
-                                    &script_rel,
-                                    &script_path,
-                                );
-                            }
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -2470,8 +2899,6 @@ impl Installer {
         }
 
         let mut join_set = tokio::task::JoinSet::new();
-        let mut bin_download_order = packages_to_download.clone();
-        bin_download_order.sort_by(|a, b| bin_package_order_cmp(&a.0, &b.0));
         let unlocked_packages = self.options.unlocked_packages.clone();
 
         for (loc, node) in &packages_to_download {
@@ -2875,16 +3302,56 @@ impl Installer {
             collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
         }
 
-        // Link package bins after materialization in npm's shallowest-first order. This makes
-        // an already-linked enclosing bin win over a nested package with the same name.
-        for (loc, _node) in &bin_download_order {
-            let target_path = loc_base_dir.join(loc);
-            let pkg_bin_dir =
-                find_enclosing_bin_dir(&target_path, &root_bin_dir, &node_modules_dir);
-            if let Ok(pkg_manifest) = Manifest::from_file(target_path.join("package.json")) {
-                link_installed_pkg_bins(&target_path, &pkg_bin_dir, &pkg_manifest, &collector);
-            }
-        }
+        // Link all package bins across the tree in shallowest-first order with first-writer-wins
+        // per .bin directory in this run, overwriting shims and cleaning up stale ones.
+        let tree_packages: Vec<String> = graph
+            .nodes
+            .keys()
+            .filter(|loc| {
+                if loc.is_empty() {
+                    return false;
+                }
+                if self.options.omit_dev && graph.nodes.get(*loc).is_some_and(|n| n.flags.dev) {
+                    return false;
+                }
+                if self.options.omit_optional
+                    && graph.nodes.get(*loc).is_some_and(|n| n.flags.optional)
+                {
+                    return false;
+                }
+                if self.options.omit_peer && graph.nodes.get(*loc).is_some_and(|n| n.flags.peer) {
+                    return false;
+                }
+                if let Some(node) = graph.nodes.get(*loc) {
+                    let is_optional = node.flags.optional || node.flags.dev_optional;
+                    if is_optional {
+                        let host_platform = self.options.platform();
+                        let is_compat = rnpm_solver::is_platform_compatible(
+                            &host_platform,
+                            node.os.as_deref(),
+                            node.cpu.as_deref(),
+                            node.libc.as_deref(),
+                        );
+                        if !is_compat {
+                            return false;
+                        }
+                    }
+                }
+                if workspace_members.iter().any(|m| &m.relative_path == *loc) {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        link_tree_bins(
+            tree_packages,
+            &loc_base_dir,
+            &root_bin_dir,
+            &node_modules_dir,
+            Some(&collector),
+        );
 
         // 3. Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
@@ -2919,7 +3386,7 @@ impl Installer {
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
             lockfile
-                .save_hidden(&self.options.project_dir)
+                .save_hidden(&loc_base_dir)
                 .context("Failed to save hidden package-lock.json")?;
         }
 
@@ -3546,30 +4013,6 @@ impl Installer {
                 let pkg_manifest_path = target_dir.join("package.json");
                 if pkg_manifest_path.exists() {
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        let bin_entries = pkg_manifest.bin_entries();
-                        if !bin_entries.is_empty() {
-                            let pkg_bin_dir =
-                                find_enclosing_bin_dir(&link_path, &bin_dir, &node_modules_dir);
-                            let t_bins = std::time::Instant::now();
-                            let _bins_span =
-                                tracing::info_span!("bins", package = %pkg_key).entered();
-                            for (bin_name, script_rel) in bin_entries {
-                                if pkg_bin_dir.join(&bin_name).exists()
-                                    || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
-                                    || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
-                                {
-                                    continue;
-                                }
-                                let target_rel_bin =
-                                    compute_bin_target_rel(&link_path, &pkg_bin_dir, &script_rel);
-                                let script_path = target_dir.join(&script_rel);
-                                let _ = normalize_shebang(&script_path);
-                                let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel_bin);
-                            }
-                            drop(_bins_span);
-                            collector.record_phase(Phase::Bins, t_bins.elapsed());
-                        }
-
                         let clean_pkg_name =
                             pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
                         if !workspace_members.iter().any(|m| m.name == clean_pkg_name) {
@@ -3710,27 +4153,6 @@ impl Installer {
                 let pkg_manifest_path = full_target.join("package.json");
                 if pkg_manifest_path.exists() {
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                        let bin_entries = pkg_manifest.bin_entries();
-                        if !bin_entries.is_empty() {
-                            let target_bin_dir =
-                                find_enclosing_bin_dir(&full_target, &bin_dir, &node_modules_dir);
-                            let t_bins = std::time::Instant::now();
-                            let _bins_span =
-                                tracing::info_span!("bins", package = %pkg_key).entered();
-                            for (bin_name, script_rel) in bin_entries {
-                                let script_path = full_target.join(&script_rel);
-                                link_single_pkg_bin(
-                                    &full_target,
-                                    &target_bin_dir,
-                                    &bin_name,
-                                    &script_rel,
-                                    &script_path,
-                                );
-                            }
-                            drop(_bins_span);
-                            collector.record_phase(Phase::Bins, t_bins.elapsed());
-                        }
-
                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
                             || pkg_manifest.scripts.contains_key("postinstall")
@@ -3975,17 +4397,13 @@ impl Installer {
                     ) in &bin_packages
                     {
                         let target_path = loc_base_dir.join(pkg_key);
-                        let pkg_bin_dir =
-                            find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
                         if *has_bins_or_scripts {
-                            if let Some(l_node) = process_installed_pkg_manifest(
+                            if let Some(l_node) = process_installed_pkg_manifest_without_bins(
                                 &target_path,
-                                &pkg_bin_dir,
                                 pkg_key,
                                 resolved_url,
                                 declared_dependencies,
                                 *is_optional,
-                                &collector,
                             ) {
                                 lifecycle_nodes.push(l_node);
                             }
@@ -4338,28 +4756,37 @@ impl Installer {
                 self.pack_store.populate_cas_from_installed(&cas_copy_list);
                 collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
             }
-
-            // Link bins only after every package has been materialized. npm processes package
-            // locations shallowest-first, so an enclosing bin always wins a later conflict.
-            for (
-                pkg_key,
-                _resolved_url,
-                _integrity,
-                _is_optional,
-                _declared_dependencies,
-                has_bins_or_scripts,
-            ) in &bin_packages
-            {
-                if !has_bins_or_scripts {
-                    continue;
-                }
-                let target_path = loc_base_dir.join(pkg_key);
-                let pkg_bin_dir = find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
-                if let Ok(pkg_manifest) = Manifest::from_file(target_path.join("package.json")) {
-                    link_installed_pkg_bins(&target_path, &pkg_bin_dir, &pkg_manifest, &collector);
-                }
-            }
         }
+
+        // Link all package bins across the tree in shallowest-first order with first-writer-wins
+        // per .bin directory in this run, overwriting shims and cleaning up stale ones.
+        let ci_tree_packages: Vec<String> = lockfile
+            .packages
+            .keys()
+            .filter(|k| {
+                if k.is_empty() {
+                    return false;
+                }
+                if platform_skipped_packages.contains(*k) {
+                    return false;
+                }
+                if let Some(info) = lockfile.packages.get(*k) {
+                    if info.link == Some(true) {
+                        return true;
+                    }
+                }
+                k.starts_with("node_modules/")
+            })
+            .cloned()
+            .collect();
+
+        link_tree_bins(
+            ci_tree_packages,
+            &loc_base_dir,
+            &bin_dir,
+            &node_modules_dir,
+            Some(&collector),
+        );
 
         // Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
@@ -5510,30 +5937,7 @@ impl Installer {
     /// 3. Deletes the corresponding package directories from `node_modules` (including nested packages that are no longer referenced).
     /// 4. Writes updated deterministic `package.json` and `package-lock.json`.
     pub fn uninstall(&self, options: &UninstallOptions) -> Result<UninstallSummary> {
-        let manifest_path = self.options.project_dir.join("package.json");
-        if !manifest_path.exists() {
-            if options.is_global || self.options.is_global {
-                let minimal_pkg = serde_json::json!({
-                    "name": "global-packages",
-                    "version": "1.0.0",
-                    "private": true,
-                    "dependencies": {}
-                });
-                let _ = std::fs::create_dir_all(&self.options.project_dir);
-                let _ = std::fs::write(
-                    &manifest_path,
-                    serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default(),
-                );
-            } else {
-                return Err(anyhow!(
-                    "package.json not found in {}",
-                    self.options.project_dir.display()
-                ));
-            }
-        }
-
-        let mut manifest =
-            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
+        let is_global = options.is_global || self.options.is_global;
 
         // Validate package names against malformed inputs or path traversal attacks
         for pkg in &options.packages {
@@ -5547,6 +5951,21 @@ impl Installer {
                 ));
             }
         }
+
+        if is_global {
+            return self.uninstall_global(options);
+        }
+
+        let manifest_path = self.options.project_dir.join("package.json");
+        if !manifest_path.exists() {
+            return Err(anyhow!(
+                "package.json not found in {}",
+                self.options.project_dir.display()
+            ));
+        }
+
+        let mut manifest =
+            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
 
         let mut removed_packages = Vec::new();
 
@@ -5725,6 +6144,108 @@ impl Installer {
         Ok(UninstallSummary {
             removed_packages,
             pruned_dependencies: pruned_nodes.into_iter().collect(),
+            lockfile_path,
+        })
+    }
+
+    fn uninstall_global(&self, options: &UninstallOptions) -> Result<UninstallSummary> {
+        let (node_modules_dir, bin_dir, _loc_base_dir) = {
+            let nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
+            let bin = rnpm_config::find_global_bin_dir(&self.options.project_dir);
+            let base = if cfg!(windows) {
+                self.options.project_dir.clone()
+            } else {
+                self.options.project_dir.join("lib")
+            };
+            (nm, bin, base)
+        };
+
+        let mut removed_packages = Vec::new();
+
+        for raw_pkg in &options.packages {
+            let pkg = raw_pkg.trim();
+            if pkg.is_empty() {
+                continue;
+            }
+
+            let target_path = node_modules_dir.join(pkg);
+            let is_junc = is_junction(&target_path).unwrap_or(false);
+
+            if target_path.exists() || is_junc {
+                // Remove shims from global bin dir if package had bin entries
+                let pkg_manifest_path = target_path.join("package.json");
+                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    for (bin_name, _) in pkg_manifest.bin_entries() {
+                        let shim_path = bin_dir.join(&bin_name);
+                        let _ = std::fs::remove_file(&shim_path);
+                        #[cfg(windows)]
+                        {
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
+                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
+                        }
+                    }
+                }
+
+                // Delete package directory (which includes all its nested dependencies)
+                if is_junc {
+                    let _ = remove_junction(&target_path);
+                } else if target_path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&target_path);
+                } else {
+                    let _ = std::fs::remove_file(&target_path);
+                }
+
+                // If package was scoped (e.g. @scope/pkg) and scope dir is now empty, remove scope dir
+                if let Some(parent) = target_path.parent() {
+                    if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                        if parent_name.starts_with('@') && parent.is_dir() {
+                            if let Ok(mut entries) = std::fs::read_dir(parent) {
+                                if entries.next().is_none() {
+                                    let _ = std::fs::remove_dir(parent);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                removed_packages.push(pkg.to_string());
+            }
+        }
+
+        // Update hidden lockfile if it exists
+        let loc_base_dir = if cfg!(windows) {
+            self.options.project_dir.clone()
+        } else {
+            self.options.project_dir.join("lib")
+        };
+        if let Ok(mut lockfile) = LockfileV3::load_hidden(&loc_base_dir) {
+            let prefix = "node_modules/";
+            for pkg in &removed_packages {
+                let pkg_key = format!("{prefix}{pkg}");
+                let nested_prefix = format!("{pkg_key}/node_modules/");
+                lockfile.packages.retain(|k, _| k != &pkg_key && !k.starts_with(&nested_prefix));
+            }
+            let _ = lockfile.save_hidden(&loc_base_dir);
+        }
+
+        // Clean up .bin if empty
+        if bin_dir.exists() && bin_dir.file_name().is_some_and(|f| f == ".bin") {
+            if let Ok(mut entries) = std::fs::read_dir(&bin_dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(&bin_dir);
+                }
+            }
+        }
+        clean_empty_bin_dirs(&node_modules_dir);
+
+        if self.options.wait_for_trash || !self.options.detached_trash {
+            crate::trash::wait_all_trash_deletions();
+        }
+
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
+        Ok(UninstallSummary {
+            removed_packages,
+            pruned_dependencies: Vec::new(),
             lockfile_path,
         })
     }

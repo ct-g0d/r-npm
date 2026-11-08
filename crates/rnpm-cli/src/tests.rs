@@ -538,7 +538,7 @@ async fn test_cli_exec_local_binary_success() {
             package: "echo-tool".to_string(),
             args: vec![],
             yes: false,
-            package_spec: None,
+            packages: vec![],
             registry: None,
             cache: None,
             offline: false,
@@ -576,7 +576,7 @@ async fn test_cli_exec_exit_code_fidelity() {
             package: "fail-tool".to_string(),
             args: vec![],
             yes: false,
-            package_spec: None,
+            packages: vec![],
             registry: None,
             cache: None,
             offline: false,
@@ -633,6 +633,47 @@ fn make_tarball_with_bin(
         bin_header.set_cksum();
         builder
             .append(&bin_header, Cursor::new(script_bytes))
+            .unwrap();
+
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+fn make_tarball_with_file(
+    pkg_name: &str,
+    version: &str,
+    file_path: &str,
+    file_content: &str,
+) -> Vec<u8> {
+    let manifest_json = serde_json::json!({
+        "name": pkg_name,
+        "version": version,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+    let file_bytes = file_content.as_bytes();
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        let mut header = Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        let path = "package/package.json";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(manifest_bytes))
+            .unwrap();
+
+        let mut data_header = Header::new_gnu();
+        data_header.set_size(file_bytes.len() as u64);
+        data_header.set_mode(0o644);
+        let data_path = format!("package/{file_path}");
+        data_header.as_mut_bytes()[..data_path.len()].copy_from_slice(data_path.as_bytes());
+        data_header.set_cksum();
+        builder
+            .append(&data_header, Cursor::new(file_bytes))
             .unwrap();
 
         builder.finish().unwrap();
@@ -722,7 +763,7 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
             package: "mock-cli-tool".to_string(),
             args: vec![],
             yes: false,
-            package_spec: None,
+            packages: vec![],
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
@@ -742,6 +783,297 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
         npx_dir.join("package.json").exists(),
         "Ephemeral package.json must exist"
     );
+
+    let _ = tx.send(());
+}
+
+#[test]
+fn test_cli_exec_parsing_package_flags() {
+    // 1. Single -p with command and args (matching `rnpm exec -y -p typescript@5.4.5 tsc --version`)
+    let cli = Cli::try_parse_from(vec![
+        "rnpm", "exec", "-y", "-p", "typescript@5.4.5", "tsc", "--version",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Exec {
+            package,
+            args,
+            yes,
+            packages,
+            ..
+        } => {
+            assert!(yes);
+            assert_eq!(package, "tsc");
+            assert_eq!(packages, vec!["typescript@5.4.5"]);
+            assert_eq!(args, vec!["--version"]);
+        }
+        _ => panic!("Expected Commands::Exec"),
+    }
+
+    // 2. Multiple -p flags with command (matching `rnpm exec -p a -p b cmd`)
+    let cli = Cli::try_parse_from(vec![
+        "rnpm", "exec", "-p", "pkg-a@1.0.0", "-p", "pkg-b@2.0.0", "custom-bin", "arg1", "arg2",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Exec {
+            package,
+            args,
+            packages,
+            ..
+        } => {
+            assert_eq!(package, "custom-bin");
+            assert_eq!(packages, vec!["pkg-a@1.0.0", "pkg-b@2.0.0"]);
+            assert_eq!(args, vec!["arg1", "arg2"]);
+        }
+        _ => panic!("Expected Commands::Exec"),
+    }
+
+    // 3. Without -p: first positional arg is package spec
+    let cli = Cli::try_parse_from(vec!["rnpm", "exec", "cowsay@1.5.0", "moo"]).unwrap();
+    match cli.command {
+        Commands::Exec {
+            package,
+            args,
+            packages,
+            ..
+        } => {
+            assert_eq!(package, "cowsay@1.5.0");
+            assert!(packages.is_empty());
+            assert_eq!(args, vec!["moo"]);
+        }
+        _ => panic!("Expected Commands::Exec"),
+    }
+}
+
+#[tokio::test]
+async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let marker_file = project_dir.path().join("flag_exec_marker.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+    let script = format!("require('fs').writeFileSync('{escaped_marker}', process.argv[2] || 'no-arg');\n");
+
+    let pkg_tar = make_tarball_with_bin("custom-tool-pkg", "1.0.0", "custom-runner", &script);
+    let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let pkg_int_c = pkg_int.clone();
+                        let pkg_tar_c = pkg_tar.clone();
+                        let su_c = su.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /custom-tool-pkg") {
+                                    let json = serde_json::json!({
+                                        "name": "custom-tool-pkg",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "custom-tool-pkg",
+                                                "version": "1.0.0",
+                                                "bin": { "custom-runner": "bin/custom-runner.js" },
+                                                "dist": {
+                                                    "tarball": format!("{su_c}tarballs/custom-tool-pkg.tgz"),
+                                                    "integrity": pkg_int_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/custom-tool-pkg.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], pkg_tar_c)
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
+
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let cli = Cli {
+        command: Commands::Exec {
+            package: "custom-runner".to_string(),
+            args: vec!["test-arg".to_string()],
+            yes: true,
+            packages: vec!["custom-tool-pkg@1.0.0".to_string()],
+            registry: Some(server_url),
+            cache: Some(cache_dir.path().to_path_buf()),
+            offline: false,
+        },
+    };
+
+    let res = run_cli(cli, Some(project_dir.path().to_path_buf())).await;
+    assert!(res.is_ok(), "Exec with -p should succeed: {:?}", res.err());
+
+    let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(marker_content.trim(), "test-arg");
+
+    let npx_dir = cache_dir.path().join("_npx").join("custom-tool-pkg_1.0.0");
+    assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
+    let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
+    assert!(manifest_str.contains("custom-tool-pkg"), "Manifest must list custom-tool-pkg in dependencies");
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let marker_file = project_dir.path().join("multi_flag_marker.txt");
+    let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
+    let script = format!(
+        "const data = require('pkg-data/data.json');\nrequire('fs').writeFileSync('{escaped_marker}', data.val);\n"
+    );
+
+    let pkg_runner_tar = make_tarball_with_bin("pkg-runner", "1.0.0", "multi-runner", &script);
+    let pkg_runner_int = Integrity::from_bytes(&pkg_runner_tar, Algorithm::Sha512).to_string();
+
+    let pkg_data_tar = make_tarball_with_file("pkg-data", "1.0.0", "data.json", r#"{"val":"multi-pkg-success"}"#);
+    let pkg_data_int = Integrity::from_bytes(&pkg_data_tar, Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let pkg_runner_int_c = pkg_runner_int.clone();
+                        let pkg_runner_tar_c = pkg_runner_tar.clone();
+                        let pkg_data_int_c = pkg_data_int.clone();
+                        let pkg_data_tar_c = pkg_data_tar.clone();
+                        let su_c = su.clone();
+
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /pkg-runner") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-runner",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "pkg-runner",
+                                                "version": "1.0.0",
+                                                "bin": { "multi-runner": "bin/multi-runner.js" },
+                                                "dist": {
+                                                    "tarball": format!("{su_c}tarballs/pkg-runner.tgz"),
+                                                    "integrity": pkg_runner_int_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/pkg-runner.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], pkg_runner_tar_c)
+                                } else if req_str.contains("GET /pkg-data") {
+                                    let json = serde_json::json!({
+                                        "name": "pkg-data",
+                                        "dist-tags": { "latest": "1.0.0" },
+                                        "versions": {
+                                            "1.0.0": {
+                                                "name": "pkg-data",
+                                                "version": "1.0.0",
+                                                "dist": {
+                                                    "tarball": format!("{su_c}tarballs/pkg-data.tgz"),
+                                                    "integrity": pkg_data_int_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/pkg-data.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], pkg_data_tar_c)
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
+
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let cli = Cli {
+        command: Commands::Exec {
+            package: "multi-runner".to_string(),
+            args: vec![],
+            yes: true,
+            packages: vec!["pkg-data@1.0.0".to_string(), "pkg-runner@1.0.0".to_string()],
+            registry: Some(server_url),
+            cache: Some(cache_dir.path().to_path_buf()),
+            offline: false,
+        },
+    };
+
+    let res = run_cli(cli, Some(project_dir.path().to_path_buf())).await;
+    assert!(res.is_ok(), "Exec with multiple -p should succeed: {:?}", res.err());
+
+    let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(marker_content.trim(), "multi-pkg-success");
+
+    let npx_dir = cache_dir.path().join("_npx").join("pkg-data_1.0.0_pkg-runner_1.0.0");
+    assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
+    let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
+    assert!(manifest_str.contains("pkg-data"), "Manifest must list pkg-data in dependencies");
+    assert!(manifest_str.contains("pkg-runner"), "Manifest must list pkg-runner in dependencies");
 
     let _ = tx.send(());
 }

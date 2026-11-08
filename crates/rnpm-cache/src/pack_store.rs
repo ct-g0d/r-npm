@@ -44,6 +44,14 @@ pub const PACK_ALIGNMENT: usize = 4096;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Extracts the modified timestamp (nanoseconds since UNIX epoch) from file metadata.
+pub fn mtime_to_timestamp(meta: &fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+}
+
 /// A single file entry inside the `.idx` pack index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackFileEntry {
@@ -66,6 +74,9 @@ pub struct PackFileEntry {
     pub cas_path: Option<PathBuf>,
     #[serde(skip)]
     pub cas_verified: bool,
+    /// Modified time (nanoseconds since UNIX epoch) of the CAS blob when verified/written.
+    #[serde(alias = "checked_at", default, skip_serializing_if = "Option::is_none")]
+    pub cas_mtime: Option<u64>,
 }
 
 impl PartialEq for PackFileEntry {
@@ -77,6 +88,7 @@ impl PartialEq for PackFileEntry {
             && self.aligned_offset == other.aligned_offset
             && self.sha256 == other.sha256
             && self.cas_path == other.cas_path
+            && self.cas_mtime == other.cas_mtime
     }
 }
 
@@ -412,14 +424,20 @@ impl PackagePack {
             let mut copied = false;
             if !can_block_clone {
                 if let Some(ref cas_path) = entry.cas_path {
-                    let cas_valid = cas_path
-                        .metadata()
-                        .map(|metadata| metadata.len() == entry.size)
-                        .unwrap_or(false);
+                    let cas_valid = entry.cas_verified
+                        && cas_path
+                            .metadata()
+                            .map(|metadata| {
+                                metadata.len() == entry.size
+                                    && entry.cas_mtime.is_none_or(|m| {
+                                        mtime_to_timestamp(&metadata) == Some(m)
+                                    })
+                            })
+                            .unwrap_or(false);
                     if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
                         copied = true;
                         rnpm_fs::record_file_created(entry.size);
-                    } else if cas_path.exists() {
+                    } else {
                         // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
                         let _ = PackStore::write_cas_file_safe(cas_path, slice);
                         if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
@@ -469,6 +487,7 @@ pub struct PackStore {
     root: PathBuf,
     mmap_cache: Arc<Mutex<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
+    cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
 }
 
 impl PackStore {
@@ -481,7 +500,20 @@ impl PackStore {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
+            cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Returns the cached (size, mtime) stamp for a CAS blob if recorded.
+    pub fn get_cas_stamp(&self, path: &Path) -> Option<(u64, u64)> {
+        self.cas_stamp_cache.read().ok()?.get(path).copied()
+    }
+
+    /// Records the (size, mtime) stamp for a CAS blob.
+    pub fn set_cas_stamp(&self, path: &Path, size: u64, mtime: u64) {
+        if let Ok(mut cache) = self.cas_stamp_cache.write() {
+            cache.insert(path.to_path_buf(), (size, mtime));
+        }
     }
 
     /// Determines default store directory:
@@ -551,7 +583,11 @@ impl PackStore {
 pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Ok(meta) = cas_path.metadata() {
         if meta.len() == data.len() as u64 {
-            return Ok(());
+            if let Ok(existing) = fs::read(cas_path) {
+                if existing == data {
+                    return Ok(());
+                }
+            }
         }
     }
     if let Some(parent) = cas_path.parent() {
@@ -584,6 +620,9 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
 
     /// Fills the CAS by copying already-installed files from node_modules into CAS
     /// across 16 parallel threads using fast native OS copy primitives.
+    ///
+    /// Copies to a unique temporary file in the CAS directory and atomically renames
+    /// into the final destination to prevent data races and partial reads.
     pub fn populate_cas_from_installed(&self, files: &[(PathBuf, PathBuf)]) {
         if files.is_empty() {
             return;
@@ -598,6 +637,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             let _ = fs::create_dir_all(&parent);
         }
 
+        let pid = std::process::id();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let num_workers = 16.min(files.len());
         std::thread::scope(|scope| {
@@ -608,10 +648,37 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    if dst.exists() {
+                    if dst.exists() && is_destination_valid(dst) {
+                        if let Ok(meta) = dst.metadata() {
+                            if let Some(mtime) = mtime_to_timestamp(&meta) {
+                                self.set_cas_stamp(dst, meta.len(), mtime);
+                            }
+                        }
                         continue;
                     }
-                    let _ = rnpm_fs::copy_file_fast(src, dst);
+                    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let tmp_dst = dst.with_extension(format!("tmp_{pid}_{counter}"));
+                    if rnpm_fs::copy_file_fast(src, &tmp_dst).is_ok() {
+                        let renamed = match fs::rename(&tmp_dst, dst) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                if !dst.exists() || !is_destination_valid(dst) {
+                                    let _ = fs::remove_file(dst);
+                                    fs::rename(&tmp_dst, dst).is_ok()
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        let _ = fs::remove_file(&tmp_dst);
+                        if renamed {
+                            if let Ok(meta) = dst.metadata() {
+                                if let Some(mtime) = mtime_to_timestamp(&meta) {
+                                    self.set_cas_stamp(dst, meta.len(), mtime);
+                                }
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -876,7 +943,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             index: index.clone(),
             buffer,
             pack_path,
-            idx_path,
+            idx_path: idx_path.clone(),
         };
 
         // Verify checksum once upon loading into memory BEFORE touching CAS
@@ -887,6 +954,8 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
 
         let mut index = index;
         let buf_data = pack.data();
+        let mut index_updated = false;
+
         for entry in &mut index.files {
             let sha = match entry.sha256 {
                 Some(ref s) => s.clone(),
@@ -896,6 +965,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                     if end <= buf_data.len() {
                         let h = HEXLOWER.encode(&Sha256::digest(&buf_data[start..end]));
                         entry.sha256 = Some(h.clone());
+                        index_updated = true;
                         h
                     } else {
                         continue;
@@ -903,8 +973,94 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }
             };
             let cas_file = self.cas_file_path(&sha);
-            entry.cas_path = Some(cas_file);
-            entry.cas_verified = true;
+            entry.cas_path = Some(cas_file.clone());
+
+            let start = entry.offset as usize;
+            let end = start.saturating_add(entry.size as usize);
+            let slice = if end <= buf_data.len() {
+                Some(&buf_data[start..end])
+            } else {
+                None
+            };
+
+            let cas_meta = cas_file.metadata().ok();
+            match cas_meta {
+                Some(meta) => {
+                    let current_size = meta.len();
+                    let current_mtime = mtime_to_timestamp(&meta);
+                    let recorded_mtime = entry
+                        .cas_mtime
+                        .or_else(|| self.get_cas_stamp(&cas_file).map(|(_s, m)| m));
+                    let stamp_match = current_size == entry.size
+                        && recorded_mtime.is_some()
+                        && current_mtime == recorded_mtime;
+
+                    if stamp_match {
+                        entry.cas_verified = true;
+                    } else {
+                        // Size or mtime changed, or verification stamp missing: rehash blob
+                        let hash_valid = if current_size == entry.size {
+                            if let Ok(bytes) = fs::read(&cas_file) {
+                                HEXLOWER.encode(&Sha256::digest(&bytes)) == sha
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if hash_valid {
+                            entry.cas_mtime = current_mtime;
+                            entry.cas_verified = true;
+                            index_updated = true;
+                            if let Some(m) = current_mtime {
+                                self.set_cas_stamp(&cas_file, current_size, m);
+                            }
+                        } else if let Some(slice) = slice {
+                            // Checksum mismatch or unreadable: repair from pack slice
+                            let _ = PackStore::write_cas_file_safe(&cas_file, slice);
+                            if let Ok(new_meta) = cas_file.metadata() {
+                                let new_mtime = mtime_to_timestamp(&new_meta);
+                                entry.cas_mtime = new_mtime;
+                                if let Some(m) = new_mtime {
+                                    self.set_cas_stamp(&cas_file, new_meta.len(), m);
+                                }
+                            }
+                            entry.cas_verified = true;
+                            index_updated = true;
+                        } else {
+                            entry.cas_verified = false;
+                        }
+                    }
+                }
+                None => {
+                    if let Some(slice) = slice {
+                        let _ = PackStore::write_cas_file_safe(&cas_file, slice);
+                        if let Ok(new_meta) = cas_file.metadata() {
+                            let new_mtime = mtime_to_timestamp(&new_meta);
+                            entry.cas_mtime = new_mtime;
+                            if let Some(m) = new_mtime {
+                                self.set_cas_stamp(&cas_file, new_meta.len(), m);
+                            }
+                        }
+                        entry.cas_verified = true;
+                        index_updated = true;
+                    } else {
+                        entry.cas_verified = false;
+                    }
+                }
+            }
+        }
+
+        if index_updated {
+            let pid = std::process::id();
+            let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let tmp_idx = self.tmp_dir().join(format!("idx_upd_{pid}_{count}.tmp"));
+            if let Ok(updated_idx_bytes) = index.to_bytes() {
+                if fs::write(&tmp_idx, &updated_idx_bytes).is_ok() {
+                    let _ = rename_atomic(&tmp_idx, &idx_path);
+                }
+            }
         }
 
         let pack = PackagePack {
@@ -1062,6 +1218,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 sha256: Some(sha256_hex),
                 cas_path: Some(cas_path),
                 cas_verified: populate_cas,
+                cas_mtime: None,
             });
         }
 
@@ -1080,7 +1237,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         }
 
         if populate_cas && !index_files.is_empty() {
-            self.populate_cas_parallel(&index_files, &pack_bytes);
+            self.populate_cas_parallel(&mut index_files, &pack_bytes);
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
@@ -1162,7 +1319,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         Ok(index)
     }
 
-    fn populate_cas_parallel(&self, entries: &[PackFileEntry], pack_bytes: &[u8]) {
+    fn populate_cas_parallel(&self, entries: &mut [PackFileEntry], pack_bytes: &[u8]) {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let workers = entries.len().min(16);
         std::thread::scope(|scope| {
@@ -1184,6 +1341,17 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 });
             }
         });
+        for entry in entries.iter_mut() {
+            if let Some(ref cas_path) = entry.cas_path {
+                if let Ok(meta) = cas_path.metadata() {
+                    let mtime = mtime_to_timestamp(&meta);
+                    entry.cas_mtime = mtime;
+                    if let Some(m) = mtime {
+                        self.set_cas_stamp(cas_path, meta.len(), m);
+                    }
+                }
+            }
+        }
     }
 
     /// Extract a tarball into the pack store atomically.
@@ -1596,6 +1764,15 @@ fn is_destination_valid(to: &Path) -> bool {
         }
         meta.len() > 0
     } else {
+        if let Some(name) = to.file_name().and_then(|n| n.to_str()) {
+            if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+                if let Ok(bytes) = fs::read(to) {
+                    let actual = HEXLOWER.encode(&Sha256::digest(&bytes));
+                    return actual.eq_ignore_ascii_case(name);
+                }
+                return false;
+            }
+        }
         meta.len() > 0
     }
 }
@@ -2402,5 +2579,71 @@ mod tests {
             let cache = store.block_clone_cache.read().unwrap();
             assert!(cache.is_empty());
         }
+    }
+
+    #[test]
+    fn test_same_size_cas_blob_corruption_detected_and_repaired() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-samesizecorruption98765==";
+        let original_data = b"export const version = '1.0.0';\nconsole.log('clean');";
+        let files = [PackInputFile::new("index.js", 0o644, original_data)];
+
+        let index = store.put_package_pack(integrity, &files).unwrap();
+        let cas_path = index.files[0].cas_path.clone().unwrap();
+        let expected_sha256 = index.files[0].sha256.clone().unwrap();
+
+        assert!(cas_path.is_file(), "CAS blob must be written to disk");
+        assert_eq!(fs::read(&cas_path).unwrap(), original_data);
+
+        // Sleep briefly to ensure filesystem mtime changes on subsequent modification
+        sleep(Duration::from_millis(25));
+
+        // Corrupt exactly 1 byte in place, keeping the file size identical
+        let mut corrupted_data = original_data.to_vec();
+        corrupted_data[7] ^= 0x55;
+        assert_eq!(corrupted_data.len(), original_data.len());
+        fs::write(&cas_path, &corrupted_data).unwrap();
+        assert_eq!(fs::read(&cas_path).unwrap(), corrupted_data);
+        assert_ne!(fs::read(&cas_path).unwrap(), original_data);
+
+        // Clear in-memory mmap cache to simulate warm verification in a fresh process
+        store.clear_mmap_cache();
+
+        // get_package_pack must detect the corruption, rehash, repair from pack slice,
+        // and match the correct SHA-256
+        let pack = store
+            .get_package_pack(integrity)
+            .unwrap()
+            .expect("Package pack must load successfully");
+
+        // Verify that the corrupted CAS blob on disk was repaired
+        let repaired_disk_bytes = fs::read(&cas_path).unwrap();
+        assert_eq!(
+            repaired_disk_bytes, original_data,
+            "CAS blob on disk must be repaired to original content"
+        );
+        let repaired_sha = HEXLOWER.encode(&Sha256::digest(&repaired_disk_bytes));
+        assert_eq!(
+            repaired_sha, expected_sha256,
+            "Repaired CAS blob must match expected SHA-256"
+        );
+
+        // Verify pack slice matches original data
+        assert_eq!(
+            pack.get_file_slice("index.js").unwrap(),
+            original_data
+        );
+
+        // Verify materialization uses the repaired CAS blob cleanly
+        let target = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+        assert_eq!(summary.entries_extracted, 1);
+        assert_eq!(
+            fs::read(target.path().join("index.js")).unwrap(),
+            original_data
+        );
     }
 }

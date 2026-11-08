@@ -416,7 +416,7 @@ pub(crate) enum Commands {
 
         /// Package to install for the command
         #[arg(short = 'p', long = "package")]
-        package_spec: Option<String>,
+        packages: Vec<String>,
 
         /// Custom npm registry URL
         #[arg(long)]
@@ -2112,54 +2112,151 @@ where
     result
 }
 
-pub(crate) async fn execute_exec(
-    current_dir: &std::path::Path,
-    package: &str,
-    args: &[String],
-    registry: Option<String>,
-    cache: Option<PathBuf>,
-    offline: bool,
-) -> anyhow::Result<()> {
-    // Parse package and version/range
-    let (pkg_name, version_req) = if let Some(stripped) = package.strip_prefix('@') {
+fn parse_package_spec(spec: &str) -> (String, String) {
+    if let Some(stripped) = spec.strip_prefix('@') {
         if let Some(idx) = stripped.find('@') {
             (
                 format!("@{}", &stripped[..idx]),
                 stripped[idx + 1..].to_string(),
             )
         } else {
-            (package.to_string(), "*".to_string())
+            (spec.to_string(), "*".to_string())
         }
-    } else if let Some(idx) = package.find('@') {
-        (package[..idx].to_string(), package[idx + 1..].to_string())
+    } else if let Some(idx) = spec.find('@') {
+        (spec[..idx].to_string(), spec[idx + 1..].to_string())
     } else {
-        (package.to_string(), "*".to_string())
+        (spec.to_string(), "*".to_string())
+    }
+}
+
+pub(crate) async fn execute_exec(
+    current_dir: &std::path::Path,
+    command: &str,
+    package_specs: &[String],
+    args: &[String],
+    registry: Option<String>,
+    cache: Option<PathBuf>,
+    offline: bool,
+) -> anyhow::Result<()> {
+    let (cmd_pkg_name, _) = parse_package_spec(command);
+    let cmd_bin_name = if let Some(slash) = cmd_pkg_name.find('/') {
+        &cmd_pkg_name[slash + 1..]
+    } else {
+        &cmd_pkg_name
     };
 
-    let bin_name = if let Some(slash) = pkg_name.find('/') {
-        &pkg_name[slash + 1..]
-    } else {
-        &pkg_name
-    };
+    let cache_path = cache.clone().unwrap_or_else(|| {
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            PathBuf::from(appdata).join("rnpm").join("cache")
+        } else {
+            std::env::temp_dir().join(".rnpm-cache")
+        }
+    });
 
-    // 1. Check local node_modules/.bin first
-    let local_bin = rnpm_lifecycle::find_local_binary(current_dir, &pkg_name)
-        .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, bin_name))
-        .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, package));
+    let binary_to_run = if package_specs.is_empty() {
+        // When -p is NOT provided:
+        // 1. Check local node_modules/.bin first
+        let local_bin = rnpm_lifecycle::find_local_binary(current_dir, &cmd_pkg_name)
+            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, cmd_bin_name))
+            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, command));
 
-    let binary_to_run = if let Some(bin_path) = local_bin {
-        bin_path
-    } else {
-        // Not found locally: resolve and install into ephemeral _npx cache
-        let cache_path = cache.clone().unwrap_or_else(|| {
-            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-                PathBuf::from(appdata).join("rnpm").join("cache")
+        if let Some(bin_path) = local_bin {
+            bin_path
+        } else {
+            // Not found locally: derive package and version from command, and install into ephemeral _npx cache
+            let (pkg_name, version_req) = parse_package_spec(command);
+            let safe_spec: String = command
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+
+            let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+            let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
+                .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name))
+                .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, command));
+
+            if let Some(target) = bin_target {
+                target
             } else {
-                std::env::temp_dir().join(".rnpm-cache")
-            }
-        });
+                if offline {
+                    return Err(anyhow::anyhow!(
+                        "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
+                        command
+                    ));
+                }
 
-        let safe_spec: String = package
+                std::fs::create_dir_all(&npx_env_dir)?;
+
+                let minimal_manifest = serde_json::json!({
+                    "name": "rnpm-exec-env",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        pkg_name.clone(): version_req
+                    }
+                });
+
+                std::fs::write(
+                    npx_env_dir.join("package.json"),
+                    serde_json::to_string_pretty(&minimal_manifest)?,
+                )?;
+
+                let install_options = InstallOptions {
+                    project_dir: npx_env_dir.clone(),
+                    registry_url: registry,
+                    cache_dir: Some(cache_path.clone()),
+                    offline: false,
+                    ignore_scripts: false,
+                    ..Default::default()
+                };
+
+                let mut installer = Installer::new(install_options)?;
+                installer.run().await?;
+
+                // Now locate binary in npx_env_dir
+                if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
+                    target
+                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
+                    target
+                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
+                    target
+                } else {
+                    // Scan .bin folder in npx_env_dir for any executable
+                    let bin_dir = npx_env_dir.join("node_modules").join(".bin");
+                    let mut found = None;
+                    if bin_dir.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.is_file() {
+                                    found = Some(p);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Could not determine binary to run for package '{}'",
+                            command
+                        )
+                    })?
+                }
+            }
+        }
+    } else {
+        // When -p is provided:
+        // Strictly install packages provided via -p into ephemeral _npx cache,
+        // and execute command from the resulting node_modules/.bin
+        let mut sorted_specs = package_specs.to_vec();
+        sorted_specs.sort();
+        let raw_spec = sorted_specs.join("_");
+        let safe_spec: String = raw_spec
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
@@ -2171,28 +2268,32 @@ pub(crate) async fn execute_exec(
             .collect();
 
         let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
-        let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name)
-            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, bin_name))
-            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, package));
+        let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, command)
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name))
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name));
 
         if let Some(target) = bin_target {
             target
         } else {
             if offline {
                 return Err(anyhow::anyhow!(
-                    "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
-                    package
+                    "Package(s) '{}' not installed locally and offline mode prevents dynamic fetching",
+                    package_specs.join(", ")
                 ));
             }
 
             std::fs::create_dir_all(&npx_env_dir)?;
 
+            let mut deps = serde_json::Map::new();
+            for spec in package_specs {
+                let (pkg_name, version_req) = parse_package_spec(spec);
+                deps.insert(pkg_name, serde_json::Value::String(version_req));
+            }
+
             let minimal_manifest = serde_json::json!({
                 "name": "rnpm-exec-env",
                 "version": "1.0.0",
-                "dependencies": {
-                    pkg_name.clone(): version_req
-                }
+                "dependencies": deps
             });
 
             std::fs::write(
@@ -2212,15 +2313,13 @@ pub(crate) async fn execute_exec(
             let mut installer = Installer::new(install_options)?;
             installer.run().await?;
 
-            // Now locate binary in npx_env_dir
-            if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &pkg_name) {
+            if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, bin_name) {
+            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, package) {
+            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
                 target
             } else {
-                // Scan .bin folder in npx_env_dir for any executable
                 let bin_dir = npx_env_dir.join("node_modules").join(".bin");
                 let mut found = None;
                 if bin_dir.is_dir() {
@@ -2236,8 +2335,8 @@ pub(crate) async fn execute_exec(
                 }
                 found.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Could not determine binary to run for package '{}'",
-                        package
+                        "Could not determine binary to run for command '{}'",
+                        command
                     )
                 })?
             }
@@ -4492,28 +4591,32 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             package,
             args,
             yes: _,
-            package_spec,
+            packages,
             registry,
             cache,
             offline,
         } => {
-            let (target_package, target_args) = if package.is_empty() {
-                if let Some(spec) = package_spec {
-                    let filtered_args = if args.first().map(|s| s == &spec).unwrap_or(false) {
-                        args[1..].to_vec()
-                    } else {
-                        args
-                    };
-                    (spec, filtered_args)
-                } else if !args.is_empty() {
+            let (target_command, target_args) = if package.is_empty() {
+                if !args.is_empty() {
                     (args[0].clone(), args[1..].to_vec())
+                } else if packages.len() == 1 {
+                    (packages[0].clone(), vec![])
                 } else {
                     return Err(anyhow::anyhow!("No package or command specified for exec"));
                 }
             } else {
                 (package, args)
             };
-            execute_exec(&current_dir, &target_package, &target_args, registry, cache, offline).await?;
+            execute_exec(
+                &current_dir,
+                &target_command,
+                &packages,
+                &target_args,
+                registry,
+                cache,
+                offline,
+            )
+            .await?;
         }
         Commands::Init {
             initializer,
@@ -4526,7 +4629,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         } => {
             if let Some(init_pkg) = initializer {
                 let transformed = init::transform_initializer(&init_pkg);
-                execute_exec(&current_dir, &transformed, &args, registry, cache, offline).await?;
+                execute_exec(&current_dir, &transformed, &[], &args, registry, cache, offline).await?;
             } else {
                 let init_opts = init::InitOptions {
                     yes,

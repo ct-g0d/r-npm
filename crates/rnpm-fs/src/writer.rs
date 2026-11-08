@@ -3,8 +3,10 @@ use crate::tarball::{
     ensure_no_symlink_ancestors, normalize_rel_path, strip_package_prefix, unlink_target_path,
     validate_entry_path, validate_link_target, CountingReader, ExtractionSummary, TarLimits,
 };
+use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
 use path_clean::clean;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -617,10 +619,29 @@ pub struct MaterializeFileRef<'a> {
 
 static CAS_REPAIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn cas_file_is_valid(path: &Path, data_len: usize) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.len() == data_len as u64)
-        .unwrap_or(false)
+fn cas_file_is_valid(
+    path: &Path,
+    data_len: usize,
+    expected_sha256: Option<&str>,
+    source_verified: bool,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() != data_len as u64 {
+        return false;
+    }
+    if source_verified {
+        return true;
+    }
+    if let Some(expected) = expected_sha256 {
+        if let Ok(bytes) = std::fs::read(path) {
+            let actual = HEXLOWER.encode(&Sha256::digest(&bytes));
+            return actual.eq_ignore_ascii_case(expected);
+        }
+        return false;
+    }
+    true
 }
 
 fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usize) {
@@ -630,8 +651,12 @@ fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usiz
     let count = CAS_REPAIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
     let tmp_path = path.with_extension(format!("tmp_{pid}_{count}"));
-    if write_file_fast(&tmp_path, data, mode, prealloc_threshold).is_ok() {
+    if write_file_fast(&tmp_path, data, mode, prealloc_threshold).is_ok()
+        && std::fs::rename(&tmp_path, path).is_err()
+    {
+        let _ = std::fs::remove_file(path);
         let _ = std::fs::rename(&tmp_path, path);
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }
 
@@ -692,10 +717,20 @@ pub fn materialize_files_parallel_refs<'a>(
                         for file in &files_slice[start..end] {
                             let mut copied = false;
                             if let Some(src) = file.source_path {
-                                let mut cas_valid = cas_file_is_valid(src, file.data.len());
+                                let mut cas_valid = cas_file_is_valid(
+                                    src,
+                                    file.data.len(),
+                                    file.expected_sha256,
+                                    file.source_verified,
+                                );
                                 if !cas_valid {
                                     repair_cas_file(src, file.data, file.mode, prealloc_thresh);
-                                    cas_valid = cas_file_is_valid(src, file.data.len());
+                                    cas_valid = cas_file_is_valid(
+                                        src,
+                                        file.data.len(),
+                                        file.expected_sha256,
+                                        true,
+                                    );
                                 }
                                 if cas_valid && copy_file_fast(src, &file.path).is_ok() {
                                     copied = true;
@@ -776,10 +811,20 @@ pub fn materialize_files_parallel_refs<'a>(
                         for file in &batches_slice[idx] {
                             let mut copied = false;
                             if let Some(src) = file.source_path {
-                                let mut cas_valid = cas_file_is_valid(src, file.data.len());
+                                let mut cas_valid = cas_file_is_valid(
+                                    src,
+                                    file.data.len(),
+                                    file.expected_sha256,
+                                    file.source_verified,
+                                );
                                 if !cas_valid {
                                     repair_cas_file(src, file.data, file.mode, prealloc_thresh);
-                                    cas_valid = cas_file_is_valid(src, file.data.len());
+                                    cas_valid = cas_file_is_valid(
+                                        src,
+                                        file.data.len(),
+                                        file.expected_sha256,
+                                        true,
+                                    );
                                 }
                                 if cas_valid && copy_file_fast(src, &file.path).is_ok() {
                                     copied = true;
