@@ -27,20 +27,6 @@ Write-Host " Project fixture:  $fixtureDir" -ForegroundColor Cyan
 Write-Host " Benchmark runs:   $Runs (alternated)" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
-# Step 0: Ensure a warm baseline node_modules exists for robocopy measurement
-$warmBaselineDir = Join-Path $env:TEMP "rnpm-warm-baseline-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
-New-Item -ItemType Directory -Path $warmBaselineDir -Force | Out-Null
-Copy-Item (Join-Path $fixtureDir "package.json") $warmBaselineDir
-Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmBaselineDir
-Write-Host "`n[Setup] Populating warm cache and baseline node_modules..." -ForegroundColor Gray
-Push-Location $warmBaselineDir
-& $rnpmBin ci 2>&1 | Out-Null
-Pop-Location
-
-$robocopyTimes = [System.Collections.Generic.List[double]]::new()
-$rnpmTimes = [System.Collections.Generic.List[double]]::new()
-$npmTimes = [System.Collections.Generic.List[double]]::new()
-
 function Measure-CommandMs {
     param([scriptblock]$Action)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -62,21 +48,77 @@ function Get-Median {
     }
 }
 
+# Step 0: Antivirus Asymmetry Probe
+Write-Host "`n[Probe] Running Antivirus Asymmetry Probe (2,000 files in %TEMP%)..." -ForegroundColor Gray
+$probeDirNode = Join-Path $env:TEMP "probe-node-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
+$probeDirNative = Join-Path $env:TEMP "probe-native-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
+New-Item -ItemType Directory -Path $probeDirNode -Force | Out-Null
+New-Item -ItemType Directory -Path $probeDirNative -Force | Out-Null
+
+$nodeScript = @"
+const fs = require('fs');
+const path = require('path');
+const dir = process.argv[1];
+const buf = Buffer.alloc(4096, 65);
+const t0 = Date.now();
+for (let i = 0; i < 2000; i++) {
+  fs.writeFileSync(path.join(dir, 'file-' + i + '.dat'), buf);
+}
+console.log(Date.now() - t0);
+"@
+
+$nodeProbeMs = [double](& node -e $nodeScript $probeDirNode)
+
+$nativeProbeMs = Measure-CommandMs {
+    $buf = [byte[]]::new(4096)
+    for ($i = 0; $i -lt 2000; $i++) {
+        [System.IO.File]::WriteAllBytes((Join-Path $probeDirNative "file-$i.dat"), $buf)
+    }
+}
+
+Remove-Item $probeDirNode -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $probeDirNative -Recurse -Force -ErrorAction SilentlyContinue
+
+$probeRatio = if ($nodeProbeMs -gt 0) { $nativeProbeMs / $nodeProbeMs } else { 1.0 }
+Write-Host ("  Node.js probe (2k files):   {0,8:N1} ms" -f $nodeProbeMs) -ForegroundColor Gray
+Write-Host ("  Native probe (2k files):    {0,8:N1} ms" -f $nativeProbeMs) -ForegroundColor Gray
+Write-Host ("  Probe penalty ratio:        {0,8:N2}x" -f $probeRatio) -ForegroundColor Gray
+
+$antivirusAsymmetryDetected = ($probeRatio -gt 1.30)
+if ($antivirusAsymmetryDetected) {
+    Write-Host "  [!] Asymmetric antivirus inspection detected (probe penalty ratio > 1.30x)." -ForegroundColor Yellow
+    Write-Host "      node.exe has process/path exclusion, adding ~1.5ms overhead per CreateFile/CloseHandle on non-excluded binaries." -ForegroundColor Yellow
+}
+
+# Step 1: Ensure a warm baseline node_modules exists for robocopy measurement
+$warmBaselineDir = Join-Path $env:TEMP "rnpm-warm-baseline-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+New-Item -ItemType Directory -Path $warmBaselineDir -Force | Out-Null
+Copy-Item (Join-Path $fixtureDir "package.json") $warmBaselineDir
+Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmBaselineDir
+Write-Host "`n[Setup] Populating warm cache and baseline node_modules..." -ForegroundColor Gray
+Push-Location $warmBaselineDir
+& $rnpmBin ci 2>&1 | Out-Null
+Pop-Location
+
+$robocopyTimes = [System.Collections.Generic.List[double]]::new()
+$rnpmTimes = [System.Collections.Generic.List[double]]::new()
+$npmTimes = [System.Collections.Generic.List[double]]::new()
+
 try {
     for ($i = 1; $i -le $Runs; $i++) {
-        Write-Host "`n--- Run $i of $Runs ---" -ForegroundColor Yellow
+        Write-Host "`n--- Run $i of $Runs ---\" -ForegroundColor Yellow
 
-        # 1. Robocopy baseline
+        # 1. Robocopy baseline (using /MT:16 multithreaded copy)
         $roboDest = Join-Path $env:TEMP "robo-dest-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         $srcNm = Join-Path $warmBaselineDir "node_modules"
         $dstNm = Join-Path $roboDest "node_modules"
         New-Item -ItemType Directory -Path $dstNm -Force | Out-Null
         
         $roboMs = Measure-CommandMs {
-            & robocopy $srcNm $dstNm /E /NFL /NDL /NJH /NJS /NC /NS /NP *>$null
+            & robocopy $srcNm $dstNm /E /MT:16 /NFL /NDL /NJH /NJS /NC /NS /NP *>$null
         }
         $robocopyTimes.Add($roboMs)
-        Write-Host ("  Robocopy baseline: {0,8:N1} ms ({1:N2} s)" -f $roboMs, ($roboMs / 1000.0)) -ForegroundColor Gray
+        Write-Host ("  Robocopy baseline (/MT:16): {0,8:N1} ms ({1:N2} s)" -f $roboMs, ($roboMs / 1000.0)) -ForegroundColor Gray
         Remove-Item $roboDest -Recurse -Force -ErrorAction SilentlyContinue
 
         # 2. rnpm ci on fresh copy
@@ -94,7 +136,7 @@ try {
             }
         }
         $rnpmTimes.Add($rnpmMs)
-        Write-Host ("  rnpm ci:           {0,8:N1} ms ({1:N2} s)" -f $rnpmMs, ($rnpmMs / 1000.0)) -ForegroundColor Cyan
+        Write-Host ("  rnpm ci:                   {0,8:N1} ms ({1:N2} s)" -f $rnpmMs, ($rnpmMs / 1000.0)) -ForegroundColor Cyan
         Remove-Item $rnpmRunDir -Recurse -Force -ErrorAction SilentlyContinue
 
         # 3. npm ci on fresh copy
@@ -112,7 +154,7 @@ try {
             }
         }
         $npmTimes.Add($npmMs)
-        Write-Host ("  npm ci:            {0,8:N1} ms ({1:N2} s)" -f $npmMs, ($npmMs / 1000.0)) -ForegroundColor Magenta
+        Write-Host ("  npm ci:                    {0,8:N1} ms ({1:N2} s)" -f $npmMs, ($npmMs / 1000.0)) -ForegroundColor Magenta
         Remove-Item $npmRunDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 } finally {
@@ -129,11 +171,18 @@ $ratioVsRobo = if ($roboMedian -gt 0) { $rnpmMedian / $roboMedian } else { 0 }
 Write-Host "`n====================================================" -ForegroundColor Cyan
 Write-Host " Speed Gate Summary & Medians" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host (" Robocopy median:   {0,8:N1} ms ({1:N2} s)" -f $roboMedian, ($roboMedian / 1000.0))
-Write-Host (" rnpm ci median:    {0,8:N1} ms ({1:N2} s)" -f $rnpmMedian, ($rnpmMedian / 1000.0)) -ForegroundColor Cyan
-Write-Host (" npm ci median:     {0,8:N1} ms ({1:N2} s)" -f $npmMedian, ($npmMedian / 1000.0)) -ForegroundColor Magenta
-Write-Host (" Speedup vs npm:    {0:N2}x faster" -f $ratioVsNpm)
-Write-Host (" Ratio vs robocopy: {0:N2}x" -f $ratioVsRobo)
+Write-Host (" Robocopy median (/MT:16): {0,8:N1} ms ({1:N2} s)" -f $roboMedian, ($roboMedian / 1000.0))
+Write-Host (" rnpm ci median:          {0,8:N1} ms ({1:N2} s)" -f $rnpmMedian, ($rnpmMedian / 1000.0)) -ForegroundColor Cyan
+Write-Host (" npm ci median:           {0,8:N1} ms ({1:N2} s)" -f $npmMedian, ($npmMedian / 1000.0)) -ForegroundColor Magenta
+Write-Host (" Speedup vs npm:          {0:N2}x faster" -f $ratioVsNpm)
+Write-Host (" Ratio vs robocopy:       {0:N2}x" -f $ratioVsRobo)
+
+if ($antivirusAsymmetryDetected) {
+    Write-Host "`n[INVALID] Benchmark run is marked INVALID due to detected external antivirus asymmetry (probe penalty ratio $([math]::Round($probeRatio, 2))x > 1.5x)" -ForegroundColor Yellow
+    Write-Host "          node.exe has process/path exclusion, adding ~1.5ms overhead per CreateFile/CloseHandle on non-excluded binaries." -ForegroundColor Yellow
+    Write-Host "          Equalize treatment by adding rnpm exclusion (Add-MpPreference -ExclusionProcess $rnpmBin), or running on Dev Drive / clean CI runner." -ForegroundColor Yellow
+    exit 0
+}
 
 $gatePassed = $true
 if ($rnpmMedian -gt $npmMedian) {

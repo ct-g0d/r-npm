@@ -3742,6 +3742,7 @@ impl Installer {
         let mut used_fast_path = false;
 
         if all_packs_available {
+            let t_mat = std::time::Instant::now();
             let mut loaded_packs = Vec::with_capacity(packages_to_process.len());
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
@@ -3764,12 +3765,12 @@ impl Installer {
                         loaded_packs.push((pkg_key.clone(), pkg_target, pack));
                     }
                     Err(e) => {
-                        eprintln!("[DEBUG_CI] get_package_pack error for {pkg_key}: {e}");
+                        warn!("get_package_pack failed for {pkg_key}: {e}. Falling back to standard pipeline.");
                         load_success = false;
                         break;
                     }
                     Ok(None) => {
-                        eprintln!("[DEBUG_CI] get_package_pack None for {pkg_key}");
+                        warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
                         load_success = false;
                         break;
                     }
@@ -3780,7 +3781,7 @@ impl Installer {
                 let mut all_file_refs = Vec::with_capacity(16384);
                 let mut all_symlinks = Vec::new();
 
-                for (pkg_key, pkg_target, pack) in &loaded_packs {
+                'load_files: for (pkg_key, pkg_target, pack) in &loaded_packs {
                     for entry in &pack.index.files {
                         let full_path = pkg_target.join(&entry.path);
                         if let Some(parent) = full_path.parent() {
@@ -3793,6 +3794,13 @@ impl Installer {
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
                             });
+                        } else {
+                            warn!(
+                                "Corrupted pack: missing file slice for '{}' in pack '{}'. Falling back to standard extraction.",
+                                entry.path, pkg_key
+                            );
+                            load_success = false;
+                            break 'load_files;
                         }
                     }
                     for (link_rel, target_rel) in &pack.index.symlinks {
@@ -3800,52 +3808,62 @@ impl Installer {
                     }
                 }
 
-                used_fast_path = true;
+                if load_success {
+                    used_fast_path = true;
 
-                // 1. Precreate all directories breadth-first in a single pass
-                let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
-                let _ = precreate_directories(dir_refs);
+                    // 1. Precreate all directories breadth-first in a single pass
+                    let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+                    let _ = precreate_directories(dir_refs);
 
-                // 2. Materialize all files globally parallel across threads
-                let t_mat = std::time::Instant::now();
-                rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
-                    .map_err(|e| anyhow!("{e}"))?;
-                collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                    // 2. Materialize all files globally parallel across threads
+                    rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
-                // 3. Recreate symlinks
-                for (link_path, target_path) in all_symlinks {
-                    let _ = rnpm_fs::create_junction(&link_path, &target_path);
-                }
-
-                // 4. Process bin shims and lifecycle scripts
-                for (
-                    pkg_key,
-                    resolved_url,
-                    _,
-                    is_optional,
-                    declared_dependencies,
-                    has_bins_or_scripts,
-                ) in &packages_to_process
-                {
-                    let target_path = loc_base_dir.join(pkg_key);
-                    let pkg_bin_dir =
-                        find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
-                    if *has_bins_or_scripts {
-                        if let Some(l_node) = process_installed_pkg_manifest(
-                            &target_path,
-                            &pkg_bin_dir,
-                            pkg_key,
-                            resolved_url,
-                            declared_dependencies,
-                            *is_optional,
-                            &collector,
-                        ) {
-                            lifecycle_nodes.push(l_node);
+                    // 3. Recreate symlinks
+                    for (link_path, target_path) in all_symlinks {
+                        if let Some(parent) = link_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = rnpm_fs::create_junction(&link_path, &target_path) {
+                            warn!(
+                                "Failed to create junction from '{}' to '{}': {e}",
+                                link_path.display(),
+                                target_path.display()
+                            );
                         }
                     }
-                    packages_installed += 1;
-                    cache_hits += 1;
-                    collector.record_cache_hit();
+
+                    // 4. Process bin shims and lifecycle scripts
+                    for (
+                        pkg_key,
+                        resolved_url,
+                        _,
+                        is_optional,
+                        declared_dependencies,
+                        has_bins_or_scripts,
+                    ) in &packages_to_process
+                    {
+                        let target_path = loc_base_dir.join(pkg_key);
+                        let pkg_bin_dir =
+                            find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
+                        if *has_bins_or_scripts {
+                            if let Some(l_node) = process_installed_pkg_manifest(
+                                &target_path,
+                                &pkg_bin_dir,
+                                pkg_key,
+                                resolved_url,
+                                declared_dependencies,
+                                *is_optional,
+                                &collector,
+                            ) {
+                                lifecycle_nodes.push(l_node);
+                            }
+                        }
+                        packages_installed += 1;
+                        cache_hits += 1;
+                        collector.record_cache_hit();
+                    }
                 }
             }
         }

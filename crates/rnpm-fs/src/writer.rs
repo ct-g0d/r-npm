@@ -446,22 +446,36 @@ pub fn write_file_fast(
         let data_len = data.len();
 
         if data_len > 0 {
-            let mut written = 0u32;
-            let ok = unsafe {
-                WriteFile(
-                    handle,
-                    data.as_ptr() as *const std::ffi::c_void,
-                    data_len as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                let err = unsafe { GetLastError() };
-                unsafe {
-                    CloseHandle(handle);
+            let mut offset = 0usize;
+            while offset < data_len {
+                let chunk_len = ((data_len - offset).min(u32::MAX as usize)) as u32;
+                let mut written = 0u32;
+                let ok = unsafe {
+                    WriteFile(
+                        handle,
+                        data[offset..].as_ptr() as *const std::ffi::c_void,
+                        chunk_len,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    unsafe {
+                        CloseHandle(handle);
+                    }
+                    return Err(std::io::Error::from_raw_os_error(err as i32));
                 }
-                return Err(std::io::Error::from_raw_os_error(err as i32));
+                if written == 0 {
+                    unsafe {
+                        CloseHandle(handle);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "WriteFile returned 0 bytes written",
+                    ));
+                }
+                offset += written as usize;
             }
         }
 
@@ -609,8 +623,13 @@ pub fn materialize_files_parallel_refs<'a>(
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(32, 48).max(32)
+        config.worker_threads.clamp(1, 32)
     };
+    tracing::debug!(
+        "Materializing {} package batches across {} worker threads",
+        total_batches,
+        num_threads
+    );
     let batches_slice = &batches[..];
 
     std::thread::scope(|scope| {
