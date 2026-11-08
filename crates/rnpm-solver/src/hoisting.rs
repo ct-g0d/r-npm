@@ -121,6 +121,7 @@ pub fn determine_placement_with_peers(
                 && !candidate_has_incompatible_peer(
                     graph,
                     &root_target,
+                    parent_location,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -138,6 +139,7 @@ pub fn determine_placement_with_peers(
             && !candidate_has_incompatible_peer(
                 graph,
                 &root_target,
+                parent_location,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -160,6 +162,7 @@ pub fn determine_placement_with_peers(
             && !candidate_has_incompatible_peer(
                 graph,
                 &root_target,
+                parent_location,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -190,6 +193,7 @@ pub fn determine_placement_with_peers(
                 && !candidate_has_incompatible_peer(
                     graph,
                     &candidate,
+                    parent_location,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -212,8 +216,15 @@ pub fn determine_placement_with_peers(
         ) && !candidate_has_incompatible_peer(
             graph,
             &candidate,
+            parent_location,
             peer_dependencies,
             peer_dependencies_meta,
+        ) && !candidate_shadows_ancestor_dep(
+            graph,
+            ancestor,
+            install_name,
+            package_name,
+            target,
         ) {
             return PlacementDecision::PlaceNew(candidate);
         }
@@ -234,9 +245,56 @@ pub fn determine_placement_with_peers(
     PlacementDecision::PlaceNew(nested_target)
 }
 
+fn candidate_shadows_ancestor_dep(
+    graph: &DependencyGraph,
+    ancestor: &str,
+    install_name: &str,
+    package_name: &str,
+    target: &PackageTarget,
+) -> bool {
+    let Some(ancestor_node) = graph.nodes.get(ancestor) else {
+        return false;
+    };
+    let dep_spec = ancestor_node
+        .dependencies
+        .get(install_name)
+        .or_else(|| ancestor_node.dependencies.get(package_name))
+        .or_else(|| ancestor_node.optional_dependencies.get(install_name))
+        .or_else(|| ancestor_node.optional_dependencies.get(package_name));
+
+    let Some(spec) = dep_spec else {
+        return false;
+    };
+
+    if let Ok(req_target) = PackageTarget::parse(spec) {
+        if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
+            if node_satisfies_target(visible, &req_target) && !node_satisfies_target(visible, target) {
+                return true;
+            }
+        }
+        match target {
+            PackageTarget::Version(v) => {
+                if !version_satisfies_target(&v.to_string(), &req_target) {
+                    return true;
+                }
+            }
+            PackageTarget::Range(range) => {
+                if let Ok(v) = Version::parse(&range.raw) {
+                    if !version_satisfies_target(&v.to_string(), &req_target) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn candidate_has_incompatible_peer(
     graph: &DependencyGraph,
     candidate_location: &str,
+    parent_location: &str,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies_meta: &std::collections::BTreeMap<
         String,
@@ -255,6 +313,7 @@ fn candidate_has_incompatible_peer(
         if node_satisfies_target(existing, &target) {
             return false;
         }
+
         // Optional peers constrain placement when an incompatible visible
         // version exists. Required peers retain the existing conflict
         // diagnostics and resolution path.
@@ -262,7 +321,23 @@ fn candidate_has_incompatible_peer(
             .get(peer_name)
             .map(|meta| meta.optional)
             .unwrap_or(false);
-        optional
+        if optional {
+            return true;
+        }
+
+        // For required peers: if parent scope has a satisfying peer visible,
+        // do not hoist to candidate_location where the visible peer is incompatible.
+        if !parent_location.is_empty() {
+            if let Some(parent_peer) =
+                find_visible_peer_node(graph, parent_location, peer_name, peer_name)
+            {
+                if node_satisfies_target(parent_peer, &target) {
+                    return true;
+                }
+            }
+        }
+
+        false
     })
 }
 

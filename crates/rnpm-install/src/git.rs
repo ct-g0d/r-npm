@@ -190,7 +190,16 @@ impl GitFetcher {
 
         // 1. Try mirror clone
         let (mirror_ok, _, mirror_err) = run_git_cmd(
-            &["clone", "--mirror", &normalized_url, &remote_dir_str],
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "clone",
+                "--mirror",
+                &normalized_url,
+                &remote_dir_str,
+            ],
             None,
         )
         .await?;
@@ -201,8 +210,20 @@ impl GitFetcher {
 
         // 2. Fallback to bare clone if mirror fails
         let _ = safe_remove_dir_all(&remote_dir);
-        let (bare_ok, _, bare_err) =
-            run_git_cmd(&["clone", "--bare", &normalized_url, &remote_dir_str], None).await?;
+        let (bare_ok, _, bare_err) = run_git_cmd(
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "clone",
+                "--bare",
+                &normalized_url,
+                &remote_dir_str,
+            ],
+            None,
+        )
+        .await?;
 
         if bare_ok {
             return Ok(remote_dir);
@@ -410,6 +431,10 @@ impl GitFetcher {
         let (checkout_ok, _, checkout_err) = run_git_cmd(
             &[
                 "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "-c",
                 "core.bare=false",
                 "--git-dir",
                 &remote_dir_str,
@@ -499,17 +524,6 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
     url.to_string()
 }
 
-/// Recursively copies directory tree from `src` to `dst`, respecting npm packaging rules when package.json is present.
-fn copy_git_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let bytes = std::fs::read(source)?;
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        std::fs::write(destination, normalized.as_bytes())
-    } else {
-        std::fs::write(destination, bytes)
-    }
-}
-
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
@@ -523,7 +537,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
                     if let Some(p) = to.parent() {
                         let _ = std::fs::create_dir_all(p);
                     }
-                    copy_git_file(&file_path, &to).with_context(|| {
+                    std::fs::copy(&file_path, &to).with_context(|| {
                         format!(
                             "Failed to copy '{}' -> '{}'",
                             file_path.display(),
@@ -557,10 +571,10 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             }
             #[cfg(windows)]
             {
-                let _ = copy_git_file(&from, &to);
+                let _ = std::fs::copy(&from, &to);
             }
         } else {
-            copy_git_file(&from, &to).with_context(|| {
+            std::fs::copy(&from, &to).with_context(|| {
                 format!("Failed to copy '{}' -> '{}'", from.display(), to.display())
             })?;
         }
@@ -608,7 +622,8 @@ fn is_valid_hex_sha(s: &str) -> bool {
 /// Executes git command with sanitized environment variables (non-interactive).
 async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String, String)> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args)
+    cmd.args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"])
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "");
@@ -632,6 +647,10 @@ async fn run_git_archive(remote_dir: &Path, commit_sha: &str) -> Result<Vec<u8>>
     let remote_dir_str = remote_dir.to_string_lossy();
     let mut cmd = tokio::process::Command::new("git");
     cmd.args([
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
         "--git-dir",
         &remote_dir_str,
         "archive",

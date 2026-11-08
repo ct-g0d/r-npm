@@ -537,6 +537,8 @@ async fn test_cli_exec_local_binary_success() {
         command: Commands::Exec {
             package: "echo-tool".to_string(),
             args: vec![],
+            yes: false,
+            package_spec: None,
             registry: None,
             cache: None,
             offline: false,
@@ -573,6 +575,8 @@ async fn test_cli_exec_exit_code_fidelity() {
         command: Commands::Exec {
             package: "fail-tool".to_string(),
             args: vec![],
+            yes: false,
+            package_spec: None,
             registry: None,
             cache: None,
             offline: false,
@@ -717,6 +721,8 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
         command: Commands::Exec {
             package: "mock-cli-tool".to_string(),
             args: vec![],
+            yes: false,
+            package_spec: None,
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
@@ -994,6 +1000,7 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             force: false,
             timing: false,
             install_strategy: None,
+            prefix: None,
             wait_for_trash: false,
             detached_trash: true,
         },

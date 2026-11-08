@@ -178,6 +178,10 @@ pub(crate) enum Commands {
         #[arg(short = 'g', long = "global")]
         global: bool,
 
+        /// Custom installation prefix directory
+        #[arg(long = "prefix")]
+        prefix: Option<PathBuf>,
+
         /// Print high-resolution per-phase timing table and metrics
         #[arg(long = "timing")]
         timing: bool,
@@ -399,11 +403,20 @@ pub(crate) enum Commands {
     #[command(alias = "npx", alias = "x")]
     Exec {
         /// Package name or binary to execute
+        #[arg(default_value = "")]
         package: String,
 
         /// Additional arguments passed to the binary
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Automatically say yes to installation prompts
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+
+        /// Package to install for the command
+        #[arg(short = 'p', long = "package")]
+        package_spec: Option<String>,
 
         /// Custom npm registry URL
         #[arg(long)]
@@ -4079,6 +4092,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             legacy_peer_deps,
             strict_peer_deps,
             global,
+            prefix,
             include,
             no_package_lock,
             package_lock,
@@ -4132,7 +4146,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 fund.unwrap_or(true)
             };
-            let target_dir = if global {
+            let target_dir = if let Some(p) = prefix {
+                if p.is_absolute() {
+                    p
+                } else {
+                    current_dir.join(p)
+                }
+            } else if global {
                 rnpm_config::find_global_prefix()
             } else {
                 current_dir.clone()
@@ -4471,11 +4491,29 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Exec {
             package,
             args,
+            yes: _,
+            package_spec,
             registry,
             cache,
             offline,
         } => {
-            execute_exec(&current_dir, &package, &args, registry, cache, offline).await?;
+            let (target_package, target_args) = if package.is_empty() {
+                if let Some(spec) = package_spec {
+                    let filtered_args = if args.first().map(|s| s == &spec).unwrap_or(false) {
+                        args[1..].to_vec()
+                    } else {
+                        args
+                    };
+                    (spec, filtered_args)
+                } else if !args.is_empty() {
+                    (args[0].clone(), args[1..].to_vec())
+                } else {
+                    return Err(anyhow::anyhow!("No package or command specified for exec"));
+                }
+            } else {
+                (package, args)
+            };
+            execute_exec(&current_dir, &target_package, &target_args, registry, cache, offline).await?;
         }
         Commands::Init {
             initializer,

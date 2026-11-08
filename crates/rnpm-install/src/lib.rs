@@ -717,6 +717,24 @@ pub(crate) fn process_installed_pkg_manifest(
     )
 }
 
+fn link_single_pkg_bin(
+    target_path: &Path,
+    pkg_bin_dir: &Path,
+    bin_name: &str,
+    script_rel: &str,
+    source_script_path: &Path,
+) {
+    if pkg_bin_dir.join(bin_name).exists()
+        || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
+        || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
+    {
+        return;
+    }
+    let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
+    let _ = normalize_shebang(source_script_path);
+    let _ = create_shims(pkg_bin_dir, bin_name, &target_rel);
+}
+
 fn link_installed_pkg_bins(
     target_path: &Path,
     pkg_bin_dir: &Path,
@@ -725,16 +743,8 @@ fn link_installed_pkg_bins(
 ) {
     let t_bins = std::time::Instant::now();
     for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-        if pkg_bin_dir.join(&bin_name).exists()
-            || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
-            || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
-        {
-            continue;
-        }
-        let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, &script_rel);
         let script_path = target_path.join(&script_rel);
-        let _ = normalize_shebang(&script_path);
-        let _ = create_shims(pkg_bin_dir, &bin_name, &target_rel);
+        link_single_pkg_bin(target_path, pkg_bin_dir, &bin_name, &script_rel, &script_path);
     }
     collector.record_phase(Phase::Bins, t_bins.elapsed());
 }
@@ -797,12 +807,18 @@ fn process_installed_pkg_manifest_without_bins(
 
 type CiPackage = (String, String, String, bool, Vec<String>, bool);
 
+fn package_location_depth(loc: &str) -> usize {
+    loc.matches("node_modules/").count()
+}
+
+fn bin_package_order_cmp(loc_a: &str, loc_b: &str) -> std::cmp::Ordering {
+    let depth_a = package_location_depth(loc_a);
+    let depth_b = package_location_depth(loc_b);
+    depth_a.cmp(&depth_b).then_with(|| loc_a.cmp(loc_b))
+}
+
 fn sort_packages_for_bin_linking(packages: &mut [CiPackage]) {
-    packages.sort_by(|a, b| {
-        let depth_a = a.0.split('/').count();
-        let depth_b = b.0.split('/').count();
-        depth_a.cmp(&depth_b).then_with(|| a.0.cmp(&b.0))
-    });
+    packages.sort_by(|a, b| bin_package_order_cmp(&a.0, &b.0));
 }
 
 #[derive(Debug, Clone)]
@@ -1050,16 +1066,6 @@ impl Installer {
         crate::trash::cleanup_leftover_trash(root_dir);
         if options.is_global && !root_dir.join("package.json").exists() {
             let _ = std::fs::create_dir_all(root_dir);
-            let minimal_pkg = serde_json::json!({
-                "name": "global-packages",
-                "version": "1.0.0",
-                "private": true,
-                "dependencies": {}
-            });
-            let _ = std::fs::write(
-                root_dir.join("package.json"),
-                serde_json::to_string_pretty(&minimal_pkg).unwrap_or_default(),
-            );
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
 
@@ -1255,7 +1261,7 @@ impl Installer {
         let _plan_span = tracing::info_span!("plan").entered();
 
         let manifest_path = self.options.project_dir.join("package.json");
-        if !manifest_path.exists() {
+        if !manifest_path.exists() && !self.options.is_global {
             return Err(anyhow!(
                 "package.json not found in {}",
                 self.options.project_dir.display()
@@ -1294,8 +1300,20 @@ impl Installer {
             }
         }
 
-        let mut manifest =
-            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
+        let mut manifest = if manifest_path.exists() {
+            Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?
+        } else if self.options.is_global {
+            Manifest {
+                name: Some("global-packages".to_string()),
+                version: Some("1.0.0".to_string()),
+                ..Default::default()
+            }
+        } else {
+            return Err(anyhow!(
+                "package.json not found in {}",
+                self.options.project_dir.display()
+            ));
+        };
 
         // Fast path: if package.json matches existing committed lockfile and no package args were passed,
         // take the exact same reification fast path as `ci` without re-resolving through network metadata or calling solver!
@@ -1696,8 +1714,8 @@ impl Installer {
                 }
             }
 
-            // Save package.json unless --no-save was passed
-            if !self.options.no_save && !self.options.dry_run {
+            // Save package.json unless --no-save was passed or in global mode
+            if !self.options.is_global && !self.options.no_save && !self.options.dry_run {
                 manifest
                     .save_to_file(&manifest_path)
                     .context("Failed to save updated package.json")?;
@@ -2109,11 +2127,8 @@ impl Installer {
                         let bin_dir =
                             find_enclosing_bin_dir(&link_target, &root_bin_dir, &node_modules_dir);
                         for (bin_name, script_rel) in bin_entries {
-                            let target_rel =
-                                compute_bin_target_rel(&link_target, &bin_dir, &script_rel);
                             let script_path = source_path.join(&script_rel);
-                            let _ = normalize_shebang(&script_path);
-                            let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                            link_single_pkg_bin(&link_target, &bin_dir, &bin_name, &script_rel, &script_path);
                         }
                     }
                 }
@@ -2172,11 +2187,14 @@ impl Installer {
                     if pkg_manifest_path.exists() {
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                             for (bin_name, script_rel) in m.bin_entries() {
-                                let target_rel =
-                                    compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                 let script_path = dest_dir.join(&script_rel);
-                                let _ = normalize_shebang(&script_path);
-                                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                                link_single_pkg_bin(
+                                    &dest_dir,
+                                    &bin_dir,
+                                    &bin_name,
+                                    &script_rel,
+                                    &script_path,
+                                );
                             }
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
@@ -2291,11 +2309,14 @@ impl Installer {
                         if pkg_manifest_path.exists() {
                             if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                                 for (bin_name, script_rel) in m.bin_entries() {
-                                    let target_rel =
-                                        compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                     let script_path = dest_dir.join(&script_rel);
-                                    let _ = normalize_shebang(&script_path);
-                                    let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                                    link_single_pkg_bin(
+                                        &dest_dir,
+                                        &bin_dir,
+                                        &bin_name,
+                                        &script_rel,
+                                        &script_path,
+                                    );
                                 }
                                 if m.scripts.contains_key("preinstall")
                                     || m.scripts.contains_key("install")
@@ -2329,11 +2350,14 @@ impl Installer {
                         let pkg_manifest_path = abs_file.join("package.json");
                         if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
                             for (bin_name, script_rel) in m.bin_entries() {
-                                let target_rel =
-                                    compute_bin_target_rel(&dest_dir, &bin_dir, &script_rel);
                                 let script_path = abs_file.join(&script_rel);
-                                let _ = normalize_shebang(&script_path);
-                                let _ = create_shims(&bin_dir, &bin_name, &target_rel);
+                                link_single_pkg_bin(
+                                    &dest_dir,
+                                    &bin_dir,
+                                    &bin_name,
+                                    &script_rel,
+                                    &script_path,
+                                );
                             }
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
@@ -2447,15 +2471,10 @@ impl Installer {
 
         let mut join_set = tokio::task::JoinSet::new();
         let mut bin_download_order = packages_to_download.clone();
-        bin_download_order.sort_by(|a, b| {
-            a.0.split('/')
-                .count()
-                .cmp(&b.0.split('/').count())
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        bin_download_order.sort_by(|a, b| bin_package_order_cmp(&a.0, &b.0));
         let unlocked_packages = self.options.unlocked_packages.clone();
 
-        for (loc, node) in packages_to_download {
+        for (loc, node) in &packages_to_download {
             let sem = Arc::clone(&semaphore);
             let cache = self.cache.clone();
             let pack_store = Arc::clone(&self.pack_store);
@@ -2465,6 +2484,8 @@ impl Installer {
             let offline = self.options.offline;
             let worker_collector = collector.clone();
             let pkg_writer_cfg = Arc::clone(&writer_cfg);
+            let loc = loc.clone();
+            let node = node.clone();
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -2563,6 +2584,7 @@ impl Installer {
                                     .unwrap_or(&loc);
                                 if !worker_unlocked_packages.is_empty()
                                     && !worker_unlocked_packages.contains(location_name)
+                                    && dest_dir.join("package.json").exists()
                                 {
                                     return Ok(Some((true, None)));
                                 }
@@ -2723,10 +2745,10 @@ impl Installer {
                     return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
                 }
 
-                // Construct and write pack to store if not already present
+                // Construct and write pack to store if not already present (deferred CAS write)
                 if let Some(ref integ_str) = node.integrity {
                     if !integ_str.is_empty() && !pack_store.has_package_pack(integ_str) {
-                        let _ = pack_store.put_package_from_tarball(integ_str, &bytes);
+                        let _ = pack_store.put_package_from_tarball_deferred(integ_str, &bytes);
                     }
                 }
 
@@ -2831,6 +2853,28 @@ impl Installer {
             }
         }
 
+        // Fill CAS by copying from node_modules on 16 threads for cold installs
+        let mut cas_copy_list = Vec::new();
+        for (loc, node) in &packages_to_download {
+            if let Some(ref integrity_str) = node.integrity {
+                if !integrity_str.is_empty() {
+                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                        for entry in &pack.index.files {
+                            if let Some(ref cas_path) = entry.cas_path {
+                                let src = loc_base_dir.join(loc).join(&entry.path);
+                                cas_copy_list.push((src, cas_path.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !cas_copy_list.is_empty() {
+            let t_cas = std::time::Instant::now();
+            self.pack_store.populate_cas_from_installed(&cas_copy_list);
+            collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
+        }
+
         // Link package bins after materialization in npm's shallowest-first order. This makes
         // an already-linked enclosing bin win over a nested package with the same name.
         for (loc, _node) in &bin_download_order {
@@ -2866,10 +2910,12 @@ impl Installer {
         if !self.options.no_save && self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
-            // 4. Write deterministic lockfile
-            lockfile
-                .save_to_file_version(&lockfile_path, self.options.lockfile_version)
-                .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
+            // 4. Write deterministic lockfile (only for local projects, not global prefix)
+            if !self.options.is_global {
+                lockfile
+                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
+            }
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
             lockfile
@@ -3508,6 +3554,12 @@ impl Installer {
                             let _bins_span =
                                 tracing::info_span!("bins", package = %pkg_key).entered();
                             for (bin_name, script_rel) in bin_entries {
+                                if pkg_bin_dir.join(&bin_name).exists()
+                                    || pkg_bin_dir.join(format!("{bin_name}.cmd")).exists()
+                                    || pkg_bin_dir.join(format!("{bin_name}.ps1")).exists()
+                                {
+                                    continue;
+                                }
                                 let target_rel_bin =
                                     compute_bin_target_rel(&link_path, &pkg_bin_dir, &script_rel);
                                 let script_path = target_dir.join(&script_rel);
@@ -3666,14 +3718,14 @@ impl Installer {
                             let _bins_span =
                                 tracing::info_span!("bins", package = %pkg_key).entered();
                             for (bin_name, script_rel) in bin_entries {
-                                let target_rel = compute_bin_target_rel(
+                                let script_path = full_target.join(&script_rel);
+                                link_single_pkg_bin(
                                     &full_target,
                                     &target_bin_dir,
+                                    &bin_name,
                                     &script_rel,
+                                    &script_path,
                                 );
-                                let script_path = full_target.join(&script_rel);
-                                let _ = normalize_shebang(&script_path);
-                                let _ = create_shims(&target_bin_dir, &bin_name, &target_rel);
                             }
                             drop(_bins_span);
                             collector.record_phase(Phase::Bins, t_bins.elapsed());
@@ -3960,7 +4012,7 @@ impl Installer {
                 is_optional,
                 declared_dependencies,
                 has_bins_or_scripts,
-            ) in packages_to_process
+            ) in &packages_to_process
             {
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache.clone();
@@ -3970,6 +4022,12 @@ impl Installer {
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
                 let pkg_writer_cfg = Arc::clone(&ci_writer_cfg);
+                let pkg_key = pkg_key.clone();
+                let resolved_url = resolved_url.clone();
+                let integrity_str = integrity_str.clone();
+                let is_optional = *is_optional;
+                let declared_dependencies = declared_dependencies.clone();
+                let has_bins_or_scripts = *has_bins_or_scripts;
 
                 join_set.spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -4188,10 +4246,10 @@ impl Installer {
                         }
                     };
 
-                    // Construct pack in pack store if not present
+                    // Construct pack in pack store if not present (deferred CAS write)
                     if !integrity_str.is_empty() && !pack_store.has_package_pack(&integrity_str) {
                         let t_sw = std::time::Instant::now();
-                        let _ = pack_store.put_package_from_tarball(&integrity_str, &bytes);
+                        let _ = pack_store.put_package_from_tarball_deferred(&integrity_str, &bytes);
                         worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
                     }
 
@@ -4259,6 +4317,26 @@ impl Installer {
                         lifecycle_nodes.push(l_node);
                     }
                 }
+            }
+
+            // Fill CAS by copying from node_modules on 16 threads for cold installs
+            let mut cas_copy_list = Vec::new();
+            for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
+                if !integrity_str.is_empty() {
+                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                        for entry in &pack.index.files {
+                            if let Some(ref cas_path) = entry.cas_path {
+                                let src = loc_base_dir.join(pkg_key).join(&entry.path);
+                                cas_copy_list.push((src, cas_path.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            if !cas_copy_list.is_empty() {
+                let t_cas = std::time::Instant::now();
+                self.pack_store.populate_cas_from_installed(&cas_copy_list);
+                collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
             }
 
             // Link bins only after every package has been materialized. npm processes package

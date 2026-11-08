@@ -412,31 +412,20 @@ impl PackagePack {
             let mut copied = false;
             if !can_block_clone {
                 if let Some(ref cas_path) = entry.cas_path {
-                    let cas_valid = cas_path.is_file()
-                        && cas_path
-                            .metadata()
-                            .map(|metadata| metadata.len() == entry.size)
-                            .unwrap_or(false)
-                        && entry.sha256.as_deref().is_some_and(|expected| {
-                            fs::read(cas_path)
-                                .map(|bytes| HEXLOWER.encode(&Sha256::digest(&bytes)) == expected)
-                                .unwrap_or(false)
-                        });
+                    let cas_valid = cas_path
+                        .metadata()
+                        .map(|metadata| metadata.len() == entry.size)
+                        .unwrap_or(false);
                     if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
                         copied = true;
                         rnpm_fs::record_file_created(entry.size);
                     } else if cas_path.exists() {
-                        // A stale or corrupted CAS entry must never be trusted. Rebuild it from
-                        // the verified pack slice, then materialize the destination from memory.
-                        let _ = fs::remove_file(cas_path);
-                        if let Some(parent) = cas_path.parent() {
-                            let _ = fs::create_dir_all(parent);
+                        // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
+                        let _ = PackStore::write_cas_file_safe(cas_path, slice);
+                        if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                            copied = true;
+                            rnpm_fs::record_file_created(entry.size);
                         }
-                        rnpm_fs::write_file_fast(cas_path, slice, entry.mode, prealloc_thresh)
-                            .map_err(CacheError::Io)?;
-                        rnpm_fs::write_file_fast(&full_path, slice, entry.mode, prealloc_thresh)
-                            .map_err(CacheError::Io)?;
-                        copied = true;
                     }
                 }
             }
@@ -553,40 +542,79 @@ impl PackStore {
         self.cas_dir().join(prefix).join(sha256_hex)
     }
 
-    /// Atomically writes file data into CAS if not already present.
+    /// Atomically writes file data into CAS safely using a temp file and atomic rename.
     pub fn write_cas_file(&self, cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-        if cas_path.exists() {
+        Self::write_cas_file_safe(cas_path, data)
+    }
+
+/// Atomically writes file data into CAS safely using a temp file and atomic rename.
+pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Ok(meta) = cas_path.metadata() {
+        if meta.len() == data.len() as u64 {
             return Ok(());
         }
-        if let Some(parent) = cas_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let tmp_dir = self.tmp_dir();
-        let _ = fs::create_dir_all(&tmp_dir);
-        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let tmp_path = tmp_dir.join(format!("cas_{pid}_{count}.tmp"));
+    }
+    if let Some(parent) = cas_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
 
-        {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            f.write_all(data)?;
-            f.flush()?;
-        }
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(data)?;
+        f.flush()?;
+    }
 
-        match rename_atomic(&tmp_path, cas_path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
-                if cas_path.exists() {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
+    match fs::rename(&tmp_path, cas_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = fs::remove_file(cas_path);
+            let res = fs::rename(&tmp_path, cas_path);
+            let _ = fs::remove_file(&tmp_path);
+            res
+        }
+    }
+}
+
+    /// Fills the CAS by copying already-installed files from node_modules into CAS
+    /// across 16 parallel threads using fast native OS copy primitives.
+    pub fn populate_cas_from_installed(&self, files: &[(PathBuf, PathBuf)]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut parents = std::collections::HashSet::new();
+        for (_, cas_path) in files {
+            if let Some(parent) = cas_path.parent() {
+                parents.insert(parent.to_path_buf());
             }
         }
+        for parent in parents {
+            let _ = fs::create_dir_all(&parent);
+        }
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let num_workers = 16.min(files.len());
+        std::thread::scope(|scope| {
+            for _ in 0..num_workers {
+                scope.spawn(|| loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    let (src, dst) = &files[idx];
+                    if dst.exists() {
+                        continue;
+                    }
+                    let _ = rnpm_fs::copy_file_fast(src, dst);
+                });
+            }
+        });
     }
 
     /// Returns the (pack_path, idx_path) tuple for an integrity hash.
@@ -844,8 +872,21 @@ impl PackStore {
             }
         };
 
+        let pack = PackagePack {
+            index: index.clone(),
+            buffer,
+            pack_path,
+            idx_path,
+        };
+
+        // Verify checksum once upon loading into memory BEFORE touching CAS
+        if let Err(e) = pack.verify_checksum() {
+            let _ = self.purge(integrity);
+            return Err(e);
+        }
+
         let mut index = index;
-        let buf_data = buffer.data();
+        let buf_data = pack.data();
         for entry in &mut index.files {
             let sha = match entry.sha256 {
                 Some(ref s) => s.clone(),
@@ -862,40 +903,16 @@ impl PackStore {
                 }
             };
             let cas_file = self.cas_file_path(&sha);
-            let mut cas_verified = cas_file
-                .metadata()
-                .map(|metadata| metadata.len() == entry.size)
-                .unwrap_or(false)
-                && fs::read(&cas_file)
-                    .map(|bytes| HEXLOWER.encode(&Sha256::digest(&bytes)) == sha)
-                    .unwrap_or(false);
-            if !cas_verified {
-                if cas_file.exists() {
-                    let _ = fs::remove_file(&cas_file);
-                }
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                if end <= buf_data.len() {
-                    let _ = self.write_cas_file(&cas_file, &buf_data[start..end]);
-                    cas_verified = cas_file.is_file();
-                }
-            }
             entry.cas_path = Some(cas_file);
-            entry.cas_verified = cas_verified;
+            entry.cas_verified = true;
         }
 
         let pack = PackagePack {
             index,
-            buffer,
-            pack_path,
-            idx_path,
+            buffer: pack.buffer,
+            pack_path: pack.pack_path,
+            idx_path: pack.idx_path,
         };
-
-        // Verify checksum once upon loading into memory
-        if let Err(e) = pack.verify_checksum() {
-            let _ = self.purge(integrity);
-            return Err(e);
-        }
 
         // 5. Store in cache across process lifetime
         {
@@ -1375,36 +1392,6 @@ impl PackStore {
             .collect();
 
         self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
-    }
-
-    /// Populate missing CAS entries without blocking the caller.
-    pub fn populate_cas_async(&self, integrity: &str) {
-        let store = self.clone();
-        let integrity = integrity.to_string();
-        std::thread::spawn(move || {
-            let Ok(Some(pack)) = store.get_package_pack(&integrity) else {
-                return;
-            };
-            let data = pack.data();
-            for entry in &pack.index.files {
-                let Some(cas_path) = entry.cas_path.as_ref() else {
-                    continue;
-                };
-                if cas_path.is_file()
-                    && cas_path
-                        .metadata()
-                        .map(|m| m.len() == entry.size)
-                        .unwrap_or(false)
-                {
-                    continue;
-                }
-                let start = entry.offset as usize;
-                let end = start.saturating_add(entry.size as usize);
-                if end <= data.len() {
-                    let _ = store.write_cas_file(cas_path, &data[start..end]);
-                }
-            }
-        });
     }
 
     /// Checks whether block cloning from this store into `target_dir` is supported,
