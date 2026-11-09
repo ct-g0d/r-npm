@@ -72,3 +72,35 @@ fn explain_json_reports_dependents_without_requiring_lockfile() {
         .unwrap();
     assert!(!missing.status.success());
 }
+
+#[test]
+fn explain_shared_dependency_keeps_each_requesting_spec() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"a":"1.0.0","b":"1.0.0"}}"#,
+    )
+    .unwrap();
+    for (name, manifest) in [
+        (
+            "a",
+            r#"{"name":"a","version":"1.0.0","dependencies":{"shared":"^1.0.0"}}"#,
+        ),
+        (
+            "b",
+            r#"{"name":"b","version":"1.0.0","dependencies":{"shared":"~1.2.0"}}"#,
+        ),
+        ("shared", r#"{"name":"shared","version":"1.2.3"}"#),
+    ] {
+        let dir = tmp.path().join("node_modules").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("package.json"), manifest).unwrap();
+    }
+    let output = run(tmp.path(), &["explain", "shared", "--json"]);
+    let explanation: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let edges = explanation[0]["dependents"].as_array().unwrap();
+    assert_eq!(edges.len(), 2);
+    assert_eq!(edges[0]["spec"], "^1.0.0");
+    assert_eq!(edges[1]["spec"], "~1.2.0");
+    assert_eq!(edges[1]["from"]["dependents"][0]["spec"], "1.0.0");
+}

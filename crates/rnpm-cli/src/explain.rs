@@ -95,6 +95,20 @@ fn dependents<'a>(
                     }
                 })
                 .unwrap_or("prod");
+            let field = match kind {
+                "dev" => "devDependencies",
+                "optional" => "optionalDependencies",
+                "peer" | "peerOptional" => "peerDependencies",
+                _ => "dependencies",
+            };
+            let spec = parent
+                .raw_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.get(field))
+                .and_then(|deps| deps.get(&child.name))
+                .and_then(|value| value.as_str())
+                .or(child.required.as_deref())
+                .unwrap_or("*");
             let from = if parent.location.is_empty() {
                 FromNode {
                     name: None,
@@ -115,7 +129,7 @@ fn dependents<'a>(
             result.push(Dependent {
                 kind,
                 name: &child.name,
-                spec: child.required.as_deref().unwrap_or("*"),
+                spec,
                 from,
             });
         }
