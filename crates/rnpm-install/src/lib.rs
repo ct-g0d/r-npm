@@ -907,14 +907,6 @@ pub(crate) fn clean_empty_bin_dirs(root_nm: &Path) {
             }
         }
     }
-    let root_bin = root_nm.join(".bin");
-    if root_bin.is_dir() {
-        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
-            if bin_entries.next().is_none() {
-                let _ = std::fs::remove_dir(&root_bin);
-            }
-        }
-    }
     visit(root_nm, true);
 }
 
@@ -968,6 +960,7 @@ fn link_single_pkg_bin(
     let _ = create_shims(pkg_bin_dir, bin_name, &target_rel);
 }
 
+#[allow(dead_code)]
 fn collect_all_bin_dirs(
     root_nm: &Path,
     wanted_dirs: impl IntoIterator<Item = PathBuf>,
@@ -1027,12 +1020,46 @@ fn collect_all_bin_dirs(
     all_dirs
 }
 
+pub(crate) fn package_name_from_loc(loc: &str) -> &str {
+    let clean = loc.strip_prefix("node_modules/").unwrap_or(loc);
+    if let Some(idx) = clean.rfind("/node_modules/") {
+        &clean[idx + "/node_modules/".len()..]
+    } else {
+        clean
+    }
+}
+
+pub(crate) fn extract_bin_entries_from_lockfile(
+    pkg_name: &str,
+    bin: &rnpm_lockfile::PackageBin,
+) -> Vec<(String, String)> {
+    match bin {
+        rnpm_lockfile::PackageBin::Single(script_path) => {
+            let bin_name = if let Some(slash_idx) = pkg_name.find('/') {
+                &pkg_name[slash_idx + 1..]
+            } else {
+                pkg_name
+            };
+            let bin_name = if bin_name.is_empty() { "app" } else { bin_name };
+            vec![(bin_name.to_string(), script_path.clone())]
+        }
+        rnpm_lockfile::PackageBin::Map(map) => {
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        }
+    }
+}
+
 fn cleanup_stale_shims(
     node_modules_dir: &Path,
     wanted_shims: &HashMap<PathBuf, HashSet<String>>,
 ) {
-    let all_bin_dirs = collect_all_bin_dirs(node_modules_dir, wanted_shims.keys().cloned());
-    for bin_dir in all_bin_dirs {
+    let mut bin_dirs: Vec<PathBuf> = wanted_shims.keys().cloned().collect();
+    let root_bin = node_modules_dir.join(".bin");
+    if !bin_dirs.contains(&root_bin) {
+        bin_dirs.push(root_bin);
+    }
+
+    for bin_dir in bin_dirs {
         // Only clean directories ending with ".bin"
         if bin_dir.file_name().map(|n| n != ".bin").unwrap_or(true) {
             continue;
@@ -1061,39 +1088,64 @@ fn cleanup_stale_shims(
 
         clean_empty_bin_dir_at(&bin_dir);
     }
-
-    clean_empty_bin_dirs(node_modules_dir);
 }
 
 pub(crate) fn link_tree_bins(
     mut package_locs: Vec<String>,
+    known_bins: Option<&HashMap<String, Vec<(String, String)>>>,
     loc_base_dir: &Path,
     root_bin_dir: &Path,
     node_modules_dir: &Path,
+    is_clean_install: bool,
     collector: Option<&TimingCollector>,
 ) {
     let t_bins = std::time::Instant::now();
 
-    // 1. Walk packages shallowest first (depth based on `node_modules/` count), sorted according to npm precedence.
+    // 1. If known_bins is provided, filter package_locs to only packages that actually have bins or are junctions!
+    if let Some(bins) = known_bins {
+        package_locs.retain(|loc| {
+            bins.contains_key(loc) || rnpm_fs::is_junction(&loc_base_dir.join(loc)).unwrap_or(false)
+        });
+    }
+
+    // 2. Walk packages shallowest first (depth based on `node_modules/` count), sorted according to npm precedence.
     package_locs.sort_by(|a, b| bin_package_order_cmp(a, b));
 
-    // 2. Track claimed bin names per .bin directory in memory for the current run.
+    // 3. Track claimed bin names per .bin directory in memory for the current run.
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut shims_to_link = Vec::new();
 
     for loc in &package_locs {
         let target_path = loc_base_dir.join(loc);
-        let pkg_manifest_path = target_path.join("package.json");
-        if !pkg_manifest_path.exists() {
-            continue;
-        }
 
-        let pkg_manifest = match Manifest::from_file(&pkg_manifest_path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let bin_entries = if let Some(bins) = known_bins {
+            if let Some(entries) = bins.get(loc) {
+                entries.clone()
+            } else if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
+                let pkg_manifest_path = target_path.join("package.json");
+                if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                    m.bin_entries()
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else {
+            let pkg_manifest_path = target_path.join("package.json");
+            if !pkg_manifest_path.exists() {
+                continue;
+            }
+
+            let pkg_manifest = match Manifest::from_file(&pkg_manifest_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            pkg_manifest.bin_entries()
         };
 
-        let bin_entries = pkg_manifest.bin_entries();
         if bin_entries.is_empty() {
             continue;
         }
@@ -1108,7 +1160,7 @@ pub(crate) fn link_tree_bins(
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
                 let script_path = target_path.join(&script_rel);
-                link_single_pkg_bin(&target_path, &pkg_bin_dir, &bin_name, &script_rel, &script_path);
+                shims_to_link.push((target_path.clone(), pkg_bin_dir.clone(), bin_name.clone(), script_rel, script_path));
 
                 wanted_set.insert(bin_name.clone());
                 wanted_set.insert(format!("{bin_name}.cmd"));
@@ -1122,8 +1174,28 @@ pub(crate) fn link_tree_bins(
         }
     }
 
-    // 3. Clean up stale shims: remove any shims in .bin that are not owned by any package in the new tree's wanted bin set.
-    cleanup_stale_shims(node_modules_dir, &wanted_shims);
+    if shims_to_link.len() <= 2 {
+        for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in &shims_to_link {
+            link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
+        }
+    } else {
+        let num_threads = 16.min(shims_to_link.len());
+        let chunk_size = shims_to_link.len().div_ceil(num_threads);
+        std::thread::scope(|scope| {
+            for chunk in shims_to_link.chunks(chunk_size) {
+                scope.spawn(move || {
+                    for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
+                        link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
+                    }
+                });
+            }
+        });
+    }
+
+    // 4. Clean up stale shims: remove any shims in .bin that are not owned by any package in the new tree's wanted bin set.
+    if !is_clean_install {
+        cleanup_stale_shims(node_modules_dir, &wanted_shims);
+    }
 
     if let Some(c) = collector {
         c.record_phase(Phase::Bins, t_bins.elapsed());
@@ -1999,6 +2071,25 @@ impl Installer {
         };
         let existing_lockfile_for_merge = existing_lockfile.clone();
 
+        if let Some(ref lf) = existing_lockfile {
+            if let Ok(mut cache_guard) = metadata_cache.lock() {
+                for loc in lf.packages.keys() {
+                    if loc.is_empty() {
+                        continue;
+                    }
+                    let name = package_name_from_loc(loc);
+                    if self.options.unlocked_packages.contains(name) {
+                        continue;
+                    }
+                    if !cache_guard.contains_key(name) {
+                        if let Some(meta) = package_metadata_from_lockfile(name, lf) {
+                            cache_guard.insert(name.to_string(), meta);
+                        }
+                    }
+                }
+            }
+        }
+
         let provider = RegistryPackageProvider {
             client: self.registry_client.clone(),
             handle,
@@ -2485,6 +2576,13 @@ impl Installer {
                 if loc.is_empty() {
                     continue;
                 }
+                if let Some(ref diff) = tree_diff_opt {
+                    if let Some(action) = diff.get(loc) {
+                        if action.is_unchanged() {
+                            continue;
+                        }
+                    }
+                }
                 let dest_dir = loc_base_dir.join(loc);
                 if let Some(parent) = dest_dir.parent() {
                     dirs_to_precreate.push(parent.to_path_buf());
@@ -2492,16 +2590,7 @@ impl Installer {
                 let has_bin = match &node.bin {
                     Some(rnpm_lockfile::PackageBin::Single(_)) => true,
                     Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
-                    None => {
-                        let pkg_manifest_path = dest_dir.join("package.json");
-                        if pkg_manifest_path.exists() {
-                            Manifest::from_file(&pkg_manifest_path)
-                                .map(|m| !m.bin_entries().is_empty())
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        }
-                    }
+                    None => false,
                 };
                 if has_bin {
                     let bin_dir =
@@ -2536,9 +2625,7 @@ impl Installer {
                 if let Some(action) = diff.get(loc) {
                     if action.is_unchanged() {
                         let dest_dir = loc_base_dir.join(loc);
-                        if dest_dir.join("package.json").is_file()
-                            || rnpm_fs::is_junction(&dest_dir).unwrap_or(false)
-                        {
+                        if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                             debug!("Skipping unchanged package: {}", loc);
                             continue;
                         }
@@ -2898,23 +2985,173 @@ impl Installer {
             }
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
-        let unlocked_packages = self.options.unlocked_packages.clone();
+        let all_packs_available = !packages_to_download.is_empty()
+            && packages_to_download.iter().all(|(_, node)| {
+                node.integrity
+                    .as_ref()
+                    .is_some_and(|i| !i.is_empty() && self.pack_store.has_package_pack(i))
+            });
 
-        for (loc, node) in &packages_to_download {
-            let sem = Arc::clone(&semaphore);
-            let cache = self.cache.clone();
+        let mut used_fast_materialize = false;
+        if all_packs_available {
+            let t_mat = std::time::Instant::now();
+            let mut all_dirs = std::collections::BTreeSet::new();
+            all_dirs.insert(node_modules_dir.clone());
+            all_dirs.insert(root_bin_dir.clone());
+
+            for (loc, _) in &packages_to_download {
+                let pkg_target = loc_base_dir.join(loc);
+                if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(&pkg_target);
+                }
+                all_dirs.insert(pkg_target.clone());
+                if let Some(parent) = pkg_target.parent() {
+                    all_dirs.insert(parent.to_path_buf());
+                }
+            }
+
+            let total_pkgs = packages_to_download.len();
+            let num_workers = 16.min(total_pkgs);
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let load_failed = std::sync::atomic::AtomicBool::new(false);
             let pack_store = Arc::clone(&self.pack_store);
-            let registry_client = self.registry_client.clone();
-            let project_dir = loc_base_dir.clone();
-            let worker_unlocked_packages = unlocked_packages.clone();
-            let offline = self.options.offline;
-            let worker_collector = collector.clone();
-            let pkg_writer_cfg = Arc::clone(&writer_cfg);
-            let loc = loc.clone();
-            let node = node.clone();
 
-            join_set.spawn(async move {
+            let mut loaded_packs = Vec::with_capacity(total_pkgs);
+            let load_success = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(num_workers);
+                for _ in 0..num_workers {
+                    handles.push(scope.spawn(|| -> Result<Vec<(usize, String, PathBuf, rnpm_cache::PackagePack)>, ()> {
+                        let mut local = Vec::new();
+                        while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= total_pkgs {
+                                break;
+                            }
+                            let (loc, node) = &packages_to_download[idx];
+                            let integrity_str = node.integrity.as_ref().unwrap();
+                            let pkg_target = loc_base_dir.join(loc);
+                            match pack_store.get_package_pack(integrity_str) {
+                                Ok(Some(pack)) => {
+                                    local.push((idx, loc.clone(), pkg_target, pack));
+                                }
+                                _ => {
+                                    load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return Err(());
+                                }
+                            }
+                        }
+                        Ok(local)
+                    }));
+                }
+
+                let mut all_results = Vec::with_capacity(total_pkgs);
+                let mut any_err = false;
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(items)) => all_results.extend(items),
+                        _ => any_err = true,
+                    }
+                }
+                if any_err || all_results.len() != total_pkgs {
+                    false
+                } else {
+                    all_results.sort_by_key(|(idx, _, _, _)| *idx);
+                    for (_, loc, pkg_target, pack) in all_results {
+                        loaded_packs.push((loc, pkg_target, pack));
+                    }
+                    true
+                }
+            });
+
+            if load_success {
+                let mut all_file_refs = Vec::with_capacity(16384);
+                let mut all_symlinks = Vec::new();
+
+                let mut files_valid = true;
+                for (loc, pkg_target, pack) in &loaded_packs {
+                    for entry in &pack.index.files {
+                        let full_path = pkg_target.join(&entry.path);
+                        if let Some(parent) = full_path.parent() {
+                            all_dirs.insert(parent.to_path_buf());
+                        }
+                        if let Some(slice) = pack.get_file_slice(&entry.path) {
+                            all_file_refs.push(rnpm_fs::MaterializeFileRef {
+                                path: full_path,
+                                data: slice,
+                                mode: entry.mode,
+                                package_id: Some(loc.as_str()),
+                                source_path: entry.cas_path.as_deref(),
+                                expected_sha256: entry.sha256.as_deref(),
+                                source_verified: entry.cas_verified,
+                            });
+                        } else {
+                            files_valid = false;
+                            break;
+                        }
+                    }
+                    for (link_rel, target_rel) in &pack.index.symlinks {
+                        all_symlinks.push((pkg_target.join(link_rel), pkg_target.join(target_rel)));
+                    }
+                }
+
+                if files_valid {
+                    let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+                    if precreate_directories(dir_refs).is_ok()
+                        && rnpm_fs::materialize_files_parallel_refs(all_file_refs, &writer_cfg).is_ok()
+                    {
+                        for (link_path, target_path) in all_symlinks {
+                            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
+                        }
+
+                        // Collect lifecycle scripts
+                        for (idx, (loc, pkg_target, pack)) in loaded_packs.iter().enumerate() {
+                            let node = &packages_to_download[idx].1;
+                            if let Some(slice) = pack.get_file_slice("package.json") {
+                                if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
+                                    let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
+                                        || pkg_manifest.scripts.contains_key("install")
+                                        || pkg_manifest.scripts.contains_key("postinstall");
+                                    if has_install_script {
+                                        lifecycle_nodes.push(LifecyclePackageNode {
+                                            package_path: loc.clone(),
+                                            disk_path: pkg_target.clone(),
+                                            manifest: pkg_manifest,
+                                            source: PackageSource::Registry,
+                                            dependencies: node.dependencies.keys().cloned().collect(),
+                                            optional: node.flags.optional,
+                                        });
+                                    }
+                                }
+                            }
+                            packages_installed += 1;
+                            cache_hits += 1;
+                            collector.record_cache_hit();
+                        }
+                        collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                        used_fast_materialize = true;
+                    }
+                }
+            }
+        }
+
+        if !used_fast_materialize {
+            let mut join_set = tokio::task::JoinSet::new();
+            let unlocked_packages = self.options.unlocked_packages.clone();
+
+            for (loc, node) in &packages_to_download {
+                let sem = Arc::clone(&semaphore);
+                let cache = self.cache.clone();
+                let pack_store = Arc::clone(&self.pack_store);
+                let registry_client = self.registry_client.clone();
+                let project_dir = loc_base_dir.clone();
+                let worker_unlocked_packages = unlocked_packages.clone();
+                let offline = self.options.offline;
+                let worker_collector = collector.clone();
+                let pkg_writer_cfg = Arc::clone(&writer_cfg);
+                let loc = loc.clone();
+                let node = node.clone();
+
+                join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
 
                 // Early path containment defense: validate loc before warm pack check or junction removal
@@ -3279,27 +3516,30 @@ impl Installer {
                 }
             }
         }
+        }
 
         // Fill CAS by copying from node_modules on 16 threads for cold installs
-        let mut cas_copy_list = Vec::new();
-        for (loc, node) in &packages_to_download {
-            if let Some(ref integrity_str) = node.integrity {
-                if !integrity_str.is_empty() {
-                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
-                        for entry in &pack.index.files {
-                            if let Some(ref cas_path) = entry.cas_path {
-                                let src = loc_base_dir.join(loc).join(&entry.path);
-                                cas_copy_list.push((src, cas_path.clone()));
+        if !used_fast_materialize {
+            let mut cas_copy_list = Vec::new();
+            for (loc, node) in &packages_to_download {
+                if let Some(ref integrity_str) = node.integrity {
+                    if !integrity_str.is_empty() {
+                        if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                            for entry in &pack.index.files {
+                                if let Some(ref cas_path) = entry.cas_path {
+                                    let src = loc_base_dir.join(loc).join(&entry.path);
+                                    cas_copy_list.push((src, cas_path.clone()));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        if !cas_copy_list.is_empty() {
-            let t_cas = std::time::Instant::now();
-            self.pack_store.populate_cas_from_installed(&cas_copy_list);
-            collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
+            if !cas_copy_list.is_empty() {
+                let t_cas = std::time::Instant::now();
+                self.pack_store.populate_cas_from_installed(&cas_copy_list);
+                collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
+            }
         }
 
         // Link all package bins across the tree in shallowest-first order with first-writer-wins
@@ -3345,11 +3585,30 @@ impl Installer {
             .cloned()
             .collect();
 
+        let mut known_bins = HashMap::new();
+        for (loc, node) in &graph.nodes {
+            if let Some(ref bin) = node.bin {
+                let entries = extract_bin_entries_from_lockfile(&node.name, bin);
+                if !entries.is_empty() {
+                    known_bins.insert(loc.clone(), entries);
+                }
+            }
+        }
+        for member in &workspace_members {
+            let entries = member.manifest.bin_entries();
+            if !entries.is_empty() {
+                known_bins.insert(format!("node_modules/{}", member.name), entries.clone());
+                known_bins.insert(member.relative_path.clone(), entries);
+            }
+        }
+
         link_tree_bins(
             tree_packages,
+            Some(&known_bins),
             &loc_base_dir,
             &root_bin_dir,
             &node_modules_dir,
+            false,
             Some(&collector),
         );
 
@@ -3815,16 +4074,7 @@ impl Installer {
                 let has_bin = match &pkg_info.bin {
                     Some(rnpm_lockfile::PackageBin::Single(_)) => true,
                     Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
-                    None => {
-                        let pkg_manifest_path = target_path.join("package.json");
-                        if pkg_manifest_path.exists() {
-                            Manifest::from_file(&pkg_manifest_path)
-                                .map(|m| !m.bin_entries().is_empty())
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        }
-                    }
+                    None => false,
                 };
                 if has_bin {
                     let pkg_bin_dir =
@@ -4294,14 +4544,11 @@ impl Installer {
 
         if all_packs_available {
             let t_mat = std::time::Instant::now();
-            let mut loaded_packs = Vec::with_capacity(packages_to_process.len());
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
             all_dirs.insert(bin_dir.clone());
 
-            let mut load_success = true;
-
-            for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
+            for (pkg_key, _, _, _, _, _) in &packages_to_process {
                 let pkg_target = loc_base_dir.join(pkg_key);
                 if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
@@ -4310,23 +4557,65 @@ impl Installer {
                 if let Some(parent) = pkg_target.parent() {
                     all_dirs.insert(parent.to_path_buf());
                 }
+            }
 
-                match self.pack_store.get_package_pack(integrity_str) {
-                    Ok(Some(pack)) => {
-                        loaded_packs.push((pkg_key.clone(), pkg_target, pack));
-                    }
-                    Err(e) => {
-                        warn!("get_package_pack failed for {pkg_key}: {e}. Falling back to standard pipeline.");
-                        load_success = false;
-                        break;
-                    }
-                    Ok(None) => {
-                        warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
-                        load_success = false;
-                        break;
+            let total_pkgs = packages_to_process.len();
+            let num_workers = 16.min(total_pkgs);
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let load_failed = std::sync::atomic::AtomicBool::new(false);
+            let pack_store = Arc::clone(&self.pack_store);
+
+            let mut loaded_packs = Vec::with_capacity(total_pkgs);
+            let mut load_success = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(num_workers);
+                for _ in 0..num_workers {
+                    handles.push(scope.spawn(|| -> Result<Vec<(usize, String, PathBuf, rnpm_cache::PackagePack)>, ()> {
+                        let mut local = Vec::new();
+                        while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if idx >= total_pkgs {
+                                break;
+                            }
+                            let (pkg_key, _, integrity_str, _, _, _) = &packages_to_process[idx];
+                            let pkg_target = loc_base_dir.join(pkg_key);
+                            match pack_store.get_package_pack(integrity_str) {
+                                Ok(Some(pack)) => {
+                                    local.push((idx, pkg_key.clone(), pkg_target, pack));
+                                }
+                                Err(e) => {
+                                    warn!("get_package_pack failed for {pkg_key}: {e}. Falling back to standard pipeline.");
+                                    load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return Err(());
+                                }
+                                Ok(None) => {
+                                    warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
+                                    load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    return Err(());
+                                }
+                            }
+                        }
+                        Ok(local)
+                    }));
+                }
+
+                let mut all_results = Vec::with_capacity(total_pkgs);
+                let mut any_err = false;
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(items)) => all_results.extend(items),
+                        _ => any_err = true,
                     }
                 }
-            }
+                if any_err || all_results.len() != total_pkgs {
+                    false
+                } else {
+                    all_results.sort_by_key(|(idx, _, _, _)| *idx);
+                    for (_, pkg_key, pkg_target, pack) in all_results {
+                        loaded_packs.push((pkg_key, pkg_target, pack));
+                    }
+                    true
+                }
+            });
 
             if load_success {
                 let mut all_file_refs = Vec::with_capacity(16384);
@@ -4780,11 +5069,40 @@ impl Installer {
             .cloned()
             .collect();
 
+        let mut known_bins = HashMap::new();
+        for (loc, pkg_info) in &lockfile.packages {
+            if let Some(ref bin) = pkg_info.bin {
+                let pkg_name = pkg_info.name.as_deref().unwrap_or_else(|| {
+                    package_name_from_loc(loc)
+                });
+                let entries = extract_bin_entries_from_lockfile(pkg_name, bin);
+                if !entries.is_empty() {
+                    known_bins.insert(loc.clone(), entries);
+                }
+            } else if pkg_info.link == Some(true) {
+                if let Some(ref resolved) = pkg_info.resolved {
+                    if let Some(target) = lockfile.packages.get(resolved) {
+                        if let Some(ref bin) = target.bin {
+                            let pkg_name = target.name.as_deref().unwrap_or_else(|| {
+                                package_name_from_loc(loc)
+                            });
+                            let entries = extract_bin_entries_from_lockfile(pkg_name, bin);
+                            if !entries.is_empty() {
+                                known_bins.insert(loc.clone(), entries);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         link_tree_bins(
             ci_tree_packages,
+            Some(&known_bins),
             &loc_base_dir,
             &bin_dir,
             &node_modules_dir,
+            true,
             Some(&collector),
         );
 
@@ -6304,16 +6622,55 @@ impl Installer {
 /// lockfile before serialization. This also preserves object-shaped funding
 /// metadata exactly as published.
 fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_dir: &Path) {
-    for (location, package) in &mut lockfile.packages {
-        if location.is_empty() || package.link == Some(true) {
-            continue;
+    let locations: Vec<String> = lockfile
+        .packages
+        .iter()
+        .filter_map(|(location, package)| {
+            if location.is_empty() || package.link == Some(true) {
+                return None;
+            }
+            if package.license.is_some() && package.engines.is_some() {
+                return None;
+            }
+            Some(location.clone())
+        })
+        .collect();
+
+    if locations.is_empty() {
+        return;
+    }
+
+    let num_threads = 16.min(locations.len());
+    let chunk_size = locations.len().div_ceil(num_threads);
+    let manifests_by_loc: HashMap<String, Manifest> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in locations.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::with_capacity(chunk.len());
+                for loc in chunk {
+                    let manifest_path = if loc.is_empty() {
+                        project_dir.join("package.json")
+                    } else {
+                        project_dir.join(loc).join("package.json")
+                    };
+                    if let Ok(m) = Manifest::from_file(&manifest_path) {
+                        local.push((loc.clone(), m));
+                    }
+                }
+                local
+            }));
         }
-        let manifest_path = if location.is_empty() {
-            project_dir.join("package.json")
-        } else {
-            project_dir.join(location).join("package.json")
-        };
-        let Ok(manifest) = Manifest::from_file(&manifest_path) else {
+        let mut results = HashMap::with_capacity(locations.len());
+        for handle in handles {
+            if let Ok(items) = handle.join() {
+                results.extend(items);
+            }
+        }
+        results
+    });
+
+    for (location, manifest) in manifests_by_loc {
+        let Some(package) = lockfile.packages.get_mut(&location) else {
             continue;
         };
 
