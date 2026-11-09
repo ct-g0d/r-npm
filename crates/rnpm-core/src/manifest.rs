@@ -93,6 +93,72 @@ pub enum PackageWorkspaces {
     Config { packages: Vec<String> },
 }
 
+/// Formatting metadata detected from raw package.json content to preserve
+/// exact indentation (spaces or tabs), newline style (CRLF or LF), trailing newline, and UTF-8 BOM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestFormat {
+    pub indent: String,
+    pub newline: String,
+    pub trailing_newline: bool,
+    pub has_bom: bool,
+}
+
+impl Default for ManifestFormat {
+    fn default() -> Self {
+        Self {
+            indent: "  ".to_string(),
+            newline: "\n".to_string(),
+            trailing_newline: true,
+            has_bom: false,
+        }
+    }
+}
+
+impl ManifestFormat {
+    pub fn detect(raw: &str) -> Self {
+        let has_bom = raw.starts_with('\u{feff}') || raw.as_bytes().starts_with(b"\xEF\xBB\xBF");
+        let clean = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+
+        let newline = if clean.contains("\r\n") {
+            "\r\n".to_string()
+        } else {
+            "\n".to_string()
+        };
+
+        let trailing_newline = clean.ends_with('\n') || clean.ends_with('\r');
+
+        let trimmed = clean.trim_start();
+        let indent = if let Some(after_bracket) = trimmed
+            .strip_prefix('{')
+            .or_else(|| trimmed.strip_prefix('['))
+        {
+            if let Some(nl_pos) = after_bracket.find('\n') {
+                let rest = &after_bracket[nl_pos + 1..];
+                let leading_ws: String = rest
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                if leading_ws.is_empty() {
+                    "  ".to_string()
+                } else {
+                    leading_ws
+                }
+            } else {
+                "  ".to_string()
+            }
+        } else {
+            "  ".to_string()
+        };
+
+        Self {
+            indent,
+            newline,
+            trailing_newline,
+            has_bom,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PeerDependencyMeta {
     #[serde(default)]
@@ -250,6 +316,14 @@ pub struct Manifest {
 
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+
+    /// Format metadata for round-trip fidelity
+    #[serde(skip)]
+    pub format: ManifestFormat,
+
+    /// Raw JSON representation preserving original key order and comments/fields
+    #[serde(skip)]
+    pub raw_json: Option<crate::ordered_json::OrderedJsonValue>,
 }
 
 impl Manifest {
@@ -261,25 +335,17 @@ impl Manifest {
         } else {
             bytes
         };
-
-        let mut manifest: Self =
-            serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
-                message: err.to_string(),
-                line: err.line(),
-                column: err.column(),
-            })?;
-        let value: serde_json::Value =
-            serde_json::from_slice(clean_bytes).map_err(|err| ManifestError::MalformedJson {
-                message: err.to_string(),
-                line: err.line(),
-                column: err.column(),
-            })?;
-        manifest.capture_dependency_order(&value);
-        Ok(manifest)
+        let s = std::str::from_utf8(clean_bytes).map_err(|_| ManifestError::MalformedJson {
+            message: "invalid utf-8".to_string(),
+            line: 0,
+            column: 0,
+        })?;
+        Self::from_str(s)
     }
 
     /// Parse manifest from string, with tolerance for UTF-8 BOM.
     pub fn from_str(s: &str) -> Result<Self, ManifestError> {
+        let format = ManifestFormat::detect(s);
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
         let mut manifest: Self =
             serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
@@ -287,13 +353,15 @@ impl Manifest {
                 line: err.line(),
                 column: err.column(),
             })?;
-        let value: serde_json::Value =
-            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+        let value: crate::ordered_json::OrderedJsonValue = serde_json::from_str(clean_str)
+            .map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
                 line: err.line(),
                 column: err.column(),
             })?;
         manifest.capture_dependency_order(&value);
+        manifest.format = format;
+        manifest.raw_json = Some(value);
         Ok(manifest)
     }
 
@@ -307,14 +375,14 @@ impl Manifest {
         Self::from_slice(&bytes)
     }
 
-    fn capture_dependency_order(&mut self, value: &serde_json::Value) {
+    fn capture_dependency_order(&mut self, value: &crate::ordered_json::OrderedJsonValue) {
         let Some(object) = value.as_object() else {
             return;
         };
         let collect = |key: &str| {
             object
                 .get(key)
-                .and_then(serde_json::Value::as_object)
+                .and_then(crate::ordered_json::OrderedJsonValue::as_object)
                 .map(|map| map.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default()
         };
@@ -370,16 +438,124 @@ impl Manifest {
         }
     }
 
-    /// Serialize manifest to a deterministic formatted JSON string with a trailing newline.
-    pub fn to_json_string(&self) -> Result<String, ManifestError> {
-        let mut json =
-            serde_json::to_string_pretty(self).map_err(|err| ManifestError::MalformedJson {
+    /// Format a JSON Value or serializable value preserving indentation, newline, BOM, and trailing newline preferences.
+    pub fn format_json_value<T: Serialize>(
+        value: &T,
+        format: &ManifestFormat,
+    ) -> Result<String, ManifestError> {
+        let mut buf = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(format.indent.as_bytes());
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        value
+            .serialize(&mut ser)
+            .map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
                 line: err.line(),
                 column: err.column(),
             })?;
-        json.push('\n');
-        Ok(json)
+        let formatted = String::from_utf8(buf).map_err(|e| ManifestError::MalformedJson {
+            message: e.to_string(),
+            line: 0,
+            column: 0,
+        })?;
+
+        let mut output = if format.newline == "\r\n" {
+            formatted.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            formatted
+        };
+
+        // npm (@npmcli/package-json) always appends a trailing newline
+        output.push_str(&format.newline);
+
+        if format.has_bom {
+            output.insert(0, '\u{feff}');
+        }
+
+        Ok(output)
+    }
+
+    /// Serialize manifest to a deterministic formatted JSON string with high fidelity,
+    /// preserving original key order, custom indentation (spaces or tabs), and line endings (CRLF or LF).
+    pub fn to_json_string(&self) -> Result<String, ManifestError> {
+        use crate::ordered_json::OrderedJsonValue;
+
+        let mut doc = if let Some(ref raw) = self.raw_json {
+            raw.clone()
+        } else {
+            let val = serde_json::to_value(self).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
+            OrderedJsonValue::from(val)
+        };
+
+        if let OrderedJsonValue::Object(ref mut map) = doc {
+            if let Some(ref name) = self.name {
+                map.insert("name".to_string(), OrderedJsonValue::String(name.clone()));
+            }
+            if let Some(ref version) = self.version {
+                map.insert(
+                    "version".to_string(),
+                    OrderedJsonValue::String(version.clone()),
+                );
+            }
+            if let Some(ref desc) = self.description {
+                map.insert(
+                    "description".to_string(),
+                    OrderedJsonValue::String(desc.clone()),
+                );
+            }
+            if let Some(ref main) = self.main {
+                map.insert("main".to_string(), OrderedJsonValue::String(main.clone()));
+            }
+            if !self.scripts.is_empty() {
+                let mut scripts_map = indexmap::IndexMap::new();
+                for (k, v) in &self.scripts {
+                    scripts_map.insert(k.clone(), OrderedJsonValue::String(v.clone()));
+                }
+                map.insert("scripts".to_string(), OrderedJsonValue::Object(scripts_map));
+            }
+
+            fn sync_deps(
+                map: &mut indexmap::IndexMap<String, OrderedJsonValue>,
+                key: &str,
+                deps: &BTreeMap<String, String>,
+            ) {
+                if deps.is_empty() {
+                    map.shift_remove(key);
+                } else {
+                    let mut deps_map = indexmap::IndexMap::new();
+                    for (k, v) in deps {
+                        deps_map.insert(k.clone(), OrderedJsonValue::String(v.clone()));
+                    }
+                    map.insert(key.to_string(), OrderedJsonValue::Object(deps_map));
+                }
+            }
+
+            sync_deps(map, "dependencies", &self.dependencies);
+            sync_deps(map, "devDependencies", &self.dev_dependencies);
+            sync_deps(map, "peerDependencies", &self.peer_dependencies);
+            sync_deps(map, "optionalDependencies", &self.optional_dependencies);
+
+            if !self.peer_dependencies_meta.is_empty() {
+                let val = serde_json::to_value(&self.peer_dependencies_meta).unwrap_or_default();
+                map.insert(
+                    "peerDependenciesMeta".to_string(),
+                    OrderedJsonValue::from(val),
+                );
+            } else {
+                map.shift_remove("peerDependenciesMeta");
+            }
+
+            if let Some(ref ws) = self.workspaces {
+                let val = serde_json::to_value(ws).unwrap_or_default();
+                map.insert("workspaces".to_string(), OrderedJsonValue::from(val));
+            }
+        }
+
+        Self::format_json_value(&doc, &self.format)
     }
 
     /// Save the manifest deterministically to disk.
