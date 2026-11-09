@@ -18,7 +18,10 @@ pub use error::{CacheError, PackError};
 pub use index::IndexEntry;
 pub use lock::CacheLock;
 pub use pack_store::{
-    PackFileEntry, PackIndex, PackInputFile, PackStore, PackagePack, PACK_ALIGNMENT,
+    CasWriteJob, DecodedPackage, PackFileEntry, PackIndex, PackInputFile, PackStore, PackagePack,
+    PACK_ALIGNMENT, TIME_CAS_WRITE, TIME_GZ_PARSE, TIME_PACK_WRITE,
+    TIME_EXTRACT_DIRS, TIME_EXTRACT_CAS_WRITE, TIME_EXTRACT_LINK,
+    COUNT_LINK_OK, COUNT_LINK_FAIL,
 };
 pub use storage::{packument_key, Cache, VerifyReport};
 

@@ -1066,11 +1066,22 @@ fn cleanup_stale_shims(
 }
 
 pub(crate) fn link_tree_bins(
+    package_locs: Vec<String>,
+    loc_base_dir: &Path,
+    root_bin_dir: &Path,
+    node_modules_dir: &Path,
+    collector: Option<&TimingCollector>,
+) {
+    link_tree_bins_opt(package_locs, loc_base_dir, root_bin_dir, node_modules_dir, collector, false);
+}
+
+pub(crate) fn link_tree_bins_opt(
     mut package_locs: Vec<String>,
     loc_base_dir: &Path,
     root_bin_dir: &Path,
     node_modules_dir: &Path,
     collector: Option<&TimingCollector>,
+    clean_slate: bool,
 ) {
     let t_bins = std::time::Instant::now();
 
@@ -1080,6 +1091,7 @@ pub(crate) fn link_tree_bins(
     // 2. Track claimed bin names per .bin directory in memory for the current run.
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut bins_to_create: Vec<(PathBuf, PathBuf, String, String, PathBuf)> = Vec::new();
 
     for loc in &package_locs {
         let target_path = loc_base_dir.join(loc);
@@ -1108,7 +1120,13 @@ pub(crate) fn link_tree_bins(
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
                 let script_path = target_path.join(&script_rel);
-                link_single_pkg_bin(&target_path, &pkg_bin_dir, &bin_name, &script_rel, &script_path);
+                bins_to_create.push((
+                    target_path.clone(),
+                    pkg_bin_dir.clone(),
+                    bin_name.clone(),
+                    script_rel,
+                    script_path,
+                ));
 
                 wanted_set.insert(bin_name.clone());
                 wanted_set.insert(format!("{bin_name}.cmd"));
@@ -1122,8 +1140,25 @@ pub(crate) fn link_tree_bins(
         }
     }
 
-    // 3. Clean up stale shims: remove any shims in .bin that are not owned by any package in the new tree's wanted bin set.
-    cleanup_stale_shims(node_modules_dir, &wanted_shims);
+    if !bins_to_create.is_empty() {
+        let num_threads = 16.min(bins_to_create.len()).max(1);
+        let chunk_size = bins_to_create.len().div_ceil(num_threads);
+        let bins_slice = &bins_to_create[..];
+        std::thread::scope(|s| {
+            for chunk in bins_slice.chunks(chunk_size) {
+                s.spawn(move || {
+                    for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
+                        link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
+                    }
+                });
+            }
+        });
+    }
+
+    // 3. Clean up stale shims only if not a fresh clean slate install
+    if !clean_slate {
+        cleanup_stale_shims(node_modules_dir, &wanted_shims);
+    }
 
     if let Some(c) = collector {
         c.record_phase(Phase::Bins, t_bins.elapsed());
@@ -1561,7 +1596,11 @@ impl Installer {
         if let Some(c) = concurrency {
             if c > 0 {
                 client_config.max_concurrent_requests = c;
+                client_config.pool_max_idle_per_host = c;
             }
+        } else {
+            client_config.max_concurrent_requests = 64;
+            client_config.pool_max_idle_per_host = 64;
         }
 
         apply_npmrc_to_client_config(&mut client_config, &config.npmrc);
@@ -2666,7 +2705,8 @@ impl Installer {
 
                 if res.starts_with("file:") {
                     let rel_file = res.strip_prefix("file:").unwrap();
-                    let abs_file = self.options.project_dir.join(rel_file);
+                    let clean_rel = rel_file.trim_start_matches("./").trim_start_matches(".\\");
+                    let abs_file = self.options.project_dir.join(clean_rel);
                     if abs_file.is_file() {
                         let archive_bytes = std::fs::read(&abs_file)?;
                         let computed_integrity = if let Some(ref integ) = node.integrity {
@@ -3172,10 +3212,10 @@ impl Installer {
                     return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
                 }
 
-                // Construct and write pack to store if not already present (deferred CAS write)
+                // Construct and write pack to store if not already present
                 if let Some(ref integ_str) = node.integrity {
                     if !integ_str.is_empty() && !pack_store.has_package_pack(integ_str) {
-                        let _ = pack_store.put_package_from_tarball_deferred(integ_str, &bytes);
+                        let _ = pack_store.put_package_from_tarball(integ_str, &bytes);
                     }
                 }
 
@@ -3288,8 +3328,10 @@ impl Installer {
                     if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
                         for entry in &pack.index.files {
                             if let Some(ref cas_path) = entry.cas_path {
-                                let src = loc_base_dir.join(loc).join(&entry.path);
-                                cas_copy_list.push((src, cas_path.clone()));
+                                if !cas_path.exists() {
+                                    let src = loc_base_dir.join(loc).join(&entry.path);
+                                    cas_copy_list.push((src, cas_path.clone()));
+                                }
                             }
                         }
                     }
@@ -3413,9 +3455,27 @@ impl Installer {
 
     /// Run strict CI installation from committed package-lock.json.
     pub async fn run_ci(&mut self) -> Result<InstallSummary> {
+        let t0 = std::time::Instant::now();
         let res = self.run_ci_internal().await;
+        let t_internal = t0.elapsed();
+        rnpm_fs::writer::wait_all_handles_closed();
+        let t_handles = t0.elapsed();
         if self.options.wait_for_trash || !self.options.detached_trash {
             crate::trash::wait_all_trash_deletions();
+        }
+        let t_trash = t0.elapsed();
+        if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+            eprintln!(
+                "[RNPM_TIMING_DEBUG] internal: {:.2}s, handles_closed: {:.2}s, trash_done: {:.2}s",
+                t_internal.as_secs_f64(),
+                (t_handles - t_internal).as_secs_f64(),
+                (t_trash - t_handles).as_secs_f64()
+            );
+            if let Ok(ref s) = res {
+                if let Some(ref t) = s.timing {
+                    eprintln!("{}", t.format_table());
+                }
+            }
         }
         res
     }
@@ -3779,64 +3839,6 @@ impl Installer {
         std::fs::create_dir_all(&node_modules_dir)?;
         std::fs::create_dir_all(&bin_dir)?;
 
-        // Pre-create all package parent directories and bin directories in one breadth-first pass
-        {
-            let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
-            for (pkg_key, pkg_info) in &lockfile.packages {
-                if pkg_key.is_empty() || platform_skipped_packages.contains(pkg_key) {
-                    continue;
-                }
-                let is_dev = pkg_info.dev.unwrap_or(false);
-                let is_optional = pkg_info.optional.unwrap_or(false)
-                    || pkg_info.is_effective_optional()
-                    || pkg_info.is_peer_optional();
-                let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-                if self.options.omit_dev && (is_dev || is_dev_optional) {
-                    continue;
-                }
-                if self.options.omit_optional && (is_optional || is_dev_optional) {
-                    continue;
-                }
-                if is_optional {
-                    let host_platform = self.options.platform();
-                    if !rnpm_solver::is_platform_compatible(
-                        &host_platform,
-                        pkg_info.os.as_deref(),
-                        pkg_info.cpu.as_deref(),
-                        pkg_info.libc.as_deref(),
-                    ) {
-                        continue;
-                    }
-                }
-                let target_path = self.options.project_dir.join(pkg_key);
-                if let Some(parent) = target_path.parent() {
-                    dirs_to_precreate.push(parent.to_path_buf());
-                }
-                let has_bin = match &pkg_info.bin {
-                    Some(rnpm_lockfile::PackageBin::Single(_)) => true,
-                    Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
-                    None => {
-                        let pkg_manifest_path = target_path.join("package.json");
-                        if pkg_manifest_path.exists() {
-                            Manifest::from_file(&pkg_manifest_path)
-                                .map(|m| !m.bin_entries().is_empty())
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        }
-                    }
-                };
-                if has_bin {
-                    let pkg_bin_dir =
-                        find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
-                    dirs_to_precreate.push(pkg_bin_dir);
-                }
-            }
-            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            if let Err(e) = precreate_directories(dir_refs) {
-                warn!("precreate_directories warning: {e}");
-            }
-        }
         drop(_plan2_span);
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
 
@@ -4221,13 +4223,8 @@ impl Installer {
                 .map(|d| d.keys().cloned().collect())
                 .unwrap_or_default();
 
-            let has_bin = match &pkg_info.bin {
-                Some(rnpm_lockfile::PackageBin::Single(_)) => true,
-                Some(rnpm_lockfile::PackageBin::Map(m)) => !m.is_empty(),
-                None => false,
-            };
             let has_scripts = pkg_info.has_install_script.unwrap_or(false);
-            let has_bins_or_scripts = has_bin || has_scripts;
+            let has_bins_or_scripts = has_scripts;
 
             packages_to_process.push((
                 pkg_key.clone(),
@@ -4279,14 +4276,363 @@ impl Installer {
             }
         }
 
-        let ci_writer_cfg = Arc::clone(&self.writer_cfg);
+        let mut custom_cfg = (*self.writer_cfg).clone();
+        if !custom_cfg.is_hdd {
+            custom_cfg.worker_threads = 16;
+        }
+        let ci_writer_cfg = Arc::new(custom_cfg);
 
-        let all_packs_available = !packages_to_process.is_empty()
-            && packages_to_process
-                .iter()
-                .all(|(_, _, integrity_str, _, _, _)| {
-                    !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
+        // Concurrently fetch tarballs and populate pack_store for any packages missing a pack
+        let missing_packs: Vec<(usize, String, String, String, bool)> = packages_to_process
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, integrity_str, _, _, _))| {
+                !integrity_str.is_empty() && !self.pack_store.has_package_pack(integrity_str)
+            })
+            .map(|(i, (pkg_key, resolved_url, integrity_str, is_optional, _, _))| {
+                (i, pkg_key.clone(), resolved_url.clone(), integrity_str.clone(), *is_optional)
+            })
+            .collect();
+
+        let mut missing_pack_results: HashMap<usize, bool> = HashMap::new();
+        let mut failed_optional_indices: HashSet<usize> = HashSet::new();
+        let mut directly_extracted_indices: HashSet<usize> = HashSet::new();
+
+        if !missing_packs.is_empty() {
+            let semaphore = Arc::clone(&self.io_semaphore);
+            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(12));
+            let mut join_set = tokio::task::JoinSet::new();
+
+            let (blob_tx, blob_rx) = std::sync::mpsc::channel::<(Vec<u8>, String)>();
+            let blob_rx = Arc::new(std::sync::Mutex::new(blob_rx));
+            let cache_clone = self.cache.clone();
+            let mut blob_handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let rx = Arc::clone(&blob_rx);
+                let c = cache_clone.clone();
+                blob_handles.push(std::thread::spawn(move || {
+                    loop {
+                        let item = {
+                            let Ok(guard) = rx.lock() else { break; };
+                            guard.recv().ok()
+                        };
+                        let Some((bytes, hex)) = item else { break; };
+                        let _ = c.put_blob_direct(&bytes, &hex);
+                    }
+                }));
+            }
+
+            let (pack_tx, pack_rx) = std::sync::mpsc::channel::<(String, PathBuf, Vec<rnpm_fs::MaterializeFile>, bool)>();
+            let pack_rx = Arc::new(std::sync::Mutex::new(pack_rx));
+            let pack_store_clone = Arc::clone(&self.pack_store);
+            let mut pack_handles = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let rx = Arc::clone(&pack_rx);
+                let ps = Arc::clone(&pack_store_clone);
+                pack_handles.push(std::thread::spawn(move || {
+                    loop {
+                        let item = {
+                            let Ok(guard) = rx.lock() else { break; };
+                            guard.recv().ok()
+                        };
+                        let Some((integrity, pkg_target, files, populate_cas)) = item else { break; };
+                        let _ = ps.put_package_pack_from_decoded(&integrity, &pkg_target, &files, populate_cas);
+                    }
+                }));
+            }
+
+            for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
+                let sem = Arc::clone(&semaphore);
+                let cpu_sem = Arc::clone(&cpu_semaphore);
+                let cache = self.cache.clone();
+                let registry_client = self.registry_client.clone();
+                let project_dir = loc_base_dir.clone();
+                let offline = self.options.offline;
+                let worker_collector = collector.clone();
+                let p_tx = pack_tx.clone();
+                let idx = *idx;
+                let pkg_key = pkg_key.clone();
+                let resolved_url = resolved_url.clone();
+                let integrity_str = integrity_str.clone();
+                let is_optional = *is_optional;
+
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+
+                    let (bytes, was_hit, to_cache) = if resolved_url.starts_with("file:") {
+                        let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
+                        if file_path.contains('\0') {
+                            return Err(anyhow!(
+                                "Resolved file URL contains null bytes: {resolved_url}"
+                            ));
+                        }
+                        let clean_project_dir = path_clean::clean(&project_dir);
+                        let candidate_path = if Path::new(file_path).is_absolute() {
+                            PathBuf::from(file_path)
+                        } else {
+                            clean_project_dir.join(file_path)
+                        };
+                        let clean_file_path = path_clean::clean(&candidate_path);
+                        if !clean_file_path.starts_with(&clean_project_dir) {
+                            return Err(anyhow!(
+                                "Security error: resolved file URL '{}' escapes project directory '{}'",
+                                resolved_url,
+                                clean_project_dir.display()
+                            ));
+                        }
+                        if let (Ok(canon_proj), Ok(canon_file)) = (
+                            clean_project_dir.canonicalize(),
+                            clean_file_path.canonicalize(),
+                        ) {
+                            if !canon_file.starts_with(&canon_proj) {
+                                return Err(anyhow!(
+                                    "Security error: resolved file path '{}' canonical path '{}' escapes project directory '{}'",
+                                    resolved_url,
+                                    canon_file.display(),
+                                    canon_proj.display()
+                                ));
+                            }
+                        }
+                        if !clean_file_path.exists() {
+                            if is_optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Archive {} not found",
+                                    clean_file_path.display()
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!(
+                                    "Archive file not found: {}",
+                                    clean_file_path.display()
+                                ));
+                            }
+                        }
+                        let bytes = std::fs::read(&clean_file_path).with_context(|| {
+                            format!(
+                                "Failed to read local archive file '{}'",
+                                clean_file_path.display()
+                            )
+                        })?;
+
+                        let expected_integrity: Integrity = integrity_str
+                            .parse()
+                            .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+                        if let Err(e) = expected_integrity.verify(&bytes) {
+                            if is_optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for local archive {pkg_key}: {e}"
+                                );
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!(
+                                    "Integrity verification failed for local archive {pkg_key}: {e}"
+                                ));
+                            }
+                        }
+                        (bytes, true, None)
+                    } else {
+                        let expected_integrity: Integrity = integrity_str
+                            .parse()
+                            .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
+
+                        let t_fetch = std::time::Instant::now();
+                        let (data, was_hit, sha_hex) = if let Ok(Some(data)) = cache.get_by_integrity(&expected_integrity) {
+                            (data, true, None)
+                        } else if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                            if expected_integrity.verify(&data).is_ok() {
+                                (data, true, None)
+                            } else {
+                                debug!("Cached blob for {pkg_key} failed integrity, purging and re-fetching");
+                                let _ = cache.purge_key(&resolved_url);
+                                if offline {
+                                    if is_optional {
+                                        return Ok(None);
+                                    }
+                                    return Err(anyhow!(
+                                        "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}"
+                                    ));
+                                }
+                                match registry_client.download_tarball_bytes(&resolved_url).await {
+                                    Ok(fresh_bytes) => {
+                                        if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                            if is_optional {
+                                                warn!(
+                                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                                );
+                                                return Ok(None);
+                                            } else {
+                                                return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                            }
+                                        }
+                                        let sha_hex = expected_integrity.entries.iter()
+                                            .find(|e| e.algorithm == rnpm_core::integrity::Algorithm::Sha512)
+                                            .map(|e| data_encoding::HEXLOWER.encode(&e.digest));
+                                        (fresh_bytes, false, sha_hex)
+                                    }
+                                    Err(e) => return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                                }
+                            }
+                        } else if offline {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {pkg_key} not found in local cache (--offline)");
+                                return Ok(None);
+                            }
+                            return Err(anyhow!(
+                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            ));
+                        } else {
+                            match registry_client.download_tarball_bytes(&resolved_url).await {
+                                Ok(fresh_bytes) => {
+                                    if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
+                                        if is_optional {
+                                            warn!(
+                                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {pkg_key}: {fresh_err}"
+                                            );
+                                            return Ok(None);
+                                        } else {
+                                            return Err(anyhow!("Integrity verification failed for {pkg_key}: {fresh_err}"));
+                                        }
+                                    }
+                                    let sha_hex = expected_integrity.entries.iter()
+                                        .find(|e| e.algorithm == rnpm_core::integrity::Algorithm::Sha512)
+                                        .map(|e| data_encoding::HEXLOWER.encode(&e.digest));
+                                    (fresh_bytes, false, sha_hex)
+                                }
+                                Err(e) => return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                            }
+                        };
+                        worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
+                        let to_cache = sha_hex.map(|h| (data.clone(), h));
+                        (data, was_hit, to_cache)
+                    };
+
+                    let _cpu_permit = cpu_sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                    let t_sw = std::time::Instant::now();
+                    let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
+                        pkg_key.replace('/', "\\")
+                    } else {
+                        pkg_key.clone()
+                    };
+                    let loc_base_dir_v = rnpm_fs::to_verbatim_path(&project_dir);
+                    let pkg_target = loc_base_dir_v.join(pkg_key_clean);
+                    let pkg_key_for_pack = pkg_key.clone();
+                    let pack_res = tokio::task::spawn_blocking(move || {
+                        let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        if idx < 2 && !integrity_str.is_empty() {
+                            let _ = p_tx.send((integrity_str, pkg_target, decoded.files.clone(), true));
+                        }
+                        Ok::<rnpm_cache::DecodedPackage, anyhow::Error>(decoded)
+                    })
+                    .await
+                    .map_err(|e| anyhow!("pack worker panicked: {e}"))?;
+
+                    match pack_res {
+                        Ok(decoded) => {
+                            worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                            Ok(Some((idx, was_hit, pkg_key, decoded, to_cache)))
+                        }
+                        Err(e) => {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create pack for {pkg_key}: {e}");
+                                Ok(None)
+                            } else {
+                                Err(anyhow!("Failed to create pack for {pkg_key}: {e}"))
+                            }
+                        }
+                    }
                 });
+            }
+
+            drop(pack_tx);
+
+            let mut all_files = Vec::new();
+            let mut all_dirs = std::collections::BTreeSet::new();
+            all_dirs.insert(node_modules_dir.clone());
+            all_dirs.insert(bin_dir.clone());
+            let mut all_decoded_symlinks = Vec::new();
+
+            let t_decode_start = std::time::Instant::now();
+            while let Some(join_res) = join_set.join_next().await {
+                let item_opt =
+                    join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
+                if let Some((idx, was_hit, _pkg_k, decoded, blob_opt)) = item_opt {
+                    missing_pack_results.insert(idx, was_hit);
+                    directly_extracted_indices.insert(idx);
+                    all_dirs.extend(decoded.dirs);
+                    all_files.extend(decoded.files);
+                    all_decoded_symlinks.extend(decoded.symlinks);
+                    if let Some(blob) = blob_opt {
+                        let _ = blob_tx.send(blob);
+                    }
+                }
+            }
+            let decode_dur = t_decode_start.elapsed();
+            drop(blob_tx);
+
+            let t_mat = std::time::Instant::now();
+            let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+            precreate_directories(dir_refs)
+                .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
+            let dirs_dur = t_mat.elapsed();
+
+            let t_mat_files = std::time::Instant::now();
+            rnpm_fs::materialize_files_parallel(all_files, &ci_writer_cfg)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            for (link_path, target_path) in all_decoded_symlinks {
+                if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
+                    warn!(
+                        "Failed to create link or copy from '{}' to '{}': {e}",
+                        link_path.display(),
+                        target_path.display()
+                    );
+                }
+            }
+            let mat_dur = t_mat_files.elapsed();
+            collector.record_phase(Phase::Materialize, t_mat.elapsed());
+            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                eprintln!(
+                    "[RNPM_TIMING_DEBUG] decode: {:.2}s, dirs: {:.2}s, materialize: {:.2}s",
+                    decode_dur.as_secs_f64(),
+                    dirs_dur.as_secs_f64(),
+                    mat_dur.as_secs_f64()
+                );
+            }
+
+            for h in blob_handles {
+                let _ = h.join();
+            }
+            for h in pack_handles {
+                let _ = h.join();
+            }
+
+            if missing_pack_results.len() < missing_packs.len() {
+                for (idx, _, _, _, is_opt) in &missing_packs {
+                    if !missing_pack_results.contains_key(idx) && *is_opt {
+                        failed_optional_indices.insert(*idx);
+                    }
+                }
+            }
+
+            if !failed_optional_indices.is_empty() {
+                let mut kept = Vec::new();
+                for (i, pkg) in packages_to_process.into_iter().enumerate() {
+                    if !failed_optional_indices.contains(&i) {
+                        kept.push(pkg);
+                    }
+                }
+                packages_to_process = kept;
+            }
+        }
+
+        let all_packs_available = directly_extracted_indices.len() == packages_to_process.len()
+            || (!packages_to_process.is_empty()
+                && packages_to_process
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| {
+                        !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
+                    }));
 
         let mut used_fast_path = false;
         let mut bin_packages = packages_to_process.clone();
@@ -4295,14 +4641,23 @@ impl Installer {
         if all_packs_available {
             let t_mat = std::time::Instant::now();
             let mut loaded_packs = Vec::with_capacity(packages_to_process.len());
+            let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
             let mut all_dirs = std::collections::BTreeSet::new();
-            all_dirs.insert(node_modules_dir.clone());
-            all_dirs.insert(bin_dir.clone());
+            all_dirs.insert(rnpm_fs::to_verbatim_path(&node_modules_dir));
+            all_dirs.insert(rnpm_fs::to_verbatim_path(&bin_dir));
 
             let mut load_success = true;
 
-            for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
-                let pkg_target = loc_base_dir.join(pkg_key);
+            for (i, (pkg_key, _, integrity_str, _, _, _)) in packages_to_process.iter().enumerate() {
+                if directly_extracted_indices.contains(&i) {
+                    continue;
+                }
+                let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
+                    pkg_key.replace('/', "\\")
+                } else {
+                    pkg_key.clone()
+                };
+                let pkg_target = loc_base_dir_v.join(pkg_key_clean);
                 if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
                 }
@@ -4334,7 +4689,12 @@ impl Installer {
 
                 'load_files: for (pkg_key, pkg_target, pack) in &loaded_packs {
                     for entry in &pack.index.files {
-                        let full_path = pkg_target.join(&entry.path);
+                        let clean_entry_path = if cfg!(windows) && entry.path.contains('/') {
+                            entry.path.replace('/', "\\")
+                        } else {
+                            entry.path.clone()
+                        };
+                        let full_path = pkg_target.join(clean_entry_path);
                         if let Some(parent) = full_path.parent() {
                             all_dirs.insert(parent.to_path_buf());
                         }
@@ -4344,9 +4704,13 @@ impl Installer {
                                 data: slice,
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
-                                source_path: entry.cas_path.as_deref(),
+                                source_path: if entry.cas_verified {
+                                    entry.cas_path.as_deref()
+                                } else {
+                                    None
+                                },
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: entry.cas_verified,
+                                source_verified: false,
                             });
                         } else {
                             warn!(
@@ -4358,33 +4722,45 @@ impl Installer {
                         }
                     }
                     for (link_rel, target_rel) in &pack.index.symlinks {
-                        all_symlinks.push((pkg_target.join(link_rel), pkg_target.join(target_rel)));
+                        let clean_link = if cfg!(windows) && link_rel.contains('/') {
+                            link_rel.replace('/', "\\")
+                        } else {
+                            link_rel.clone()
+                        };
+                        let clean_target = if cfg!(windows) && target_rel.contains('/') {
+                            target_rel.replace('/', "\\")
+                        } else {
+                            target_rel.clone()
+                        };
+                        all_symlinks.push((pkg_target.join(clean_link), pkg_target.join(clean_target)));
                     }
                 }
 
                 if load_success {
                     used_fast_path = true;
 
-                    // 1. Precreate all directories breadth-first in a single pass
-                    let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
-                    precreate_directories(dir_refs)
-                        .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
+                    if !all_file_refs.is_empty() {
+                        // 1. Precreate all directories breadth-first in a single pass
+                        let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+                        precreate_directories(dir_refs)
+                            .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
 
-                    // 2. Materialize all files globally parallel across threads
-                    rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                        // 2. Materialize all files globally parallel across threads
+                        rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
+                            .map_err(|e| anyhow!("{e}"))?;
 
-                    // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
-                    for (link_path, target_path) in all_symlinks {
-                        if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
-                            warn!(
-                                "Failed to create link or copy from '{}' to '{}': {e}",
-                                link_path.display(),
-                                target_path.display()
-                            );
+                        // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
+                        for (link_path, target_path) in all_symlinks {
+                            if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
+                                warn!(
+                                    "Failed to create link or copy from '{}' to '{}': {e}",
+                                    link_path.display(),
+                                    target_path.display()
+                                );
+                            }
                         }
                     }
+                    collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
                     // 4. Process bin shims and lifecycle scripts
                     for (
@@ -4409,6 +4785,19 @@ impl Installer {
                             }
                         }
                         packages_installed += 1;
+                    }
+
+                    for was_hit in missing_pack_results.values() {
+                        if *was_hit {
+                            cache_hits += 1;
+                            collector.record_cache_hit();
+                        } else {
+                            cache_misses += 1;
+                            collector.record_cache_miss();
+                        }
+                    }
+                    let already_warm_count = packages_to_process.len().saturating_sub(missing_packs.len());
+                    for _ in 0..already_warm_count {
                         cache_hits += 1;
                         collector.record_cache_hit();
                     }
@@ -4664,10 +5053,10 @@ impl Installer {
                         }
                     };
 
-                    // Construct pack in pack store if not present (deferred CAS write)
+                    // Construct pack in pack store if not present
                     if !integrity_str.is_empty() && !pack_store.has_package_pack(&integrity_str) {
                         let t_sw = std::time::Instant::now();
-                        let _ = pack_store.put_package_from_tarball_deferred(&integrity_str, &bytes);
+                        let _ = pack_store.put_package_from_tarball(&integrity_str, &bytes);
                         worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
                     }
 
@@ -4744,8 +5133,10 @@ impl Installer {
                     if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
                         for entry in &pack.index.files {
                             if let Some(ref cas_path) = entry.cas_path {
-                                let src = loc_base_dir.join(pkg_key).join(&entry.path);
-                                cas_copy_list.push((src, cas_path.clone()));
+                                if !cas_path.exists() {
+                                    let src = loc_base_dir.join(pkg_key).join(&entry.path);
+                                    cas_copy_list.push((src, cas_path.clone()));
+                                }
                             }
                         }
                     }
@@ -4762,30 +5153,37 @@ impl Installer {
         // per .bin directory in this run, overwriting shims and cleaning up stale ones.
         let ci_tree_packages: Vec<String> = lockfile
             .packages
-            .keys()
-            .filter(|k| {
+            .iter()
+            .filter(|(k, info)| {
                 if k.is_empty() {
                     return false;
                 }
                 if platform_skipped_packages.contains(*k) {
                     return false;
                 }
-                if let Some(info) = lockfile.packages.get(*k) {
-                    if info.link == Some(true) {
-                        return true;
-                    }
+                let has_bin = match &info.bin {
+                    Some(rnpm_lockfile::PackageBin::Single(_)) => true,
+                    Some(rnpm_lockfile::PackageBin::Map(m)) => !m.is_empty(),
+                    None => false,
+                };
+                if !has_bin && info.link != Some(true) {
+                    return false;
+                }
+                if info.link == Some(true) {
+                    return true;
                 }
                 k.starts_with("node_modules/")
             })
-            .cloned()
+            .map(|(k, _)| k.clone())
             .collect();
 
-        link_tree_bins(
+        link_tree_bins_opt(
             ci_tree_packages,
             &loc_base_dir,
             &bin_dir,
             &node_modules_dir,
             Some(&collector),
+            true,
         );
 
         // Execute lifecycle scripts bottom-up followed by root hooks
@@ -4826,7 +5224,12 @@ impl Installer {
             }
         }
 
-        clean_empty_bin_dirs(&node_modules_dir);
+        let root_bin = node_modules_dir.join(".bin");
+        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
+            if bin_entries.next().is_none() {
+                let _ = std::fs::remove_dir(&root_bin);
+            }
+        }
 
         Ok(InstallSummary {
             packages_installed,

@@ -7,7 +7,7 @@ use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::Manifest;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder, Header};
 
@@ -135,6 +135,8 @@ pub fn extract_tar_gz<R: Read>(
     let limits = limits.unwrap_or_default();
     let verbatim_dest = crate::path::to_verbatim_path(destination);
     fs::create_dir_all(&verbatim_dest)?;
+    let clean_dest = clean(&verbatim_dest);
+    let mut verified_safe_ancestors: HashSet<PathBuf> = HashSet::new();
 
     let compressed_counter = Arc::new(AtomicU64::new(0));
     let counting_reader = CountingReader::with_counter(reader, Arc::clone(&compressed_counter));
@@ -287,7 +289,6 @@ pub fn extract_tar_gz<R: Read>(
         let target_path = verbatim_dest.join(&relative_path);
 
         // Verify strict canonical path containment
-        let clean_dest = clean(&verbatim_dest);
         let clean_target = clean(&target_path);
         if !clean_target.starts_with(&clean_dest) {
             return Err(FsError::PathTraversal {
@@ -304,7 +305,13 @@ pub fn extract_tar_gz<R: Read>(
         // Security check against Symlink Slip:
         // Ensure neither target_path nor any intermediate ancestor directory is a symlink or junction
         // pointing outside destination or created by an earlier tarball entry.
-        ensure_no_symlink_ancestors(&target_path, &verbatim_dest, &symlink_paths, &relative_path)?;
+        ensure_no_symlink_ancestors_with_cache(
+            &target_path,
+            &verbatim_dest,
+            &symlink_paths,
+            &relative_path,
+            Some(&mut verified_safe_ancestors),
+        )?;
 
         // Track case-preserved normalized paths: maintain seen_paths: HashMap<String, String>
         // mapping lowercase normalized path -> exact case-preserved normalized path.
@@ -597,8 +604,10 @@ pub fn extract_tar_gz<R: Read>(
 
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
-            unlink_target_path(&target_path);
-            fs::create_dir_all(&target_path)?;
+            if !target_path.is_dir() {
+                unlink_target_path(&target_path);
+                fs::create_dir_all(&target_path)?;
+            }
         } else if entry_type.is_file() {
             // Check single entry size limit from header if available
             if let Ok(entry_size) = entry.header().size() {
@@ -622,57 +631,26 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
 
-            if let Some(parent) = target_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                } else {
-                    #[cfg(windows)]
-                    if let Ok(meta) = fs::metadata(parent) {
-                        let mut perms = meta.permissions();
-                        if perms.readonly() {
-                            perms.set_readonly(false);
-                            let _ = fs::set_permissions(parent, perms);
-                        }
-                    }
-                    #[cfg(unix)]
-                    if let Ok(meta) = fs::metadata(parent) {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = meta.permissions();
-                        if perms.mode() & 0o200 == 0 {
-                            perms.set_mode(perms.mode() | 0o700);
-                            let _ = fs::set_permissions(parent, perms);
-                        }
-                    }
-                }
+            if let Ok(0) = entry.header().size() {
+                crate::writer::write_file_fast(&target_path, &[], mode, 64 * 1024)
+                    .map_err(FsError::Io)?;
+                symlink_paths.remove(&relative_path);
+                symlink_paths.remove(&normalize_rel_path(&relative_path));
+                extracted_regular_files.insert(relative_path.clone());
+                extracted_regular_files.insert(normalize_rel_path(&relative_path));
+                continue;
             }
 
-            // If target_path is already a symlink or junction, safely unlink it to prevent writing through symlink
-            unlink_target_path(&target_path);
-
-            // Clear read-only permissions on existing target file if present
-            if target_path.exists() {
-                #[cfg(windows)]
-                if let Ok(meta) = fs::metadata(&target_path) {
-                    let mut perms = meta.permissions();
-                    if perms.readonly() {
-                        perms.set_readonly(false);
-                        let _ = fs::set_permissions(&target_path, perms);
-                    }
-                }
-                #[cfg(unix)]
-                if let Ok(meta) = fs::metadata(&target_path) {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = meta.permissions();
-                    if perms.mode() & 0o200 == 0 {
-                        perms.set_mode(perms.mode() | 0o200);
-                        let _ = fs::set_permissions(&target_path, perms);
-                    }
-                }
-            }
-
-            let raw_file = match File::create(&target_path) {
+            let mut raw_file = match File::create(&target_path) {
                 Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = target_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    File::create(&target_path)?
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    unlink_target_path(&target_path);
                     #[cfg(windows)]
                     if let Ok(meta) = fs::metadata(&target_path) {
                         let mut perms = meta.permissions();
@@ -692,7 +670,6 @@ pub fn extract_tar_gz<R: Read>(
                 }
                 Err(err) => return Err(err.into()),
             };
-            let mut out_file = BufWriter::with_capacity(128 * 1024, raw_file);
             loop {
                 let t_read = std::time::Instant::now();
                 let n = entry.read(&mut copy_buf).map_err(FsError::Io)?;
@@ -700,7 +677,7 @@ pub fn extract_tar_gz<R: Read>(
                 if n == 0 {
                     break;
                 }
-                io::Write::write_all(&mut out_file, &copy_buf[..n])?;
+                io::Write::write_all(&mut raw_file, &copy_buf[..n])?;
                 total_uncompressed += n as u64;
 
                 // Check max uncompressed size
@@ -733,8 +710,7 @@ pub fn extract_tar_gz<R: Read>(
                     }
                 }
             }
-            out_file.flush()?;
-            drop(out_file);
+            drop(raw_file);
             symlink_paths.remove(&relative_path);
             symlink_paths.remove(&normalize_rel_path(&relative_path));
             extracted_regular_files.insert(relative_path.clone());
@@ -838,6 +814,16 @@ pub fn ensure_no_symlink_ancestors(
     symlink_paths: &HashSet<PathBuf>,
     relative_path: &Path,
 ) -> Result<(), FsError> {
+    ensure_no_symlink_ancestors_with_cache(target, destination, symlink_paths, relative_path, None)
+}
+
+pub fn ensure_no_symlink_ancestors_with_cache(
+    target: &Path,
+    destination: &Path,
+    symlink_paths: &HashSet<PathBuf>,
+    relative_path: &Path,
+    mut safe_cache: Option<&mut HashSet<PathBuf>>,
+) -> Result<(), FsError> {
     // 1. Check if any intermediate ancestor directory was created as a symlink/junction by an earlier entry
     let norm_rel = normalize_rel_path(relative_path);
     for ancestor in norm_rel.ancestors() {
@@ -862,12 +848,18 @@ pub fn ensure_no_symlink_ancestors(
 
     // 3. Check all intermediate ancestors between destination and target on disk
     let mut current = target.parent();
+    let mut newly_verified = Vec::new();
     while let Some(parent) = current {
         if parent == destination || parent.as_os_str().is_empty() {
             break;
         }
         if !parent.starts_with(destination) {
             break;
+        }
+        if let Some(ref cache) = safe_cache {
+            if cache.contains(parent) {
+                break;
+            }
         }
         if let Ok(meta) = fs::symlink_metadata(parent) {
             if meta.file_type().is_symlink() {
@@ -886,7 +878,13 @@ pub fn ensure_no_symlink_ancestors(
                 }
             }
         }
+        newly_verified.push(parent.to_path_buf());
         current = parent.parent();
+    }
+    if let Some(ref mut cache) = safe_cache {
+        for p in newly_verified {
+            cache.insert(p);
+        }
     }
     Ok(())
 }

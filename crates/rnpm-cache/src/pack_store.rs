@@ -22,16 +22,16 @@ use flate2::read::GzDecoder;
 use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
-use rnpm_fs::writer::ParallelWriterConfig;
+use rnpm_fs::writer::{link_or_copy_file, ParallelWriterConfig};
 use rnpm_fs::{
     clone_or_write_pack_file, is_block_cloning_supported, is_refs_volume, is_same_volume,
-    ExtractionSummary, RawFileHandle,
+    to_verbatim_path, ExtractionSummary, RawFileHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -43,6 +43,22 @@ use tracing::warn;
 pub const PACK_ALIGNMENT: usize = 4096;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub static TIME_GZ_PARSE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_CAS_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_PACK_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_DIRS: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_CAS_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_LINK: AtomicU64 = AtomicU64::new(0);
+pub static COUNT_LINK_OK: AtomicU64 = AtomicU64::new(0);
+pub static COUNT_LINK_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// Decoded in-memory package files and directories ready for global parallel materialization.
+#[derive(Debug, Default)]
+pub struct DecodedPackage {
+    pub files: Vec<rnpm_fs::MaterializeFile>,
+    pub dirs: Vec<PathBuf>,
+    pub symlinks: Vec<(PathBuf, PathBuf)>,
+}
 
 /// Extracts the modified timestamp (nanoseconds since UNIX epoch) from file metadata.
 pub fn mtime_to_timestamp(meta: &fs::Metadata) -> Option<u64> {
@@ -238,10 +254,89 @@ pub struct PackagePack {
     pub idx_path: PathBuf,
 }
 
+/// A CAS file write job referencing a slice of an in-memory pack buffer.
+#[derive(Debug, Clone)]
+pub struct CasWriteJob {
+    pub cas_path: PathBuf,
+    pub pack_buf: Arc<Vec<u8>>,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl PackagePack {
     /// Return the raw byte slice of the entire memory-mapped pack.
     pub fn data(&self) -> &[u8] {
         self.buffer.data()
+    }
+
+    /// Returns all CAS write jobs for this package pack, zero-copy sharing the pack buffer.
+    pub fn cas_write_jobs(&self) -> Vec<CasWriteJob> {
+        let bytes_arc = match self.buffer.as_ref() {
+            PackBuffer::Bytes(b) => Arc::clone(b),
+            _ => Arc::new(self.buffer.data().to_vec()),
+        };
+        let mut jobs = Vec::with_capacity(self.index.files.len());
+        for entry in &self.index.files {
+            if let Some(ref cas_path) = entry.cas_path {
+                let start = entry.offset as usize;
+                let end = start.saturating_add(entry.size as usize);
+                if end <= bytes_arc.len() {
+                    jobs.push(CasWriteJob {
+                        cas_path: cas_path.clone(),
+                        pack_buf: Arc::clone(&bytes_arc),
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        jobs
+    }
+
+    /// Simultaneously extracts package files to target_dir and populates the CAS store,
+    /// hardlinking target files to their CAS counterparts with zero duplicated file writes.
+    pub fn extract_and_populate_cas(&self, target_dir: &Path) -> std::io::Result<()> {
+        let pack_data = self.data();
+        let mut parents = std::collections::HashSet::new();
+        parents.insert(target_dir.to_path_buf());
+        for entry in &self.index.files {
+            let full_path = target_dir.join(&entry.path);
+            if let Some(parent) = full_path.parent() {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        for (link_rel, _) in &self.index.symlinks {
+            let full_path = target_dir.join(link_rel);
+            if let Some(parent) = full_path.parent() {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        let t_dirs = std::time::Instant::now();
+        for dir in &parents {
+            let _ = fs::create_dir_all(dir);
+        }
+        TIME_EXTRACT_DIRS.fetch_add(t_dirs.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        for entry in &self.index.files {
+            let full_path = target_dir.join(&entry.path);
+            let start = entry.offset as usize;
+            let end = start + entry.size as usize;
+            if end <= pack_data.len() {
+                let slice = &pack_data[start..end];
+                let t_cw = std::time::Instant::now();
+                let _ = rnpm_fs::writer::write_file_fast(&full_path, slice, entry.mode, 65536);
+                TIME_EXTRACT_CAS_WRITE.fetch_add(t_cw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                rnpm_fs::record_file_created(entry.size);
+            }
+        }
+
+        for (link_rel, target_rel) in &self.index.symlinks {
+            let link_path = target_dir.join(link_rel);
+            let target_path = target_dir.join(target_rel);
+            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
+        }
+
+        Ok(())
     }
 
     /// Verify the pack's whole-pack content hash (SHA-256) against the checksum stored in `.idx`.
@@ -422,25 +517,29 @@ impl PackagePack {
             let src_h = None;
 
             let mut copied = false;
-            if !can_block_clone {
-                if let Some(ref cas_path) = entry.cas_path {
-                    let cas_valid = entry.cas_verified
-                        && cas_path
-                            .metadata()
-                            .map(|metadata| {
-                                metadata.len() == entry.size
-                                    && entry.cas_mtime.is_none_or(|m| {
-                                        mtime_to_timestamp(&metadata) == Some(m)
-                                    })
-                            })
-                            .unwrap_or(false);
-                    if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
-                        copied = true;
-                        rnpm_fs::record_file_created(entry.size);
+            if let Some(ref cas_path) = entry.cas_path {
+                if let Ok(meta) = cas_path.metadata() {
+                    let mut cas_valid = false;
+                    if meta.len() == entry.size {
+                        if entry.cas_verified {
+                            cas_valid = true;
+                        } else if let Some(ref expected_sha) = entry.sha256 {
+                            if let Ok(bytes) = fs::read(cas_path) {
+                                let actual = HEXLOWER.encode(&Sha256::digest(&bytes));
+                                cas_valid = actual.eq_ignore_ascii_case(expected_sha);
+                            }
+                        } else {
+                            cas_valid = true;
+                        }
+                    }
+                    if cas_valid {
+                        if link_or_copy_file(cas_path, &full_path).is_ok() {
+                            copied = true;
+                            rnpm_fs::record_file_created(entry.size);
+                        }
                     } else {
-                        // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
-                        let _ = PackStore::write_cas_file_safe(cas_path, slice);
-                        if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                        let _ = PackStore::write_cas_file_direct(cas_path, slice);
+                        if link_or_copy_file(cas_path, &full_path).is_ok() {
                             copied = true;
                             rnpm_fs::record_file_created(entry.size);
                         }
@@ -494,8 +593,11 @@ impl PackStore {
     /// Initialize a PackStore rooted at `root` directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("packs"))?;
+        let packs_dir = root.join("packs");
+        fs::create_dir_all(&packs_dir)?;
         fs::create_dir_all(root.join("tmp"))?;
+        let cas_dir = root.join("cas");
+        fs::create_dir_all(&cas_dir)?;
         Ok(Self {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -576,46 +678,175 @@ impl PackStore {
 
     /// Atomically writes file data into CAS safely using a temp file and atomic rename.
     pub fn write_cas_file(&self, cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-        Self::write_cas_file_safe(cas_path, data)
+        Self::write_cas_file_direct(cas_path, data)
     }
 
-/// Atomically writes file data into CAS safely using a temp file and atomic rename.
-pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Ok(meta) = cas_path.metadata() {
-        if meta.len() == data.len() as u64 {
-            if let Ok(existing) = fs::read(cas_path) {
-                if existing == data {
-                    return Ok(());
+    /// Direct write into CAS with FILE_FLAG_SEQUENTIAL_SCAN without temp file, flush, or rename.
+    pub fn write_cas_file_direct(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            extern "system" {
+                fn CreateFileW(
+                    lpFileName: *const u16,
+                    dwDesiredAccess: u32,
+                    dwShareMode: u32,
+                    lpSecurityAttributes: *mut std::ffi::c_void,
+                    dwCreationDisposition: u32,
+                    dwFlagsAndAttributes: u32,
+                    hTemplateFile: *mut std::ffi::c_void,
+                ) -> *mut std::ffi::c_void;
+                fn GetLastError() -> u32;
+            }
+
+            const GENERIC_WRITE: u32 = 0x40000000;
+            const FILE_SHARE_READ: u32 = 1;
+            const FILE_SHARE_WRITE: u32 = 2;
+            const FILE_SHARE_DELETE: u32 = 4;
+            const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            const CREATE_ALWAYS: u32 = 2;
+            const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+            const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+            let path_v = to_verbatim_path(cas_path);
+            let path_wide: Vec<u16> = path_v.as_os_str().encode_wide().chain(Some(0)).collect();
+
+            let mut handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
+                    std::ptr::null_mut(),
+                    CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                const ERROR_PATH_NOT_FOUND: u32 = 3;
+                if err == ERROR_PATH_NOT_FOUND {
+                    if let Some(parent) = cas_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    handle = unsafe {
+                        CreateFileW(
+                            path_wide.as_ptr(),
+                            GENERIC_WRITE,
+                            FILE_SHARE_ALL,
+                            std::ptr::null_mut(),
+                            CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                }
+            }
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+            }
+
+            Self::write_handle_bytes(handle, data)
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(parent) = cas_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(cas_path, data)
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_handle_bytes(handle: *mut std::ffi::c_void, data: &[u8]) -> std::io::Result<()> {
+        extern "system" {
+            fn WriteFile(
+                hFile: *mut std::ffi::c_void,
+                lpBuffer: *const std::ffi::c_void,
+                nNumberOfBytesToWrite: u32,
+                lpNumberOfBytesWritten: *mut u32,
+                lpOverlapped: *mut std::ffi::c_void,
+            ) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+
+        let data_len = data.len();
+        if data_len > 0 {
+            let mut offset = 0usize;
+            while offset < data_len {
+                let chunk_len = ((data_len - offset).min(u32::MAX as usize)) as u32;
+                let mut written = 0u32;
+                let ok = unsafe {
+                    WriteFile(
+                        handle,
+                        data[offset..].as_ptr() as *const std::ffi::c_void,
+                        chunk_len,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let err = unsafe { GetLastError() };
+                    unsafe { CloseHandle(handle); }
+                    return Err(std::io::Error::from_raw_os_error(err as i32));
+                }
+                if written == 0 {
+                    unsafe { CloseHandle(handle); }
+                    return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "WriteFile wrote 0 bytes"));
+                }
+                offset += written as usize;
+            }
+        }
+
+        unsafe { CloseHandle(handle); }
+        Ok(())
+    }
+
+    /// Writes file data into CAS using CREATE_NEW, succeeding immediately if file already exists.
+    pub fn write_cas_file_create_new(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            match OpenOptions::new().write(true).create_new(true).open(cas_path) {
+                Ok(mut f) => {
+                    let _ = f.write_all(data);
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) if e.raw_os_error() == Some(32) => {
+                    for _ in 0..50 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        if cas_path.exists() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    if let Some(parent) = cas_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Ok(mut f) = OpenOptions::new().write(true).create_new(true).open(cas_path) {
+                        let _ = f.write_all(data);
+                    }
+                    Ok(())
                 }
             }
         }
-    }
-    if let Some(parent) = cas_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
-
-    {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(data)?;
-        f.flush()?;
-    }
-
-    match fs::rename(&tmp_path, cas_path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let _ = fs::remove_file(cas_path);
-            let res = fs::rename(&tmp_path, cas_path);
-            let _ = fs::remove_file(&tmp_path);
-            res
+        #[cfg(not(windows))]
+        {
+            let _ = fs::write(cas_path, data);
+            Ok(())
         }
     }
+
+/// Atomically writes file data into CAS safely using direct write.
+pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+    PackStore::write_cas_file_direct(cas_path, data)
 }
 
     /// Fills the CAS by copying already-installed files from node_modules into CAS
@@ -1034,20 +1265,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                     }
                 }
                 None => {
-                    if let Some(slice) = slice {
-                        let _ = PackStore::write_cas_file_safe(&cas_file, slice);
-                        if let Ok(new_meta) = cas_file.metadata() {
-                            let new_mtime = mtime_to_timestamp(&new_meta);
-                            entry.cas_mtime = new_mtime;
-                            if let Some(m) = new_mtime {
-                                self.set_cas_stamp(&cas_file, new_meta.len(), m);
-                            }
-                        }
-                        entry.cas_verified = true;
-                        index_updated = true;
-                    } else {
-                        entry.cas_verified = false;
-                    }
+                    entry.cas_verified = false;
                 }
             }
         }
@@ -1102,6 +1320,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         files: &[PackInputFile<'_>],
     ) -> Result<PackIndex, CacheError> {
         self.put_package_pack_with_cas(integrity, files, true)
+            .map(|p| p.index)
     }
 
     /// Builds a pack/index without synchronously creating one CAS file per entry.
@@ -1113,6 +1332,32 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         files: &[PackInputFile<'_>],
     ) -> Result<PackIndex, CacheError> {
         self.put_package_pack_with_cas(integrity, files, false)
+            .map(|p| p.index)
+    }
+
+    /// Builds a pack/index directly from already decoded in-memory files without re-decoding gzip.
+    pub fn put_package_pack_from_decoded(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        files: &[rnpm_fs::MaterializeFile],
+        populate_cas: bool,
+    ) -> Result<PackIndex, CacheError> {
+        let input_files: Vec<PackInputFile<'_>> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.path.strip_prefix(pkg_target).ok()?;
+                let clean = rel.to_string_lossy().replace('\\', "/");
+                Some(PackInputFile {
+                    path: clean,
+                    mode: f.mode,
+                    data: f.data.as_slice(),
+                })
+            })
+            .collect();
+
+        self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
+            .map(|p| p.index)
     }
 
     fn put_package_pack_with_cas(
@@ -1120,7 +1365,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         integrity: &str,
         files: &[PackInputFile<'_>],
         populate_cas: bool,
-    ) -> Result<PackIndex, CacheError> {
+    ) -> Result<PackagePack, CacheError> {
         let (prefix, safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
 
         let limits = rnpm_fs::TarLimits::default();
@@ -1237,7 +1482,9 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         }
 
         if populate_cas && !index_files.is_empty() {
+            let t_cas = std::time::Instant::now();
             self.populate_cas_parallel(&mut index_files, &pack_bytes);
+            TIME_CAS_WRITE.fetch_add(t_cas.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
@@ -1250,40 +1497,16 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         );
         let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
-        // 2. Atomic write via temp directory on same filesystem
-        let tmp_dir = self.tmp_dir();
-        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
-        let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
-
-        {
-            let mut f_pack = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_pack)?;
-            f_pack.write_all(&pack_bytes)?;
-            f_pack.flush()?;
-        }
-
-        {
-            let mut f_idx = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_idx)?;
-            f_idx.write_all(&idx_bytes)?;
-            f_idx.flush()?;
-        }
-
-        // 3. Move into place
+        // 2. Direct write to packs directory (skip temp files and rename retry loops)
+        let t_p = std::time::Instant::now();
         let prefix_dir = self.packs_dir().join(&prefix);
-        let _ = fs::create_dir_all(&prefix_dir);
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
-        rename_atomic(&tmp_pack, &final_pack)?;
-        rename_atomic(&tmp_idx, &final_idx)?;
+        let _ = Self::write_cas_file_direct(&final_pack, &pack_bytes);
+        let _ = Self::write_cas_file_direct(&final_idx, &idx_bytes);
+        TIME_PACK_WRITE.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 4. Update memory-map cache
         let buffer = if pack_bytes.is_empty() {
@@ -1311,47 +1534,47 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                     .find(|e| e.algorithm == Algorithm::Sha512)
                 {
                     let canon = format!("sha512-{}", data_encoding::BASE64.encode(&entry.digest));
-                    guard.insert(canon, pack);
+                    guard.insert(canon, pack.clone());
                 }
             }
         }
 
-        Ok(index)
+        Ok(pack)
     }
 
     fn populate_cas_parallel(&self, entries: &mut [PackFileEntry], pack_bytes: &[u8]) {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let workers = entries.len().min(16);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= entries.len() {
-                        break;
+        if entries.len() <= 4 {
+            for entry in entries.iter_mut() {
+                let start = entry.offset as usize;
+                let end = start.saturating_add(entry.size as usize);
+                if end <= pack_bytes.len() {
+                    if let Some(ref cas_path) = entry.cas_path {
+                        let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                        entry.cas_verified = true;
                     }
-                    let entry = &entries[index];
-                    let start = entry.offset as usize;
-                    let end = start.saturating_add(entry.size as usize);
-                    if end <= pack_bytes.len() {
-                        let _ = self.write_cas_file(
-                            entry.cas_path.as_ref().expect("CAS path is indexed"),
-                            &pack_bytes[start..end],
-                        );
+                }
+            }
+            return;
+        }
+
+        let num_threads = 16.min(entries.len());
+        let chunk_size = entries.len().div_ceil(num_threads);
+        std::thread::scope(|s| {
+            for chunk in entries.chunks_mut(chunk_size) {
+                s.spawn(move || {
+                    for entry in chunk {
+                        let start = entry.offset as usize;
+                        let end = start.saturating_add(entry.size as usize);
+                        if end <= pack_bytes.len() {
+                            if let Some(ref cas_path) = entry.cas_path {
+                                let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                                entry.cas_verified = true;
+                            }
+                        }
                     }
                 });
             }
         });
-        for entry in entries.iter_mut() {
-            if let Some(ref cas_path) = entry.cas_path {
-                if let Ok(meta) = cas_path.metadata() {
-                    let mtime = mtime_to_timestamp(&meta);
-                    entry.cas_mtime = mtime;
-                    if let Some(m) = mtime {
-                        self.set_cas_stamp(cas_path, meta.len(), m);
-                    }
-                }
-            }
-        }
     }
 
     /// Extract a tarball into the pack store atomically.
@@ -1360,7 +1583,8 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         integrity: &str,
         tarball_bytes: &[u8],
     ) -> Result<PackIndex, CacheError> {
-        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, true)
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, true, None)
+            .map(|p| p.index)
     }
 
     /// Cold-install variant that defers per-file CAS writes.
@@ -1369,17 +1593,58 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         integrity: &str,
         tarball_bytes: &[u8],
     ) -> Result<PackIndex, CacheError> {
-        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, false)
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, true, None)
+            .map(|p| p.index)
     }
 
-    fn put_package_from_tarball_with_cas(
+    /// Cold-install variant: takes already-verified tarball bytes, defers per-file CAS writes,
+    /// skips redundant SHA-512 re-hashing, and returns the constructed `PackagePack`.
+    pub fn put_package_from_verified_tarball_deferred(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, false, None)
+    }
+
+    pub fn put_package_from_verified_tarball_deferred_and_extract(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, false, target_dir)
+    }
+
+    /// Takes already-verified tarball bytes, populates per-file CAS writes,
+    /// skips redundant SHA-512 re-hashing, and returns the constructed `PackagePack`.
+    pub fn put_package_from_verified_tarball(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, false, None)
+    }
+
+    pub fn put_package_from_verified_tarball_and_extract(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, false, target_dir)
+    }
+
+    fn put_package_from_tarball_internal(
         &self,
         integrity: &str,
         tarball_bytes: &[u8],
         populate_cas: bool,
-    ) -> Result<PackIndex, CacheError> {
+        verify_integrity: bool,
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
         let trimmed = integrity.trim();
-        if !trimmed.is_empty() {
+        if verify_integrity && !trimmed.is_empty() {
             match trimmed.parse::<Integrity>() {
                 Ok(expected_integ) => {
                     if let Err(e) = expected_integ.verify(tarball_bytes) {
@@ -1411,6 +1676,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             }
         }
 
+        let t_gz = std::time::Instant::now();
         let reader: Box<dyn Read> = if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
             Box::new(GzDecoder::new(tarball_bytes))
         } else {
@@ -1424,6 +1690,14 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         let entries = archive.entries().map_err(CacheError::Io)?;
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
+
+        let mut created_dirs = if let Some(target) = target_dir {
+            let mut set = std::collections::HashSet::new();
+            set.insert(target.to_path_buf());
+            Some(set)
+        } else {
+            None
+        };
 
         for entry_res in entries {
             let mut entry = entry_res.map_err(CacheError::Io)?;
@@ -1479,16 +1753,15 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }));
             }
 
-            if let Ok(entry_size) = entry.header().size() {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    }));
-                }
+            let entry_size = entry.header().size().unwrap_or(0);
+            if entry_size > limits.max_single_entry_size {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                }));
             }
 
             let clean_path = relative_path.to_string_lossy().replace('\\', "/");
@@ -1503,7 +1776,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 .header()
                 .mode()
                 .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE);
-            let mut data = Vec::new();
+            let mut data = Vec::with_capacity((entry_size as usize).min(1024 * 1024));
             let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
             take_reader.read_to_end(&mut data).map_err(CacheError::Io)?;
             if data.len() as u64 > limits.max_single_entry_size {
@@ -1524,12 +1797,37 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }));
             }
 
-            // Deduplicate by lowercased path, ensuring LAST entry wins
-            let lower_key = norm_path.to_lowercase();
-            if !file_payloads_map.contains_key(&lower_key) {
-                file_payloads_order.push(lower_key.clone());
+            if let (Some(target), Some(ref mut dirs)) = (target_dir, &mut created_dirs) {
+                let clean_p = if cfg!(windows) && norm_path.contains('/') {
+                    norm_path.replace('/', "\\")
+                } else {
+                    norm_path.clone()
+                };
+                let full = target.join(clean_p);
+                if let Some(parent) = full.parent() {
+                    if !dirs.contains(parent) {
+                        let _ = std::fs::create_dir_all(parent);
+                        let mut curr = parent;
+                        while curr != target && dirs.insert(curr.to_path_buf()) {
+                            if let Some(p) = curr.parent() {
+                                curr = p;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = rnpm_fs::write_file_fast(&full, &data, mode, 64 * 1024);
             }
-            file_payloads_map.insert(lower_key, (norm_path, mode, data));
+
+            if populate_cas || target_dir.is_none() {
+                // Deduplicate by lowercased path, ensuring LAST entry wins
+                let lower_key = norm_path.to_lowercase();
+                if !file_payloads_map.contains_key(&lower_key) {
+                    file_payloads_order.push(lower_key.clone());
+                }
+                file_payloads_map.insert(lower_key, (norm_path, mode, data));
+            }
         }
 
         if total_uncompressed > 50_000 && !tarball_bytes.is_empty() {
@@ -1543,6 +1841,27 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                     ),
                 }));
             }
+        }
+
+        let gz_dur = t_gz.elapsed();
+        TIME_GZ_PARSE.fetch_add(gz_dur.as_nanos() as u64, Ordering::Relaxed);
+
+        if target_dir.is_some() && !populate_cas {
+            let (_prefix, _safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
+            let dummy_index = PackIndex {
+                integrity: integrity.to_string(),
+                sha512_hex,
+                total_pack_size: 0,
+                pack_checksum: None,
+                files: Vec::new(),
+                symlinks: Vec::new(),
+            };
+            return Ok(PackagePack {
+                index: dummy_index,
+                buffer: Arc::new(PackBuffer::Empty),
+                pack_path: PathBuf::new(),
+                idx_path: PathBuf::new(),
+            });
         }
 
         let file_payloads: Vec<(String, u32, Vec<u8>)> = file_payloads_order
@@ -1560,6 +1879,142 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             .collect();
 
         self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
+    }
+
+    /// Decodes a package tarball directly in memory without writing to disk,
+    /// returning files, directories, and symlinks ready for parallel materialization.
+    pub fn decode_package_tarball(
+        tarball_bytes: &[u8],
+        target_dir: &Path,
+        pkg_key: &str,
+    ) -> Result<DecodedPackage, CacheError> {
+        let reader: Box<dyn Read> = if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
+            Box::new(GzDecoder::new(tarball_bytes))
+        } else {
+            Box::new(tarball_bytes)
+        };
+        let mut archive = tar::Archive::new(reader);
+        let limits = rnpm_fs::TarLimits::default();
+        let mut files = Vec::new();
+        let mut dirs = vec![target_dir.to_path_buf()];
+        let mut symlinks = Vec::new();
+        let mut entry_count = 0usize;
+        let mut total_uncompressed = 0u64;
+
+        for entry_res in archive.entries().map_err(CacheError::Io)? {
+            let mut entry = entry_res.map_err(CacheError::Io)?;
+            let entry_type = entry.header().entry_type();
+            if entry_type == tar::EntryType::XGlobalHeader || entry_type.as_byte() == b'g' {
+                continue;
+            }
+            if entry_type.is_block_special()
+                || entry_type.is_character_special()
+                || entry_type.is_fifo()
+            {
+                let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
+                return Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenSpecialEntry {
+                    path: raw_path,
+                }));
+            }
+
+            let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
+            let relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
+
+            let clean_path = relative_path.to_string_lossy().replace('\\', "/");
+            let norm_path = clean_path
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+            if norm_path.is_empty() {
+                continue;
+            }
+
+            let clean_rel = if cfg!(windows) && norm_path.contains('/') {
+                norm_path.replace('/', "\\")
+            } else {
+                norm_path.clone()
+            };
+            let full_path = target_dir.join(clean_rel);
+            if let Some(parent) = full_path.parent() {
+                if parent != target_dir {
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+
+            if entry_type.is_symlink() {
+                if let Some(target) = entry.link_name().map_err(CacheError::Io)? {
+                    let norm_target =
+                        rnpm_fs::strip_package_prefix(&target).unwrap_or_else(|| target.to_path_buf());
+                    symlinks.push((full_path, target_dir.join(norm_target)));
+                }
+                continue;
+            }
+
+            if !entry_type.is_file() {
+                continue;
+            }
+
+            entry_count += 1;
+            if entry_count > limits.max_entries {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "entry count".to_string(),
+                    detail: format!(
+                        "Tarball exceeded maximum allowed entries: {}",
+                        limits.max_entries
+                    ),
+                }));
+            }
+
+            let entry_size = entry.header().size().unwrap_or(0);
+            if entry_size > limits.max_single_entry_size {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                }));
+            }
+
+            let mode = entry
+                .header()
+                .mode()
+                .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE);
+            let mut data = Vec::with_capacity((entry_size as usize).min(1024 * 1024));
+            let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
+            take_reader.read_to_end(&mut data).map_err(CacheError::Io)?;
+            if data.len() as u64 > limits.max_single_entry_size {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!("Entry '{}' exceeded single file limit", norm_path),
+                }));
+            }
+
+            total_uncompressed = total_uncompressed.saturating_add(data.len() as u64);
+            if total_uncompressed > limits.max_uncompressed_size {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "uncompressed size".to_string(),
+                    detail: format!(
+                        "Total uncompressed bytes {} exceeded limit {}",
+                        total_uncompressed, limits.max_uncompressed_size
+                    ),
+                }));
+            }
+
+            files.push(rnpm_fs::MaterializeFile {
+                path: full_path,
+                data,
+                mode,
+                package_id: Some(pkg_key.to_string()),
+            });
+        }
+
+        Ok(DecodedPackage { files, dirs, symlinks })
     }
 
     /// Checks whether block cloning from this store into `target_dir` is supported,

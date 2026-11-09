@@ -460,6 +460,19 @@ impl Cache {
         Ok(sha512_hex)
     }
 
+    /// Store a pre-verified blob directly by its known SHA-512 hex digest, skipping redundant hashing.
+    pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
+        let target_path = self.blob_path(sha512_hex);
+        if target_path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = target_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = rnpm_fs::write_file_fast(&target_path, data, 0o644, 0);
+        Ok(())
+    }
+
     /// Retrieve a blob by its SHA-512 hex digest.
     ///
     /// If the file on disk is corrupted (checksum mismatch or unreadable), it is automatically
@@ -703,7 +716,17 @@ impl Cache {
         }
 
         // Put blob in content-addressable storage
-        let sha512_hex = self.put_blob(data, None)?;
+        let sha512_hex = if let Some(expected) = expected_integrity {
+            if let Some(sha_entry) = expected.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+                let hex = HEXLOWER.encode(&sha_entry.digest);
+                self.put_blob_direct(data, &hex)?;
+                hex
+            } else {
+                self.put_blob(data, None)?
+            }
+        } else {
+            self.put_blob(data, None)?
+        };
         let integrity = if let Some(expected) = expected_integrity {
             expected.to_string()
         } else {
@@ -1007,19 +1030,17 @@ impl Cache {
         for entry in sorted_entries {
             let hex = HEXLOWER.encode(&entry.digest);
             let blob_path = self.blob_path_for_algo(entry.algorithm, &hex);
-            if blob_path.exists() {
-                match fs::read(&blob_path) {
-                    Ok(bytes) => {
-                        if let Err(err) = integrity.verify(&bytes) {
-                            warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
-                            let _ = remove_file_with_retries(&blob_path);
-                        } else {
-                            return Ok(Some(bytes));
-                        }
+            match fs::read(&blob_path) {
+                Ok(bytes) => {
+                    if let Err(err) = integrity.verify(&bytes) {
+                        warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
+                        let _ = remove_file_with_retries(&blob_path);
+                    } else {
+                        return Ok(Some(bytes));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(CacheError::Io(e)),
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(CacheError::Io(e)),
             }
         }
         Ok(None)
