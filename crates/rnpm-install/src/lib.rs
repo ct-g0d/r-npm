@@ -1622,6 +1622,66 @@ impl Installer {
         };
         let existing_lockfile_for_merge = existing_lockfile.clone();
 
+        if let Some(ref lf) = existing_lockfile {
+            let mut set = tokio::task::JoinSet::new();
+            let mut seen = HashSet::new();
+            for loc in lf.packages.keys() {
+                if loc.is_empty() {
+                    continue;
+                }
+                let name = package_name_from_loc(loc).to_string();
+                if seen.insert(name.clone()) {
+                    let cache = self.cache.clone();
+                    let reg_url = self
+                        .registry_client
+                        .registry_for_package(&name)
+                        .as_str()
+                        .to_string();
+                    let name_clone = name.clone();
+                    let lf_clone = lf.clone();
+                    set.spawn_blocking(move || {
+                        let cached_data = cache
+                            .get_packument_with_accept(
+                                &reg_url,
+                                &name_clone,
+                                Some(NPM_INSTALL_V1_JSON),
+                            )
+                            .ok()
+                            .flatten()
+                            .or_else(|| {
+                                cache
+                                    .get(&format!("pacote:packument:{name_clone}"))
+                                    .ok()
+                                    .flatten()
+                            });
+                        if let Some((_entry, data)) = cached_data {
+                            if let Ok(abbrev) =
+                                serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                            {
+                                let mut meta = abbreviated_to_package_metadata(&abbrev);
+                                if let Some(lf_meta) =
+                                    package_metadata_from_lockfile(&name_clone, &lf_clone)
+                                {
+                                    for (v, vm) in lf_meta.versions {
+                                        meta.versions.entry(v).or_insert(vm);
+                                    }
+                                }
+                                return Some((name_clone, meta));
+                            }
+                        }
+                        None
+                    });
+                }
+            }
+            while let Some(res) = set.join_next().await {
+                if let Ok(Some((name, meta))) = res {
+                    if let Ok(mut cache_guard) = metadata_cache.lock() {
+                        cache_guard.insert(name, meta);
+                    }
+                }
+            }
+        }
+
         let provider = RegistryPackageProvider {
             client: self.registry_client.clone(),
             handle,

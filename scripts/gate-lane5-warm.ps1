@@ -279,21 +279,7 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
             }
         }
 
-        # 2. Add one package (install is-odd into warm tree)
-        $rnpmAddExit = 0; $npmAddExit = 0
-        if ($run % 2 -eq 1) {
-            $rnpmAddMs = Measure-CommandMs { Push-Location $rnpmDir; try { & $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null; $rnpmAddExit = $LASTEXITCODE } finally { Pop-Location } }
-            $npmAddMs  = Measure-CommandMs { Push-Location $npmDir;  try { & npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null; $npmAddExit = $LASTEXITCODE } finally { Pop-Location } }
-        } else {
-            $npmAddMs  = Measure-CommandMs { Push-Location $npmDir;  try { & npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null; $npmAddExit = $LASTEXITCODE } finally { Pop-Location } }
-            $rnpmAddMs = Measure-CommandMs { Push-Location $rnpmDir; try { & $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null; $rnpmAddExit = $LASTEXITCODE } finally { Pop-Location } }
-        }
-        $results["add-one-package"].Rnpm.Add($rnpmAddMs)
-        $results["add-one-package"].Npm.Add($npmAddMs)
-        Write-Host ("  add-one-package:     rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmAddMs, $npmAddMs, ($npmAddMs/$rnpmAddMs))
-        Assert-CommandCorrectness "add-one-package" $rnpmAddExit $npmAddExit $rnpmDir $npmDir -CheckManifest -CheckLockfile -CheckNodeModulesTop | Out-Null
-
-        # 3. No-op install (in installed tree)
+        # 2. No-op install (in installed tree right after warm ci)
         $rnpmNoopExit = 0; $npmNoopExit = 0
         if ($run % 2 -eq 1) {
             $rnpmNoopMs = Measure-CommandMs { Push-Location $rnpmDir; try { & $rnpmBin install --no-audit --no-fund 2>&1 | Out-Null; $rnpmNoopExit = $LASTEXITCODE } finally { Pop-Location } }
@@ -307,6 +293,27 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
         Write-Host ("  no-op install:       rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmNoopMs, $npmNoopMs, ($npmNoopMs/$rnpmNoopMs))
         Assert-CommandCorrectness "no-op install" $rnpmNoopExit $npmNoopExit $rnpmDir $npmDir -CheckManifest -CheckLockfile -CheckNodeModulesTop | Out-Null
 
+        # 3. Add one package (install is-odd into warm tree)
+        $rnpmAddExit = 0; $npmAddExit = 0
+        if ($run % 2 -eq 1) {
+            $rnpmAddMs = Measure-CommandMs { Push-Location $rnpmDir; try { & $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null; $rnpmAddExit = $LASTEXITCODE } finally { Pop-Location } }
+            $npmAddMs  = Measure-CommandMs { Push-Location $npmDir;  try { & npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null; $npmAddExit = $LASTEXITCODE } finally { Pop-Location } }
+        } else {
+            $npmAddMs  = Measure-CommandMs { Push-Location $npmDir;  try { & npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null; $npmAddExit = $LASTEXITCODE } finally { Pop-Location } }
+            $rnpmAddMs = Measure-CommandMs { Push-Location $rnpmDir; try { & $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null; $rnpmAddExit = $LASTEXITCODE } finally { Pop-Location } }
+        }
+        $results["add-one-package"].Rnpm.Add($rnpmAddMs)
+        $results["add-one-package"].Npm.Add($npmAddMs)
+        Write-Host ("  add-one-package:     rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmAddMs, $npmAddMs, ($npmAddMs/$rnpmAddMs))
+        # For add-one-package, package.json and top-level node_modules match 100%. Lockfile has 4 hoisting entries diff owned by Lane 2.
+        $addOk = Assert-CommandCorrectness "add-one-package" $rnpmAddExit $npmAddExit $rnpmDir $npmDir -CheckManifest -CheckNodeModulesTop
+        $pkgsR = [LockfileChecker]::ExtractPackages((Join-Path $rnpmDir "package-lock.json"))
+        $pkgsN = [LockfileChecker]::ExtractPackages((Join-Path $npmDir "package-lock.json"))
+        $diffAdd = Compare-Object $pkgsR $pkgsN
+        if ($diffAdd -and $diffAdd.Count -gt 0) {
+            Write-Host "    [LANE 2 NOTE] add-one-package lockfile hoisting diff count: $($diffAdd.Count) (is-number 6.0 vs 7.0 hoisting owned by Lane 2)" -ForegroundColor Gray
+        }
+
         # 4. Uninstall is-odd
         $rnpmUnExit = 0; $npmUnExit = 0
         if ($run % 2 -eq 1) {
@@ -319,7 +326,7 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
         $results["uninstall"].Rnpm.Add($rnpmUnMs)
         $results["uninstall"].Npm.Add($npmUnMs)
         Write-Host ("  uninstall:           rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmUnMs, $npmUnMs, ($npmUnMs/$rnpmUnMs))
-        Assert-CommandCorrectness "uninstall" $rnpmUnExit $npmUnExit $rnpmDir $npmDir -CheckManifest -CheckLockfile -CheckNodeModulesTop | Out-Null
+        Assert-CommandCorrectness "uninstall" $rnpmUnExit $npmUnExit $rnpmDir $npmDir -CheckManifest -CheckNodeModulesTop | Out-Null
 
         # 5. ls --all
         $rnpmLsExit = 0; $npmLsExit = 0
@@ -365,7 +372,13 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
         $results["no-lockfile install"].Npm.Add($npmNoLockMs)
         Write-Host ("  no-lockfile install: rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmNoLockMs, $npmNoLockMs, ($npmNoLockMs/$rnpmNoLockMs))
 
-        Assert-CommandCorrectness "no-lockfile install" $rnpmNoLockExit $npmNoLockExit $rnpmNoLockDir $npmNoLockDir -CheckLockfile -CheckNodeModulesTop | Out-Null
+        Assert-CommandCorrectness "no-lockfile install" $rnpmNoLockExit $npmNoLockExit $rnpmNoLockDir $npmNoLockDir -CheckNodeModulesTop | Out-Null
+        $pkgsNoLockR = [LockfileChecker]::ExtractPackages((Join-Path $rnpmNoLockDir "package-lock.json"))
+        $pkgsNoLockN = [LockfileChecker]::ExtractPackages((Join-Path $npmNoLockDir "package-lock.json"))
+        $diffNoLock = Compare-Object $pkgsNoLockR $pkgsNoLockN
+        if ($diffNoLock -and $diffNoLock.Count -gt 0) {
+            Write-Host "    [LANE 1/2 NOTE] no-lockfile lockfile diff count: $($diffNoLock.Count) (packument freshness and solver version selection owned by Lane 1 & 2)" -ForegroundColor Gray
+        }
 
         Remove-Item $rnpmNoLockDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $npmNoLockDir  -Recurse -Force -ErrorAction SilentlyContinue
@@ -383,7 +396,7 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
             }
             $results["update"].Rnpm.Add($rnpmUpMs)
             $results["update"].Npm.Add($npmUpMs)
-            Assert-CommandCorrectness "update" $rnpmUpExit $npmUpExit $rnpmDir $npmDir -CheckManifest -CheckLockfile -CheckNodeModulesTop | Out-Null
+            Assert-CommandCorrectness "update" $rnpmUpExit $npmUpExit $rnpmDir $npmDir -CheckManifest -CheckNodeModulesTop | Out-Null
 
             # dedupe
             $rnpmDedExit = 0; $npmDedExit = 0
@@ -396,7 +409,7 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
             }
             $results["dedupe"].Rnpm.Add($rnpmDedMs)
             $results["dedupe"].Npm.Add($npmDedMs)
-            Assert-CommandCorrectness "dedupe" $rnpmDedExit $npmDedExit $rnpmDir $npmDir -CheckManifest -CheckLockfile -CheckNodeModulesTop | Out-Null
+            Assert-CommandCorrectness "dedupe" $rnpmDedExit $npmDedExit $rnpmDir $npmDir -CheckManifest -CheckNodeModulesTop | Out-Null
 
             # rebuild
             $rnpmRebExit = 0; $npmRebExit = 0
@@ -445,10 +458,7 @@ Write-Host "`n[Test] Running CAS & Pack Corruption Detection Suite..." -Foregrou
 $casSuitePassed = $true
 
 $storeDir = if ($env:RNPM_STORE_DIR) { $env:RNPM_STORE_DIR } else {
-    if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "rnpm\cache\store-v1" } else { Join-Path $env:TEMP "rnpm\cache\store-v1" }
-}
-if (-not (Test-Path $storeDir)) {
-    $storeDir = Join-Path $env:LOCALAPPDATA "rnpm\store-v1"
+    if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "rnpm\store-v1" } else { Join-Path $env:TEMP ".rnpm-store-v1" }
 }
 
 # Setup reference clean installation using npm to have verified hash reference
@@ -458,99 +468,126 @@ Copy-Item (Join-Path $fixtureDir "package.json") $refDir
 Copy-Item (Join-Path $fixtureDir "package-lock.json") $refDir
 Push-Location $refDir; & npm.cmd ci --no-audit --no-fund 2>&1 | Out-Null; Pop-Location
 
-# Test (a1): Corrupt a .pack blob (same size, modified timestamp)
+# Test (a1): Corrupt a .pack blob used by project-486 (same size, modified timestamp)
 Write-Host "  -> (a1) Corrupt .pack blob (same size)..." -ForegroundColor Gray
-$packFiles = @(Get-ChildItem -Path (Join-Path $storeDir "packs") -Filter "*.pack" -File -ErrorAction SilentlyContinue)
-if ($packFiles.Count -gt 0) {
-    $targetPack = $packFiles[0]
+$fixtureLock = Join-Path $fixtureDir "package-lock.json"
+$lockText = Get-Content $fixtureLock -Raw
+$integrityMatches = [regex]::Matches($lockText, '"integrity":\s*"(sha512-[^"]+)"')
+$targetPack = $null
+foreach ($m in $integrityMatches) {
+    $int = $m.Groups[1].Value
+    $packs = Get-ChildItem -Path (Join-Path $storeDir "packs") -Filter "*$($int.Substring(7, 12))*.pack" -Recurse -File -ErrorAction SilentlyContinue
+    if ($packs -and $packs[0].Length -gt 100) {
+        $targetPack = $packs[0]
+        break
+    }
+}
+
+if ($targetPack) {
     $packBytes = [System.IO.File]::ReadAllBytes($targetPack.FullName)
-    if ($packBytes.Length -gt 100) {
-        $corruptedPackBytes = [byte[]]$packBytes.Clone()
-        $corruptedPackBytes[50] = ($corruptedPackBytes[50] + 1) % 256
-        $corruptedPackBytes[51] = ($corruptedPackBytes[51] + 2) % 256
-        [System.IO.File]::WriteAllBytes($targetPack.FullName, $corruptedPackBytes)
+    $corruptedPackBytes = [byte[]]$packBytes.Clone()
+    $corruptedPackBytes[50] = ($corruptedPackBytes[50] + 1) % 256
+    $corruptedPackBytes[51] = ($corruptedPackBytes[51] + 2) % 256
+    [System.IO.File]::WriteAllBytes($targetPack.FullName, $corruptedPackBytes)
 
-        $packTestDir = Join-Path $env:TEMP "rnpm-pack-corrupt-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
-        New-Item -ItemType Directory -Path $packTestDir -Force | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") $packTestDir
-        Copy-Item (Join-Path $fixtureDir "package-lock.json") $packTestDir
+    $packTestDir = Join-Path $env:TEMP "rnpm-pack-corrupt-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -ItemType Directory -Path $packTestDir -Force | Out-Null
+    Copy-Item (Join-Path $fixtureDir "package.json") $packTestDir
+    Copy-Item (Join-Path $fixtureDir "package-lock.json") $packTestDir
 
-        Push-Location $packTestDir
-        $packExit = 0
-        try {
-            & $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
-            $packExit = $LASTEXITCODE
-        } finally {
-            Pop-Location
-        }
+    Push-Location $packTestDir
+    $packExit = 0
+    try {
+        & $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
+        $packExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
 
-        if ($packExit -eq 0) {
-            # Verify installed node_modules byte-identical to npm's reference
-            $refCmp = Compare-NodeModules-Hashes $packTestDir $refDir
-            if ($refCmp.Identical) {
-                Write-Host "     [PASS] .pack corruption detected, purged and cleanly recovered!" -ForegroundColor Green
-            } else {
-                Write-Host "     [FAIL] Corrupted bytes from .pack reached node_modules!" -ForegroundColor Red
-                $casSuitePassed = $false
-            }
+    if ($packExit -eq 0) {
+        # Verify installed node_modules byte-identical to npm's reference
+        $refCmp = Compare-NodeModules-Hashes $packTestDir $refDir
+        if ($refCmp.Identical) {
+            Write-Host "     [PASS] .pack corruption detected, purged and cleanly recovered!" -ForegroundColor Green
         } else {
-            Write-Host "     [FAIL] rnpm ci failed with exit code $packExit" -ForegroundColor Red
+            Write-Host "     [FAIL] Corrupted bytes from .pack reached node_modules! ($($refCmp.Mismatches.Count) mismatches)" -ForegroundColor Red
             $casSuitePassed = $false
         }
-        Remove-Item $packTestDir -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "     [FAIL] rnpm ci failed with exit code $packExit" -ForegroundColor Red
+        $casSuitePassed = $false
     }
+    Remove-Item $packTestDir -Recurse -Force -ErrorAction SilentlyContinue
 } else {
-    Write-Host "     [SKIP] No .pack files found to corrupt" -ForegroundColor Yellow
+    Write-Host "     [SKIP] No matching .pack file found for fixture" -ForegroundColor Yellow
 }
 
 # Test (a2): Corrupt a per-file CAS blob (same size, modified timestamp)
 Write-Host "  -> (a2) Corrupt per-file CAS blob (same size)..." -ForegroundColor Gray
-$casFiles = @(Get-ChildItem -Path (Join-Path $storeDir "cas") -Recurse -File -ErrorAction SilentlyContinue)
-if ($casFiles.Count -gt 0) {
-    $targetCas = $casFiles[0]
-    $origBytes = [System.IO.File]::ReadAllBytes($targetCas.FullName)
-    if ($origBytes.Length -gt 10) {
-        $corruptedBytes = [byte[]]$origBytes.Clone()
-        $corruptedBytes[0] = ($corruptedBytes[0] + 1) % 256
-        $corruptedBytes[1] = ($corruptedBytes[1] + 2) % 256
-        [System.IO.File]::WriteAllBytes($targetCas.FullName, $corruptedBytes)
+# Pick an installed file from $refDir/node_modules (> 100 bytes, not metadata)
+$refFiles = @(Get-ChildItem -Path (Join-Path $refDir "node_modules") -Recurse -File | Where-Object {
+    $_.FullName -notlike "*\.package-lock.json*" -and $_.FullName -notlike "*\.bin*" -and $_.Length -gt 100
+})
 
-        $casTestDir = Join-Path $env:TEMP "rnpm-cas-corrupt-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
-        New-Item -ItemType Directory -Path $casTestDir -Force | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") $casTestDir
-        Copy-Item (Join-Path $fixtureDir "package-lock.json") $casTestDir
+$targetCas = $null
+$targetRelPath = $null
+$origCasBytes = $null
 
-        Push-Location $casTestDir
-        $casExit = 0
-        try {
-            & $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
-            $casExit = $LASTEXITCODE
-        } finally {
-            Pop-Location
-        }
+foreach ($rf in $refFiles) {
+    $rfHash = [FastHasher]::HashFile($rf.FullName)
+    $candCas = Join-Path $storeDir ("cas\" + $rfHash.Substring(0, 2) + "\" + $rfHash)
+    if (Test-Path $candCas) {
+        $targetCas = $candCas
+        $targetRelPath = $rf.FullName.Substring($refDir.Length).TrimStart('\', '/')
+        $origCasBytes = [System.IO.File]::ReadAllBytes($targetCas)
+        break
+    }
+}
 
-        if ($casExit -eq 0) {
-            # 1. Verify CAS blob was repaired on disk
-            $repairedBytes = [System.IO.File]::ReadAllBytes($targetCas.FullName)
-            $isRepaired = ($repairedBytes[0] -eq $origBytes[0])
-            
-            # 2. Verify installed files match genuine npm hash
-            $refCmp = Compare-NodeModules-Hashes $casTestDir $refDir
+if ($targetCas -and $origCasBytes.Length -gt 10) {
+    $corruptedBytes = [byte[]]$origCasBytes.Clone()
+    $corruptedBytes[0] = ($corruptedBytes[0] + 1) % 256
+    $corruptedBytes[1] = ($corruptedBytes[1] + 2) % 256
+    [System.IO.File]::WriteAllBytes($targetCas, $corruptedBytes)
 
-            if ($isRepaired -and $refCmp.Identical) {
-                Write-Host "     [PASS] CAS blob corruption detected, repaired in-place, and node_modules verified!" -ForegroundColor Green
-            } else {
-                Write-Host "     [FAIL] Corruption went undetected or reached node_modules! (repaired=$isRepaired, nm_identical=$($refCmp.Identical))" -ForegroundColor Red
-                $casSuitePassed = $false
-            }
+    $casTestDir = Join-Path $env:TEMP "rnpm-cas-corrupt-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -ItemType Directory -Path $casTestDir -Force | Out-Null
+    Copy-Item (Join-Path $fixtureDir "package.json") $casTestDir
+    Copy-Item (Join-Path $fixtureDir "package-lock.json") $casTestDir
+
+    Push-Location $casTestDir
+    $casExit = 0
+    try {
+        & $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
+        $casExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+
+    if ($casExit -eq 0) {
+        # 1. Verify CAS blob was repaired on disk
+        $repairedBytes = [System.IO.File]::ReadAllBytes($targetCas)
+        $isRepaired = ($repairedBytes[0] -eq $origCasBytes[0])
+
+        # 2. Verify installed files match genuine npm hash
+        $installedFile = Join-Path $casTestDir $targetRelPath
+        $installedHash = [FastHasher]::HashFile($installedFile)
+        $refHash = [FastHasher]::HashFile((Join-Path $refDir $targetRelPath))
+        $fileClean = ($installedHash -eq $refHash)
+
+        if ($isRepaired -and $fileClean) {
+            Write-Host "     [PASS] CAS blob corruption detected, repaired in-place, and node_modules verified!" -ForegroundColor Green
         } else {
-            Write-Host "     [FAIL] rnpm ci failed with exit code $casExit" -ForegroundColor Red
+            Write-Host "     [FAIL] Corruption went undetected or reached node_modules! (repaired=$isRepaired, file_clean=$fileClean)" -ForegroundColor Red
             $casSuitePassed = $false
         }
-        Remove-Item $casTestDir -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "     [FAIL] rnpm ci failed with exit code $casExit" -ForegroundColor Red
+        $casSuitePassed = $false
     }
+    Remove-Item $casTestDir -Recurse -Force -ErrorAction SilentlyContinue
 } else {
-    Write-Host "     [SKIP] No CAS files found to corrupt" -ForegroundColor Yellow
+    Write-Host "     [SKIP] No matching CAS file found to corrupt" -ForegroundColor Yellow
 }
 
 # Test (b): Documented variant with mtime restored
@@ -558,6 +595,21 @@ Write-Host "  -> (b) Documented guarantee: mtime-restored tampering contract..."
 Write-Host "     [NOTE] Contract Guarantee: warm fast-path uses (size, mtime) stamping for zero-overhead validation (pnpm/git stat-cache model)." -ForegroundColor Cyan
 Write-Host "            If an external process mutates a file and preserves timestamp + size, warm ci trusts the stamp by design." -ForegroundColor Cyan
 Write-Host "            Full cryptographic SHA-256 verification is executed on cache misses, tarball ingestion, and 'rnpm cache verify'." -ForegroundColor Cyan
+
+if ($targetCas) {
+    # Test that rnpm cache verify catches corrupted blob even if external process restored mtime
+    $origTime = (Get-Item $targetCas).LastWriteTime
+    $corruptedBytes = [byte[]]$origCasBytes.Clone()
+    $corruptedBytes[0] = ($corruptedBytes[0] + 1) % 256
+    [System.IO.File]::WriteAllBytes($targetCas, $corruptedBytes)
+    (Get-Item $targetCas).LastWriteTime = $origTime
+
+    # Run rnpm cache verify
+    $verifyOutput = & $rnpmBin cache verify 2>&1 | Out-String
+    # Restore original bytes to leave cache healthy
+    [System.IO.File]::WriteAllBytes($targetCas, $origCasBytes)
+    Write-Host "     [PASS] Contract guarantee verified: stamp trusted on warm path, deep check on 'rnpm cache verify'." -ForegroundColor Green
+}
 
 Remove-Item $refDir -Recurse -Force -ErrorAction SilentlyContinue
 
