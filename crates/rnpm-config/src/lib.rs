@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod npm_keys;
 pub mod npmrc;
 
 pub use config::{
@@ -9,8 +10,14 @@ pub use config::{
     find_global_npmrc, find_global_npmrc_with_env, find_global_prefix, find_global_prefix_with_env,
     find_local_bin_dir, find_local_node_modules, find_local_prefix, find_user_npmrc,
     find_user_npmrc_with_env, find_workspace_root, get_default_global_npmrc,
-    get_default_user_npmrc, set_config_value_in_file, Config, ConfigDetailed, ConfigLayer,
+    get_default_user_npmrc, get_process_cli_overrides, get_process_globalconfig,
+    get_process_userconfig, set_config_value_in_file, set_process_cli_overrides,
+    set_process_globalconfig, set_process_userconfig, Config, ConfigDetailed, ConfigLayer,
     ConfigOptions,
+};
+pub use npm_keys::{
+    is_boolean_npm_config_key, is_known_npm_config_key, normalize_config_key,
+    NPM_BOOLEAN_CONFIG_KEYS, NPM_CONFIG_KEYS,
 };
 pub use error::ConfigError;
 pub use npmrc::{

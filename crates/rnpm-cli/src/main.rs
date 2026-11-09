@@ -41,7 +41,19 @@ pub(crate) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
     /// Install project dependencies or packages
-    #[command(alias = "i", alias = "add", alias = "isntall")]
+    #[command(
+        alias = "i",
+        alias = "add",
+        alias = "isntall",
+        alias = "in",
+        alias = "ins",
+        alias = "inst",
+        alias = "insta",
+        alias = "instal",
+        alias = "isnt",
+        alias = "isnta",
+        alias = "isntal"
+    )]
     Install {
         /// Packages to install
         packages: Vec<String>,
@@ -204,7 +216,12 @@ pub(crate) enum Commands {
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
-    #[command(alias = "clean-install", alias = "ic")]
+    #[command(
+        alias = "clean-install",
+        alias = "ic",
+        alias = "install-clean",
+        alias = "isntall-clean"
+    )]
     Ci {
         /// Custom npm registry URL
         #[arg(long)]
@@ -357,7 +374,7 @@ pub(crate) enum Commands {
     },
 
     /// Run arbitrary package scripts
-    #[command(alias = "run-script")]
+    #[command(alias = "run-script", alias = "rum", alias = "urn")]
     Run {
         /// Script name declared in package.json
         script: Option<String>,
@@ -406,6 +423,10 @@ pub(crate) enum Commands {
     /// Run arbitrary package binaries dynamically (npx equivalent)
     #[command(alias = "npx", alias = "x")]
     Exec {
+        /// Run string inside shell
+        #[arg(short = 'c', long = "call")]
+        call: Option<String>,
+
         /// Package name or binary to execute
         #[arg(default_value = "")]
         package: String,
@@ -458,7 +479,6 @@ pub(crate) enum Commands {
     #[command(alias = "remove", alias = "rm", alias = "r", alias = "un")]
     Uninstall {
         /// Package names to uninstall
-        #[arg(required = true)]
         packages: Vec<String>,
 
         /// Remove only from devDependencies
@@ -495,7 +515,7 @@ pub(crate) enum Commands {
     },
 
     /// Update packages
-    #[command(alias = "up")]
+    #[command(alias = "up", alias = "u", alias = "upgrade", alias = "udpate")]
     Update {
         /// Specific package names to update
         packages: Vec<String>,
@@ -584,7 +604,7 @@ pub(crate) enum Commands {
     },
 
     /// Reduce duplication in node_modules and package-lock.json
-    #[command(alias = "deduplicate")]
+    #[command(alias = "deduplicate", alias = "ddp")]
     Dedupe {
         /// Specific package names to deduplicate
         packages: Vec<String>,
@@ -740,6 +760,7 @@ pub(crate) enum Commands {
     },
 
     /// Bump a package version or view version details
+    #[command(alias = "verison")]
     Version {
         newversion: Option<String>,
 
@@ -932,7 +953,7 @@ pub(crate) enum Commands {
     },
 
     /// Log in to a registry
-    #[command(alias = "adduser")]
+    #[command(alias = "adduser", alias = "add-user")]
     Login {
         /// Custom registry URL
         #[arg(long)]
@@ -1249,9 +1270,20 @@ pub(crate) enum Commands {
         dry_run: bool,
     },
     /// Install dependencies and run the test script.
+    #[command(alias = "it")]
     InstallTest {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Manage registry webhooks
+    Hook {
+        action: Option<String>,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        otp: Option<String>,
     },
     /// Create npm-shrinkwrap.json from package-lock.json.
     Shrinkwrap,
@@ -1296,7 +1328,7 @@ pub(crate) enum Commands {
     /// Retrieve a configuration value (npm get alias)
     Get {
         /// Configuration key to retrieve
-        key: String,
+        key: Option<String>,
     },
 
     /// Set a configuration value (npm set alias)
@@ -1355,6 +1387,7 @@ pub(crate) enum Commands {
     },
 
     /// View help for npm/rnpm commands and concepts
+    #[command(alias = "hlep")]
     Help {
         /// Help topic or command name (e.g. install-strategy)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1588,11 +1621,40 @@ where
             i += 1;
             continue;
         }
-        if first == "pkg" {
+        if matches!(first.as_str(), "config" | "c") {
+            if arg == "--workspaces"
+                || arg == "--workspace"
+                || arg == "--no-workspace"
+                || arg.starts_with("--workspace=")
+                || arg.starts_with("--no-workspace=")
+            {
+                return Some((
+                    "ENOWORKSPACES".to_string(),
+                    "npm error code ENOWORKSPACES\nnpm error This command does not support workspaces.".to_string(),
+                ));
+            }
+            i += 1;
+            continue;
+        }
+
+        if matches!(
+            first.as_str(),
+            "pkg" | "ls" | "list" | "la" | "ll"
+        ) {
             i += 1;
             continue;
         }
         // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, update (and their aliases)
+        let is_global = args_to_scan.iter().any(|a| a == "-g" || a == "--global");
+        if matches!(
+            first.as_str(),
+            "install" | "i" | "add" | "isntall"
+        ) && !is_global && (arg == "--allow-scripts" || arg == "--no-allow-scripts") {
+            return Some((
+                "EALLOWSCRIPTS".to_string(),
+                "npm error code EALLOWSCRIPTS\nnpm error --allow-scripts is not allowed in project-scoped installs. Add the entries to the \"allowScripts\" field in package.json, or to .npmrc, instead.".to_string(),
+            ));
+        }
         if matches!(
             first.as_str(),
             "install" | "i" | "add" | "isntall" | "ci" | "clean-install" | "ic" | "update" | "up"
@@ -1885,9 +1947,9 @@ async fn execute_run(
 
             if !available_scripts.is_empty() {
                 if lifecycle_scripts.is_empty() {
-                    println!("Scripts available in {pkg_id} via `rnpm run`:");
+                    println!("Scripts available in {pkg_id} via `npm run`:");
                 } else {
-                    println!("available via `rnpm run`:");
+                    println!("available via `npm run`:");
                 }
                 for (name, cmd) in &available_scripts {
                     println!("  {name}");
@@ -1982,14 +2044,21 @@ async fn execute_run(
                     .name
                     .clone()
                     .unwrap_or_else(|| "project".to_string());
-                println!(
-                    "\n> {}@{} {} {}",
-                    pkg_name,
-                    manifest.version.as_deref().unwrap_or("0.0.0"),
-                    ws_opts.script,
-                    current_dir.display()
-                );
-                println!("> {full_cmd}\n");
+                let is_silent = rnpm_config::get_process_cli_overrides()
+                    .as_ref()
+                    .and_then(|m| m.get("loglevel"))
+                    .map(|s| s == "silent")
+                    .unwrap_or(false);
+                if !is_silent && !ignore_scripts {
+                    println!(
+                        "\n> {}@{} {} {}",
+                        pkg_name,
+                        manifest.version.as_deref().unwrap_or("0.0.0"),
+                        ws_opts.script,
+                        current_dir.display()
+                    );
+                    println!("> {full_cmd}\n");
+                }
 
                 let mut ctx = LifecycleContext::new(
                     &current_dir,
@@ -2014,14 +2083,28 @@ async fn execute_run(
                     }
                 }
             } else if !if_present && !has_filter {
-                return Err(anyhow::anyhow!("missing script: {}", ws_opts.script));
+                return Err(anyhow::anyhow!(
+                    "npm error Missing script: \"{}\"\n\
+                     npm error\n\
+                     npm error To see a list of scripts, run:\n\
+                     npm error   npm run",
+                    ws_opts.script
+                ));
             }
         }
     } else {
         let script_cmd = match manifest.scripts.get(&script) {
             Some(cmd) => cmd,
             None => {
-                return Err(anyhow::anyhow!("missing script: {script}"));
+                if if_present {
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!(
+                    "npm error Missing script: \"{script}\"\n\
+                     npm error\n\
+                     npm error To see a list of scripts, run:\n\
+                     npm error   npm run"
+                ));
             }
         };
 
@@ -2045,6 +2128,18 @@ async fn execute_run(
             .name
             .clone()
             .unwrap_or_else(|| "project".to_string());
+
+        let is_silent = rnpm_config::get_process_cli_overrides()
+            .as_ref()
+            .and_then(|m| m.get("loglevel"))
+            .map(|s| s == "silent")
+            .unwrap_or(false);
+        if !is_silent && !ignore_scripts {
+            let ver = manifest.version.as_deref().unwrap_or("1.0.0");
+            println!("\n> {pkg_name}@{ver} {script}");
+            println!("> {full_cmd}\n");
+        }
+
         let mut ctx =
             LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
         ctx.package_version = manifest.version.clone();
@@ -2144,6 +2239,757 @@ where
     result
 }
 
+fn is_clap_declared_arg(cmd: &clap::Command, token: &str) -> Option<bool> {
+    if token == "--help" || token == "-h" {
+        return Some(false);
+    }
+    let (name, is_long) = if let Some(stripped) = token.strip_prefix("--") {
+        if let Some(eq) = stripped.find('=') {
+            (&stripped[..eq], true)
+        } else {
+            (stripped, true)
+        }
+    } else {
+        let stripped = token.strip_prefix('-')?;
+        (stripped, false)
+    };
+
+    for arg in cmd.get_arguments() {
+        if is_long {
+            if let Some(long) = arg.get_long() {
+                if long == name {
+                    return Some(arg.get_action().takes_values());
+                }
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                for alias in aliases {
+                    if alias == name {
+                        return Some(arg.get_action().takes_values());
+                    }
+                }
+            }
+        } else if name.len() == 1 {
+            let ch = name.chars().next().unwrap();
+            if let Some(short) = arg.get_short() {
+                if short == ch {
+                    return Some(arg.get_action().takes_values());
+                }
+            }
+            if let Some(aliases) = arg.get_all_short_aliases() {
+                for alias in aliases {
+                    if alias == ch {
+                        return Some(arg.get_action().takes_values());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_config_flag(
+    token: &str,
+    next_token: Option<&str>,
+    is_silent: bool,
+    overrides: &mut BTreeMap<String, String>,
+) -> Option<usize> {
+    if token == "--" || token == "--help" || token == "-h" || token == "--version" || token == "-v" || token == "-V" {
+        return None;
+    }
+    if token == "-s" || token == "--silent" {
+        overrides.insert("loglevel".to_string(), "silent".to_string());
+        return Some(1);
+    }
+    if let Some(path) = token.strip_prefix("--userconfig=") {
+        rnpm_config::set_process_userconfig(PathBuf::from(path));
+        return Some(1);
+    }
+    if token == "--userconfig" {
+        if let Some(val) = next_token {
+            rnpm_config::set_process_userconfig(PathBuf::from(val));
+            return Some(2);
+        } else {
+            return Some(1);
+        }
+    }
+    if let Some(path) = token.strip_prefix("--globalconfig=") {
+        rnpm_config::set_process_globalconfig(PathBuf::from(path));
+        return Some(1);
+    }
+    if token == "--globalconfig" {
+        if let Some(val) = next_token {
+            rnpm_config::set_process_globalconfig(PathBuf::from(val));
+            return Some(2);
+        } else {
+            return Some(1);
+        }
+    }
+    if let Some(raw_key) = token.strip_prefix("--no-") {
+        let key = rnpm_config::normalize_config_key(raw_key);
+        if !rnpm_config::is_known_npm_config_key(&key) && !is_silent {
+            eprintln!(
+                "npm warn Unknown cli config \"--{raw_key}\". This will stop working in the next major version of npm."
+            );
+        }
+        if !(key == "ca" || key == "cafile") {
+            overrides.insert(key, "false".to_string());
+        }
+        return Some(1);
+    }
+    if let Some(rest) = token.strip_prefix("--") {
+        if let Some(eq) = rest.find('=') {
+            let raw_key = &rest[..eq];
+            let val = &rest[eq + 1..];
+            let key = rnpm_config::normalize_config_key(raw_key);
+            if !rnpm_config::is_known_npm_config_key(&key) && !is_silent {
+                eprintln!(
+                    "npm warn Unknown cli config \"--{raw_key}\". This will stop working in the next major version of npm."
+                );
+            }
+            if !((key == "ca" || key == "cafile") && (val == "true" || val == "false")) {
+                overrides.insert(key, val.to_string());
+            }
+            return Some(1);
+        } else {
+            let raw_key = rest;
+            let key = rnpm_config::normalize_config_key(raw_key);
+            let is_bool = rnpm_config::is_boolean_npm_config_key(&key);
+            let is_known = rnpm_config::is_known_npm_config_key(&key);
+            if !is_known && !is_silent {
+                if let Some(next) = next_token {
+                    if !next.starts_with('-') {
+                        eprintln!(
+                            "npm warn \"{next}\" is being parsed as a normal command line argument."
+                        );
+                    }
+                }
+                eprintln!(
+                    "npm warn Unknown cli config \"--{raw_key}\". This will stop working in the next major version of npm."
+                );
+            }
+            if is_known && !is_bool {
+                if let Some(next) = next_token {
+                    if !next.starts_with('-') {
+                        if !((key == "ca" || key == "cafile") && (next == "true" || next == "false")) {
+                            overrides.insert(key, next.to_string());
+                        }
+                        return Some(2);
+                    }
+                }
+            }
+            if !(key == "ca" || key == "cafile") {
+                overrides.insert(key, "true".to_string());
+            }
+            return Some(1);
+        }
+    }
+    None
+}
+
+fn preprocess_exec_args(
+    program: &str,
+    _subcmd: &str,
+    tokens: &[String],
+    is_silent: bool,
+    overrides: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let dashdash_pos = tokens.iter().position(|t| t == "--");
+    let (before_dashdash, after_dashdash) = match dashdash_pos {
+        Some(pos) => (&tokens[..pos], &tokens[pos + 1..]),
+        None => (tokens, &[][..]),
+    };
+
+    if before_dashdash.iter().any(|t| t == "--help" || t == "-h") {
+        return vec![program.to_string(), _subcmd.to_string(), "--help".to_string()];
+    }
+
+    let mut clap_flags = Vec::new();
+    let mut command_name = None;
+    let mut script_positional_args = Vec::new();
+    let mut i = 0;
+
+    while i < before_dashdash.len() {
+        let token = &before_dashdash[i];
+        let next_token = before_dashdash.get(i + 1).map(|s| s.as_str());
+
+        if token == "-s" || token == "--silent" {
+            overrides.insert("loglevel".to_string(), "silent".to_string());
+            i += 1;
+            continue;
+        }
+
+        if token == "-y" || token == "--yes" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "-c" || token == "--call" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                clap_flags.push(next.to_string());
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--call=") || token.starts_with("-c=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--offline" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "-p" || token == "--package" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("--package=") {
+            clap_flags.push(format!("--package={rest}"));
+            i += 1;
+            continue;
+        }
+        if token == "--registry" || token == "--cache" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--registry=") || token.starts_with("--cache=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with('-') {
+            if let Some(consumed) = extract_config_flag(token, next_token, is_silent, overrides) {
+                i += consumed;
+                continue;
+            }
+        }
+
+        if command_name.is_none() {
+            command_name = Some(token.clone());
+        } else {
+            script_positional_args.push(token.clone());
+        }
+        i += 1;
+    }
+
+    let mut final_args = script_positional_args;
+    let mut final_cmd = command_name;
+    let mut after_idx = 0;
+    if final_cmd.is_none() && !after_dashdash.is_empty() {
+        final_cmd = Some(after_dashdash[0].clone());
+        after_idx = 1;
+    }
+    final_args.extend(after_dashdash[after_idx..].iter().cloned());
+
+    let mut result = vec![program.to_string(), "exec".to_string()];
+    result.extend(clap_flags);
+    if let Some(cmd) = final_cmd {
+        result.push(cmd);
+    }
+    if !final_args.is_empty() {
+        result.push("--".to_string());
+        result.extend(final_args);
+    }
+    result
+}
+
+fn preprocess_init_args(
+    program: &str,
+    _subcmd: &str,
+    tokens: &[String],
+    is_silent: bool,
+    overrides: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    if tokens.iter().any(|t| t == "--help" || t == "-h") {
+        return vec![program.to_string(), _subcmd.to_string(), "--help".to_string()];
+    }
+
+    let mut clap_flags = Vec::new();
+    let mut initializer = None;
+    let mut forwarded_args = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let token = &tokens[i];
+        let next_token = tokens.get(i + 1).map(|s| s.as_str());
+
+        if initializer.is_some() {
+            forwarded_args.push(token.clone());
+            i += 1;
+            continue;
+        }
+
+        if token == "-y" || token == "--yes" || token == "-f" || token == "--force" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--scope" || token == "--registry" || token == "--cache" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--scope=") || token.starts_with("--registry=") || token.starts_with("--cache=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+
+        if token.starts_with('-') {
+            if let Some(consumed) = extract_config_flag(token, next_token, is_silent, overrides) {
+                i += consumed;
+                continue;
+            }
+        }
+
+        initializer = Some(token.clone());
+        i += 1;
+    }
+
+    let mut result = vec![program.to_string(), "init".to_string()];
+    result.extend(clap_flags);
+    if let Some(init) = initializer {
+        result.push(init);
+        if !forwarded_args.is_empty() {
+            result.push("--".to_string());
+            result.extend(forwarded_args);
+        }
+    }
+    result
+}
+
+fn preprocess_run_args(
+    program: &str,
+    subcmd: &str,
+    tokens: &[String],
+    is_silent: bool,
+    overrides: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let dashdash_pos = tokens.iter().position(|t| t == "--");
+    let (before_dashdash, after_dashdash) = match dashdash_pos {
+        Some(pos) => (&tokens[..pos], &tokens[pos + 1..]),
+        None => (tokens, &[][..]),
+    };
+
+    if before_dashdash.iter().any(|t| t == "--help" || t == "-h") {
+        return vec![program.to_string(), subcmd.to_string(), "--help".to_string()];
+    }
+
+    let is_run = subcmd == "run" || subcmd == "run-script" || subcmd == "rum" || subcmd == "urn";
+
+    let mut clap_flags = Vec::new();
+    let mut script_name: Option<String> = if !is_run {
+        Some(subcmd.to_string())
+    } else {
+        None
+    };
+    let mut script_positional_args = Vec::new();
+    let mut i = 0;
+
+    while i < before_dashdash.len() {
+        let token = &before_dashdash[i];
+        let next_token = before_dashdash.get(i + 1).map(|s| s.as_str());
+
+        if token == "-s" || token == "--silent" {
+            overrides.insert("loglevel".to_string(), "silent".to_string());
+            i += 1;
+            continue;
+        }
+
+        if is_run {
+            if token == "--if-present" {
+                clap_flags.push("--if-present".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--ignore-scripts" {
+                clap_flags.push("--ignore-scripts".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--foreground-scripts" {
+                clap_flags.push("--foreground-scripts".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--strict-sandbox" {
+                clap_flags.push("--strict-sandbox".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--workspaces" || token == "-ws" {
+                clap_flags.push("--workspaces".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--no-workspaces" {
+                overrides.insert("workspaces".to_string(), "false".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--workspace-root" || token == "--include-workspace-root" {
+                clap_flags.push("--workspace-root".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "--no-workspace" {
+                clap_flags.push("--workspace".to_string());
+                clap_flags.push("false".to_string());
+                i += 1;
+                continue;
+            }
+            if token == "-w" || token == "--workspace" {
+                clap_flags.push("--workspace".to_string());
+                if let Some(next) = next_token {
+                    if !next.starts_with('-') {
+                        clap_flags.push(next.to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+                clap_flags.push("true".to_string());
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = token.strip_prefix("--workspace=") {
+                clap_flags.push(format!("--workspace={rest}"));
+                i += 1;
+                continue;
+            }
+            if token == "--filter" || token == "--scope" {
+                clap_flags.push(token.clone());
+                if let Some(next) = next_token {
+                    if !next.starts_with('-') {
+                        clap_flags.push(next.to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if token.starts_with("--filter=") || token.starts_with("--scope=") {
+                clap_flags.push(token.clone());
+                i += 1;
+                continue;
+            }
+        }
+
+        if token.starts_with('-') {
+            if let Some(consumed) = extract_config_flag(token, next_token, is_silent, overrides) {
+                i += consumed;
+                continue;
+            }
+        }
+
+        if is_run && script_name.is_none() {
+            script_name = Some(token.clone());
+        } else {
+            script_positional_args.push(token.clone());
+        }
+        i += 1;
+    }
+
+    let mut result = vec![program.to_string(), subcmd.to_string()];
+    result.extend(clap_flags);
+    if is_run {
+        if let Some(s) = script_name {
+            result.push(s);
+        }
+    }
+    let mut final_script_args = script_positional_args;
+    final_script_args.extend(after_dashdash.iter().cloned());
+    if !final_script_args.is_empty() {
+        result.push("--".to_string());
+        result.extend(final_script_args);
+    }
+    result
+}
+
+pub(crate) fn preprocess_cli_args<I, T>(raw_args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .map(|a| a.into().to_string_lossy().to_string())
+        .collect();
+
+    if args.is_empty() {
+        return args;
+    }
+
+    let program = args[0].clone();
+    let rest = &args[1..];
+
+    // Detect if --silent / -s / --loglevel silent is anywhere
+    let mut is_silent = false;
+    for (idx, arg) in rest.iter().enumerate() {
+        if arg == "-s" || arg == "--silent" || arg == "--loglevel=silent" {
+            is_silent = true;
+            break;
+        }
+        if (arg == "--loglevel" || arg == "-loglevel") && rest.get(idx + 1).map(|s| s.as_str()) == Some("silent") {
+            is_silent = true;
+            break;
+        }
+    }
+
+    // Find subcommand index
+    let mut subcmd_idx = None;
+    if !rest.is_empty() && !rest[0].starts_with('-') {
+        subcmd_idx = Some(0);
+    } else {
+        let root_cmd = Cli::command();
+        let mut i = 0;
+        while i < rest.len() {
+            let token = &rest[i];
+            let next_token = rest.get(i + 1).map(|s| s.as_str());
+
+            if !token.starts_with('-') {
+                if root_cmd.find_subcommand(token).is_some() {
+                    subcmd_idx = Some(i);
+                    break;
+                }
+            } else {
+                if token == "--userconfig" || token == "--globalconfig" || token == "--prefix" {
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            i += 1;
+                        }
+                    }
+                } else if let Some(takes_val) = is_clap_declared_arg(&root_cmd, token) {
+                    if takes_val && !token.contains('=') {
+                        if let Some(next) = next_token {
+                            if !next.starts_with('-') {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    let has_version_flag = rest
+        .iter()
+        .take_while(|t| *t != "--")
+        .any(|t| t == "--version" || t == "-V" || t == "-v");
+    if has_version_flag {
+        let is_forwarded = if let Some(idx) = subcmd_idx {
+            let sub = &rest[idx];
+            if matches!(
+                sub.as_str(),
+                "run" | "run-script" | "rum" | "urn" | "exec" | "x" | "npx" | "test" | "t" | "tst" | "start" | "restart" | "stop" | "init" | "create"
+            ) {
+                let pos_after = rest[idx + 1..]
+                    .iter()
+                    .position(|t| t == "--version" || t == "-V" || t == "-v");
+                let script_pos = rest[idx + 1..].iter().position(|t| !t.starts_with('-'));
+                match (pos_after, script_pos) {
+                    (Some(vp), Some(sp)) => vp > sp,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_forwarded {
+            println!("rnpm {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+    }
+
+    let mut overrides = BTreeMap::new();
+
+    // Process any flags that appear BEFORE the subcommand
+    let actual_subcmd_idx = subcmd_idx.unwrap_or(rest.len());
+    let mut pre_flags_idx = 0;
+    while pre_flags_idx < actual_subcmd_idx {
+        let token = &rest[pre_flags_idx];
+        let next_token = rest.get(pre_flags_idx + 1).map(|s| s.as_str());
+        if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+            pre_flags_idx += consumed;
+        } else {
+            pre_flags_idx += 1;
+        }
+    }
+
+    let result = if let Some(idx) = subcmd_idx {
+        let subcmd = &rest[idx];
+        if subcmd == "run"
+            || subcmd == "run-script"
+            || subcmd == "rum"
+            || subcmd == "urn"
+            || subcmd == "test"
+            || subcmd == "t"
+            || subcmd == "tst"
+            || subcmd == "start"
+            || subcmd == "restart"
+            || subcmd == "stop"
+        {
+            preprocess_run_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+        } else if subcmd == "exec" || subcmd == "x" || subcmd == "npx" {
+            preprocess_exec_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+        } else if subcmd == "init" || subcmd == "create" {
+            preprocess_init_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+        } else {
+            // General subcommand
+            let root_cmd = Cli::command();
+            let mut cmd_stack = vec![root_cmd.clone()];
+            if let Some(sub) = root_cmd.find_subcommand(subcmd) {
+                cmd_stack.push(sub.clone());
+            }
+            let mut new_tokens = vec![program.clone(), subcmd.clone()];
+            let mut j = idx + 1;
+            while j < rest.len() {
+                let token = &rest[j];
+                let next_token = rest.get(j + 1).map(|s| s.as_str());
+
+                if token == "--" {
+                    new_tokens.push(token.clone());
+                    new_tokens.extend(rest[j + 1..].iter().cloned());
+                    break;
+                }
+
+                if !token.starts_with('-') {
+                    if let Some(last_cmd) = cmd_stack.last() {
+                        if let Some(sub) = last_cmd.find_subcommand(token) {
+                            cmd_stack.push(sub.clone());
+                        }
+                    }
+                    new_tokens.push(token.clone());
+                    j += 1;
+                    continue;
+                }
+
+                let declared_takes_val = cmd_stack
+                    .iter()
+                    .rev()
+                    .find_map(|cmd| is_clap_declared_arg(cmd, token));
+
+                if let Some(takes_val) = declared_takes_val {
+                    if takes_val && !token.contains('=') {
+                        if let Some(next) = next_token {
+                            if !next.starts_with('-') {
+                                new_tokens.push(token.clone());
+                                new_tokens.push(next.to_string());
+                                j += 2;
+                                continue;
+                            }
+                        }
+                        if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                            j += consumed;
+                            continue;
+                        }
+                    } else {
+                        if !takes_val && new_tokens.iter().any(|t| t == token) {
+                            j += 1;
+                            continue;
+                        }
+                        new_tokens.push(token.clone());
+                        j += 1;
+                        continue;
+                    }
+                }
+
+                if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                    j += consumed;
+                    continue;
+                }
+
+                new_tokens.push(token.clone());
+                j += 1;
+            }
+            new_tokens
+        }
+    } else {
+        // No subcommand (e.g. `rnpm --version`, `rnpm --help`, or `rnpm`)
+        let root_cmd = Cli::command();
+        let mut new_tokens = vec![program.clone()];
+        let mut j = 0;
+        while j < rest.len() {
+            let token = &rest[j];
+            let next_token = rest.get(j + 1).map(|s| s.as_str());
+
+            if token == "--" {
+                new_tokens.push(token.clone());
+                new_tokens.extend(rest[j + 1..].iter().cloned());
+                break;
+            }
+
+            if let Some(takes_val) = is_clap_declared_arg(&root_cmd, token) {
+                if takes_val && !token.contains('=') {
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            new_tokens.push(token.clone());
+                            new_tokens.push(next.to_string());
+                            j += 2;
+                            continue;
+                        }
+                    }
+                    if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                        j += consumed;
+                        continue;
+                    }
+                } else {
+                    new_tokens.push(token.clone());
+                    j += 1;
+                    continue;
+                }
+            }
+
+            if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                j += consumed;
+                continue;
+            }
+
+            new_tokens.push(token.clone());
+            j += 1;
+        }
+        new_tokens
+    };
+
+    if !overrides.is_empty() {
+        rnpm_config::set_process_cli_overrides(overrides);
+    }
+
+    result
+}
+
 fn parse_package_spec(spec: &str) -> (String, String) {
     if let Some(stripped) = spec.strip_prefix('@') {
         if let Some(idx) = stripped.find('@') {
@@ -2170,6 +3016,9 @@ pub(crate) async fn execute_exec(
     cache: Option<PathBuf>,
     offline: bool,
 ) -> anyhow::Result<()> {
+    if command.is_empty() && package_specs.is_empty() {
+        return Ok(());
+    }
     let (cmd_pkg_name, _) = parse_package_spec(command);
     let cmd_bin_name = if let Some(slash) = cmd_pkg_name.find('/') {
         &cmd_pkg_name[slash + 1..]
@@ -2185,12 +3034,33 @@ pub(crate) async fn execute_exec(
         }
     });
 
+fn find_system_binary(command: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for p in std::env::split_paths(&path_var) {
+        let direct = p.join(command);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(windows)]
+        {
+            for ext in &[".cmd", ".exe", ".bat", ".ps1"] {
+                let with_ext = p.join(format!("{command}{ext}"));
+                if with_ext.is_file() {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+    None
+}
+
     let binary_to_run = if package_specs.is_empty() {
         // When -p is NOT provided:
-        // 1. Check local node_modules/.bin first
+        // 1. Check local node_modules/.bin first, or system PATH
         let local_bin = rnpm_lifecycle::find_local_binary(current_dir, &cmd_pkg_name)
             .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, cmd_bin_name))
-            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, command));
+            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, command))
+            .or_else(|| find_system_binary(command));
 
         if let Some(bin_path) = local_bin {
             bin_path
@@ -2619,7 +3489,13 @@ async fn execute_publish(
         auth_tokens: config.npmrc.auth_tokens.clone(),
         ..Default::default()
     };
-    if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+    let token = config.npmrc.get_auth_token(&registry_url);
+    if token.is_none() {
+        return Err(anyhow::anyhow!(
+            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to <{registry_url}>\nnpm error You need a valid auth token to publish."
+        ));
+    }
+    if let Some(token) = token {
         client_config.auth_token = Some(token.to_string());
     }
 
@@ -2936,11 +3812,12 @@ async fn execute_logout(
 
     if modified {
         println!("rnpm: successfully logged out of {registry_url}");
+        Ok(())
     } else {
-        println!("rnpm: logged out of {registry_url} (no active session token found)");
+        Err(anyhow::anyhow!(
+            "npm error code ENEEDAUTH\nnpm error need auth not logged in to {registry_url}, so can't log out"
+        ))
     }
-
-    Ok(())
 }
 
 async fn execute_token(
@@ -4268,7 +5145,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 .or_else(|| config.get("install-strategy"))
                 .or_else(|| config.get("install_strategy"))
                 .unwrap_or("hoisted");
-            let effective_strategy = strategy_str.parse::<rnpm_install::InstallStrategy>()?;
+            let effective_strategy = strategy_str
+                .parse::<rnpm_install::InstallStrategy>()
+                .unwrap_or_else(|_| {
+                    eprintln!("npm warn invalid config install-strategy={} set in command line options", strategy_str);
+                    eprintln!("npm warn invalid config Must be one of: hoisted, nested, shallow, linked");
+                    rnpm_install::InstallStrategy::Hoisted
+                });
 
             let (omit_dev, omit_optional, omit_peer) =
                 parse_omit_and_include_options(&omit, &include);
@@ -4302,6 +5185,23 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let effective_save_prefix = save_prefix
                 .or_else(|| config.get("save-prefix").map(ToString::to_string))
                 .or_else(|| config.get("save_prefix").map(ToString::to_string));
+
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let ws_in_overrides = cli_overrides.as_ref().map(|o| {
+                o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
+                    || o.contains_key("workspace")
+            }).unwrap_or(false);
+            if workspaces || !workspace.is_empty() || ws_in_overrides {
+                let has_ws = if let Ok(content) = std::fs::read_to_string(current_dir.join("package.json")) {
+                    content.contains("\"workspaces\"")
+                } else {
+                    false
+                };
+                if !has_ws {
+                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", current_dir.display());
+                    std::process::exit(1);
+                }
+            }
 
             let options = InstallOptions {
                 project_dir: target_dir,
@@ -4434,7 +5334,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 .or_else(|| config.get("install-strategy"))
                 .or_else(|| config.get("install_strategy"))
                 .unwrap_or("hoisted");
-            let effective_strategy = strategy_str.parse::<rnpm_install::InstallStrategy>()?;
+            let effective_strategy = strategy_str
+                .parse::<rnpm_install::InstallStrategy>()
+                .unwrap_or_else(|_| {
+                    eprintln!("npm warn invalid config install-strategy={} set in command line options", strategy_str);
+                    eprintln!("npm warn invalid config Must be one of: hoisted, nested, shallow, linked");
+                    rnpm_install::InstallStrategy::Hoisted
+                });
 
             let (omit_dev, omit_optional, omit_peer) =
                 parse_omit_and_include_options(&omit, &include);
@@ -4610,13 +5516,28 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             workspace_root,
         } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-            let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let has_script_overrides = cli_overrides.as_ref().map(|o| {
+                o.contains_key("ignore-scripts")
+                    || o.contains_key("foreground-scripts")
+                    || o.contains_key("strict-sandbox")
+            }).unwrap_or(false);
+
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+                let overrides = cli_overrides.as_ref().unwrap();
+                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                (ig, fg, ss)
+            } else if current_dir.join(".npmrc").is_file() {
+                let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+                let ig = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+                let fg = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+                let ss = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+                (ig, fg, ss)
+            } else {
+                (ignore_scripts, foreground_scripts, strict_sandbox)
+            };
 
             execute_run(
                 current_dir,
@@ -4635,6 +5556,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             .await?;
         }
         Commands::Exec {
+            call,
             package,
             args,
             yes: _,
@@ -4643,13 +5565,47 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
         } => {
+            if let Some(cmd_str) = call {
+                let full_cmd = if args.is_empty() {
+                    cmd_str
+                } else {
+                    let formatted_args: Vec<String> = args
+                        .iter()
+                        .map(|a| {
+                            if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                                format!("\"{}\"", a.replace('"', "\\\""))
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    format!("{cmd_str} {}", formatted_args.join(" "))
+                };
+                let ctx = LifecycleContext::new(
+                    &current_dir,
+                    &current_dir,
+                    "exec",
+                    "call",
+                    &full_cmd,
+                );
+                let status = execute_lifecycle_script(&ctx)?;
+                if !status.success() {
+                    let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                    return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                        exit_code: code,
+                        message: format!("Process exited with status code: {}", code),
+                    }));
+                }
+                return Ok(());
+            }
+
             let (target_command, target_args) = if package.is_empty() {
                 if !args.is_empty() {
                     (args[0].clone(), args[1..].to_vec())
                 } else if packages.len() == 1 {
                     (packages[0].clone(), vec![])
                 } else {
-                    return Err(anyhow::anyhow!("No package or command specified for exec"));
+                    (String::new(), vec![])
                 }
             } else {
                 (package, args)
@@ -4775,6 +5731,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspaces,
             workspace_root,
         } => {
+            if packages.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "npm error code EUSAGE\nnpm error Must provide a package name to remove"
+                ));
+            }
             let is_global = global || prefix.is_some();
             let target_dir = if let Some(p) = prefix {
                 if p.is_absolute() {
@@ -5340,6 +6301,29 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 current_dir
             };
+
+            if package_lock_only && !target_dir.join("package-lock.json").is_file() {
+                eprintln!("npm error code ENOLOCK\nnpm error ls This command requires an existing lockfile.\nnpm error ls Try creating one first with: npm i --package-lock-only");
+                std::process::exit(1);
+            }
+
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let ws_in_overrides = cli_overrides.as_ref().map(|o| {
+                o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
+                    || o.contains_key("workspace")
+            }).unwrap_or(false);
+            if ws_in_overrides {
+                let has_ws = if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
+                    content.contains("\"workspaces\"")
+                } else {
+                    false
+                };
+                if !has_ws {
+                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", target_dir.display());
+                    std::process::exit(1);
+                }
+            }
+
             let opts = list::ListOptions {
                 packages,
                 depth,
@@ -5485,6 +6469,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             update_allow_scripts_policy(&current_dir, &packages, false, all, json)?;
         }
         Commands::Completion { shell } => {
+            if shell.is_none() {
+                #[cfg(windows)]
+                return Err(anyhow::anyhow!(
+                    "npm error code ENOTSUP\nnpm error npm completion supported only in MINGW / Git bash on Windows"
+                ));
+            }
             const COMMANDS: &str = "install ci test start restart stop run exec pack uninstall update audit prune dedupe find-dupes rebuild pkg init create cache diff sbom version list outdated view query publish whoami ping login logout token approve-scripts deny-scripts completion dist-tag owner unpublish deprecate undeprecate access profile org team doctor fund explain search stars star unstar fix bugs docs edit explore help-search install-ci-test install-scripts install-test shrinkwrap trust config link unlink prefix root bin";
             match shell.as_deref().unwrap_or("bash") {
                 "bash" => println!("complete -W '{COMMANDS}' rnpm"),
@@ -5816,6 +6806,23 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Repo { packages, registry } => {
+            if packages.is_empty() {
+                let pkg_json = current_dir.join("package.json");
+                let value = std::fs::read_to_string(&pkg_json)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let repo = value
+                    .as_ref()
+                    .and_then(|v| v.get("repository"))
+                    .and_then(|v| v.get("url").or(Some(v)))
+                    .and_then(|v| v.as_str());
+                if let Some(r) = repo {
+                    println!("{r}");
+                    return Ok(());
+                } else {
+                    return Err(anyhow::anyhow!("npm error no repository"));
+                }
+            }
             let (registry_url, client) = make_registry_client(&current_dir, registry)?;
             for package in packages {
                 let local = current_dir
@@ -6059,9 +7066,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     std::fs::remove_file(&src)?;
                 }
                 println!("package-lock.json has been renamed to npm-shrinkwrap.json");
+            } else if current_dir.join("package.json").exists() {
+                let lock = rnpm_lockfile::LockfileV3::new("project", Some("1.0.0".to_string()));
+                let json = serde_json::to_string_pretty(&lock)?;
+                std::fs::write(&dst, json)?;
+                eprintln!("npm notice created a lockfile as npm-shrinkwrap.json with version 3");
+                println!("npm-shrinkwrap.json up to date");
             } else {
                 return Err(anyhow::anyhow!(
-                    "npm error code ENOENT\nnpm error package-lock.json not found"
+                    "npm error code ENOENT\nnpm error package.json not found"
                 ));
             }
         }
@@ -6213,12 +7226,39 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::Get { key } => {
-            let config = rnpm_config::Config::load(Some(&current_dir))?;
-            if let Some(val) = config.get(&key) {
-                println!("{val}");
+        Commands::Hook { registry, .. } => {
+            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let registry_url = if let Some(ref reg_str) = registry {
+                Url::parse(reg_str).map_err(|e| {
+                    anyhow::anyhow!(
+                        "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
+                    )
+                })?
             } else {
-                println!("undefined");
+                config.npmrc.registry.clone()
+            };
+            let token = config.npmrc.get_auth_token(&registry_url);
+            if token.is_none() {
+                return Err(anyhow::anyhow!(
+                    "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "npm error code ENOTSUP\nnpm error hook is not supported by the active registry"
+            ));
+        }
+        Commands::Get { key } => {
+            if let Some(key_str) = key {
+                let config = rnpm_config::Config::load(Some(&current_dir))?;
+                if let Some(val) = config.get(&key_str) {
+                    println!("{val}");
+                } else {
+                    println!("undefined");
+                }
+            } else {
+                let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
+                let detailed = rnpm_config::Config::load_detailed(opts)?;
+                print!("{}", detailed.format_text());
             }
         }
         Commands::Set {
@@ -6523,8 +7563,169 @@ fn format_bytes(bytes: u64, space: bool) -> String {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn execute_run_sync(
+    current_dir: PathBuf,
+    script: String,
+    args: Vec<String>,
+    if_present: bool,
+    ignore_scripts: bool,
+    foreground_scripts: bool,
+    strict_sandbox: bool,
+) -> anyhow::Result<()> {
+    let manifest_path = current_dir.join("package.json");
+    if !manifest_path.exists() {
+        return Err(anyhow::anyhow!(
+            "package.json not found in {}",
+            current_dir.display()
+        ));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FastManifest {
+        name: Option<String>,
+        version: Option<String>,
+        #[serde(default)]
+        scripts: std::collections::BTreeMap<String, String>,
+    }
+
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+    let manifest: FastManifest = serde_json::from_slice(&manifest_bytes)?;
+
+    let script_cmd = match manifest.scripts.get(&script) {
+        Some(cmd) => cmd,
+        None => {
+            if if_present {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(
+                "npm error Missing script: \"{script}\"\n\
+                 npm error\n\
+                 npm error To see a list of scripts, run:\n\
+                 npm error   npm run"
+            ));
+        }
+    };
+
+    let full_cmd = if args.is_empty() {
+        script_cmd.clone()
+    } else {
+        let formatted_args: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                    format!("\"{}\"", a.replace('"', "\\\""))
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        format!("{script_cmd} {}", formatted_args.join(" "))
+    };
+
+    let pkg_name = manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| "project".to_string());
+
+    let is_silent = rnpm_config::get_process_cli_overrides()
+        .as_ref()
+        .and_then(|m| m.get("loglevel"))
+        .map(|s| s == "silent")
+        .unwrap_or(false);
+    if !is_silent && !ignore_scripts {
+        let ver = manifest.version.as_deref().unwrap_or("1.0.0");
+        println!("\n> {pkg_name}@{ver} {script}");
+        println!("> {full_cmd}\n");
+    }
+
+    let mut ctx =
+        LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
+    ctx.package_version = manifest.version.clone();
+    ctx.foreground_scripts = foreground_scripts;
+    if foreground_scripts {
+        ctx.capture_output = false;
+    }
+    if strict_sandbox {
+        ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted();
+    }
+
+    if !ignore_scripts {
+        if strict_sandbox {
+            let status = execute_lifecycle_script(&ctx)?;
+            if !status.success() {
+                let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: format!(
+                        "Lifecycle script '{}' failed with exit code: {}",
+                        script, code
+                    ),
+                }));
+            }
+        } else {
+            #[cfg(windows)]
+            let mut cmd = {
+                use std::os::windows::process::CommandExt;
+                let mut c = std::process::Command::new("cmd.exe");
+                c.raw_arg(format!("/d /s /c {}", full_cmd));
+                c
+            };
+
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("/bin/sh");
+                c.arg("-c").arg(&full_cmd);
+                c
+            };
+
+            cmd.current_dir(&current_dir);
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::inherit());
+            cmd.stderr(std::process::Stdio::inherit());
+
+            let node_exe = std::env::var("NODE").unwrap_or_else(|_| "node".to_string());
+            cmd.env("NODE", &node_exe);
+            cmd.env("npm_node_execpath", &node_exe);
+            let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm"));
+            cmd.env("npm_execpath", &current_exe);
+            cmd.env("INIT_CWD", &current_dir);
+            cmd.env("npm_lifecycle_event", &script);
+            cmd.env("npm_lifecycle_script", &full_cmd);
+            cmd.env("npm_package_name", &pkg_name);
+            if let Some(ref ver) = manifest.version {
+                cmd.env("npm_package_version", ver);
+            }
+            cmd.env("npm_package_json", &manifest_path);
+
+            let local_bin = current_dir.join("node_modules").join(".bin");
+            let sys_path = std::env::var("PATH").or_else(|_| std::env::var("Path")).unwrap_or_default();
+            let final_path = if local_bin.exists() {
+                format!("{};{}", local_bin.display(), sys_path)
+            } else {
+                sys_path
+            };
+            cmd.env("PATH", &final_path);
+            #[cfg(windows)]
+            cmd.env("Path", &final_path);
+
+            let status = cmd.status()?;
+            if !status.success() {
+                let code = status.code().unwrap_or(1);
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: format!(
+                        "Lifecycle script '{}' failed with exit code: {}",
+                        script, code
+                    ),
+                }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn main() {
     // Suppress mimalloc warning output on stderr under high memory pressure
     if std::env::var("MIMALLOC_SHOW_ERRORS").is_err() {
         std::env::set_var("MIMALLOC_SHOW_ERRORS", "0");
@@ -6546,9 +7747,11 @@ async fn main() {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
+    }
 
     let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
     let filtered_args = normalize_cli_args(filtered_args);
@@ -6556,6 +7759,99 @@ async fn main() {
     if let Some((_, msg)) = check_unsupported_cli_invocation(&filtered_args) {
         eprintln!("{msg}");
         std::process::exit(1);
+    }
+
+    let filtered_args = preprocess_cli_args(filtered_args);
+
+    // Ultra-fast path for standard `rnpm run <script>` without clap AST building
+    if filtered_args.get(1).map(|s| s.as_str()) == Some("run")
+        && !filtered_args.iter().any(|a| a == "--help" || a == "-h" || a == "--workspaces" || a == "-ws" || a == "-w" || a == "--workspace" || a.starts_with("--workspace="))
+    {
+        let mut script_name = None;
+        let mut script_args = Vec::new();
+        let mut if_present = false;
+        let mut ignore_scripts = false;
+        let mut foreground_scripts = false;
+        let mut strict_sandbox = false;
+
+        let mut in_dashdash = false;
+        for arg in &filtered_args[2..] {
+            if in_dashdash {
+                script_args.push(arg.clone());
+            } else if arg == "--" {
+                in_dashdash = true;
+            } else if arg == "--if-present" {
+                if_present = true;
+            } else if arg == "--ignore-scripts" {
+                ignore_scripts = true;
+            } else if arg == "--foreground-scripts" {
+                foreground_scripts = true;
+            } else if arg == "--strict-sandbox" {
+                strict_sandbox = true;
+            } else if arg == "--workspace-root"
+                || arg == "--include-workspace-root"
+                || arg == "--scope"
+                || arg == "--filter"
+                || arg.starts_with("--scope=")
+                || arg.starts_with("--filter=")
+            {
+                // npm run CLI flags, not forwarded script arguments
+            } else if !arg.starts_with('-') && script_name.is_none() {
+                script_name = Some(arg.clone());
+            } else {
+                script_args.push(arg.clone());
+            }
+        }
+
+        if let Some(script) = script_name {
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            if let Some(ref o) = cli_overrides {
+                if let Some(shell) = o.get("script-shell") {
+                    if shell == "true" {
+                        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let has_script_overrides = cli_overrides.as_ref().map(|o| {
+                o.contains_key("ignore-scripts")
+                    || o.contains_key("foreground-scripts")
+                    || o.contains_key("strict-sandbox")
+            }).unwrap_or(false);
+
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+                let overrides = cli_overrides.as_ref().unwrap();
+                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                (ig, fg, ss)
+            } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
+                let ig = ignore_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("ignore-scripts=true"));
+                let fg = foreground_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("foreground-scripts=true"));
+                let ss = strict_sandbox || npmrc_text.lines().any(|l| l.trim().starts_with("strict-sandbox=true"));
+                (ig, fg, ss)
+            } else {
+                (ignore_scripts, foreground_scripts, strict_sandbox)
+            };
+
+            if let Err(err) = execute_run_sync(
+                current_dir,
+                script,
+                script_args,
+                if_present,
+                effective_ignore,
+                effective_foreground,
+                effective_strict,
+            ) {
+                if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+                    std::process::exit(exit_err.exit_code);
+                }
+                eprintln!("{err:?}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
     }
 
     let mut cli = match Cli::try_parse_from(&filtered_args) {
@@ -6586,7 +7882,78 @@ async fn main() {
         }
     }
 
-    if let Err(err) = Box::pin(run_cli(cli, None)).await {
+    // Fast synchronous path for standard `rnpm run <script>` without tokio runtime overhead
+    if let Commands::Run {
+        ref script,
+        ref args,
+        workspaces,
+        ref workspace,
+        ref filter,
+        ref scope,
+        if_present,
+        ignore_scripts,
+        foreground_scripts,
+        strict_sandbox,
+        workspace_root: _,
+    } = cli.command {
+        let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
+        if !workspaces && !has_filter && script.is_some() {
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            if let Some(ref o) = cli_overrides {
+                if let Some(shell) = o.get("script-shell") {
+                    if shell == "true" {
+                        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let has_script_overrides = cli_overrides.as_ref().map(|o| {
+                o.contains_key("ignore-scripts")
+                    || o.contains_key("foreground-scripts")
+                    || o.contains_key("strict-sandbox")
+            }).unwrap_or(false);
+
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+                let overrides = cli_overrides.as_ref().unwrap();
+                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                (ig, fg, ss)
+            } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
+                let ig = ignore_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("ignore-scripts=true"));
+                let fg = foreground_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("foreground-scripts=true"));
+                let ss = strict_sandbox || npmrc_text.lines().any(|l| l.trim().starts_with("strict-sandbox=true"));
+                (ig, fg, ss)
+            } else {
+                (ignore_scripts, foreground_scripts, strict_sandbox)
+            };
+
+            if let Err(err) = execute_run_sync(
+                current_dir,
+                script.as_ref().unwrap().clone(),
+                args.clone(),
+                if_present,
+                effective_ignore,
+                effective_foreground,
+                effective_strict,
+            ) {
+                if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+                    std::process::exit(exit_err.exit_code);
+                }
+                eprintln!("{err:?}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to initialize async runtime");
+
+    if let Err(err) = rt.block_on(run_cli(cli, None)) {
         if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
             std::process::exit(exit_err.exit_code);
         }

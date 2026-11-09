@@ -3,6 +3,41 @@ use crate::npmrc::Npmrc;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+static PROCESS_CLI_OVERRIDES: RwLock<Option<BTreeMap<String, String>>> = RwLock::new(None);
+static PROCESS_USERCONFIG: RwLock<Option<PathBuf>> = RwLock::new(None);
+static PROCESS_GLOBALCONFIG: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+pub fn set_process_cli_overrides(overrides: BTreeMap<String, String>) {
+    if let Ok(mut lock) = PROCESS_CLI_OVERRIDES.write() {
+        *lock = Some(overrides);
+    }
+}
+
+pub fn get_process_cli_overrides() -> Option<BTreeMap<String, String>> {
+    PROCESS_CLI_OVERRIDES.read().ok().and_then(|lock| lock.clone())
+}
+
+pub fn set_process_userconfig(path: PathBuf) {
+    if let Ok(mut lock) = PROCESS_USERCONFIG.write() {
+        *lock = Some(path);
+    }
+}
+
+pub fn get_process_userconfig() -> Option<PathBuf> {
+    PROCESS_USERCONFIG.read().ok().and_then(|lock| lock.clone())
+}
+
+pub fn set_process_globalconfig(path: PathBuf) {
+    if let Ok(mut lock) = PROCESS_GLOBALCONFIG.write() {
+        *lock = Some(path);
+    }
+}
+
+pub fn get_process_globalconfig() -> Option<PathBuf> {
+    PROCESS_GLOBALCONFIG.read().ok().and_then(|lock| lock.clone())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOptions<'a> {
@@ -120,50 +155,79 @@ impl Config {
             }
         };
 
+        let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
         let mut base_npmrc = Npmrc::default();
 
-        let global_config_path = options
+        let disable_global = options
             .globalconfig
-            .clone()
-            .or_else(|| {
-                options
-                    .cli_overrides
-                    .as_ref()
-                    .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
-            })
-            .or_else(|| {
-                env_lookup("NPM_CONFIG_GLOBALCONFIG")
-                    .or_else(|| env_lookup("npm_config_globalconfig"))
-                    .map(PathBuf::from)
-            })
-            .or_else(|| find_global_npmrc_with_env(env_lookup));
+            .as_ref()
+            .map(|p| p.as_os_str() == "false")
+            .unwrap_or(false)
+            || cli_map_opt
+                .as_ref()
+                .and_then(|cli| cli.get("globalconfig").map(|v| v == "false"))
+                .unwrap_or(false);
+
+        let global_config_path = if disable_global {
+            None
+        } else {
+            options
+                .globalconfig
+                .clone()
+                .or_else(get_process_globalconfig)
+                .or_else(|| {
+                    cli_map_opt
+                        .as_ref()
+                        .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
+                })
+                .or_else(|| {
+                    env_lookup("NPM_CONFIG_GLOBALCONFIG")
+                        .or_else(|| env_lookup("npm_config_globalconfig"))
+                        .map(PathBuf::from)
+                })
+                .or_else(|| find_global_npmrc_with_env(env_lookup))
+        };
 
         if let Some(path) = global_config_path {
-            if path.exists() {
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let global_config = Npmrc::from_file(&path)?;
                 base_npmrc.merge(global_config);
             }
         }
 
-        let user_config_path = options
+        let disable_user = options
             .userconfig
-            .clone()
-            .or_else(|| {
-                options
-                    .cli_overrides
-                    .as_ref()
-                    .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
-            })
-            .or_else(|| {
-                env_lookup("NPM_CONFIG_USERCONFIG")
-                    .or_else(|| env_lookup("npm_config_userconfig"))
-                    .map(PathBuf::from)
-            })
-            .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
-            .or_else(|| find_user_npmrc_with_env(env_lookup));
+            .as_ref()
+            .map(|p| p.as_os_str() == "false")
+            .unwrap_or(false)
+            || cli_map_opt
+                .as_ref()
+                .and_then(|cli| cli.get("userconfig").map(|v| v == "false"))
+                .unwrap_or(false);
+
+        let user_config_path = if disable_user {
+            None
+        } else {
+            options
+                .userconfig
+                .clone()
+                .or_else(get_process_userconfig)
+                .or_else(|| {
+                    cli_map_opt
+                        .as_ref()
+                        .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
+                })
+                .or_else(|| {
+                    env_lookup("NPM_CONFIG_USERCONFIG")
+                        .or_else(|| env_lookup("npm_config_userconfig"))
+                        .map(PathBuf::from)
+                })
+                .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
+                .or_else(|| find_user_npmrc_with_env(env_lookup))
+        };
 
         if let Some(path) = user_config_path {
-            if path.exists() {
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let user_config = Npmrc::from_file(&path)?;
                 base_npmrc.merge(user_config);
             }
@@ -215,7 +279,7 @@ impl Config {
             }
         }
 
-        if let Some(cli_map) = options.cli_overrides {
+        if let Some(cli_map) = cli_map_opt {
             for (key, value) in cli_map {
                 let clean_key = key.strip_prefix("--").unwrap_or(&key);
                 let lower_clean = clean_key.to_ascii_lowercase();
@@ -244,27 +308,42 @@ impl Config {
             }
         };
 
+        let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
         let mut layers = Vec::new();
         let mut base_npmrc = Npmrc::default();
 
-        let global_config_path = options
+        let disable_global = options
             .globalconfig
-            .clone()
-            .or_else(|| {
-                options
-                    .cli_overrides
-                    .as_ref()
-                    .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
-            })
-            .or_else(|| {
-                env_lookup("NPM_CONFIG_GLOBALCONFIG")
-                    .or_else(|| env_lookup("npm_config_globalconfig"))
-                    .map(PathBuf::from)
-            })
-            .or_else(|| find_global_npmrc_with_env(env_lookup));
+            .as_ref()
+            .map(|p| p.as_os_str() == "false")
+            .unwrap_or(false)
+            || cli_map_opt
+                .as_ref()
+                .and_then(|cli| cli.get("globalconfig").map(|v| v == "false"))
+                .unwrap_or(false);
+
+        let global_config_path = if disable_global {
+            None
+        } else {
+            options
+                .globalconfig
+                .clone()
+                .or_else(get_process_globalconfig)
+                .or_else(|| {
+                    cli_map_opt
+                        .as_ref()
+                        .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
+                })
+                .or_else(|| {
+                    env_lookup("NPM_CONFIG_GLOBALCONFIG")
+                        .or_else(|| env_lookup("npm_config_globalconfig"))
+                        .map(PathBuf::from)
+                })
+                .or_else(|| find_global_npmrc_with_env(env_lookup))
+        };
 
         if let Some(path) = &global_config_path {
-            if path.exists() {
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let global_config = Npmrc::from_file(path)?;
                 layers.push(ConfigLayer {
                     name: "global".to_string(),
@@ -275,25 +354,39 @@ impl Config {
             }
         }
 
-        let user_config_path = options
+        let disable_user = options
             .userconfig
-            .clone()
-            .or_else(|| {
-                options
-                    .cli_overrides
-                    .as_ref()
-                    .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
-            })
-            .or_else(|| {
-                env_lookup("NPM_CONFIG_USERCONFIG")
-                    .or_else(|| env_lookup("npm_config_userconfig"))
-                    .map(PathBuf::from)
-            })
-            .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
-            .or_else(|| find_user_npmrc_with_env(env_lookup));
+            .as_ref()
+            .map(|p| p.as_os_str() == "false")
+            .unwrap_or(false)
+            || cli_map_opt
+                .as_ref()
+                .and_then(|cli| cli.get("userconfig").map(|v| v == "false"))
+                .unwrap_or(false);
+
+        let user_config_path = if disable_user {
+            None
+        } else {
+            options
+                .userconfig
+                .clone()
+                .or_else(get_process_userconfig)
+                .or_else(|| {
+                    cli_map_opt
+                        .as_ref()
+                        .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
+                })
+                .or_else(|| {
+                    env_lookup("NPM_CONFIG_USERCONFIG")
+                        .or_else(|| env_lookup("npm_config_userconfig"))
+                        .map(PathBuf::from)
+                })
+                .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
+                .or_else(|| find_user_npmrc_with_env(env_lookup))
+        };
 
         if let Some(path) = &user_config_path {
-            if path.exists() {
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let user_config = Npmrc::from_file(path)?;
                 layers.push(ConfigLayer {
                     name: "user".to_string(),
@@ -375,7 +468,7 @@ impl Config {
             });
         }
 
-        if let Some(cli_map) = options.cli_overrides {
+        if let Some(cli_map) = cli_map_opt {
             let mut cli_layer_settings = BTreeMap::new();
             for (key, value) in cli_map {
                 let clean_key = key.strip_prefix("--").unwrap_or(&key);
