@@ -155,8 +155,10 @@ pub fn prompt_field<R: BufRead, W: Write>(
     let mut line = String::new();
     let bytes_read = reader.read_line(&mut line)?;
     if bytes_read == 0 {
-        // EOF fallback
-        return Ok(default.to_string());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "canceled",
+        ));
     }
 
     let trimmed = line.trim();
