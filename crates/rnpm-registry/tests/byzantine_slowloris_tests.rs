@@ -1026,13 +1026,21 @@ async fn test_security_redirect_to_unsupported_scheme() {
 
 #[tokio::test]
 async fn test_security_redirect_crlf_injection() {
-    let server = TestHttpServer::start(|mut stream, _, _| async move {
+    // Redirect to a loopback port that is known to be closed. A bare
+    // http://127.0.0.1/ target made the outcome depend on whether the host
+    // runs something on port 80 (GitHub's Windows runners do and answer 404).
+    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let server = TestHttpServer::start(move |mut stream, _, _| async move {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf).await;
 
         // Raw bytes with CRLF in Location header value (if sent as bytes)
-        let resp = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/evil\r\nX-Injected: true\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(resp).await;
+        let resp = format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{closed_port}/evil\r\nX-Injected: true\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(resp.as_bytes()).await;
         let _ = stream.flush().await;
     })
     .await;
