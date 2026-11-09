@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use data_encoding::HEXLOWER;
+use rnpm_cache::{PackagePack, PackStore};
 use rnpm_config::Config;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::workspace::discover_workspaces_from_manifest;
@@ -7,9 +8,10 @@ use rnpm_lockfile::LockfileV3;
 use rnpm_solver::Platform;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::linked::InstallStrategy;
 use crate::InstallOptions;
@@ -383,6 +385,255 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 /// Convenience helper for validating hidden lockfile with default or no explicit options.
 pub fn validate_hidden_lockfile_simple(project_dir: &Path) -> bool {
     validate_hidden_lockfile(project_dir, None)
+}
+
+/// Loads package packs in parallel across workers.
+pub(crate) fn parallel_load_packs(
+    pack_store: &Arc<PackStore>,
+    loc_base_dir: &Path,
+    packages_to_process: &[crate::link::CiPackage],
+) -> (Vec<(String, PathBuf, PackagePack)>, bool) {
+    let total_pkgs = packages_to_process.len();
+    let num_workers = 16.min(total_pkgs);
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let load_failed = std::sync::atomic::AtomicBool::new(false);
+    let pack_store = Arc::clone(pack_store);
+
+    let mut loaded_packs = Vec::with_capacity(total_pkgs);
+    let load_success = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            handles.push(scope.spawn(|| -> Result<Vec<(usize, String, PathBuf, PackagePack)>, ()> {
+                let mut local = Vec::new();
+                while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= total_pkgs {
+                        break;
+                    }
+                    let (pkg_key, _, integrity_str, _, _, _) = &packages_to_process[idx];
+                    let pkg_target = loc_base_dir.join(pkg_key);
+                    match pack_store.get_package_pack(integrity_str) {
+                        Ok(Some(pack)) => {
+                            local.push((idx, pkg_key.clone(), pkg_target, pack));
+                        }
+                        Err(e) => {
+                            warn!("get_package_pack failed for {pkg_key}: {e}. Falling back to standard pipeline.");
+                            load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(());
+                        }
+                        Ok(None) => {
+                            warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
+                            load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(());
+                        }
+                    }
+                }
+                Ok(local)
+            }));
+        }
+
+        let mut all_results = Vec::with_capacity(total_pkgs);
+        let mut any_err = false;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(items)) => all_results.extend(items),
+                _ => any_err = true,
+            }
+        }
+        if any_err || all_results.len() != total_pkgs {
+            false
+        } else {
+            all_results.sort_by_key(|(idx, _, _, _)| *idx);
+            for (_, pkg_key, pkg_target, pack) in all_results {
+                loaded_packs.push((pkg_key, pkg_target, pack));
+            }
+            true
+        }
+    });
+
+    (loaded_packs, load_success)
+}
+
+/// Builds in-memory lookup map of known package bins from lockfile metadata.
+pub(crate) fn build_known_bins_map(
+    lockfile: &LockfileV3,
+) -> HashMap<String, Vec<(String, String)>> {
+    let mut known_bins = HashMap::new();
+    for (loc, pkg_info) in &lockfile.packages {
+        if let Some(ref bin) = pkg_info.bin {
+            let pkg_name = pkg_info
+                .name
+                .as_deref()
+                .unwrap_or_else(|| crate::link::package_name_from_loc(loc));
+            let entries = crate::link::extract_bin_entries_from_lockfile(pkg_name, bin);
+            if !entries.is_empty() {
+                known_bins.insert(loc.clone(), entries);
+            }
+        } else if pkg_info.link == Some(true) {
+            if let Some(ref resolved) = pkg_info.resolved {
+                if let Some(target) = lockfile.packages.get(resolved) {
+                    if let Some(ref bin) = target.bin {
+                        let pkg_name = target
+                            .name
+                            .as_deref()
+                            .unwrap_or_else(|| crate::link::package_name_from_loc(loc));
+                        let entries = crate::link::extract_bin_entries_from_lockfile(pkg_name, bin);
+                        if !entries.is_empty() {
+                            known_bins.insert(loc.clone(), entries);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    known_bins
+}
+
+/// Enrich lockfile entries with author/funding/license/engines from installed manifests
+pub(crate) fn enrich_lockfile_from_installed_manifests(
+    lockfile: &mut LockfileV3,
+    project_dir: &Path,
+) {
+    let locations: Vec<String> = lockfile
+        .packages
+        .iter()
+        .filter_map(|(location, package)| {
+            if location.is_empty() || package.link == Some(true) {
+                return None;
+            }
+            if package.license.is_some() && package.engines.is_some() {
+                return None;
+            }
+            Some(location.clone())
+        })
+        .collect();
+
+    if locations.is_empty() {
+        return;
+    }
+
+    let num_threads = 16.min(locations.len());
+    let chunk_size = locations.len().div_ceil(num_threads);
+    let manifests_by_loc: HashMap<String, Manifest> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in locations.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::with_capacity(chunk.len());
+                for loc in chunk {
+                    let manifest_path = if loc.is_empty() {
+                        project_dir.join("package.json")
+                    } else {
+                        project_dir.join(loc).join("package.json")
+                    };
+                    if let Ok(m) = Manifest::from_file(&manifest_path) {
+                        local.push((loc.clone(), m));
+                    }
+                }
+                local
+            }));
+        }
+        let mut results = HashMap::with_capacity(locations.len());
+        for handle in handles {
+            if let Ok(items) = handle.join() {
+                results.extend(items);
+            }
+        }
+        results
+    });
+
+    for (location, manifest) in manifests_by_loc {
+        let Some(package) = lockfile.packages.get_mut(&location) else {
+            continue;
+        };
+
+        if package.license.is_none() {
+            package.license = manifest
+                .extra
+                .get("license")
+                .and_then(|value| {
+                    if let Some(s) = value.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(obj) = value.as_object() {
+                        obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    manifest.extra.get("licenses").and_then(|v| {
+                        v.as_array().and_then(|arr| {
+                            arr.first().and_then(|item| {
+                                if let Some(s) = item.as_str() {
+                                    Some(s.to_string())
+                                } else if let Some(obj) = item.as_object() {
+                                    obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                });
+        }
+
+        if package.engines.is_none() && !manifest.engines.is_empty() {
+            package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+        }
+        if package.bin.is_none() {
+            if let Some(bin) = &manifest.bin {
+                let lock_bin = match bin {
+                    rnpm_core::manifest::PackageBin::Single(s) => {
+                        rnpm_lockfile::PackageBin::Single(s.clone())
+                    }
+                    rnpm_core::manifest::PackageBin::Map(m) => {
+                        rnpm_lockfile::PackageBin::Map(m.clone())
+                    }
+                };
+                package.bin = Some(lock_bin);
+            }
+        }
+        if package.os.is_none() {
+            if let Some(os) = &manifest.os {
+                package.os = Some(os.clone());
+            }
+        }
+        if package.cpu.is_none() {
+            if let Some(cpu) = &manifest.cpu {
+                package.cpu = Some(cpu.clone());
+            }
+        }
+        if package.libc.is_none() {
+            if let Some(libc) = &manifest.libc {
+                package.libc = Some(libc.clone());
+            }
+        }
+        let funding_val_opt = manifest
+            .extra
+            .get("funding")
+            .or_else(|| package.extra.get("funding"));
+        if let Some(value) = funding_val_opt {
+            let normalized_val = if let Some(url_str) = value.as_str() {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "url".to_string(),
+                    serde_json::Value::String(url_str.to_string()),
+                );
+                serde_json::Value::Object(map)
+            } else {
+                value.clone()
+            };
+            package.extra.insert("funding".to_string(), normalized_val);
+        }
+        if !package.extra.contains_key("deprecated") {
+            if let Some(value) = manifest.extra.get("deprecated") {
+                if value != &serde_json::Value::Bool(false) && !value.is_null() && value != "" {
+                    package
+                        .extra
+                        .insert("deprecated".to_string(), value.clone());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
