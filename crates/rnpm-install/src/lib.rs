@@ -1229,6 +1229,7 @@ pub struct InstallOptions {
     pub strict_sandbox: bool,
     pub save_dev: bool,
     pub save_exact: bool,
+    pub save_prefix: Option<String>,
     pub save_prod: bool,
     pub save_optional: bool,
     pub save_peer: bool,
@@ -1306,6 +1307,7 @@ impl Default for InstallOptions {
             strict_sandbox: false,
             save_dev: false,
             save_exact: false,
+            save_prefix: None,
             save_prod: false,
             save_optional: false,
             save_peer: false,
@@ -1763,9 +1765,36 @@ impl Installer {
             }
         }
 
-        // Track added packages and their original requested specifiers
+        // 0. Discover workspace members (if any)
+        let mut workspace_members =
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
+
+        let has_workspace_filter = !self.options.workspace.is_empty();
+        let has_workspaces_flag = self.options.workspaces;
+        let is_workspace_mode = has_workspace_filter || has_workspaces_flag;
+
+        let mut targeted_workspace_indices: Vec<usize> = Vec::new();
+        if has_workspace_filter {
+            for (idx, m) in workspace_members.iter().enumerate() {
+                if self.options.workspace.iter().any(|target| {
+                    target == &m.name
+                        || target == &m.relative_path
+                        || m.relative_path.ends_with(target)
+                        || target.trim_start_matches("./") == m.relative_path
+                }) {
+                    targeted_workspace_indices.push(idx);
+                }
+            }
+        } else if has_workspaces_flag {
+            targeted_workspace_indices = (0..workspace_members.len()).collect();
+        }
+
+        let target_root = !is_workspace_mode || self.options.workspace_root;
+
         struct AddedPkgInfo {
             name: String,
+            #[allow(dead_code)]
             user_spec: Option<String>,
             target: PackageTarget,
         }
@@ -1846,32 +1875,38 @@ impl Installer {
                 PackageTarget::Url(u) => u.to_string(),
             };
 
-            if self.options.save_dev {
-                manifest
-                    .dev_dependencies
-                    .insert(spec.name.clone(), solver_spec);
-                manifest.dependencies.remove(&spec.name);
-                manifest.optional_dependencies.remove(&spec.name);
-                manifest.peer_dependencies.remove(&spec.name);
-            } else if self.options.save_optional {
-                manifest
-                    .optional_dependencies
-                    .insert(spec.name.clone(), solver_spec);
-                manifest.dependencies.remove(&spec.name);
-                manifest.dev_dependencies.remove(&spec.name);
-                manifest.peer_dependencies.remove(&spec.name);
-            } else if self.options.save_peer {
-                manifest
-                    .peer_dependencies
-                    .insert(spec.name.clone(), solver_spec);
-                manifest.dependencies.remove(&spec.name);
-                manifest.dev_dependencies.remove(&spec.name);
-                manifest.optional_dependencies.remove(&spec.name);
-            } else {
-                manifest.dependencies.insert(spec.name.clone(), solver_spec);
-                manifest.dev_dependencies.remove(&spec.name);
-                manifest.optional_dependencies.remove(&spec.name);
-                manifest.peer_dependencies.remove(&spec.name);
+            let insert_dep = |m: &mut Manifest| {
+                if self.options.save_dev {
+                    m.dev_dependencies
+                        .insert(spec.name.clone(), solver_spec.clone());
+                    m.dependencies.remove(&spec.name);
+                    m.optional_dependencies.remove(&spec.name);
+                    m.peer_dependencies.remove(&spec.name);
+                } else if self.options.save_optional {
+                    m.optional_dependencies
+                        .insert(spec.name.clone(), solver_spec.clone());
+                    m.dependencies.remove(&spec.name);
+                    m.dev_dependencies.remove(&spec.name);
+                    m.peer_dependencies.remove(&spec.name);
+                } else if self.options.save_peer {
+                    m.peer_dependencies
+                        .insert(spec.name.clone(), solver_spec.clone());
+                    m.dependencies.remove(&spec.name);
+                    m.dev_dependencies.remove(&spec.name);
+                    m.optional_dependencies.remove(&spec.name);
+                } else {
+                    m.dependencies.insert(spec.name.clone(), solver_spec.clone());
+                    m.dev_dependencies.remove(&spec.name);
+                    m.optional_dependencies.remove(&spec.name);
+                    m.peer_dependencies.remove(&spec.name);
+                }
+            };
+
+            if target_root {
+                insert_dep(&mut manifest);
+            }
+            for &idx in &targeted_workspace_indices {
+                insert_dep(&mut workspace_members[idx].manifest);
             }
 
             added_pkgs.push(AddedPkgInfo {
@@ -1906,29 +1941,6 @@ impl Installer {
             }
             rnpm_fs::validate_entry_path(Path::new(dep_name))
                 .map_err(|e| anyhow!("Invalid package name '{dep_name}': {e}"))?;
-        }
-
-        // 0. Discover workspace members (if any)
-        let mut workspace_members =
-            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
-
-        if !self.options.workspace.is_empty() {
-            workspace_members.retain(|m| {
-                self.options.workspace.iter().any(|target| {
-                    target == &m.name
-                        || target == &m.relative_path
-                        || m.relative_path.ends_with(target)
-                        || target.trim_start_matches("./") == m.relative_path
-                })
-            });
-
-            if !self.options.workspace_root {
-                manifest.dependencies.clear();
-                manifest.dev_dependencies.clear();
-                manifest.optional_dependencies.clear();
-                manifest.peer_dependencies.clear();
-            }
         }
 
         if self.options.omit_dev {
@@ -2046,6 +2058,12 @@ impl Installer {
 
         // 2. Post-solve: finalize versions for added packages in manifest
         if !added_pkgs.is_empty() {
+            let prefix = if self.options.save_exact {
+                ""
+            } else {
+                self.options.save_prefix.as_deref().unwrap_or("^")
+            };
+
             for added in &added_pkgs {
                 let resolved_version_opt = graph
                     .nodes
@@ -2060,95 +2078,77 @@ impl Installer {
 
                 let resolved_ver = resolved_version_opt.unwrap_or_else(|| "1.0.0".to_string());
 
-                let final_spec = if self.options.save_exact {
-                    match &added.target {
-                        PackageTarget::Alias {
-                            name: real_name, ..
-                        } => {
-                            format!("npm:{}@{}", real_name, resolved_ver)
-                        }
-                        PackageTarget::File(p) => {
-                            format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
-                        }
-                        PackageTarget::Git { url, committish } => {
-                            format!(
-                                "{}{}",
-                                url,
-                                committish
-                                    .as_ref()
-                                    .map(|c| format!("#{c}"))
-                                    .unwrap_or_default()
-                            )
-                        }
-                        PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
-                        PackageTarget::Url(u) => u.to_string(),
-                        _ => resolved_ver,
+                let final_spec = match &added.target {
+                    PackageTarget::File(p) => {
+                        format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
                     }
-                } else {
-                    match &added.target {
-                        PackageTarget::Range(_) => {
-                            if let Some(ref u_spec) = added.user_spec {
-                                if u_spec == "*" || u_spec.eq_ignore_ascii_case("x") {
-                                    format!("^{}", resolved_ver)
-                                } else {
-                                    u_spec.clone()
-                                }
-                            } else {
-                                format!("^{}", resolved_ver)
-                            }
+                    PackageTarget::Git { url, committish } => {
+                        format!(
+                            "{}{}",
+                            url,
+                            committish
+                                .as_ref()
+                                .map(|c| format!("#{c}"))
+                                .unwrap_or_default()
+                        )
+                    }
+                    PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
+                    PackageTarget::Url(u) => u.to_string(),
+                    PackageTarget::Alias {
+                        name: real_name, ..
+                    } => {
+                        if self.options.save_exact {
+                            format!("npm:{}@{}", real_name, resolved_ver)
+                        } else {
+                            format!("npm:{}@{}{}", real_name, prefix, resolved_ver)
                         }
-                        PackageTarget::Tag(_) | PackageTarget::Version(_) => {
-                            format!("^{}", resolved_ver)
+                    }
+                    _ => {
+                        if self.options.save_exact {
+                            resolved_ver
+                        } else {
+                            format!("{}{}", prefix, resolved_ver)
                         }
-                        PackageTarget::Alias {
-                            name: real_name, ..
-                        } => {
-                            if let Some(ref u_spec) = added.user_spec {
-                                format!("npm:{}@{}", real_name, u_spec)
-                            } else {
-                                format!("npm:{}@^{}", real_name, resolved_ver)
-                            }
-                        }
-                        PackageTarget::File(p) => {
-                            format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
-                        }
-                        PackageTarget::Git { url, committish } => {
-                            format!(
-                                "{}{}",
-                                url,
-                                committish
-                                    .as_ref()
-                                    .map(|c| format!("#{c}"))
-                                    .unwrap_or_default()
-                            )
-                        }
-                        PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
-                        PackageTarget::Url(u) => u.to_string(),
                     }
                 };
 
-                if self.options.save_dev {
-                    manifest
-                        .dev_dependencies
-                        .insert(added.name.clone(), final_spec);
-                } else if self.options.save_optional {
-                    manifest
-                        .optional_dependencies
-                        .insert(added.name.clone(), final_spec);
-                } else if self.options.save_peer {
-                    manifest
-                        .peer_dependencies
-                        .insert(added.name.clone(), final_spec);
-                } else {
-                    manifest.dependencies.insert(added.name.clone(), final_spec);
+                let update_final = |m: &mut Manifest| {
+                    if self.options.save_dev {
+                        m.dev_dependencies
+                            .insert(added.name.clone(), final_spec.clone());
+                    } else if self.options.save_optional {
+                        m.optional_dependencies
+                            .insert(added.name.clone(), final_spec.clone());
+                    } else if self.options.save_peer {
+                        m.peer_dependencies
+                            .insert(added.name.clone(), final_spec.clone());
+                    } else {
+                        m.dependencies.insert(added.name.clone(), final_spec.clone());
+                    }
+                };
+
+                if target_root {
+                    update_final(&mut manifest);
+                }
+                for &idx in &targeted_workspace_indices {
+                    update_final(&mut workspace_members[idx].manifest);
                 }
             }
 
             // Save package.json unless --no-save was passed or in global mode
             if !self.options.is_global && !self.options.no_save && !self.options.dry_run {
-                manifest
-                    .save_to_file(&manifest_path)
-                    .context("Failed to save updated package.json")?;
+                if target_root {
+                    manifest
+                        .save_to_file(&manifest_path)
+                        .context("Failed to save updated package.json")?;
+                }
+                for &idx in &targeted_workspace_indices {
+                    let member = &workspace_members[idx];
+                    let member_pkg_path = self.options.project_dir.join(&member.relative_path).join("package.json");
+                    member.manifest
+                        .save_to_file(&member_pkg_path)
+                        .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
+                }
             } else if self.options.dry_run {
                 for added in &added_pkgs {
                     println!("rnpm: would add {} to package.json", added.name);
@@ -2202,29 +2202,69 @@ impl Installer {
                 }
             }
         }
-        if let Some(root_pkg) = lockfile.root_package_mut() {
-            if manifest.dependencies.is_empty() {
-                root_pkg.dependencies = None;
-            } else {
-                root_pkg.dependencies = Some(manifest.dependencies.clone());
+        if target_root {
+            if let Some(root_pkg) = lockfile.root_package_mut() {
+                if manifest.dependencies.is_empty() {
+                    root_pkg.dependencies = None;
+                } else {
+                    root_pkg.dependencies = Some(manifest.dependencies.clone());
+                }
+                if manifest.dev_dependencies.is_empty() {
+                    root_pkg.dev_dependencies = None;
+                } else {
+                    root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+                }
+                if manifest.optional_dependencies.is_empty() {
+                    root_pkg.optional_dependencies = None;
+                } else {
+                    root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+                }
+                if manifest.peer_dependencies.is_empty() {
+                    root_pkg.peer_dependencies = None;
+                } else {
+                    root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
+                }
+                if !manifest.workspace_patterns().is_empty() {
+                    root_pkg.workspaces = Some(manifest.workspace_patterns());
+                }
             }
-            if manifest.dev_dependencies.is_empty() {
-                root_pkg.dev_dependencies = None;
-            } else {
-                root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+        }
+
+        for member in &workspace_members {
+            let pkg = lockfile.packages.entry(member.relative_path.clone()).or_default();
+            if pkg.version.is_none() {
+                pkg.version = member.manifest.version.clone();
             }
-            if manifest.optional_dependencies.is_empty() {
-                root_pkg.optional_dependencies = None;
+            if member.manifest.dependencies.is_empty() {
+                pkg.dependencies = None;
             } else {
-                root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+                pkg.dependencies = Some(member.manifest.dependencies.clone());
             }
-            if manifest.peer_dependencies.is_empty() {
-                root_pkg.peer_dependencies = None;
+            if member.manifest.dev_dependencies.is_empty() {
+                pkg.dev_dependencies = None;
             } else {
-                root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
+                pkg.dev_dependencies = Some(member.manifest.dev_dependencies.clone());
             }
-            if !manifest.workspace_patterns().is_empty() {
-                root_pkg.workspaces = Some(manifest.workspace_patterns());
+            if member.manifest.optional_dependencies.is_empty() {
+                pkg.optional_dependencies = None;
+            } else {
+                pkg.optional_dependencies = Some(member.manifest.optional_dependencies.clone());
+            }
+            if member.manifest.peer_dependencies.is_empty() {
+                pkg.peer_dependencies = None;
+            } else {
+                pkg.peer_dependencies = Some(member.manifest.peer_dependencies.clone());
+            }
+
+            if !member.name.is_empty() {
+                let m_name = &member.name;
+                let link_loc = format!("node_modules/{m_name}");
+                let clean_rel = member.relative_path.strip_prefix("./").unwrap_or(&member.relative_path);
+                lockfile.packages.entry(link_loc).or_insert_with(|| LockfilePackage {
+                    resolved: Some(clean_rel.to_string()),
+                    link: Some(true),
+                    ..Default::default()
+                });
             }
         }
 
@@ -3482,7 +3522,17 @@ impl Installer {
         for (dep_name, dep_spec) in &manifest.dependencies {
             if let Some(lock_spec) = lock_deps.get(dep_name) {
                 if lock_spec != dep_spec {
-                    let satisfies = if let Ok(v) = Version::parse(lock_spec) {
+                    let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                        if let Some(ref v_str) = pkg.version {
+                            if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
+                                r.satisfies(&v)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else if let Ok(v) = Version::parse(lock_spec) {
                         if let Ok(r) = Range::parse(dep_spec) {
                             r.satisfies(&v)
                         } else {
@@ -3523,7 +3573,17 @@ impl Installer {
             for (dep_name, dep_spec) in &manifest.dev_dependencies {
                 if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
                     if lock_spec != dep_spec {
-                        let satisfies = if let Ok(v) = Version::parse(lock_spec) {
+                        let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                            if let Some(ref v_str) = pkg.version {
+                                if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
+                                    r.satisfies(&v)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else if let Ok(v) = Version::parse(lock_spec) {
                             if let Ok(r) = Range::parse(dep_spec) {
                                 r.satisfies(&v)
                             } else {
@@ -3568,7 +3628,17 @@ impl Installer {
             for (dep_name, dep_spec) in &manifest.optional_dependencies {
                 if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
                     if lock_spec != dep_spec {
-                        let satisfies = if let Ok(v) = Version::parse(lock_spec) {
+                        let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                            if let Some(ref v_str) = pkg.version {
+                                if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
+                                    r.satisfies(&v)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else if let Ok(v) = Version::parse(lock_spec) {
                             if let Ok(r) = Range::parse(dep_spec) {
                                 r.satisfies(&v)
                             } else {
@@ -5967,6 +6037,32 @@ impl Installer {
         let mut manifest =
             Manifest::from_file(&manifest_path).context("Failed to parse project package.json")?;
 
+        let mut workspace_members =
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default();
+
+        let has_workspace_filter = !options.workspace.is_empty();
+        let has_workspaces_flag = options.workspaces;
+        let is_workspace_mode = has_workspace_filter || has_workspaces_flag;
+
+        let mut targeted_workspace_indices: Vec<usize> = Vec::new();
+        if has_workspace_filter {
+            for (idx, m) in workspace_members.iter().enumerate() {
+                if options.workspace.iter().any(|target| {
+                    target == &m.name
+                        || target == &m.relative_path
+                        || m.relative_path.ends_with(target)
+                        || target.trim_start_matches("./") == m.relative_path
+                }) {
+                    targeted_workspace_indices.push(idx);
+                }
+            }
+        } else if has_workspaces_flag {
+            targeted_workspace_indices = (0..workspace_members.len()).collect();
+        }
+
+        let target_root = !is_workspace_mode || options.workspace_root;
+
         let mut removed_packages = Vec::new();
 
         // Determine which sections to target
@@ -5980,18 +6076,45 @@ impl Installer {
 
             let mut removed = false;
 
-            if (options.save_dev || target_all) && manifest.dev_dependencies.remove(pkg).is_some() {
-                removed = true;
+            if target_root {
+                if (options.save_dev || target_all) && manifest.dev_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+
+                if (options.save_optional || target_all)
+                    && manifest.optional_dependencies.remove(pkg).is_some()
+                {
+                    removed = true;
+                }
+
+                if (options.save_prod || target_all) && manifest.dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+
+                if target_all && manifest.peer_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
             }
 
-            if (options.save_optional || target_all)
-                && manifest.optional_dependencies.remove(pkg).is_some()
-            {
-                removed = true;
-            }
+            for &idx in &targeted_workspace_indices {
+                let m = &mut workspace_members[idx].manifest;
+                if (options.save_dev || target_all) && m.dev_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
 
-            if (options.save_prod || target_all) && manifest.dependencies.remove(pkg).is_some() {
-                removed = true;
+                if (options.save_optional || target_all)
+                    && m.optional_dependencies.remove(pkg).is_some()
+                {
+                    removed = true;
+                }
+
+                if (options.save_prod || target_all) && m.dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
+
+                if target_all && m.peer_dependencies.remove(pkg).is_some() {
+                    removed = true;
+                }
             }
 
             if removed || options.is_global || self.options.is_global {
@@ -6000,9 +6123,18 @@ impl Installer {
         }
 
         // Save updated package.json deterministically
-        manifest
-            .save_to_file(&manifest_path)
-            .context("Failed to save updated package.json")?;
+        if target_root {
+            manifest
+                .save_to_file(&manifest_path)
+                .context("Failed to save updated package.json")?;
+        }
+        for &idx in &targeted_workspace_indices {
+            let member = &workspace_members[idx];
+            let member_pkg_path = self.options.project_dir.join(&member.relative_path).join("package.json");
+            member.manifest
+                .save_to_file(&member_pkg_path)
+                .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
+        }
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut pruned_nodes: HashSet<String> = HashSet::new();
@@ -6015,30 +6147,67 @@ impl Installer {
 
             // Build and prune in-memory dependency graph
             let mut in_memory_graph = DependencyGraph::from_lockfile_v3(&lockfile);
-            for pkg in &removed_packages {
-                in_memory_graph.remove_root_dependency(pkg);
+            if target_root {
+                for pkg in &removed_packages {
+                    in_memory_graph.remove_root_dependency(pkg);
+                }
             }
             let graph_pruned = in_memory_graph.prune_unreferenced();
 
             // Sync root package metadata with updated manifest
-            if let Some(root_pkg) = lockfile.root_package_mut() {
-                root_pkg.raw_value = None;
-                if manifest.dependencies.is_empty() {
-                    root_pkg.dependencies = None;
-                } else {
-                    root_pkg.dependencies = Some(manifest.dependencies.clone());
-                }
+            if target_root {
+                if let Some(root_pkg) = lockfile.root_package_mut() {
+                    root_pkg.raw_value = None;
+                    if manifest.dependencies.is_empty() {
+                        root_pkg.dependencies = None;
+                    } else {
+                        root_pkg.dependencies = Some(manifest.dependencies.clone());
+                    }
 
-                if manifest.dev_dependencies.is_empty() {
-                    root_pkg.dev_dependencies = None;
-                } else {
-                    root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
-                }
+                    if manifest.dev_dependencies.is_empty() {
+                        root_pkg.dev_dependencies = None;
+                    } else {
+                        root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
+                    }
 
-                if manifest.optional_dependencies.is_empty() {
-                    root_pkg.optional_dependencies = None;
-                } else {
-                    root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+                    if manifest.optional_dependencies.is_empty() {
+                        root_pkg.optional_dependencies = None;
+                    } else {
+                        root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
+                    }
+
+                    if manifest.peer_dependencies.is_empty() {
+                        root_pkg.peer_dependencies = None;
+                    } else {
+                        root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
+                    }
+                }
+            }
+
+            // Sync targeted workspace packages in lockfile
+            for &idx in &targeted_workspace_indices {
+                let m = &workspace_members[idx];
+                if let Some(pkg_entry) = lockfile.packages.get_mut(&m.relative_path) {
+                    if m.manifest.dependencies.is_empty() {
+                        pkg_entry.dependencies = None;
+                    } else {
+                        pkg_entry.dependencies = Some(m.manifest.dependencies.clone());
+                    }
+                    if m.manifest.dev_dependencies.is_empty() {
+                        pkg_entry.dev_dependencies = None;
+                    } else {
+                        pkg_entry.dev_dependencies = Some(m.manifest.dev_dependencies.clone());
+                    }
+                    if m.manifest.optional_dependencies.is_empty() {
+                        pkg_entry.optional_dependencies = None;
+                    } else {
+                        pkg_entry.optional_dependencies = Some(m.manifest.optional_dependencies.clone());
+                    }
+                    if m.manifest.peer_dependencies.is_empty() {
+                        pkg_entry.peer_dependencies = None;
+                    } else {
+                        pkg_entry.peer_dependencies = Some(m.manifest.peer_dependencies.clone());
+                    }
                 }
             }
 
@@ -6079,7 +6248,9 @@ impl Installer {
             dirs_to_remove.insert(format!("node_modules/{pkg}"));
         }
         for pruned in &pruned_nodes {
-            dirs_to_remove.insert(pruned.clone());
+            if pruned.starts_with("node_modules/") {
+                dirs_to_remove.insert(pruned.clone());
+            }
         }
 
         // Sort descending by length so nested subdirectories are deleted before parent directories
@@ -6087,6 +6258,9 @@ impl Installer {
         sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         for rel_dir in sorted_dirs {
+            if !rel_dir.starts_with("node_modules/") {
+                continue;
+            }
             let target_path = loc_base_dir.join(&rel_dir);
             let is_junc = is_junction(&target_path).unwrap_or(false);
             if target_path.exists() || is_junc {
@@ -6415,6 +6589,9 @@ pub struct UninstallOptions {
     pub save_optional: bool,
     pub save_prod: bool,
     pub is_global: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
+    pub workspace_root: bool,
 }
 
 /// Result of an uninstall run.
@@ -6720,6 +6897,14 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
         }
     }
 
+    // Workspace packages and links are entry points
+    for (key, pkg) in &lockfile.packages {
+        if !key.starts_with("node_modules/") || pkg.link == Some(true) {
+            reachable_keys.insert(key.clone());
+            queue.push_back(key.clone());
+        }
+    }
+
     while let Some(current_key) = queue.pop_front() {
         if let Some(pkg) = lockfile.packages.get(&current_key) {
             if pkg.link == Some(true) {
@@ -6779,7 +6964,7 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
     let all_keys: Vec<String> = lockfile.packages.keys().cloned().collect();
 
     for key in all_keys {
-        if !key.is_empty() && !reachable_keys.contains(&key) {
+        if !key.is_empty() && key.starts_with("node_modules/") && !reachable_keys.contains(&key) {
             lockfile.packages.remove(&key);
             pruned.insert(key);
         }

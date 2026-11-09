@@ -158,6 +158,10 @@ pub(crate) enum Commands {
         #[arg(short = 'E', long = "save-exact")]
         save_exact: bool,
 
+        /// Prefix to use before version in package.json (e.g. '^', '~', or '')
+        #[arg(long = "save-prefix")]
+        save_prefix: Option<String>,
+
         /// Save to dependencies
         #[arg(short = 'P', short_alias = 'S', long = "save-prod", alias = "save")]
         save_prod: bool,
@@ -468,6 +472,18 @@ pub(crate) enum Commands {
         /// Remove only from regular dependencies
         #[arg(short = 'P', long = "save-prod", alias = "save")]
         save_prod: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Include workspace root
+        #[arg(long = "include-workspace-root")]
+        workspace_root: bool,
 
         /// Remove from global prefix
         #[arg(short = 'g', long = "global")]
@@ -4198,6 +4214,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             save_dev,
             save_exact,
+            save_prefix,
             save_prod,
             save_optional,
             save_peer,
@@ -4273,6 +4290,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 current_dir.clone()
             };
 
+            let effective_save_prefix = save_prefix
+                .or_else(|| config.get("save-prefix").map(ToString::to_string))
+                .or_else(|| config.get("save_prefix").map(ToString::to_string));
+
             let options = InstallOptions {
                 project_dir: target_dir,
                 is_global: global,
@@ -4290,6 +4311,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 strict_peer_deps,
                 save_dev,
                 save_exact,
+                save_prefix: effective_save_prefix,
                 save_prod,
                 save_optional,
                 save_peer,
@@ -4731,6 +4753,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_prod,
             global,
             prefix,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
             let is_global = global || prefix.is_some();
             let target_dir = if let Some(p) = prefix {
@@ -4756,6 +4781,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_optional,
                 save_prod,
                 is_global,
+                workspace,
+                workspaces,
+                workspace_root,
             };
             let summary = installer.uninstall(&uninstall_options)?;
             println!(

@@ -1326,6 +1326,7 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             save_prod: false,
             save_optional: false,
             save_peer: false,
+            save_prefix: None,
             no_save: false,
             package_lock_only: false,
             global: false,
