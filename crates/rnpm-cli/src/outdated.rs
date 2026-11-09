@@ -270,16 +270,27 @@ pub async fn run_outdated_inner(
         }
     }
 
-    let client = RegistryClient::with_config(client_config)
-        .map_err(|e| anyhow::anyhow!("Failed to initialize registry client: {e}"))?;
+    let client = std::sync::Arc::new(
+        RegistryClient::with_config(client_config)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize registry client: {e}"))?,
+    );
 
-    // 5. Fetch packument metadata and determine wanted / latest
-    let mut outdated_packages: Vec<OutdatedPackage> = Vec::new();
+    // 5. Fetch packument metadata concurrently and determine wanted / latest
+    let mut join_set = tokio::task::JoinSet::new();
 
     for (dep, current, homepage) in installed_info {
-        let packument = client
-            .get_package_metadata(&dep.name)
-            .await
+        let client_clone = client.clone();
+        join_set.spawn(async move {
+            let res = client_clone.get_package_metadata(&dep.name).await;
+            (dep, current, homepage, res)
+        });
+    }
+
+    let mut outdated_packages: Vec<OutdatedPackage> = Vec::new();
+
+    while let Some(res) = join_set.join_next().await {
+        let (dep, current, homepage, packument_res) = res?;
+        let packument = packument_res
             .map_err(|e| anyhow::anyhow!("Failed to fetch metadata for {}: {e}", dep.name))?;
 
         let (wanted, latest) = resolve_wanted_and_latest(
