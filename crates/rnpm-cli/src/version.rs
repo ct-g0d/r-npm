@@ -224,10 +224,11 @@ async fn execute_version_bump(
             serde_json::Value::String(new_version.clone()),
         );
     }
-    let mut formatted_pkg = serde_json::to_string_pretty(&pkg_json)?;
-    formatted_pkg.push('\n');
+    let format = rnpm_core::manifest::ManifestFormat::detect(&pkg_content);
+    let formatted_pkg = rnpm_core::manifest::Manifest::format_json_value(&pkg_json, &format)?;
     std::fs::write(&pkg_path, formatted_pkg)
         .with_context(|| format!("Failed to write {}", pkg_path.display()))?;
+
 
     for lock_name in &["package-lock.json", "npm-shrinkwrap.json"] {
         let lock_path = project_dir.join(lock_name);

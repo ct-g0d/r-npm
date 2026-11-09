@@ -2,6 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+use crate::manifest::{Manifest, ManifestFormat};
+
 /// Represents a single segment in a package manifest property path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathSegment {
@@ -756,9 +758,9 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
         set_value(&mut root, &segments, val)?;
     }
 
-    let mut formatted = serde_json::to_string_pretty(&root)
+    let format = ManifestFormat::detect(&content);
+    let formatted = Manifest::format_json_value(&root, &format)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
-    formatted.push('\n');
     std::fs::write(&resolved_path, formatted).map_err(|e| {
         anyhow!(
             "Failed to write manifest at '{}': {}",
@@ -770,11 +772,11 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Deletes specified properties from `package.json` at `manifest_path`.
+/// Deletes specified properties from `package.json` at `manifest_path``.
 ///
 /// Multiple array index deletions targeting the same array container are sorted descending
 /// so element shifting does not alter remaining deletion targets.
-/// The resulting JSON is persisted with 2 spaces indentation and a trailing newline (`\n`).
+/// The resulting JSON is persisted preserving original formatting (indentation, newlines).
 pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
     let resolved_path = resolve_manifest_path(manifest_path);
     let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
@@ -824,9 +826,9 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
         delete_value(&mut root, &segments);
     }
 
-    let mut formatted = serde_json::to_string_pretty(&root)
+    let format = ManifestFormat::detect(&content);
+    let formatted = Manifest::format_json_value(&root, &format)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
-    formatted.push('\n');
     std::fs::write(&resolved_path, formatted).map_err(|e| {
         anyhow!(
             "Failed to write manifest at '{}': {}",
@@ -837,3 +839,4 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
 
     Ok(())
 }
+
