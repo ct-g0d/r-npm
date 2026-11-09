@@ -1183,12 +1183,7 @@ impl LockfileV3 {
 
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
         if pkg.link == Some(true) {
-            if let Ok(target) = PackageTarget::parse(spec) {
-                match target {
-                    PackageTarget::File(_) | PackageTarget::Workspace(_) => return true,
-                    _ => {}
-                }
-            }
+            return true;
         }
         let Some(ref ver_str) = pkg.version else {
             return false;
@@ -1408,7 +1403,7 @@ impl LockfileV3 {
             0,
             &mut out,
         );
-        if format.trailing_newline && !out.ends_with('\n') {
+        if !out.ends_with('\n') {
             out.push('\n');
         }
         let final_json = if format.newline == "\r\n" {
@@ -1460,7 +1455,7 @@ impl LockfileV3 {
                     0,
                     &mut out,
                 );
-                if format.trailing_newline && !out.ends_with('\n') {
+                if !out.ends_with('\n') {
                     out.push('\n');
                 }
                 let final_json = if format.newline == "\r\n" {
