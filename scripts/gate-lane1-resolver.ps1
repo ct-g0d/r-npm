@@ -653,15 +653,21 @@ try {
             if (-not $SkipNpm) {
                 $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $actualNpmWarmRuns
             } else {
-                $resNpmWarm = @{ Times = @(); Median = 12399 }
+                $resNpmWarm = $null
             }
 
             Write-Host "`n  === Warm Speed Summary ===" -ForegroundColor Cyan
-            Write-Host ("  WARM Cache:`n    HEAD ({0} runs):    {1} ms`n    79a19fd ({0} runs): {2} ms`n    npm ({3} runs):     {4} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $actualNpmWarmRuns, $resNpmWarm.Median) -ForegroundColor White
+            if ($resNpmWarm -ne $null) {
+                Write-Host ("  WARM Cache:`n    HEAD ({0} runs):    {1} ms`n    79a19fd ({0} runs): {2} ms`n    npm ({3} runs):     {4} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $actualNpmWarmRuns, $resNpmWarm.Median) -ForegroundColor White
+            } else {
+                Write-Host ("  WARM Cache:`n    HEAD ({0} runs):    {1} ms`n    79a19fd ({0} runs): {2} ms`n    npm:               NOT MEASURED" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median) -ForegroundColor White
+            }
             $warmVs79 = [math]::Round($resHeadWarm.Median / [math]::Max($res79Warm.Median, 1), 3)
-            $warmVsNpm = [math]::Round($resNpmWarm.Median / [math]::Max($resHeadWarm.Median, 1), 2)
             Write-Host "    HEAD vs 79a19fd ratio: ${warmVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
-            Write-Host "    HEAD vs npm speedup:   ${warmVsNpm}x (target >= 2.0x, lanes 4/5 fetch/materialize domain)" -ForegroundColor Cyan
+            if ($resNpmWarm -ne $null) {
+                $warmVsNpm = [math]::Round($resNpmWarm.Median / [math]::Max($resHeadWarm.Median, 1), 2)
+                Write-Host "    HEAD vs npm speedup:   ${warmVsNpm}x (target >= 2.0x, lanes 4/5 fetch/materialize domain)" -ForegroundColor Cyan
+            }
 
             $warmNonRegression = $resHeadWarm.Median -le ($res79Warm.Median * 1.05)
             if (-not $warmNonRegression) {
