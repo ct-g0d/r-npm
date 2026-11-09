@@ -1,7 +1,8 @@
 param(
-    [switch]$SkipCargo = $false,
-    [switch]$SkipParity = $false,
-    [switch]$KeepTemp = $false
+    [switch]$SkipCargo = $true,
+    [switch]$SkipParity = $true,
+    [switch]$KeepTemp = $false,
+    [switch]$SelfTest = $false
 )
 
 $ErrorActionPreference = "Continue"
@@ -18,10 +19,14 @@ Write-Host "====================================================" -ForegroundCol
 Write-Host " LANE 2 GATE: Manifest, Save Specs, Workspaces, CI, LS" -ForegroundColor Cyan
 Write-Host " npm version:  $npmVer" -ForegroundColor Cyan
 Write-Host " rnpm binary:  $rnpmBin" -ForegroundColor Cyan
+if ($SelfTest) {
+    Write-Host " [MODE] SelfTest active: deliberate corruption will be introduced" -ForegroundColor Magenta
+}
 Write-Host "====================================================" -ForegroundColor Cyan
 
 $allPass = $true
 $testResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:selfTestTriggered = $false
 
 function Record-Result {
     param([string]$Gate, [string]$Name, [bool]$Passed, [string]$Details = "")
@@ -39,6 +44,16 @@ function Record-Result {
     }
 }
 
+function Assert-ValidJson([string]$JsonStr, [string]$Name) {
+    try {
+        $clean = $JsonStr.TrimStart([char]0xFEFF)
+        $null = ConvertFrom-Json $clean -ErrorAction Stop
+    } catch {
+        Write-Error "FATAL: Fixture '$Name' is INVALID JSON: $_"
+        exit 1
+    }
+}
+
 # ==============================================================================
 # GATE 1: Package.json formatting fidelity & save specs (byte-identical to npm)
 # ==============================================================================
@@ -49,8 +64,11 @@ function Test-ManifestFidelity {
         [string]$Name,
         [string]$InitialJson,
         [string[]]$NpmArgs,
-        [string[]]$RnpmArgs
+        [string[]]$RnpmArgs,
+        [bool]$ExpectModified = $true
     )
+
+    Assert-ValidJson -JsonStr $InitialJson -Name $Name
 
     $tempBase = Join-Path $env:TEMP ("gate2-fid-" + [Guid]::NewGuid().ToString("N"))
     $npmDir = Join-Path $tempBase "npm"
@@ -59,26 +77,44 @@ function Test-ManifestFidelity {
     New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
 
     try {
-        [System.IO.File]::WriteAllBytes((Join-Path $npmDir "package.json"), [System.Text.Encoding]::UTF8.GetBytes($InitialJson))
-        [System.IO.File]::WriteAllBytes((Join-Path $rnpmDir "package.json"), [System.Text.Encoding]::UTF8.GetBytes($InitialJson))
+        $initBytes = [System.Text.Encoding]::UTF8.GetBytes($InitialJson)
+        [System.IO.File]::WriteAllBytes((Join-Path $npmDir "package.json"), $initBytes)
+        [System.IO.File]::WriteAllBytes((Join-Path $rnpmDir "package.json"), $initBytes)
 
         Push-Location $npmDir
         & npm.cmd @NpmArgs 2>&1 | Out-Null
+        $npmExit = $LASTEXITCODE
         Pop-Location
 
         Push-Location $rnpmDir
         & $rnpmBin @RnpmArgs 2>&1 | Out-Null
+        $rnpmExit = $LASTEXITCODE
         Pop-Location
 
         $bytesNpm = [System.IO.File]::ReadAllBytes((Join-Path $npmDir "package.json"))
         $bytesRnpm = [System.IO.File]::ReadAllBytes((Join-Path $rnpmDir "package.json"))
 
+        if ($SelfTest -and -not $script:selfTestTriggered) {
+            $script:selfTestTriggered = $true
+            # Deliberately flip the first byte of rnpm's output to verify gate detects corruption
+            $bytesRnpm[0] = [byte]($bytesRnpm[0] -bxor 0xFF)
+        }
+
+        # Assert exit codes
+        $exitSuccess = ($npmExit -eq 0 -and $rnpmExit -eq 0)
+
+        # Assert byte match
         $strNpm = [System.Text.Encoding]::UTF8.GetString($bytesNpm)
         $strRnpm = [System.Text.Encoding]::UTF8.GetString($bytesRnpm)
-
         $match = ($strNpm -eq $strRnpm)
-        $details = if ($match) { "Byte-identical ($($bytesNpm.Length) bytes)" } else { "Mismatch! npm: $($bytesNpm.Length) bytes, rnpm: $($bytesRnpm.Length) bytes" }
-        Record-Result -Gate "Gate 1: Fidelity" -Name $Name -Passed $match -Details $details
+
+        # Assert modification if expected (content changed vs input)
+        $npmModified = -not [System.Linq.Enumerable]::SequenceEqual($bytesNpm, $initBytes)
+        $modSuccess = if ($ExpectModified) { $npmModified } else { -not $npmModified }
+
+        $passed = $exitSuccess -and $match -and $modSuccess
+        $details = "npm exit: $npmExit, rnpm exit: $rnpmExit, in: $($initBytes.Length) B, npm: $($bytesNpm.Length) B, rnpm: $($bytesRnpm.Length) B, modified: $npmModified, match: $match"
+        Record-Result -Gate "Gate 1: Fidelity" -Name $Name -Passed $passed -Details $details
     } finally {
         if (-not $KeepTemp) {
             Remove-Item -Recurse -Force $tempBase -ErrorAction SilentlyContinue
@@ -86,36 +122,75 @@ function Test-ManifestFidelity {
     }
 }
 
-$crlf4 = "{\r\n    `"version`": `"1.0.0`",\r\n    `"name`": `"test-crlf`",\r\n    `"private`": true\r\n}\r\n"
+$crlf = [string][char]13 + [string][char]10
+$lf = [string][char]10
+$tab = [string][char]9
+
+$crlf4 = "{" + $crlf +
+    "    `"version`": `"1.0.0`"," + $crlf +
+    "    `"name`": `"test-crlf`"," + $crlf +
+    "    `"private`": true" + $crlf +
+    "}" + $crlf
+
 Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 (^ save)" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
 Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7.0.0 --save-exact" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7.0.0", "--save-exact") -RnpmArgs @("install", "is-number@7.0.0", "--save-exact")
 Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 --save-dev" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7", "--save-dev") -RnpmArgs @("install", "is-number@7", "--save-dev")
 Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 --save-optional" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7", "--save-optional") -RnpmArgs @("install", "is-number@7", "--save-optional")
 Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 --save-peer" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7", "--save-peer") -RnpmArgs @("install", "is-number@7", "--save-peer")
-Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 --no-save" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7", "--no-save") -RnpmArgs @("install", "is-number@7", "--no-save")
+Test-ManifestFidelity -Name "CRLF 4-space: install is-number@7 --no-save" -InitialJson $crlf4 -NpmArgs @("install", "is-number@7", "--no-save") -RnpmArgs @("install", "is-number@7", "--no-save") -ExpectModified $false
 
-$lfTab = "{\n\t`"name`": `"test-tab`",\n\t`"version`": `"1.0.0`"\n}\n"
+$lfTab = "{" + $lf +
+    $tab + "`"name`": `"test-tab`"," + $lf +
+    $tab + "`"version`": `"1.0.0`"" + $lf +
+    "}" + $lf
 Test-ManifestFidelity -Name "LF tab: install is-number@7" -InitialJson $lfTab -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
 
-$lf2 = "{\n  `"name`": `"test-lf2`",\n  `"version`": `"1.0.0`"\n}\n"
+$lf2 = "{" + $lf +
+    "  `"name`": `"test-lf2`"," + $lf +
+    "  `"version`": `"1.0.0`"" + $lf +
+    "}" + $lf
 Test-ManifestFidelity -Name "LF 2-space: install is-number@7" -InitialJson $lf2 -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
 
-$withDep = "{\r\n    `"name`": `"test-un`",\r\n    `"version`": `"1.0.0`",\r\n    `"dependencies`": {\r\n        `"is-number`": `"^7.0.0`"\r\n    }\r\n}\r\n"
+$withDep = "{" + $crlf +
+    "    `"name`": `"test-un`"," + $crlf +
+    "    `"version`": `"1.0.0`"," + $crlf +
+    "    `"dependencies`": {" + $crlf +
+    "        `"is-number`": `"^7.0.0`"" + $crlf +
+    "    }" + $crlf +
+    "}" + $crlf
 Test-ManifestFidelity -Name "CRLF 4-space: uninstall is-number" -InitialJson $withDep -NpmArgs @("uninstall", "is-number") -RnpmArgs @("uninstall", "is-number")
 
-$noNl = "{\n  `"name`": `"test-nonl`",\n  `"version`": `"1.0.0`"\n}"
+$noNl = "{" + $lf +
+    "  `"name`": `"test-nonl`"," + $lf +
+    "  `"version`": `"1.0.0`"" + $lf +
+    "}"
 Test-ManifestFidelity -Name "No trailing newline: install is-number@7" -InitialJson $noNl -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
 
-$bomJson = [System.Text.Encoding]::UTF8.GetString([byte[]]@(0xEF, 0xBB, 0xBF)) + "{\n  `"name`": `"test-bom`",\n  `"version`": `"1.0.0`"\n}\n"
+$bomJson = [System.Text.Encoding]::UTF8.GetString([byte[]]@(0xEF, 0xBB, 0xBF)) + "{" + $lf +
+    "  `"name`": `"test-bom`"," + $lf +
+    "  `"version`": `"1.0.0`"" + $lf +
+    "}" + $lf
 Test-ManifestFidelity -Name "UTF-8 BOM preservation: install is-number@7" -InitialJson $bomJson -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
 
-$verJson = "{\n  `"name`": `"test-ver`",\n  `"version`": `"1.0.0`"\n}\n"
+$verJson = "{" + $lf +
+    "  `"name`": `"test-ver`"," + $lf +
+    "  `"version`": `"1.0.0`"" + $lf +
+    "}" + $lf
 Test-ManifestFidelity -Name "npm version patch byte fidelity" -InitialJson $verJson -NpmArgs @("version", "patch", "--no-git-tag-version") -RnpmArgs @("version", "patch", "--no-git-tag-version")
 
-$pkgJson = "{\n  `"name`": `"test-pkg`",\n  `"version`": `"1.0.0`"\n}\n"
-Test-ManifestFidelity -Name "npm pkg set byte fidelity" -InitialJson $pkgJson -NpmArgs @("pkg", "set", "scripts.test=echo 1") -RnpmArgs @("pkg", "set", "scripts.test=echo 1")
+$pkgJson = "{" + $lf +
+    "  `"name`": `"test-pkg`"," + $lf +
+    "  `"version`": `"1.0.0`"" + $lf +
+    "}" + $lf
+Test-ManifestFidelity -Name "npm pkg set byte fidelity" -InitialJson $pkgJson -NpmArgs @("pkg", "set", "scripts.test=test") -RnpmArgs @("pkg", "set", "scripts.test=test")
 
-$pkgDelJson = "{\n  `"name`": `"test-pkg`",\n  `"version`": `"1.0.0`",\n  `"scripts`": {\n    `"test`": `"echo 1`"\n  }\n}\n"
+$pkgDelJson = "{" + $lf +
+    "  `"name`": `"test-pkg`"," + $lf +
+    "  `"version`": `"1.0.0`"," + $lf +
+    "  `"scripts`": {" + $lf +
+    "    `"test`": `"echo 1`"" + $lf +
+    "  }" + $lf +
+    "}" + $lf
 Test-ManifestFidelity -Name "npm pkg delete byte fidelity" -InitialJson $pkgDelJson -NpmArgs @("pkg", "delete", "scripts.test") -RnpmArgs @("pkg", "delete", "scripts.test")
 
 # ==============================================================================
@@ -145,9 +220,9 @@ function Test-WorkspaceParity {
             name = "b"
             version = "1.0.0"
         } | ConvertTo-Json
-        Set-Content (Join-Path $targetDir "package.json") $rootPkg
-        Set-Content (Join-Path $targetDir "packages\a\package.json") $pkgA
-        Set-Content (Join-Path $targetDir "packages\b\package.json") $pkgB
+        Set-Content (Join-Path $targetDir "package.json") ($rootPkg + "`n")
+        Set-Content (Join-Path $targetDir "packages\a\package.json") ($pkgA + "`n")
+        Set-Content (Join-Path $targetDir "packages\b\package.json") ($pkgB + "`n")
     }
 
     function Diff-LockfilePackages([string]$dir1, [string]$dir2) {
@@ -174,10 +249,12 @@ try {
         # 1. install is-number@7 -w a
         Push-Location $npmDir
         & npm.cmd install is-number@7 -w a 2>&1 | Out-Null
+        $npmExit1 = $LASTEXITCODE
         Pop-Location
 
         Push-Location $rnpmDir
         & $rnpmBin install is-number@7 -w a 2>&1 | Out-Null
+        $rnpmExit1 = $LASTEXITCODE
         Pop-Location
 
         $aNpm = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\a\package.json"))
@@ -185,74 +262,127 @@ try {
         $rootNpm = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
         $rootRnpm = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
 
-        $matchA = ($aNpm -eq $aRnpm)
-        $matchRoot = ($rootNpm -eq $rootRnpm)
+        $lockBytesNpm1 = [System.IO.File]::ReadAllBytes((Join-Path $npmDir "package-lock.json"))
+        $lockBytesRnpm1 = [System.IO.File]::ReadAllBytes((Join-Path $rnpmDir "package-lock.json"))
+        $lockByteMatch1 = [System.Linq.Enumerable]::SequenceEqual($lockBytesNpm1, $lockBytesRnpm1)
         $diffPkgs1 = Diff-LockfilePackages $npmDir $rnpmDir
 
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (member package.json byte match)" -Passed $matchA -Details "packages/a/package.json match: $matchA"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (root package.json untouched byte match)" -Passed $matchRoot -Details "root package.json match: $matchRoot"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (full lockfile packages section deep equality)" -Passed $diffPkgs1 -Details "full packages diff equal: $diffPkgs1"
+        $matchA1 = ($aNpm -eq $aRnpm)
+        $matchRoot1 = ($rootNpm -eq $rootRnpm)
+        $exitSuccess1 = ($npmExit1 -eq 0 -and $rnpmExit1 -eq 0)
+
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (member package.json byte match)" -Passed ($exitSuccess1 -and $matchA1) -Details "packages/a/package.json match: $matchA1 (npm exit: $npmExit1, rnpm exit: $rnpmExit1)"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (root package.json untouched byte match)" -Passed ($exitSuccess1 -and $matchRoot1) -Details "root package.json match: $matchRoot1"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (full lockfile byte-for-byte identical)" -Passed ($exitSuccess1 -and $lockByteMatch1) -Details "npm lock: $($lockBytesNpm1.Length) B, rnpm lock: $($lockBytesRnpm1.Length) B, byte match: $lockByteMatch1"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (full lockfile packages section deep equality)" -Passed ($exitSuccess1 -and $diffPkgs1) -Details "full packages diff equal: $diffPkgs1"
 
         # 2. uninstall is-number -w a
         Push-Location $npmDir
         & npm.cmd uninstall is-number -w a 2>&1 | Out-Null
+        $npmExit2 = $LASTEXITCODE
         Pop-Location
 
         Push-Location $rnpmDir
         & $rnpmBin uninstall is-number -w a 2>&1 | Out-Null
+        $rnpmExit2 = $LASTEXITCODE
         Pop-Location
 
         $aNpmUn = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\a\package.json"))
         $aRnpmUn = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\a\package.json"))
         $rootNpmUn = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
         $rootRnpmUn = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
+
+        $lockBytesNpm2 = [System.IO.File]::ReadAllBytes((Join-Path $npmDir "package-lock.json"))
+        $lockBytesRnpm2 = [System.IO.File]::ReadAllBytes((Join-Path $rnpmDir "package-lock.json"))
+        $lockByteMatch2 = [System.Linq.Enumerable]::SequenceEqual($lockBytesNpm2, $lockBytesRnpm2)
         $diffPkgs2 = Diff-LockfilePackages $npmDir $rnpmDir
 
         $matchUnA = ($aNpmUn -eq $aRnpmUn)
         $matchUnRoot = ($rootNpmUn -eq $rootRnpmUn)
-        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (member package.json byte match)" -Passed $matchUnA -Details "packages/a/package.json match after uninstall: $matchUnA"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (root package.json untouched byte match)" -Passed $matchUnRoot -Details "root package.json match after uninstall: $matchUnRoot"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (full lockfile packages section deep equality)" -Passed $diffPkgs2 -Details "full packages diff equal: $diffPkgs2"
+        $exitSuccess2 = ($npmExit2 -eq 0 -and $rnpmExit2 -eq 0)
 
-        # 3. install is-number@7 --workspaces
-        Push-Location $npmDir
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (member package.json byte match)" -Passed ($exitSuccess2 -and $matchUnA) -Details "packages/a/package.json match after uninstall: $matchUnA (npm exit: $npmExit2, rnpm exit: $rnpmExit2)"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (root package.json untouched byte match)" -Passed ($exitSuccess2 -and $matchUnRoot) -Details "root package.json match after uninstall: $matchUnRoot"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (full lockfile byte-for-byte identical)" -Passed ($exitSuccess2 -and $lockByteMatch2) -Details "npm lock: $($lockBytesNpm2.Length) B, rnpm lock: $($lockBytesRnpm2.Length) B, byte match: $lockByteMatch2"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (full lockfile packages section deep equality)" -Passed ($exitSuccess2 -and $diffPkgs2) -Details "full packages diff equal: $diffPkgs2"
+
+        # 3. install is-number@7 --workspaces (in fresh workspace trees)
+        $tempBase3 = Join-Path $env:TEMP ("gate2-ws3-" + [Guid]::NewGuid().ToString("N"))
+        $npmDir3 = Join-Path $tempBase3 "npm"
+        $rnpmDir3 = Join-Path $tempBase3 "rnpm"
+        Setup-WsTree $npmDir3
+        Setup-WsTree $rnpmDir3
+
+        Push-Location $npmDir3
         & npm.cmd install is-number@7 --workspaces 2>&1 | Out-Null
+        $npmExit3 = $LASTEXITCODE
         Pop-Location
 
-        Push-Location $rnpmDir
+        Push-Location $rnpmDir3
         & $rnpmBin install is-number@7 --workspaces 2>&1 | Out-Null
+        $rnpmExit3 = $LASTEXITCODE
         Pop-Location
 
-        $aNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\a\package.json"))
-        $aRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\a\package.json"))
-        $bNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\b\package.json"))
-        $bRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\b\package.json"))
-        $rootNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
-        $rootRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
-        $diffPkgs3 = Diff-LockfilePackages $npmDir $rnpmDir
+        $aNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir3 "packages\a\package.json"))
+        $aRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir3 "packages\a\package.json"))
+        $bNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir3 "packages\b\package.json"))
+        $bRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir3 "packages\b\package.json"))
+        $rootNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir3 "package.json"))
+        $rootRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir3 "package.json"))
+
+        $lockBytesNpm3 = [System.IO.File]::ReadAllBytes((Join-Path $npmDir3 "package-lock.json"))
+        $lockBytesRnpm3 = [System.IO.File]::ReadAllBytes((Join-Path $rnpmDir3 "package-lock.json"))
+        $lockByteMatch3 = [System.Linq.Enumerable]::SequenceEqual($lockBytesNpm3, $lockBytesRnpm3)
+        $diffPkgs3 = Diff-LockfilePackages $npmDir3 $rnpmDir3
 
         $matchAllWs = ($aNpmWs -eq $aRnpmWs) -and ($bNpmWs -eq $bRnpmWs)
         $matchWsRoot = ($rootNpmWs -eq $rootRnpmWs)
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (all members byte match)" -Passed $matchAllWs -Details "a match: $($aNpmWs -eq $aRnpmWs), b match: $($bNpmWs -eq $bRnpmWs)"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (root package.json byte match)" -Passed $matchWsRoot -Details "root package.json match: $matchWsRoot"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (full lockfile packages section deep equality)" -Passed $diffPkgs3 -Details "full packages diff equal: $diffPkgs3"
+        $exitSuccess3 = ($npmExit3 -eq 0 -and $rnpmExit3 -eq 0)
 
-        # 4. install is-number@7 --include-workspace-root
-        Push-Location $npmDir
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (all members byte match)" -Passed ($exitSuccess3 -and $matchAllWs) -Details "a match: $($aNpmWs -eq $aRnpmWs), b match: $($bNpmWs -eq $bRnpmWs) (npm exit: $npmExit3, rnpm exit: $rnpmExit3)"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (root package.json byte match)" -Passed ($exitSuccess3 -and $matchWsRoot) -Details "root package.json match: $matchWsRoot"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (full lockfile byte-for-byte identical)" -Passed ($exitSuccess3 -and $lockByteMatch3) -Details "npm lock: $($lockBytesNpm3.Length) B, rnpm lock: $($lockBytesRnpm3.Length) B, byte match: $lockByteMatch3"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (full lockfile packages section deep equality)" -Passed ($exitSuccess3 -and $diffPkgs3) -Details "full packages diff equal: $diffPkgs3"
+
+        if (-not $KeepTemp) {
+            Remove-Item -Recurse -Force $tempBase3 -ErrorAction SilentlyContinue
+        }
+
+        # 4. install is-number@7 --include-workspace-root (in fresh workspace trees)
+        $tempBase4 = Join-Path $env:TEMP ("gate2-ws4-" + [Guid]::NewGuid().ToString("N"))
+        $npmDir4 = Join-Path $tempBase4 "npm"
+        $rnpmDir4 = Join-Path $tempBase4 "rnpm"
+        Setup-WsTree $npmDir4
+        Setup-WsTree $rnpmDir4
+
+        Push-Location $npmDir4
         & npm.cmd install is-number@7 --include-workspace-root 2>&1 | Out-Null
+        $npmExit4 = $LASTEXITCODE
         Pop-Location
 
-        Push-Location $rnpmDir
+        Push-Location $rnpmDir4
         & $rnpmBin install is-number@7 --include-workspace-root 2>&1 | Out-Null
+        $rnpmExit4 = $LASTEXITCODE
         Pop-Location
 
-        $rootNpmInc = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
-        $rootRnpmInc = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
-        $diffPkgs4 = Diff-LockfilePackages $npmDir $rnpmDir
-        $matchIncRoot = ($rootNpmInc -eq $rootRnpmInc)
+        $rootNpmInc = [System.IO.File]::ReadAllText((Join-Path $npmDir4 "package.json"))
+        $rootRnpmInc = [System.IO.File]::ReadAllText((Join-Path $rnpmDir4 "package.json"))
 
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (root package.json byte match)" -Passed $matchIncRoot -Details "root package.json match: $matchIncRoot"
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (full lockfile packages section deep equality)" -Passed $diffPkgs4 -Details "full packages diff equal: $diffPkgs4"
+        $lockBytesNpm4 = [System.IO.File]::ReadAllBytes((Join-Path $npmDir4 "package-lock.json"))
+        $lockBytesRnpm4 = [System.IO.File]::ReadAllBytes((Join-Path $rnpmDir4 "package-lock.json"))
+        $lockByteMatch4 = [System.Linq.Enumerable]::SequenceEqual($lockBytesNpm4, $lockBytesRnpm4)
+        $diffPkgs4 = Diff-LockfilePackages $npmDir4 $rnpmDir4
+
+        $matchIncRoot = ($rootNpmInc -eq $rootRnpmInc)
+        $exitSuccess4 = ($npmExit4 -eq 0 -and $rnpmExit4 -eq 0)
+
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (root package.json byte match)" -Passed ($exitSuccess4 -and $matchIncRoot) -Details "root package.json match: $matchIncRoot (npm exit: $npmExit4, rnpm exit: $rnpmExit4)"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (full lockfile byte-for-byte identical)" -Passed ($exitSuccess4 -and $lockByteMatch4) -Details "npm lock: $($lockBytesNpm4.Length) B, rnpm lock: $($lockBytesRnpm4.Length) B, byte match: $lockByteMatch4"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (full lockfile packages section deep equality)" -Passed ($exitSuccess4 -and $diffPkgs4) -Details "full packages diff equal: $diffPkgs4"
+
+        if (-not $KeepTemp) {
+            Remove-Item -Recurse -Force $tempBase4 -ErrorAction SilentlyContinue
+        }
 
     } finally {
         if (-not $KeepTemp) {
@@ -263,9 +393,9 @@ try {
 Test-WorkspaceParity
 
 # ==============================================================================
-# GATE 3: CI Lockfile validation (exact vs range and mismatch)
+# GATE 3: CI Lockfile validation parity vs npm across drift scenarios
 # ==============================================================================
-Write-Host "`n>>> GATE 3: CI lockfile validation <<<" -ForegroundColor Yellow
+Write-Host "`n>>> GATE 3: CI lockfile validation parity <<<" -ForegroundColor Yellow
 
 function Test-CiScenarioParity {
     param(
@@ -294,7 +424,7 @@ function Test-CiScenarioParity {
         Pop-Location
 
         $passed = ($npmCode -eq 0 -and $rnpmCode -eq 0) -or ($npmCode -ne 0 -and $rnpmCode -ne 0)
-        Record-Result -Gate "Gate 3: CI" -Name $Name -Passed $passed -Details "npm: $npmCode, rnpm: $rnpmCode"
+        Record-Result -Gate "Gate 3: CI" -Name $Name -Passed $passed -Details "npm exit: $npmCode, rnpm exit: $rnpmCode"
     } finally {
         if (-not $KeepTemp) {
             Remove-Item -Recurse -Force $tempBase -ErrorAction SilentlyContinue
@@ -302,10 +432,20 @@ function Test-CiScenarioParity {
     }
 }
 
-Test-CiScenarioParity -Name "CI: 1. exact package.json vs range lockfile (exit 0)" -SetupBlock {
+# 1a. Lockfile root has range "^7.0.0" (locked 7.0.0), package.json rewritten to exact "7.0.0"
+Test-CiScenarioParity -Name "CI: 1a. exact package.json (7.0.0) vs range lockfile (^7.0.0) exits 0" -SetupBlock {
     param($dir)
     Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
     Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"7.0.0"}}'
+}
+
+# 1b. Lockfile root has exact "7.0.0" (locked 7.0.0), package.json rewritten to range "^7.0.0"
+Test-CiScenarioParity -Name "CI: 1b. range package.json (^7.0.0) vs exact lockfile (7.0.0) exits 0" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
 }
 
 Test-CiScenarioParity -Name "CI: 2. incompatible version mismatch (exit non-zero)" -SetupBlock {
@@ -417,9 +557,9 @@ function Test-LsParity {
 Test-LsParity
 
 # ==============================================================================
-# GATE 5: Speed benchmarks (no-op install >= 3x, ls >= 2x)
+# GATE 5: Speed benchmarks (5 runs with 1 warmup discarded, true median, warm cache)
 # ==============================================================================
-Write-Host "`n>>> GATE 5: Speed benchmarks <<<" -ForegroundColor Yellow
+Write-Host "`n>>> GATE 5: Speed benchmarks (5 runs, 1 warmup discarded, true median) <<<" -ForegroundColor Yellow
 
 function Get-Median([double[]]$Values) {
     $sorted = $Values | Sort-Object
@@ -443,24 +583,21 @@ function Test-SpeedBenchmarks {
         & $rnpmBin ci 2>&1 | Out-Null
 
         # No-op install measurement: 6 runs (run 0 warmup, runs 1-5 measured, true median)
-        # Cache state: npm cache warm (populated local cache environment)
+        # Cache state: npm cache warm (populated local cache environment), alternated runs
         $rnpmInstallTimes = @()
-        for ($i = 0; $i -lt 6; $i++) {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $rnpmBin install 2>&1 | Out-Null
-            $sw.Stop()
-            if ($i -gt 0) {
-                $rnpmInstallTimes += $sw.Elapsed.TotalMilliseconds
-            }
-        }
-
         $npmInstallTimes = @()
         for ($i = 0; $i -lt 6; $i++) {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $sw1 = [System.Diagnostics.Stopwatch]::StartNew()
+            & $rnpmBin install 2>&1 | Out-Null
+            $sw1.Stop()
+
+            $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
             & npm.cmd install 2>&1 | Out-Null
-            $sw.Stop()
+            $sw2.Stop()
+
             if ($i -gt 0) {
-                $npmInstallTimes += $sw.Elapsed.TotalMilliseconds
+                $rnpmInstallTimes += $sw1.Elapsed.TotalMilliseconds
+                $npmInstallTimes += $sw2.Elapsed.TotalMilliseconds
             }
         }
 
@@ -471,24 +608,21 @@ function Test-SpeedBenchmarks {
         $passInstall = ($installRatio -ge 3.0)
         Record-Result -Gate "Gate 5: Speed" -Name "No-op install >= 3x faster than npm (median over 5 runs, warm cache)" -Passed $passInstall -Details ("rnpm: {0:N1}ms, npm: {1:N1}ms -> {2:N2}x faster" -f $rnpmInstallMed, $npmInstallMed, $installRatio)
 
-        # LS measurement: 6 runs (run 0 warmup, runs 1-5 measured, true median)
+        # LS measurement: 6 runs (run 0 warmup, runs 1-5 measured, true median), alternated runs
         $rnpmLsTimes = @()
-        for ($i = 0; $i -lt 6; $i++) {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $rnpmBin ls 2>&1 | Out-Null
-            $sw.Stop()
-            if ($i -gt 0) {
-                $rnpmLsTimes += $sw.Elapsed.TotalMilliseconds
-            }
-        }
-
         $npmLsTimes = @()
         for ($i = 0; $i -lt 6; $i++) {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $sw1 = [System.Diagnostics.Stopwatch]::StartNew()
+            & $rnpmBin ls 2>&1 | Out-Null
+            $sw1.Stop()
+
+            $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
             & npm.cmd ls 2>&1 | Out-Null
-            $sw.Stop()
+            $sw2.Stop()
+
             if ($i -gt 0) {
-                $npmLsTimes += $sw.Elapsed.TotalMilliseconds
+                $rnpmLsTimes += $sw1.Elapsed.TotalMilliseconds
+                $npmLsTimes += $sw2.Elapsed.TotalMilliseconds
             }
         }
 
@@ -552,7 +686,7 @@ $totalCount = $testResults.Count
 foreach ($r in $testResults) {
     $col = if ($r.Passed) { "Green" } else { "Red" }
     $status = if ($r.Passed) { "PASS" } else { "FAIL" }
-    Write-Host ("[{0}] {1,-20} | {2,-45} | {3}" -f $status, $r.Gate, $r.Test, $r.Details) -ForegroundColor $col
+    Write-Host ("[{0}] {1,-20} | {2,-50} | {3}" -f $status, $r.Gate, $r.Test, $r.Details) -ForegroundColor $col
 }
 
 Write-Host "====================================================" -ForegroundColor Cyan
