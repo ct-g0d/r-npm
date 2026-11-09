@@ -550,7 +550,7 @@ console.log(ent ? ent.version || '' : '');
 # ---------------------------------------------------------------
 # Check 5: Speed Non-Regression & Benchmark (project-486 Medians)
 # ---------------------------------------------------------------
-if ($Checks -contains "5") {
+if ($Checks -contains "5" -or $Checks -contains "5w" -or $Checks -contains "5f") {
 Write-Host "`n>>> [Check 5/6] Speed Non-Regression Measurement on project-486 (Warm: $WarmRuns runs, Fresh: $FreshRuns runs)" -ForegroundColor Yellow
 $tmp5 = New-Item -ItemType Directory -Path ([System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString()))
 try {
@@ -608,11 +608,14 @@ try {
         return @{ Times = $times; Median = $med }
     }
 
-    if ($WarmRuns -le 0 -and $FreshRuns -le 0) {
-        Write-Host "  [FAIL] Speed check requires at least 1 run for warm or fresh (provided: Warm=$WarmRuns, Fresh=$FreshRuns)" -ForegroundColor Red
-        $allPassed = $false
+    $runWarm = ($Checks -contains "5" -or $Checks -contains "5w")
+    $runFresh = ($Checks -contains "5" -or $Checks -contains "5f")
+
+    if ((-not $runWarm) -and (-not $runFresh)) {
+        Write-Host "  Speed check skipped." -ForegroundColor Gray
     } else {
-        if ($WarmRuns -gt 0) {
+        if ($runWarm) {
+            if ($WarmRuns -gt 0) {
             # Warm caches setup: seed each in an isolated directory
             Write-Host "  -> Setting up warm caches..."
             $warmCache79 = Join-Path $tmp5.FullName "warm-cache-79"
@@ -675,12 +678,14 @@ try {
             } else {
                 Write-Host "  [PASS] Warm speed non-regression verified (HEAD <= 1.05x 79a19fd)." -ForegroundColor Green
             }
-        } else {
-            Write-Host "  [FAIL] Warm runs count is 0 (NOT RUN)" -ForegroundColor Red
-            $allPassed = $false
+            } else {
+                Write-Host "  [FAIL] Warm runs count is 0 (NOT RUN)" -ForegroundColor Red
+                $allPassed = $false
+            }
         }
 
-        if ($FreshRuns -gt 0) {
+        if ($runFresh) {
+            if ($FreshRuns -gt 0) {
             Write-Host "`n  -> Measuring FRESH empty cache no-lockfile install ($FreshRuns runs each)..."
             $timesHeadFresh = @()
             $times79Fresh = @()
@@ -723,9 +728,10 @@ try {
             if ($freshNonRegression -and $fresh2xPassed) {
                 Write-Host "  [PASS] Fresh speed non-regression and >=2x target verified." -ForegroundColor Green
             }
-        } else {
-            Write-Host "  [FAIL] Fresh runs count is 0 (NOT RUN)" -ForegroundColor Red
-            $allPassed = $false
+            } else {
+                Write-Host "  [FAIL] Fresh runs count is 0 (NOT RUN)" -ForegroundColor Red
+                $allPassed = $false
+            }
         }
     }
 } finally {
