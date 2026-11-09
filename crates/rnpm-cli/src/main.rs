@@ -5084,8 +5084,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         None => std::env::current_dir()?,
     };
 
-    let silent = rnpm_config::Config::load(Some(&current_dir))?
-        .get("loglevel") == Some("silent");
+    let silent =
+        rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
 
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
@@ -5779,7 +5779,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     summary.removed_packages.len(),
                     summary.pruned_dependencies.len()
                 );
-                }
+            }
         }
         Commands::Update {
             packages,
@@ -5837,7 +5837,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if dry_run {
                 let summary = installer.run().await?;
                 if !silent {
-                    println!("rnpm: dry-run: would install {} package(s)", summary.packages_installed);
+                    println!(
+                        "rnpm: dry-run: would install {} package(s)",
+                        summary.packages_installed
+                    );
                 }
                 return Ok(());
             }

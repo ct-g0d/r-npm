@@ -91,7 +91,7 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
     }
 }
 
-/// Recursively collects unique problem lines from a node and its descendants.
+/// Preserve npm's field order without changing serde_json's workspace-wide map type.
 fn ordered_node_json(value: &Value) -> rnpm_core::ordered_json::OrderedJsonValue {
     use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
     let Some(map) = value.as_object() else {
@@ -111,6 +111,7 @@ fn ordered_node_json(value: &Value) -> rnpm_core::ordered_json::OrderedJsonValue
     OrderedJsonValue::Object(ordered)
 }
 
+/// Recursively collects unique problem lines from a node and its descendants.
 fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     for p in &node.problems {
         if seen.insert(p.clone()) {
