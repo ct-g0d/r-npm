@@ -4296,7 +4296,6 @@ impl Installer {
 
         let mut missing_pack_results: HashMap<usize, bool> = HashMap::new();
         let mut failed_optional_indices: HashSet<usize> = HashSet::new();
-        let mut directly_extracted_indices: HashSet<usize> = HashSet::new();
 
         if !missing_packs.is_empty() {
             let semaphore = Arc::clone(&self.io_semaphore);
@@ -4322,25 +4321,6 @@ impl Installer {
                 }));
             }
 
-            let (pack_tx, pack_rx) = std::sync::mpsc::channel::<(String, PathBuf, Vec<rnpm_fs::MaterializeFile>, bool)>();
-            let pack_rx = Arc::new(std::sync::Mutex::new(pack_rx));
-            let pack_store_clone = Arc::clone(&self.pack_store);
-            let mut pack_handles = Vec::with_capacity(2);
-            for _ in 0..2 {
-                let rx = Arc::clone(&pack_rx);
-                let ps = Arc::clone(&pack_store_clone);
-                pack_handles.push(std::thread::spawn(move || {
-                    loop {
-                        let item = {
-                            let Ok(guard) = rx.lock() else { break; };
-                            guard.recv().ok()
-                        };
-                        let Some((integrity, pkg_target, files, populate_cas)) = item else { break; };
-                        let _ = ps.put_package_pack_from_decoded(&integrity, &pkg_target, &files, populate_cas);
-                    }
-                }));
-            }
-
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
                 let sem = Arc::clone(&semaphore);
                 let cpu_sem = Arc::clone(&cpu_semaphore);
@@ -4349,7 +4329,7 @@ impl Installer {
                 let project_dir = loc_base_dir.clone();
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
-                let p_tx = pack_tx.clone();
+                let pack_store = Arc::clone(&self.pack_store);
                 let idx = *idx;
                 let pkg_key = pkg_key.clone();
                 let resolved_url = resolved_url.clone();
@@ -4519,8 +4499,8 @@ impl Installer {
                     let pack_res = tokio::task::spawn_blocking(move || {
                         let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
                             .map_err(|e| anyhow!("{e}"))?;
-                        if idx < 2 && !integrity_str.is_empty() {
-                            let _ = p_tx.send((integrity_str, pkg_target, decoded.files.clone(), true));
+                        if !integrity_str.is_empty() {
+                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, true);
                         }
                         Ok::<rnpm_cache::DecodedPackage, anyhow::Error>(decoded)
                     })
@@ -4544,66 +4524,19 @@ impl Installer {
                 });
             }
 
-            drop(pack_tx);
-
-            let mut all_files = Vec::new();
-            let mut all_dirs = std::collections::BTreeSet::new();
-            all_dirs.insert(node_modules_dir.clone());
-            all_dirs.insert(bin_dir.clone());
-            let mut all_decoded_symlinks = Vec::new();
-
-            let t_decode_start = std::time::Instant::now();
             while let Some(join_res) = join_set.join_next().await {
                 let item_opt =
                     join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
-                if let Some((idx, was_hit, _pkg_k, decoded, blob_opt)) = item_opt {
+                if let Some((idx, was_hit, _pkg_k, _decoded, blob_opt)) = item_opt {
                     missing_pack_results.insert(idx, was_hit);
-                    directly_extracted_indices.insert(idx);
-                    all_dirs.extend(decoded.dirs);
-                    all_files.extend(decoded.files);
-                    all_decoded_symlinks.extend(decoded.symlinks);
                     if let Some(blob) = blob_opt {
                         let _ = blob_tx.send(blob);
                     }
                 }
             }
-            let decode_dur = t_decode_start.elapsed();
             drop(blob_tx);
 
-            let t_mat = std::time::Instant::now();
-            let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
-            precreate_directories(dir_refs)
-                .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
-            let dirs_dur = t_mat.elapsed();
-
-            let t_mat_files = std::time::Instant::now();
-            rnpm_fs::materialize_files_parallel(all_files, &ci_writer_cfg)
-                .map_err(|e| anyhow!("{e}"))?;
-
-            for (link_path, target_path) in all_decoded_symlinks {
-                if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
-                    warn!(
-                        "Failed to create link or copy from '{}' to '{}': {e}",
-                        link_path.display(),
-                        target_path.display()
-                    );
-                }
-            }
-            let mat_dur = t_mat_files.elapsed();
-            collector.record_phase(Phase::Materialize, t_mat.elapsed());
-            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                eprintln!(
-                    "[RNPM_TIMING_DEBUG] decode: {:.2}s, dirs: {:.2}s, materialize: {:.2}s",
-                    decode_dur.as_secs_f64(),
-                    dirs_dur.as_secs_f64(),
-                    mat_dur.as_secs_f64()
-                );
-            }
-
             for h in blob_handles {
-                let _ = h.join();
-            }
-            for h in pack_handles {
                 let _ = h.join();
             }
 
@@ -4626,13 +4559,12 @@ impl Installer {
             }
         }
 
-        let all_packs_available = directly_extracted_indices.len() == packages_to_process.len()
-            || (!packages_to_process.is_empty()
-                && packages_to_process
-                    .iter()
-                    .all(|(_, _, integrity_str, _, _, _)| {
-                        !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
-                    }));
+        let all_packs_available = !packages_to_process.is_empty()
+            && packages_to_process
+                .iter()
+                .all(|(_, _, integrity_str, _, _, _)| {
+                    !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
+                });
 
         let mut used_fast_path = false;
         let mut bin_packages = packages_to_process.clone();
@@ -4648,10 +4580,7 @@ impl Installer {
 
             let mut load_success = true;
 
-            for (i, (pkg_key, _, integrity_str, _, _, _)) in packages_to_process.iter().enumerate() {
-                if directly_extracted_indices.contains(&i) {
-                    continue;
-                }
+            for (pkg_key, _, integrity_str, _, _, _) in packages_to_process.iter() {
                 let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
                     pkg_key.replace('/', "\\")
                 } else {
@@ -4710,7 +4639,7 @@ impl Installer {
                                     None
                                 },
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: false,
+                                source_verified: entry.cas_verified,
                             });
                         } else {
                             warn!(

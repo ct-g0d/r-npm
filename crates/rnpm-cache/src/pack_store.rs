@@ -598,6 +598,10 @@ impl PackStore {
         fs::create_dir_all(root.join("tmp"))?;
         let cas_dir = root.join("cas");
         fs::create_dir_all(&cas_dir)?;
+        for b in 0..=255u8 {
+            let hex_sub = format!("{:02x}", b);
+            let _ = fs::create_dir(cas_dir.join(hex_sub));
+        }
         Ok(Self {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1550,6 +1554,9 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 if end <= pack_bytes.len() {
                     if let Some(ref cas_path) = entry.cas_path {
                         let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                        if let Ok(meta) = cas_path.metadata() {
+                            entry.cas_mtime = mtime_to_timestamp(&meta);
+                        }
                         entry.cas_verified = true;
                     }
                 }
@@ -1568,6 +1575,9 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                         if end <= pack_bytes.len() {
                             if let Some(ref cas_path) = entry.cas_path {
                                 let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                                if let Ok(meta) = cas_path.metadata() {
+                                    entry.cas_mtime = mtime_to_timestamp(&meta);
+                                }
                                 entry.cas_verified = true;
                             }
                         }

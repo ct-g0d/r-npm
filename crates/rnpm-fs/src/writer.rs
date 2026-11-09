@@ -611,6 +611,25 @@ pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> 
 
         if ret == 0 {
             let err = unsafe { GetLastError() };
+            const ERROR_PATH_NOT_FOUND: u32 = 3;
+            if err == ERROR_PATH_NOT_FOUND {
+                if let Some(parent) = destination.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let ret2 = unsafe {
+                    CopyFileExW(
+                        src_wide.as_ptr(),
+                        dst_wide.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if ret2 != 0 {
+                    return Ok(());
+                }
+            }
             Err(std::io::Error::from_raw_os_error(err as i32))
         } else {
             Ok(())
@@ -855,7 +874,7 @@ pub fn materialize_files_parallel_refs<'a>(
                                     true,
                                 );
                             }
-                            if cas_valid && link_or_copy_file(src, &file.path).is_ok() {
+                            if cas_valid && copy_file_fast(src, &file.path).is_ok() {
                                 copied = true;
                                 #[cfg(unix)]
                                 {
