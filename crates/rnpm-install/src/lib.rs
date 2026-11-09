@@ -792,31 +792,30 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             return;
         }
 
-        let client = self.client.clone();
-        let cache = self.cache.clone();
-        let prefer_offline = self.prefer_offline;
-        let to_fetch: Vec<String> = missing
-            .into_iter()
-            .filter(|name| {
-                let reg_url = client.registry_for_package(name).as_str().to_string();
-                if let Ok(Some((entry, _))) =
-                    cache.get_packument_with_accept(&reg_url, name, Some(NPM_INSTALL_V1_JSON))
-                {
-                    if is_packument_fresh(&entry, prefer_offline, false) {
-                        return false;
+        let mut to_fetch: Vec<String> = Vec::new();
+        for name in missing {
+            if let Some((entry, data)) = self.get_cached_packument(&name) {
+                if is_packument_fresh(&entry, self.prefer_offline, false) {
+                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                        let mut meta = abbreviated_to_package_metadata(&abbrev);
+                        self.merge_lockfile_metadata(&name, &mut meta);
+                        if let Ok(mut locked) = self.metadata_cache.lock() {
+                            locked.insert(name, meta);
+                        }
+                        continue;
                     }
                 }
-                true
-            })
-            .collect();
+            }
+            to_fetch.push(name);
+        }
 
         if to_fetch.is_empty() {
             return;
         }
 
         let reg_cache = self.metadata_cache.clone();
-        let client_c = client.clone();
-        let cache_c = cache.clone();
+        let client_c = self.client.clone();
+        let cache_c = self.cache.clone();
         let lockfile_c = self.lockfile.clone();
         self.handle.block_on(async move {
             let results = client_c.get_package_metadata_concurrent(&to_fetch).await;
@@ -2287,32 +2286,51 @@ impl Installer {
             let lockfile_ref = existing_lockfile.clone();
             let unlocked = self.options.unlocked_packages.clone();
 
-            let to_fetch: Vec<String> = root_pkg_names
-                .into_iter()
-                .filter(|name| {
-                    if let Some(ref lf) = lockfile_ref {
-                        if !unlocked.contains(name)
-                            && package_metadata_from_lockfile(name, lf).is_some()
-                        {
-                            return false;
-                        }
-                    }
-                    if let Ok(locked) = reg_cache.lock() {
-                        if locked.contains_key(name) {
-                            return false;
-                        }
-                    }
-                    let reg_url = client.registry_for_package(name).as_str().to_string();
-                    if let Ok(Some((entry, _))) =
-                        cache.get_packument_with_accept(&reg_url, name, Some(NPM_INSTALL_V1_JSON))
+            let mut to_fetch: Vec<String> = Vec::new();
+            for name in root_pkg_names {
+                if let Some(ref lf) = lockfile_ref {
+                    if !unlocked.contains(&name)
+                        && package_metadata_from_lockfile(&name, lf).is_some()
                     {
-                        if is_packument_fresh(&entry, prefer_offline, false) {
-                            return false;
+                        continue;
+                    }
+                }
+                if let Ok(locked) = reg_cache.lock() {
+                    if locked.contains_key(&name) {
+                        continue;
+                    }
+                }
+                let reg_url = client.registry_for_package(&name).as_str().to_string();
+                let cached = cache
+                    .get_packument_with_accept(&reg_url, &name, Some(NPM_INSTALL_V1_JSON))
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        cache
+                            .get(&format!("pacote:packument:{name}"))
+                            .ok()
+                            .flatten()
+                    });
+                if let Some((entry, data)) = cached {
+                    if is_packument_fresh(&entry, prefer_offline, false) {
+                        if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                            let mut meta = abbreviated_to_package_metadata(&abbrev);
+                            if let Some(ref lf) = lockfile_ref {
+                                if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
+                                    for (v, vm) in lf_meta.versions {
+                                        meta.versions.entry(v).or_insert(vm);
+                                    }
+                                }
+                            }
+                            if let Ok(mut locked) = reg_cache.lock() {
+                                locked.insert(name, meta);
+                            }
+                            continue;
                         }
                     }
-                    true
-                })
-                .collect();
+                }
+                to_fetch.push(name);
+            }
 
             if !to_fetch.is_empty() {
                 let fetches = client.get_package_metadata_concurrent(&to_fetch).await;
