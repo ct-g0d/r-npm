@@ -1696,35 +1696,17 @@ impl LockfileV3 {
             true
         });
 
-        let mut content = hidden.to_npm_json_string()?;
-        let uses_crlf = if hidden_path.exists() {
-            std::fs::read(&hidden_path)
-                .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                .unwrap_or(false)
-        } else {
-            let lock_path = project_dir.join("package-lock.json");
-            let sw_path = project_dir.join("npm-shrinkwrap.json");
-            let pkg_json = project_dir.join("package.json");
-            if lock_path.exists() {
-                std::fs::read(&lock_path)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
-            } else if sw_path.exists() {
-                std::fs::read(&sw_path)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
-            } else if pkg_json.exists() {
-                std::fs::read(&pkg_json)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        };
-
-        if uses_crlf {
-            content = content.replace("\r\n", "\n").replace('\n', "\r\n");
-        }
+        let format = [
+            hidden_path.clone(),
+            project_dir.join("package-lock.json"),
+            project_dir.join("npm-shrinkwrap.json"),
+            project_dir.join("package.json"),
+        ]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
+        .unwrap_or_default();
+        let content = hidden.to_npm_json_string_formatted(&format)?;
 
         if let Some(parent) = hidden_path.parent() {
             fs::create_dir_all(parent)?;
@@ -1735,6 +1717,13 @@ impl LockfileV3 {
 
     /// Serializes with npm's `json-stringify-nice` key ordering so diffs against npm are minimal.
     pub fn to_npm_json_string(&self) -> Result<String, LockfileError> {
+        self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default())
+    }
+
+    fn to_npm_json_string_formatted(
+        &self,
+        format: &rnpm_core::ManifestFormat,
+    ) -> Result<String, LockfileError> {
         let has_any_raw = self.packages.values().any(|p| p.raw_value.is_some());
         let value = if has_any_raw {
             let mut root = serde_json::Map::new();
@@ -1774,9 +1763,12 @@ impl LockfileV3 {
             serde_json::to_value(&copy)?
         };
         let mut out = String::new();
-        stringify_npm_nice(&value, 0, &mut out);
+        stringify_npm_nice_indent(&value, &format.indent, 0, &mut out);
         if !out.ends_with('\n') {
             out.push('\n');
+        }
+        if format.newline == "\r\n" {
+            out = out.replace('\n', "\r\n");
         }
         Ok(out)
     }
