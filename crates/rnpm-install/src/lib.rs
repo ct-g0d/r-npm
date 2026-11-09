@@ -11,7 +11,7 @@ use rnpm_cache::{Cache, CacheError, PackStore};
 use rnpm_config::Config;
 use rnpm_core::integrity::Integrity;
 use rnpm_core::manifest::Manifest;
-use rnpm_core::semver::{Range, Version};
+use rnpm_core::semver::Version;
 use rnpm_core::spec::{PackageSpec, PackageTarget};
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
 use rnpm_fs::junction::{is_junction, remove_junction};
@@ -58,6 +58,9 @@ pub use diff::*;
 
 pub mod trash;
 pub use trash::*;
+
+pub mod save;
+pub use save::*;
 
 pub mod linked;
 pub use linked::*;
@@ -1770,27 +1773,12 @@ impl Installer {
             discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
                 .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
 
-        let has_workspace_filter = !self.options.workspace.is_empty();
-        let has_workspaces_flag = self.options.workspaces;
-        let is_workspace_mode = has_workspace_filter || has_workspaces_flag;
-
-        let mut targeted_workspace_indices: Vec<usize> = Vec::new();
-        if has_workspace_filter {
-            for (idx, m) in workspace_members.iter().enumerate() {
-                if self.options.workspace.iter().any(|target| {
-                    target == &m.name
-                        || target == &m.relative_path
-                        || m.relative_path.ends_with(target)
-                        || target.trim_start_matches("./") == m.relative_path
-                }) {
-                    targeted_workspace_indices.push(idx);
-                }
-            }
-        } else if has_workspaces_flag {
-            targeted_workspace_indices = (0..workspace_members.len()).collect();
-        }
-
-        let target_root = !is_workspace_mode || self.options.workspace_root;
+        let (targeted_workspace_indices, target_root) = save::resolve_targeted_workspaces(
+            &workspace_members,
+            &self.options.workspace,
+            self.options.workspaces,
+            self.options.workspace_root,
+        );
 
         struct AddedPkgInfo {
             name: String,
@@ -2058,14 +2046,8 @@ impl Installer {
 
         // 2. Post-solve: finalize versions for added packages in manifest
         if !added_pkgs.is_empty() {
-            let prefix = if self.options.save_exact {
-                ""
-            } else {
-                self.options.save_prefix.as_deref().unwrap_or("^")
-            };
-
             for added in &added_pkgs {
-                let resolved_version_opt = graph
+                let resolved_ver = graph
                     .nodes
                     .get(&format!("node_modules/{}", added.name))
                     .or_else(|| {
@@ -2074,81 +2056,47 @@ impl Installer {
                             .values()
                             .find(|n| n.install_name == added.name || n.name == added.name)
                     })
-                    .map(|n| n.version.clone());
+                    .map(|n| n.version.as_str())
+                    .unwrap_or("1.0.0");
 
-                let resolved_ver = resolved_version_opt.unwrap_or_else(|| "1.0.0".to_string());
-
-                let final_spec = match &added.target {
-                    PackageTarget::File(p) => {
-                        format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
-                    }
-                    PackageTarget::Git { url, committish } => {
-                        format!(
-                            "{}{}",
-                            url,
-                            committish
-                                .as_ref()
-                                .map(|c| format!("#{c}"))
-                                .unwrap_or_default()
-                        )
-                    }
-                    PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
-                    PackageTarget::Url(u) => u.to_string(),
-                    PackageTarget::Alias {
-                        name: real_name, ..
-                    } => {
-                        if self.options.save_exact {
-                            format!("npm:{}@{}", real_name, resolved_ver)
-                        } else {
-                            format!("npm:{}@{}{}", real_name, prefix, resolved_ver)
-                        }
-                    }
-                    _ => {
-                        if self.options.save_exact {
-                            resolved_ver
-                        } else {
-                            format!("{}{}", prefix, resolved_ver)
-                        }
-                    }
-                };
-
-                let update_final = |m: &mut Manifest| {
-                    if self.options.save_dev {
-                        m.dev_dependencies
-                            .insert(added.name.clone(), final_spec.clone());
-                    } else if self.options.save_optional {
-                        m.optional_dependencies
-                            .insert(added.name.clone(), final_spec.clone());
-                    } else if self.options.save_peer {
-                        m.peer_dependencies
-                            .insert(added.name.clone(), final_spec.clone());
-                    } else {
-                        m.dependencies.insert(added.name.clone(), final_spec.clone());
-                    }
-                };
+                let final_spec = save::compute_save_spec(
+                    &added.target,
+                    resolved_ver,
+                    self.options.save_exact,
+                    self.options.save_prefix.as_deref(),
+                );
 
                 if target_root {
-                    update_final(&mut manifest);
+                    save::insert_manifest_dep(
+                        &mut manifest,
+                        &added.name,
+                        &final_spec,
+                        self.options.save_dev,
+                        self.options.save_optional,
+                        self.options.save_peer,
+                    );
                 }
                 for &idx in &targeted_workspace_indices {
-                    update_final(&mut workspace_members[idx].manifest);
+                    save::insert_manifest_dep(
+                        &mut workspace_members[idx].manifest,
+                        &added.name,
+                        &final_spec,
+                        self.options.save_dev,
+                        self.options.save_optional,
+                        self.options.save_peer,
+                    );
                 }
             }
 
             // Save package.json unless --no-save was passed or in global mode
             if !self.options.is_global && !self.options.no_save && !self.options.dry_run {
-                if target_root {
-                    manifest
-                        .save_to_file(&manifest_path)
-                        .context("Failed to save updated package.json")?;
-                }
-                for &idx in &targeted_workspace_indices {
-                    let member = &workspace_members[idx];
-                    let member_pkg_path = self.options.project_dir.join(&member.relative_path).join("package.json");
-                    member.manifest
-                        .save_to_file(&member_pkg_path)
-                        .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
-                }
+                save::save_manifests(
+                    &self.options.project_dir,
+                    &manifest,
+                    target_root,
+                    &workspace_members,
+                    &targeted_workspace_indices,
+                )?;
             } else if self.options.dry_run {
                 for added in &added_pkgs {
                     println!("rnpm: would add {} to package.json", added.name);
@@ -2202,31 +2150,12 @@ impl Installer {
                 }
             }
         }
-        if target_root {
-            if let Some(root_pkg) = lockfile.root_package_mut() {
-                if manifest.dependencies.is_empty() {
-                    root_pkg.dependencies = None;
-                } else {
-                    root_pkg.dependencies = Some(manifest.dependencies.clone());
-                }
-                if manifest.dev_dependencies.is_empty() {
-                    root_pkg.dev_dependencies = None;
-                } else {
-                    root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
-                }
-                if manifest.optional_dependencies.is_empty() {
-                    root_pkg.optional_dependencies = None;
-                } else {
-                    root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
-                }
-                if manifest.peer_dependencies.is_empty() {
-                    root_pkg.peer_dependencies = None;
-                } else {
-                    root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
-                }
-                if !manifest.workspace_patterns().is_empty() {
-                    root_pkg.workspaces = Some(manifest.workspace_patterns());
-                }
+        if let Some(root_pkg) = lockfile.root_package_mut() {
+            if target_root {
+                save::sync_lockfile_package_entry(root_pkg, &manifest);
+            }
+            if !manifest.workspace_patterns().is_empty() {
+                root_pkg.workspaces = Some(manifest.workspace_patterns());
             }
         }
 
@@ -2235,26 +2164,7 @@ impl Installer {
             if pkg.version.is_none() {
                 pkg.version = member.manifest.version.clone();
             }
-            if member.manifest.dependencies.is_empty() {
-                pkg.dependencies = None;
-            } else {
-                pkg.dependencies = Some(member.manifest.dependencies.clone());
-            }
-            if member.manifest.dev_dependencies.is_empty() {
-                pkg.dev_dependencies = None;
-            } else {
-                pkg.dev_dependencies = Some(member.manifest.dev_dependencies.clone());
-            }
-            if member.manifest.optional_dependencies.is_empty() {
-                pkg.optional_dependencies = None;
-            } else {
-                pkg.optional_dependencies = Some(member.manifest.optional_dependencies.clone());
-            }
-            if member.manifest.peer_dependencies.is_empty() {
-                pkg.peer_dependencies = None;
-            } else {
-                pkg.peer_dependencies = Some(member.manifest.peer_dependencies.clone());
-            }
+            save::sync_lockfile_package_entry(pkg, &member.manifest);
 
             if !member.name.is_empty() {
                 let m_name = &member.name;
@@ -3523,43 +3433,20 @@ impl Installer {
             if let Some(lock_spec) = lock_deps.get(dep_name) {
                 if lock_spec != dep_spec {
                     let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
-                        if let Some(ref v_str) = pkg.version {
-                            if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
-                                r.satisfies(&v)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else if let Ok(v) = Version::parse(lock_spec) {
-                        if let Ok(r) = Range::parse(dep_spec) {
-                            r.satisfies(&v)
-                        } else {
-                            false
-                        }
+                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                     } else {
                         false
                     };
                     if !satisfies {
                         return Err(anyhow!(
-                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {}@{} does not match lockfile spec {} (EUSAGE)",
-                        dep_name, dep_spec, lock_spec
-                    ));
+                            "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {}@{} does not match lockfile spec {} (EUSAGE)",
+                            dep_name, dep_spec, lock_spec
+                        ));
                     }
                 }
             } else {
                 return Err(anyhow!(
                     "rnpm ERR! code ELOCKFILE_DRIFT: package.json dependency {} missing from {} (EUSAGE)",
-                    dep_name,
-                    lockfile_name
-                ));
-            }
-        }
-        for dep_name in lock_deps.keys() {
-            if !manifest.dependencies.contains_key(dep_name) {
-                return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: dependency {} present in {} but removed from package.json (EUSAGE)",
                     dep_name,
                     lockfile_name
                 ));
@@ -3574,46 +3461,23 @@ impl Installer {
                 if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
                     if lock_spec != dep_spec {
                         let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
-                            if let Some(ref v_str) = pkg.version {
-                                if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
-                                    r.satisfies(&v)
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else if let Ok(v) = Version::parse(lock_spec) {
-                            if let Ok(r) = Range::parse(dep_spec) {
-                                r.satisfies(&v)
-                            } else {
-                                false
-                            }
+                            LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                         } else {
                             false
                         };
                         if !satisfies {
                             return Err(anyhow!(
-                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {}@{} does not match lockfile spec {} (EUSAGE)",
-                        dep_name, dep_spec, lock_spec
-                    ));
+                                "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {}@{} does not match lockfile spec {} (EUSAGE)",
+                                dep_name, dep_spec, lock_spec
+                            ));
                         }
                     }
                 } else {
                     return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from {} (EUSAGE)",
-                    dep_name,
-                    lockfile_name
-                ));
-                }
-            }
-            for dep_name in lock_dev_deps.keys() {
-                if !manifest.dev_dependencies.contains_key(dep_name) {
-                    return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: devDependency {} present in {} but removed from package.json (EUSAGE)",
-                    dep_name,
-                    lockfile_name
-                ));
+                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from {} (EUSAGE)",
+                        dep_name,
+                        lockfile_name
+                    ));
                 }
             }
         }
@@ -3629,46 +3493,23 @@ impl Installer {
                 if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
                     if lock_spec != dep_spec {
                         let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
-                            if let Some(ref v_str) = pkg.version {
-                                if let (Ok(v), Ok(r)) = (Version::parse(v_str), Range::parse(dep_spec)) {
-                                    r.satisfies(&v)
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else if let Ok(v) = Version::parse(lock_spec) {
-                            if let Ok(r) = Range::parse(dep_spec) {
-                                r.satisfies(&v)
-                            } else {
-                                false
-                            }
+                            LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                         } else {
                             false
                         };
                         if !satisfies {
                             return Err(anyhow!(
-                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {}@{} does not match lockfile spec {} (EUSAGE)",
-                        dep_name, dep_spec, lock_spec
-                    ));
+                                "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {}@{} does not match lockfile spec {} (EUSAGE)",
+                                dep_name, dep_spec, lock_spec
+                            ));
                         }
                     }
                 } else {
                     return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {} missing from {} (EUSAGE)",
-                    dep_name,
-                    lockfile_name
-                ));
-                }
-            }
-            for dep_name in lock_opt_deps.keys() {
-                if !manifest.optional_dependencies.contains_key(dep_name) {
-                    return Err(anyhow!(
-                    "rnpm ERR! code ELOCKFILE_DRIFT: optionalDependency {} present in {} but removed from package.json (EUSAGE)",
-                    dep_name,
-                    lockfile_name
-                ));
+                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json optionalDependency {} missing from {} (EUSAGE)",
+                        dep_name,
+                        lockfile_name
+                    ));
                 }
             }
         }
@@ -3730,25 +3571,7 @@ impl Installer {
                     }
 
                     let is_satisfied = if let Some(resolved_pkg) = found_node {
-                        if resolved_pkg.link == Some(true)
-                            || effective_range.starts_with("file:")
-                            || effective_range.starts_with("workspace:")
-                            || effective_range.starts_with("git")
-                            || effective_range.starts_with("http:")
-                            || effective_range.starts_with("https:")
-                        {
-                            true
-                        } else if let Some(ref ver_str) = resolved_pkg.version {
-                            if let (Ok(ver), Ok(range)) =
-                                (Version::parse(ver_str), Range::parse(&effective_range))
-                            {
-                                range.satisfies(&ver)
-                            } else {
-                                ver_str == &effective_range
-                            }
-                        } else {
-                            false
-                        }
+                        LockfileV3::package_satisfies_spec(dep_name, resolved_pkg, &effective_range)
                     } else {
                         false
                     };
@@ -6041,27 +5864,12 @@ impl Installer {
             discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
                 .unwrap_or_default();
 
-        let has_workspace_filter = !options.workspace.is_empty();
-        let has_workspaces_flag = options.workspaces;
-        let is_workspace_mode = has_workspace_filter || has_workspaces_flag;
-
-        let mut targeted_workspace_indices: Vec<usize> = Vec::new();
-        if has_workspace_filter {
-            for (idx, m) in workspace_members.iter().enumerate() {
-                if options.workspace.iter().any(|target| {
-                    target == &m.name
-                        || target == &m.relative_path
-                        || m.relative_path.ends_with(target)
-                        || target.trim_start_matches("./") == m.relative_path
-                }) {
-                    targeted_workspace_indices.push(idx);
-                }
-            }
-        } else if has_workspaces_flag {
-            targeted_workspace_indices = (0..workspace_members.len()).collect();
-        }
-
-        let target_root = !is_workspace_mode || options.workspace_root;
+        let (targeted_workspace_indices, target_root) = save::resolve_targeted_workspaces(
+            &workspace_members,
+            &options.workspace,
+            options.workspaces,
+            options.workspace_root,
+        );
 
         let mut removed_packages = Vec::new();
 
@@ -6123,18 +5931,13 @@ impl Installer {
         }
 
         // Save updated package.json deterministically
-        if target_root {
-            manifest
-                .save_to_file(&manifest_path)
-                .context("Failed to save updated package.json")?;
-        }
-        for &idx in &targeted_workspace_indices {
-            let member = &workspace_members[idx];
-            let member_pkg_path = self.options.project_dir.join(&member.relative_path).join("package.json");
-            member.manifest
-                .save_to_file(&member_pkg_path)
-                .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
-        }
+        save::save_manifests(
+            &self.options.project_dir,
+            &manifest,
+            target_root,
+            &workspace_members,
+            &targeted_workspace_indices,
+        )?;
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut pruned_nodes: HashSet<String> = HashSet::new();
@@ -6155,32 +5958,12 @@ impl Installer {
             let graph_pruned = in_memory_graph.prune_unreferenced();
 
             // Sync root package metadata with updated manifest
-            if target_root {
-                if let Some(root_pkg) = lockfile.root_package_mut() {
-                    root_pkg.raw_value = None;
-                    if manifest.dependencies.is_empty() {
-                        root_pkg.dependencies = None;
-                    } else {
-                        root_pkg.dependencies = Some(manifest.dependencies.clone());
-                    }
-
-                    if manifest.dev_dependencies.is_empty() {
-                        root_pkg.dev_dependencies = None;
-                    } else {
-                        root_pkg.dev_dependencies = Some(manifest.dev_dependencies.clone());
-                    }
-
-                    if manifest.optional_dependencies.is_empty() {
-                        root_pkg.optional_dependencies = None;
-                    } else {
-                        root_pkg.optional_dependencies = Some(manifest.optional_dependencies.clone());
-                    }
-
-                    if manifest.peer_dependencies.is_empty() {
-                        root_pkg.peer_dependencies = None;
-                    } else {
-                        root_pkg.peer_dependencies = Some(manifest.peer_dependencies.clone());
-                    }
+            if let Some(root_pkg) = lockfile.root_package_mut() {
+                if target_root {
+                    save::sync_lockfile_package_entry(root_pkg, &manifest);
+                }
+                if !manifest.workspace_patterns().is_empty() {
+                    root_pkg.workspaces = Some(manifest.workspace_patterns());
                 }
             }
 
@@ -6188,26 +5971,7 @@ impl Installer {
             for &idx in &targeted_workspace_indices {
                 let m = &workspace_members[idx];
                 if let Some(pkg_entry) = lockfile.packages.get_mut(&m.relative_path) {
-                    if m.manifest.dependencies.is_empty() {
-                        pkg_entry.dependencies = None;
-                    } else {
-                        pkg_entry.dependencies = Some(m.manifest.dependencies.clone());
-                    }
-                    if m.manifest.dev_dependencies.is_empty() {
-                        pkg_entry.dev_dependencies = None;
-                    } else {
-                        pkg_entry.dev_dependencies = Some(m.manifest.dev_dependencies.clone());
-                    }
-                    if m.manifest.optional_dependencies.is_empty() {
-                        pkg_entry.optional_dependencies = None;
-                    } else {
-                        pkg_entry.optional_dependencies = Some(m.manifest.optional_dependencies.clone());
-                    }
-                    if m.manifest.peer_dependencies.is_empty() {
-                        pkg_entry.peer_dependencies = None;
-                    } else {
-                        pkg_entry.peer_dependencies = Some(m.manifest.peer_dependencies.clone());
-                    }
+                    save::sync_lockfile_package_entry(pkg_entry, &m.manifest);
                 }
             }
 

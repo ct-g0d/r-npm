@@ -1,6 +1,6 @@
 use crate::error::LockfileError;
 use rnpm_core::manifest::BundledDependencies;
-use rnpm_core::semver::{Range, Version};
+use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use serde::{Deserialize, Serialize};
@@ -1147,14 +1147,9 @@ impl LockfileV3 {
         true
     }
 
-    fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
+    pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
         if pkg.link == Some(true) {
-            if let Ok(target) = PackageTarget::parse(spec) {
-                match target {
-                    PackageTarget::File(_) | PackageTarget::Workspace(_) => return true,
-                    _ => {}
-                }
-            }
+            return true;
         }
         let Some(ref ver_str) = pkg.version else {
             return false;
@@ -1212,39 +1207,25 @@ impl LockfileV3 {
         manifest_map: &std::collections::BTreeMap<String, String>,
         lock_map: &Option<std::collections::BTreeMap<String, String>>,
     ) -> bool {
-        if manifest_map.is_empty() {
-            lock_map.as_ref().map(|m| m.is_empty()).unwrap_or(true)
-        } else {
-            let Some(lock) = lock_map else {
+        let empty_lock = std::collections::BTreeMap::new();
+        let lock = lock_map.as_ref().unwrap_or(&empty_lock);
+
+        for (k, manifest_spec) in manifest_map {
+            let Some(lock_spec) = lock.get(k) else {
                 return false;
             };
-            if manifest_map.len() != lock.len() {
+            if lock_spec == manifest_spec {
+                continue;
+            }
+            let key = format!("node_modules/{k}");
+            let Some(pkg) = packages.get(&key) else {
+                return false;
+            };
+            if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
                 return false;
             }
-            for (k, manifest_spec) in manifest_map {
-                let Some(lock_spec) = lock.get(k) else {
-                    return false;
-                };
-                if lock_spec == manifest_spec {
-                    continue;
-                }
-                let key = format!("node_modules/{k}");
-                if let Some(pkg) = packages.get(&key) {
-                    if Self::package_satisfies_spec(k, pkg, manifest_spec) {
-                        continue;
-                    }
-                }
-                if let Ok(v) = Version::parse(lock_spec) {
-                    if let Ok(r) = Range::parse(manifest_spec) {
-                        if r.satisfies(&v) {
-                            continue;
-                        }
-                    }
-                }
-                return false;
-            }
-            true
         }
+        true
     }
 
     fn peer_meta_matches(
