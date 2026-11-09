@@ -1,6 +1,6 @@
 param(
-    [switch]$SkipCargo = $true,
-    [switch]$SkipParity = $true,
+    [switch]$SkipCargo = $false,
+    [switch]$SkipParity = $false,
     [switch]$KeepTemp = $false,
     [switch]$SelfTest = $false
 )
