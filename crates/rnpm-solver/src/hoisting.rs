@@ -21,9 +21,22 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
         PackageTarget::Range(range) => range.satisfies(&v),
         PackageTarget::Tag(_) => true,
         PackageTarget::Alias { target, .. } => version_satisfies_target(version_str, target),
-        PackageTarget::File(_) => true,
-        PackageTarget::Git { .. } => true,
-        PackageTarget::Url(_) => true,
+        PackageTarget::File(p) => {
+            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+            version_str == expected
+        }
+        PackageTarget::Git { url, committish } => {
+            let expected = format!(
+                "{}{}",
+                url,
+                committish
+                    .as_ref()
+                    .map(|c| format!("#{c}"))
+                    .unwrap_or_default()
+            );
+            version_str == expected
+        }
+        PackageTarget::Url(u) => version_str == u.as_str(),
         PackageTarget::Workspace(ws_spec) => {
             let s = ws_spec.trim();
             if s == "*" || s == "^" || s == "~" || s.is_empty() {
@@ -42,6 +55,37 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
 /// Fast check if a node satisfies target constraint, leveraging cached parsed_version.
 #[inline]
 pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) -> bool {
+    match target {
+        PackageTarget::Url(u) => {
+            if let Some(ref res) = node.resolved {
+                return res == u.as_str();
+            }
+            return true;
+        }
+        PackageTarget::File(p) => {
+            if let Some(ref res) = node.resolved {
+                let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+                return res == &expected;
+            }
+            return true;
+        }
+        PackageTarget::Git { url, committish } => {
+            if let Some(ref res) = node.resolved {
+                let expected = format!(
+                    "{}{}",
+                    url,
+                    committish
+                        .as_ref()
+                        .map(|c| format!("#{c}"))
+                        .unwrap_or_default()
+                );
+                return res == &expected;
+            }
+            return true;
+        }
+        _ => {}
+    }
+
     if let Some(parsed) = &node.parsed_version {
         match target {
             PackageTarget::Version(expected) => parsed == expected,
@@ -91,6 +135,7 @@ pub fn determine_placement(
         target,
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
     )
 }
 
@@ -103,6 +148,7 @@ pub fn determine_placement_with_peers(
     install_name: &str,
     package_name: &str,
     target: &PackageTarget,
+    dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies_meta: &std::collections::BTreeMap<
         String,
@@ -122,6 +168,7 @@ pub fn determine_placement_with_peers(
                     graph,
                     &root_target,
                     parent_location,
+                    dependencies,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -140,6 +187,7 @@ pub fn determine_placement_with_peers(
                 graph,
                 &root_target,
                 parent_location,
+                dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -163,6 +211,7 @@ pub fn determine_placement_with_peers(
                 graph,
                 &root_target,
                 parent_location,
+                dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -194,6 +243,7 @@ pub fn determine_placement_with_peers(
                     graph,
                     &candidate,
                     parent_location,
+                    dependencies,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -217,6 +267,7 @@ pub fn determine_placement_with_peers(
             graph,
             &candidate,
             parent_location,
+            dependencies,
             peer_dependencies,
             peer_dependencies_meta,
         ) && !candidate_shadows_ancestor_dep(
@@ -295,6 +346,7 @@ fn candidate_has_incompatible_peer(
     graph: &DependencyGraph,
     candidate_location: &str,
     parent_location: &str,
+    dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies_meta: &std::collections::BTreeMap<
         String,
@@ -302,6 +354,9 @@ fn candidate_has_incompatible_peer(
     >,
 ) -> bool {
     peer_dependencies.iter().any(|(peer_name, peer_spec)| {
+        if dependencies.contains_key(peer_name) {
+            return false;
+        }
         let Some(existing) =
             find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
         else {

@@ -66,6 +66,7 @@ struct ResolveTask {
     raw_spec: String,
     dep_type: DependencyType,
     dev_path: bool,
+    parent_depth: usize,
     ancestors: std::sync::Arc<Vec<String>>,
 }
 
@@ -121,28 +122,43 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         if dep_type == DependencyType::Peer || dep_type == DependencyType::PeerOptional {
             self.peer_ctx.enter(&parent_package_name, &install_name);
         }
-        self.queue.push_back(ResolveTask {
+        let parent_depth = if parent_location.is_empty() {
+            0
+        } else {
+            parent_location.matches("node_modules").count()
+        };
+        self.push_task(ResolveTask {
             parent_location,
             parent_package_name,
             install_name,
             raw_spec,
             dep_type,
             dev_path: dep_type == DependencyType::Dev,
+            parent_depth,
             ancestors,
         });
     }
 
     fn push_task(&mut self, task: ResolveTask) {
-        if task.dev_path {
-            self.queue.push_back(task);
-            return;
-        }
-        let insert_at = self
+        let task_key = (
+            task.dev_path,
+            task.parent_depth,
+            task.parent_location.as_str(),
+            task.install_name.as_str(),
+        );
+        let pos = self
             .queue
-            .iter()
-            .position(|queued| queued.dev_path)
-            .unwrap_or(self.queue.len());
-        self.queue.insert(insert_at, task);
+            .binary_search_by(|queued| {
+                let queued_key = (
+                    queued.dev_path,
+                    queued.parent_depth,
+                    queued.parent_location.as_str(),
+                    queued.install_name.as_str(),
+                );
+                queued_key.cmp(&task_key)
+            })
+            .unwrap_or_else(|e| e);
+        self.queue.insert(pos, task);
     }
 
     /// Processes all queued dependency resolution tasks until completion.
@@ -280,6 +296,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         raw_spec,
                         dep_type,
                         dev_path: dep_type == DependencyType::Dev,
+                        parent_depth: 0,
                         ancestors: root_ancestors.clone(),
                     });
                 }
@@ -306,6 +323,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         for install_name in root_deps.keys() {
             enqueue_root(install_name, &mut self, &mut queued);
         }
+
+        let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
+        self.provider.prefetch_packages(&root_names);
 
         // Process resolution queue
         while let Some(task) = self.queue.pop_front() {
@@ -666,6 +686,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &dep_spec.install_name,
             &dep_spec.package_name,
             &dep_spec.target,
+            &chosen_version.dependencies,
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
         );
@@ -767,6 +788,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &dep_spec.install_name,
                 &dep_spec.package_name,
                 &dep_spec.target,
+                &chosen_version.dependencies,
                 &chosen_version.peer_dependencies,
                 &chosen_version.peer_dependencies_meta,
             );
@@ -936,6 +958,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // a shared hoisted slot (for example Express's `ms`).  The
                 // BTreeMap keeps traversal deterministic and matches npm's
                 // lockfile dependency ordering.
+                let child_depth = target_loc.matches("node_modules").count();
                 let child_tasks = child_deps
                     .into_iter()
                     .map(|(c_name, (c_spec, c_type))| ResolveTask {
@@ -945,6 +968,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         raw_spec: c_spec,
                         dep_type: c_type,
                         dev_path: task.dev_path || c_type == DependencyType::Dev,
+                        parent_depth: child_depth,
                         ancestors: child_ancestors.clone(),
                     })
                     .collect::<Vec<_>>();
@@ -953,6 +977,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // placement pass and lets a later direct dependency claim a
                 // compatible root slot before an earlier sibling's nested
                 // subtree is expanded.
+                let child_names: Vec<&str> =
+                    child_tasks.iter().map(|t| t.install_name.as_str()).collect();
+                self.provider.prefetch_packages(&child_names);
                 for child_task in child_tasks {
                     self.push_task(child_task);
                 }
@@ -1200,8 +1227,33 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             PackageTarget::Alias { target, .. } => {
                 self.select_version(parent_location, pkg_name, meta, target)
             }
-            PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
-                select_max_semver_version(meta)
+            PackageTarget::Url(u) => {
+                let u_str = u.as_str();
+                meta.versions
+                    .values()
+                    .find(|v| v.dist_tarball.as_deref() == Some(u_str))
+                    .or_else(|| select_max_semver_version(meta))
+            }
+            PackageTarget::File(p) => {
+                let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+                meta.versions
+                    .values()
+                    .find(|v| v.dist_tarball.as_deref() == Some(&expected))
+                    .or_else(|| select_max_semver_version(meta))
+            }
+            PackageTarget::Git { url, committish } => {
+                let expected = format!(
+                    "{}{}",
+                    url,
+                    committish
+                        .as_ref()
+                        .map(|c| format!("#{c}"))
+                        .unwrap_or_default()
+                );
+                meta.versions
+                    .values()
+                    .find(|v| v.dist_tarball.as_deref() == Some(&expected))
+                    .or_else(|| select_max_semver_version(meta))
             }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
