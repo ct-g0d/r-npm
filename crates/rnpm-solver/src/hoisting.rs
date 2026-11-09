@@ -399,7 +399,9 @@ fn candidate_shadows_ancestor_dep(
 
     if let Ok(req_target) = PackageTarget::parse(spec) {
         if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
-            if node_satisfies_target(visible, &req_target) && !node_satisfies_target(visible, target) {
+            if node_satisfies_target(visible, &req_target)
+                && !node_satisfies_target(visible, target)
+            {
                 return true;
             }
         }

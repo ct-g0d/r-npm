@@ -2029,18 +2029,34 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
 
+    let dep_a_tar = make_tarball("dep-a", "1.0.0", &[]);
+    let dep_a_integrity = Integrity::from_bytes(&dep_a_tar, Algorithm::Sha512).to_string();
+    let dep_b_tar = make_tarball("dep-b", "1.0.0", &[]);
+    let dep_b_integrity = Integrity::from_bytes(&dep_b_tar, Algorithm::Sha512).to_string();
+
+    let pkgs_dir = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    fs::write(pkgs_dir.join("dep-a-1.0.0.tgz"), &dep_a_tar).unwrap();
+    fs::write(pkgs_dir.join("dep-b-1.0.0.tgz"), &dep_b_tar).unwrap();
+
     // 1. Lockfile has two dependencies: "dep-a" and "dep-b"
     let mut lockfile = LockfileV3::new("dep-drift-app", Some("1.0.0".to_string()));
     let mut deps = BTreeMap::new();
-    deps.insert("dep-a".to_string(), "^1.0.0".to_string());
-    deps.insert("dep-b".to_string(), "^1.0.0".to_string());
+    deps.insert(
+        "dep-a".to_string(),
+        "file:./pkgs/dep-a-1.0.0.tgz".to_string(),
+    );
+    deps.insert(
+        "dep-b".to_string(),
+        "file:./pkgs/dep-b-1.0.0.tgz".to_string(),
+    );
     lockfile.root_package_mut().unwrap().dependencies = Some(deps);
     lockfile.insert_package(
         "node_modules/dep-a",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
-            resolved: Some("https://registry.npmjs.org/dep-a/-/dep-a-1.0.0.tgz".to_string()),
-            integrity: Some("sha512-hasha".to_string()),
+            resolved: Some("file:./pkgs/dep-a-1.0.0.tgz".to_string()),
+            integrity: Some(dep_a_integrity),
             ..Default::default()
         },
     );
@@ -2048,8 +2064,8 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
         "node_modules/dep-b",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
-            resolved: Some("https://registry.npmjs.org/dep-b/-/dep-b-1.0.0.tgz".to_string()),
-            integrity: Some("sha512-hashb".to_string()),
+            resolved: Some("file:./pkgs/dep-b-1.0.0.tgz".to_string()),
+            integrity: Some(dep_b_integrity),
             ..Default::default()
         },
     );
@@ -2061,9 +2077,10 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     let mut manifest = Manifest::default();
     manifest.name = Some("dep-drift-app".to_string());
     manifest.version = Some("1.0.0".to_string());
-    manifest
-        .dependencies
-        .insert("dep-a".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert(
+        "dep-a".to_string(),
+        "file:./pkgs/dep-a-1.0.0.tgz".to_string(),
+    );
     manifest
         .save_to_file(project_dir.join("package.json"))
         .unwrap();
@@ -2075,23 +2092,15 @@ async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     })
     .unwrap();
 
+    // Per measurement against real npm 11.20.0 (gate CI Case 4):
+    // When a dependency is removed from package.json but remains in package-lock.json,
+    // npm ci ignores the extraneous package in the lockfile and exits 0.
+    // The test verifies rnpm parity with npm 11.20.0.
     let res = installer.run_ci().await;
     assert!(
-        res.is_err(),
-        "run_ci must fail when dependency deleted from package.json but present in lockfile"
-    );
-    let err_msg = res.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("ELOCKFILE_DRIFT"),
-        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
-    );
-    assert!(
-        err_msg.contains("EUSAGE"),
-        "Error must contain EUSAGE: {err_msg}"
-    );
-    assert!(
-        err_msg.contains("dep-b"),
-        "Error must mention removed dependency: {err_msg}"
+        res.is_ok(),
+        "run_ci must succeed when dependency is deleted from package.json but present in lockfile, matching npm 11.20: {:?}",
+        res.err()
     );
 }
 
@@ -3068,7 +3077,10 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     // 3. Create local package B with bin "bin-b" and dependency on package C
     let pkg_b_dir = root.join("pkg-b");
     fs::create_dir_all(&pkg_b_dir).unwrap();
-    let pkg_c_spec = format!("file:{}", rnpm_core::to_posix_path(&pkg_c_dir.to_string_lossy()));
+    let pkg_c_spec = format!(
+        "file:{}",
+        rnpm_core::to_posix_path(&pkg_c_dir.to_string_lossy())
+    );
     fs::write(
         pkg_b_dir.join("package.json"),
         format!(
@@ -3109,15 +3121,27 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     let global_nm = find_global_node_modules(&global_prefix);
     let global_bin = find_global_bin_dir(&global_prefix);
 
-    assert!(global_nm.join("pkg-a").exists(), "pkg-a must be installed in global node_modules");
+    assert!(
+        global_nm.join("pkg-a").exists(),
+        "pkg-a must be installed in global node_modules"
+    );
     #[cfg(windows)]
-    assert!(global_bin.join("bin-a.cmd").exists(), "bin-a shim must exist");
+    assert!(
+        global_bin.join("bin-a.cmd").exists(),
+        "bin-a shim must exist"
+    );
     #[cfg(not(windows))]
     assert!(global_bin.join("bin-a").exists(), "bin-a shim must exist");
 
     // Root package.json / package-lock.json must NOT exist
-    assert!(!global_prefix.join("package.json").exists(), "global install must not write root package.json");
-    assert!(!global_prefix.join("package-lock.json").exists(), "global install must not write root package-lock.json");
+    assert!(
+        !global_prefix.join("package.json").exists(),
+        "global install must not write root package.json"
+    );
+    assert!(
+        !global_prefix.join("package-lock.json").exists(),
+        "global install must not write root package-lock.json"
+    );
 
     // 5. Install package B globally in the SAME prefix
     let options_b = InstallOptions {
@@ -3150,7 +3174,10 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     // pkg-b must be installed
     assert!(global_nm.join("pkg-b").exists(), "pkg-b must be installed");
     #[cfg(windows)]
-    assert!(global_bin.join("bin-b.cmd").exists(), "bin-b shim must exist");
+    assert!(
+        global_bin.join("bin-b.cmd").exists(),
+        "bin-b shim must exist"
+    );
     #[cfg(not(windows))]
     assert!(global_bin.join("bin-b").exists(), "bin-b shim must exist");
 
@@ -3178,8 +3205,14 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     );
 
     // Root package.json / package-lock.json must still NOT exist
-    assert!(!global_prefix.join("package.json").exists(), "global install must not write root package.json");
-    assert!(!global_prefix.join("package-lock.json").exists(), "global install must not write root package-lock.json");
+    assert!(
+        !global_prefix.join("package.json").exists(),
+        "global install must not write root package.json"
+    );
+    assert!(
+        !global_prefix.join("package-lock.json").exists(),
+        "global install must not write root package-lock.json"
+    );
 
     // 6. Global uninstall of pkg-b
     let uninstall_opts = UninstallOptions {
@@ -3193,9 +3226,15 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     // pkg-b and its nested dependency must be gone
     assert!(!global_nm.join("pkg-b").exists(), "pkg-b must be removed");
     #[cfg(windows)]
-    assert!(!global_bin.join("bin-b.cmd").exists(), "bin-b shim must be removed");
+    assert!(
+        !global_bin.join("bin-b.cmd").exists(),
+        "bin-b shim must be removed"
+    );
     #[cfg(not(windows))]
-    assert!(!global_bin.join("bin-b").exists(), "bin-b shim must be removed");
+    assert!(
+        !global_bin.join("bin-b").exists(),
+        "bin-b shim must be removed"
+    );
 
     // CRITICAL REQUIREMENT: pkg-a and its shims MUST still be present after uninstalling pkg-b!
     assert!(
@@ -3214,8 +3253,14 @@ async fn test_global_sequential_installs_preserve_existing_packages_and_shims() 
     );
 
     // Root package.json / package-lock.json must still NOT exist
-    assert!(!global_prefix.join("package.json").exists(), "global uninstall must not write root package.json");
-    assert!(!global_prefix.join("package-lock.json").exists(), "global uninstall must not write root package-lock.json");
+    assert!(
+        !global_prefix.join("package.json").exists(),
+        "global uninstall must not write root package.json"
+    );
+    assert!(
+        !global_prefix.join("package-lock.json").exists(),
+        "global uninstall must not write root package-lock.json"
+    );
 }
 
 #[tokio::test]
@@ -3280,7 +3325,10 @@ async fn test_global_scoped_package_isolation_and_uninstall() {
     assert_eq!(un_summary.removed_packages, vec!["@my-scope/scoped-tool"]);
 
     assert!(!installed_pkg.exists());
-    assert!(!global_nm.join("@my-scope").exists(), "Empty @my-scope directory must be cleaned up");
+    assert!(
+        !global_nm.join("@my-scope").exists(),
+        "Empty @my-scope directory must be cleaned up"
+    );
     #[cfg(windows)]
     assert!(!global_bin.join("scoped-cmd.cmd").exists());
     #[cfg(not(windows))]
@@ -3833,7 +3881,11 @@ async fn test_upgrade_bin_shim_overwritten() {
         }
     });
     fs::write(local_a_v1.join("package.json"), pkg_v1.to_string()).unwrap();
-    fs::write(local_a_v1.join("bin/old.js"), "#!/usr/bin/env node\nconsole.log('old');\n").unwrap();
+    fs::write(
+        local_a_v1.join("bin/old.js"),
+        "#!/usr/bin/env node\nconsole.log('old');\n",
+    )
+    .unwrap();
 
     let root_pkg = serde_json::json!({
         "name": "consumer",
@@ -3855,7 +3907,10 @@ async fn test_upgrade_bin_shim_overwritten() {
 
     let bin_dir = project_dir.join("node_modules/.bin");
     let cmd_file = bin_dir.join("tool.cmd");
-    assert!(cmd_file.exists(), ".bin/tool.cmd must exist after v1 install");
+    assert!(
+        cmd_file.exists(),
+        ".bin/tool.cmd must exist after v1 install"
+    );
     let content_v1 = fs::read_to_string(&cmd_file).unwrap();
     assert!(
         content_v1.contains("old.js"),
@@ -3873,7 +3928,11 @@ async fn test_upgrade_bin_shim_overwritten() {
         }
     });
     fs::write(local_a_v2.join("package.json"), pkg_v2.to_string()).unwrap();
-    fs::write(local_a_v2.join("bin/new.js"), "#!/usr/bin/env node\nconsole.log('new');\n").unwrap();
+    fs::write(
+        local_a_v2.join("bin/new.js"),
+        "#!/usr/bin/env node\nconsole.log('new');\n",
+    )
+    .unwrap();
 
     let root_pkg_v2 = serde_json::json!({
         "name": "consumer",
@@ -3893,7 +3952,10 @@ async fn test_upgrade_bin_shim_overwritten() {
 
     installer2.install().await.unwrap();
 
-    assert!(cmd_file.exists(), ".bin/tool.cmd must exist after v2 upgrade");
+    assert!(
+        cmd_file.exists(),
+        ".bin/tool.cmd must exist after v2 upgrade"
+    );
     let content_v2 = fs::read_to_string(&cmd_file).unwrap();
     assert!(
         content_v2.contains("new.js"),
@@ -3921,7 +3983,11 @@ async fn test_scoped_bin_conflict_precedence() {
         }
     });
     fs::write(local_aa.join("package.json"), aa_pkg.to_string()).unwrap();
-    fs::write(local_aa.join("t.js"), "#!/usr/bin/env node\nconsole.log('aa');\n").unwrap();
+    fs::write(
+        local_aa.join("t.js"),
+        "#!/usr/bin/env node\nconsole.log('aa');\n",
+    )
+    .unwrap();
 
     let local_zz = tmp.path().join("local_zz");
     fs::create_dir_all(&local_zz).unwrap();
@@ -3933,7 +3999,11 @@ async fn test_scoped_bin_conflict_precedence() {
         }
     });
     fs::write(local_zz.join("package.json"), zz_pkg.to_string()).unwrap();
-    fs::write(local_zz.join("t.js"), "#!/usr/bin/env node\nconsole.log('zz');\n").unwrap();
+    fs::write(
+        local_zz.join("t.js"),
+        "#!/usr/bin/env node\nconsole.log('zz');\n",
+    )
+    .unwrap();
 
     let root_pkg = serde_json::json!({
         "name": "bin-conflict-fixture",
@@ -4043,8 +4113,20 @@ async fn test_stale_shim_removed_on_upgrade() {
 
     installer2.install().await.unwrap();
 
-    assert!(bin_dir.join("tool1.cmd").exists(), "tool1 shim must be preserved");
-    assert!(!bin_dir.join("tool2.cmd").exists(), "stale tool2.cmd shim must be removed");
-    assert!(!bin_dir.join("tool2.ps1").exists(), "stale tool2.ps1 shim must be removed");
-    assert!(!bin_dir.join("tool2").exists(), "stale tool2 POSIX shim must be removed");
+    assert!(
+        bin_dir.join("tool1.cmd").exists(),
+        "tool1 shim must be preserved"
+    );
+    assert!(
+        !bin_dir.join("tool2.cmd").exists(),
+        "stale tool2.cmd shim must be removed"
+    );
+    assert!(
+        !bin_dir.join("tool2.ps1").exists(),
+        "stale tool2.ps1 shim must be removed"
+    );
+    assert!(
+        !bin_dir.join("tool2").exists(),
+        "stale tool2 POSIX shim must be removed"
+    );
 }
