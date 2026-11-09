@@ -770,7 +770,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         if self.offline {
             return;
         }
-        let missing: Vec<String> = {
+        let mut missing: Vec<String> = {
             let cache = match self.metadata_cache.lock() {
                 Ok(c) => c,
                 Err(_) => return,
@@ -788,10 +788,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 .map(|n| n.to_string())
                 .collect()
         };
+        missing.sort_unstable();
+        missing.dedup();
         if missing.is_empty() {
             return;
         }
 
+        let mut fresh_metas = Vec::new();
         let mut to_fetch: Vec<String> = Vec::new();
         for name in missing {
             if let Some((entry, data)) = self.get_cached_packument(&name) {
@@ -799,14 +802,20 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
                         self.merge_lockfile_metadata(&name, &mut meta);
-                        if let Ok(mut locked) = self.metadata_cache.lock() {
-                            locked.insert(name, meta);
-                        }
+                        fresh_metas.push((name, meta));
                         continue;
                     }
                 }
             }
             to_fetch.push(name);
+        }
+
+        if !fresh_metas.is_empty() {
+            if let Ok(mut locked) = self.metadata_cache.lock() {
+                for (name, meta) in fresh_metas {
+                    locked.insert(name, meta);
+                }
+            }
         }
 
         if to_fetch.is_empty() {
@@ -2286,6 +2295,7 @@ impl Installer {
             let lockfile_ref = existing_lockfile.clone();
             let unlocked = self.options.unlocked_packages.clone();
 
+            let mut fresh_metas = Vec::new();
             let mut to_fetch: Vec<String> = Vec::new();
             for name in root_pkg_names {
                 if let Some(ref lf) = lockfile_ref {
@@ -2322,14 +2332,20 @@ impl Installer {
                                     }
                                 }
                             }
-                            if let Ok(mut locked) = reg_cache.lock() {
-                                locked.insert(name, meta);
-                            }
+                            fresh_metas.push((name, meta));
                             continue;
                         }
                     }
                 }
                 to_fetch.push(name);
+            }
+
+            if !fresh_metas.is_empty() {
+                if let Ok(mut locked) = reg_cache.lock() {
+                    for (name, meta) in fresh_metas {
+                        locked.insert(name, meta);
+                    }
+                }
             }
 
             if !to_fetch.is_empty() {
