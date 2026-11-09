@@ -188,7 +188,10 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
 /// Traverses an [`OrderedJsonValue`] using the provided [`PathSegment`]s.
 ///
 /// Returns `Some(&OrderedJsonValue)` if the path exists, or `None` if any segment cannot be resolved.
-pub fn get_value_at_path<'a>(root: &'a OrderedJsonValue, segments: &[PathSegment]) -> Option<&'a OrderedJsonValue> {
+pub fn get_value_at_path<'a>(
+    root: &'a OrderedJsonValue,
+    segments: &[PathSegment],
+) -> Option<&'a OrderedJsonValue> {
     if segments.is_empty() {
         return Some(root);
     }
@@ -254,7 +257,11 @@ pub fn coerce_value(raw: &str) -> OrderedJsonValue {
 
 /// Navigates `root` along `segments`, creating intermediate `OrderedJsonValue::Object` (or `OrderedJsonValue::Array`)
 /// containers if absent, and assigns `value` to the leaf segment.
-pub fn set_value(root: &mut OrderedJsonValue, segments: &[PathSegment], value: OrderedJsonValue) -> Result<()> {
+pub fn set_value(
+    root: &mut OrderedJsonValue,
+    segments: &[PathSegment],
+    value: OrderedJsonValue,
+) -> Result<()> {
     if segments.is_empty() {
         bail!("Path cannot be empty");
     }
@@ -364,7 +371,10 @@ pub fn set_value(root: &mut OrderedJsonValue, segments: &[PathSegment], value: O
                     while arr.len() <= idx {
                         arr.push(OrderedJsonValue::Null);
                     }
-                    let is_container = matches!(arr[idx], OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_));
+                    let is_container = matches!(
+                        arr[idx],
+                        OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_)
+                    );
                     if !is_container {
                         arr[idx] = if next_is_array {
                             OrderedJsonValue::Array(Vec::new())
@@ -395,7 +405,10 @@ pub fn set_value(root: &mut OrderedJsonValue, segments: &[PathSegment], value: O
                         while arr.len() <= idx {
                             arr.push(OrderedJsonValue::Null);
                         }
-                        let is_container = matches!(arr[idx], OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_));
+                        let is_container = matches!(
+                            arr[idx],
+                            OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_)
+                        );
                         if !is_container {
                             arr[idx] = if next_is_array {
                                 OrderedJsonValue::Array(Vec::new())
@@ -645,7 +658,10 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
                 return Ok(s.clone());
             }
         }
-        return Ok(Manifest::format_json_value(value, &ManifestFormat::default())?);
+        return Ok(Manifest::format_json_value(
+            value,
+            &ManifestFormat::default(),
+        )?);
     }
 
     let mut result_map = OrderedJsonMap::new();
@@ -656,7 +672,10 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
         }
     }
 
-    Ok(Manifest::format_json_value(&OrderedJsonValue::Object(result_map), &ManifestFormat::default())?)
+    Ok(Manifest::format_json_value(
+        &OrderedJsonValue::Object(result_map),
+        &ManifestFormat::default(),
+    )?)
 }
 
 /// Retrieves package manifest values as an [`OrderedJsonValue`].
@@ -714,7 +733,10 @@ pub fn pkg_get_workspaces(members: &[(&str, &Path)], field_paths: &[String]) -> 
         root_map.insert((*name).to_string(), val);
     }
     let format = ManifestFormat::default();
-    Ok(Manifest::format_json_value(&OrderedJsonValue::Object(root_map), &format)?)
+    Ok(Manifest::format_json_value(
+        &OrderedJsonValue::Object(root_map),
+        &format,
+    )?)
 }
 
 /// Sets properties in `package.json` at `manifest_path` based on `<path>=<value>` assignments.

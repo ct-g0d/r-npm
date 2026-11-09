@@ -128,10 +128,16 @@ impl ManifestFormat {
         let trailing_newline = clean.ends_with('\n') || clean.ends_with('\r');
 
         let trimmed = clean.trim_start();
-        let indent = if let Some(after_bracket) = trimmed.strip_prefix('{').or_else(|| trimmed.strip_prefix('[')) {
+        let indent = if let Some(after_bracket) = trimmed
+            .strip_prefix('{')
+            .or_else(|| trimmed.strip_prefix('['))
+        {
             if let Some(nl_pos) = after_bracket.find('\n') {
                 let rest = &after_bracket[nl_pos + 1..];
-                let leading_ws: String = rest.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                let leading_ws: String = rest
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
                 if leading_ws.is_empty() {
                     "  ".to_string()
                 } else {
@@ -347,8 +353,8 @@ impl Manifest {
                 line: err.line(),
                 column: err.column(),
             })?;
-        let value: crate::ordered_json::OrderedJsonValue =
-            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+        let value: crate::ordered_json::OrderedJsonValue = serde_json::from_str(clean_str)
+            .map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
                 line: err.line(),
                 column: err.column(),
@@ -440,11 +446,13 @@ impl Manifest {
         let mut buf = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(format.indent.as_bytes());
         let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        value.serialize(&mut ser).map_err(|err| ManifestError::MalformedJson {
-            message: err.to_string(),
-            line: err.line(),
-            column: err.column(),
-        })?;
+        value
+            .serialize(&mut ser)
+            .map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
         let formatted = String::from_utf8(buf).map_err(|e| ManifestError::MalformedJson {
             message: e.to_string(),
             line: 0,
@@ -488,10 +496,16 @@ impl Manifest {
                 map.insert("name".to_string(), OrderedJsonValue::String(name.clone()));
             }
             if let Some(ref version) = self.version {
-                map.insert("version".to_string(), OrderedJsonValue::String(version.clone()));
+                map.insert(
+                    "version".to_string(),
+                    OrderedJsonValue::String(version.clone()),
+                );
             }
             if let Some(ref desc) = self.description {
-                map.insert("description".to_string(), OrderedJsonValue::String(desc.clone()));
+                map.insert(
+                    "description".to_string(),
+                    OrderedJsonValue::String(desc.clone()),
+                );
             }
             if let Some(ref main) = self.main {
                 map.insert("main".to_string(), OrderedJsonValue::String(main.clone()));
@@ -527,7 +541,10 @@ impl Manifest {
 
             if !self.peer_dependencies_meta.is_empty() {
                 let val = serde_json::to_value(&self.peer_dependencies_meta).unwrap_or_default();
-                map.insert("peerDependenciesMeta".to_string(), OrderedJsonValue::from(val));
+                map.insert(
+                    "peerDependenciesMeta".to_string(),
+                    OrderedJsonValue::from(val),
+                );
             } else {
                 map.shift_remove("peerDependenciesMeta");
             }

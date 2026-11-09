@@ -2462,20 +2462,49 @@ fn test_npm_package_environment_variables_flattening() {
     )
     .unwrap();
 
-    let ctx = LifecycleContext::new(temp.path(), &pkg_dir, "my-test-pkg", "build", "echo building");
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        &pkg_dir,
+        "my-test-pkg",
+        "build",
+        "echo building",
+    );
     let env = build_lifecycle_env(&ctx);
 
-    assert_eq!(env.get("npm_package_name").map(|s| s.as_str()), Some("my-test-pkg"));
-    assert_eq!(env.get("npm_package_version").map(|s| s.as_str()), Some("2.4.1"));
+    assert_eq!(
+        env.get("npm_package_name").map(|s| s.as_str()),
+        Some("my-test-pkg")
+    );
+    assert_eq!(
+        env.get("npm_package_version").map(|s| s.as_str()),
+        Some("2.4.1")
+    );
     assert_eq!(
         env.get("npm_package_description").map(|s| s.as_str()),
         Some("A package for testing lifecycle envs")
     );
-    assert_eq!(env.get("npm_package_config_port").map(|s| s.as_str()), Some("8080"));
-    assert_eq!(env.get("npm_package_config_active").map(|s| s.as_str()), Some("true"));
-    assert_eq!(env.get("npm_package_keywords_0").map(|s| s.as_str()), Some("fast"));
-    assert_eq!(env.get("npm_package_keywords_1").map(|s| s.as_str()), Some("rust"));
-    assert_eq!(env.get("npm_package_keywords_2").map(|s| s.as_str()), Some("npm"));
-    assert_eq!(env.get("npm_package_scripts_build").map(|s| s.as_str()), Some("echo building"));
+    assert_eq!(
+        env.get("npm_package_config_port").map(|s| s.as_str()),
+        Some("8080")
+    );
+    assert_eq!(
+        env.get("npm_package_config_active").map(|s| s.as_str()),
+        Some("true")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_0").map(|s| s.as_str()),
+        Some("fast")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_1").map(|s| s.as_str()),
+        Some("rust")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_2").map(|s| s.as_str()),
+        Some("npm")
+    );
+    assert_eq!(
+        env.get("npm_package_scripts_build").map(|s| s.as_str()),
+        Some("echo building")
+    );
 }
-

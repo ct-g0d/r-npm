@@ -727,7 +727,12 @@ pub fn build_dependency_tree(
 
     // Attach nested children to their respective parents
     let mut ancestors = Vec::new();
-    attach_nested_dependencies(&mut root.dependencies, &mut resolved_nodes_by_loc, &all_resolved_nodes, &mut ancestors);
+    attach_nested_dependencies(
+        &mut root.dependencies,
+        &mut resolved_nodes_by_loc,
+        &all_resolved_nodes,
+        &mut ancestors,
+    );
 
     Ok(root)
 }
@@ -790,7 +795,12 @@ fn attach_nested_dependencies(
             }
         }
         if !node.dependencies.is_empty() {
-            attach_nested_dependencies(&mut node.dependencies, resolved_by_loc, all_resolved_nodes, ancestors);
+            attach_nested_dependencies(
+                &mut node.dependencies,
+                resolved_by_loc,
+                all_resolved_nodes,
+                ancestors,
+            );
         }
 
         ancestors.pop();

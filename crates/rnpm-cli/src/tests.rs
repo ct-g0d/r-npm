@@ -791,7 +791,13 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
 fn test_cli_exec_parsing_package_flags() {
     // 1. Single -p with command and args (matching `rnpm exec -y -p typescript@5.4.5 tsc --version`)
     let cli = Cli::try_parse_from(vec![
-        "rnpm", "exec", "-y", "-p", "typescript@5.4.5", "tsc", "--version",
+        "rnpm",
+        "exec",
+        "-y",
+        "-p",
+        "typescript@5.4.5",
+        "tsc",
+        "--version",
     ])
     .unwrap();
     match cli.command {
@@ -812,7 +818,15 @@ fn test_cli_exec_parsing_package_flags() {
 
     // 2. Multiple -p flags with command (matching `rnpm exec -p a -p b cmd`)
     let cli = Cli::try_parse_from(vec![
-        "rnpm", "exec", "-p", "pkg-a@1.0.0", "-p", "pkg-b@2.0.0", "custom-bin", "arg1", "arg2",
+        "rnpm",
+        "exec",
+        "-p",
+        "pkg-a@1.0.0",
+        "-p",
+        "pkg-b@2.0.0",
+        "custom-bin",
+        "arg1",
+        "arg2",
     ])
     .unwrap();
     match cli.command {
@@ -853,7 +867,8 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
 
     let marker_file = project_dir.path().join("flag_exec_marker.txt");
     let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
-    let script = format!("require('fs').writeFileSync('{escaped_marker}', process.argv[2] || 'no-arg');\n");
+    let script =
+        format!("require('fs').writeFileSync('{escaped_marker}', process.argv[2] || 'no-arg');\n");
 
     let pkg_tar = make_tarball_with_bin("custom-tool-pkg", "1.0.0", "custom-runner", &script);
     let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
@@ -944,7 +959,10 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
     let npx_dir = cache_dir.path().join("_npx").join("custom-tool-pkg_1.0.0");
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
-    assert!(manifest_str.contains("custom-tool-pkg"), "Manifest must list custom-tool-pkg in dependencies");
+    assert!(
+        manifest_str.contains("custom-tool-pkg"),
+        "Manifest must list custom-tool-pkg in dependencies"
+    );
 
     let _ = tx.send(());
 }
@@ -963,7 +981,12 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
     let pkg_runner_tar = make_tarball_with_bin("pkg-runner", "1.0.0", "multi-runner", &script);
     let pkg_runner_int = Integrity::from_bytes(&pkg_runner_tar, Algorithm::Sha512).to_string();
 
-    let pkg_data_tar = make_tarball_with_file("pkg-data", "1.0.0", "data.json", r#"{"val":"multi-pkg-success"}"#);
+    let pkg_data_tar = make_tarball_with_file(
+        "pkg-data",
+        "1.0.0",
+        "data.json",
+        r#"{"val":"multi-pkg-success"}"#,
+    );
     let pkg_data_int = Integrity::from_bytes(&pkg_data_tar, Algorithm::Sha512).to_string();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1064,16 +1087,29 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
     };
 
     let res = run_cli(cli, Some(project_dir.path().to_path_buf())).await;
-    assert!(res.is_ok(), "Exec with multiple -p should succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "Exec with multiple -p should succeed: {:?}",
+        res.err()
+    );
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
     assert_eq!(marker_content.trim(), "multi-pkg-success");
 
-    let npx_dir = cache_dir.path().join("_npx").join("pkg-data_1.0.0_pkg-runner_1.0.0");
+    let npx_dir = cache_dir
+        .path()
+        .join("_npx")
+        .join("pkg-data_1.0.0_pkg-runner_1.0.0");
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
-    assert!(manifest_str.contains("pkg-data"), "Manifest must list pkg-data in dependencies");
-    assert!(manifest_str.contains("pkg-runner"), "Manifest must list pkg-runner in dependencies");
+    assert!(
+        manifest_str.contains("pkg-data"),
+        "Manifest must list pkg-data in dependencies"
+    );
+    assert!(
+        manifest_str.contains("pkg-runner"),
+        "Manifest must list pkg-runner in dependencies"
+    );
 
     let _ = tx.send(());
 }
@@ -2686,9 +2722,7 @@ fn test_cli_list_uninstall_prefix_and_global() {
     // 1. list -g and --prefix
     let cli = Cli::try_parse_from(["rnpm", "list", "-g"]).unwrap();
     match cli.command {
-        Commands::List {
-            global, prefix, ..
-        } => {
+        Commands::List { global, prefix, .. } => {
             assert!(global);
             assert!(prefix.is_none());
         }
@@ -2697,9 +2731,7 @@ fn test_cli_list_uninstall_prefix_and_global() {
 
     let cli = Cli::try_parse_from(["rnpm", "ls", "--prefix", "/custom/prefix"]).unwrap();
     match cli.command {
-        Commands::List {
-            global, prefix, ..
-        } => {
+        Commands::List { global, prefix, .. } => {
             assert!(!global);
             assert_eq!(prefix, Some(PathBuf::from("/custom/prefix")));
         }
@@ -2707,7 +2739,8 @@ fn test_cli_list_uninstall_prefix_and_global() {
     }
 
     // 2. uninstall --prefix
-    let cli = Cli::try_parse_from(["rnpm", "uninstall", "--prefix", "/custom/prefix", "cowsay"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["rnpm", "uninstall", "--prefix", "/custom/prefix", "cowsay"]).unwrap();
     match cli.command {
         Commands::Uninstall {
             global,

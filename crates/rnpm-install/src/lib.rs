@@ -247,12 +247,8 @@ fn package_metadata_from_manifest(m: &Manifest) -> Option<PackageMetadata> {
     let name = m.name.clone()?;
     let ver_str = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
     let bin = m.bin.as_ref().map(|b| match b {
-        rnpm_core::manifest::PackageBin::Single(s) => {
-            rnpm_lockfile::PackageBin::Single(s.clone())
-        }
-        rnpm_core::manifest::PackageBin::Map(map) => {
-            rnpm_lockfile::PackageBin::Map(map.clone())
-        }
+        rnpm_core::manifest::PackageBin::Single(s) => rnpm_lockfile::PackageBin::Single(s.clone()),
+        rnpm_core::manifest::PackageBin::Map(map) => rnpm_lockfile::PackageBin::Map(map.clone()),
     });
     let ver_meta = PackageVersionMetadata {
         name: name.clone(),
@@ -269,7 +265,11 @@ fn package_metadata_from_manifest(m: &Manifest) -> Option<PackageMetadata> {
         cpu: m.cpu.clone(),
         libc: m.libc.clone(),
         bin,
-        license: m.extra.get("license").and_then(|v| v.as_str()).map(str::to_owned),
+        license: m
+            .extra
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         engines: m.engines.clone(),
         has_install_script: m.scripts.contains_key("install")
             || m.scripts.contains_key("postinstall")
@@ -315,7 +315,8 @@ pub(crate) fn scan_global_packages(global_nm: &Path) -> HashMap<String, String> 
                     let pkg_json = pkg_dir.join("package.json");
                     if pkg_json.is_file() {
                         if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
-                            let pkg_name = pkg_m.name.unwrap_or_else(|| format!("{name}/{sub_name}"));
+                            let pkg_name =
+                                pkg_m.name.unwrap_or_else(|| format!("{name}/{sub_name}"));
                             let version = pkg_m.version.unwrap_or_else(|| "1.0.0".to_string());
                             installed.insert(pkg_name, format!("^{version}"));
                         }
@@ -411,7 +412,10 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
             n.clone()
         } else if let Some((_, n)) = graph.nodes.iter().find(|(l, n)| {
             !l.is_empty()
-                && !l.strip_prefix("node_modules/").unwrap_or("").contains("/node_modules/")
+                && !l
+                    .strip_prefix("node_modules/")
+                    .unwrap_or("")
+                    .contains("/node_modules/")
                 && (&n.install_name == top_pkg || &n.name == top_pkg)
         }) {
             n.clone()
@@ -466,9 +470,10 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
             if edge.from_location.is_empty() {
                 continue;
             }
-            if let (Some(from_new), Some(to_new)) =
-                (loc_map.get(&edge.from_location), loc_map.get(&edge.to_location))
-            {
+            if let (Some(from_new), Some(to_new)) = (
+                loc_map.get(&edge.from_location),
+                loc_map.get(&edge.to_location),
+            ) {
                 let mut new_edge = edge.clone();
                 new_edge.from_location = from_new.clone();
                 new_edge.to_location = to_new.clone();
@@ -1030,10 +1035,7 @@ fn collect_all_bin_dirs(
     all_dirs
 }
 
-fn cleanup_stale_shims(
-    node_modules_dir: &Path,
-    wanted_shims: &HashMap<PathBuf, HashSet<String>>,
-) {
+fn cleanup_stale_shims(node_modules_dir: &Path, wanted_shims: &HashMap<PathBuf, HashSet<String>>) {
     let all_bin_dirs = collect_all_bin_dirs(node_modules_dir, wanted_shims.keys().cloned());
     for bin_dir in all_bin_dirs {
         // Only clean directories ending with ".bin"
@@ -1111,7 +1113,13 @@ pub(crate) fn link_tree_bins(
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
                 let script_path = target_path.join(&script_rel);
-                link_single_pkg_bin(&target_path, &pkg_bin_dir, &bin_name, &script_rel, &script_path);
+                link_single_pkg_bin(
+                    &target_path,
+                    &pkg_bin_dir,
+                    &bin_name,
+                    &script_rel,
+                    &script_path,
+                );
 
                 wanted_set.insert(bin_name.clone());
                 wanted_set.insert(format!("{bin_name}.cmd"));
@@ -1143,7 +1151,13 @@ fn link_installed_pkg_bins(
     let t_bins = std::time::Instant::now();
     for (bin_name, script_rel) in pkg_manifest.bin_entries() {
         let script_path = target_path.join(&script_rel);
-        link_single_pkg_bin(target_path, pkg_bin_dir, &bin_name, &script_rel, &script_path);
+        link_single_pkg_bin(
+            target_path,
+            pkg_bin_dir,
+            &bin_name,
+            &script_rel,
+            &script_path,
+        );
     }
     collector.record_phase(Phase::Bins, t_bins.elapsed());
 }
@@ -1883,7 +1897,8 @@ impl Installer {
                     m.dev_dependencies.remove(&spec.name);
                     m.optional_dependencies.remove(&spec.name);
                 } else {
-                    m.dependencies.insert(spec.name.clone(), solver_spec.clone());
+                    m.dependencies
+                        .insert(spec.name.clone(), solver_spec.clone());
                     m.dev_dependencies.remove(&spec.name);
                     m.optional_dependencies.remove(&spec.name);
                     m.peer_dependencies.remove(&spec.name);
@@ -2160,7 +2175,10 @@ impl Installer {
         }
 
         for member in &workspace_members {
-            let pkg = lockfile.packages.entry(member.relative_path.clone()).or_default();
+            let pkg = lockfile
+                .packages
+                .entry(member.relative_path.clone())
+                .or_default();
             if pkg.version.is_none() {
                 pkg.version = member.manifest.version.clone();
             }
@@ -2169,12 +2187,18 @@ impl Installer {
             if !member.name.is_empty() {
                 let m_name = &member.name;
                 let link_loc = format!("node_modules/{m_name}");
-                let clean_rel = member.relative_path.strip_prefix("./").unwrap_or(&member.relative_path);
-                lockfile.packages.entry(link_loc).or_insert_with(|| LockfilePackage {
-                    resolved: Some(clean_rel.to_string()),
-                    link: Some(true),
-                    ..Default::default()
-                });
+                let clean_rel = member
+                    .relative_path
+                    .strip_prefix("./")
+                    .unwrap_or(&member.relative_path);
+                lockfile
+                    .packages
+                    .entry(link_loc)
+                    .or_insert_with(|| LockfilePackage {
+                        resolved: Some(clean_rel.to_string()),
+                        link: Some(true),
+                        ..Default::default()
+                    });
             }
         }
 
@@ -2209,7 +2233,10 @@ impl Installer {
             }
 
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
-            if !self.options.dry_run && self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global
+            if !self.options.dry_run
+                && self.options.package_lock_enabled()
+                && !self.options.no_save
+                && !self.options.is_global
             {
                 let _lock_guard = collector.enter_phase(Phase::Lockfile);
                 lockfile
@@ -3432,7 +3459,9 @@ impl Installer {
         for (dep_name, dep_spec) in &manifest.dependencies {
             if let Some(lock_spec) = lock_deps.get(dep_name) {
                 if lock_spec != dep_spec {
-                    let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                    let satisfies = if let Some(pkg) =
+                        lockfile.packages.get(&format!("node_modules/{dep_name}"))
+                    {
                         LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                     } else {
                         false
@@ -3460,7 +3489,9 @@ impl Installer {
             for (dep_name, dep_spec) in &manifest.dev_dependencies {
                 if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
                     if lock_spec != dep_spec {
-                        let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                        let satisfies = if let Some(pkg) =
+                            lockfile.packages.get(&format!("node_modules/{dep_name}"))
+                        {
                             LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                         } else {
                             false
@@ -3492,7 +3523,9 @@ impl Installer {
             for (dep_name, dep_spec) in &manifest.optional_dependencies {
                 if let Some(lock_spec) = lock_opt_deps.get(dep_name) {
                     if lock_spec != dep_spec {
-                        let satisfies = if let Some(pkg) = lockfile.packages.get(&format!("node_modules/{dep_name}")) {
+                        let satisfies = if let Some(pkg) =
+                            lockfile.packages.get(&format!("node_modules/{dep_name}"))
+                        {
                             LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
                         } else {
                             false
@@ -5885,7 +5918,9 @@ impl Installer {
             let mut removed = false;
 
             if target_root {
-                if (options.save_dev || target_all) && manifest.dev_dependencies.remove(pkg).is_some() {
+                if (options.save_dev || target_all)
+                    && manifest.dev_dependencies.remove(pkg).is_some()
+                {
                     removed = true;
                 }
 
@@ -5895,7 +5930,8 @@ impl Installer {
                     removed = true;
                 }
 
-                if (options.save_prod || target_all) && manifest.dependencies.remove(pkg).is_some() {
+                if (options.save_prod || target_all) && manifest.dependencies.remove(pkg).is_some()
+                {
                     removed = true;
                 }
 
@@ -6161,7 +6197,9 @@ impl Installer {
             for pkg in &removed_packages {
                 let pkg_key = format!("{prefix}{pkg}");
                 let nested_prefix = format!("{pkg_key}/node_modules/");
-                lockfile.packages.retain(|k, _| k != &pkg_key && !k.starts_with(&nested_prefix));
+                lockfile
+                    .packages
+                    .retain(|k, _| k != &pkg_key && !k.starts_with(&nested_prefix));
             }
             let _ = lockfile.save_hidden(&loc_base_dir);
         }

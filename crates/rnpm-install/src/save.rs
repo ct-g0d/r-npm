@@ -64,7 +64,9 @@ pub fn compute_save_spec(
         }
         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
         PackageTarget::Url(u) => u.to_string(),
-        PackageTarget::Alias { name: real_name, .. } => {
+        PackageTarget::Alias {
+            name: real_name, ..
+        } => {
             if save_exact {
                 format!("npm:{}@{}", real_name, resolved_version)
             } else {
@@ -91,11 +93,14 @@ pub fn insert_manifest_dep(
     save_peer: bool,
 ) {
     if save_dev {
-        m.dev_dependencies.insert(name.to_string(), spec.to_string());
+        m.dev_dependencies
+            .insert(name.to_string(), spec.to_string());
     } else if save_optional {
-        m.optional_dependencies.insert(name.to_string(), spec.to_string());
+        m.optional_dependencies
+            .insert(name.to_string(), spec.to_string());
     } else if save_peer {
-        m.peer_dependencies.insert(name.to_string(), spec.to_string());
+        m.peer_dependencies
+            .insert(name.to_string(), spec.to_string());
     } else {
         m.dependencies.insert(name.to_string(), spec.to_string());
     }
@@ -143,7 +148,8 @@ pub fn save_manifests(
     for &idx in targeted_indices {
         let member = &workspace_members[idx];
         let member_pkg_path = project_dir.join(&member.relative_path).join("package.json");
-        member.manifest
+        member
+            .manifest
             .save_to_file(&member_pkg_path)
             .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
     }

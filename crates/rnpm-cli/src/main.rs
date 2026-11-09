@@ -2251,11 +2251,16 @@ pub(crate) async fn execute_exec(
                 installer.run().await?;
 
                 // Now locate binary in npx_env_dir
-                if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
+                if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
+                {
                     target
-                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
+                } else if let Some(target) =
+                    rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name)
+                {
                     target
-                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
+                } else if let Some(target) =
+                    rnpm_lifecycle::find_local_binary(&npx_env_dir, command)
+                {
                     target
                 } else {
                     // Scan .bin folder in npx_env_dir for any executable
@@ -2347,9 +2352,13 @@ pub(crate) async fn execute_exec(
 
             if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
+            } else if let Some(target) =
+                rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name)
+            {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
+            } else if let Some(target) =
+                rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
+            {
                 target
             } else {
                 let bin_dir = npx_env_dir.join("node_modules").join(".bin");
@@ -4667,7 +4676,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         } => {
             if let Some(init_pkg) = initializer {
                 let transformed = init::transform_initializer(&init_pkg);
-                execute_exec(&current_dir, &transformed, &[], &args, registry, cache, offline).await?;
+                execute_exec(
+                    &current_dir,
+                    &transformed,
+                    &[],
+                    &args,
+                    registry,
+                    cache,
+                    offline,
+                )
+                .await?;
             } else {
                 let init_opts = init::InitOptions {
                     yes,

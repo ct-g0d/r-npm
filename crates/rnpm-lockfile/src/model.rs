@@ -1183,7 +1183,12 @@ impl LockfileV3 {
 
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
         if pkg.link == Some(true) {
-            return true;
+            if let Ok(target) = PackageTarget::parse(spec) {
+                match target {
+                    PackageTarget::File(_) | PackageTarget::Workspace(_) => return true,
+                    _ => {}
+                }
+            }
         }
         let Some(ref ver_str) = pkg.version else {
             return false;
@@ -1255,6 +1260,27 @@ impl LockfileV3 {
             };
             if lock_spec == manifest_spec {
                 continue;
+            }
+            // If lock spec is a Version and manifest spec is a Range, check satisfies
+            if let Ok(v) = Version::parse(lock_spec) {
+                if let Ok(r) = rnpm_core::semver::Range::parse(manifest_spec) {
+                    if r.satisfies(&v) {
+                        continue;
+                    }
+                }
+            }
+            // If lock spec is a Range and manifest spec is a Version, check satisfies
+            if let Ok(v) = Version::parse(manifest_spec) {
+                if let Ok(r) = rnpm_core::semver::Range::parse(lock_spec) {
+                    if r.satisfies(&v) {
+                        continue;
+                    }
+                }
+            }
+            // For other spec differences, verify whether resolved package in packages satisfies manifest spec,
+            // but ONLY if the lock spec itself was not a file/link/target that diverged.
+            if lock_spec.starts_with("file:") || manifest_spec.starts_with("file:") {
+                return false;
             }
             let key = format!("node_modules/{k}");
             let Some(pkg) = packages.get(&key) else {
@@ -1376,7 +1402,12 @@ impl LockfileV3 {
         }
         root.insert("packages".into(), serde_json::Value::Object(packages));
         let mut out = String::new();
-        stringify_npm_nice_indent(&serde_json::Value::Object(root), &format.indent, 0, &mut out);
+        stringify_npm_nice_indent(
+            &serde_json::Value::Object(root),
+            &format.indent,
+            0,
+            &mut out,
+        );
         if format.trailing_newline && !out.ends_with('\n') {
             out.push('\n');
         }
@@ -1423,7 +1454,12 @@ impl LockfileV3 {
                     root.insert("dependencies".into(), legacy);
                 }
                 let mut out = String::new();
-                stringify_npm_nice_indent(&serde_json::Value::Object(root), &format.indent, 0, &mut out);
+                stringify_npm_nice_indent(
+                    &serde_json::Value::Object(root),
+                    &format.indent,
+                    0,
+                    &mut out,
+                );
                 if format.trailing_newline && !out.ends_with('\n') {
                     out.push('\n');
                 }
