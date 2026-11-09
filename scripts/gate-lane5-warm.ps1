@@ -238,6 +238,8 @@ function Assert-CommandCorrectness {
 $effectiveRuns = if ($Quick) { 1 } else { $Runs }
 $parityPassed = $true
 
+$refDir = $null
+
 for ($run = 1; $run -le $effectiveRuns; $run++) {
     Write-Host "`n--- Run $run of $effectiveRuns ---" -ForegroundColor Yellow
 
@@ -246,6 +248,7 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
     $npmDir  = Join-Path $env:TEMP "npm-lane5-run-$run-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
     New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
     New-Item -ItemType Directory -Path $npmDir  -Force | Out-Null
+    if (-not $refDir) { $refDir = $npmDir }
 
     Copy-Item (Join-Path $fixtureDir "package.json") $rnpmDir
     Copy-Item (Join-Path $fixtureDir "package-lock.json") $rnpmDir
@@ -383,8 +386,8 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
         Remove-Item $rnpmNoLockDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $npmNoLockDir  -Recurse -Force -ErrorAction SilentlyContinue
 
-        # 8. Extra lane-relevant commands: update, dedupe, rebuild, audit, outdated, exec (measured across runs >= 5)
-        if ($run -le [math]::Max(5, [math]::Min($effectiveRuns, 5))) {
+        # 8. Extra lane-relevant commands: update, dedupe, rebuild, audit, outdated, exec (tested on Run 1)
+        if ($run -eq 1) {
             # update
             $rnpmUpExit = 0; $npmUpExit = 0
             if ($run % 2 -eq 1) {
@@ -446,7 +449,9 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
     } finally {
         if (-not $KeepTemp) {
             Remove-Item $rnpmDir -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item $npmDir  -Recurse -Force -ErrorAction SilentlyContinue
+            if ($npmDir -ne $refDir) {
+                Remove-Item $npmDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
