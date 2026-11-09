@@ -841,6 +841,7 @@ impl LockfileV3 {
                     let mut extra = manifest.extra.clone();
                     extra.remove("overrides");
                     extra.remove("directories");
+                    extra.remove("private");
                     if let Some(v) = extra.get("deprecated") {
                         if v == &serde_json::Value::Bool(false) || v.is_null() || v == "" {
                             extra.remove("deprecated");

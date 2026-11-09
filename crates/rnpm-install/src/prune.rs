@@ -681,7 +681,19 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             None
         }
     } else {
-        None
+        let manifest = Manifest::from_file(project_dir.join("package.json"))?;
+        // With no dependency graph to reconstruct, npm still saves a root lockfile.
+        if manifest.dependencies.is_empty()
+            && manifest.dev_dependencies.is_empty()
+            && manifest.optional_dependencies.is_empty()
+            && manifest.peer_dependencies.is_empty()
+            && manifest.workspace_patterns().is_empty()
+        {
+            LockfileV3::from_manifest(&manifest).save_to_file(&lockfile_path)?;
+            Some(lockfile_path)
+        } else {
+            None
+        }
     };
 
     Ok(PruneSummary {

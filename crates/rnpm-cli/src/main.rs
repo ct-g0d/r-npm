@@ -5084,6 +5084,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         None => std::env::current_dir()?,
     };
 
+    let silent = rnpm_config::Config::load(Some(&current_dir))?
+        .get("loglevel") == Some("silent");
+
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
         rnpm_install::trash::cleanup_leftover_trash(&current_dir);
@@ -5164,12 +5167,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
-                audit.unwrap_or(true)
+                audit.unwrap_or_else(|| config.get_bool("audit").unwrap_or(true))
             };
             let fund_val = if no_fund || fund == Some(false) {
                 false
             } else {
-                fund.unwrap_or(true)
+                fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
             };
             let target_dir = if let Some(p) = prefix {
                 if p.is_absolute() {
@@ -5256,24 +5259,26 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
 
-            if dry_run {
+            if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
-            } else {
-                println!(
-                    "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
-                    summary.packages_installed, summary.cache_hits, summary.cache_misses
-                );
+            } else if !dry_run {
+                if !silent {
+                    println!(
+                        "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
+                        summary.packages_installed, summary.cache_hits, summary.cache_misses
+                    );
 
-                if fund_val {
-                    let count = audit::count_funding_packages(&current_dir);
-                    if count > 0 {
-                        println!(
-                            "\n{} packages are looking for funding\n  run `rnpm fund`",
-                            count
-                        );
+                    if fund_val {
+                        let count = audit::count_funding_packages(&current_dir);
+                        if count > 0 {
+                            println!(
+                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                count
+                            );
+                        }
                     }
                 }
 
@@ -5353,12 +5358,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
-                audit.unwrap_or(true)
+                audit.unwrap_or_else(|| config.get_bool("audit").unwrap_or(true))
             };
             let fund_val = if no_fund || fund == Some(false) {
                 false
             } else {
-                fund.unwrap_or(true)
+                fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
             };
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
@@ -5403,24 +5408,26 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
 
-            if dry_run {
+            if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
-            } else {
-                println!(
-                    "rnpm: successfully verified and installed {} package(s) from lockfile",
-                    summary.packages_installed
-                );
+            } else if !dry_run {
+                if !silent {
+                    println!(
+                        "rnpm: successfully verified and installed {} package(s) from lockfile",
+                        summary.packages_installed
+                    );
 
-                if fund_val {
-                    let count = audit::count_funding_packages(&current_dir);
-                    if count > 0 {
-                        println!(
-                            "\n{} packages are looking for funding\n  run `rnpm fund`",
-                            count
-                        );
+                    if fund_val {
+                        let count = audit::count_funding_packages(&current_dir);
+                        if count > 0 {
+                            println!(
+                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                count
+                            );
+                        }
                     }
                 }
 
@@ -5766,11 +5773,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
             };
             let summary = installer.uninstall(&uninstall_options)?;
-            println!(
-                "rnpm: removed {} package(s), pruned {} unreferenced dependencies",
-                summary.removed_packages.len(),
-                summary.pruned_dependencies.len()
-            );
+            if !silent {
+                println!(
+                    "rnpm: removed {} package(s), pruned {} unreferenced dependencies",
+                    summary.removed_packages.len(),
+                    summary.pruned_dependencies.len()
+                );
+                }
         }
         Commands::Update {
             packages,
@@ -5791,6 +5800,24 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let effective_strict =
                 strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
 
+            // update() reads a newly written lockfile to construct its summary.
+            // Dry runs instead use the install simulation with the same unlock set.
+            let dry_run = config.get_bool("dry-run").unwrap_or(false);
+            let mut unlocked_packages = std::collections::HashSet::new();
+            if dry_run {
+                if packages.is_empty() {
+                    let manifest = Manifest::from_file(current_dir.join("package.json"))?;
+                    unlocked_packages.extend(manifest.dependencies.into_keys());
+                    unlocked_packages.extend(manifest.dev_dependencies.into_keys());
+                    unlocked_packages.extend(manifest.optional_dependencies.into_keys());
+                } else {
+                    for package in &packages {
+                        let name = package.rsplit("node_modules/").next().unwrap_or(package);
+                        unlocked_packages.insert(rnpm_core::spec::PackageSpec::parse(name)?.name);
+                    }
+                }
+            }
+
             let options = InstallOptions {
                 project_dir: current_dir,
                 registry_url: registry,
@@ -5801,13 +5828,24 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 strict_sandbox: effective_strict,
                 legacy_peer_deps,
                 strict_peer_deps,
+                dry_run,
+                unlocked_packages,
                 ..Default::default()
             };
 
             let mut installer = Installer::new(options)?;
+            if dry_run {
+                let summary = installer.run().await?;
+                if !silent {
+                    println!("rnpm: dry-run: would install {} package(s)", summary.packages_installed);
+                }
+                return Ok(());
+            }
             let summary = installer.update(&packages).await?;
 
-            if summary.packages_updated == 0 {
+            if silent {
+                return Ok(());
+            } else if summary.packages_updated == 0 {
                 println!("rnpm: up to date");
             } else {
                 for pkg in &summary.updated_packages {
@@ -5865,6 +5903,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 let analysis = installer.analyze_prune(&prune_options)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&analysis)?);
+                } else if silent {
+                    return Ok(());
                 } else if analysis.extraneous_packages.is_empty() {
                     println!("rnpm: dry-run: no packages would be pruned");
                 } else {
@@ -5880,6 +5920,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 let summary = installer.prune(&prune_options)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else if silent {
+                    return Ok(());
                 } else if summary.removed_packages.is_empty() {
                     println!("rnpm: no extraneous packages pruned");
                 } else {
