@@ -67,7 +67,7 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 
     if options.json {
         let json_val = format_tree_json(&root_node, effective_depth, options.long);
-        println!("{}", serde_json::to_string_pretty(&json_val)?);
+        println!("{}", serde_json::to_string_pretty(&ordered_node_json(&json_val))?);
     } else if options.parseable {
         let mut paths = Vec::new();
         let mut seen_paths = HashSet::new();
@@ -92,6 +92,25 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 }
 
 /// Recursively collects unique problem lines from a node and its descendants.
+fn ordered_node_json(value: &Value) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
+    let Some(map) = value.as_object() else {
+        return value.clone().into();
+    };
+    let mut ordered = OrderedJsonMap::new();
+    for key in ["version", "name", "resolved", "overridden", "required", "missing", "extraneous", "invalid", "deduped", "description", "license", "problems", "dependencies", "error"] {
+        if let Some(value) = map.get(key) {
+            let value = if key == "dependencies" {
+                OrderedJsonValue::Object(value.as_object().into_iter().flatten().map(|(name, child)| (name.clone(), ordered_node_json(child))).collect())
+            } else {
+                value.clone().into()
+            };
+            ordered.insert(key.to_string(), value);
+        }
+    }
+    OrderedJsonValue::Object(ordered)
+}
+
 fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     for p in &node.problems {
         if seen.insert(p.clone()) {
@@ -368,6 +387,9 @@ fn format_child_json(
     let mut map = serde_json::Map::new();
 
     if node.missing {
+        if node.optional {
+            return Value::Object(map);
+        }
         if let Some(req) = &node.required {
             map.insert("required".to_string(), Value::String(req.clone()));
         }

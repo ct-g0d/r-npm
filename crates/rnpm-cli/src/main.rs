@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
+mod explain;
 pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
@@ -6729,52 +6730,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Explain { package, json } => {
-            let lock = current_dir.join("package-lock.json");
-            let value = std::fs::read_to_string(lock)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-            let result = value
-                .as_ref()
-                .and_then(|v| v.get("packages"))
-                .and_then(|p| p.get(format!("node_modules/{package}")))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else if result.is_null() {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error No dependencies found matching {package}"
-                ));
-            } else {
-                let version = result
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let location = format!("node_modules/{package}");
-                println!("{package}@{version}");
-                println!("{location}");
-                let root_spec = value
-                    .as_ref()
-                    .and_then(|v| v.get("packages"))
-                    .and_then(|p| p.get(""))
-                    .and_then(|root| {
-                        [
-                            "dependencies",
-                            "optionalDependencies",
-                            "devDependencies",
-                            "peerDependencies",
-                        ]
-                        .iter()
-                        .find_map(|field| {
-                            root.get(*field)
-                                .and_then(|deps| deps.get(&package))
-                                .and_then(|spec| spec.as_str())
-                        })
-                    });
-                if let Some(spec) = root_spec {
-                    println!("  {package}@\"{spec}\" from the root project");
-                }
-            }
+            explain::run_explain(&current_dir, &package, json)?;
         }
         Commands::Bugs { packages, .. } => {
             for package in packages {
