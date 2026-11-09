@@ -103,6 +103,21 @@ Test-ManifestFidelity -Name "LF 2-space: install is-number@7" -InitialJson $lf2 
 $withDep = "{\r\n    `"name`": `"test-un`",\r\n    `"version`": `"1.0.0`",\r\n    `"dependencies`": {\r\n        `"is-number`": `"^7.0.0`"\r\n    }\r\n}\r\n"
 Test-ManifestFidelity -Name "CRLF 4-space: uninstall is-number" -InitialJson $withDep -NpmArgs @("uninstall", "is-number") -RnpmArgs @("uninstall", "is-number")
 
+$noNl = "{\n  `"name`": `"test-nonl`",\n  `"version`": `"1.0.0`"\n}"
+Test-ManifestFidelity -Name "No trailing newline: install is-number@7" -InitialJson $noNl -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
+
+$bomJson = [System.Text.Encoding]::UTF8.GetString([byte[]]@(0xEF, 0xBB, 0xBF)) + "{\n  `"name`": `"test-bom`",\n  `"version`": `"1.0.0`"\n}\n"
+Test-ManifestFidelity -Name "UTF-8 BOM preservation: install is-number@7" -InitialJson $bomJson -NpmArgs @("install", "is-number@7") -RnpmArgs @("install", "is-number@7")
+
+$verJson = "{\n  `"name`": `"test-ver`",\n  `"version`": `"1.0.0`"\n}\n"
+Test-ManifestFidelity -Name "npm version patch byte fidelity" -InitialJson $verJson -NpmArgs @("version", "patch", "--no-git-tag-version") -RnpmArgs @("version", "patch", "--no-git-tag-version")
+
+$pkgJson = "{\n  `"name`": `"test-pkg`",\n  `"version`": `"1.0.0`"\n}\n"
+Test-ManifestFidelity -Name "npm pkg set byte fidelity" -InitialJson $pkgJson -NpmArgs @("pkg", "set", "scripts.test=echo 1") -RnpmArgs @("pkg", "set", "scripts.test=echo 1")
+
+$pkgDelJson = "{\n  `"name`": `"test-pkg`",\n  `"version`": `"1.0.0`",\n  `"scripts`": {\n    `"test`": `"echo 1`"\n  }\n}\n"
+Test-ManifestFidelity -Name "npm pkg delete byte fidelity" -InitialJson $pkgDelJson -NpmArgs @("pkg", "delete", "scripts.test") -RnpmArgs @("pkg", "delete", "scripts.test")
+
 # ==============================================================================
 # GATE 2: Workspaces install & uninstall parity (-w, --workspaces)
 # ==============================================================================
@@ -135,6 +150,23 @@ function Test-WorkspaceParity {
         Set-Content (Join-Path $targetDir "packages\b\package.json") $pkgB
     }
 
+    function Diff-LockfilePackages([string]$dir1, [string]$dir2) {
+        $nodeDiff = @"
+const fs = require('fs');
+const assert = require('assert');
+try {
+  const p1 = JSON.parse(fs.readFileSync(process.argv[1] + '/package-lock.json', 'utf8'));
+  const p2 = JSON.parse(fs.readFileSync(process.argv[2] + '/package-lock.json', 'utf8'));
+  assert.deepStrictEqual(p1.packages, p2.packages);
+  process.exit(0);
+} catch (e) {
+  process.exit(1);
+}
+"@
+        & node -e $nodeDiff $dir1 $dir2 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    }
+
     try {
         Setup-WsTree $npmDir
         Setup-WsTree $rnpmDir
@@ -155,14 +187,11 @@ function Test-WorkspaceParity {
 
         $matchA = ($aNpm -eq $aRnpm)
         $matchRoot = ($rootNpm -eq $rootRnpm)
+        $diffPkgs1 = Diff-LockfilePackages $npmDir $rnpmDir
+
         Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (member package.json byte match)" -Passed $matchA -Details "packages/a/package.json match: $matchA"
         Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (root package.json untouched byte match)" -Passed $matchRoot -Details "root package.json match: $matchRoot"
-
-        # Check lockfile packages["packages/a"].dependencies has is-number
-        $nodeCheck = "const fs = require('fs'); const r = JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const n = JSON.parse(fs.readFileSync(process.argv[2],'utf8')); const rs = r.packages['packages/a']?.dependencies?.['is-number']; const ns = n.packages['packages/a']?.dependencies?.['is-number']; process.exit((rs === ns && !!rs) ? 0 : 1);"
-        & node -e $nodeCheck (Join-Path $rnpmDir "package-lock.json") (Join-Path $npmDir "package-lock.json") 2>&1 | Out-Null
-        $lockMatch = ($LASTEXITCODE -eq 0)
-        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (lockfile packages/a spec match)" -Passed $lockMatch -Details "packages/a spec match: $lockMatch"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 -w a (full lockfile packages section deep equality)" -Passed $diffPkgs1 -Details "full packages diff equal: $diffPkgs1"
 
         # 2. uninstall is-number -w a
         Push-Location $npmDir
@@ -175,8 +204,15 @@ function Test-WorkspaceParity {
 
         $aNpmUn = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\a\package.json"))
         $aRnpmUn = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\a\package.json"))
-        $matchUn = ($aNpmUn -eq $aRnpmUn)
-        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (member package.json byte match)" -Passed $matchUn -Details "packages/a/package.json match after uninstall: $matchUn"
+        $rootNpmUn = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
+        $rootRnpmUn = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
+        $diffPkgs2 = Diff-LockfilePackages $npmDir $rnpmDir
+
+        $matchUnA = ($aNpmUn -eq $aRnpmUn)
+        $matchUnRoot = ($rootNpmUn -eq $rootRnpmUn)
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (member package.json byte match)" -Passed $matchUnA -Details "packages/a/package.json match after uninstall: $matchUnA"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (root package.json untouched byte match)" -Passed $matchUnRoot -Details "root package.json match after uninstall: $matchUnRoot"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "uninstall is-number -w a (full lockfile packages section deep equality)" -Passed $diffPkgs2 -Details "full packages diff equal: $diffPkgs2"
 
         # 3. install is-number@7 --workspaces
         Push-Location $npmDir
@@ -191,9 +227,32 @@ function Test-WorkspaceParity {
         $aRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\a\package.json"))
         $bNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir "packages\b\package.json"))
         $bRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "packages\b\package.json"))
+        $rootNpmWs = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
+        $rootRnpmWs = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
+        $diffPkgs3 = Diff-LockfilePackages $npmDir $rnpmDir
 
         $matchAllWs = ($aNpmWs -eq $aRnpmWs) -and ($bNpmWs -eq $bRnpmWs)
+        $matchWsRoot = ($rootNpmWs -eq $rootRnpmWs)
         Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (all members byte match)" -Passed $matchAllWs -Details "a match: $($aNpmWs -eq $aRnpmWs), b match: $($bNpmWs -eq $bRnpmWs)"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (root package.json byte match)" -Passed $matchWsRoot -Details "root package.json match: $matchWsRoot"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --workspaces (full lockfile packages section deep equality)" -Passed $diffPkgs3 -Details "full packages diff equal: $diffPkgs3"
+
+        # 4. install is-number@7 --include-workspace-root
+        Push-Location $npmDir
+        & npm.cmd install is-number@7 --include-workspace-root 2>&1 | Out-Null
+        Pop-Location
+
+        Push-Location $rnpmDir
+        & $rnpmBin install is-number@7 --include-workspace-root 2>&1 | Out-Null
+        Pop-Location
+
+        $rootNpmInc = [System.IO.File]::ReadAllText((Join-Path $npmDir "package.json"))
+        $rootRnpmInc = [System.IO.File]::ReadAllText((Join-Path $rnpmDir "package.json"))
+        $diffPkgs4 = Diff-LockfilePackages $npmDir $rnpmDir
+        $matchIncRoot = ($rootNpmInc -eq $rootRnpmInc)
+
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (root package.json byte match)" -Passed $matchIncRoot -Details "root package.json match: $matchIncRoot"
+        Record-Result -Gate "Gate 2: Workspaces" -Name "install is-number@7 --include-workspace-root (full lockfile packages section deep equality)" -Passed $diffPkgs4 -Details "full packages diff equal: $diffPkgs4"
 
     } finally {
         if (-not $KeepTemp) {
@@ -208,86 +267,104 @@ Test-WorkspaceParity
 # ==============================================================================
 Write-Host "`n>>> GATE 3: CI lockfile validation <<<" -ForegroundColor Yellow
 
-function Test-CiLockfileValidation {
+function Test-CiScenarioParity {
+    param(
+        [string]$Name,
+        [scriptblock]$SetupBlock
+    )
+
     $tempBase = Join-Path $env:TEMP ("gate2-ci-" + [Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $tempBase -Force | Out-Null
+    $npmDir = Join-Path $tempBase "npm"
+    $rnpmDir = Join-Path $tempBase "rnpm"
+    New-Item -ItemType Directory -Path $npmDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
 
     try {
-        # Generate lockfile with is-number ^7.0.0
-        $pkgJson = @{
-            name = "ci-test"
-            version = "1.0.0"
-            dependencies = @{
-                "is-number" = "^7.0.0"
-            }
-        } | ConvertTo-Json
-        Set-Content -Path (Join-Path $tempBase "package.json") -Value $pkgJson
-
-        Push-Location $tempBase
-        & npm.cmd install --package-lock-only 2>&1 | Out-Null
-        Pop-Location
-
-        # Case A: package.json has exact "7.0.0", lockfile has "^7.0.0"
-        $pkgJsonExact = @{
-            name = "ci-test"
-            version = "1.0.0"
-            dependencies = @{
-                "is-number" = "7.0.0"
-            }
-        } | ConvertTo-Json
-        Set-Content -Path (Join-Path $tempBase "package.json") -Value $pkgJsonExact
-
-        $npmDir = Join-Path $env:TEMP ("gate2-ci-npm-" + [Guid]::NewGuid().ToString("N"))
-        $rnpmDir = Join-Path $env:TEMP ("gate2-ci-rnpm-" + [Guid]::NewGuid().ToString("N"))
-        Copy-Item -Recurse $tempBase $npmDir
-        Copy-Item -Recurse $tempBase $rnpmDir
+        & $SetupBlock $npmDir
+        & $SetupBlock $rnpmDir
 
         Push-Location $npmDir
         & npm.cmd ci 2>&1 | Out-Null
-        $npmExitA = $LASTEXITCODE
+        $npmCode = $LASTEXITCODE
         Pop-Location
 
         Push-Location $rnpmDir
         & $rnpmBin ci 2>&1 | Out-Null
-        $rnpmExitA = $LASTEXITCODE
+        $rnpmCode = $LASTEXITCODE
         Pop-Location
 
-        $passA = ($npmExitA -eq 0 -and $rnpmExitA -eq 0)
-        Record-Result -Gate "Gate 3: CI" -Name "CI exact package.json vs range lockfile exits 0" -Passed $passA -Details "npm: $npmExitA, rnpm: $rnpmExitA"
-
-        # Case B: package.json has incompatible "8.0.0", lockfile has "^7.0.0"
-        $pkgJsonMismatch = @{
-            name = "ci-test"
-            version = "1.0.0"
-            dependencies = @{
-                "is-number" = "8.0.0"
-            }
-        } | ConvertTo-Json
-        Set-Content -Path (Join-Path $npmDir "package.json") -Value $pkgJsonMismatch
-        Set-Content -Path (Join-Path $rnpmDir "package.json") -Value $pkgJsonMismatch
-
-        Push-Location $npmDir
-        & npm.cmd ci 2>&1 | Out-Null
-        $npmExitB = $LASTEXITCODE
-        Pop-Location
-
-        Push-Location $rnpmDir
-        & $rnpmBin ci 2>&1 | Out-Null
-        $rnpmExitB = $LASTEXITCODE
-        Pop-Location
-
-        $passB = ($npmExitB -ne 0 -and $rnpmExitB -ne 0)
-        Record-Result -Gate "Gate 3: CI" -Name "CI spec mismatch exits non-zero" -Passed $passB -Details "npm: $npmExitB, rnpm: $rnpmExitB"
-
-        Remove-Item -Recurse -Force $npmDir -ErrorAction SilentlyContinue
-        Remove-Item -Recurse -Force $rnpmDir -ErrorAction SilentlyContinue
+        $passed = ($npmCode -eq 0 -and $rnpmCode -eq 0) -or ($npmCode -ne 0 -and $rnpmCode -ne 0)
+        Record-Result -Gate "Gate 3: CI" -Name $Name -Passed $passed -Details "npm: $npmCode, rnpm: $rnpmCode"
     } finally {
         if (-not $KeepTemp) {
             Remove-Item -Recurse -Force $tempBase -ErrorAction SilentlyContinue
         }
     }
 }
-Test-CiLockfileValidation
+
+Test-CiScenarioParity -Name "CI: 1. exact package.json vs range lockfile (exit 0)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+}
+
+Test-CiScenarioParity -Name "CI: 2. incompatible version mismatch (exit non-zero)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^6.0.0"}}'
+}
+
+Test-CiScenarioParity -Name "CI: 3. dep in package.json missing from lock (exit non-zero)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0","is-odd":"^3.0.1"}}'
+}
+
+Test-CiScenarioParity -Name "CI: 4. dep removed from package.json but in lockfile (exit 0)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0"}'
+}
+
+Test-CiScenarioParity -Name "CI: 5. devDependencies version mismatch (exit non-zero)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","devDependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","devDependencies":{"is-number":"^6.0.0"}}'
+}
+
+Test-CiScenarioParity -Name "CI: 6. npm: alias spec (exit 0)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"my-num":"npm:is-number@^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+}
+
+Test-CiScenarioParity -Name "CI: 7. file: spec (exit 0)" -SetupBlock {
+    param($dir)
+    $localPkg = Join-Path $dir "local-pkg"
+    New-Item -ItemType Directory -Path $localPkg -Force | Out-Null
+    Set-Content (Join-Path $localPkg "package.json") '{"name":"local-pkg","version":"1.0.0"}'
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"local-pkg":"file:local-pkg"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+}
+
+Test-CiScenarioParity -Name "CI: 8. lockfile root spec differs & node_modules missing (exit non-zero)" -SetupBlock {
+    param($dir)
+    Set-Content (Join-Path $dir "package.json") '{"name":"t","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}'
+    Push-Location $dir; & npm.cmd install --package-lock-only 2>&1 | Out-Null; Pop-Location
+    $lockPath = Join-Path $dir "package-lock.json"
+    $nodeScript = @"
+const fs = require('fs');
+const lock = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+delete lock.packages['node_modules/is-number'];
+lock.packages[''].dependencies['is-number'] = '7.0.0';
+fs.writeFileSync(process.argv[1], JSON.stringify(lock, null, 2));
+"@
+    & node -e $nodeScript $lockPath
+}
 
 # ==============================================================================
 # GATE 4: ls --all on project-486 (exit code 0 and stdout parity)
@@ -344,6 +421,17 @@ Test-LsParity
 # ==============================================================================
 Write-Host "`n>>> GATE 5: Speed benchmarks <<<" -ForegroundColor Yellow
 
+function Get-Median([double[]]$Values) {
+    $sorted = $Values | Sort-Object
+    $count = $sorted.Count
+    if ($count % 2 -eq 1) {
+        return $sorted[[Math]::Floor($count / 2)]
+    } else {
+        $mid = [int]($count / 2)
+        return ($sorted[$mid - 1] + $sorted[$mid]) / 2.0
+    }
+}
+
 function Test-SpeedBenchmarks {
     $fixtureDir = Join-Path $repoRoot "benchmarks\fixtures\project-486"
     $tempDir = Join-Path $env:TEMP ("gate2-speed-" + [Guid]::NewGuid().ToString("N"))
@@ -354,53 +442,62 @@ function Test-SpeedBenchmarks {
         Push-Location $tempDir
         & $rnpmBin ci 2>&1 | Out-Null
 
-        # No-op install measurement
+        # No-op install measurement: 6 runs (run 0 warmup, runs 1-5 measured, true median)
+        # Cache state: npm cache warm (populated local cache environment)
         $rnpmInstallTimes = @()
-        for ($i = 0; $i -lt 3; $i++) {
+        for ($i = 0; $i -lt 6; $i++) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             & $rnpmBin install 2>&1 | Out-Null
             $sw.Stop()
-            $rnpmInstallTimes += $sw.Elapsed.TotalMilliseconds
+            if ($i -gt 0) {
+                $rnpmInstallTimes += $sw.Elapsed.TotalMilliseconds
+            }
         }
 
         $npmInstallTimes = @()
-        for ($i = 0; $i -lt 3; $i++) {
+        for ($i = 0; $i -lt 6; $i++) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             & npm.cmd install 2>&1 | Out-Null
             $sw.Stop()
-            $npmInstallTimes += $sw.Elapsed.TotalMilliseconds
+            if ($i -gt 0) {
+                $npmInstallTimes += $sw.Elapsed.TotalMilliseconds
+            }
         }
 
-        $rnpmInstallMed = ($rnpmInstallTimes | Measure-Object -Average).Average
-        $npmInstallMed = ($npmInstallTimes | Measure-Object -Average).Average
+        $rnpmInstallMed = Get-Median $rnpmInstallTimes
+        $npmInstallMed = Get-Median $npmInstallTimes
         $installRatio = $npmInstallMed / [Math]::Max(1.0, $rnpmInstallMed)
 
         $passInstall = ($installRatio -ge 3.0)
-        Record-Result -Gate "Gate 5: Speed" -Name "No-op install >= 3x faster than npm" -Passed $passInstall -Details ("rnpm: {0:N1}ms, npm: {1:N1}ms -> {2:N2}x faster" -f $rnpmInstallMed, $npmInstallMed, $installRatio)
+        Record-Result -Gate "Gate 5: Speed" -Name "No-op install >= 3x faster than npm (median over 5 runs, warm cache)" -Passed $passInstall -Details ("rnpm: {0:N1}ms, npm: {1:N1}ms -> {2:N2}x faster" -f $rnpmInstallMed, $npmInstallMed, $installRatio)
 
-        # LS measurement
+        # LS measurement: 6 runs (run 0 warmup, runs 1-5 measured, true median)
         $rnpmLsTimes = @()
-        for ($i = 0; $i -lt 3; $i++) {
+        for ($i = 0; $i -lt 6; $i++) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             & $rnpmBin ls 2>&1 | Out-Null
             $sw.Stop()
-            $rnpmLsTimes += $sw.Elapsed.TotalMilliseconds
+            if ($i -gt 0) {
+                $rnpmLsTimes += $sw.Elapsed.TotalMilliseconds
+            }
         }
 
         $npmLsTimes = @()
-        for ($i = 0; $i -lt 3; $i++) {
+        for ($i = 0; $i -lt 6; $i++) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             & npm.cmd ls 2>&1 | Out-Null
             $sw.Stop()
-            $npmLsTimes += $sw.Elapsed.TotalMilliseconds
+            if ($i -gt 0) {
+                $npmLsTimes += $sw.Elapsed.TotalMilliseconds
+            }
         }
 
-        $rnpmLsMed = ($rnpmLsTimes | Measure-Object -Average).Average
-        $npmLsMed = ($npmLsTimes | Measure-Object -Average).Average
+        $rnpmLsMed = Get-Median $rnpmLsTimes
+        $npmLsMed = Get-Median $npmLsTimes
         $lsRatio = $npmLsMed / [Math]::Max(1.0, $rnpmLsMed)
 
         $passLs = ($lsRatio -ge 2.0)
-        Record-Result -Gate "Gate 5: Speed" -Name "ls >= 2x faster than npm" -Passed $passLs -Details ("rnpm: {0:N1}ms, npm: {1:N1}ms -> {2:N2}x faster" -f $rnpmLsMed, $npmLsMed, $lsRatio)
+        Record-Result -Gate "Gate 5: Speed" -Name "ls >= 2x faster than npm (median over 5 runs, warm cache)" -Passed $passLs -Details ("rnpm: {0:N1}ms, npm: {1:N1}ms -> {2:N2}x faster" -f $rnpmLsMed, $npmLsMed, $lsRatio)
 
         Pop-Location
     } finally {
