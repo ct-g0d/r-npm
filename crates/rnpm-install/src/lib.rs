@@ -3514,8 +3514,8 @@ impl Installer {
             }
         }
 
-        // 4. Comprehensive lockfile validation via matches_manifest
-        if !lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
+        // 4. Comprehensive lockfile validation via matches_manifest_for_ci
+        if !lockfile.matches_manifest_for_ci(&manifest, !self.options.omit_dev) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name

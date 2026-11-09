@@ -16,7 +16,8 @@ pub mod workspace;
 pub use error::{CoreError, IntegrityError, ManifestError, SemverError, SpecError, WorkspaceError};
 pub use integrity::{Algorithm, Integrity, IntegrityEntry};
 pub use manifest::{
-    BundledDependencies, Manifest, PackageBin, PackageWorkspaces, PeerDependencyMeta,
+    BundledDependencies, Manifest, ManifestFormat, PackageBin, PackageWorkspaces,
+    PeerDependencyMeta,
 };
 pub use ordered_json::{OrderedJsonMap, OrderedJsonValue};
 pub use pkg::{

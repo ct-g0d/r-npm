@@ -1029,6 +1029,23 @@ impl LockfileV3 {
         manifest: &rnpm_core::manifest::Manifest,
         include_dev: bool,
     ) -> bool {
+        self.matches_manifest_ext(manifest, include_dev, false)
+    }
+
+    pub fn matches_manifest_for_ci(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+    ) -> bool {
+        self.matches_manifest_ext(manifest, include_dev, true)
+    }
+
+    pub fn matches_manifest_ext(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+        allow_extra_lock_deps: bool,
+    ) -> bool {
         let Some(root_pkg) = self.root_package() else {
             return false;
         };
@@ -1052,12 +1069,23 @@ impl LockfileV3 {
         }
 
         // 1. Check dependencies
-        if !Self::map_matches(&self.packages, &manifest.dependencies, &root_pkg.dependencies) {
+        if !Self::map_matches(
+            &self.packages,
+            &manifest.dependencies,
+            &root_pkg.dependencies,
+            allow_extra_lock_deps,
+        ) {
             return false;
         }
 
         // 2. Check devDependencies
-        if include_dev && !Self::map_matches(&self.packages, &manifest.dev_dependencies, &root_pkg.dev_dependencies)
+        if include_dev
+            && !Self::map_matches(
+                &self.packages,
+                &manifest.dev_dependencies,
+                &root_pkg.dev_dependencies,
+                allow_extra_lock_deps,
+            )
         {
             return false;
         }
@@ -1067,12 +1095,18 @@ impl LockfileV3 {
             &self.packages,
             &manifest.optional_dependencies,
             &root_pkg.optional_dependencies,
+            allow_extra_lock_deps,
         ) {
             return false;
         }
 
         // 4. Check peerDependencies
-        if !Self::map_matches(&self.packages, &manifest.peer_dependencies, &root_pkg.peer_dependencies) {
+        if !Self::map_matches(
+            &self.packages,
+            &manifest.peer_dependencies,
+            &root_pkg.peer_dependencies,
+            allow_extra_lock_deps,
+        ) {
             return false;
         }
 
@@ -1206,9 +1240,14 @@ impl LockfileV3 {
         packages: &std::collections::BTreeMap<String, LockfilePackage>,
         manifest_map: &std::collections::BTreeMap<String, String>,
         lock_map: &Option<std::collections::BTreeMap<String, String>>,
+        allow_extra_lock_deps: bool,
     ) -> bool {
         let empty_lock = std::collections::BTreeMap::new();
         let lock = lock_map.as_ref().unwrap_or(&empty_lock);
+
+        if !allow_extra_lock_deps && manifest_map.len() != lock.len() {
+            return false;
+        }
 
         for (k, manifest_spec) in manifest_map {
             let Some(lock_spec) = lock.get(k) else {
@@ -1308,12 +1347,61 @@ impl LockfileV3 {
         Ok(lf_json)
     }
 
+    pub fn to_json_string_formatted(
+        &self,
+        format: &rnpm_core::ManifestFormat,
+    ) -> Result<String, LockfileError> {
+        let mut root = serde_json::Map::new();
+        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        if let Some(v) = &self.version {
+            root.insert("version".into(), serde_json::Value::String(v.clone()));
+        }
+        root.insert(
+            "lockfileVersion".into(),
+            serde_json::Value::Number(self.lockfile_version.into()),
+        );
+        if let Some(r) = self.requires {
+            root.insert("requires".into(), serde_json::Value::Bool(r));
+        }
+        let mut packages = serde_json::Map::new();
+        for (k, v) in &self.packages {
+            let mut pkg = v.clone();
+            pkg.normalize_flags();
+            let pkg_val = if let Some(ref raw) = pkg.raw_value {
+                raw.clone()
+            } else {
+                serde_json::to_value(&pkg)?
+            };
+            packages.insert(to_posix_path(k), pkg_val);
+        }
+        root.insert("packages".into(), serde_json::Value::Object(packages));
+        let mut out = String::new();
+        stringify_npm_nice_indent(&serde_json::Value::Object(root), &format.indent, 0, &mut out);
+        if format.trailing_newline && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let final_json = if format.newline == "\r\n" {
+            out.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            out.replace("\r\n", "\n")
+        };
+        Ok(final_json)
+    }
+
     /// Serialize using npm's requested lockfile format.  The resolver keeps a
     /// single v3 graph internally, then projects it to the legacy v1/v2
     /// representations only at the filesystem boundary.
     pub fn to_json_string_version(&self, version: u32) -> Result<String, LockfileError> {
+        self.to_json_string_version_formatted(version, &rnpm_core::ManifestFormat::default())
+    }
+
+    pub fn to_json_string_version_formatted(
+        &self,
+        version: u32,
+        format: &rnpm_core::ManifestFormat,
+    ) -> Result<String, LockfileError> {
         match version {
-            3 => self.to_json_string(),
+            3 => self.to_json_string_formatted(format),
             1 | 2 => {
                 let mut root = serde_json::Map::new();
                 root.insert("name".into(), serde_json::Value::String(self.name.clone()));
@@ -1334,11 +1422,17 @@ impl LockfileV3 {
                     root.insert("packages".into(), packages);
                     root.insert("dependencies".into(), legacy);
                 }
-                let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
-                if !out.ends_with('\n') {
+                let mut out = String::new();
+                stringify_npm_nice_indent(&serde_json::Value::Object(root), &format.indent, 0, &mut out);
+                if format.trailing_newline && !out.ends_with('\n') {
                     out.push('\n');
                 }
-                Ok(out)
+                let final_json = if format.newline == "\r\n" {
+                    out.replace("\r\n", "\n").replace('\n', "\r\n")
+                } else {
+                    out.replace("\r\n", "\n")
+                };
+                Ok(final_json)
             }
             other => Err(LockfileError::UnsupportedVersion(other)),
         }
@@ -1346,12 +1440,10 @@ impl LockfileV3 {
 
     /// Save using npm lockfile-version semantics (1, 2, or 3).
     pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
-        let mut content = self.to_json_string_version(version)?;
-
-        let uses_crlf = if path.exists() {
-            std::fs::read(path)
-                .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                .unwrap_or(false)
+        let format = if path.exists() {
+            std::fs::read_to_string(path)
+                .map(|s| rnpm_core::ManifestFormat::detect(&s))
+                .unwrap_or_default()
         } else if let Some(parent) = path.parent() {
             let root_dir = if parent.ends_with("node_modules") {
                 parent.parent().unwrap_or(parent)
@@ -1362,27 +1454,25 @@ impl LockfileV3 {
             let sw_path = root_dir.join("npm-shrinkwrap.json");
             let pkg_json = root_dir.join("package.json");
             if lock_path.exists() {
-                std::fs::read(&lock_path)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
+                std::fs::read_to_string(&lock_path)
+                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
+                    .unwrap_or_default()
             } else if sw_path.exists() {
-                std::fs::read(&sw_path)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
+                std::fs::read_to_string(&sw_path)
+                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
+                    .unwrap_or_default()
             } else if pkg_json.exists() {
-                std::fs::read(&pkg_json)
-                    .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-                    .unwrap_or(false)
+                std::fs::read_to_string(&pkg_json)
+                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
+                    .unwrap_or_default()
             } else {
-                false
+                rnpm_core::ManifestFormat::default()
             }
         } else {
-            false
+            rnpm_core::ManifestFormat::default()
         };
 
-        if uses_crlf {
-            content = content.replace("\r\n", "\n").replace('\n', "\r\n");
-        }
+        let content = self.to_json_string_version_formatted(version, &format)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1672,13 +1762,22 @@ const SW_KEY_ORDER: &[&str] = &[
     "dependencies",
 ];
 
-fn indent_spaces(out: &mut String, level: usize) {
+fn indent_spaces(out: &mut String, indent: &str, level: usize) {
     for _ in 0..level {
-        out.push_str("  ");
+        out.push_str(indent);
     }
 }
 
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
+    stringify_npm_nice_indent(val, "  ", indent_level, out);
+}
+
+pub(crate) fn stringify_npm_nice_indent(
+    val: &serde_json::Value,
+    indent: &str,
+    indent_level: usize,
+    out: &mut String,
+) {
     match val {
         serde_json::Value::Null => out.push_str("null"),
         serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -1692,14 +1791,14 @@ pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, o
             } else {
                 out.push_str("[\n");
                 for (i, item) in arr.iter().enumerate() {
-                    indent_spaces(out, indent_level + 1);
-                    stringify_npm_nice(item, indent_level + 1, out);
+                    indent_spaces(out, indent, indent_level + 1);
+                    stringify_npm_nice_indent(item, indent, indent_level + 1, out);
                     if i + 1 < arr.len() {
                         out.push(',');
                     }
                     out.push('\n');
                 }
-                indent_spaces(out, indent_level);
+                indent_spaces(out, indent, indent_level);
                 out.push(']');
             }
         }
@@ -1734,16 +1833,16 @@ pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, o
                 });
 
                 for (i, (k, v)) in entries.iter().enumerate() {
-                    indent_spaces(out, indent_level + 1);
+                    indent_spaces(out, indent, indent_level + 1);
                     out.push_str(&serde_json::to_string(k).unwrap_or_default());
                     out.push_str(": ");
-                    stringify_npm_nice(v, indent_level + 1, out);
+                    stringify_npm_nice_indent(v, indent, indent_level + 1, out);
                     if i + 1 < entries.len() {
                         out.push(',');
                     }
                     out.push('\n');
                 }
-                indent_spaces(out, indent_level);
+                indent_spaces(out, indent, indent_level);
                 out.push('}');
             }
         }
