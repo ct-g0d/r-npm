@@ -180,6 +180,7 @@ pub struct ParallelWriterConfig {
     pub worker_threads: usize,
     pub is_hdd: bool,
     pub preallocate_threshold: usize,
+    pub skip_existing_matching: bool,
 }
 
 impl Default for ParallelWriterConfig {
@@ -188,6 +189,7 @@ impl Default for ParallelWriterConfig {
             worker_threads: 0,
             is_hdd: false,
             preallocate_threshold: 64 * 1024, // 64 KiB
+            skip_existing_matching: false,
         }
     }
 }
@@ -218,6 +220,7 @@ pub fn determine_writer_config(
         worker_threads: threads,
         is_hdd,
         preallocate_threshold: 64 * 1024,
+        skip_existing_matching: false,
     }
 }
 
@@ -597,11 +600,6 @@ pub fn copy_file_fast_buf(
     dst_buf: &mut Vec<u16>,
 ) -> std::io::Result<()> {
     extern "system" {
-        fn CreateHardLinkW(
-            lpFileName: *const u16,
-            lpExistingFileName: *const u16,
-            lpSecurityAttributes: *mut std::ffi::c_void,
-        ) -> i32;
         fn CopyFileExW(
             lpExistingFileName: *const u16,
             lpNewFileName: *const u16,
@@ -615,14 +613,6 @@ pub fn copy_file_fast_buf(
 
     path_to_wide_buf(source, src_buf);
     path_to_wide_buf(destination, dst_buf);
-
-    // Try hardlink first (instant MFT entry creation on same volume)
-    let link_ret = unsafe {
-        CreateHardLinkW(dst_buf.as_ptr(), src_buf.as_ptr(), std::ptr::null_mut())
-    };
-    if link_ret != 0 {
-        return Ok(());
-    }
 
     let ret = unsafe {
         CopyFileExW(
@@ -777,7 +767,7 @@ pub fn materialize_files_parallel_refs<'a>(
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(1, 16)
+        config.worker_threads.clamp(1, 32)
     };
 
     if !config.is_hdd {
@@ -805,6 +795,14 @@ pub fn materialize_files_parallel_refs<'a>(
                         }
                         let end = (start + chunk_size).min(total_files);
                         for file in &files_slice[start..end] {
+                            if config.skip_existing_matching {
+                                if let Ok(meta) = std::fs::metadata(&file.path) {
+                                    if meta.len() == file.data.len() as u64 {
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let mut copied = false;
                             if let Some(src) = file.source_path {
                                 let mut cas_valid = cas_file_is_valid(
