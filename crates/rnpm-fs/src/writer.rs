@@ -588,7 +588,7 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     wide
 }
 
-/// Copies a file using native OS primitives (CopyFileExW on Windows) reusing caller wide-string buffers.
+/// Copies or hardlinks a file using native OS primitives (CreateHardLinkW / CopyFileExW on Windows) reusing caller wide-string buffers.
 #[cfg(windows)]
 pub fn copy_file_fast_buf(
     source: &Path,
@@ -597,6 +597,11 @@ pub fn copy_file_fast_buf(
     dst_buf: &mut Vec<u16>,
 ) -> std::io::Result<()> {
     extern "system" {
+        fn CreateHardLinkW(
+            lpFileName: *const u16,
+            lpExistingFileName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
         fn CopyFileExW(
             lpExistingFileName: *const u16,
             lpNewFileName: *const u16,
@@ -610,6 +615,14 @@ pub fn copy_file_fast_buf(
 
     path_to_wide_buf(source, src_buf);
     path_to_wide_buf(destination, dst_buf);
+
+    // Try hardlink first (instant MFT entry creation on same volume)
+    let link_ret = unsafe {
+        CreateHardLinkW(dst_buf.as_ptr(), src_buf.as_ptr(), std::ptr::null_mut())
+    };
+    if link_ret != 0 {
+        return Ok(());
+    }
 
     let ret = unsafe {
         CopyFileExW(
