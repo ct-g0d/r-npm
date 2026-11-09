@@ -189,50 +189,61 @@ pub struct RegistryPackageProvider {
 }
 
 fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<PackageMetadata> {
-    let loc = format!("node_modules/{name}");
-    let pkg = lf.packages.get(&loc).or_else(|| {
-        lf.packages.iter().find_map(|(k, v)| {
-            if k.ends_with(&format!("/node_modules/{name}")) {
-                Some(v)
-            } else {
-                None
-            }
-        })
-    })?;
-    let ver_str = pkg.version.clone()?;
-    let bin = pkg.bin.clone();
-    let ver_meta = PackageVersionMetadata {
-        name: name.to_string(),
-        version: ver_str.clone(),
-        dist_tarball: pkg.resolved.clone(),
-        dist_integrity: pkg.integrity.clone(),
-        dependencies: pkg.dependencies.clone().unwrap_or_default(),
-        dependency_order: pkg
-            .dependencies
-            .as_ref()
-            .map(|d| d.keys().cloned().collect())
-            .unwrap_or_default(),
-        dev_dependencies: pkg.dev_dependencies.clone().unwrap_or_default(),
-        peer_dependencies: pkg.peer_dependencies.clone().unwrap_or_default(),
-        peer_dependencies_meta: BTreeMap::new(),
-        optional_dependencies: pkg.optional_dependencies.clone().unwrap_or_default(),
-        os: pkg.os.clone(),
-        cpu: pkg.cpu.clone(),
-        libc: pkg.libc.clone(),
-        bin,
-        license: None,
-        engines: match &pkg.engines {
-            Some(rnpm_lockfile::PackageEngines::Map(m)) => m.clone(),
-            _ => BTreeMap::new(),
-        },
-        has_install_script: pkg.has_install_script == Some(true),
-        deprecated: None,
-        extra: BTreeMap::new(),
-    };
-    let mut dist_tags = BTreeMap::new();
-    dist_tags.insert("latest".to_string(), ver_str.clone());
     let mut versions = BTreeMap::new();
-    versions.insert(ver_str, ver_meta);
+    let mut top_ver = None;
+
+    let target_top = format!("node_modules/{name}");
+    let target_suffix = format!("/node_modules/{name}");
+
+    for (k, pkg) in &lf.packages {
+        if k == &target_top || k.ends_with(&target_suffix) {
+            let Some(ref ver_str) = pkg.version else { continue };
+            if k == &target_top {
+                top_ver = Some(ver_str.clone());
+            }
+            if versions.contains_key(ver_str) {
+                continue;
+            }
+            let bin = pkg.bin.clone();
+            let ver_meta = PackageVersionMetadata {
+                name: name.to_string(),
+                version: ver_str.clone(),
+                dist_tarball: pkg.resolved.clone(),
+                dist_integrity: pkg.integrity.clone(),
+                dependencies: pkg.dependencies.clone().unwrap_or_default(),
+                dependency_order: pkg
+                    .dependencies
+                    .as_ref()
+                    .map(|d| d.keys().cloned().collect())
+                    .unwrap_or_default(),
+                dev_dependencies: pkg.dev_dependencies.clone().unwrap_or_default(),
+                peer_dependencies: pkg.peer_dependencies.clone().unwrap_or_default(),
+                peer_dependencies_meta: BTreeMap::new(),
+                optional_dependencies: pkg.optional_dependencies.clone().unwrap_or_default(),
+                os: pkg.os.clone(),
+                cpu: pkg.cpu.clone(),
+                libc: pkg.libc.clone(),
+                bin,
+                license: None,
+                engines: match &pkg.engines {
+                    Some(rnpm_lockfile::PackageEngines::Map(m)) => m.clone(),
+                    _ => BTreeMap::new(),
+                },
+                has_install_script: pkg.has_install_script == Some(true),
+                deprecated: None,
+                extra: BTreeMap::new(),
+            };
+            versions.insert(ver_str.clone(), ver_meta);
+        }
+    }
+
+    if versions.is_empty() {
+        return None;
+    }
+
+    let latest_ver = top_ver.or_else(|| versions.keys().last().cloned()).unwrap();
+    let mut dist_tags = BTreeMap::new();
+    dist_tags.insert("latest".to_string(), latest_ver);
     Some(PackageMetadata {
         name: name.to_string(),
         dist_tags,
@@ -1610,25 +1621,6 @@ impl Installer {
             None
         };
         let existing_lockfile_for_merge = existing_lockfile.clone();
-
-        if let Some(ref lf) = existing_lockfile {
-            if let Ok(mut cache_guard) = metadata_cache.lock() {
-                for loc in lf.packages.keys() {
-                    if loc.is_empty() {
-                        continue;
-                    }
-                    let name = package_name_from_loc(loc);
-                    if self.options.unlocked_packages.contains(name) {
-                        continue;
-                    }
-                    if !cache_guard.contains_key(name) {
-                        if let Some(meta) = package_metadata_from_lockfile(name, lf) {
-                            cache_guard.insert(name.to_string(), meta);
-                        }
-                    }
-                }
-            }
-        }
 
         let provider = RegistryPackageProvider {
             client: self.registry_client.clone(),
