@@ -2555,7 +2555,11 @@ impl Installer {
             }
         }
 
-        let writer_cfg = Arc::clone(&self.writer_cfg);
+        let mut active_writer_cfg = (*self.writer_cfg).clone();
+        if loc_base_dir.join("node_modules").is_dir() {
+            active_writer_cfg.skip_existing_matching = true;
+        }
+        let writer_cfg = Arc::new(active_writer_cfg);
         let semaphore = Arc::clone(&self.io_semaphore);
 
         // Early path containment check on all packages to download before precreating dirs
@@ -2585,6 +2589,7 @@ impl Installer {
             });
 
         let mut used_fast_materialize = false;
+        let mut in_memory_manifests: HashMap<String, Manifest> = HashMap::new();
         if all_packs_available {
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
@@ -2695,11 +2700,12 @@ impl Installer {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
                         }
 
-                        // Collect lifecycle scripts
+                        // Collect lifecycle scripts and cache in-memory manifests
                         for (idx, (loc, pkg_target, pack)) in loaded_packs.iter().enumerate() {
                             let node = &packages_to_download[idx].1;
                             if let Some(slice) = pack.get_file_slice("package.json") {
                                 if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
+                                    in_memory_manifests.insert(loc.clone(), pkg_manifest.clone());
                                     let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
                                         || pkg_manifest.scripts.contains_key("install")
                                         || pkg_manifest.scripts.contains_key("postinstall");
@@ -3227,7 +3233,7 @@ impl Installer {
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         if !self.options.no_save && self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
-            crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
+            crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir, Some(&in_memory_manifests));
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if !self.options.is_global {
                 lockfile
@@ -4196,10 +4202,66 @@ impl Installer {
                     precreate_directories(dir_refs)
                         .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
 
-                    // 2. Materialize all files globally parallel across threads
-                    rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
-                        .map_err(|e| anyhow!("{e}"))?;
+                    // Prepare bin linking and hidden lockfile data to overlap with materialize
+                    let ci_tree_packages: Vec<String> = lockfile
+                        .packages
+                        .keys()
+                        .filter(|k| {
+                            if k.is_empty() {
+                                return false;
+                            }
+                            if platform_skipped_packages.contains(*k) {
+                                return false;
+                            }
+                            if let Some(info) = lockfile.packages.get(*k) {
+                                if info.link == Some(true) {
+                                    return true;
+                                }
+                            }
+                            k.starts_with("node_modules/")
+                        })
+                        .cloned()
+                        .collect();
+
+                    let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
+                    let save_hidden_needed = self.options.package_lock_enabled() && !self.options.dry_run;
+                    let project_dir_ref = &self.options.project_dir;
+                    let lockfile_ref = &lockfile;
+                    let loc_base_ref = &loc_base_dir;
+                    let bin_dir_ref = &bin_dir;
+                    let nm_dir_ref = &node_modules_dir;
+
+                    // Overlap materialize tail with bin link phase
+                    let (bin_time, mat_res) = std::thread::scope(|s| {
+                        let bin_handle = s.spawn(|| {
+                            let t_start = std::time::Instant::now();
+                            link_tree_bins(
+                                ci_tree_packages,
+                                Some(&known_bins),
+                                loc_base_ref,
+                                bin_dir_ref,
+                                nm_dir_ref,
+                                true,
+                                None,
+                            );
+                            t_start.elapsed()
+                        });
+
+                        let mat_res = rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg);
+                        let bin_time = bin_handle.join().unwrap_or_default();
+
+                        (bin_time, mat_res)
+                    });
+
+                    mat_res.map_err(|e| anyhow!("{e}"))?;
                     collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                    collector.record_phase(Phase::Bins, bin_time);
+
+                    if save_hidden_needed {
+                        let t_lock = std::time::Instant::now();
+                        let _ = lockfile_ref.save_hidden(project_dir_ref);
+                        collector.record_phase(Phase::Lockfile, t_lock.elapsed());
+                    }
 
                     // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                     for (link_path, target_path) in all_symlinks {
@@ -4212,7 +4274,12 @@ impl Installer {
                         }
                     }
 
-                    // 4. Process bin shims and lifecycle scripts
+                    // 4. Process lifecycle scripts directly from in-memory pack slices
+                    let pack_map: HashMap<&str, &rnpm_cache::PackagePack> = loaded_packs
+                        .iter()
+                        .map(|(k, _, p)| (k.as_str(), p))
+                        .collect();
+
                     for (
                         pkg_key,
                         resolved_url,
@@ -4224,13 +4291,31 @@ impl Installer {
                     {
                         let target_path = loc_base_dir.join(pkg_key);
                         if *has_bins_or_scripts {
-                            if let Some(l_node) = process_installed_pkg_manifest_without_bins(
-                                &target_path,
-                                pkg_key,
-                                resolved_url,
-                                declared_dependencies,
-                                *is_optional,
-                            ) {
+                            let mut found_node = None;
+                            if let Some(pack) = pack_map.get(pkg_key.as_str()) {
+                                if let Some(slice) = pack.get_file_slice("package.json") {
+                                    if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
+                                        found_node = lifecycle_node_for_manifest(
+                                            &target_path,
+                                            pkg_key,
+                                            resolved_url,
+                                            declared_dependencies,
+                                            *is_optional,
+                                            pkg_manifest,
+                                        );
+                                    }
+                                }
+                            }
+                            if found_node.is_none() {
+                                found_node = process_installed_pkg_manifest_without_bins(
+                                    &target_path,
+                                    pkg_key,
+                                    resolved_url,
+                                    declared_dependencies,
+                                    *is_optional,
+                                );
+                            }
+                            if let Some(l_node) = found_node {
                                 lifecycle_nodes.push(l_node);
                             }
                         }
@@ -4584,39 +4669,41 @@ impl Installer {
             }
         }
 
-        // Link all package bins across the tree in shallowest-first order with first-writer-wins
-        // per .bin directory in this run, overwriting shims and cleaning up stale ones.
-        let ci_tree_packages: Vec<String> = lockfile
-            .packages
-            .keys()
-            .filter(|k| {
-                if k.is_empty() {
-                    return false;
-                }
-                if platform_skipped_packages.contains(*k) {
-                    return false;
-                }
-                if let Some(info) = lockfile.packages.get(*k) {
-                    if info.link == Some(true) {
-                        return true;
+        if !used_fast_path {
+            // Link all package bins across the tree in shallowest-first order with first-writer-wins
+            // per .bin directory in this run, overwriting shims and cleaning up stale ones.
+            let ci_tree_packages: Vec<String> = lockfile
+                .packages
+                .keys()
+                .filter(|k| {
+                    if k.is_empty() {
+                        return false;
                     }
-                }
-                k.starts_with("node_modules/")
-            })
-            .cloned()
-            .collect();
+                    if platform_skipped_packages.contains(*k) {
+                        return false;
+                    }
+                    if let Some(info) = lockfile.packages.get(*k) {
+                        if info.link == Some(true) {
+                            return true;
+                        }
+                    }
+                    k.starts_with("node_modules/")
+                })
+                .cloned()
+                .collect();
 
-        let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
+            let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
 
-        link_tree_bins(
-            ci_tree_packages,
-            Some(&known_bins),
-            &loc_base_dir,
-            &bin_dir,
-            &node_modules_dir,
-            true,
-            Some(&collector),
-        );
+            link_tree_bins(
+                ci_tree_packages,
+                Some(&known_bins),
+                &loc_base_dir,
+                &bin_dir,
+                &node_modules_dir,
+                true,
+                Some(&collector),
+            );
+        }
 
         // Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
@@ -4639,7 +4726,7 @@ impl Installer {
         }
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
-        if self.options.package_lock_enabled() && !self.options.dry_run {
+        if !used_fast_path && self.options.package_lock_enabled() && !self.options.dry_run {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             lockfile
                 .save_hidden(&self.options.project_dir)

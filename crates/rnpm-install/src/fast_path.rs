@@ -493,53 +493,58 @@ pub(crate) fn build_known_bins_map(
 pub(crate) fn enrich_lockfile_from_installed_manifests(
     lockfile: &mut LockfileV3,
     project_dir: &Path,
+    manifest_cache: Option<&HashMap<String, Manifest>>,
 ) {
-    let locations: Vec<String> = lockfile
-        .packages
-        .iter()
-        .filter_map(|(location, package)| {
-            if location.is_empty() || package.link == Some(true) {
-                return None;
-            }
-            if package.license.is_some() && package.engines.is_some() {
-                return None;
-            }
-            Some(location.clone())
-        })
-        .collect();
+    let mut manifests_by_loc: HashMap<String, Manifest> = HashMap::new();
+    let mut missing_locations = Vec::new();
 
-    if locations.is_empty() {
-        return;
+    for (location, package) in &lockfile.packages {
+        if location.is_empty() || package.link == Some(true) {
+            continue;
+        }
+        if package.license.is_some() && package.engines.is_some() {
+            continue;
+        }
+        if let Some(cache) = manifest_cache {
+            if let Some(m) = cache.get(location) {
+                manifests_by_loc.insert(location.clone(), m.clone());
+                continue;
+            }
+        }
+        missing_locations.push(location.clone());
     }
 
-    let num_threads = 16.min(locations.len());
-    let chunk_size = locations.len().div_ceil(num_threads);
-    let manifests_by_loc: HashMap<String, Manifest> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in locations.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::with_capacity(chunk.len());
-                for loc in chunk {
-                    let manifest_path = if loc.is_empty() {
-                        project_dir.join("package.json")
-                    } else {
-                        project_dir.join(loc).join("package.json")
-                    };
-                    if let Ok(m) = Manifest::from_file(&manifest_path) {
-                        local.push((loc.clone(), m));
+    if !missing_locations.is_empty() {
+        let num_threads = 16.min(missing_locations.len());
+        let chunk_size = missing_locations.len().div_ceil(num_threads);
+        let disk_manifests = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in missing_locations.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for loc in chunk {
+                        let manifest_path = if loc.is_empty() {
+                            project_dir.join("package.json")
+                        } else {
+                            project_dir.join(loc).join("package.json")
+                        };
+                        if let Ok(m) = Manifest::from_file(&manifest_path) {
+                            local.push((loc.clone(), m));
+                        }
                     }
-                }
-                local
-            }));
-        }
-        let mut results = HashMap::with_capacity(locations.len());
-        for handle in handles {
-            if let Ok(items) = handle.join() {
-                results.extend(items);
+                    local
+                }));
             }
-        }
-        results
-    });
+            let mut results = HashMap::with_capacity(missing_locations.len());
+            for handle in handles {
+                if let Ok(items) = handle.join() {
+                    results.extend(items);
+                }
+            }
+            results
+        });
+        manifests_by_loc.extend(disk_manifests);
+    }
 
     for (location, manifest) in manifests_by_loc {
         let Some(package) = lockfile.packages.get_mut(&location) else {
