@@ -21,9 +21,27 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
         PackageTarget::Range(range) => range.satisfies(&v),
         PackageTarget::Tag(_) => true,
         PackageTarget::Alias { target, .. } => version_satisfies_target(version_str, target),
-        PackageTarget::File(_) => true,
-        PackageTarget::Git { .. } => true,
-        PackageTarget::Url(_) => true,
+        PackageTarget::File(p) => {
+            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+            version_str == expected
+        }
+        PackageTarget::Git { url, committish } => {
+            let expected = format!(
+                "{}{}",
+                url,
+                committish
+                    .as_ref()
+                    .map(|c| format!("#{c}"))
+                    .unwrap_or_default()
+            );
+            version_str == expected
+                || git_target_matches_resolved(url, committish.as_deref(), version_str)
+                || committish
+                    .as_ref()
+                    .map(|c| c.trim_start_matches('v') == version_str)
+                    .unwrap_or(false)
+        }
+        PackageTarget::Url(u) => version_str == u.as_str(),
         PackageTarget::Workspace(ws_spec) => {
             let s = ws_spec.trim();
             if s == "*" || s == "^" || s == "~" || s.is_empty() {
@@ -39,9 +57,115 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
     }
 }
 
+/// Extracts (host, normalized_path) from a git URL.
+fn git_url_repo_key(url: &str) -> Option<(String, String)> {
+    let clean = url.split('#').next()?.trim();
+    let clean = clean.strip_prefix("git+").unwrap_or(clean);
+    if let Some(rest) = clean.strip_prefix("github:") {
+        let repo = rest.trim_end_matches(".git").trim_matches('/');
+        return Some(("github.com".to_string(), repo.to_string()));
+    }
+    if let Some(rest) = clean.strip_prefix("gitlab:") {
+        let repo = rest.trim_end_matches(".git").trim_matches('/');
+        return Some(("gitlab.com".to_string(), repo.to_string()));
+    }
+    if let Some(rest) = clean.strip_prefix("bitbucket:") {
+        let repo = rest.trim_end_matches(".git").trim_matches('/');
+        return Some(("bitbucket.org".to_string(), repo.to_string()));
+    }
+    let clean = clean
+        .strip_prefix("ssh://")
+        .or_else(|| clean.strip_prefix("https://"))
+        .or_else(|| clean.strip_prefix("http://"))
+        .or_else(|| clean.strip_prefix("file://"))
+        .or_else(|| clean.strip_prefix("git://"))
+        .unwrap_or(clean);
+    let clean = clean.strip_prefix("git@").unwrap_or(clean);
+    let (host, path) = if let Some((h, p)) = clean.split_once(':') {
+        (h, p)
+    } else if let Some((h, p)) = clean.split_once('/') {
+        (h, p)
+    } else {
+        return None;
+    };
+    let path = path.trim_end_matches(".git").trim_matches('/');
+    Some((host.to_lowercase(), path.to_string()))
+}
+
+/// Checks if two git URLs point to the same repository.
+pub fn git_urls_match_repo(url_a: &str, url_b: &str) -> bool {
+    let a_clean = url_a.split('#').next().unwrap_or(url_a).trim();
+    let b_clean = url_b.split('#').next().unwrap_or(url_b).trim();
+    if a_clean == b_clean {
+        return true;
+    }
+    match (git_url_repo_key(a_clean), git_url_repo_key(b_clean)) {
+        (Some(key_a), Some(key_b)) => key_a == key_b,
+        _ => {
+            let norm = |s: &str| {
+                s.strip_prefix("git+")
+                    .unwrap_or(s)
+                    .strip_prefix("file://")
+                    .unwrap_or(s)
+                    .replace('\\', "/")
+                    .trim_end_matches(".git")
+                    .trim_matches('/')
+                    .to_lowercase()
+            };
+            norm(a_clean) == norm(b_clean)
+        }
+    }
+}
+
+/// Checks if a resolved git URL matches a target Git specification.
+pub fn git_target_matches_resolved(
+    target_url: &str,
+    committish: Option<&str>,
+    resolved: &str,
+) -> bool {
+    let expected = format!(
+        "{}{}",
+        target_url,
+        committish
+            .map(|c| format!("#{c}"))
+            .unwrap_or_default()
+    );
+    if resolved == expected || resolved.starts_with(target_url) {
+        return true;
+    }
+    if !git_urls_match_repo(target_url, resolved) {
+        return false;
+    }
+    if let Some(c) = committish {
+        if let Some(resolved_hash) = resolved.split('#').nth(1) {
+            if resolved_hash == c || resolved_hash.starts_with(c) || c.starts_with(resolved_hash) {
+                return true;
+            }
+        }
+    }
+    true
+}
+
 /// Fast check if a node satisfies target constraint, leveraging cached parsed_version.
 #[inline]
 pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) -> bool {
+    match target {
+        PackageTarget::Url(u) => {
+            return node.resolved.as_deref() == Some(u.as_str());
+        }
+        PackageTarget::File(p) => {
+            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+            return node.resolved.as_deref() == Some(&expected);
+        }
+        PackageTarget::Git { url, committish } => {
+            return node
+                .resolved
+                .as_deref()
+                .is_some_and(|r| git_target_matches_resolved(url, committish.as_deref(), r));
+        }
+        _ => {}
+    }
+
     if let Some(parsed) = &node.parsed_version {
         match target {
             PackageTarget::Version(expected) => parsed == expected,
@@ -91,6 +215,7 @@ pub fn determine_placement(
         target,
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
     )
 }
 
@@ -103,6 +228,7 @@ pub fn determine_placement_with_peers(
     install_name: &str,
     package_name: &str,
     target: &PackageTarget,
+    dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies_meta: &std::collections::BTreeMap<
         String,
@@ -122,6 +248,7 @@ pub fn determine_placement_with_peers(
                     graph,
                     &root_target,
                     parent_location,
+                    dependencies,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -140,6 +267,7 @@ pub fn determine_placement_with_peers(
                 graph,
                 &root_target,
                 parent_location,
+                dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -163,6 +291,7 @@ pub fn determine_placement_with_peers(
                 graph,
                 &root_target,
                 parent_location,
+                dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
             )
@@ -194,6 +323,7 @@ pub fn determine_placement_with_peers(
                     graph,
                     &candidate,
                     parent_location,
+                    dependencies,
                     peer_dependencies,
                     peer_dependencies_meta,
                 )
@@ -217,6 +347,7 @@ pub fn determine_placement_with_peers(
             graph,
             &candidate,
             parent_location,
+            dependencies,
             peer_dependencies,
             peer_dependencies_meta,
         ) && !candidate_shadows_ancestor_dep(
@@ -268,7 +399,9 @@ fn candidate_shadows_ancestor_dep(
 
     if let Ok(req_target) = PackageTarget::parse(spec) {
         if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
-            if node_satisfies_target(visible, &req_target) && !node_satisfies_target(visible, target) {
+            if node_satisfies_target(visible, &req_target)
+                && !node_satisfies_target(visible, target)
+            {
                 return true;
             }
         }
@@ -295,6 +428,7 @@ fn candidate_has_incompatible_peer(
     graph: &DependencyGraph,
     candidate_location: &str,
     parent_location: &str,
+    dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies: &std::collections::BTreeMap<String, String>,
     peer_dependencies_meta: &std::collections::BTreeMap<
         String,
@@ -302,6 +436,9 @@ fn candidate_has_incompatible_peer(
     >,
 ) -> bool {
     peer_dependencies.iter().any(|(peer_name, peer_spec)| {
+        if dependencies.contains_key(peer_name) {
+            return false;
+        }
         let Some(existing) =
             find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
         else {
@@ -633,5 +770,68 @@ mod tests {
             find_visible_peer_node(&graph, "node_modules/react-redux", "my-react", "my-react");
         assert!(found_by_alias.is_some());
         assert_eq!(found_by_alias.unwrap().location, "node_modules/my-react");
+    }
+
+    #[test]
+    fn test_candidate_peer_satisfied_by_direct_dependency() {
+        let mut graph = DependencyGraph::new();
+        // Visible at root is peer-pkg@1.0.0 (incompatible with ^2.0.0)
+        graph.nodes.insert(
+            "node_modules/peer-pkg".to_string(),
+            make_test_node("node_modules/peer-pkg", "peer-pkg", "1.0.0"),
+        );
+
+        let mut direct_deps = std::collections::BTreeMap::new();
+        direct_deps.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+        let mut peer_deps = std::collections::BTreeMap::new();
+        peer_deps.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+        let mut peer_meta = std::collections::BTreeMap::new();
+        peer_meta.insert(
+            "peer-pkg".to_string(),
+            rnpm_core::manifest::PeerDependencyMeta { optional: true },
+        );
+
+        // When package declares peer-pkg in its own direct dependencies,
+        // it satisfies the peer itself, so candidate_has_incompatible_peer must be false
+        let has_conflict = candidate_has_incompatible_peer(
+            &graph,
+            "node_modules/my-pkg",
+            "",
+            &direct_deps,
+            &peer_deps,
+            &peer_meta,
+        );
+        assert!(!has_conflict);
+
+        // Without direct dependency providing it, candidate_has_incompatible_peer is true
+        let empty_deps = std::collections::BTreeMap::new();
+        let has_conflict_without = candidate_has_incompatible_peer(
+            &graph,
+            "node_modules/my-pkg",
+            "",
+            &empty_deps,
+            &peer_deps,
+            &peer_meta,
+        );
+        assert!(has_conflict_without);
+    }
+
+    #[test]
+    fn test_node_satisfies_target_tightened() {
+        let mut node = make_test_node("node_modules/test", "test", "1.0.0");
+        node.resolved = None; // e.g. root or uninitialized node
+
+        let url_target = PackageTarget::parse("https://example.com/test-1.0.0.tgz").unwrap();
+        assert!(!node_satisfies_target(&node, &url_target));
+
+        let file_target = PackageTarget::parse("file:../test.tgz").unwrap();
+        assert!(!node_satisfies_target(&node, &file_target));
+
+        let git_target = PackageTarget::parse("git+https://github.com/foo/bar.git").unwrap();
+        assert!(!node_satisfies_target(&node, &git_target));
+
+        // When resolved matches exactly
+        node.resolved = Some("https://example.com/test-1.0.0.tgz".to_string());
+        assert!(node_satisfies_target(&node, &url_target));
     }
 }

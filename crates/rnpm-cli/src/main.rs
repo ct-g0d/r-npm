@@ -170,6 +170,10 @@ pub(crate) enum Commands {
         #[arg(short = 'E', long = "save-exact")]
         save_exact: bool,
 
+        /// Prefix to use before version in package.json (e.g. '^', '~', or '')
+        #[arg(long = "save-prefix")]
+        save_prefix: Option<String>,
+
         /// Save to dependencies
         #[arg(short = 'P', short_alias = 'S', long = "save-prod", alias = "save")]
         save_prod: bool,
@@ -488,6 +492,18 @@ pub(crate) enum Commands {
         /// Remove only from regular dependencies
         #[arg(short = 'P', long = "save-prod", alias = "save")]
         save_prod: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Include workspace root
+        #[arg(long = "include-workspace-root")]
+        workspace_root: bool,
 
         /// Remove from global prefix
         #[arg(short = 'g', long = "global")]
@@ -3105,11 +3121,16 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                 installer.run().await?;
 
                 // Now locate binary in npx_env_dir
-                if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
+                if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
+                {
                     target
-                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
+                } else if let Some(target) =
+                    rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name)
+                {
                     target
-                } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
+                } else if let Some(target) =
+                    rnpm_lifecycle::find_local_binary(&npx_env_dir, command)
+                {
                     target
                 } else {
                     // Scan .bin folder in npx_env_dir for any executable
@@ -3201,9 +3222,13 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
 
             if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name) {
+            } else if let Some(target) =
+                rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name)
+            {
                 target
-            } else if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name) {
+            } else if let Some(target) =
+                rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
+            {
                 target
             } else {
                 let bin_dir = npx_env_dir.join("node_modules").join(".bin");
@@ -5075,6 +5100,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             save_dev,
             save_exact,
+            save_prefix,
             save_prod,
             save_optional,
             save_peer,
@@ -5156,6 +5182,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 current_dir.clone()
             };
 
+            let effective_save_prefix = save_prefix
+                .or_else(|| config.get("save-prefix").map(ToString::to_string))
+                .or_else(|| config.get("save_prefix").map(ToString::to_string));
+
             let cli_overrides = rnpm_config::get_process_cli_overrides();
             let ws_in_overrides = cli_overrides.as_ref().map(|o| {
                 o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
@@ -5190,6 +5220,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 strict_peer_deps,
                 save_dev,
                 save_exact,
+                save_prefix: effective_save_prefix,
                 save_prod,
                 save_optional,
                 save_peer,
@@ -5601,7 +5632,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         } => {
             if let Some(init_pkg) = initializer {
                 let transformed = init::transform_initializer(&init_pkg);
-                execute_exec(&current_dir, &transformed, &[], &args, registry, cache, offline).await?;
+                execute_exec(
+                    &current_dir,
+                    &transformed,
+                    &[],
+                    &args,
+                    registry,
+                    cache,
+                    offline,
+                )
+                .await?;
             } else {
                 let init_opts = init::InitOptions {
                     yes,
@@ -5687,6 +5727,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_prod,
             global,
             prefix,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
             if packages.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -5717,6 +5760,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_optional,
                 save_prod,
                 is_global,
+                workspace,
+                workspaces,
+                workspace_root,
             };
             let summary = installer.uninstall(&uninstall_options)?;
             println!(

@@ -109,6 +109,7 @@ pub struct PackageMetadata {
 /// Abstract provider for retrieving package metadata from a registry, cache, or mock source.
 pub trait PackageMetadataProvider: Send + Sync {
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError>;
+    fn prefetch_packages(&self, _names: &[&str]) {}
 }
 
 /// In-memory package provider convenient for unit tests, fixtures, and synthetic graph creation.

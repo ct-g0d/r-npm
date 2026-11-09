@@ -101,10 +101,12 @@ fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut Hash
 
     if node.problems.is_empty() {
         if node.missing {
-            let req = node.required.as_deref().unwrap_or("*");
-            let p = format!("missing: {}@{}", node.name, req);
-            if seen.insert(p.clone()) {
-                out.push(p);
+            if !node.optional {
+                let req = node.required.as_deref().unwrap_or("*");
+                let p = format!("missing: {}@{}", node.name, req);
+                if seen.insert(p.clone()) {
+                    out.push(p);
+                }
             }
         } else if node.extraneous {
             let p = format!(
@@ -217,13 +219,22 @@ pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> S
         out.push_str(&format!("{}@{} {}\n", root.name, version_str, path_display));
     }
 
-    let dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
+    let mut dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
+    dep_keys.sort_by(|a, b| {
+        let child_a = root.dependencies.get(a).unwrap();
+        let child_b = root.dependencies.get(b).unwrap();
+        let id_a = child_a.pkgid.as_deref().unwrap_or(a);
+        let id_b = child_b.pkgid.as_deref().unwrap_or(b);
+        id_a.cmp(id_b)
+    });
+
     for (idx, name) in dep_keys.iter().enumerate() {
         let is_last = idx == dep_keys.len() - 1;
         let child = root.dependencies.get(name).unwrap();
         format_child_text(child, max_depth, 0, "", is_last, long, &mut out);
     }
 
+    out.push('\n');
     out
 }
 
@@ -240,10 +251,17 @@ fn format_child_text(
 
     if node.missing {
         let req = node.required.as_deref().unwrap_or("*");
-        out.push_str(&format!(
-            "{prefix}{branch}UNMET DEPENDENCY {}@{}\n",
-            node.name, req
-        ));
+        if node.optional {
+            out.push_str(&format!(
+                "{prefix}{branch}UNMET OPTIONAL DEPENDENCY {}@{}\n",
+                node.name, req
+            ));
+        } else {
+            out.push_str(&format!(
+                "{prefix}{branch}UNMET DEPENDENCY {}@{}\n",
+                node.name, req
+            ));
+        }
     } else {
         let ver = node.version.as_deref().unwrap_or("unknown");
         let mut marker = String::new();
@@ -260,7 +278,7 @@ fn format_child_text(
         ));
     }
 
-    let continuation = if is_last { "    " } else { "|   " };
+    let continuation = if is_last { "  " } else { "| " };
     let child_prefix = format!("{prefix}{continuation}");
 
     if long {
@@ -273,7 +291,15 @@ fn format_child_text(
     }
 
     if current_depth < max_depth && !node.deduped && !node.missing {
-        let dep_keys: Vec<String> = node.dependencies.keys().cloned().collect();
+        let mut dep_keys: Vec<String> = node.dependencies.keys().cloned().collect();
+        dep_keys.sort_by(|a, b| {
+            let child_a = node.dependencies.get(a).unwrap();
+            let child_b = node.dependencies.get(b).unwrap();
+            let id_a = child_a.pkgid.as_deref().unwrap_or(a);
+            let id_b = child_b.pkgid.as_deref().unwrap_or(b);
+            id_a.cmp(id_b)
+        });
+
         for (idx, name) in dep_keys.iter().enumerate() {
             let child_is_last = idx == dep_keys.len() - 1;
             let child = node.dependencies.get(name).unwrap();
@@ -593,8 +619,8 @@ mod tests {
         assert_eq!(lines[1], "| /app");
         assert_eq!(lines[2], "| Root application");
         assert_eq!(lines[3], "`-- dep@2.0.0");
-        assert_eq!(lines[4], "    | /app/node_modules/dep");
-        assert_eq!(lines[5], "    | A dependency description");
+        assert_eq!(lines[4], "  | /app/node_modules/dep");
+        assert_eq!(lines[5], "  | A dependency description");
     }
 
     #[test]
@@ -938,10 +964,10 @@ mod tests {
 
         assert_eq!(lines[0], "root@1.0.0 /app");
         assert_eq!(lines[1], "+-- last@1.0.0");
-        assert_eq!(lines[2], "|   `-- end1@1.0.0");
+        assert_eq!(lines[2], "| `-- end1@1.0.0");
         assert_eq!(lines[3], "`-- mid@1.0.0");
-        assert_eq!(lines[4], "    +-- sub1@1.0.0");
-        assert_eq!(lines[5], "    `-- sub2@1.0.0");
+        assert_eq!(lines[4], "  +-- sub1@1.0.0");
+        assert_eq!(lines[5], "  `-- sub2@1.0.0");
     }
 
     #[test]

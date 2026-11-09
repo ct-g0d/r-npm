@@ -455,30 +455,35 @@ pub fn build_dependency_tree(
     let mut reachable_locations: HashSet<String> = HashSet::new();
 
     // 1. Direct dependencies from root manifest
-    let mut direct_deps: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
+    let mut direct_deps: BTreeMap<String, (String, &'static str, bool)> = BTreeMap::new();
     if let Some(m) = &root_manifest {
         for (name, req) in &m.dependencies {
-            direct_deps.insert(name.clone(), (req.clone(), "prod"));
+            direct_deps.insert(name.clone(), (req.clone(), "prod", false));
         }
         if !options.omit_dev {
             for (name, req) in &m.dev_dependencies {
                 direct_deps
                     .entry(name.clone())
-                    .or_insert((req.clone(), "dev"));
+                    .or_insert((req.clone(), "dev", false));
             }
         }
         if !options.omit_optional {
             for (name, req) in &m.optional_dependencies {
                 direct_deps
                     .entry(name.clone())
-                    .or_insert((req.clone(), "optional"));
+                    .or_insert((req.clone(), "optional", true));
             }
         }
         if !options.omit_peer {
             for (name, req) in &m.peer_dependencies {
+                let is_opt = m
+                    .peer_dependencies_meta
+                    .get(name)
+                    .map(|meta| meta.optional)
+                    .unwrap_or(false);
                 direct_deps
                     .entry(name.clone())
-                    .or_insert((req.clone(), "peer"));
+                    .or_insert((req.clone(), "peer", is_opt));
             }
         }
     } else if options.is_global {
@@ -486,7 +491,7 @@ pub fn build_dependency_tree(
         for (loc, pkg) in &disk_packages {
             if loc.starts_with("node_modules/") && loc.matches("node_modules/").count() == 1 {
                 let ver_req = pkg.version.clone().unwrap_or_else(|| "*".to_string());
-                direct_deps.insert(pkg.name.clone(), (ver_req, "prod"));
+                direct_deps.insert(pkg.name.clone(), (ver_req, "prod", false));
             }
         }
     }
@@ -494,7 +499,7 @@ pub fn build_dependency_tree(
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut resolved_nodes_by_loc: HashMap<String, InspectedNode> = HashMap::new();
 
-    for (dep_name, (dep_req, dep_type)) in &direct_deps {
+    for (dep_name, (dep_req, dep_type, is_optional)) in &direct_deps {
         let expected_loc = format!("node_modules/{dep_name}");
         root.to.push(expected_loc.clone());
 
@@ -507,6 +512,9 @@ pub fn build_dependency_tree(
                 Some(dep_req.clone()),
                 dep_type,
             );
+            if *is_optional {
+                node.optional = true;
+            }
             node.from.push(String::new());
 
             // Validate version against requirement
@@ -536,15 +544,19 @@ pub fn build_dependency_tree(
             // Missing package
             let mut missing_node = create_missing_node(dep_name, dep_req, &expected_loc, dep_type);
             missing_node.from.push(String::new());
-            let prob = format!(
-                "missing: {}@{}, required by {}@{}",
-                dep_name,
-                dep_req,
-                root.name,
-                root.version.as_deref().unwrap_or("")
-            );
-            missing_node.problems.push(prob.clone());
-            root.problems.push(prob);
+            if *is_optional {
+                missing_node.optional = true;
+            } else {
+                let prob = format!(
+                    "missing: {}@{}, required by {}@{}",
+                    dep_name,
+                    dep_req,
+                    root.name,
+                    root.version.as_deref().unwrap_or("")
+                );
+                missing_node.problems.push(prob.clone());
+                root.problems.push(prob);
+            }
 
             root.dependencies.insert(dep_name.clone(), missing_node);
         }
@@ -557,28 +569,33 @@ pub fn build_dependency_tree(
             None => continue,
         };
 
-        let mut child_deps: BTreeMap<String, (String, &'static str)> = BTreeMap::new();
+        let mut child_deps: BTreeMap<String, (String, &'static str, bool)> = BTreeMap::new();
         if let Some(m) = &current_disk.manifest {
             for (name, req) in &m.dependencies {
-                child_deps.insert(name.clone(), (req.clone(), "prod"));
+                child_deps.insert(name.clone(), (req.clone(), "prod", false));
             }
             if !options.omit_optional {
                 for (name, req) in &m.optional_dependencies {
                     child_deps
                         .entry(name.clone())
-                        .or_insert((req.clone(), "optional"));
+                        .or_insert((req.clone(), "optional", true));
                 }
             }
             if !options.omit_peer {
                 for (name, req) in &m.peer_dependencies {
+                    let is_opt = m
+                        .peer_dependencies_meta
+                        .get(name)
+                        .map(|meta| meta.optional)
+                        .unwrap_or(false);
                     child_deps
                         .entry(name.clone())
-                        .or_insert((req.clone(), "peer"));
+                        .or_insert((req.clone(), "peer", is_opt));
                 }
             }
         }
 
-        for (child_name, (child_req, child_type)) in &child_deps {
+        for (child_name, (child_req, child_type, is_optional)) in &child_deps {
             let candidates = candidate_locations(&current_loc, child_name);
             let mut resolved_loc = None;
 
@@ -606,6 +623,9 @@ pub fn build_dependency_tree(
                         Some(child_req.clone()),
                         child_type,
                     );
+                    if *is_optional {
+                        node.optional = true;
+                    }
                     node.from.push(current_loc.clone());
 
                     // Check version validity
@@ -637,15 +657,19 @@ pub fn build_dependency_tree(
                 let mut missing_node =
                     create_missing_node(child_name, child_req, &expected_loc, child_type);
                 missing_node.from.push(current_loc.clone());
-                let prob = format!(
-                    "missing: {}@{}, required by {}@{}",
-                    child_name,
-                    child_req,
-                    current_disk.name,
-                    current_disk.version.as_deref().unwrap_or("")
-                );
-                missing_node.problems.push(prob.clone());
-                root.problems.push(prob);
+                if *is_optional {
+                    missing_node.optional = true;
+                } else {
+                    let prob = format!(
+                        "missing: {}@{}, required by {}@{}",
+                        child_name,
+                        child_req,
+                        current_disk.name,
+                        current_disk.version.as_deref().unwrap_or("")
+                    );
+                    missing_node.problems.push(prob.clone());
+                    root.problems.push(prob);
+                }
 
                 if let Some(curr_node) = resolved_nodes_by_loc.get_mut(&current_loc) {
                     curr_node
@@ -690,6 +714,9 @@ pub fn build_dependency_tree(
     }
 
     // 4. Assemble hierarchical tree under root
+    // Keep a complete map of all resolved nodes for deduped references
+    let all_resolved_nodes = resolved_nodes_by_loc.clone();
+
     // For direct dependencies of root:
     for dep_name in direct_deps.keys() {
         let loc = format!("node_modules/{dep_name}");
@@ -699,7 +726,13 @@ pub fn build_dependency_tree(
     }
 
     // Attach nested children to their respective parents
-    attach_nested_dependencies(&mut root.dependencies, &mut resolved_nodes_by_loc);
+    let mut ancestors = Vec::new();
+    attach_nested_dependencies(
+        &mut root.dependencies,
+        &mut resolved_nodes_by_loc,
+        &all_resolved_nodes,
+        &mut ancestors,
+    );
 
     Ok(root)
 }
@@ -707,24 +740,70 @@ pub fn build_dependency_tree(
 fn attach_nested_dependencies(
     current_map: &mut BTreeMap<String, InspectedNode>,
     resolved_by_loc: &mut HashMap<String, InspectedNode>,
+    all_resolved_nodes: &HashMap<String, InspectedNode>,
+    ancestors: &mut Vec<String>,
 ) {
     for node in current_map.values_mut() {
-        let _parent_loc = &node.location;
+        if node.deduped {
+            continue;
+        }
+
+        let node_loc = node.location.clone();
+        ancestors.push(node_loc.clone());
+
         for to_loc in &node.to {
-            if let Some(child_node) = resolved_by_loc.remove(to_loc) {
-                node.dependencies
-                    .insert(child_node.name.clone(), child_node);
-            } else if let Some(existing) = resolved_by_loc.get(to_loc) {
-                // Deduped / hoisted elsewhere
+            if ancestors.contains(to_loc) {
+                // Circular reference: attach as deduped leaf
+                if let Some(existing) = all_resolved_nodes.get(to_loc) {
+                    let mut deduped_node = existing.clone();
+                    deduped_node.deduped = true;
+                    deduped_node.to.clear();
+                    deduped_node.dependencies.clear();
+                    node.dependencies
+                        .insert(deduped_node.name.clone(), deduped_node);
+                }
+                continue;
+            }
+
+            // Check if this node is the primary parent (first in BFS order, i.e. shallowest)
+            let is_primary_parent = all_resolved_nodes
+                .get(to_loc)
+                .and_then(|target| target.from.first())
+                .map(|first_from| first_from == &node_loc)
+                .unwrap_or(false);
+
+            if is_primary_parent {
+                if let Some(child_node) = resolved_by_loc.remove(to_loc) {
+                    node.dependencies
+                        .insert(child_node.name.clone(), child_node);
+                } else if let Some(existing) = all_resolved_nodes.get(to_loc) {
+                    let mut deduped_node = existing.clone();
+                    deduped_node.deduped = true;
+                    deduped_node.to.clear();
+                    deduped_node.dependencies.clear();
+                    node.dependencies
+                        .insert(deduped_node.name.clone(), deduped_node);
+                }
+            } else if let Some(existing) = all_resolved_nodes.get(to_loc) {
+                // Deduped / hoisted to another (shallower) parent
                 let mut deduped_node = existing.clone();
                 deduped_node.deduped = true;
+                deduped_node.to.clear();
+                deduped_node.dependencies.clear();
                 node.dependencies
                     .insert(deduped_node.name.clone(), deduped_node);
             }
         }
         if !node.dependencies.is_empty() {
-            attach_nested_dependencies(&mut node.dependencies, resolved_by_loc);
+            attach_nested_dependencies(
+                &mut node.dependencies,
+                resolved_by_loc,
+                all_resolved_nodes,
+                ancestors,
+            );
         }
+
+        ancestors.pop();
     }
 }
 

@@ -429,9 +429,9 @@ impl PackagePack {
                             .metadata()
                             .map(|metadata| {
                                 metadata.len() == entry.size
-                                    && entry.cas_mtime.is_none_or(|m| {
-                                        mtime_to_timestamp(&metadata) == Some(m)
-                                    })
+                                    && entry
+                                        .cas_mtime
+                                        .is_none_or(|m| mtime_to_timestamp(&metadata) == Some(m))
                             })
                             .unwrap_or(false);
                     if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
@@ -579,44 +579,44 @@ impl PackStore {
         Self::write_cas_file_safe(cas_path, data)
     }
 
-/// Atomically writes file data into CAS safely using a temp file and atomic rename.
-pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Ok(meta) = cas_path.metadata() {
-        if meta.len() == data.len() as u64 {
-            if let Ok(existing) = fs::read(cas_path) {
-                if existing == data {
-                    return Ok(());
+    /// Atomically writes file data into CAS safely using a temp file and atomic rename.
+    pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if let Ok(meta) = cas_path.metadata() {
+            if meta.len() == data.len() as u64 {
+                if let Ok(existing) = fs::read(cas_path) {
+                    if existing == data {
+                        return Ok(());
+                    }
                 }
             }
         }
-    }
-    if let Some(parent) = cas_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
+        if let Some(parent) = cas_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
 
-    {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(data)?;
-        f.flush()?;
-    }
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            f.write_all(data)?;
+            f.flush()?;
+        }
 
-    match fs::rename(&tmp_path, cas_path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let _ = fs::remove_file(cas_path);
-            let res = fs::rename(&tmp_path, cas_path);
-            let _ = fs::remove_file(&tmp_path);
-            res
+        match fs::rename(&tmp_path, cas_path) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = fs::remove_file(cas_path);
+                let res = fs::rename(&tmp_path, cas_path);
+                let _ = fs::remove_file(&tmp_path);
+                res
+            }
         }
     }
-}
 
     /// Fills the CAS by copying already-installed files from node_modules into CAS
     /// across 16 parallel threads using fast native OS copy primitives.
@@ -2630,10 +2630,7 @@ mod tests {
         );
 
         // Verify pack slice matches original data
-        assert_eq!(
-            pack.get_file_slice("index.js").unwrap(),
-            original_data
-        );
+        assert_eq!(pack.get_file_slice("index.js").unwrap(), original_data);
 
         // Verify materialization uses the repaired CAS blob cleanly
         let target = tempdir().unwrap();
