@@ -41,7 +41,7 @@ impl PackageTarget {
 
         // file: specifier
         if let Some(path_str) = s.strip_prefix("file:") {
-            return Ok(PackageTarget::File(PathBuf::from(path_str)));
+            return Ok(PackageTarget::File(path_clean::clean(path_str)));
         }
 
         // npm: alias specifier (e.g. npm:foo@^1.0.0 or npm:@scope/foo@~2.0.0)
@@ -275,7 +275,7 @@ impl PackageSpec {
 
         // Direct "file:" specifier without name (e.g. "file:../foo")
         if let Some(path_str) = trimmed.strip_prefix("file:") {
-            let path = PathBuf::from(path_str);
+            let path = path_clean::clean(path_str);
             let name = extract_path_package_name(&path);
             return Ok(Self {
                 name,
