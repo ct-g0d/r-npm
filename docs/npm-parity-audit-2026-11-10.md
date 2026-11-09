@@ -18,7 +18,7 @@ the same npm-packed bytes in both directories.
 
 | Audited item | Status | Evidence after changes | Commit |
 | --- | --- | --- | --- |
-| 1. Local tarball manifest name | FIXED-by-you | Both already used `actual-package-name`, despite filename `realname-1.0.0.tgz`. Fixed remaining `file:./` vs `file:` save-spec difference; all compared files now match. | `17316b1` |
+| 1. Local tarball manifest name | FIXED-by-you | Both already used `actual-package-name`, despite filename `realname-1.0.0.tgz`. Fixed remaining `file:./` vs `file:` save-spec difference; all compared files now match. The resolver also accepts existing noncanonical metadata. | `17316b1`, `c7ae72a` |
 | 2. Root URL and transitive registry range | already-OK | Root is-number URL resolves 7.0.0, is-odd gets nested is-number 6.0.0; exits 0 and all files match. | baseline |
 | 3. Install into workspace a | already-OK | `install is-number@7 -w a` leaves root dependencies unchanged and saves `^7.0.0` to a; all files match. | baseline |
 | 4. CRLF, tabs, BOM, key order | FIXED-by-you | package.json was already exact. Fixed hidden lockfile using spaces instead of tabs. Manifest, public lockfile, hidden lockfile, and package files now match. | `686af48` |
@@ -30,7 +30,7 @@ the same npm-packed bytes in both directories.
 | 10. outdated --json, current empty project | already-OK | Both stdout `{}` and exit 0; no file changes. | baseline |
 | 11. view is-number@7.0.0 version --json | already-OK | Identical stdout `"7.0.0"`, exit 0; no file changes. | baseline |
 | 12. pack --dry-run | already-OK | Identical tarball filename on stdout, exit 0; no archive or project mutations. | baseline |
-| 13. explain is-number --json | FIXED-by-you | npm returned an array with dependents; rnpm returned a raw lock entry. Now matching JSON after substituting the sibling fixture path. Also works without a lockfile and fails for missing matches. | `b657d8f` |
+| 13. explain is-number --json | FIXED-by-you | npm returned an array with dependents; rnpm returned a raw lock entry. Now matching JSON after substituting the sibling fixture path. Also works without a lockfile, fails for missing matches, and preserves each parent's declared range for shared dependencies. | `b657d8f`, `c1f4850` |
 | 14. config get registry | FIXED-by-you | Previously `undefined`; now npm's default registry URL, preserving explicit project override. Stdout matches. | `72f8e94` |
 | 15. uninstall is-number --silent | FIXED-by-you | Removed extra rnpm summary; exits, stdout, manifests, lockfiles, and resulting node_modules match. | `c6d9e7b` |
 | 16. update --dry-run --silent, empty project | FIXED-by-you | Previously wrote lockfiles/node_modules and printed a summary. Now exit 0, empty stdout, no file changes, matching npm. | `c6d9e7b` |
@@ -39,6 +39,8 @@ the same npm-packed bytes in both directories.
 | 19. init -y --silent, existing manifest | FIXED-by-you | Previously sorted keys and omitted `type`. Now keeps insertion order, defaults to commonjs, and matches file bytes and stdout after fixture-path substitution. | `1d1a605` |
 | 20. exec -- node -e console.log(123) | already-OK | Both stdout `123`, exit 0, no file changes. | baseline |
 | Empty install hidden lockfile | OPEN-blocked-by-constraint | npm writes the public lockfile but does not create node_modules. rnpm also creates node_modules/.package-lock.json. | protected function below |
+| Populated update --dry-run --silent | OPEN-blocked-by-constraint | Both exit 0 and leave all project files unchanged. npm stdout is empty; rnpm prints one simulation line for is-number from protected install code. | protected function below |
+| Existing manifest with file:./ archive dependency | OPEN-blocked-by-constraint | Both install successfully and preserve package.json. npm canonicalizes the installed package's lockfile resolved field to file:realname-1.0.0.tgz; rnpm retains file:./realname-1.0.0.tgz in both lockfiles. | protected function below |
 
 ## Regressions and validation
 
@@ -62,11 +64,17 @@ then saves a hidden lockfile. After saving the public lockfile, skip creation of
 new node_modules tree and hidden lockfile when the graph contains only the root
 and no installed tree existed. Preserve handling of an already-existing tree.
 
-The dry-run simulation in the same protected function also prints one line per
+The dry-run simulation in `Installer::install_internal` also prints one line per
 package directly. Its logging should respect loglevel silent. The CLI fix routes
 update dry-runs through this existing simulation rather than through update's
 summary code, which requires a newly written lockfile. Nonempty dry-run output
 therefore still needs this protected-function follow-up.
+
+`crates/rnpm-install/src/lib.rs`, `Installer::populate_custom_target_metadata`,
+File archive branch: `resolved_url` uses `file_spec_clean`, the original manifest
+text. Build the resolved file URL from the normalized parsed file target instead,
+relative to the project for absolute paths, while keeping the user's dependency
+spec unchanged in package.json and the root lockfile entry.
 
 The audit verifies the listed fixtures, not complete npm compatibility. In
 particular, flag acceptance is not proof of complete flag semantics, and empty
