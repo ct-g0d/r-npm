@@ -1906,14 +1906,14 @@
     },
     "clean-install": {
       "helpExit": 0,
-      "bareExit": 0,
-      "errorCode": null,
+      "bareExit": 1,
+      "errorCode": "EUSAGE",
       "timedOut": false
     },
     "ic": {
       "helpExit": 0,
-      "bareExit": 0,
-      "errorCode": null,
+      "bareExit": 1,
+      "errorCode": "EUSAGE",
       "timedOut": false
     },
     "rum": {
@@ -1924,14 +1924,14 @@
     },
     "install-clean": {
       "helpExit": 0,
-      "bareExit": 0,
-      "errorCode": null,
+      "bareExit": 1,
+      "errorCode": "EUSAGE",
       "timedOut": false
     },
     "isntall-clean": {
       "helpExit": 0,
-      "bareExit": 0,
-      "errorCode": null,
+      "bareExit": 1,
+      "errorCode": "EUSAGE",
       "timedOut": false
     },
     "urn": {

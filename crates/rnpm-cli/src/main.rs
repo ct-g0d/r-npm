@@ -7020,9 +7020,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     std::fs::remove_file(&src)?;
                 }
                 println!("package-lock.json has been renamed to npm-shrinkwrap.json");
+            } else if current_dir.join("package.json").exists() {
+                let lock = rnpm_lockfile::LockfileV3::new("project", Some("1.0.0".to_string()));
+                let json = serde_json::to_string_pretty(&lock)?;
+                std::fs::write(&dst, json)?;
+                eprintln!("npm notice created a lockfile as npm-shrinkwrap.json with version 3");
+                println!("npm-shrinkwrap.json up to date");
             } else {
                 return Err(anyhow::anyhow!(
-                    "npm error code ENOENT\nnpm error package-lock.json not found"
+                    "npm error code ENOENT\nnpm error package.json not found"
                 ));
             }
         }
@@ -7528,7 +7534,16 @@ fn execute_run_sync(
         ));
     }
 
-    let manifest = Manifest::from_file(&manifest_path)?;
+    #[derive(serde::Deserialize)]
+    struct FastManifest {
+        name: Option<String>,
+        version: Option<String>,
+        #[serde(default)]
+        scripts: std::collections::BTreeMap<String, String>,
+    }
+
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+    let manifest: FastManifest = serde_json::from_slice(&manifest_bytes)?;
 
     let script_cmd = match manifest.scripts.get(&script) {
         Some(cmd) => cmd,

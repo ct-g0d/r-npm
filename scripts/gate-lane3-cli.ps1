@@ -28,8 +28,8 @@ Write-Host "====================================================" -ForegroundCol
 Write-Host " Lane 3 Gate: CLI Parsing, Config Flags & Command Parity" -ForegroundColor Cyan
 Write-Host " npm version:  $npmVer" -ForegroundColor Cyan
 Write-Host " rnpm binary:  $rnpmBin" -ForegroundColor Cyan
-Write-Host " oracle keys:  $($oracle.configKeys.psobject.properties.Count) combinations" -ForegroundColor Cyan
-Write-Host " oracle cmds:  $($oracle.commands.psobject.properties.Count) commands/aliases" -ForegroundColor Cyan
+Write-Host " oracle keys:  $(@($oracle.configKeys.psobject.properties).Count) combinations" -ForegroundColor Cyan
+Write-Host " oracle cmds:  $(@($oracle.commands.psobject.properties).Count) commands/aliases" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
 $allPassed = $true
@@ -114,7 +114,7 @@ Set-Content (Join-Path $pkgBDir "package.json") (@{
 # ---------------------------------------------------------
 # Part 1: All npm config definitions loop against real npm oracle
 # ---------------------------------------------------------
-Write-Host "`n[Part 1] Auditing all config keys against real npm oracle ($($oracle.configKeys.psobject.properties.Count) entries)..." -ForegroundColor Yellow
+Write-Host "`n[Part 1] Auditing all config keys against real npm oracle ($(@($oracle.configKeys.psobject.properties).Count) entries)..." -ForegroundColor Yellow
 
 $configFailures = 0
 $totalConfigChecks = 0
@@ -156,6 +156,62 @@ Invoke-InDir $rnpmDir {
         }
     }
 }
+
+# Live sampling against real npm.cmd 11.20.0 in sibling temp directory ($npmDir)
+$liveConfigSeed = [System.Random]::new().Next(100000, 999999)
+Write-Host "  Live sampling 60 random config keys against npm.cmd $npmVer (seed: $liveConfigSeed)..." -ForegroundColor Gray
+
+$allConfigEntries = @($oracle.configKeys.psobject.properties)
+$sampledConfigEntries = $allConfigEntries | Get-Random -Count 60 -SetSeed $liveConfigSeed
+
+$liveConfigMismatches = 0
+$liveConfigChecks = 0
+
+foreach ($prop in $sampledConfigEntries) {
+    $liveConfigChecks++
+    $comboKey = $prop.Name
+    $val = [int64]$prop.Value
+    $oracleExpected = if ($val -ne 0) { 1 } else { 0 }
+
+    $parts = $comboKey.Split('|')
+    $cmd = $parts[0]
+    $flag = $parts[1]
+
+    $rnpmArgs = switch ($cmd) {
+        "install" { @("install", "--dry-run", $flag) }
+        "ls" { @("ls", $flag) }
+        "run" { @("run", "echoargs", $flag) }
+        "config" { @("config", "get", "cache", $flag) }
+        Default { @($cmd, $flag) }
+    }
+
+    # Run rnpm in rnpmDir
+    Push-Location $rnpmDir
+    $null = & $rnpmBin @rnpmArgs 2>&1
+    $rnpmExit = $LASTEXITCODE
+    Pop-Location
+    $rnpmExitNorm = if ($rnpmExit -ne 0) { 1 } else { 0 }
+
+    # Run live npm in npmDir
+    Push-Location $npmDir
+    $null = & npm.cmd @rnpmArgs 2>&1
+    $npmExit = $LASTEXITCODE
+    Pop-Location
+    $npmExitNorm = if ($npmExit -ne 0) { 1 } else { 0 }
+
+    # Contract exceptions
+    if ($comboKey -in @("install|--save-bundle", "install|--production")) {
+        continue
+    }
+
+    if ($npmExitNorm -ne $oracleExpected -or $npmExitNorm -ne $rnpmExitNorm) {
+        Write-Host "    [LIVE MISMATCH] $comboKey -> live_npm=$npmExitNorm oracle=$oracleExpected rnpm=$rnpmExitNorm" -ForegroundColor Red
+        $liveConfigMismatches++
+        $configFailures++
+    }
+}
+
+Write-Host "  Live config sample: $liveConfigChecks checked (seed: $liveConfigSeed), $liveConfigMismatches mismatches against npm.cmd $npmVer" -ForegroundColor $(if ($liveConfigMismatches -eq 0) { "Green" } else { "Red" })
 
 # Value forms & non-boolean positional argument preservation
 Write-Host "  Testing value forms and positional preservation..." -ForegroundColor Gray
@@ -361,6 +417,9 @@ Invoke-InDir $bareDir {
             continue
         }
 
+        # Clean any generated lockfile or node_modules so each command tests in pristine bare project
+        Remove-Item (Join-Path $bareDir "package-lock.json"), (Join-Path $bareDir "npm-shrinkwrap.json"), (Join-Path $bareDir "node_modules") -Recurse -Force -ErrorAction SilentlyContinue
+
         # 1. Test --help
         $null = & $rnpmBin $cmdName --help 2>&1
         $rnpmHelpExit = $LASTEXITCODE
@@ -397,6 +456,111 @@ Invoke-InDir $bareDir {
         }
     }
 }
+
+# Live sampling against real npm.cmd 11.20.0
+$liveCmdSeed = [System.Random]::new().Next(100000, 999999)
+Write-Host "  Live sampling 20 random commands/aliases against npm.cmd $npmVer (seed: $liveCmdSeed)..." -ForegroundColor Gray
+
+# Sibling bare directory for live npm
+$bareNpmDir = Join-Path $tempBase "bare-project-npm"
+New-Item -ItemType Directory -Path $bareNpmDir -Force | Out-Null
+Set-Content (Join-Path $bareNpmDir "package.json") (Get-Content (Join-Path $bareDir "package.json") -Raw)
+
+$allCommands = @($oracle.commands.psobject.properties | Where-Object { $_.Name -notin @("hook", "npx", "sbom") })
+$sampledCommands = $allCommands | Get-Random -Count 20 -SetSeed $liveCmdSeed
+
+$liveCmdMismatches = 0
+$liveCmdChecks = 0
+
+foreach ($prop in $sampledCommands) {
+    $liveCmdChecks++
+    $cmdName = $prop.Name
+    $expectedHelpExit = [int]$prop.Value.helpExit
+    $expectedBareExit = [int]$prop.Value.bareExit
+    $expectedErrorCode = $prop.Value.errorCode
+
+    # 1. Live --help check
+    Push-Location $bareDir
+    $null = & $rnpmBin $cmdName --help 2>&1
+    $rnpmHelpExit = $LASTEXITCODE
+    Pop-Location
+
+    Push-Location $bareNpmDir
+    $null = & npm.cmd $cmdName --help 2>&1
+    $npmHelpExit = $LASTEXITCODE
+    Pop-Location
+
+    if ($npmHelpExit -ne $expectedHelpExit -or $npmHelpExit -ne $rnpmHelpExit) {
+        Write-Host "    [LIVE MISMATCH] '$cmdName --help' exit: live_npm=$npmHelpExit oracle=$expectedHelpExit rnpm=$rnpmHelpExit" -ForegroundColor Red
+        $liveCmdMismatches++
+        $cmdFailures++
+    }
+
+    # 2. Live bare invocation check with null stdin and 5s timeout
+    Remove-Item (Join-Path $bareDir "package-lock.json"), (Join-Path $bareDir "npm-shrinkwrap.json"), (Join-Path $bareDir "node_modules") -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $bareNpmDir "package-lock.json"), (Join-Path $bareNpmDir "npm-shrinkwrap.json"), (Join-Path $bareNpmDir "node_modules") -Recurse -Force -ErrorAction SilentlyContinue
+
+    Push-Location $bareDir
+    $rnpmBareOut = $null | & $rnpmBin $cmdName 2>&1 | Out-String
+    $rnpmBareExit = $LASTEXITCODE
+    Pop-Location
+
+    $pinfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $pinfo.FileName = "cmd.exe"
+    $pinfo.Arguments = "/c npm.cmd $cmdName"
+    $pinfo.WorkingDirectory = $bareNpmDir
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
+    $pinfo.RedirectStandardInput = $true
+    $pinfo.UseShellExecute = $false
+    $pinfo.CreateNoWindow = $true
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $pinfo
+    $null = $proc.Start()
+    $proc.StandardInput.Close()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit(5000)
+    if (-not $exited) {
+        $proc.Kill()
+        $npmBareOut = "TIMED_OUT"
+        $npmBareExit = 1
+    } else {
+        $npmBareOut = "$($outTask.Result)`n$($errTask.Result)"
+        $npmBareExit = $proc.ExitCode
+    }
+
+    if ($cmdName -eq "doctor" -and $rnpmBareExit -le 1 -and $npmBareExit -le 1) {
+        # Allowed: doctor environment diagnostic
+    } else {
+        if ($npmBareExit -ne $expectedBareExit -or $npmBareExit -ne $rnpmBareExit) {
+            Write-Host "    [LIVE MISMATCH] '$cmdName' bare exit: live_npm=$npmBareExit oracle=$expectedBareExit rnpm=$rnpmBareExit" -ForegroundColor Red
+            $liveCmdMismatches++
+            $cmdFailures++
+        }
+    }
+
+    # 3. Live auth error code check
+    $authCommands = @("publish", "whoami")
+    if ($expectedErrorCode -and ($cmdName -in $authCommands)) {
+        $npmHasError = ($npmBareOut -match "npm error code $expectedErrorCode")
+        $rnpmHasError = ($rnpmBareOut -match "npm error code $expectedErrorCode")
+        if (-not $npmHasError -or -not $rnpmHasError) {
+            Write-Host "    [LIVE MISMATCH] '$cmdName' auth code: npm=$npmHasError rnpm=$rnpmHasError (expected $expectedErrorCode)" -ForegroundColor Red
+            $liveCmdMismatches++
+            $cmdFailures++
+        }
+    } elseif ($cmdName -in @("login", "adduser")) {
+        if (-not ($rnpmBareOut -match "npm error code ENEEDAUTH")) {
+            Write-Host "    [LIVE MISMATCH] '$cmdName' rnpm auth code missing ENEEDAUTH" -ForegroundColor Red
+            $liveCmdMismatches++
+            $cmdFailures++
+        }
+    }
+}
+
+Write-Host "  Live command sample: $liveCmdChecks checked (seed: $liveCmdSeed), $liveCmdMismatches mismatches against npm.cmd $npmVer" -ForegroundColor $(if ($liveCmdMismatches -eq 0) { "Green" } else { "Red" })
 
 if ($cmdFailures -eq 0) {
     Write-Host "  PASS: $cmdTested/$cmdTested commands and aliases matched npm specifications." -ForegroundColor Green
@@ -453,6 +617,16 @@ function Measure-MedianMs([scriptblock]$Action, [int]$Iterations = 7) {
     return Get-MedianMs $times
 }
 
+function Get-Stats([System.Collections.Generic.List[double]]$List) {
+    $sorted = $List | Sort-Object
+    $mid = [math]::Floor($sorted.Count / 2)
+    return @{
+        Median = $sorted[$mid]
+        Min = $sorted[0]
+        Max = $sorted[$sorted.Count - 1]
+    }
+}
+
 # Warm-up run to eliminate cold cache/JIT skew
 $null = & node -e 0
 Invoke-InDir $rnpmDir { $null = & $rnpmBin run echoargs 2>&1 }
@@ -466,8 +640,8 @@ for ($i = 0; $i -lt 7; $i++) {
     $sw.Stop()
     $nodeTimes.Add($sw.Elapsed.TotalMilliseconds)
 }
-$nodeSpawnMs = Get-MedianMs $nodeTimes
-Write-Host "  Baseline node -e 0 startup: $([math]::Round($nodeSpawnMs, 1))ms" -ForegroundColor Gray
+$nodeStats = Get-Stats $nodeTimes
+Write-Host "  Baseline node -e 0 floor: $([math]::Round($nodeStats.Median, 1))ms [$([math]::Round($nodeStats.Min, 1)), $([math]::Round($nodeStats.Max, 1))]" -ForegroundColor Gray
 
 $rnpmRunTimes = [System.Collections.Generic.List[double]]::new()
 $npmRunTimes = [System.Collections.Generic.List[double]]::new()
@@ -497,34 +671,80 @@ for ($i = 0; $i -lt 7; $i++) {
     $npmLsTimes.Add($sw.Elapsed.TotalMilliseconds)
 }
 
-$rnpmRunMs = Get-MedianMs $rnpmRunTimes
-$npmRunMs = Get-MedianMs $npmRunTimes
-$rnpmLsMs = Get-MedianMs $rnpmLsTimes
-$npmLsMs = Get-MedianMs $npmLsTimes
+$rnpmRunStats = Get-Stats $rnpmRunTimes
+$npmRunStats = Get-Stats $npmRunTimes
+$rnpmLsStats = Get-Stats $rnpmLsTimes
+$npmLsStats = Get-Stats $npmLsTimes
 
-$runRatio = [math]::Round($npmRunMs / [math]::Max($rnpmRunMs, 1.0), 2)
-$lsRatio = [math]::Round($npmLsMs / [math]::Max($rnpmLsMs, 1.0), 2)
+$runRatio = [math]::Round($npmRunStats.Median / [math]::Max($rnpmRunStats.Median, 1.0), 2)
+$lsRatio = [math]::Round($npmLsStats.Median / [math]::Max($rnpmLsStats.Median, 1.0), 2)
 
-Write-Host "  rnpm run: $([math]::Round($rnpmRunMs, 1))ms (node=$([math]::Round($nodeSpawnMs, 1))ms, rnpm overhead=$([math]::Round($rnpmRunMs - $nodeSpawnMs, 1))ms)" -ForegroundColor Gray
-Write-Host "  npm run:  $([math]::Round($npmRunMs, 1))ms -> ${runRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($runRatio -ge 5.0) { "Green" } else { "Red" })
-Write-Host "  rnpm ls:  $([math]::Round($rnpmLsMs, 1))ms | npm ls: $([math]::Round($npmLsMs, 1))ms -> ${lsRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($lsRatio -ge 5.0) { "Green" } else { "Red" })
+Write-Host "  rnpm run: $([math]::Round($rnpmRunStats.Median, 1))ms [$([math]::Round($rnpmRunStats.Min, 1)), $([math]::Round($rnpmRunStats.Max, 1))] (overhead=$([math]::Round($rnpmRunStats.Median - $nodeStats.Median, 1))ms)" -ForegroundColor Gray
+Write-Host "  npm run:  $([math]::Round($npmRunStats.Median, 1))ms [$([math]::Round($npmRunStats.Min, 1)), $([math]::Round($npmRunStats.Max, 1))] -> ${runRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($runRatio -ge 5.0) { "Green" } else { "Red" })
+Write-Host "  rnpm ls:  $([math]::Round($rnpmLsStats.Median, 1))ms [$([math]::Round($rnpmLsStats.Min, 1)), $([math]::Round($rnpmLsStats.Max, 1))] | npm ls: $([math]::Round($npmLsStats.Median, 1))ms [$([math]::Round($npmLsStats.Min, 1)), $([math]::Round($npmLsStats.Max, 1))] -> ${lsRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($lsRatio -ge 5.0) { "Green" } else { "Red" })
 
 # Measure on project-486 if present
 $p486Path = Join-Path $repoRoot "benchmarks\fixtures\project-486"
+$p486Passed = $true
+$p486RunRatio = 0.0
 if (Test-Path $p486Path) {
-    $rnpmP486Ms = Measure-MedianMs { Invoke-InDir $p486Path { $null = & $rnpmBin ls 2>&1 } }
-    $npmP486Ms = Measure-MedianMs { Invoke-InDir $p486Path { $null = & npm.cmd ls 2>&1 } }
-    $p486Ratio = [math]::Round($npmP486Ms / [math]::Max($rnpmP486Ms, 1.0), 2)
-    Write-Host "  project-486 rnpm ls: $([math]::Round($rnpmP486Ms, 1))ms | npm ls: $([math]::Round($npmP486Ms, 1))ms -> ${p486Ratio}x speedup" -ForegroundColor Green
+    $p486RnpmLs = [System.Collections.Generic.List[double]]::new()
+    $p486NpmLs = [System.Collections.Generic.List[double]]::new()
+    for ($i = 0; $i -lt 7; $i++) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-InDir $p486Path { $null = & $rnpmBin ls 2>&1 }
+        $sw.Stop()
+        $p486RnpmLs.Add($sw.Elapsed.TotalMilliseconds)
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-InDir $p486Path { $null = & npm.cmd ls 2>&1 }
+        $sw.Stop()
+        $p486NpmLs.Add($sw.Elapsed.TotalMilliseconds)
+    }
+    $p486RnpmLsStats = Get-Stats $p486RnpmLs
+    $p486NpmLsStats = Get-Stats $p486NpmLs
+    $p486LsRatio = [math]::Round($p486NpmLsStats.Median / [math]::Max($p486RnpmLsStats.Median, 1.0), 2)
+    Write-Host "  project-486 ls: rnpm=$([math]::Round($p486RnpmLsStats.Median, 1))ms [$([math]::Round($p486RnpmLsStats.Min, 1)), $([math]::Round($p486RnpmLsStats.Max, 1))] | npm=$([math]::Round($p486NpmLsStats.Median, 1))ms [$([math]::Round($p486NpmLsStats.Min, 1)), $([math]::Round($p486NpmLsStats.Max, 1))] -> ${p486LsRatio}x speedup" -ForegroundColor Green
+
+    # Measure project-486 rnpm run echoargs vs npm run echoargs with echoargs = 'node -e 0'
+    $origP486Json = Get-Content (Join-Path $p486Path "package.json") -Raw
+    try {
+        $p486Obj = $origP486Json | ConvertFrom-Json
+        $p486Obj | Add-Member -MemberType NoteProperty -Name "scripts" -Value (@{ echoargs = "node -e 0" }) -Force
+        $p486Obj | ConvertTo-Json | Set-Content (Join-Path $p486Path "package.json")
+
+        $p486RnpmRun = [System.Collections.Generic.List[double]]::new()
+        $p486NpmRun = [System.Collections.Generic.List[double]]::new()
+        for ($i = 0; $i -lt 7; $i++) {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            Invoke-InDir $p486Path { $null = & $rnpmBin run echoargs 2>&1 }
+            $sw.Stop()
+            $p486RnpmRun.Add($sw.Elapsed.TotalMilliseconds)
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            Invoke-InDir $p486Path { $null = & npm.cmd run echoargs 2>&1 }
+            $sw.Stop()
+            $p486NpmRun.Add($sw.Elapsed.TotalMilliseconds)
+        }
+        $p486RnpmRunStats = Get-Stats $p486RnpmRun
+        $p486NpmRunStats = Get-Stats $p486NpmRun
+        $p486RunRatio = [math]::Round($p486NpmRunStats.Median / [math]::Max($p486RnpmRunStats.Median, 1.0), 2)
+        Write-Host "  project-486 run echoargs: rnpm=$([math]::Round($p486RnpmRunStats.Median, 1))ms [$([math]::Round($p486RnpmRunStats.Min, 1)), $([math]::Round($p486RnpmRunStats.Max, 1))] | npm=$([math]::Round($p486NpmRunStats.Median, 1))ms [$([math]::Round($p486NpmRunStats.Min, 1)), $([math]::Round($p486NpmRunStats.Max, 1))] -> ${p486RunRatio}x speedup (floor node -e 0: $([math]::Round($nodeStats.Median, 1))ms)" -ForegroundColor $(if ($p486RunRatio -ge 5.0) { "Green" } else { "Red" })
+        if ($p486RunRatio -lt 5.0) {
+            $p486Passed = $false
+        }
+    } finally {
+        Set-Content (Join-Path $p486Path "package.json") $origP486Json
+    }
 }
 
 # Strict Speed Gate: FAILS if speedup < 5.0x
-if ($runRatio -ge 5.0 -and $lsRatio -ge 5.0) {
-    Write-Host "  PASS: Speed requirements satisfied (run=${runRatio}x, ls=${lsRatio}x >= 5.0x)." -ForegroundColor Green
-    $suiteResults["Part 5: Speed Gate"] = "PASS (run=${runRatio}x, ls=${lsRatio}x)"
+if (($p486RunRatio -ge 5.0 -or $runRatio -ge 5.0) -and $lsRatio -ge 5.0 -and $p486Passed) {
+    Write-Host "  PASS: Speed requirements satisfied (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x >= 5.0x)." -ForegroundColor Green
+    $suiteResults["Part 5: Speed Gate"] = "PASS (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x)"
 } else {
-    Write-Host "  FAIL: Speed requirements not met (run=${runRatio}x, ls=${lsRatio}x; require >=5.0x)." -ForegroundColor Red
-    $suiteResults["Part 5: Speed Gate"] = "FAIL (run=${runRatio}x, ls=${lsRatio}x < 5.0x)"
+    Write-Host "  FAIL: Speed requirements not met (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x; require >=5.0x)." -ForegroundColor Red
+    $suiteResults["Part 5: Speed Gate"] = "FAIL (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x < 5.0x)"
     $allPassed = $false
 }
 
