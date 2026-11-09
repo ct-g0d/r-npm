@@ -626,7 +626,9 @@ try {
             Pop-Location
             Remove-Item -Recurse -Force $seedHead -ErrorAction SilentlyContinue
 
-            Copy-Item -Recurse -Force $warmCacheHead $warmCache79
+            New-Item -ItemType Directory -Path $warmCache79 | Out-Null
+            Copy-Item -Recurse -Force (Join-Path $warmCacheHead "content-v2") $warmCache79
+            Copy-Item -Recurse -Force (Join-Path $warmCacheHead "index-v5") $warmCache79
 
             $seedNpm = Join-Path $tmp5.FullName "seed-npm"
             New-Item -ItemType Directory -Path $seedNpm | Out-Null
