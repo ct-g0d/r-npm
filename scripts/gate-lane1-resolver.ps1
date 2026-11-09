@@ -607,103 +607,117 @@ try {
         return @{ Times = $times; Median = $med }
     }
 
-    if ($WarmRuns -le 0 -or $FreshRuns -le 0) {
-        Write-Host "  [FAIL] Speed check requires at least 1 run for both warm and fresh (provided: Warm=$WarmRuns, Fresh=$FreshRuns)" -ForegroundColor Red
+    if ($WarmRuns -le 0 -and $FreshRuns -le 0) {
+        Write-Host "  [FAIL] Speed check requires at least 1 run for warm or fresh (provided: Warm=$WarmRuns, Fresh=$FreshRuns)" -ForegroundColor Red
         $allPassed = $false
     } else {
-        # Warm caches setup: seed each in an isolated directory
-        Write-Host "  -> Setting up warm caches..."
-        $warmCache79 = Join-Path $tmp5.FullName "warm-cache-79"
-        $warmCacheHead = Join-Path $tmp5.FullName "warm-cache-head"
-        $warmCacheNpm = Join-Path $tmp5.FullName "warm-cache-npm"
+        if ($WarmRuns -gt 0) {
+            # Warm caches setup: seed each in an isolated directory
+            Write-Host "  -> Setting up warm caches..."
+            $warmCache79 = Join-Path $tmp5.FullName "warm-cache-79"
+            $warmCacheHead = Join-Path $tmp5.FullName "warm-cache-head"
+            $warmCacheNpm = Join-Path $tmp5.FullName "warm-cache-npm"
 
-        $seedHead = Join-Path $tmp5.FullName "seed-head"
-        New-Item -ItemType Directory -Path $seedHead | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedHead "package.json")
-        Push-Location $seedHead
-        & $rnpmBin install --cache $warmCacheHead 2>&1 | Out-Null
-        Pop-Location
-        Remove-Item -Recurse -Force $seedHead -ErrorAction SilentlyContinue
+            $seedHead = Join-Path $tmp5.FullName "seed-head"
+            New-Item -ItemType Directory -Path $seedHead | Out-Null
+            Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedHead "package.json")
+            Push-Location $seedHead
+            & $rnpmBin install --cache $warmCacheHead 2>&1 | Out-Null
+            Pop-Location
+            Remove-Item -Recurse -Force $seedHead -ErrorAction SilentlyContinue
 
-        $seed79 = Join-Path $tmp5.FullName "seed-79"
-        New-Item -ItemType Directory -Path $seed79 | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seed79 "package.json")
-        Push-Location $seed79
-        & $baseBin install --cache $warmCache79 2>&1 | Out-Null
-        Pop-Location
-        Remove-Item -Recurse -Force $seed79 -ErrorAction SilentlyContinue
+            $seed79 = Join-Path $tmp5.FullName "seed-79"
+            New-Item -ItemType Directory -Path $seed79 | Out-Null
+            Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seed79 "package.json")
+            Push-Location $seed79
+            & $baseBin install --cache $warmCache79 2>&1 | Out-Null
+            Pop-Location
+            Remove-Item -Recurse -Force $seed79 -ErrorAction SilentlyContinue
 
-        $seedNpm = Join-Path $tmp5.FullName "seed-npm"
-        New-Item -ItemType Directory -Path $seedNpm | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedNpm "package.json")
-        Push-Location $seedNpm
-        & npm.cmd install --cache $warmCacheNpm 2>&1 | Out-Null
-        Pop-Location
-        Remove-Item -Recurse -Force $seedNpm -ErrorAction SilentlyContinue
+            $seedNpm = Join-Path $tmp5.FullName "seed-npm"
+            New-Item -ItemType Directory -Path $seedNpm | Out-Null
+            Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedNpm "package.json")
+            Push-Location $seedNpm
+            & npm.cmd install --cache $warmCacheNpm 2>&1 | Out-Null
+            Pop-Location
+            Remove-Item -Recurse -Force $seedNpm -ErrorAction SilentlyContinue
 
-        Write-Host "`n  -> Measuring WARM cache no-lockfile install ($WarmRuns runs each)..."
-        $resHeadWarm = Measure-NoLockfileInstall $rnpmBin $warmCacheHead "HEAD (warm)" $WarmRuns
-        $res79Warm = Measure-NoLockfileInstall $baseBin $warmCache79 "79a19fd (warm)" $WarmRuns
-        $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $WarmRuns
+            Write-Host "`n  -> Measuring WARM cache no-lockfile install ($WarmRuns runs each)..."
+            $resHeadWarm = Measure-NoLockfileInstall $rnpmBin $warmCacheHead "HEAD (warm)" $WarmRuns
+            $res79Warm = Measure-NoLockfileInstall $baseBin $warmCache79 "79a19fd (warm)" $WarmRuns
+            $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $WarmRuns
 
-        Write-Host "`n  -> Measuring FRESH empty cache no-lockfile install ($FreshRuns runs each)..."
-        $timesHeadFresh = @()
-        $times79Fresh = @()
-        $timesNpmFresh = @()
-        for ($i = 1; $i -le $FreshRuns; $i++) {
-            $cHead = Join-Path $tmp5.FullName "fresh-head-$i"
-            $c79 = Join-Path $tmp5.FullName "fresh-79-$i"
-            $cNpm = Join-Path $tmp5.FullName "fresh-npm-$i"
+            Write-Host "`n  === Warm Speed Summary ===" -ForegroundColor Cyan
+            Write-Host ("  WARM Cache (Medians of {0} runs):`n    HEAD:    {1} ms`n    79a19fd: {2} ms`n    npm:     {3} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $resNpmWarm.Median) -ForegroundColor White
+            $warmVs79 = [math]::Round($resHeadWarm.Median / [math]::Max($res79Warm.Median, 1), 3)
+            $warmVsNpm = [math]::Round($resNpmWarm.Median / [math]::Max($resHeadWarm.Median, 1), 2)
+            Write-Host "    HEAD vs 79a19fd ratio: ${warmVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
+            Write-Host "    HEAD vs npm speedup:   ${warmVsNpm}x (target >= 2.0x)" -ForegroundColor Cyan
 
-            $mHead = Measure-NoLockfileInstall $rnpmBin $cHead "HEAD (fresh)" 1
-            $timesHeadFresh += $mHead.Times[0]
-
-            $m79 = Measure-NoLockfileInstall $baseBin $c79 "79a19fd (fresh)" 1
-            $times79Fresh += $m79.Times[0]
-
-            $mNpm = Measure-NoLockfileInstall "npm.cmd" $cNpm "npm (fresh)" 1
-            $timesNpmFresh += $mNpm.Times[0]
-        }
-        $resHeadFresh = @{ Times = $timesHeadFresh; Median = (Get-Median $timesHeadFresh) }
-        $res79Fresh = @{ Times = $times79Fresh; Median = (Get-Median $times79Fresh) }
-        $resNpmFresh = @{ Times = $timesNpmFresh; Median = (Get-Median $timesNpmFresh) }
-
-        Write-Host "`n  === Speed Summary ===" -ForegroundColor Cyan
-        Write-Host ("  WARM Cache (Medians of {0} runs):`n    HEAD:    {1} ms`n    79a19fd: {2} ms`n    npm:     {3} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $resNpmWarm.Median) -ForegroundColor White
-        $warmVs79 = [math]::Round($resHeadWarm.Median / [math]::Max($res79Warm.Median, 1), 3)
-        $warmVsNpm = [math]::Round($resNpmWarm.Median / [math]::Max($resHeadWarm.Median, 1), 2)
-        Write-Host "    HEAD vs 79a19fd ratio: ${warmVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
-        Write-Host "    HEAD vs npm speedup:   ${warmVsNpm}x (target >= 2.0x)" -ForegroundColor Cyan
-
-        Write-Host ("`n  FRESH Cache (Medians of {0} runs):`n    HEAD:    {1} ms`n    79a19fd: {2} ms`n    npm:     {3} ms" -f $FreshRuns, $resHeadFresh.Median, $res79Fresh.Median, $resNpmFresh.Median) -ForegroundColor White
-        $freshVs79 = [math]::Round($resHeadFresh.Median / [math]::Max($res79Fresh.Median, 1), 3)
-        $freshVsNpm = [math]::Round($resNpmFresh.Median / [math]::Max($resHeadFresh.Median, 1), 2)
-        Write-Host "    HEAD vs 79a19fd ratio: ${freshVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
-        Write-Host "    HEAD vs npm speedup:   ${freshVsNpm}x (target >= 2.0x)" -ForegroundColor Cyan
-
-        $warmNonRegression = if ($WarmRuns -gt 0) { $resHeadWarm.Median -le ($res79Warm.Median * 1.05) } else { $false }
-        $freshNonRegression = if ($FreshRuns -gt 0) { $resHeadFresh.Median -le ($res79Fresh.Median * 1.05) } else { $false }
-        $warm2xPassed = if ($WarmRuns -gt 0) { $warmVsNpm -ge 2.0 } else { $false }
-        $fresh2xPassed = if ($FreshRuns -gt 0) { $freshVsNpm -ge 2.0 } else { $false }
-
-        if (-not $warmNonRegression) {
-            Write-Host "`n  [FAIL] Warm non-regression failed! HEAD=$($resHeadWarm.Median) ms > 79a19fd=$($res79Warm.Median) ms * 1.05" -ForegroundColor Red
+            $warmNonRegression = $resHeadWarm.Median -le ($res79Warm.Median * 1.05)
+            $warm2xPassed = $warmVsNpm -ge 2.0
+            if (-not $warmNonRegression) {
+                Write-Host "  [FAIL] Warm non-regression failed! HEAD=$($resHeadWarm.Median) ms > 79a19fd=$($res79Warm.Median) ms * 1.05" -ForegroundColor Red
+                $allPassed = $false
+            }
+            if (-not $warm2xPassed) {
+                Write-Host "  [FAIL] Warm 2x target failed! HEAD vs npm is ${warmVsNpm}x (< 2.0x)" -ForegroundColor Red
+                $allPassed = $false
+            }
+            if ($warmNonRegression -and $warm2xPassed) {
+                Write-Host "  [PASS] Warm speed non-regression and >=2x target verified." -ForegroundColor Green
+            }
+        } else {
+            Write-Host "  [FAIL] Warm runs count is 0 (NOT RUN)" -ForegroundColor Red
             $allPassed = $false
         }
-        if (-not $freshNonRegression) {
-            Write-Host "`n  [FAIL] Fresh non-regression failed! HEAD=$($resHeadFresh.Median) ms > 79a19fd=$($res79Fresh.Median) ms * 1.05" -ForegroundColor Red
+
+        if ($FreshRuns -gt 0) {
+            Write-Host "`n  -> Measuring FRESH empty cache no-lockfile install ($FreshRuns runs each)..."
+            $timesHeadFresh = @()
+            $times79Fresh = @()
+            $timesNpmFresh = @()
+            for ($i = 1; $i -le $FreshRuns; $i++) {
+                $cHead = Join-Path $tmp5.FullName "fresh-head-$i"
+                $c79 = Join-Path $tmp5.FullName "fresh-79-$i"
+                $cNpm = Join-Path $tmp5.FullName "fresh-npm-$i"
+
+                $mHead = Measure-NoLockfileInstall $rnpmBin $cHead "HEAD (fresh)" 1
+                $timesHeadFresh += $mHead.Times[0]
+
+                $m79 = Measure-NoLockfileInstall $baseBin $c79 "79a19fd (fresh)" 1
+                $times79Fresh += $m79.Times[0]
+
+                $mNpm = Measure-NoLockfileInstall "npm.cmd" $cNpm "npm (fresh)" 1
+                $timesNpmFresh += $mNpm.Times[0]
+            }
+            $resHeadFresh = @{ Times = $timesHeadFresh; Median = (Get-Median $timesHeadFresh) }
+            $res79Fresh = @{ Times = $times79Fresh; Median = (Get-Median $times79Fresh) }
+            $resNpmFresh = @{ Times = $timesNpmFresh; Median = (Get-Median $timesNpmFresh) }
+
+            Write-Host "`n  === Fresh Speed Summary ===" -ForegroundColor Cyan
+            Write-Host ("  FRESH Cache (Medians of {0} runs):`n    HEAD:    {1} ms`n    79a19fd: {2} ms`n    npm:     {3} ms" -f $FreshRuns, $resHeadFresh.Median, $res79Fresh.Median, $resNpmFresh.Median) -ForegroundColor White
+            $freshVs79 = [math]::Round($resHeadFresh.Median / [math]::Max($res79Fresh.Median, 1), 3)
+            $freshVsNpm = [math]::Round($resNpmFresh.Median / [math]::Max($resHeadFresh.Median, 1), 2)
+            Write-Host "    HEAD vs 79a19fd ratio: ${freshVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
+            Write-Host "    HEAD vs npm speedup:   ${freshVsNpm}x (target >= 2.0x)" -ForegroundColor Cyan
+
+            $freshNonRegression = $resHeadFresh.Median -le ($res79Fresh.Median * 1.05)
+            $fresh2xPassed = $freshVsNpm -ge 2.0
+            if (-not $freshNonRegression) {
+                Write-Host "  [FAIL] Fresh non-regression failed! HEAD=$($resHeadFresh.Median) ms > 79a19fd=$($res79Fresh.Median) ms * 1.05" -ForegroundColor Red
+                $allPassed = $false
+            }
+            if (-not $fresh2xPassed) {
+                Write-Host "  [FAIL] Fresh 2x target failed! HEAD vs npm is ${freshVsNpm}x (< 2.0x)" -ForegroundColor Red
+                $allPassed = $false
+            }
+            if ($freshNonRegression -and $fresh2xPassed) {
+                Write-Host "  [PASS] Fresh speed non-regression and >=2x target verified." -ForegroundColor Green
+            }
+        } else {
+            Write-Host "  [FAIL] Fresh runs count is 0 (NOT RUN)" -ForegroundColor Red
             $allPassed = $false
-        }
-        if (-not $warm2xPassed) {
-            Write-Host "  [FAIL] Warm 2x target failed! HEAD vs npm is ${warmVsNpm}x (< 2.0x)" -ForegroundColor Red
-            $allPassed = $false
-        }
-        if (-not $fresh2xPassed) {
-            Write-Host "  [FAIL] Fresh 2x target failed! HEAD vs npm is ${freshVsNpm}x (< 2.0x)" -ForegroundColor Red
-            $allPassed = $false
-        }
-        if ($warmNonRegression -and $freshNonRegression -and $warm2xPassed -and $fresh2xPassed -and ($script:speedRunErrors.Count -eq 0)) {
-            Write-Host "`n  [PASS] Speed benchmark and non-regression verified (Warm: ${warmVsNpm}x npm, Fresh: ${freshVsNpm}x npm)." -ForegroundColor Green
         }
     }
 } finally {
