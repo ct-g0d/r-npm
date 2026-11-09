@@ -602,9 +602,7 @@ try {
                 $script:allPassed = $false
             }
 
-            Start-Sleep -Milliseconds 100
-            cmd.exe /c rd /s /q "$projDir" 2>$null
-            Remove-Item -Recurse -Force $projDir -ErrorAction SilentlyContinue
+            Start-Process -FilePath "cmd.exe" -ArgumentList "/c rd /s /q `"$projDir`"" -WindowStyle Hidden
         }
         $med = Get-Median $times
         return @{ Times = $times; Median = $med }
