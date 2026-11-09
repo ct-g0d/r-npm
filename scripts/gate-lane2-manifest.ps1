@@ -648,8 +648,8 @@ Test-SpeedBenchmarks
 if (-not $SkipCargo) {
     Write-Host "`n>>> GATE 6: Cargo tests & clippy <<<" -ForegroundColor Yellow
 
-    Write-Host "Running cargo test --workspace --jobs 2..."
-    $testOut = cargo test --workspace --jobs 2 2>&1
+    Write-Host "Running cargo test --workspace..."
+    $testOut = cargo test --workspace 2>&1
     $testExit = $LASTEXITCODE
     $passTest = ($testExit -eq 0)
     Record-Result -Gate "Gate 6: Quality" -Name "cargo test --workspace passes" -Passed $passTest -Details "Exit code: $testExit"
