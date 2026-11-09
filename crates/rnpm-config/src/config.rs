@@ -562,17 +562,12 @@ pub fn find_global_npmrc_with_env<LookupFn>(lookup: LookupFn) -> Option<PathBuf>
 where
     LookupFn: Fn(&str) -> Option<String>,
 {
-    if let Some(prefix) = lookup("PREFIX") {
-        let path = PathBuf::from(prefix).join("etc").join("npmrc");
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    if let Some(appdata) = lookup("APPDATA") {
-        let path = PathBuf::from(appdata).join("npm").join("etc").join("npmrc");
-        if path.exists() {
-            return Some(path);
-        }
+    // Same prefix resolution as `config set --global` and global installs
+    // (NPM_CONFIG_PREFIX, npm_config_prefix, PREFIX, then the platform default),
+    // so global config is read from where it was written.
+    let path = find_global_prefix_with_env(&lookup).join("etc").join("npmrc");
+    if path.exists() {
+        return Some(path);
     }
     let etc_path = PathBuf::from("/etc/npmrc");
     if etc_path.exists() {
