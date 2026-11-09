@@ -626,9 +626,13 @@ try {
             Pop-Location
             Remove-Item -Recurse -Force $seedHead -ErrorAction SilentlyContinue
 
-            New-Item -ItemType Directory -Path $warmCache79 | Out-Null
-            Copy-Item -Recurse -Force (Join-Path $warmCacheHead "content-v2") $warmCache79
-            Copy-Item -Recurse -Force (Join-Path $warmCacheHead "index-v5") $warmCache79
+            $seed79 = Join-Path $tmp5.FullName "seed-79"
+            New-Item -ItemType Directory -Path $seed79 | Out-Null
+            Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seed79 "package.json")
+            Push-Location $seed79
+            & $baseBin install --cache $warmCache79 2>&1 | Out-Null
+            Pop-Location
+            Remove-Item -Recurse -Force $seed79 -ErrorAction SilentlyContinue
 
             $seedNpm = Join-Path $tmp5.FullName "seed-npm"
             New-Item -ItemType Directory -Path $seedNpm | Out-Null
