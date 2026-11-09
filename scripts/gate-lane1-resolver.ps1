@@ -611,21 +611,35 @@ try {
         Write-Host "  [FAIL] Speed check requires at least 1 run for both warm and fresh (provided: Warm=$WarmRuns, Fresh=$FreshRuns)" -ForegroundColor Red
         $allPassed = $false
     } else {
-        # Warm caches setup
+        # Warm caches setup: seed each in an isolated directory
         Write-Host "  -> Setting up warm caches..."
         $warmCache79 = Join-Path $tmp5.FullName "warm-cache-79"
         $warmCacheHead = Join-Path $tmp5.FullName "warm-cache-head"
         $warmCacheNpm = Join-Path $tmp5.FullName "warm-cache-npm"
 
-        $seedProj = Join-Path $tmp5.FullName "seed-proj"
-        New-Item -ItemType Directory -Path $seedProj | Out-Null
-        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedProj "package.json")
-        Push-Location $seedProj
+        $seedHead = Join-Path $tmp5.FullName "seed-head"
+        New-Item -ItemType Directory -Path $seedHead | Out-Null
+        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedHead "package.json")
+        Push-Location $seedHead
         & $rnpmBin install --cache $warmCacheHead 2>&1 | Out-Null
+        Pop-Location
+        Remove-Item -Recurse -Force $seedHead -ErrorAction SilentlyContinue
+
+        $seed79 = Join-Path $tmp5.FullName "seed-79"
+        New-Item -ItemType Directory -Path $seed79 | Out-Null
+        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seed79 "package.json")
+        Push-Location $seed79
         & $baseBin install --cache $warmCache79 2>&1 | Out-Null
+        Pop-Location
+        Remove-Item -Recurse -Force $seed79 -ErrorAction SilentlyContinue
+
+        $seedNpm = Join-Path $tmp5.FullName "seed-npm"
+        New-Item -ItemType Directory -Path $seedNpm | Out-Null
+        Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedNpm "package.json")
+        Push-Location $seedNpm
         & npm.cmd install --cache $warmCacheNpm 2>&1 | Out-Null
         Pop-Location
-        Remove-Item -Recurse -Force $seedProj -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $seedNpm -ErrorAction SilentlyContinue
 
         Write-Host "`n  -> Measuring WARM cache no-lockfile install ($WarmRuns runs each)..."
         $resHeadWarm = Measure-NoLockfileInstall $rnpmBin $warmCacheHead "HEAD (warm)" $WarmRuns
