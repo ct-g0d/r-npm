@@ -2,6 +2,7 @@ param(
     [switch]$SkipCargoTests = $false,
     [int]$WarmRuns = 5,
     [int]$FreshRuns = 5,
+    [int]$NpmWarmRuns = 0,
     $Checks = @("1", "2", "3", "4", "5", "6")
 )
 
@@ -645,10 +646,11 @@ try {
             Write-Host "`n  -> Measuring WARM cache no-lockfile install ($WarmRuns runs each)..."
             $resHeadWarm = Measure-NoLockfileInstall $rnpmBin $warmCacheHead "HEAD (warm)" $WarmRuns
             $res79Warm = Measure-NoLockfileInstall $baseBin $warmCache79 "79a19fd (warm)" $WarmRuns
-            $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $WarmRuns
+            $actualNpmWarmRuns = if ($NpmWarmRuns -gt 0) { $NpmWarmRuns } else { $WarmRuns }
+            $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $actualNpmWarmRuns
 
             Write-Host "`n  === Warm Speed Summary ===" -ForegroundColor Cyan
-            Write-Host ("  WARM Cache (Medians of {0} runs):`n    HEAD:    {1} ms`n    79a19fd: {2} ms`n    npm:     {3} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $resNpmWarm.Median) -ForegroundColor White
+            Write-Host ("  WARM Cache:`n    HEAD ({0} runs):    {1} ms`n    79a19fd ({0} runs): {2} ms`n    npm ({3} runs):     {4} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $actualNpmWarmRuns, $resNpmWarm.Median) -ForegroundColor White
             $warmVs79 = [math]::Round($resHeadWarm.Median / [math]::Max($res79Warm.Median, 1), 3)
             $warmVsNpm = [math]::Round($resNpmWarm.Median / [math]::Max($resHeadWarm.Median, 1), 2)
             Write-Host "    HEAD vs 79a19fd ratio: ${warmVs79}x (must be <= 1.05x)" -ForegroundColor Cyan
