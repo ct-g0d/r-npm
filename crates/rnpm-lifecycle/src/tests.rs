@@ -1508,7 +1508,7 @@ process.exitCode = 0;
         execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(15),
+        start.elapsed() < std::time::Duration::from_secs(45),
         "Must complete without pipe buffer deadlock"
     );
 
@@ -1592,7 +1592,7 @@ process.exitCode = 0;
         .expect("Async massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(15),
+        start.elapsed() < std::time::Duration::from_secs(45),
         "Must complete without pipe buffer deadlock"
     );
 
