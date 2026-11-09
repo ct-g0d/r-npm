@@ -257,6 +257,7 @@ pub static NPM_BOOLEAN_CONFIG_KEYS: &[&str] = &[
     "verbose",
     "version",
     "versions",
+    "workspaces",
     "workspaces-update",
     "yes",
 ];
