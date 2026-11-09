@@ -1052,18 +1052,19 @@ impl LockfileV3 {
         }
 
         // 1. Check dependencies
-        if !Self::map_matches(&manifest.dependencies, &root_pkg.dependencies) {
+        if !Self::map_matches(&self.packages, &manifest.dependencies, &root_pkg.dependencies) {
             return false;
         }
 
         // 2. Check devDependencies
-        if include_dev && !Self::map_matches(&manifest.dev_dependencies, &root_pkg.dev_dependencies)
+        if include_dev && !Self::map_matches(&self.packages, &manifest.dev_dependencies, &root_pkg.dev_dependencies)
         {
             return false;
         }
 
         // 3. Check optionalDependencies
         if !Self::map_matches(
+            &self.packages,
             &manifest.optional_dependencies,
             &root_pkg.optional_dependencies,
         ) {
@@ -1071,7 +1072,7 @@ impl LockfileV3 {
         }
 
         // 4. Check peerDependencies
-        if !Self::map_matches(&manifest.peer_dependencies, &root_pkg.peer_dependencies) {
+        if !Self::map_matches(&self.packages, &manifest.peer_dependencies, &root_pkg.peer_dependencies) {
             return false;
         }
 
@@ -1207,6 +1208,7 @@ impl LockfileV3 {
     }
 
     fn map_matches(
+        packages: &std::collections::BTreeMap<String, LockfilePackage>,
         manifest_map: &std::collections::BTreeMap<String, String>,
         lock_map: &Option<std::collections::BTreeMap<String, String>>,
     ) -> bool {
@@ -1225,6 +1227,12 @@ impl LockfileV3 {
                 };
                 if lock_spec == manifest_spec {
                     continue;
+                }
+                let key = format!("node_modules/{k}");
+                if let Some(pkg) = packages.get(&key) {
+                    if Self::package_satisfies_spec(k, pkg, manifest_spec) {
+                        continue;
+                    }
                 }
                 if let Ok(v) = Version::parse(lock_spec) {
                     if let Ok(r) = Range::parse(manifest_spec) {
