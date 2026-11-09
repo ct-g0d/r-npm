@@ -602,7 +602,8 @@ try {
                 $script:allPassed = $false
             }
 
-            Start-Sleep -Milliseconds 200
+            Start-Sleep -Milliseconds 100
+            cmd.exe /c rd /s /q "$projDir" 2>$null
             Remove-Item -Recurse -Force $projDir -ErrorAction SilentlyContinue
         }
         $med = Get-Median $times
