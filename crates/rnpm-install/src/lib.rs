@@ -479,18 +479,55 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
     graph.edges = new_edges;
 }
 
-impl PackageMetadataProvider for RegistryPackageProvider {
-    fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
-        if let Ok(cache) = self.metadata_cache.lock() {
-            if let Some(meta) = cache.get(name) {
-                return Ok(Some(meta.clone()));
+/// Determines if a disk-cached packument is fresh according to npm's 300s TTL rule.
+pub fn is_packument_fresh(
+    entry: &rnpm_cache::IndexEntry,
+    prefer_offline: bool,
+    offline: bool,
+) -> bool {
+    if offline || prefer_offline {
+        return true;
+    }
+    if entry.time == 0 {
+        return false;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms.saturating_sub(entry.time) < 300_000
+}
+
+/// Extracts an ETag string from cacache metadata JSON.
+pub fn extract_stored_etag(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata.and_then(|m| {
+        m.get("etag")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                m.get("response")
+                    .and_then(|r| r.get("headers"))
+                    .and_then(|h| h.get("etag"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+    })
+}
+
+impl RegistryPackageProvider {
+    fn merge_lockfile_metadata(&self, name: &str, meta: &mut PackageMetadata) {
+        if let Some(ref lf) = self.lockfile {
+            if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
+                for (v, vm) in lf_meta.versions {
+                    meta.versions.entry(v).or_insert(vm);
+                }
             }
         }
+    }
 
+    fn get_cached_packument(&self, name: &str) -> Option<(rnpm_cache::IndexEntry, Vec<u8>)> {
         let registry_url = self.client.registry_for_package(name).as_str().to_string();
-
-        let cached_data = self
-            .cache
+        self.cache
             .get_packument_with_accept(&registry_url, name, Some(NPM_INSTALL_V1_JSON))
             .ok()
             .flatten()
@@ -499,132 +536,139 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     .get(&format!("pacote:packument:{name}"))
                     .ok()
                     .flatten()
-            });
+            })
+    }
 
-        if let Some((entry, data)) = cached_data {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let age_ms = now_ms.saturating_sub(entry.time);
-            let is_fresh =
-                self.offline || self.prefer_offline || (entry.time > 0 && age_ms < 300_000);
+    #[allow(clippy::result_large_err)]
+    fn fetch_or_revalidate_packument(&self, name: &str) -> Result<PackageMetadata, SolverError> {
+        let registry_url = self.client.registry_for_package(name).as_str().to_string();
+        let cached = self.get_cached_packument(name);
 
-            if is_fresh {
+        if let Some((entry, data)) = cached {
+            if is_packument_fresh(&entry, self.prefer_offline, self.offline) {
                 if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                     let mut meta = abbreviated_to_package_metadata(&abbrev);
-                    if let Some(ref lf) = self.lockfile {
-                        if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
-                            for (v, vm) in lf_meta.versions {
-                                meta.versions.entry(v).or_insert(vm);
-                            }
-                        }
-                    }
-                    if let Ok(mut cache) = self.metadata_cache.lock() {
-                        cache.insert(name.to_string(), meta.clone());
-                    }
-                    return Ok(Some(meta));
+                    self.merge_lockfile_metadata(name, &mut meta);
+                    return Ok(meta);
                 }
-            } else {
-                let stored_etag = entry.metadata.as_ref().and_then(|m| {
-                    m.get("etag")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            m.get("response")
-                                .and_then(|r| r.get("headers"))
-                                .and_then(|h| h.get("etag"))
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
-                });
+            }
 
-                let client = self.client.clone();
-                let pkg_name = name.to_string();
-                let if_none_match = stored_etag.clone();
-                let res = self.handle.block_on(async move {
-                    client
-                        .get_package_metadata_conditional(&pkg_name, if_none_match.as_deref())
-                        .await
-                });
+            // Stale cached entry: attempt conditional revalidation with ETag
+            let stored_etag = extract_stored_etag(entry.metadata.as_ref());
+            let client = self.client.clone();
+            let pkg_name = name.to_string();
+            let if_none_match = stored_etag.clone();
+            let res = self.handle.block_on(async move {
+                client
+                    .get_package_metadata_conditional(&pkg_name, if_none_match.as_deref())
+                    .await
+            });
 
-                match res {
-                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
-                        let new_etag = etag.or(stored_etag);
-                        let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
+            match res {
+                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
+                    let new_etag = etag.or(stored_etag);
+                    let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
+                    let _ = self.cache.put_packument_with_accept(
+                        &registry_url,
+                        name,
+                        Some(NPM_INSTALL_V1_JSON),
+                        &data,
+                        cache_meta,
+                    );
+                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                        let mut meta = abbreviated_to_package_metadata(&abbrev);
+                        self.merge_lockfile_metadata(name, &mut meta);
+                        return Ok(meta);
+                    }
+                }
+                Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
+                    if let Ok(bytes) = serde_json::to_vec(&abbrev) {
+                        let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
                         let _ = self.cache.put_packument_with_accept(
                             &registry_url,
                             name,
                             Some(NPM_INSTALL_V1_JSON),
-                            &data,
+                            &bytes,
                             cache_meta,
                         );
-                        if let Ok(abbrev) =
-                            serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
-                        {
-                            let mut meta = abbreviated_to_package_metadata(&abbrev);
-                            if let Some(ref lf) = self.lockfile {
-                                if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
-                                    for (v, vm) in lf_meta.versions {
-                                        meta.versions.entry(v).or_insert(vm);
-                                    }
-                                }
-                            }
-                            if let Ok(mut cache) = self.metadata_cache.lock() {
-                                cache.insert(name.to_string(), meta.clone());
-                            }
-                            return Ok(Some(meta));
-                        }
                     }
-                    Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
-                        metadata: abbrev,
-                        etag,
-                    }) => {
-                        if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                            let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                            let _ = self.cache.put_packument_with_accept(
-                                &registry_url,
-                                name,
-                                Some(NPM_INSTALL_V1_JSON),
-                                &bytes,
-                                cache_meta,
-                            );
-                        }
+                    let mut meta = abbreviated_to_package_metadata(&abbrev);
+                    self.merge_lockfile_metadata(name, &mut meta);
+                    return Ok(meta);
+                }
+                Err(err) => {
+                    debug!("Failed conditional fetch for {name}: {err}. Falling back to cached packument.");
+                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
-                        if let Some(ref lf) = self.lockfile {
-                            if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
-                                for (v, vm) in lf_meta.versions {
-                                    meta.versions.entry(v).or_insert(vm);
-                                }
-                            }
-                        }
-                        if let Ok(mut cache) = self.metadata_cache.lock() {
-                            cache.insert(name.to_string(), meta.clone());
-                        }
-                        return Ok(Some(meta));
-                    }
-                    Err(err) => {
-                        debug!(
-                            "Failed conditional fetch for {name}: {err}. Falling back to cached packument."
-                        );
-                        if let Ok(abbrev) =
-                            serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
-                        {
-                            let mut meta = abbreviated_to_package_metadata(&abbrev);
-                            if let Some(ref lf) = self.lockfile {
-                                if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
-                                    for (v, vm) in lf_meta.versions {
-                                        meta.versions.entry(v).or_insert(vm);
-                                    }
-                                }
-                            }
-                            if let Ok(mut cache) = self.metadata_cache.lock() {
-                                cache.insert(name.to_string(), meta.clone());
-                            }
-                            return Ok(Some(meta));
-                        }
+                        self.merge_lockfile_metadata(name, &mut meta);
+                        return Ok(meta);
                     }
                 }
+            }
+        }
+
+        // Cache miss: check lockfile first
+        if let Some(ref lf) = self.lockfile {
+            if let Some(meta) = package_metadata_from_lockfile(name, lf) {
+                return Ok(meta);
+            }
+        }
+
+        if self.offline {
+            return Err(SolverError::PackageMetadata(
+                name.to_string(),
+                format!(
+                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                ),
+            ));
+        }
+
+        let client = self.client.clone();
+        let pkg_name = name.to_string();
+        let res = self.handle.block_on(async move {
+            client
+                .get_package_metadata_conditional(&pkg_name, None)
+                .await
+        });
+        match res {
+            Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
+                if let Ok(bytes) = serde_json::to_vec(&abbrev) {
+                    let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
+                    let _ = self.cache.put_packument_with_accept(
+                        &registry_url,
+                        name,
+                        Some(NPM_INSTALL_V1_JSON),
+                        &bytes,
+                        cache_meta,
+                    );
+                }
+                let mut meta = abbreviated_to_package_metadata(&abbrev);
+                self.merge_lockfile_metadata(name, &mut meta);
+                Ok(meta)
+            }
+            Ok(rnpm_registry::client::MetadataFetchResult::NotModified { .. }) => {
+                Err(SolverError::PackageMetadata(
+                    name.to_string(),
+                    "Unexpected 304 response for unconditional request".to_string(),
+                ))
+            }
+            Err(e) => {
+                if let Some(ref lf) = self.lockfile {
+                    if let Some(meta) = package_metadata_from_lockfile(name, lf) {
+                        return Ok(meta);
+                    }
+                }
+                Err(SolverError::PackageMetadata(name.to_string(), e.to_string()))
+            }
+        }
+    }
+}
+
+impl PackageMetadataProvider for RegistryPackageProvider {
+    fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
+        if let Ok(cache) = self.metadata_cache.lock() {
+            if let Some(meta) = cache.get(name) {
+                return Ok(Some(meta.clone()));
             }
         }
 
@@ -706,86 +750,19 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
-        if let Some(ref lf) = self.lockfile {
-            if let Some(meta) = package_metadata_from_lockfile(name, lf) {
-                if let Ok(mut cache) = self.metadata_cache.lock() {
-                    cache.insert(name.to_string(), meta.clone());
-                }
-                return Ok(Some(meta));
-            }
-        }
-
-        if self.offline {
-            return Err(SolverError::PackageMetadata(
-                name.to_string(),
-                format!(
-                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
-                ),
-            ));
-        }
-
-        let client = self.client.clone();
-        let pkg_name = name.to_string();
-        let res = self.handle.block_on(async move {
-            client
-                .get_package_metadata_conditional(&pkg_name, None)
-                .await
-        });
-        match res {
-            Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
-                metadata: abbrev,
-                etag,
-            }) => {
-                // Persist the abbreviated packument under the registry-scoped key
-                // so a later invocation can resolve from disk without repeating
-                // metadata requests and metadata from different registries is completely isolated.
-                if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                    let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                    let _ = self.cache.put_packument_with_accept(
-                        &registry_url,
-                        name,
-                        Some(NPM_INSTALL_V1_JSON),
-                        &bytes,
-                        cache_meta,
-                    );
-                }
-                let mut meta = abbreviated_to_package_metadata(&abbrev);
-                if let Some(ref lf) = self.lockfile {
-                    if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
-                        for (v, vm) in lf_meta.versions {
-                            meta.versions.entry(v).or_insert(vm);
-                        }
-                    }
-                }
+        match self.fetch_or_revalidate_packument(name) {
+            Ok(meta) => {
                 if let Ok(mut cache) = self.metadata_cache.lock() {
                     cache.insert(name.to_string(), meta.clone());
                 }
                 Ok(Some(meta))
             }
-            Ok(rnpm_registry::client::MetadataFetchResult::NotModified { .. }) => {
-                Err(SolverError::PackageMetadata(
-                    name.to_string(),
-                    "Unexpected 304 response for unconditional request".to_string(),
-                ))
+            Err(SolverError::PackageMetadata(_, msg))
+                if msg.contains("404") || msg.contains("Not Found") =>
+            {
+                Ok(None)
             }
-            Err(e) => {
-                if let Some(ref lf) = self.lockfile {
-                    if let Some(meta) = package_metadata_from_lockfile(name, lf) {
-                        if let Ok(mut cache) = self.metadata_cache.lock() {
-                            cache.insert(name.to_string(), meta.clone());
-                        }
-                        return Ok(Some(meta));
-                    }
-                }
-                if e.is_not_found() {
-                    Ok(None)
-                } else {
-                    Err(SolverError::PackageMetadata(
-                        name.to_string(),
-                        e.to_string(),
-                    ))
-                }
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -825,13 +802,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 if let Ok(Some((entry, _))) =
                     cache.get_packument_with_accept(&reg_url, name, Some(NPM_INSTALL_V1_JSON))
                 {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    if prefer_offline
-                        || (entry.time > 0 && now_ms.saturating_sub(entry.time) < 300_000)
-                    {
+                    if is_packument_fresh(&entry, prefer_offline, false) {
                         return false;
                     }
                 }
@@ -1995,20 +1966,29 @@ impl Installer {
                 return Err(anyhow!("Package argument contains null character"));
             }
 
-            let is_path = (trimmed.starts_with("./")
-                || trimmed.starts_with("../")
-                || trimmed.starts_with(".\\")
-                || trimmed.starts_with("..\\")
-                || trimmed.starts_with('/')
-                || trimmed.starts_with('\\')
-                || (trimmed.len() > 2
-                    && trimmed.as_bytes()[1] == b':'
-                    && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/'))
-                || trimmed.ends_with(".tgz")
-                || trimmed.ends_with(".tar.gz")
-                || trimmed.ends_with(".tar")
-                || Path::new(trimmed).exists())
-                && !trimmed.starts_with("file:");
+            let is_remote = trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("git://")
+                || trimmed.starts_with("git+")
+                || trimmed.starts_with("github:")
+                || trimmed.starts_with("gitlab:")
+                || trimmed.starts_with("bitbucket:");
+
+            let is_path = !is_remote
+                && !trimmed.starts_with("file:")
+                && (trimmed.starts_with("./")
+                    || trimmed.starts_with("../")
+                    || trimmed.starts_with(".\\")
+                    || trimmed.starts_with("..\\")
+                    || trimmed.starts_with('/')
+                    || trimmed.starts_with('\\')
+                    || (trimmed.len() > 2
+                        && trimmed.as_bytes()[1] == b':'
+                        && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/'))
+                    || trimmed.ends_with(".tgz")
+                    || trimmed.ends_with(".tar.gz")
+                    || trimmed.ends_with(".tar")
+                    || Path::new(trimmed).exists());
 
             let formatted_input = if is_path {
                 format!("file:{}", trimmed)
@@ -2300,7 +2280,10 @@ impl Installer {
             let client = self.registry_client.clone();
             let cache = self.cache.clone();
             let reg_cache = metadata_cache.clone();
-            let prefer_offline = self.options.prefer_offline;
+            let prefer_offline = self.options.prefer_offline
+                || std::env::var("npm_config_prefer_offline")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false);
             let lockfile_ref = existing_lockfile.clone();
             let unlocked = self.options.unlocked_packages.clone();
 
@@ -2323,13 +2306,7 @@ impl Installer {
                     if let Ok(Some((entry, _))) =
                         cache.get_packument_with_accept(&reg_url, name, Some(NPM_INSTALL_V1_JSON))
                     {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        if prefer_offline
-                            || (entry.time > 0 && now_ms.saturating_sub(entry.time) < 300_000)
-                        {
+                        if is_packument_fresh(&entry, prefer_offline, false) {
                             return false;
                         }
                     }
@@ -5401,20 +5378,35 @@ impl Installer {
                     extra: m.extra.clone(),
                 };
 
-                let mut dist_tags = BTreeMap::new();
-                dist_tags.insert("latest".to_string(), version.clone());
-                let mut versions = BTreeMap::new();
-                versions.insert(version.clone(), ver_meta);
+                let mut meta = if let Ok(locked) = cache.lock() {
+                    locked.get(name).cloned()
+                } else {
+                    None
+                };
+
+                if meta.is_none() {
+                    if let Ok(reg_abbrev) =
+                        self.registry_client.get_package_metadata(name).await
+                    {
+                        meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
+                    }
+                }
+
+                let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
+                    name: name.clone(),
+                    dist_tags: BTreeMap::new(),
+                    versions: BTreeMap::new(),
+                });
+
+                pkg_meta.versions.insert(version.clone(), ver_meta);
+                if pkg_meta.dist_tags.is_empty() {
+                    pkg_meta
+                        .dist_tags
+                        .insert("latest".to_string(), version.clone());
+                }
 
                 if let Ok(mut locked) = cache.lock() {
-                    locked.insert(
-                        name.clone(),
-                        PackageMetadata {
-                            name: name.clone(),
-                            dist_tags: dist_tags.clone(),
-                            versions: versions.clone(),
-                        },
-                    );
+                    locked.insert(name.clone(), pkg_meta);
                 }
 
                 Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
@@ -5486,20 +5478,35 @@ impl Installer {
                                 extra: m.extra.clone(),
                             };
 
-                            let mut dist_tags = BTreeMap::new();
-                            dist_tags.insert("latest".to_string(), version.clone());
-                            let mut versions = BTreeMap::new();
-                            versions.insert(version, ver_meta);
+                            let mut meta = if let Ok(locked) = cache.lock() {
+                                locked.get(name).cloned()
+                            } else {
+                                None
+                            };
+
+                            if meta.is_none() {
+                                if let Ok(reg_abbrev) =
+                                    self.registry_client.get_package_metadata(name).await
+                                {
+                                    meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
+                                }
+                            }
+
+                            let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
+                                name: name.clone(),
+                                dist_tags: BTreeMap::new(),
+                                versions: BTreeMap::new(),
+                            });
+
+                            pkg_meta.versions.insert(version.clone(), ver_meta);
+                            if pkg_meta.dist_tags.is_empty() {
+                                pkg_meta
+                                    .dist_tags
+                                    .insert("latest".to_string(), version.clone());
+                            }
 
                             if let Ok(mut locked) = cache.lock() {
-                                locked.insert(
-                                    name.clone(),
-                                    PackageMetadata {
-                                        name: name.clone(),
-                                        dist_tags,
-                                        versions,
-                                    },
-                                );
+                                locked.insert(name.clone(), pkg_meta);
                             }
 
                             Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
@@ -5553,20 +5560,35 @@ impl Installer {
                             extra: m.extra.clone(),
                         };
 
-                        let mut dist_tags = BTreeMap::new();
-                        dist_tags.insert("latest".to_string(), version.clone());
-                        let mut versions = BTreeMap::new();
-                        versions.insert(version, ver_meta);
+                        let mut meta = if let Ok(locked) = cache.lock() {
+                            locked.get(name).cloned()
+                        } else {
+                            None
+                        };
+
+                        if meta.is_none() {
+                            if let Ok(reg_abbrev) =
+                                self.registry_client.get_package_metadata(name).await
+                            {
+                                meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
+                            }
+                        }
+
+                        let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
+                            name: name.clone(),
+                            dist_tags: BTreeMap::new(),
+                            versions: BTreeMap::new(),
+                        });
+
+                        pkg_meta.versions.insert(version.clone(), ver_meta);
+                        if pkg_meta.dist_tags.is_empty() {
+                            pkg_meta
+                                .dist_tags
+                                .insert("latest".to_string(), version.clone());
+                        }
 
                         if let Ok(mut locked) = cache.lock() {
-                            locked.insert(
-                                name.clone(),
-                                PackageMetadata {
-                                    name: name.clone(),
-                                    dist_tags,
-                                    versions,
-                                },
-                            );
+                            locked.insert(name.clone(), pkg_meta);
                         }
 
                         Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
