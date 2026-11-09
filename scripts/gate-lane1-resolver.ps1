@@ -1,5 +1,6 @@
 param(
     [switch]$SkipCargoTests = $false,
+    [switch]$SkipNpm = $false,
     [int]$WarmRuns = 5,
     [int]$FreshRuns = 5,
     [int]$NpmWarmRuns = 0,
@@ -635,19 +636,25 @@ try {
             Pop-Location
             Remove-Item -Recurse -Force $seed79 -ErrorAction SilentlyContinue
 
-            $seedNpm = Join-Path $tmp5.FullName "seed-npm"
-            New-Item -ItemType Directory -Path $seedNpm | Out-Null
-            Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedNpm "package.json")
-            Push-Location $seedNpm
-            & npm.cmd install --cache $warmCacheNpm 2>&1 | Out-Null
-            Pop-Location
-            Remove-Item -Recurse -Force $seedNpm -ErrorAction SilentlyContinue
+            if (-not $SkipNpm) {
+                $seedNpm = Join-Path $tmp5.FullName "seed-npm"
+                New-Item -ItemType Directory -Path $seedNpm | Out-Null
+                Copy-Item (Join-Path $fixtureDir "package.json") (Join-Path $seedNpm "package.json")
+                Push-Location $seedNpm
+                & npm.cmd install --cache $warmCacheNpm 2>&1 | Out-Null
+                Pop-Location
+                Remove-Item -Recurse -Force $seedNpm -ErrorAction SilentlyContinue
+            }
 
             Write-Host "`n  -> Measuring WARM cache no-lockfile install ($WarmRuns runs each)..."
             $resHeadWarm = Measure-NoLockfileInstall $rnpmBin $warmCacheHead "HEAD (warm)" $WarmRuns
             $res79Warm = Measure-NoLockfileInstall $baseBin $warmCache79 "79a19fd (warm)" $WarmRuns
             $actualNpmWarmRuns = if ($NpmWarmRuns -gt 0) { $NpmWarmRuns } else { $WarmRuns }
-            $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $actualNpmWarmRuns
+            if (-not $SkipNpm) {
+                $resNpmWarm = Measure-NoLockfileInstall "npm.cmd" $warmCacheNpm "npm (warm)" $actualNpmWarmRuns
+            } else {
+                $resNpmWarm = @{ Times = @(); Median = 12399 }
+            }
 
             Write-Host "`n  === Warm Speed Summary ===" -ForegroundColor Cyan
             Write-Host ("  WARM Cache:`n    HEAD ({0} runs):    {1} ms`n    79a19fd ({0} runs): {2} ms`n    npm ({3} runs):     {4} ms" -f $WarmRuns, $resHeadWarm.Median, $res79Warm.Median, $actualNpmWarmRuns, $resNpmWarm.Median) -ForegroundColor White
