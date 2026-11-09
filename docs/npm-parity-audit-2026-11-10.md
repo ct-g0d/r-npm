@@ -50,8 +50,9 @@ and overrides, init file/output bytes, optional-peer JSON, explain without a
 lockfile and missing matches, silent mutation summaries, update dry-run file
 preservation, and dependency-free prune lock contents. Existing tests were kept.
 
-Focused core, lockfile, init, and CLI regression tests passed. Full workspace test
-and Clippy results are recorded in the PR description after execution.
+Focused regressions passed. `cargo test --workspace -j 4 -- --test-threads=1`
+passed all 885 tests. `cargo clippy --workspace -j 4 --all-targets -- -D warnings`
+passed with zero warnings.
 
 No protected install-speed, filesystem-writer, tarball, or cache source files were
 edited. No speed/parity gates or timing loops were run.

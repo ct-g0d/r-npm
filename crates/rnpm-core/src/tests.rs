@@ -1326,4 +1326,3 @@ fn file_specs_normalize_relative_current_directory_components() {
     }
     assert_eq!(PackageTarget::parse("file:../sibling.tgz").unwrap(), PackageTarget::File("../sibling.tgz".into()));
 }
-
