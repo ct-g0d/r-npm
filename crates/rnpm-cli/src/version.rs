@@ -131,7 +131,9 @@ async fn execute_version_bump(
 
     let pkg_content = std::fs::read_to_string(&pkg_path)
         .with_context(|| format!("Failed to read {}", pkg_path.display()))?;
-    let mut pkg_json: serde_json::Value = serde_json::from_str(&pkg_content)
+    let format = rnpm_core::manifest::ManifestFormat::detect(&pkg_content);
+    let clean_str = pkg_content.strip_prefix('\u{feff}').unwrap_or(&pkg_content);
+    let mut pkg_json: rnpm_core::OrderedJsonValue = serde_json::from_str(clean_str)
         .with_context(|| format!("Failed to parse {}", pkg_path.display()))?;
 
     let old_version_raw = pkg_json
@@ -218,45 +220,26 @@ async fn execute_version_bump(
     }
 
     // b) Version bump in package.json and package-lock.json
-    if let serde_json::Value::Object(ref mut map) = pkg_json {
+    if let rnpm_core::OrderedJsonValue::Object(ref mut map) = pkg_json {
         map.insert(
             "version".to_string(),
-            serde_json::Value::String(new_version.clone()),
+            rnpm_core::OrderedJsonValue::String(new_version.clone()),
         );
     }
-    let format = rnpm_core::manifest::ManifestFormat::detect(&pkg_content);
     let formatted_pkg = rnpm_core::manifest::Manifest::format_json_value(&pkg_json, &format)?;
     std::fs::write(&pkg_path, formatted_pkg)
         .with_context(|| format!("Failed to write {}", pkg_path.display()))?;
 
-
     for lock_name in &["package-lock.json", "npm-shrinkwrap.json"] {
         let lock_path = project_dir.join(lock_name);
         if lock_path.exists() {
-            if let Ok(lock_str) = std::fs::read_to_string(&lock_path) {
-                if let Ok(mut lock_json) = serde_json::from_str::<serde_json::Value>(&lock_str) {
-                    if let serde_json::Value::Object(ref mut map) = lock_json {
-                        map.insert(
-                            "version".to_string(),
-                            serde_json::Value::String(new_version.clone()),
-                        );
-                        if let Some(serde_json::Value::Object(ref mut pkgs)) =
-                            map.get_mut("packages")
-                        {
-                            if let Some(serde_json::Value::Object(ref mut root_pkg)) =
-                                pkgs.get_mut("")
-                            {
-                                root_pkg.insert(
-                                    "version".to_string(),
-                                    serde_json::Value::String(new_version.clone()),
-                                );
-                            }
-                        }
-                    }
-                    let mut formatted_lock = serde_json::to_string_pretty(&lock_json)?;
-                    formatted_lock.push('\n');
-                    let _ = std::fs::write(&lock_path, formatted_lock);
+            if let Ok(mut lockfile) = rnpm_lockfile::LockfileV3::load_from_file(&lock_path) {
+                lockfile.version = Some(new_version.clone());
+                if let Some(root_pkg) = lockfile.root_package_mut() {
+                    root_pkg.version = Some(new_version.clone());
+                    root_pkg.raw_value = None;
                 }
+                let _ = lockfile.save_to_file(&lock_path);
             }
         }
     }

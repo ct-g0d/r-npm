@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::manifest::{Manifest, ManifestFormat};
+use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
 
 /// Represents a single segment in a package manifest property path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,17 +185,17 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     Ok(segments)
 }
 
-/// Traverses a JSON [`Value`] using the provided [`PathSegment`]s.
+/// Traverses an [`OrderedJsonValue`] using the provided [`PathSegment`]s.
 ///
-/// Returns `Some(&Value)` if the path exists, or `None` if any segment cannot be resolved.
-pub fn get_value_at_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Option<&'a Value> {
+/// Returns `Some(&OrderedJsonValue)` if the path exists, or `None` if any segment cannot be resolved.
+pub fn get_value_at_path<'a>(root: &'a OrderedJsonValue, segments: &[PathSegment]) -> Option<&'a OrderedJsonValue> {
     if segments.is_empty() {
         return Some(root);
     }
     let mut curr = root;
     for segment in segments {
         match curr {
-            Value::Object(map) => match segment {
+            OrderedJsonValue::Object(map) => match segment {
                 PathSegment::Key(key) => {
                     curr = map.get(key)?;
                 }
@@ -205,7 +205,7 @@ pub fn get_value_at_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Optio
                 }
                 PathSegment::Append => return None,
             },
-            Value::Array(arr) => match segment {
+            OrderedJsonValue::Array(arr) => match segment {
                 PathSegment::Index(idx) => {
                     curr = arr.get(*idx)?;
                 }
@@ -224,43 +224,43 @@ pub fn get_value_at_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Optio
     Some(curr)
 }
 
-/// Coerces a raw value string into a [`serde_json::Value`] according to npm coercion rules:
-/// - `"true"` -> `Value::Bool(true)`
-/// - `"false"` -> `Value::Bool(false)`
-/// - `"null"` -> `Value::Null`
-/// - Valid number string (e.g. `"42"`, `"3.14"`) -> `Value::Number`
+/// Coerces a raw value string into an [`OrderedJsonValue`] according to npm coercion rules:
+/// - `"true"` -> `OrderedJsonValue::Bool(true)`
+/// - `"false"` -> `OrderedJsonValue::Bool(false)`
+/// - `"null"` -> `OrderedJsonValue::Null`
+/// - Valid number string (e.g. `"42"`, `"3.14"`) -> `OrderedJsonValue::Number`
 /// - Valid JSON object/array string (starts with `{` or `[`) -> parsed JSON via `serde_json::from_str`
-/// - Otherwise -> `Value::String(value)`
-pub fn coerce_value(raw: &str) -> Value {
+/// - Otherwise -> `OrderedJsonValue::String(value)`
+pub fn coerce_value(raw: &str) -> OrderedJsonValue {
     let trimmed = raw.trim();
     if trimmed == "true" {
-        Value::Bool(true)
+        OrderedJsonValue::Bool(true)
     } else if trimmed == "false" {
-        Value::Bool(false)
+        OrderedJsonValue::Bool(false)
     } else if trimmed == "null" {
-        Value::Null
+        OrderedJsonValue::Null
     } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<OrderedJsonValue>(trimmed) {
             parsed
         } else {
-            Value::String(raw.to_string())
+            OrderedJsonValue::String(raw.to_string())
         }
     } else if let Ok(num) = serde_json::from_str::<serde_json::Number>(trimmed) {
-        Value::Number(num)
+        OrderedJsonValue::Number(num)
     } else {
-        Value::String(raw.to_string())
+        OrderedJsonValue::String(raw.to_string())
     }
 }
 
-/// Navigates `root` along `segments`, creating intermediate `Value::Object` (or `Value::Array`)
+/// Navigates `root` along `segments`, creating intermediate `OrderedJsonValue::Object` (or `OrderedJsonValue::Array`)
 /// containers if absent, and assigns `value` to the leaf segment.
-pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Result<()> {
+pub fn set_value(root: &mut OrderedJsonValue, segments: &[PathSegment], value: OrderedJsonValue) -> Result<()> {
     if segments.is_empty() {
         bail!("Path cannot be empty");
     }
 
     if !root.is_object() {
-        *root = Value::Object(serde_json::Map::new());
+        *root = OrderedJsonValue::Object(OrderedJsonMap::new());
     }
 
     let mut current = root;
@@ -270,16 +270,16 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
         if is_leaf {
             match segment {
                 PathSegment::Key(key) => match current {
-                    Value::Object(map) => {
+                    OrderedJsonValue::Object(map) => {
                         map.insert(key.clone(), value);
                     }
-                    Value::Array(arr) => {
+                    OrderedJsonValue::Array(arr) => {
                         if let Ok(idx) = key.parse::<usize>() {
                             if idx < arr.len() {
                                 arr[idx] = value;
                             } else {
                                 while arr.len() < idx {
-                                    arr.push(Value::Null);
+                                    arr.push(OrderedJsonValue::Null);
                                 }
                                 arr.push(value);
                             }
@@ -288,43 +288,43 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
                         }
                     }
                     _ => {
-                        let mut map = serde_json::Map::new();
+                        let mut map = OrderedJsonMap::new();
                         map.insert(key.clone(), value);
-                        *current = Value::Object(map);
+                        *current = OrderedJsonValue::Object(map);
                     }
                 },
                 PathSegment::Index(idx) => {
                     let idx = *idx;
                     match current {
-                        Value::Array(arr) => {
+                        OrderedJsonValue::Array(arr) => {
                             if idx < arr.len() {
                                 arr[idx] = value;
                             } else {
                                 while arr.len() < idx {
-                                    arr.push(Value::Null);
+                                    arr.push(OrderedJsonValue::Null);
                                 }
                                 arr.push(value);
                             }
                         }
-                        Value::Object(map) => {
+                        OrderedJsonValue::Object(map) => {
                             map.insert(idx.to_string(), value);
                         }
                         _ => {
                             let mut arr = Vec::new();
                             while arr.len() < idx {
-                                arr.push(Value::Null);
+                                arr.push(OrderedJsonValue::Null);
                             }
                             arr.push(value);
-                            *current = Value::Array(arr);
+                            *current = OrderedJsonValue::Array(arr);
                         }
                     }
                 }
                 PathSegment::Append => match current {
-                    Value::Array(arr) => {
+                    OrderedJsonValue::Array(arr) => {
                         arr.push(value);
                     }
                     _ => {
-                        *current = Value::Array(vec![value]);
+                        *current = OrderedJsonValue::Array(vec![value]);
                     }
                 },
             }
@@ -339,51 +339,51 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
 
         match segment {
             PathSegment::Key(key) => match current {
-                Value::Object(map) => {
+                OrderedJsonValue::Object(map) => {
                     let needs_new_container = match map.get(key) {
                         None => true,
-                        Some(Value::Null) => true,
-                        Some(Value::Object(_)) => false,
-                        Some(Value::Array(_)) => false,
+                        Some(OrderedJsonValue::Null) => true,
+                        Some(OrderedJsonValue::Object(_)) => false,
+                        Some(OrderedJsonValue::Array(_)) => false,
                         Some(_) => true,
                     };
                     if needs_new_container {
                         let new_container = if next_is_array {
-                            Value::Array(Vec::new())
+                            OrderedJsonValue::Array(Vec::new())
                         } else {
-                            Value::Object(serde_json::Map::new())
+                            OrderedJsonValue::Object(OrderedJsonMap::new())
                         };
                         map.insert(key.clone(), new_container);
                     }
                     current = map.get_mut(key).unwrap();
                 }
-                Value::Array(arr) => {
+                OrderedJsonValue::Array(arr) => {
                     let idx = key.parse::<usize>().map_err(|_| {
                         anyhow!("Cannot navigate named property '{}' on array", key)
                     })?;
                     while arr.len() <= idx {
-                        arr.push(Value::Null);
+                        arr.push(OrderedJsonValue::Null);
                     }
-                    let is_container = matches!(arr[idx], Value::Object(_) | Value::Array(_));
+                    let is_container = matches!(arr[idx], OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_));
                     if !is_container {
                         arr[idx] = if next_is_array {
-                            Value::Array(Vec::new())
+                            OrderedJsonValue::Array(Vec::new())
                         } else {
-                            Value::Object(serde_json::Map::new())
+                            OrderedJsonValue::Object(OrderedJsonMap::new())
                         };
                     }
                     current = &mut arr[idx];
                 }
                 _ => {
-                    let mut map = serde_json::Map::new();
+                    let mut map = OrderedJsonMap::new();
                     let new_container = if next_is_array {
-                        Value::Array(Vec::new())
+                        OrderedJsonValue::Array(Vec::new())
                     } else {
-                        Value::Object(serde_json::Map::new())
+                        OrderedJsonValue::Object(OrderedJsonMap::new())
                     };
                     map.insert(key.clone(), new_container);
-                    *current = Value::Object(map);
-                    if let Value::Object(m) = current {
+                    *current = OrderedJsonValue::Object(map);
+                    if let OrderedJsonValue::Object(m) = current {
                         current = m.get_mut(key).unwrap();
                     }
                 }
@@ -391,34 +391,34 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
             PathSegment::Index(idx) => {
                 let idx = *idx;
                 match current {
-                    Value::Array(arr) => {
+                    OrderedJsonValue::Array(arr) => {
                         while arr.len() <= idx {
-                            arr.push(Value::Null);
+                            arr.push(OrderedJsonValue::Null);
                         }
-                        let is_container = matches!(arr[idx], Value::Object(_) | Value::Array(_));
+                        let is_container = matches!(arr[idx], OrderedJsonValue::Object(_) | OrderedJsonValue::Array(_));
                         if !is_container {
                             arr[idx] = if next_is_array {
-                                Value::Array(Vec::new())
+                                OrderedJsonValue::Array(Vec::new())
                             } else {
-                                Value::Object(serde_json::Map::new())
+                                OrderedJsonValue::Object(OrderedJsonMap::new())
                             };
                         }
                         current = &mut arr[idx];
                     }
-                    Value::Object(map) => {
+                    OrderedJsonValue::Object(map) => {
                         let key = idx.to_string();
                         let needs_new_container = match map.get(&key) {
                             None => true,
-                            Some(Value::Null) => true,
-                            Some(Value::Object(_)) => false,
-                            Some(Value::Array(_)) => false,
+                            Some(OrderedJsonValue::Null) => true,
+                            Some(OrderedJsonValue::Object(_)) => false,
+                            Some(OrderedJsonValue::Array(_)) => false,
                             Some(_) => true,
                         };
                         if needs_new_container {
                             let new_container = if next_is_array {
-                                Value::Array(Vec::new())
+                                OrderedJsonValue::Array(Vec::new())
                             } else {
-                                Value::Object(serde_json::Map::new())
+                                OrderedJsonValue::Object(OrderedJsonMap::new())
                             };
                             map.insert(key.clone(), new_container);
                         }
@@ -427,38 +427,38 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
                     _ => {
                         let mut arr = Vec::new();
                         while arr.len() <= idx {
-                            arr.push(Value::Null);
+                            arr.push(OrderedJsonValue::Null);
                         }
                         arr[idx] = if next_is_array {
-                            Value::Array(Vec::new())
+                            OrderedJsonValue::Array(Vec::new())
                         } else {
-                            Value::Object(serde_json::Map::new())
+                            OrderedJsonValue::Object(OrderedJsonMap::new())
                         };
-                        *current = Value::Array(arr);
-                        if let Value::Array(a) = current {
+                        *current = OrderedJsonValue::Array(arr);
+                        if let OrderedJsonValue::Array(a) = current {
                             current = &mut a[idx];
                         }
                     }
                 }
             }
             PathSegment::Append => match current {
-                Value::Array(arr) => {
+                OrderedJsonValue::Array(arr) => {
                     let new_container = if next_is_array {
-                        Value::Array(Vec::new())
+                        OrderedJsonValue::Array(Vec::new())
                     } else {
-                        Value::Object(serde_json::Map::new())
+                        OrderedJsonValue::Object(OrderedJsonMap::new())
                     };
                     arr.push(new_container);
                     current = arr.last_mut().unwrap();
                 }
                 _ => {
                     let new_container = if next_is_array {
-                        Value::Array(Vec::new())
+                        OrderedJsonValue::Array(Vec::new())
                     } else {
-                        Value::Object(serde_json::Map::new())
+                        OrderedJsonValue::Object(OrderedJsonMap::new())
                     };
-                    *current = Value::Array(vec![new_container]);
-                    if let Value::Array(a) = current {
+                    *current = OrderedJsonValue::Array(vec![new_container]);
+                    if let OrderedJsonValue::Array(a) = current {
                         current = a.last_mut().unwrap();
                     }
                 }
@@ -470,7 +470,7 @@ pub fn set_value(root: &mut Value, segments: &[PathSegment], value: Value) -> Re
 }
 
 /// Navigates `root` along `segments` and removes the leaf property or array element.
-pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
+pub fn delete_value(root: &mut OrderedJsonValue, segments: &[PathSegment]) {
     if segments.is_empty() {
         return;
     }
@@ -478,17 +478,17 @@ pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
     if segments.len() == 1 {
         match &segments[0] {
             PathSegment::Key(key) => {
-                if let Value::Object(map) = root {
-                    map.remove(key);
+                if let OrderedJsonValue::Object(map) = root {
+                    map.shift_remove(key);
                 }
             }
             PathSegment::Index(idx) => {
-                if let Value::Array(arr) = root {
+                if let OrderedJsonValue::Array(arr) = root {
                     if *idx < arr.len() {
                         arr.remove(*idx);
                     }
-                } else if let Value::Object(map) = root {
-                    map.remove(&idx.to_string());
+                } else if let OrderedJsonValue::Object(map) = root {
+                    map.shift_remove(&idx.to_string());
                 }
             }
             PathSegment::Append => {}
@@ -501,14 +501,14 @@ pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
     for segment in &segments[..segments.len() - 1] {
         match segment {
             PathSegment::Key(key) => match current {
-                Value::Object(map) => {
+                OrderedJsonValue::Object(map) => {
                     if let Some(next) = map.get_mut(key) {
                         current = next;
                     } else {
                         return;
                     }
                 }
-                Value::Array(arr) => {
+                OrderedJsonValue::Array(arr) => {
                     if let Ok(idx) = key.parse::<usize>() {
                         if idx < arr.len() {
                             current = &mut arr[idx];
@@ -524,14 +524,14 @@ pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
             PathSegment::Index(idx) => {
                 let idx = *idx;
                 match current {
-                    Value::Array(arr) => {
+                    OrderedJsonValue::Array(arr) => {
                         if idx < arr.len() {
                             current = &mut arr[idx];
                         } else {
                             return;
                         }
                     }
-                    Value::Object(map) => {
+                    OrderedJsonValue::Object(map) => {
                         let key = idx.to_string();
                         if let Some(next) = map.get_mut(&key) {
                             current = next;
@@ -550,10 +550,10 @@ pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
     let leaf = &segments[segments.len() - 1];
     match leaf {
         PathSegment::Key(key) => match current {
-            Value::Object(map) => {
-                map.remove(key);
+            OrderedJsonValue::Object(map) => {
+                map.shift_remove(key);
             }
-            Value::Array(arr) => {
+            OrderedJsonValue::Array(arr) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     if idx < arr.len() {
                         arr.remove(idx);
@@ -565,13 +565,13 @@ pub fn delete_value(root: &mut Value, segments: &[PathSegment]) {
         PathSegment::Index(idx) => {
             let idx = *idx;
             match current {
-                Value::Array(arr) => {
+                OrderedJsonValue::Array(arr) => {
                     if idx < arr.len() {
                         arr.remove(idx);
                     }
                 }
-                Value::Object(map) => {
-                    map.remove(&idx.to_string());
+                OrderedJsonValue::Object(map) => {
+                    map.shift_remove(&idx.to_string());
                 }
                 _ => {}
             }
@@ -618,9 +618,10 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
             resolved_path.display()
         )
     })?;
+    let format = ManifestFormat::detect(&content);
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
-    let manifest_val: Value = serde_json::from_str(clean_str).with_context(|| {
+    let manifest_val: OrderedJsonValue = serde_json::from_str(clean_str).with_context(|| {
         format!(
             "Failed to parse JSON in package manifest at '{}'",
             resolved_path.display()
@@ -628,7 +629,7 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
     })?;
 
     if field_paths.is_empty() {
-        return Ok(serde_json::to_string_pretty(&manifest_val)?);
+        return Ok(Manifest::format_json_value(&manifest_val, &format)?);
     }
 
     if field_paths.len() == 1 {
@@ -639,15 +640,15 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
             None => return Ok("{}".to_string()),
         };
 
-        if let Value::String(s) = value {
+        if let OrderedJsonValue::String(s) = value {
             if !json {
                 return Ok(s.clone());
             }
         }
-        return Ok(serde_json::to_string_pretty(value)?);
+        return Ok(Manifest::format_json_value(value, &ManifestFormat::default())?);
     }
 
-    let mut result_map = serde_json::Map::new();
+    let mut result_map = OrderedJsonMap::new();
     for path_str in field_paths {
         let segments = parse_path(path_str)?;
         if let Some(value) = get_value_at_path(&manifest_val, &segments) {
@@ -655,15 +656,15 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
         }
     }
 
-    Ok(serde_json::to_string_pretty(&Value::Object(result_map))?)
+    Ok(Manifest::format_json_value(&OrderedJsonValue::Object(result_map), &ManifestFormat::default())?)
 }
 
-/// Retrieves package manifest values as a [`serde_json::Value`].
+/// Retrieves package manifest values as an [`OrderedJsonValue`].
 ///
 /// - If `field_paths` is empty: returns the full manifest value.
 /// - If single field: returns that field's value or `{}` if not found.
 /// - If multiple fields: returns a JSON object `{ field: value, ... }` of found fields.
-pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Value> {
+pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<OrderedJsonValue> {
     let resolved_path = resolve_manifest_path(manifest_path);
     let content = std::fs::read_to_string(&resolved_path).with_context(|| {
         format!(
@@ -673,7 +674,7 @@ pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Val
     })?;
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
-    let manifest_val: Value = serde_json::from_str(clean_str).with_context(|| {
+    let manifest_val: OrderedJsonValue = serde_json::from_str(clean_str).with_context(|| {
         format!(
             "Failed to parse JSON in package manifest at '{}'",
             resolved_path.display()
@@ -689,11 +690,11 @@ pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Val
         let segments = parse_path(path_str)?;
         let val = get_value_at_path(&manifest_val, &segments)
             .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            .unwrap_or_else(|| OrderedJsonValue::Object(OrderedJsonMap::new()));
         return Ok(val);
     }
 
-    let mut result_map = serde_json::Map::new();
+    let mut result_map = OrderedJsonMap::new();
     for path_str in field_paths {
         let segments = parse_path(path_str)?;
         if let Some(value) = get_value_at_path(&manifest_val, &segments) {
@@ -701,25 +702,26 @@ pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Val
         }
     }
 
-    Ok(Value::Object(result_map))
+    Ok(OrderedJsonValue::Object(result_map))
 }
 
 /// Retrieves properties across workspace members formatted as pretty-printed JSON:
 /// `{ "<workspace-name>": <extracted-value>, ... }`.
 pub fn pkg_get_workspaces(members: &[(&str, &Path)], field_paths: &[String]) -> Result<String> {
-    let mut root_map = serde_json::Map::new();
+    let mut root_map = OrderedJsonMap::new();
     for (name, path) in members {
         let val = pkg_get_value(path, field_paths)?;
         root_map.insert((*name).to_string(), val);
     }
-    Ok(serde_json::to_string_pretty(&Value::Object(root_map))?)
+    let format = ManifestFormat::default();
+    Ok(Manifest::format_json_value(&OrderedJsonValue::Object(root_map), &format)?)
 }
 
 /// Sets properties in `package.json` at `manifest_path` based on `<path>=<value>` assignments.
 ///
-/// Intermediate `Value::Object` (or `Value::Array`) containers are created automatically
-/// if absent. Values are coerced according to npm rules. The resulting JSON is persisted
-/// with 2 spaces indentation and a trailing newline (`\n`).
+/// Intermediate containers are created automatically if absent. Values are coerced
+/// according to npm rules. The resulting JSON is persisted preserving original formatting
+/// (indentation, newlines, UTF-8 BOM, and trailing newlines).
 pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     let resolved_path = resolve_manifest_path(manifest_path);
     let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
@@ -729,8 +731,9 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
             e
         )
     })?;
+    let format = ManifestFormat::detect(&content);
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    let mut root: Value = serde_json::from_str(clean_str).map_err(|e| {
+    let mut root: OrderedJsonValue = serde_json::from_str(clean_str).map_err(|e| {
         anyhow!(
             "Failed to parse JSON in manifest at '{}': {}",
             resolved_path.display(),
@@ -739,7 +742,7 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     })?;
 
     if !root.is_object() {
-        root = Value::Object(serde_json::Map::new());
+        root = OrderedJsonValue::Object(OrderedJsonMap::new());
     }
 
     for assignment in assignments {
@@ -758,7 +761,6 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
         set_value(&mut root, &segments, val)?;
     }
 
-    let format = ManifestFormat::detect(&content);
     let formatted = Manifest::format_json_value(&root, &format)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
     std::fs::write(&resolved_path, formatted).map_err(|e| {
@@ -772,11 +774,11 @@ pub fn pkg_set(manifest_path: &Path, assignments: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Deletes specified properties from `package.json` at `manifest_path``.
+/// Deletes specified properties from `package.json` at `manifest_path`.
 ///
 /// Multiple array index deletions targeting the same array container are sorted descending
 /// so element shifting does not alter remaining deletion targets.
-/// The resulting JSON is persisted preserving original formatting (indentation, newlines).
+/// The resulting JSON is persisted preserving original formatting (indentation, newlines, BOM).
 pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
     let resolved_path = resolve_manifest_path(manifest_path);
     let content = std::fs::read_to_string(&resolved_path).map_err(|e| {
@@ -786,8 +788,9 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
             e
         )
     })?;
+    let format = ManifestFormat::detect(&content);
     let clean_str = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    let mut root: Value = serde_json::from_str(clean_str).map_err(|e| {
+    let mut root: OrderedJsonValue = serde_json::from_str(clean_str).map_err(|e| {
         anyhow!(
             "Failed to parse JSON in manifest at '{}': {}",
             resolved_path.display(),
@@ -826,7 +829,6 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
         delete_value(&mut root, &segments);
     }
 
-    let format = ManifestFormat::detect(&content);
     let formatted = Manifest::format_json_value(&root, &format)
         .map_err(|e| anyhow!("Failed to serialize manifest: {}", e))?;
     std::fs::write(&resolved_path, formatted).map_err(|e| {
@@ -839,4 +841,3 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
 
     Ok(())
 }
-

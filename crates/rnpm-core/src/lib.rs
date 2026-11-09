@@ -7,6 +7,7 @@
 pub mod error;
 pub mod integrity;
 pub mod manifest;
+pub mod ordered_json;
 pub mod pkg;
 pub mod semver;
 pub mod spec;
@@ -17,6 +18,7 @@ pub use integrity::{Algorithm, Integrity, IntegrityEntry};
 pub use manifest::{
     BundledDependencies, Manifest, PackageBin, PackageWorkspaces, PeerDependencyMeta,
 };
+pub use ordered_json::{OrderedJsonMap, OrderedJsonValue};
 pub use pkg::{
     coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_get_value,
     pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
