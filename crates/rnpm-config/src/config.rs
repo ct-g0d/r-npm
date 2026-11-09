@@ -117,6 +117,7 @@ impl Config {
             .or_else(|| self.npmrc.settings.get(&dashed))
             .or_else(|| self.npmrc.settings.get(&underscored))
             .map(|val| val.as_str())
+            .or_else(|| (dashed == "registry").then(|| self.npmrc.registry.as_str()))
     }
 
     pub fn get_bool(&self, key: &str) -> Option<bool> {
