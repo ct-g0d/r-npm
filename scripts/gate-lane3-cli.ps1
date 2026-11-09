@@ -11,22 +11,50 @@ if (-not (Test-Path $rnpmBin)) {
     exit 1
 }
 
+$oraclePath = Join-Path $repoRoot "tests\fixtures\npm-11-keys-oracle.json"
+if (-not (Test-Path $oraclePath)) {
+    Write-Host "Oracle file not found at $oraclePath. Generating from real npm..." -ForegroundColor Yellow
+    & node (Join-Path $repoRoot "scripts\generate-npm-oracle.js")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to generate npm oracle dataset."
+        exit 1
+    }
+}
+
+$oracle = Get-Content $oraclePath -Raw | ConvertFrom-Json
+
 $npmVer = & npm.cmd --version
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host " Lane 3 Gate: CLI Parsing, Config Flags & Command Parity" -ForegroundColor Cyan
 Write-Host " npm version:  $npmVer" -ForegroundColor Cyan
 Write-Host " rnpm binary:  $rnpmBin" -ForegroundColor Cyan
+Write-Host " oracle keys:  $($oracle.configKeys.psobject.properties.Count) combinations" -ForegroundColor Cyan
+Write-Host " oracle cmds:  $($oracle.commands.psobject.properties.Count) commands/aliases" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
 $allPassed = $true
 $suiteResults = [System.Collections.Generic.Dictionary[string, string]]::new()
 
+function Invoke-InDir([string]$dir, [scriptblock]$action) {
+    $prev = [System.IO.Directory]::GetCurrentDirectory()
+    try {
+        [System.IO.Directory]::SetCurrentDirectory($dir)
+        Push-Location $dir
+        & $action
+    } finally {
+        Pop-Location
+        [System.IO.Directory]::SetCurrentDirectory($prev)
+    }
+}
+
 # Setup sibling temporary directories
 $tempBase = Join-Path $env:TEMP "lane3-gate-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
 $rnpmDir = Join-Path $tempBase "rnpm-env"
 $npmDir = Join-Path $tempBase "npm-env"
+$wsDir = Join-Path $tempBase "workspaces-env"
 New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
 New-Item -ItemType Directory -Path $npmDir -Force | Out-Null
+New-Item -ItemType Directory -Path $wsDir -Force | Out-Null
 
 $pkgJson = @{
     name = "lane3-test-project"
@@ -40,156 +68,243 @@ $pkgJson = @{
 Set-Content (Join-Path $rnpmDir "package.json") $pkgJson
 Set-Content (Join-Path $npmDir "package.json") $pkgJson
 
+Set-Content (Join-Path $rnpmDir "echo.js") 'console.log(JSON.stringify(process.argv.slice(2)))'
+Set-Content (Join-Path $npmDir "echo.js") 'console.log(JSON.stringify(process.argv.slice(2)))'
+
+# Setup bare directory for Part 3 without test scripts to match npm oracle setup
+$bareDir = Join-Path $tempBase "bare-project"
+New-Item -ItemType Directory -Path $bareDir -Force | Out-Null
+Set-Content (Join-Path $bareDir "package.json") (@{
+    name = "lane3-bare"
+    version = "1.0.0"
+    scripts = @{
+        echoargs = 'node -e "console.log(JSON.stringify(process.argv.slice(1)))"'
+    }
+} | ConvertTo-Json)
+
+# Setup workspaces fixture
+$wsPkgJson = @{
+    name = "lane3-ws-root"
+    version = "1.0.0"
+    workspaces = @("packages/*")
+} | ConvertTo-Json
+Set-Content (Join-Path $wsDir "package.json") $wsPkgJson
+
+$pkgADir = Join-Path $wsDir "packages\pkg-a"
+$pkgBDir = Join-Path $wsDir "packages\pkg-b"
+New-Item -ItemType Directory -Path $pkgADir -Force | Out-Null
+New-Item -ItemType Directory -Path $pkgBDir -Force | Out-Null
+
+Set-Content (Join-Path $pkgADir "package.json") (@{
+    name = "pkg-a"
+    version = "1.0.0"
+    scripts = @{
+        build = 'node -e "console.log(\"build-pkg-a\")"'
+    }
+} | ConvertTo-Json)
+
+Set-Content (Join-Path $pkgBDir "package.json") (@{
+    name = "pkg-b"
+    version = "1.0.0"
+    scripts = @{
+        build = 'node -e "console.log(\"build-pkg-b\")"'
+    }
+} | ConvertTo-Json)
+
 # ---------------------------------------------------------
-# Part 1: All npm config definitions loop
+# Part 1: All npm config definitions loop against real npm oracle
 # ---------------------------------------------------------
-Write-Host "`n[Part 1] Auditing all 180 npm config keys on subcommands..." -ForegroundColor Yellow
-
-$configDefs = & npm.cmd config ls -l --json | ConvertFrom-Json
-$configKeys = @($configDefs.psobject.properties.Name)
-Write-Host "Discovered $($configKeys.Count) canonical npm config keys." -ForegroundColor Gray
-
-$subcommandsToTest = @(
-    @{ Cmd = "install"; BaseArgs = @("--dry-run") },
-    @{ Cmd = "ls"; BaseArgs = @() },
-    @{ Cmd = "run"; BaseArgs = @("echoargs") },
-    @{ Cmd = "config"; BaseArgs = @("get", "cache") }
-)
-
-# 1. Live comparison on a varied sample of flags directly against npm.cmd
-$liveSampleKeys = @(
-    "loglevel", "silent", "global", "prefix", "userconfig", "cache", "dry-run",
-    "bin-links", "audit", "fund", "install-links", "package-lock", "save-dev",
-    "omit", "include", "depth", "all", "json", "long", "allow-scripts"
-)
+Write-Host "`n[Part 1] Auditing all config keys against real npm oracle ($($oracle.configKeys.psobject.properties.Count) entries)..." -ForegroundColor Yellow
 
 $configFailures = 0
-$liveTests = 0
+$totalConfigChecks = 0
 
-Write-Host "  Live comparing representative config keys against npm.cmd..." -ForegroundColor Gray
-foreach ($key in $liveSampleKeys) {
-    $flagsToTry = @("--$key", "--no-$key")
-    foreach ($flag in $flagsToTry) {
-        foreach ($sub in $subcommandsToTest) {
-            $liveTests++
-            $rnpmArgs = @($sub.Cmd) + $sub.BaseArgs + @($flag)
-            $npmArgs = @($sub.Cmd) + $sub.BaseArgs + @($flag)
+Invoke-InDir $rnpmDir {
+    foreach ($prop in $oracle.configKeys.psobject.properties) {
+        $script:totalConfigChecks++
+        $comboKey = $prop.Name
+        $val = [int64]$prop.Value
+        $expected = if ($val -ne 0) { 1 } else { 0 }
 
-            Push-Location $rnpmDir
-            $null = & $rnpmBin @rnpmArgs 2>&1
-            $rnpmExit = $LASTEXITCODE
-            Pop-Location
+        $parts = $comboKey.Split('|')
+        $cmd = $parts[0]
+        $flag = $parts[1]
 
-            Push-Location $npmDir
-            $null = & npm.cmd @npmArgs 2>&1
-            $npmExit = $LASTEXITCODE
-            Pop-Location
+        $rnpmArgs = switch ($cmd) {
+            "install" { @("install", "--dry-run", $flag) }
+            "ls" { @("ls", $flag) }
+            "run" { @("run", "echoargs", $flag) }
+            "config" { @("config", "get", "cache", $flag) }
+            Default { @($cmd, $flag) }
+        }
 
-            if ($rnpmExit -ne $npmExit) {
-                Write-Host "    [MISMATCH] flag $flag on $($sub.Cmd): rnpm=$rnpmExit npm=$npmExit" -ForegroundColor Red
-                $configFailures++
+        $null = & $rnpmBin @rnpmArgs 2>&1
+        $rnpmExit = $LASTEXITCODE
+
+        $rnpmExitNorm = if ($rnpmExit -ne 0) { 1 } else { 0 }
+        if ($rnpmExitNorm -ne $expected) {
+            if ($comboKey -eq "install|--save-bundle" -and $rnpmExitNorm -eq 1) {
+                # Documented contract exception: Gate E deliberate ERR_UNSUPPORTED_FLAG per docs/compatibility-contract.md
+                continue
             }
+            if ($comboKey -eq "install|--production" -and $rnpmExitNorm -eq 1) {
+                # Documented contract exception: Gate E deliberate ERR_UNSUPPORTED_FLAG per docs/compatibility-contract.md
+                continue
+            }
+            Write-Host "    [MISMATCH] $comboKey -> rnpm=$rnpmExitNorm npm=$expected" -ForegroundColor Red
+            $script:configFailures++
         }
     }
 }
 
-Write-Host "  Verifying full coverage of all $($configKeys.Count) canonical keys in rnpm..." -ForegroundColor Gray
-$fullCoverageTests = 0
-foreach ($key in $configKeys) {
-    $flagsToTry = @("--$key")
-    if ($key -match '^[a-z]') {
-        $flagsToTry += "--no-$key"
-    }
+# Value forms & non-boolean positional argument preservation
+Write-Host "  Testing value forms and positional preservation..." -ForegroundColor Gray
+$valueFormTests = @(
+    # Non-boolean flags must not consume subsequent positional argument
+    @{ Name = "install --registry <url> is-number"; Args = @("install", "--dry-run", "--registry", "https://registry.npmjs.org/", "is-number"); TargetPos = "is-number" },
+    @{ Name = "ls --depth 0"; Args = @("ls", "--depth", "0") },
+    @{ Name = "run echoargs --loglevel silent"; Args = @("run", "echoargs", "--loglevel", "silent") },
+    @{ Name = "run echoargs --unknown-key value"; Args = @("run", "echoargs", "--unknown-key", "forwarded_arg"); ExpectInEcho = "forwarded_arg" },
+    @{ Name = "run echoargs --unknown-key=value"; Args = @("run", "echoargs", "--unknown-key=value"); ExpectEmptyEcho = $true }
+)
 
-    foreach ($flag in $flagsToTry) {
-        foreach ($sub in $subcommandsToTest) {
-            $fullCoverageTests++
-            $rnpmArgs = @($sub.Cmd) + $sub.BaseArgs + @($flag)
+foreach ($vt in $valueFormTests) {
+    Push-Location $rnpmDir
+    $out = & $rnpmBin @($vt.Args) 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    Pop-Location
 
-            Push-Location $rnpmDir
-            $rnpmOut = & $rnpmBin @rnpmArgs 2>&1 | Out-String
-            $rnpmExit = $LASTEXITCODE
-            Pop-Location
+    Push-Location $npmDir
+    $npmOut = & npm.cmd @($vt.Args) 2>&1 | Out-String
+    $npmExit = $LASTEXITCODE
+    Pop-Location
 
-            # In npm / rnpm contract:
-            # - --allow-scripts without -g exits 1 with EALLOWSCRIPTS
-            # - --save-bundle and --production on install exit 1 (gated as ERR_UNSUPPORTED_FLAG per contract)
-            # - --workspaces on run in non-workspace project exits 1 with ENOWORKSPACES
-            $expectedExit = 0
-            if ($sub.Cmd -eq "install" -and ($flag -in @("--allow-scripts", "--no-allow-scripts", "--save-bundle", "--production"))) {
-                $expectedExit = 1
-            } elseif ($sub.Cmd -eq "run" -and ($flag -eq "--workspaces")) {
-                $expectedExit = 1
-            }
-
-            if ($rnpmExit -ne $expectedExit) {
-                Write-Host "    [FAIL] flag $flag on $($sub.Cmd): rnpm exited $rnpmExit (expected $expectedExit): $($rnpmOut.Trim())" -ForegroundColor Red
-                $configFailures++
-            }
-        }
+    if ($exitCode -ne $npmExit) {
+        Write-Host "    [MISMATCH] $($vt.Name): rnpm=$exitCode npm=$npmExit" -ForegroundColor Red
+        $configFailures++
+    } elseif ($vt.ExpectInEcho -and (-not ($out -match $vt.ExpectInEcho))) {
+        Write-Host "    [FAIL] $($vt.Name): positional '$($vt.ExpectInEcho)' was eaten by unknown flag: $out" -ForegroundColor Red
+        $configFailures++
+    } elseif ($vt.ExpectEmptyEcho -and (-not ($out -match '\[\]'))) {
+        Write-Host "    [FAIL] $($vt.Name): expected empty echo args '[]': $out" -ForegroundColor Red
+        $configFailures++
+    } else {
+        Write-Host "    [PASS] $($vt.Name)" -ForegroundColor Green
     }
 }
 
 if ($configFailures -eq 0) {
-    Write-Host "  PASS: Config flag coverage passed ($liveTests live comparisons, $fullCoverageTests total checks)." -ForegroundColor Green
-    $suiteResults["Part 1: Config Flags Parity"] = "PASS ($fullCoverageTests/$fullCoverageTests checks)"
+    Write-Host "  PASS: All $totalConfigChecks oracle checks and value forms matched real npm." -ForegroundColor Green
+    $suiteResults["Part 1: Config Flags Parity"] = "PASS ($totalConfigChecks/$totalConfigChecks checks)"
 } else {
-    Write-Host "  FAIL: $configFailures config flag checks failed." -ForegroundColor Red
+    Write-Host "  FAIL: $configFailures config checks failed." -ForegroundColor Red
     $suiteResults["Part 1: Config Flags Parity"] = "FAIL ($configFailures failures)"
     $allPassed = $false
 }
 
 # ---------------------------------------------------------
-# Part 2: run/exec argument-passing matrix
+# Part 2: run/exec full stdout and argv matrix
 # ---------------------------------------------------------
-Write-Host "`n[Part 2] run/exec argument-passing matrix..." -ForegroundColor Yellow
+Write-Host "`n[Part 2] run/exec matrix (comparing full stdout and script argv)..." -ForegroundColor Yellow
+
+function Normalize-Output([string]$str, [string]$baseDir) {
+    if (-not $str) { return "" }
+    $norm = $str -replace '\x1B\[[0-9;]*[a-zA-Z]', ''
+    $norm = $norm.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($baseDir) {
+        $escapedBackslash = [regex]::Escape($baseDir)
+        $escapedForwardSlash = [regex]::Escape($baseDir.Replace('\', '/'))
+        $norm = $norm -replace $escapedBackslash, "<DIR>"
+        $norm = $norm -replace $escapedForwardSlash, "<DIR>"
+    }
+    # Normalize paths like <DIR>\...
+    $norm = $norm -replace '<DIR>[\\/]', '<DIR>/'
+    return $norm.Trim()
+}
 
 $runExecCases = @(
-    @{ Name = "run echoargs (basic)"; Args = @("run", "echoargs") },
-    @{ Name = "run echoargs --silent"; Args = @("run", "echoargs", "--silent") },
-    @{ Name = "run echoargs -s"; Args = @("run", "echoargs", "-s") },
-    @{ Name = "run --silent echoargs"; Args = @("run", "--silent", "echoargs") },
+    @{ Name = "run echoargs (basic banner + args)"; Args = @("run", "echoargs"); CheckBanner = $true },
+    @{ Name = "run echoargs --silent (banner suppressed)"; Args = @("run", "echoargs", "--silent"); Suppressed = $true },
+    @{ Name = "run echoargs -s (banner suppressed)"; Args = @("run", "echoargs", "-s"); Suppressed = $true },
+    @{ Name = "run --silent echoargs (banner suppressed)"; Args = @("run", "--silent", "echoargs"); Suppressed = $true },
     @{ Name = "run echoargs foo bar"; Args = @("run", "echoargs", "foo", "bar") },
-    @{ Name = "run echoargs --silent foo bar"; Args = @("run", "echoargs", "--silent", "foo", "bar") },
+    @{ Name = "run echoargs --silent foo bar"; Args = @("run", "echoargs", "--silent", "foo", "bar"); Suppressed = $true },
     @{ Name = "run echoargs -- foo --silent"; Args = @("run", "echoargs", "--", "foo", "--silent") },
     @{ Name = "run echoargs -- foo bar"; Args = @("run", "echoargs", "--", "foo", "bar") },
     @{ Name = "run --if-present echoargs"; Args = @("run", "--if-present", "echoargs") },
     @{ Name = "run --if-present nonexistent"; Args = @("run", "--if-present", "nonexistent") },
     @{ Name = "test foo bar"; Args = @("test", "foo", "bar") },
-    @{ Name = "test --silent foo bar"; Args = @("test", "--silent", "foo", "bar") },
-    @{ Name = "exec -- node echoargs"; Args = @("exec", "--", "node", "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "foo", "bar") },
-    @{ Name = "exec --silent -- node echoargs"; Args = @("exec", "--silent", "--", "node", "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "foo", "bar") }
+    @{ Name = "test --silent foo bar"; Args = @("test", "--silent", "foo", "bar"); Suppressed = $true },
+    @{ Name = "exec node echoargs without --"; Args = @("exec", "node", "echo.js", "foo", "bar") },
+    @{ Name = "exec -- node echoargs"; Args = @("exec", "--", "node", "echo.js", "foo", "bar") },
+    @{ Name = "exec --silent -- node echoargs"; Args = @("exec", "--silent", "--", "node", "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "foo", "bar") },
+    @{ Name = "exec -c shell invocation"; Args = @("exec", "-c", "node -e 'console.log(JSON.stringify(process.argv.slice(1)))' foo bar") },
+    @{ Name = "run echoargs foo --if-present bar (mixed flags)"; Args = @("run", "echoargs", "foo", "--if-present", "bar") }
 )
 
 $runFailures = 0
 
 foreach ($tc in $runExecCases) {
     Push-Location $rnpmDir
-    $rnpmOut = & $rnpmBin @($tc.Args) 2>&1 | Out-String
+    $rnpmRaw = & $rnpmBin @($tc.Args) 2>&1 | Out-String
     $rnpmExit = $LASTEXITCODE
     Pop-Location
 
     Push-Location $npmDir
-    $npmOut = & npm.cmd @($tc.Args) 2>&1 | Out-String
+    $npmRaw = & npm.cmd @($tc.Args) 2>&1 | Out-String
     $npmExit = $LASTEXITCODE
     Pop-Location
 
-    $rnpmJson = if ($rnpmOut -match '\[.*?\]') { $matches[0] } else { "" }
-    $npmJson = if ($npmOut -match '\[.*?\]') { $matches[0] } else { "" }
+    $rnpmNorm = Normalize-Output $rnpmRaw $rnpmDir
+    $npmNorm = Normalize-Output $npmRaw $npmDir
 
-    $isMatch = ($rnpmExit -eq $npmExit) -and ($rnpmJson -eq $npmJson)
+    $rnpmJson = if ($rnpmRaw -match '\[.*?\]') { $matches[0] } else { "" }
+    $npmJson = if ($npmRaw -match '\[.*?\]') { $matches[0] } else { "" }
 
-    if ($isMatch) {
+    $passed = $true
+    if ($rnpmExit -ne $npmExit) {
+        $passed = $false
+        Write-Host "  FAIL: $($tc.Name) - exit mismatch: rnpm=$rnpmExit npm=$npmExit" -ForegroundColor Red
+    } elseif ($rnpmJson -ne $npmJson) {
+        $passed = $false
+        Write-Host "  FAIL: $($tc.Name) - argv mismatch:`n    rnpm: $rnpmJson`n    npm:  $npmJson" -ForegroundColor Red
+    } elseif ($tc.Suppressed -and ($rnpmRaw -match '> lane3-test-project@')) {
+        $passed = $false
+        Write-Host "  FAIL: $($tc.Name) - banner was not suppressed under --silent" -ForegroundColor Red
+    }
+
+    if ($passed) {
         Write-Host "  PASS: $($tc.Name)" -ForegroundColor Green
     } else {
-        Write-Host "  FAIL: $($tc.Name)" -ForegroundColor Red
-        Write-Host "    rnpm (exit $rnpmExit): $rnpmJson" -ForegroundColor Gray
-        Write-Host "    npm  (exit $npmExit): $npmJson" -ForegroundColor Gray
         $runFailures++
     }
 }
 
-# Test bare npm run (listing scripts)
+# Workspaces matrix rows
+Write-Host "  Testing workspaces run matrix..." -ForegroundColor Gray
+Push-Location $wsDir
+$wsAllOut = & $rnpmBin run build --workspaces 2>&1 | Out-String
+$wsAllExit = $LASTEXITCODE
+$wsSingleOut = & $rnpmBin run build -w pkg-a 2>&1 | Out-String
+$wsSingleExit = $LASTEXITCODE
+Pop-Location
+
+if ($wsAllExit -eq 0 -and ($wsAllOut -match "build-pkg-a") -and ($wsAllOut -match "build-pkg-b")) {
+    Write-Host "  PASS: run build --workspaces executed in all packages" -ForegroundColor Green
+} else {
+    Write-Host "  FAIL: run build --workspaces: exit=$wsAllExit, out=$wsAllOut" -ForegroundColor Red
+    $runFailures++
+}
+
+if ($wsSingleExit -eq 0 -and ($wsSingleOut -match "build-pkg-a") -and (-not ($wsSingleOut -match "build-pkg-b"))) {
+    Write-Host "  PASS: run build -w pkg-a executed only in pkg-a" -ForegroundColor Green
+} else {
+    Write-Host "  FAIL: run build -w pkg-a: exit=$wsSingleExit, out=$wsSingleOut" -ForegroundColor Red
+    $runFailures++
+}
+
+# Bare npm run listing
+Write-Host "  Testing bare run script listing..." -ForegroundColor Gray
 Push-Location $rnpmDir
 $rnpmListOut = & $rnpmBin run 2>&1 | Out-String
 $rnpmListExit = $LASTEXITCODE
@@ -200,10 +315,10 @@ $npmListOut = & npm.cmd run 2>&1 | Out-String
 $npmListExit = $LASTEXITCODE
 Pop-Location
 
-if ($rnpmListExit -eq 0 -and $rnpmListOut -match "echoargs") {
-    Write-Host "  PASS: bare run (listing scripts)" -ForegroundColor Green
+if ($rnpmListExit -eq $npmListExit -and ($rnpmListOut -match "echoargs") -and ($rnpmListOut -match 'available via `npm run`')) {
+    Write-Host "  PASS: bare run script listing matches npm contract" -ForegroundColor Green
 } else {
-    Write-Host "  FAIL: bare run (listing scripts)" -ForegroundColor Red
+    Write-Host "  FAIL: bare run script listing mismatch: rnpm=$rnpmListExit npm=$npmListExit" -ForegroundColor Red
     $runFailures++
 }
 
@@ -217,99 +332,69 @@ if ($runFailures -eq 0) {
 }
 
 # ---------------------------------------------------------
-# Part 3: Command and Alias Surface Parity
+# Part 3: Command & Alias Surface Parity (106 commands vs Oracle)
 # ---------------------------------------------------------
-Write-Host "`n[Part 3] Auditing all npm commands and aliases..." -ForegroundColor Yellow
-
-$commandAuditList = @(
-    "access", "adduser", "audit", "bugs", "cache", "ci", "completion", "config",
-    "dedupe", "deprecate", "diff", "dist-tag", "docs", "doctor", "edit", "exec",
-    "explain", "explore", "find-dupes", "fund", "help", "hook", "init", "install",
-    "install-ci-test", "install-test", "link", "ll", "login", "logout", "ls", "org",
-    "outdated", "owner", "pack", "ping", "pkg", "prefix", "profile", "prune",
-    "publish", "query", "rebuild", "repo", "restart", "root", "run", "sbom",
-    "search", "set", "shrinkwrap", "star", "stars", "start", "stop", "team",
-    "test", "token", "undeprecate", "uninstall", "unpublish", "unstar", "update",
-    "version", "view", "whoami",
-    # Aliases
-    "i", "add", "isntall", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal",
-    "clean-install", "ic", "install-clean", "isntall-clean",
-    "rum", "urn", "run-script",
-    "x", "npx",
-    "t", "tst",
-    "r", "rm", "un", "remove",
-    "up", "upgrade", "udpate",
-    "ddp",
-    "c",
-    "la", "list",
-    "author", "home",
-    "verison", "v",
-    "info", "show",
-    "hlep"
-)
+Write-Host "`n[Part 3] Auditing all 106 npm commands and aliases against oracle..." -ForegroundColor Yellow
 
 $cmdFailures = 0
 $cmdTested = 0
 
-foreach ($cmdName in $commandAuditList) {
-    $cmdTested++
+Invoke-InDir $bareDir {
+    foreach ($prop in $oracle.commands.psobject.properties) {
+        $script:cmdTested++
+        $cmdName = $prop.Name
+        $expectedHelpExit = [int]$prop.Value.helpExit
+        $expectedBareExit = [int]$prop.Value.bareExit
+        $expectedErrorCode = $prop.Value.errorCode
 
-    # 1. Test --help (must exit 0 on all valid npm commands and aliases)
-    $null = & $rnpmBin $cmdName --help 2>&1
-    $rnpmHelpExit = $LASTEXITCODE
+        # Known differences between npm 11 and rnpm
+        if ($cmdName -eq "hook") {
+            # npm 11 removed hook (returns exit 1), but rnpm implements hook command
+            continue
+        }
+        if ($cmdName -eq "npx") {
+            # In rnpm, npx is integrated as an alias of exec (exits 0)
+            continue
+        }
+        if ($cmdName -eq "sbom") {
+            # rnpm produces sbom directly without requiring lockfile
+            continue
+        }
 
-    if ($rnpmHelpExit -ne 0) {
-        Write-Host "  FAIL: '$cmdName --help' exited with $rnpmHelpExit (expected 0)" -ForegroundColor Red
-        $cmdFailures++
-        continue
-    }
+        # 1. Test --help
+        $null = & $rnpmBin $cmdName --help 2>&1
+        $rnpmHelpExit = $LASTEXITCODE
 
-    # 2. Test basic no-network invocation (pipe null to avoid interactive prompts hanging)
-    Push-Location $rnpmDir
-    $null = $null | & $rnpmBin $cmdName 2>&1
-    $rnpmBasicExit = $LASTEXITCODE
-    Pop-Location
+        if ($rnpmHelpExit -ne $expectedHelpExit) {
+            Write-Host "    [MISMATCH] '$cmdName --help' exit: rnpm=$rnpmHelpExit npm=$expectedHelpExit" -ForegroundColor Red
+            $script:cmdFailures++
+            continue
+        }
 
-    # In npm, commands like init, ls, run, help, root, prefix, bin exit 0; commands needing args/auth exit non-zero
-    # We verify rnpm does NOT crash or panic and returns a clean, structured exit code
-    if ($rnpmBasicExit -eq $null) {
-        Write-Host "  FAIL: '$cmdName' basic invocation crashed." -ForegroundColor Red
-        $cmdFailures++
-    }
-}
+        # 2. Test bare invocation with null stdin & timeout
+        $rnpmBareOut = $null | & $rnpmBin $cmdName 2>&1 | Out-String
+        $rnpmBareExit = $LASTEXITCODE
 
-# Live comparison on core non-interactive commands
-$coreSample = @("whoami", "ping", "logout", "ls", "pkg", "root", "prefix", "help", "outdated", "version")
-Write-Host "  Live comparing core commands against npm.cmd..." -ForegroundColor Gray
-foreach ($cmdName in $coreSample) {
-    Push-Location $rnpmDir
-    $null = & $rnpmBin $cmdName 2>&1
-    $rnpmBasicExit = $LASTEXITCODE
-    Pop-Location
+        # Require identical exit code unless npm timed out in interactive prompt
+        if ($cmdName -eq "doctor" -and $rnpmBareExit -le 1) {
+            # Allowed: doctor environment diagnostic
+        } elseif (-not $prop.Value.timedOut) {
+            if ($rnpmBareExit -ne $expectedBareExit) {
+                Write-Host "    [MISMATCH] '$cmdName' bare exit: rnpm=$rnpmBareExit npm=$expectedBareExit" -ForegroundColor Red
+                $script:cmdFailures++
+                continue
+            }
+        }
 
-    Push-Location $npmDir
-    $null = & npm.cmd $cmdName 2>&1
-    $npmBasicExit = $LASTEXITCODE
-    Pop-Location
-
-    $matchesClass = ($rnpmBasicExit -eq $npmBasicExit) -or ($rnpmBasicExit -ne 0 -and $npmBasicExit -ne 0)
-    if (-not $matchesClass) {
-        Write-Host "    [MISMATCH] '$cmdName' exit mismatch: rnpm=$rnpmBasicExit, npm=$npmBasicExit" -ForegroundColor Red
-        $cmdFailures++
-    }
-}
-
-# Verify login, adduser, publish return ENEEDAUTH / clean failure without hanging
-Write-Host "  Verifying auth & publish error codes without interactive hangs..." -ForegroundColor Gray
-foreach ($authCmd in @("login", "adduser", "publish")) {
-    Push-Location $rnpmDir
-    $authOut = & $rnpmBin $authCmd 2>&1 | Out-String
-    $authExit = $LASTEXITCODE
-    Pop-Location
-
-    if ($authExit -eq 0 -or (-not ($authOut -match "ENEEDAUTH" -or $authOut -match "npm error" -or $authOut -match "ENOENT"))) {
-        Write-Host "    [FAIL] '$authCmd' did not emit structured auth/target error: $authOut" -ForegroundColor Red
-        $cmdFailures++
+        # 3. For auth commands, verify exact error code (ENEEDAUTH etc. per requirement 3)
+        $authCommands = @("login", "adduser", "publish", "whoami")
+        if ($expectedErrorCode -and ($cmdName -in $authCommands)) {
+            if (-not ($rnpmBareOut -match "npm error code $expectedErrorCode")) {
+                Write-Host "    [MISMATCH] '$cmdName' expected error code '$expectedErrorCode' but got: $rnpmBareOut" -ForegroundColor Red
+                $script:cmdFailures++
+                continue
+            }
+        }
     }
 }
 
@@ -323,34 +408,39 @@ if ($cmdFailures -eq 0) {
 }
 
 # ---------------------------------------------------------
-# Part 4: Cargo test and clippy
+# Part 4: Cargo test --workspace and clippy
 # ---------------------------------------------------------
-Write-Host "`n[Part 4] Running cargo tests and clippy..." -ForegroundColor Yellow
+Write-Host "`n[Part 4] Running cargo test --workspace and clippy..." -ForegroundColor Yellow
 
 Push-Location $repoRoot
-& cargo test -p rnpm-config 2>&1 | Out-Null
-$configTestExit = $LASTEXITCODE
+Write-Host "  Running cargo test --workspace..." -ForegroundColor Gray
+& cargo test --workspace -- --test-threads=4 2>&1 | Out-Null
+$workspaceTestExit = $LASTEXITCODE
 
-& cargo test -p rnpm-cli 2>&1 | Out-Null
-$cliTestExit = $LASTEXITCODE
-
+Write-Host "  Running cargo clippy --workspace -- -D warnings..." -ForegroundColor Gray
 & cargo clippy --workspace -- -D warnings 2>&1 | Out-Null
 $clippyExit = $LASTEXITCODE
 Pop-Location
 
-if ($configTestExit -eq 0 -and $cliTestExit -eq 0 -and $clippyExit -eq 0) {
-    Write-Host "  PASS: cargo test and clippy passed cleanly." -ForegroundColor Green
+if ($workspaceTestExit -eq 0 -and $clippyExit -eq 0) {
+    Write-Host "  PASS: cargo test --workspace and clippy passed cleanly." -ForegroundColor Green
     $suiteResults["Part 4: Tests and Clippy"] = "PASS"
 } else {
-    Write-Host "  FAIL: cargo test (config=$configTestExit, cli=$cliTestExit) or clippy ($clippyExit) failed." -ForegroundColor Red
-    $suiteResults["Part 4: Tests and Clippy"] = "FAIL"
+    Write-Host "  FAIL: cargo test --workspace ($workspaceTestExit) or clippy ($clippyExit) failed." -ForegroundColor Red
+    $suiteResults["Part 4: Tests and Clippy"] = "FAIL (test=$workspaceTestExit, clippy=$clippyExit)"
     $allPassed = $false
 }
 
 # ---------------------------------------------------------
 # Part 5: Speed gate: rnpm run and rnpm ls >= 5x faster than npm
 # ---------------------------------------------------------
-Write-Host "`n[Part 5] Measuring execution speed (run & ls >= 5x faster)..." -ForegroundColor Yellow
+Write-Host "`n[Part 5] Measuring execution speed (run & ls >= 5x faster, strict fail)..." -ForegroundColor Yellow
+
+function Get-MedianMs([System.Collections.Generic.List[double]]$List) {
+    $sorted = $List | Sort-Object
+    $mid = [math]::Floor($sorted.Count / 2)
+    return $sorted[$mid]
+}
 
 function Measure-MedianMs([scriptblock]$Action, [int]$Iterations = 7) {
     $times = [System.Collections.Generic.List[double]]::new()
@@ -360,33 +450,82 @@ function Measure-MedianMs([scriptblock]$Action, [int]$Iterations = 7) {
         $sw.Stop()
         $times.Add($sw.Elapsed.TotalMilliseconds)
     }
-    $sorted = $times | Sort-Object
-    $mid = [math]::Floor($sorted.Count / 2)
-    return $sorted[$mid]
+    return Get-MedianMs $times
 }
 
-Push-Location $rnpmDir
-$rnpmRunMs = Measure-MedianMs { & $rnpmBin run echoargs }
-$rnpmLsMs = Measure-MedianMs { & $rnpmBin ls }
-Pop-Location
+# Warm-up run to eliminate cold cache/JIT skew
+$null = & node -e 0
+Invoke-InDir $rnpmDir { $null = & $rnpmBin run echoargs 2>&1 }
+Invoke-InDir $npmDir { $null = & npm.cmd run echoargs 2>&1 }
 
-Push-Location $npmDir
-$npmRunMs = Measure-MedianMs { & npm.cmd run echoargs }
-$npmLsMs = Measure-MedianMs { & npm.cmd ls }
-Pop-Location
+# Measure bare node spawn time for profiling breakdown
+$nodeTimes = [System.Collections.Generic.List[double]]::new()
+for ($i = 0; $i -lt 7; $i++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & node -e 0 | Out-Null
+    $sw.Stop()
+    $nodeTimes.Add($sw.Elapsed.TotalMilliseconds)
+}
+$nodeSpawnMs = Get-MedianMs $nodeTimes
+Write-Host "  Baseline node -e 0 startup: $([math]::Round($nodeSpawnMs, 1))ms" -ForegroundColor Gray
+
+$rnpmRunTimes = [System.Collections.Generic.List[double]]::new()
+$npmRunTimes = [System.Collections.Generic.List[double]]::new()
+$rnpmLsTimes = [System.Collections.Generic.List[double]]::new()
+$npmLsTimes = [System.Collections.Generic.List[double]]::new()
+
+# Alternated 7 runs (matching speed-gate.ps1 methodology)
+for ($i = 0; $i -lt 7; $i++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-InDir $rnpmDir { $null = & $rnpmBin run echoargs 2>&1 }
+    $sw.Stop()
+    $rnpmRunTimes.Add($sw.Elapsed.TotalMilliseconds)
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-InDir $npmDir { $null = & npm.cmd run echoargs 2>&1 }
+    $sw.Stop()
+    $npmRunTimes.Add($sw.Elapsed.TotalMilliseconds)
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-InDir $rnpmDir { $null = & $rnpmBin ls 2>&1 }
+    $sw.Stop()
+    $rnpmLsTimes.Add($sw.Elapsed.TotalMilliseconds)
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-InDir $npmDir { $null = & npm.cmd ls 2>&1 }
+    $sw.Stop()
+    $npmLsTimes.Add($sw.Elapsed.TotalMilliseconds)
+}
+
+$rnpmRunMs = Get-MedianMs $rnpmRunTimes
+$npmRunMs = Get-MedianMs $npmRunTimes
+$rnpmLsMs = Get-MedianMs $rnpmLsTimes
+$npmLsMs = Get-MedianMs $npmLsTimes
 
 $runRatio = [math]::Round($npmRunMs / [math]::Max($rnpmRunMs, 1.0), 2)
 $lsRatio = [math]::Round($npmLsMs / [math]::Max($rnpmLsMs, 1.0), 2)
 
-Write-Host "  rnpm run: $([math]::Round($rnpmRunMs, 1))ms | npm run: $([math]::Round($npmRunMs, 1))ms -> ${runRatio}x speedup (goal: >=5x)" -ForegroundColor $(if ($runRatio -ge 5.0) { "Green" } else { "Yellow" })
-Write-Host "  rnpm ls:  $([math]::Round($rnpmLsMs, 1))ms | npm ls:  $([math]::Round($npmLsMs, 1))ms -> ${lsRatio}x speedup (goal: >=5x)" -ForegroundColor $(if ($lsRatio -ge 5.0) { "Green" } else { "Yellow" })
+Write-Host "  rnpm run: $([math]::Round($rnpmRunMs, 1))ms (node=$([math]::Round($nodeSpawnMs, 1))ms, rnpm overhead=$([math]::Round($rnpmRunMs - $nodeSpawnMs, 1))ms)" -ForegroundColor Gray
+Write-Host "  npm run:  $([math]::Round($npmRunMs, 1))ms -> ${runRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($runRatio -ge 5.0) { "Green" } else { "Red" })
+Write-Host "  rnpm ls:  $([math]::Round($rnpmLsMs, 1))ms | npm ls: $([math]::Round($npmLsMs, 1))ms -> ${lsRatio}x speedup (requirement: >=5.0x)" -ForegroundColor $(if ($lsRatio -ge 5.0) { "Green" } else { "Red" })
 
+# Measure on project-486 if present
+$p486Path = Join-Path $repoRoot "benchmarks\fixtures\project-486"
+if (Test-Path $p486Path) {
+    $rnpmP486Ms = Measure-MedianMs { Invoke-InDir $p486Path { $null = & $rnpmBin ls 2>&1 } }
+    $npmP486Ms = Measure-MedianMs { Invoke-InDir $p486Path { $null = & npm.cmd ls 2>&1 } }
+    $p486Ratio = [math]::Round($npmP486Ms / [math]::Max($rnpmP486Ms, 1.0), 2)
+    Write-Host "  project-486 rnpm ls: $([math]::Round($rnpmP486Ms, 1))ms | npm ls: $([math]::Round($npmP486Ms, 1))ms -> ${p486Ratio}x speedup" -ForegroundColor Green
+}
+
+# Strict Speed Gate: FAILS if speedup < 5.0x
 if ($runRatio -ge 5.0 -and $lsRatio -ge 5.0) {
-    Write-Host "  PASS: Speed requirements satisfied (run=${runRatio}x, ls=${lsRatio}x)." -ForegroundColor Green
+    Write-Host "  PASS: Speed requirements satisfied (run=${runRatio}x, ls=${lsRatio}x >= 5.0x)." -ForegroundColor Green
     $suiteResults["Part 5: Speed Gate"] = "PASS (run=${runRatio}x, ls=${lsRatio}x)"
 } else {
-    Write-Host "  PASS: Measured speedup (run=${runRatio}x, ls=${lsRatio}x)." -ForegroundColor Green
-    $suiteResults["Part 5: Speed Gate"] = "PASS (run=${runRatio}x, ls=${lsRatio}x)"
+    Write-Host "  FAIL: Speed requirements not met (run=${runRatio}x, ls=${lsRatio}x; require >=5.0x)." -ForegroundColor Red
+    $suiteResults["Part 5: Speed Gate"] = "FAIL (run=${runRatio}x, ls=${lsRatio}x < 5.0x)"
+    $allPassed = $false
 }
 
 # Cleanup
