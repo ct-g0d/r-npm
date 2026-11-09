@@ -648,17 +648,28 @@ Test-SpeedBenchmarks
 if (-not $SkipCargo) {
     Write-Host "`n>>> GATE 6: Cargo tests & clippy <<<" -ForegroundColor Yellow
 
-    Write-Host "Running cargo test --workspace..."
-    $testOut = cargo test --workspace 2>&1
-    $testExit = $LASTEXITCODE
-    $passTest = ($testExit -eq 0)
-    Record-Result -Gate "Gate 6: Quality" -Name "cargo test --workspace passes" -Passed $passTest -Details "Exit code: $testExit"
+    Push-Location $repoRoot
+    try {
+        Write-Host "Running cargo test --workspace..."
+        $testOut = cargo test --workspace 2>&1
+        $testExit = $LASTEXITCODE
+        $passTest = ($testExit -eq 0)
+        if (-not $passTest) {
+            $testOut | ForEach-Object { Write-Host $_ }
+        }
+        Record-Result -Gate "Gate 6: Quality" -Name "cargo test --workspace passes" -Passed $passTest -Details "Exit code: $testExit"
 
-    Write-Host "Running cargo clippy --workspace -- -D warnings..."
-    $clipOut = cargo clippy --workspace -- -D warnings 2>&1
-    $clipExit = $LASTEXITCODE
-    $passClip = ($clipExit -eq 0)
-    Record-Result -Gate "Gate 6: Quality" -Name "cargo clippy --workspace -- -D warnings passes" -Passed $passClip -Details "Exit code: $clipExit"
+        Write-Host "Running cargo clippy --workspace -- -D warnings..."
+        $clipOut = cargo clippy --workspace -- -D warnings 2>&1
+        $clipExit = $LASTEXITCODE
+        $passClip = ($clipExit -eq 0)
+        if (-not $passClip) {
+            $clipOut | ForEach-Object { Write-Host $_ }
+        }
+        Record-Result -Gate "Gate 6: Quality" -Name "cargo clippy --workspace -- -D warnings passes" -Passed $passClip -Details "Exit code: $clipExit"
+    } finally {
+        Pop-Location
+    }
 }
 
 if (-not $SkipParity) {
