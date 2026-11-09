@@ -80,6 +80,44 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     queue: VecDeque<ResolveTask>,
 }
 
+/// Compares two strings using Arborist-compatible collation.
+/// Arborist sorts depsQueue by depth then `a.path.localeCompare(b.path, 'en') || a.name.localeCompare(b.name, 'en')`.
+pub fn arborist_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let min_len = a_bytes.len().min(b_bytes.len());
+    for i in 0..min_len {
+        let ca = a_bytes[i].to_ascii_lowercase();
+        let cb = b_bytes[i].to_ascii_lowercase();
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+    }
+    match a_bytes.len().cmp(&b_bytes.len()) {
+        std::cmp::Ordering::Equal => {
+            // Case tie-breaker: in JavaScript 'en' localeCompare, lowercase comes before uppercase ('a' < 'A')
+            for i in 0..min_len {
+                let ca = a_bytes[i];
+                let cb = b_bytes[i];
+                if ca != cb {
+                    let is_ca_lower = ca.is_ascii_lowercase();
+                    let is_cb_lower = cb.is_ascii_lowercase();
+                    if is_ca_lower != is_cb_lower {
+                        return if is_ca_lower {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                    }
+                    return ca.cmp(&cb);
+                }
+            }
+            std::cmp::Ordering::Equal
+        }
+        ord => ord,
+    }
+}
+
 impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     pub fn new(provider: &'a P, options: ResolverOptions, overrides: Overrides) -> Self {
         Self {
@@ -140,22 +178,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn push_task(&mut self, task: ResolveTask) {
-        let task_key = (
-            task.dev_path,
-            task.parent_depth,
-            task.parent_location.as_str(),
-            task.install_name.as_str(),
-        );
         let pos = self
             .queue
             .binary_search_by(|queued| {
-                let queued_key = (
-                    queued.dev_path,
-                    queued.parent_depth,
-                    queued.parent_location.as_str(),
-                    queued.install_name.as_str(),
-                );
-                queued_key.cmp(&task_key)
+                queued
+                    .dev_path
+                    .cmp(&task.dev_path)
+                    .then_with(|| queued.parent_depth.cmp(&task.parent_depth))
+                    .then_with(|| arborist_compare(&queued.parent_location, &task.parent_location))
+                    .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
             })
             .unwrap_or_else(|e| e);
         self.queue.insert(pos, task);
@@ -1232,28 +1263,48 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 meta.versions
                     .values()
                     .find(|v| v.dist_tarball.as_deref() == Some(u_str))
-                    .or_else(|| select_max_semver_version(meta))
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
             }
             PackageTarget::File(p) => {
                 let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
                 meta.versions
                     .values()
                     .find(|v| v.dist_tarball.as_deref() == Some(&expected))
-                    .or_else(|| select_max_semver_version(meta))
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
             }
             PackageTarget::Git { url, committish } => {
-                let expected = format!(
-                    "{}{}",
-                    url,
-                    committish
-                        .as_ref()
-                        .map(|c| format!("#{c}"))
-                        .unwrap_or_default()
-                );
                 meta.versions
                     .values()
-                    .find(|v| v.dist_tarball.as_deref() == Some(&expected))
-                    .or_else(|| select_max_semver_version(meta))
+                    .find(|v| {
+                        if let Some(ref dt) = v.dist_tarball {
+                            crate::hoisting::git_target_matches_resolved(
+                                url,
+                                committish.as_deref(),
+                                dt,
+                            )
+                        } else {
+                            false
+                        }
+                    })
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
             }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
@@ -1567,4 +1618,30 @@ pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
     );
     let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arborist_compare_collation() {
+        assert_eq!(arborist_compare("a", "b"), std::cmp::Ordering::Less);
+        assert_eq!(arborist_compare("b", "a"), std::cmp::Ordering::Greater);
+        assert_eq!(arborist_compare("a", "a"), std::cmp::Ordering::Equal);
+
+        // Lowercase comes before uppercase in en locale collation tie-break
+        assert_eq!(arborist_compare("a", "A"), std::cmp::Ordering::Less);
+        assert_eq!(arborist_compare("A", "b"), std::cmp::Ordering::Less);
+
+        // Scoped package vs unscoped package
+        assert_eq!(
+            arborist_compare("@eslint/js", "axios"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            arborist_compare("@eslint-community/regexpp", "@eslint/js"),
+            std::cmp::Ordering::Less
+        );
+    }
 }
