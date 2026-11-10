@@ -404,6 +404,9 @@ impl DependencyGraph {
                     if let Some(bin) = &node.bin {
                         root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
                     }
+                    if node.flags.has_install_script {
+                        root_pkg.has_install_script = Some(true);
+                    }
                     root_pkg.license = node.license.clone().or_else(|| {
                         node.extra.get("license").and_then(|v| {
                             if let Some(s) = v.as_str() {

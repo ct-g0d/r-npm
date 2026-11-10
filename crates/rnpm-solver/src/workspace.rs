@@ -554,7 +554,12 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         version: root_version,
         resolved: None,
         integrity: None,
-        flags: NodeFlags::default(),
+        flags: NodeFlags {
+            has_install_script: root_manifest.scripts.contains_key("preinstall")
+                || root_manifest.scripts.contains_key("install")
+                || root_manifest.scripts.contains_key("postinstall"),
+            ..Default::default()
+        },
         dependencies: root_manifest.dependencies.clone(),
         dev_dependencies: root_manifest.dev_dependencies.clone(),
         peer_dependencies: root_manifest.peer_dependencies.clone(),

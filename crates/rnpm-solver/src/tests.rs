@@ -5376,3 +5376,25 @@ fn test_root_bundled_dependencies_preserved_in_lockfile() {
     let regular_entry = lockfile.packages.get("node_modules/regular-dep").unwrap();
     assert_eq!(regular_entry.in_bundle, None);
 }
+
+#[test]
+fn test_root_lifecycle_scripts_set_has_install_script_in_lockfile() {
+    let provider = InMemoryPackageProvider::new();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("lifecycle-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .scripts
+        .insert("postinstall".to_string(), "echo ok".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let root_node = graph.nodes.get("").unwrap();
+    assert!(root_node.flags.has_install_script);
+
+    let lockfile = graph.to_lockfile_v3("lifecycle-app", Some("1.0.0"));
+    let root_entry = lockfile.packages.get("").unwrap();
+    assert_eq!(root_entry.has_install_script, Some(true));
+}
