@@ -566,10 +566,15 @@ impl RegistryPackageProvider {
         let cached = self.get_cached_packument(name);
 
         if let Some((entry, data)) = cached {
-            if is_packument_fresh(&entry, self.prefer_offline, self.offline) {
-                if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
-                    let mut meta = abbreviated_to_package_metadata(&abbrev);
-                    self.merge_lockfile_metadata(name, &mut meta);
+            if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                let mut meta = abbreviated_to_package_metadata(&abbrev);
+                self.merge_lockfile_metadata(name, &mut meta);
+                let is_in_lockfile = self
+                    .lockfile
+                    .as_ref()
+                    .and_then(|lf| package_metadata_from_lockfile(name, lf))
+                    .is_some();
+                if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, self.offline) {
                     return Ok(meta);
                 }
             }
@@ -799,13 +804,6 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             names
                 .iter()
                 .filter(|n| !cache.contains_key(**n))
-                .filter(|n| {
-                    if let Some(ref lf) = self.lockfile {
-                        package_metadata_from_lockfile(n, lf).is_none()
-                    } else {
-                        true
-                    }
-                })
                 .map(|n| n.to_string())
                 .collect()
         };
@@ -818,17 +816,31 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         let mut fresh_metas = Vec::new();
         let mut to_revalidate: Vec<RevalidationItem> = Vec::new();
         for name in missing {
+            let is_in_lockfile = self
+                .lockfile
+                .as_ref()
+                .and_then(|lf| package_metadata_from_lockfile(&name, lf))
+                .is_some();
+
             if let Some((entry, data)) = self.get_cached_packument(&name) {
-                if is_packument_fresh(&entry, self.prefer_offline, false) {
-                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
-                        let mut meta = abbreviated_to_package_metadata(&abbrev);
-                        self.merge_lockfile_metadata(&name, &mut meta);
+                if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                    let mut meta = abbreviated_to_package_metadata(&abbrev);
+                    self.merge_lockfile_metadata(&name, &mut meta);
+                    if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, false) {
                         fresh_metas.push((name, meta));
                         continue;
                     }
                 }
                 let stored_etag = extract_stored_etag(entry.metadata.as_ref());
                 to_revalidate.push((name, stored_etag, Some((entry, data))));
+            } else if is_in_lockfile {
+                if let Some(ref lf) = self.lockfile {
+                    if let Some(meta) = package_metadata_from_lockfile(&name, lf) {
+                        fresh_metas.push((name, meta));
+                        continue;
+                    }
+                }
+                to_revalidate.push((name, None, None));
             } else {
                 to_revalidate.push((name, None, None));
             }
@@ -1953,211 +1965,10 @@ impl Installer {
         };
         let existing_lockfile_for_merge = existing_lockfile.clone();
 
-        if !self.options.offline {
-            let mut root_pkg_names: Vec<String> = manifest
-                .dependencies
-                .keys()
-                .chain(manifest.dev_dependencies.keys())
-                .chain(manifest.optional_dependencies.keys())
-                .chain(manifest.peer_dependencies.keys())
-                .cloned()
-                .collect();
-            for member in &workspace_members {
-                root_pkg_names.extend(member.manifest.dependencies.keys().cloned());
-                root_pkg_names.extend(member.manifest.dev_dependencies.keys().cloned());
-                root_pkg_names.extend(member.manifest.optional_dependencies.keys().cloned());
-            }
-            root_pkg_names.sort();
-            root_pkg_names.dedup();
-
-            let client = self.registry_client.clone();
-            let cache = self.cache.clone();
-            let reg_cache = metadata_cache.clone();
-            let prefer_offline = self.options.prefer_offline
-                || std::env::var("npm_config_prefer_offline")
-                    .map(|v| v == "true" || v == "1")
-                    .unwrap_or(false);
-            let lockfile_ref = existing_lockfile.clone();
-            let unlocked = self.options.unlocked_packages.clone();
-
-            let mut all_pkg_names = root_pkg_names.clone();
-            if lockfile_ref.is_none() {
-                let mut visited = HashSet::new();
-                let mut queue = root_pkg_names.clone();
-                while let Some(pkg_name) = queue.pop() {
-                    if !visited.insert(pkg_name.clone()) {
-                        continue;
-                    }
-                    let reg_url = client.registry_for_package(&pkg_name).as_str().to_string();
-                    let cached = cache
-                        .get_packument_with_accept(&reg_url, &pkg_name, Some(NPM_INSTALL_V1_JSON))
-                        .ok()
-                        .flatten()
-                        .or_else(|| {
-                            cache
-                                .get(&format!("pacote:packument:{pkg_name}"))
-                                .ok()
-                                .flatten()
-                        });
-                    if let Some((_entry, data)) = cached {
-                        if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
-                            for ver in abbrev.versions.values() {
-                                for dep in ver.dependencies.keys() {
-                                    if !visited.contains(dep) {
-                                        all_pkg_names.push(dep.clone());
-                                        queue.push(dep.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                all_pkg_names.sort();
-                all_pkg_names.dedup();
-            }
-
-            let mut fresh_metas = Vec::new();
-            let mut to_revalidate: Vec<RevalidationItem> = Vec::new();
-            for name in all_pkg_names {
-                if let Some(ref lf) = lockfile_ref {
-                    if !unlocked.contains(&name)
-                        && package_metadata_from_lockfile(&name, lf).is_some()
-                    {
-                        continue;
-                    }
-                }
-                if let Ok(locked) = reg_cache.lock() {
-                    if locked.contains_key(&name) {
-                        continue;
-                    }
-                }
-                let reg_url = client.registry_for_package(&name).as_str().to_string();
-                let cached = cache
-                    .get_packument_with_accept(&reg_url, &name, Some(NPM_INSTALL_V1_JSON))
-                    .ok()
-                    .flatten()
-                    .or_else(|| {
-                        cache
-                            .get(&format!("pacote:packument:{name}"))
-                            .ok()
-                            .flatten()
-                    });
-                if let Some((entry, data)) = cached {
-                    if is_packument_fresh(&entry, prefer_offline, false) {
-                        if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
-                            let mut meta = abbreviated_to_package_metadata(&abbrev);
-                            if let Some(ref lf) = lockfile_ref {
-                                if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
-                                    for (v, vm) in lf_meta.versions {
-                                        meta.versions.entry(v).or_insert(vm);
-                                    }
-                                }
-                            }
-                            fresh_metas.push((name, meta));
-                            continue;
-                        }
-                    }
-                    let stored_etag = extract_stored_etag(entry.metadata.as_ref());
-                    to_revalidate.push((name, stored_etag, Some((entry, data))));
-                } else {
-                    to_revalidate.push((name, None, None));
-                }
-            }
-
-            if !fresh_metas.is_empty() {
-                if let Ok(mut locked) = reg_cache.lock() {
-                    for (name, meta) in fresh_metas {
-                        locked.insert(name, meta);
-                    }
-                }
-            }
-
-            if !to_revalidate.is_empty() {
-                let req_pkgs: Vec<(String, Option<String>)> = to_revalidate
-                    .iter()
-                    .map(|(n, etag, _)| (n.clone(), etag.clone()))
-                    .collect();
-                let results = client.get_package_metadata_conditional_concurrent(&req_pkgs).await;
-                for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
-                    let reg_url = client.registry_for_package(&name).as_str().to_string();
-                    match res {
-                        Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
-                            let new_etag = etag.or(stored_etag);
-                            let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
-                            if let Some((_, ref data)) = cached_info {
-                                let _ = cache.put_packument_with_accept(
-                                    &reg_url,
-                                    &name,
-                                    Some(NPM_INSTALL_V1_JSON),
-                                    data,
-                                    cache_meta,
-                                );
-                                if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(data) {
-                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
-                                    if let Some(ref lf) = lockfile_ref {
-                                        if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
-                                            for (v, vm) in lf_meta.versions {
-                                                meta.versions.entry(v).or_insert(vm);
-                                            }
-                                        }
-                                    }
-                                    if let Ok(mut locked) = reg_cache.lock() {
-                                        locked.insert(name, meta);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
-                            if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                                let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                                let _ = cache.put_packument_with_accept(
-                                    &reg_url,
-                                    &name,
-                                    Some(NPM_INSTALL_V1_JSON),
-                                    &bytes,
-                                    cache_meta,
-                                );
-                            }
-                            let mut meta = abbreviated_to_package_metadata(&abbrev);
-                            if let Some(ref lf) = lockfile_ref {
-                                if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
-                                    for (v, vm) in lf_meta.versions {
-                                        meta.versions.entry(v).or_insert(vm);
-                                    }
-                                }
-                            }
-                            if let Ok(mut locked) = reg_cache.lock() {
-                                locked.insert(name, meta);
-                            }
-                        }
-                        Err(err) => {
-                            debug!("Conditional fetch error for {name}: {err}");
-                            if let Some((_, ref data)) = cached_info {
-                                if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(data) {
-                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
-                                    if let Some(ref lf) = lockfile_ref {
-                                        if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
-                                            for (v, vm) in lf_meta.versions {
-                                                meta.versions.entry(v).or_insert(vm);
-                                            }
-                                        }
-                                    }
-                                    if let Ok(mut locked) = reg_cache.lock() {
-                                        locked.insert(name, meta);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let prefer_offline = self.options.prefer_offline
             || std::env::var("npm_config_prefer_offline")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
-
 
         let provider = RegistryPackageProvider {
             client: self.registry_client.clone(),
