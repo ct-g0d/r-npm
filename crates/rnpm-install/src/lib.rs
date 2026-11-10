@@ -2127,13 +2127,27 @@ impl Installer {
                 PackageTarget::Version(v) => v.to_string(),
                 PackageTarget::File(p) => {
                     let rel = if p.is_absolute() {
-                        rnpm_shim::path::compute_relative_path(&self.options.project_dir, p)
-                            .unwrap_or_else(|_| rnpm_core::to_posix_path(&p.to_string_lossy()))
+                        let rel_res = rnpm_shim::path::compute_relative_path(&self.options.project_dir, p);
+                        match rel_res {
+                            Ok(r) => r,
+                            Err(_) => {
+                                if let (Ok(cp), Ok(ct)) = (
+                                    std::fs::canonicalize(&self.options.project_dir),
+                                    std::fs::canonicalize(p),
+                                ) {
+                                    rnpm_shim::path::compute_relative_path(&cp, &ct)
+                                        .unwrap_or_else(|_| rnpm_core::to_posix_path(&p.to_string_lossy()))
+                                } else {
+                                    rnpm_core::to_posix_path(&p.to_string_lossy())
+                                }
+                            }
+                        }
                     } else {
                         rnpm_core::to_posix_path(&p.to_string_lossy())
                     };
-                    spec.target = PackageTarget::File(PathBuf::from(&rel));
-                    format!("file:{rel}")
+                    let clean_rel = rel.strip_prefix("./").unwrap_or(&rel).to_string();
+                    spec.target = PackageTarget::File(PathBuf::from(&clean_rel));
+                    format!("file:{clean_rel}")
                 }
                 PackageTarget::Git { url, committish } => {
                     format!(
