@@ -5185,21 +5185,14 @@ impl Installer {
             }
         }
 
-        let client = self.registry_client.clone();
-        let mut jobs = tokio::task::JoinSet::new();
-        for name in names {
-            let client = client.clone();
-            jobs.spawn(async move {
-                let result = client.get_package_metadata_full(&name).await;
-                (name, result)
-            });
-        }
-
-        while let Some(result) = jobs.join_next().await {
-            let (name, metadata) =
-                result.map_err(|e| anyhow!("metadata enrichment task failed: {e}"))?;
-            if let Ok(metadata) = metadata {
-                self.metadata_cache.insert(name, metadata);
+        for name in &names {
+            if !self.metadata_cache.contains_key(name) {
+                let registry_url = self.registry_client.registry_for_package(name).as_str();
+                if let Ok(Some((_entry, bytes))) = self.cache.get_packument(registry_url, name) {
+                    if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&bytes) {
+                        self.metadata_cache.insert(name.clone(), meta);
+                    }
+                }
             }
         }
 

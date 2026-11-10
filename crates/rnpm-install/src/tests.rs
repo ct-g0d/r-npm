@@ -4164,3 +4164,41 @@ fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
         "Deprecated licenses array must not synthesize a license field, matching npm 11"
     );
 }
+
+#[tokio::test]
+async fn test_enrich_lockfile_never_makes_network_requests() {
+    use rnpm_registry::{http_request_count, reset_http_request_count};
+
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    reset_http_request_count();
+
+    let mut lockfile = LockfileV3::new("no-net-app", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/nonexistent-package-with-no-license",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: false,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+
+    let before_requests = http_request_count();
+    installer
+        .enrich_lockfile_from_registry(&mut lockfile)
+        .await
+        .unwrap();
+    let after_requests = http_request_count();
+
+    assert_eq!(
+        before_requests, after_requests,
+        "enrich_lockfile_from_registry must never make network requests"
+    );
+}

@@ -64,6 +64,27 @@ pub const DEFAULT_MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
 /// ability to consume large registry metadata documents.
 pub const DEFAULT_MAX_METADATA_SIZE: usize = 64 * 1024 * 1024;
 
+/// Global atomic counter for HTTP requests dispatched by the registry client.
+pub static HTTP_REQUEST_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns the total number of HTTP requests dispatched since process start or last reset.
+pub fn http_request_count() -> usize {
+    HTTP_REQUEST_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Resets the global HTTP request counter to zero.
+pub fn reset_http_request_count() {
+    HTTP_REQUEST_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn track_http_request(method: &Method, url: &Url) {
+    let count = HTTP_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if std::env::var("RNPM_COUNT_HTTP").is_ok() || std::env::var("RNPM_TIMING_DEBUG").is_ok() {
+        eprintln!("[http-request #{count}] {method} {url}");
+    }
+}
+
 /// Default chunk idle timeout for streaming sockets (10 seconds).
 pub const DEFAULT_CHUNK_IDLE_TIMEOUT_SECS: u64 = 10;
 
@@ -1055,6 +1076,7 @@ impl RegistryClient {
                     );
                 }
 
+                track_http_request(&method, &current_url);
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) => break Err(RegistryError::Http(e)),
@@ -1290,6 +1312,7 @@ impl RegistryClient {
 
                 req = req.body(body.clone());
 
+                track_http_request(&method, &current_url);
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) => break Err(RegistryError::Http(e)),
