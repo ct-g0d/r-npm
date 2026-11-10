@@ -6287,21 +6287,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             parseable,
             registry,
         } => {
-            let opts = outdated::OutdatedOptions {
-                packages,
-                all,
-                json,
-                long,
-                parseable,
-                registry,
-            };
-            let code = outdated::run_outdated(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "outdated dependencies found".to_string(),
-                }));
-            }
+            commands::outdated::run(packages, all, json, long, parseable, registry, current_dir).await?;
         }
         Commands::View {
             args,
