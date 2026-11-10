@@ -560,9 +560,10 @@ impl DependencyGraph {
                 }
 
                 let is_standard_nm_loc = loc
-                    .strip_prefix("node_modules/")
-                    .or_else(|| loc.split_once("/node_modules/").map(|(_, rest)| rest))
-                    == Some(&node.name);
+                    .rsplit("/node_modules/")
+                    .next()
+                    .and_then(|leaf| leaf.strip_prefix("node_modules/").or(Some(leaf)))
+                    == Some(node.name.as_str());
                 let pkg = LockfilePackage {
                     preserve_dev_optional_split: true,
                     name: if !is_standard_nm_loc {

@@ -5494,3 +5494,62 @@ fn test_lockfile_normalizes_single_bin_string_to_map() {
         )])))
     );
 }
+
+#[test]
+fn test_lockfile_omits_name_for_nested_node_modules_standard_packages() {
+    use crate::graph::DependencyGraph;
+    use crate::graph::Node;
+
+    let mut graph = DependencyGraph::new();
+    graph.nodes.insert(
+        "".to_string(),
+        Node {
+            location: "".to_string(),
+            name: "root-app".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    // Nested package: node_modules/parent/node_modules/child
+    graph.nodes.insert(
+        "node_modules/parent/node_modules/child".to_string(),
+        Node {
+            location: "node_modules/parent/node_modules/child".to_string(),
+            name: "child".to_string(),
+            install_name: "child".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    // Nested scoped package: node_modules/parent/node_modules/@scope/scoped-child
+    graph.nodes.insert(
+        "node_modules/parent/node_modules/@scope/scoped-child".to_string(),
+        Node {
+            location: "node_modules/parent/node_modules/@scope/scoped-child".to_string(),
+            name: "@scope/scoped-child".to_string(),
+            install_name: "@scope/scoped-child".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = graph.to_lockfile_v3("root-app", Some("1.0.0"));
+
+    let child_lock = lockfile
+        .packages
+        .get("node_modules/parent/node_modules/child")
+        .expect("child lock entry");
+    assert_eq!(
+        child_lock.name, None,
+        "Standard nested package location must omit name in lockfile"
+    );
+
+    let scoped_child_lock = lockfile
+        .packages
+        .get("node_modules/parent/node_modules/@scope/scoped-child")
+        .expect("scoped child lock entry");
+    assert_eq!(
+        scoped_child_lock.name, None,
+        "Standard nested scoped package location must omit name in lockfile"
+    );
+}
