@@ -5633,13 +5633,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 json,
                 silent,
             };
-            commands::prune::run(args, current_dir)?;
+            commands::prune::run(args, current_dir).await?;
         }
         Commands::Dedupe { packages, dry_run } => {
-            commands::dedupe::run_dedupe(packages, dry_run, current_dir)?;
+            commands::dedupe::run_dedupe(packages, dry_run, current_dir).await?;
         }
         Commands::FindDupes { packages } => {
-            commands::dedupe::run_find_dupes(packages, current_dir)?;
+            commands::dedupe::run_find_dupes(packages, current_dir).await?;
         }
         Commands::Rebuild {
             packages,

@@ -34,18 +34,8 @@ pub(crate) async fn run(opts: RebuildOptions, current_dir: PathBuf) -> Result<()
         ..Default::default()
     })?;
 
-    let summary = installer.rebuild(&rebuild_options).await?;
-    if summary.rebuilt_packages.is_empty() {
-        println!("rnpm: rebuild: no packages required rebuilding");
-    } else {
-        for pkg in &summary.rebuilt_packages {
-            println!("rnpm: rebuilt {pkg}");
-        }
-        println!(
-            "rnpm: successfully rebuilt {} package(s)",
-            summary.rebuilt_packages.len()
-        );
-    }
+    let _summary = installer.rebuild(&rebuild_options).await?;
+    println!("rebuilt dependencies successfully");
 
     Ok(())
 }
