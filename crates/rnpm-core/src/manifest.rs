@@ -127,27 +127,32 @@ impl ManifestFormat {
 
         let trailing_newline = clean.ends_with('\n') || clean.ends_with('\r');
 
-        let trimmed = clean.trim_start();
-        let indent = if let Some(after_bracket) = trimmed
-            .strip_prefix('{')
-            .or_else(|| trimmed.strip_prefix('['))
-        {
-            if let Some(nl_pos) = after_bracket.find('\n') {
-                let rest = &after_bracket[nl_pos + 1..];
-                let leading_ws: String = rest
-                    .chars()
-                    .take_while(|c| *c == ' ' || *c == '\t')
-                    .collect();
-                if leading_ws.is_empty() {
-                    "  ".to_string()
+        let trimmed_content = clean.trim();
+        let indent = if trimmed_content.lines().count() <= 1 {
+            String::new()
+        } else {
+            let trimmed = clean.trim_start();
+            if let Some(after_bracket) = trimmed
+                .strip_prefix('{')
+                .or_else(|| trimmed.strip_prefix('['))
+            {
+                if let Some(nl_pos) = after_bracket.find('\n') {
+                    let rest = &after_bracket[nl_pos + 1..];
+                    let leading_ws: String = rest
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .collect();
+                    if leading_ws.is_empty() {
+                        "  ".to_string()
+                    } else {
+                        leading_ws
+                    }
                 } else {
-                    leading_ws
+                    "  ".to_string()
                 }
             } else {
                 "  ".to_string()
             }
-        } else {
-            "  ".to_string()
         };
 
         Self {
@@ -443,21 +448,29 @@ impl Manifest {
         value: &T,
         format: &ManifestFormat,
     ) -> Result<String, ManifestError> {
-        let mut buf = Vec::new();
-        let formatter = serde_json::ser::PrettyFormatter::with_indent(format.indent.as_bytes());
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        value
-            .serialize(&mut ser)
-            .map_err(|err| ManifestError::MalformedJson {
+        let formatted = if format.indent.is_empty() {
+            serde_json::to_string(value).map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
                 line: err.line(),
                 column: err.column(),
-            })?;
-        let formatted = String::from_utf8(buf).map_err(|e| ManifestError::MalformedJson {
-            message: e.to_string(),
-            line: 0,
-            column: 0,
-        })?;
+            })?
+        } else {
+            let mut buf = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(format.indent.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+            value
+                .serialize(&mut ser)
+                .map_err(|err| ManifestError::MalformedJson {
+                    message: err.to_string(),
+                    line: err.line(),
+                    column: err.column(),
+                })?;
+            String::from_utf8(buf).map_err(|e| ManifestError::MalformedJson {
+                message: e.to_string(),
+                line: 0,
+                column: 0,
+            })?
+        };
 
         let mut output = if format.newline == "\r\n" {
             formatted.replace("\r\n", "\n").replace('\n', "\r\n")
