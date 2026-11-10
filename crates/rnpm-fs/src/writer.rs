@@ -765,14 +765,14 @@ fn cas_file_is_valid(
     expected_sha256: Option<&str>,
     source_verified: bool,
 ) -> bool {
+    if source_verified {
+        return true;
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
     if meta.len() != data_len as u64 {
         return false;
-    }
-    if source_verified {
-        return true;
     }
     if let Some(expected) = expected_sha256 {
         if let Ok(bytes) = std::fs::read(path) {

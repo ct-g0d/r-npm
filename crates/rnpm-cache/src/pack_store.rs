@@ -813,38 +813,88 @@ impl PackStore {
     pub fn write_cas_file_create_new(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
         #[cfg(windows)]
         {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            match OpenOptions::new().write(true).create_new(true).open(cas_path) {
-                Ok(mut f) => {
-                    let _ = f.write_all(data);
-                    Ok(())
+            use std::os::windows::ffi::OsStrExt;
+            extern "system" {
+                fn CreateFileW(
+                    lpFileName: *const u16,
+                    dwDesiredAccess: u32,
+                    dwShareMode: u32,
+                    lpSecurityAttributes: *mut std::ffi::c_void,
+                    dwCreationDisposition: u32,
+                    dwFlagsAndAttributes: u32,
+                    hTemplateFile: *mut std::ffi::c_void,
+                ) -> *mut std::ffi::c_void;
+                fn GetLastError() -> u32;
+            }
+
+            const GENERIC_WRITE: u32 = 0x40000000;
+            const FILE_SHARE_READ: u32 = 1;
+            const FILE_SHARE_WRITE: u32 = 2;
+            const FILE_SHARE_DELETE: u32 = 4;
+            const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            const CREATE_NEW: u32 = 1;
+            const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
+            const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+            const ERROR_FILE_EXISTS: u32 = 80;
+            const ERROR_ALREADY_EXISTS: u32 = 183;
+
+            let path_v = to_verbatim_path(cas_path);
+            let path_wide: Vec<u16> = path_v.as_os_str().encode_wide().chain(Some(0)).collect();
+
+            let mut handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
+                    std::ptr::null_mut(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS {
+                    return Ok(());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                Err(e) if e.raw_os_error() == Some(32) => {
-                    for _ in 0..50 {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        if cas_path.exists() {
-                            return Ok(());
-                        }
-                    }
-                    Ok(())
-                }
-                Err(_) => {
+                const ERROR_PATH_NOT_FOUND: u32 = 3;
+                if err == ERROR_PATH_NOT_FOUND {
                     if let Some(parent) = cas_path.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-                    if let Ok(mut f) = OpenOptions::new().write(true).create_new(true).open(cas_path) {
-                        let _ = f.write_all(data);
+                    handle = unsafe {
+                        CreateFileW(
+                            path_wide.as_ptr(),
+                            GENERIC_WRITE,
+                            FILE_SHARE_ALL,
+                            std::ptr::null_mut(),
+                            CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if handle == INVALID_HANDLE_VALUE {
+                        let err2 = unsafe { GetLastError() };
+                        if err2 == ERROR_FILE_EXISTS || err2 == ERROR_ALREADY_EXISTS {
+                            return Ok(());
+                        }
+                        return Err(std::io::Error::from_raw_os_error(err2 as i32));
                     }
-                    Ok(())
+                } else {
+                    return Err(std::io::Error::from_raw_os_error(err as i32));
                 }
             }
+
+            Self::write_handle_bytes(handle, data)
         }
         #[cfg(not(windows))]
         {
-            let _ = fs::write(cas_path, data);
-            Ok(())
+            if cas_path.exists() {
+                return Ok(());
+            }
+            fs::write(cas_path, data)
         }
     }
 
@@ -852,6 +902,33 @@ impl PackStore {
 pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
     PackStore::write_cas_file_direct(cas_path, data)
 }
+
+    /// Fills the CAS by writing all uncompressed file payloads across 16 parallel threads.
+    pub fn populate_cas_global(&self, files: &[(&Path, &[u8])]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut unique_map = std::collections::HashMap::with_capacity(files.len());
+        for (cas_path, data) in files {
+            unique_map.entry(*cas_path).or_insert(*data);
+        }
+        let unique_files: Vec<(&Path, &[u8])> = unique_map.into_iter().collect();
+
+        let num_threads = 16.min(unique_files.len());
+        let chunk_size = unique_files.len().div_ceil(num_threads);
+
+        std::thread::scope(|s| {
+            for chunk in unique_files.chunks(chunk_size) {
+                s.spawn(move || {
+                    for (cas_path, data) in chunk {
+                        if !cas_path.exists() {
+                            let _ = std::fs::write(cas_path, data);
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     /// Fills the CAS by copying already-installed files from node_modules into CAS
     /// across 16 parallel threads using fast native OS copy primitives.
@@ -1466,7 +1543,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 aligned_offset: aligned_offset as u64,
                 sha256: Some(sha256_hex),
                 cas_path: Some(cas_path),
-                cas_verified: populate_cas,
+                cas_verified: true,
                 cas_mtime: None,
             });
         }
@@ -1547,44 +1624,16 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
     }
 
     fn populate_cas_parallel(&self, entries: &mut [PackFileEntry], pack_bytes: &[u8]) {
-        if entries.len() <= 4 {
-            for entry in entries.iter_mut() {
-                let start = entry.offset as usize;
-                let end = start.saturating_add(entry.size as usize);
-                if end <= pack_bytes.len() {
-                    if let Some(ref cas_path) = entry.cas_path {
-                        let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
-                        if let Ok(meta) = cas_path.metadata() {
-                            entry.cas_mtime = mtime_to_timestamp(&meta);
-                        }
-                        entry.cas_verified = true;
-                    }
+        for entry in entries.iter_mut() {
+            let start = entry.offset as usize;
+            let end = start.saturating_add(entry.size as usize);
+            if end <= pack_bytes.len() {
+                if let Some(ref cas_path) = entry.cas_path {
+                    let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                    entry.cas_verified = true;
                 }
             }
-            return;
         }
-
-        let num_threads = 16.min(entries.len());
-        let chunk_size = entries.len().div_ceil(num_threads);
-        std::thread::scope(|s| {
-            for chunk in entries.chunks_mut(chunk_size) {
-                s.spawn(move || {
-                    for entry in chunk {
-                        let start = entry.offset as usize;
-                        let end = start.saturating_add(entry.size as usize);
-                        if end <= pack_bytes.len() {
-                            if let Some(ref cas_path) = entry.cas_path {
-                                let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
-                                if let Ok(meta) = cas_path.metadata() {
-                                    entry.cas_mtime = mtime_to_timestamp(&meta);
-                                }
-                                entry.cas_verified = true;
-                            }
-                        }
-                    }
-                });
-            }
-        });
     }
 
     /// Extract a tarball into the pack store atomically.

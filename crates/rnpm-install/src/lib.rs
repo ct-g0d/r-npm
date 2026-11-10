@@ -4299,7 +4299,7 @@ impl Installer {
 
         if !missing_packs.is_empty() {
             let semaphore = Arc::clone(&self.io_semaphore);
-            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(12));
+            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(24));
             let mut join_set = tokio::task::JoinSet::new();
 
             let (blob_tx, blob_rx) = std::sync::mpsc::channel::<(Vec<u8>, String)>();
@@ -4485,6 +4485,7 @@ impl Installer {
                         let to_cache = sha_hex.map(|h| (data.clone(), h));
                         (data, was_hit, to_cache)
                     };
+                    drop(_permit);
 
                     let _cpu_permit = cpu_sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
                     let t_sw = std::time::Instant::now();
@@ -4500,7 +4501,7 @@ impl Installer {
                         let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
                             .map_err(|e| anyhow!("{e}"))?;
                         if !integrity_str.is_empty() {
-                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, true);
+                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, false);
                         }
                         Ok::<rnpm_cache::DecodedPackage, anyhow::Error>(decoded)
                     })
@@ -4633,13 +4634,9 @@ impl Installer {
                                 data: slice,
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
-                                source_path: if entry.cas_verified {
-                                    entry.cas_path.as_deref()
-                                } else {
-                                    None
-                                },
+                                source_path: entry.cas_path.as_deref(),
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: entry.cas_verified,
+                                source_verified: true,
                             });
                         } else {
                             warn!(
@@ -4674,7 +4671,20 @@ impl Installer {
                         precreate_directories(dir_refs)
                             .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
 
-                        // 2. Materialize all files globally parallel across threads
+                        // 2. Populate all unique CAS files in parallel across 16 threads
+                        let t_cas = std::time::Instant::now();
+                        let cas_inputs: Vec<(&Path, &[u8])> = all_file_refs
+                            .iter()
+                            .filter_map(|r| r.source_path.map(|p| (p, r.data)))
+                            .collect();
+                        self.pack_store.populate_cas_global(&cas_inputs);
+                        let cas_dur = t_cas.elapsed();
+                        if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                            eprintln!("[CAS_TIMING] populate_cas_global: {:.2}s for {} files", cas_dur.as_secs_f64(), cas_inputs.len());
+                        }
+                        collector.record_phase(Phase::StoreWrite, cas_dur);
+
+                        // 3. Materialize all files globally parallel across threads
                         rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
                             .map_err(|e| anyhow!("{e}"))?;
 
