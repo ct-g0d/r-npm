@@ -30,9 +30,9 @@ pub(crate) fn run(action: CacheAction, cache_arg: Option<PathBuf>, current_dir: 
                 eprintln!("npm error code EUSAGE");
                 eprintln!("npm error As of npm@5, the npm cache self-heals from corruption issues");
                 eprintln!("npm error and data extracted from the cache is guaranteed to be valid.");
-                eprintln!("npm error If you want to make sure everything is healthy, use 'npm cache verify' instead.");
+                eprintln!("npm error If you want to make sure everything is healthy, use 'rnpm cache verify' instead.");
                 eprintln!("npm error If you are sure you want to delete the entire cache, run:");
-                eprintln!("npm error   npm cache clean --force");
+                eprintln!("npm error   rnpm cache clean --force");
                 std::process::exit(1);
             }
             cache.clean()?;
