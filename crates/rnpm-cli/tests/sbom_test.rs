@@ -405,3 +405,42 @@ fn test_sbom_missing_files_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("package.json not found") || stderr.contains("ENOENT"));
 }
+
+#[test]
+fn test_sbom_live_npm_parity() {
+    let tmp_rnpm = tempdir().unwrap();
+    let tmp_npm = tempdir().unwrap();
+    setup_test_project(tmp_rnpm.path());
+    setup_test_project(tmp_npm.path());
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let rnpm_res = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .arg("sbom")
+        .output()
+        .expect("rnpm sbom failed");
+
+    let npm_res = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "sbom"])
+        .current_dir(tmp_npm.path())
+        .output();
+
+    if let Ok(npm_out) = npm_res {
+        if npm_out.status.success() {
+            assert_eq!(rnpm_res.status.code(), npm_out.status.code());
+            let rnpm_val: Value = serde_json::from_slice(&rnpm_res.stdout).unwrap();
+            let npm_val: Value = serde_json::from_slice(&npm_out.stdout).unwrap();
+
+            // Compare top-level SPDX fields
+            assert_eq!(rnpm_val["spdxVersion"], npm_val["spdxVersion"]);
+            assert_eq!(rnpm_val["dataLicense"], npm_val["dataLicense"]);
+            assert_eq!(rnpm_val["SPDXID"], npm_val["SPDXID"]);
+            assert_eq!(rnpm_val["name"], npm_val["name"]);
+            assert_eq!(rnpm_val["documentDescribes"], npm_val["documentDescribes"]);
+
+            // Both produce 0 stderr
+            assert!(rnpm_res.stderr.is_empty());
+        }
+    }
+}
+

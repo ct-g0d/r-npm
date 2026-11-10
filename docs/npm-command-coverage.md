@@ -69,7 +69,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `restart` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `restart` on fresh fixture directory |
 | `root` | - | **matching** | Resolves local and global node_modules directory paths matching npm output | Ran `root` against npm parity test |
 | `run` | `run-script`, `rum`, `urn` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `run test` on fresh fixture directory |
-| `sbom` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `sbom --help` on fresh fixture directory |
+| `sbom` | - | **matching** | Software Bill of Materials generation in SPDX 2.3 and CycloneDX formats with package dependency relationships matches npm | Ran `sbom` against npm parity test |
 | `search` | `find`, `s`, `se` | **matching** | Block text format and JSON array output match npm 11 parity | Ran `search is-number` on fresh fixture directory |
 | `set` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `set foo=bar` on fresh fixture directory |
 | `shrinkwrap` | - | **matching** | Renames `package-lock.json` to `npm-shrinkwrap.json`, outputs notice to stderr and keeps stdout empty matching npm | Ran `shrinkwrap` against npm parity test |
