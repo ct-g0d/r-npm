@@ -5803,42 +5803,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             foreground_scripts,
             strict_sandbox,
         } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-            let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
-
-            let rebuild_options = rnpm_install::RebuildOptions {
-                project_dir: current_dir.clone(),
+            let opts = commands::rebuild::RebuildOptions {
                 packages,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
             };
-
-            let installer = Installer::new(InstallOptions {
-                project_dir: current_dir,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
-                ..Default::default()
-            })?;
-
-            let summary = installer.rebuild(&rebuild_options).await?;
-            if summary.rebuilt_packages.is_empty() {
-                println!("rnpm: rebuild: no packages required rebuilding");
-            } else {
-                for pkg in &summary.rebuilt_packages {
-                    println!("rnpm: rebuilt {pkg}");
-                }
-                println!(
-                    "rnpm: successfully rebuilt {} package(s)",
-                    summary.rebuilt_packages.len()
-                );
-            }
+            commands::rebuild::run(opts, current_dir).await?;
         }
         Commands::Pkg {
             action,

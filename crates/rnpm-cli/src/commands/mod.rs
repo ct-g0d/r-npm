@@ -9,3 +9,4 @@ pub mod version;
 pub mod pack;
 pub mod prune;
 pub mod dedupe;
+pub mod rebuild;
