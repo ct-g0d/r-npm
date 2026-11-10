@@ -29,7 +29,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `config` | `c` | **partial** | Configuration key lifecycle: `get`, `set`, and `delete` match npm contract; `config list` omits node-gyp and npm internal installation paths while outputting active `.npmrc` and environment settings | Ran `config` against npm parity test |
 | `dedupe` | `ddp` | **matching** | Full dependency tree reification, lockfile generation, and summary line wording match npm parity | Ran `dedupe` on fresh fixture directory |
 | `deny-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `deny-scripts --help` on fresh fixture directory |
-| `deprecate` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `deprecate --help` on fresh fixture directory |
+| `deprecate` | - | **partial** | Remote authentication requirement: package deprecation requires write authorization token on registry; verified via mock registry integration test | Ran `deprecate` against mock registry |
 | `diff` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `diff` on fresh fixture directory |
 | `dist-tag` | `dist-tags` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `dist-tag ls is-number` on fresh fixture directory |
 | `docs` | `home` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `docs` on fresh fixture directory |
