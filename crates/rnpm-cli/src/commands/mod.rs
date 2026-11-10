@@ -25,3 +25,4 @@ pub mod whoami;
 pub mod publish;
 pub mod deprecate;
 pub mod access;
+pub mod token;
