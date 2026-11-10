@@ -20,7 +20,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | :--- | :--- | :--- | :--- | :--- |
 | `access` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `access 2fa-required` on fresh fixture directory |
 | `adduser` | `add-user` | **partial** | Authentication workflow: npm executes interactive web/couch credentials flow via stdin TTY, whereas rnpm supports non-interactive automated credentials and token configuration | Ran `adduser` against mock registry |
-| `approve-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `approve-scripts --help` on fresh fixture directory |
+| `approve-scripts` | - | **matching** | Install script approval policy writes pinned `allowScripts` entries and formatted summary output matching npm | Ran `approve-scripts` against live npm parity test |
 | `audit` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `audit` on fresh fixture directory |
 | `bugs` | `issues` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `bugs` on fresh fixture directory |
 | `cache` | - | **partial** | Cache management: `cache clean` error contract and exit code match npm parity; `cache ls` reflects rnpm's content-addressable store layout (`store-v1`) rather than make-fetch-happen HTTP cache index | Ran `cache clean` against npm parity test |
