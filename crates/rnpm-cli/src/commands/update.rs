@@ -14,6 +14,7 @@ pub(crate) struct UpdateOptions {
     pub legacy_peer_deps: bool,
     pub strict_peer_deps: bool,
     pub silent: bool,
+    pub json: bool,
 }
 
 pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()> {
@@ -67,30 +68,29 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         }
         return Ok(());
     }
+    let start_time = std::time::Instant::now();
     let summary = installer.update(&opts.packages).await?;
+    let elapsed_str = crate::format_duration(start_time.elapsed());
 
-    if opts.silent {
+    if opts.json {
+        let json_output = serde_json::json!({
+            "add": [],
+            "added": summary.packages_updated,
+            "audited": 0,
+            "change": [],
+            "changed": 0,
+            "funding": 0,
+            "remove": [],
+            "removed": 0
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if opts.silent {
         return Ok(());
     } else if summary.packages_updated == 0 {
-        println!("rnpm: up to date");
+        println!("\nup to date in {}", elapsed_str);
     } else {
-        for pkg in &summary.updated_packages {
-            let old_v = summary
-                .old_versions
-                .get(pkg)
-                .map(|s| s.as_str())
-                .unwrap_or("none");
-            let new_v = summary
-                .new_versions
-                .get(pkg)
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-            println!("rnpm: updated {pkg} {old_v} -> {new_v}");
-        }
-        println!(
-            "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
-            summary.packages_updated, summary.cache_hits, summary.cache_misses
-        );
+        let pkg_str = if summary.packages_updated == 1 { "package" } else { "packages" };
+        println!("\nadded {} {} in {}", summary.packages_updated, pkg_str, elapsed_str);
     }
 
     Ok(())

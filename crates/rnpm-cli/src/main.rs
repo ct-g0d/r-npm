@@ -215,6 +215,10 @@ pub(crate) enum Commands {
         /// Detached background trash deletion without blocking exit (default: true)
         #[arg(long = "detached-trash", default_value = "true", action = clap::ArgAction::Set)]
         detached_trash: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -344,6 +348,10 @@ pub(crate) enum Commands {
         /// Detached background trash deletion without blocking exit (default: true)
         #[arg(long = "detached-trash", default_value = "true", action = clap::ArgAction::Set)]
         detached_trash: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run package test script
@@ -534,6 +542,10 @@ pub(crate) enum Commands {
         /// Custom installation prefix directory
         #[arg(long = "prefix")]
         prefix: Option<PathBuf>,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Update packages
@@ -573,6 +585,10 @@ pub(crate) enum Commands {
         /// Fail installation if any peer dependencies are missing or invalid
         #[arg(long = "strict-peer-deps")]
         strict_peer_deps: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -4847,6 +4863,20 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
     }
 }
 
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
+    let millis = d.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        let secs = d.as_secs_f64();
+        if (secs * 10.0).round() % 10.0 == 0.0 {
+            format!("{:.0}s", secs)
+        } else {
+            format!("{:.1}s", secs)
+        }
+    }
+}
+
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let current_dir = match dir {
         Some(d) => d,
@@ -4903,6 +4933,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             install_strategy,
             wait_for_trash,
             detached_trash,
+            json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing || config.get_bool("timing").unwrap_or(false);
@@ -5025,20 +5056,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ..Default::default()
             };
 
+            let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
+            let elapsed_str = format_duration(start_time.elapsed());
 
-            if !silent && dry_run {
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": summary.packages_installed,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": 0
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
             } else if !dry_run {
                 if !silent {
-                    println!(
-                        "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
-                        summary.packages_installed, summary.cache_hits, summary.cache_misses
-                    );
+                    if summary.packages_installed > 0 {
+                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
+                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                    } else {
+                        println!("\nup to date in {}", elapsed_str);
+                    }
 
                     if fund_val {
                         let count = audit::count_funding_packages(&current_dir);
@@ -5094,6 +5141,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             install_strategy,
             wait_for_trash,
             detached_trash,
+            json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing || config.get_bool("timing").unwrap_or(false);
@@ -5174,20 +5222,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ..Default::default()
             };
 
+            let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
+            let elapsed_str = format_duration(start_time.elapsed());
 
-            if !silent && dry_run {
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": summary.packages_installed,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": 0
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
             } else if !dry_run {
                 if !silent {
-                    println!(
-                        "rnpm: successfully verified and installed {} package(s) from lockfile",
-                        summary.packages_installed
-                    );
+                    if summary.packages_installed > 0 {
+                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
+                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                    } else {
+                        println!("\nup to date in {}", elapsed_str);
+                    }
 
                     if fund_val {
                         let count = audit::count_funding_packages(&current_dir);
@@ -5458,6 +5522,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace,
             workspaces,
             workspace_root,
+            json,
         } => {
             if packages.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -5481,6 +5546,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 is_global,
                 ..Default::default()
             };
+            let start_time = std::time::Instant::now();
             let installer = Installer::new(options)?;
             let uninstall_options = UninstallOptions {
                 packages,
@@ -5493,12 +5559,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
             };
             let summary = installer.uninstall(&uninstall_options)?;
-            if !silent {
-                println!(
-                    "rnpm: removed {} package(s), pruned {} unreferenced dependencies",
-                    summary.removed_packages.len(),
-                    summary.pruned_dependencies.len()
-                );
+            let mut all_removed = std::collections::HashSet::new();
+            for pkg in &summary.removed_packages {
+                all_removed.insert(pkg.clone());
+            }
+            for pruned in &summary.pruned_dependencies {
+                let name = pruned.rsplit("node_modules/").next().unwrap_or(pruned);
+                all_removed.insert(name.to_string());
+            }
+            let total_removed = all_removed.len();
+            let elapsed_str = format_duration(start_time.elapsed());
+
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": 0,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": total_removed
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent {
+                if total_removed > 0 {
+                    let pkg_str = if total_removed == 1 { "package" } else { "packages" };
+                    println!("\nremoved {} {} in {}", total_removed, pkg_str, elapsed_str);
+                } else {
+                    println!("\nup to date in {}", elapsed_str);
+                }
             }
         }
         Commands::Update {
@@ -5511,6 +5601,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
+            json,
         } => {
             let opts = commands::update::UpdateOptions {
                 packages,
@@ -5523,6 +5614,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 legacy_peer_deps,
                 strict_peer_deps,
                 silent,
+                json,
             };
             commands::update::run(opts, current_dir).await?;
         }
