@@ -5334,3 +5334,45 @@ fn test_strict_peer_deps_succeeds_when_peers_are_satisfied() {
     assert!(graph.nodes.contains_key("node_modules/core-lib"));
     assert!(graph.nodes.contains_key("node_modules/plugin-ok"));
 }
+
+#[test]
+fn test_root_bundled_dependencies_preserved_in_lockfile() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("bundled-dep", "1.0.0", |_| {});
+    provider.add_version("regular-dep", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("bundled-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.bundled_dependencies = Some(rnpm_core::manifest::BundledDependencies::List(vec![
+        "bundled-dep".to_string(),
+    ]));
+    manifest
+        .dependencies
+        .insert("bundled-dep".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("regular-dep".to_string(), "^1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let node_bundled = graph.nodes.get("node_modules/bundled-dep").unwrap();
+    assert!(node_bundled.flags.bundled);
+
+    let node_regular = graph.nodes.get("node_modules/regular-dep").unwrap();
+    assert!(!node_regular.flags.bundled);
+
+    let lockfile = graph.to_lockfile_v3("bundled-app", Some("1.0.0"));
+    let root_entry = lockfile.packages.get("").unwrap();
+    assert_eq!(
+        root_entry.bundled_package_names(),
+        vec!["bundled-dep".to_string()]
+    );
+
+    let bundled_entry = lockfile.packages.get("node_modules/bundled-dep").unwrap();
+    assert_eq!(bundled_entry.in_bundle, Some(true));
+
+    let regular_entry = lockfile.packages.get("node_modules/regular-dep").unwrap();
+    assert_eq!(regular_entry.in_bundle, None);
+}

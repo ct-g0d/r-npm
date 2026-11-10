@@ -262,7 +262,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 .map(str::to_owned),
             engines: root_manifest.engines.clone(),
             parsed_version: None,
-            extra: root_manifest.extra.clone(),
+            extra: {
+                let mut extra = root_manifest.extra.clone();
+                if let Some(ref bd) = root_manifest.bundled_dependencies {
+                    if let Ok(val) = serde_json::to_value(bd) {
+                        extra.insert("bundleDependencies".to_string(), val);
+                    }
+                }
+                extra
+            },
         };
         self.graph.nodes.insert(String::new(), root_node);
 
@@ -875,12 +883,33 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     target_loc
                 );
 
+                let is_bundled = if task.parent_location.is_empty() {
+                    self.graph
+                        .nodes
+                        .get("")
+                        .map(|p| {
+                            p.bundled_package_names().contains(&task.install_name)
+                                || p.bundled_package_names().contains(&dep_spec.package_name)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    self.graph
+                        .nodes
+                        .get(&task.parent_location)
+                        .map(|p| {
+                            p.flags.bundled
+                                || p.bundled_package_names().contains(&task.install_name)
+                                || p.bundled_package_names().contains(&dep_spec.package_name)
+                        })
+                        .unwrap_or(false)
+                };
+
                 let flags = NodeFlags {
                     dev: task.dep_type == DependencyType::Dev,
                     optional: task.dep_type == DependencyType::Optional,
                     dev_optional: false,
                     peer: is_peer,
-                    bundled: false,
+                    bundled: is_bundled,
                     has_install_script: chosen_version.has_install_script,
                     skipped: platform_skipped || parent_skipped,
                     link: false,

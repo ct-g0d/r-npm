@@ -574,7 +574,15 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             .map(str::to_owned),
         engines: root_manifest.engines.clone(),
         parsed_version: parsed_root_version,
-        extra: root_manifest.extra.clone(),
+        extra: {
+            let mut extra = root_manifest.extra.clone();
+            if let Some(ref bd) = root_manifest.bundled_dependencies {
+                if let Ok(val) = serde_json::to_value(bd) {
+                    extra.insert("bundleDependencies".to_string(), val);
+                }
+            }
+            extra
+        },
     };
     graph.nodes.insert(String::new(), root_node);
 
@@ -621,6 +629,15 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
             engines: member.manifest.engines.clone(),
+            extra: {
+                let mut extra = member.manifest.extra.clone();
+                if let Some(ref bd) = member.manifest.bundled_dependencies {
+                    if let Ok(val) = serde_json::to_value(bd) {
+                        extra.insert("bundleDependencies".to_string(), val);
+                    }
+                }
+                extra
+            },
             ..Default::default()
         };
         graph.nodes.insert(member_loc.clone(), member_node);

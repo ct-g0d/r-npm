@@ -98,6 +98,26 @@ pub struct Node {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl Node {
+    pub fn bundle_dependencies(&self) -> Option<rnpm_core::manifest::BundledDependencies> {
+        self.extra
+            .get("bundleDependencies")
+            .or_else(|| self.extra.get("bundledDependencies"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    pub fn bundled_package_names(&self) -> Vec<String> {
+        match self.bundle_dependencies() {
+            None => Vec::new(),
+            Some(rnpm_core::manifest::BundledDependencies::Boolean(true)) => {
+                self.dependencies.keys().cloned().collect()
+            }
+            Some(rnpm_core::manifest::BundledDependencies::Boolean(false)) => Vec::new(),
+            Some(rnpm_core::manifest::BundledDependencies::List(list)) => list,
+        }
+    }
+}
+
 /// Complete resolved dependency graph and tree geometry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DependencyGraph {
@@ -400,9 +420,18 @@ impl DependencyGraph {
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
                     };
+                    if let Some(bundled) = node.bundle_dependencies() {
+                        root_pkg.bundle_dependencies = Some(bundled);
+                    }
                     let mut filtered_extra = std::collections::BTreeMap::new();
                     for (k, v) in &node.extra {
-                        if k == "overrides" || k == "directories" || k == "license" || k == "libc" {
+                        if k == "overrides"
+                            || k == "directories"
+                            || k == "license"
+                            || k == "libc"
+                            || k == "bundleDependencies"
+                            || k == "bundledDependencies"
+                        {
                             continue;
                         }
                         if k == "deprecated"
@@ -573,6 +602,7 @@ impl DependencyGraph {
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
                     },
+                    bundle_dependencies: node.bundle_dependencies(),
                     extra,
                     ..Default::default()
                 };
@@ -647,7 +677,15 @@ impl DependencyGraph {
                 bin: pkg.bin.clone(),
                 license: pkg.license.clone(),
                 engines: pkg.engines_map().unwrap_or_default(),
-                extra: pkg.extra.clone(),
+                extra: {
+                    let mut extra = pkg.extra.clone();
+                    if let Some(ref bd) = pkg.bundle_dependencies {
+                        if let Ok(val) = serde_json::to_value(bd) {
+                            extra.insert("bundleDependencies".to_string(), val);
+                        }
+                    }
+                    extra
+                },
             };
             graph.nodes.insert(loc.clone(), node);
         }

@@ -85,7 +85,15 @@ impl PackageVersionMetadata {
                 || manifest.scripts.contains_key("install")
                 || manifest.scripts.contains_key("postinstall"),
             deprecated: None,
-            extra: manifest.extra.clone(),
+            extra: {
+                let mut extra = manifest.extra.clone();
+                if let Some(ref bd) = manifest.bundled_dependencies {
+                    if let Ok(val) = serde_json::to_value(bd) {
+                        extra.insert("bundleDependencies".to_string(), val);
+                    }
+                }
+                extra
+            },
         }
     }
 
