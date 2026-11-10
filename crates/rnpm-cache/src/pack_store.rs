@@ -1441,6 +1441,7 @@ impl PackStore {
         let limits = rnpm_fs::TarLimits::default();
         let mut file_payloads_map: HashMap<String, (String, u32, Vec<u8>)> = HashMap::new();
         let mut file_payloads_order = Vec::new();
+        let mut saw_npmignores: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let entries = archive.entries().map_err(CacheError::Io)?;
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
@@ -1476,10 +1477,24 @@ impl PackStore {
             }
 
             let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-            let relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
+            let mut relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
                 Some(p) => p,
                 None => continue,
             };
+
+            // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+            // unless a .npmignore file is already present.
+            if entry_type.is_file() {
+                if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                    saw_npmignores.insert(relative_path.clone());
+                } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+                    let ni = relative_path.with_file_name(".npmignore");
+                    if saw_npmignores.contains(&ni) {
+                        continue;
+                    }
+                    relative_path = ni;
+                }
+            }
 
             rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
 

@@ -1,0 +1,10 @@
+{
+  "name": "@real-monorepo/pkg-a",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node -e \"console.log('pkg-a ok')\""
+  },
+  "dependencies": {
+    "ms": "^2.1.3"
+  }
+}

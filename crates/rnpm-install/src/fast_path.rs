@@ -563,32 +563,40 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                     } else {
                         None
                     }
-                })
-                .or_else(|| {
-                    manifest.extra.get("licenses").and_then(|v| {
-                        v.as_array().and_then(|arr| {
-                            arr.first().and_then(|item| {
-                                if let Some(s) = item.as_str() {
-                                    Some(s.to_string())
-                                } else if let Some(obj) = item.as_object() {
-                                    obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                    })
                 });
         }
 
-        if package.engines.is_none() && !manifest.engines.is_empty() {
-            package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+        if package.engines.is_none() {
+            let manifest_path = if location.is_empty() {
+                project_dir.join("package.json")
+            } else {
+                project_dir.join(&location).join("package.json")
+            };
+            if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
+                    if let Some(engines_val) = json.get("engines") {
+                        if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(engines_val.clone()) {
+                            if !engines.is_empty() {
+                                package.engines = Some(engines);
+                            }
+                        }
+                    }
+                }
+            }
+            if package.engines.is_none() && !manifest.engines.is_empty() {
+                package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+            }
         }
         if package.bin.is_none() {
             if let Some(bin) = &manifest.bin {
                 let lock_bin = match bin {
                     rnpm_core::manifest::PackageBin::Single(s) => {
-                        rnpm_lockfile::PackageBin::Single(s.clone())
+                        let clean = s.strip_prefix("./").unwrap_or(s);
+                        let pkg_name = manifest.name.as_deref().unwrap_or("");
+                        let bin_name = pkg_name.rsplit('/').next().unwrap_or(pkg_name);
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(bin_name.to_string(), clean.to_string());
+                        rnpm_lockfile::PackageBin::Map(m)
                     }
                     rnpm_core::manifest::PackageBin::Map(m) => {
                         rnpm_lockfile::PackageBin::Map(m.clone())
@@ -596,6 +604,13 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                 };
                 package.bin = Some(lock_bin);
             }
+        } else if let Some(rnpm_lockfile::PackageBin::Single(s)) = &package.bin {
+            let clean = s.strip_prefix("./").unwrap_or(s);
+            let pkg_name = manifest.name.as_deref().unwrap_or("");
+            let bin_name = pkg_name.rsplit('/').next().unwrap_or(pkg_name);
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(bin_name.to_string(), clean.to_string());
+            package.bin = Some(rnpm_lockfile::PackageBin::Map(m));
         }
         if package.os.is_none() {
             if let Some(os) = &manifest.os {
