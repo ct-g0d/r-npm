@@ -13,3 +13,4 @@ pub mod rebuild;
 pub mod link;
 pub mod init;
 pub mod query;
+pub mod install_test;

@@ -1960,7 +1960,7 @@ fn is_lifecycle_script(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_run(
+pub(crate) async fn execute_run(
     current_dir: PathBuf,
     script: Option<String>,
     args: Vec<String>,
@@ -6545,26 +6545,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::InstallCiTest { args } => {
-            let mut installer = Installer::new(InstallOptions {
-                project_dir: current_dir.clone(),
-                ..Default::default()
-            })?;
-            installer.run_ci().await?;
-            execute_run(
-                current_dir,
-                Some("test".into()),
-                args,
-                false,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
-            )
-            .await?;
+            commands::install_test::run_install_ci_test(args, current_dir).await?;
         }
         Commands::InstallScripts {
             action,
@@ -6584,26 +6565,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         },
         Commands::InstallTest { args } => {
-            let mut installer = Installer::new(InstallOptions {
-                project_dir: current_dir.clone(),
-                ..Default::default()
-            })?;
-            installer.run().await?;
-            execute_run(
-                current_dir,
-                Some("test".into()),
-                args,
-                false,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
-            )
-            .await?;
+            commands::install_test::run_install_test(args, current_dir).await?;
         }
         Commands::Shrinkwrap => {
             let src = current_dir.join("package-lock.json");
