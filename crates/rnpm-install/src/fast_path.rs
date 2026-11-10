@@ -563,21 +563,6 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                     } else {
                         None
                     }
-                })
-                .or_else(|| {
-                    manifest.extra.get("licenses").and_then(|v| {
-                        v.as_array().and_then(|arr| {
-                            arr.first().and_then(|item| {
-                                if let Some(s) = item.as_str() {
-                                    Some(s.to_string())
-                                } else if let Some(obj) = item.as_object() {
-                                    obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                    })
                 });
         }
 

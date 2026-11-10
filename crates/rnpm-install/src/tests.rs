@@ -150,9 +150,11 @@ fn test_link_tree_bins_ansi_html() {
 
     crate::link_tree_bins(
         vec!["node_modules/ansi-html".to_string()],
+        None,
         root,
         &bin,
         &nm,
+        true,
         None,
     );
 
@@ -4184,7 +4186,7 @@ fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
         },
     );
 
-    crate::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir);
+    crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir, None);
 
     let pkg = lockfile.packages.get("node_modules/legacy-pkg").unwrap();
     assert_eq!(
