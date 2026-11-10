@@ -1,6 +1,6 @@
 use crate::error::ManifestError;
 use serde::{
-    de::{self, Deserializer, SeqAccess, Visitor},
+    de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
 use std::collections::BTreeMap;
@@ -72,6 +72,123 @@ where
     deserializer.deserialize_any(OptVecOrStringVisitor)
 }
 
+fn parse_engine_entry_str(entry: &str) -> Option<(&str, &str)> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(idx) = trimmed.find(|c: char| c.is_whitespace() || c == '@') {
+        let name = trimmed[..idx].trim();
+        let range = trimmed[idx + 1..].trim();
+        if !name.is_empty() && !range.is_empty() {
+            return Some((name, range));
+        }
+    }
+    if let Some(idx) = trimmed.find(['>', '<', '=', '~', '^']) {
+        let name = trimmed[..idx].trim();
+        let range = trimmed[idx..].trim();
+        if !name.is_empty() && !range.is_empty() {
+            return Some((name, range));
+        }
+    }
+    None
+}
+
+fn parse_engine_entries_from_str(s: &str) -> Vec<(&str, &str)> {
+    let mut res = Vec::new();
+    if s.contains(',') {
+        for part in s.split(',') {
+            if let Some(pair) = parse_engine_entry_str(part) {
+                res.push(pair);
+            }
+        }
+    } else if let Some(pair) = parse_engine_entry_str(s) {
+        res.push(pair);
+    }
+    res
+}
+
+pub fn deserialize_engines<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct EnginesVisitor;
+
+    impl<'de> Visitor<'de> for EnginesVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map, list, or string of engines")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
+                if let Some(s) = value.as_str() {
+                    map.insert(key, s.to_string());
+                } else if value.is_number() || value.is_boolean() {
+                    map.insert(key, value.to_string());
+                }
+            }
+            Ok(map)
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                if let Some(s) = elem.as_str() {
+                    if let Some((name, range)) = parse_engine_entry_str(s) {
+                        map.insert(name.to_string(), range.to_string());
+                    }
+                }
+            }
+            Ok(map)
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let mut map = BTreeMap::new();
+            for (name, range) in parse_engine_entries_from_str(s) {
+                map.insert(name.to_string(), range.to_string());
+            }
+            Ok(map)
+        }
+
+        fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&s)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(BTreeMap::new())
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    deserializer.deserialize_any(EnginesVisitor)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PackageBin {
@@ -119,20 +236,20 @@ impl ManifestFormat {
         let has_bom = raw.starts_with('\u{feff}') || raw.as_bytes().starts_with(b"\xEF\xBB\xBF");
         let clean = raw.strip_prefix('\u{feff}').unwrap_or(raw);
 
-        let newline = if clean.contains("\r\n") {
-            "\r\n".to_string()
-        } else {
-            "\n".to_string()
-        };
-
         let trailing_newline = clean.ends_with('\n') || clean.ends_with('\r');
 
         let trimmed_content = clean.trim();
-        let indent = if trimmed_content.lines().count() <= 1 {
-            String::new()
+        let (indent, newline) = if trimmed_content.lines().count() <= 1 {
+            (String::new(), String::new())
         } else {
+            let nl = if clean.contains("\r\n") {
+                "\r\n".to_string()
+            } else {
+                "\n".to_string()
+            };
+
             let trimmed = clean.trim_start();
-            if let Some(after_bracket) = trimmed
+            let ind = if let Some(after_bracket) = trimmed
                 .strip_prefix('{')
                 .or_else(|| trimmed.strip_prefix('['))
             {
@@ -152,7 +269,8 @@ impl ManifestFormat {
                 }
             } else {
                 "  ".to_string()
-            }
+            };
+            (ind, nl)
         };
 
         Self {
@@ -316,7 +434,11 @@ pub struct Manifest {
     )]
     pub libc: Option<Vec<String>>,
 
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_engines",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub engines: BTreeMap<String, String>,
 
     #[serde(flatten)]
