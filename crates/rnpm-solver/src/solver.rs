@@ -1272,10 +1272,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     })
             }
             PackageTarget::File(p) => {
-                let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
                 meta.versions
                     .values()
-                    .find(|v| v.dist_tarball.as_deref() == Some(&expected))
+                    .find(|v| v.dist_tarball.as_deref().is_some_and(|resolved| {
+                        crate::hoisting::file_target_matches_resolved(p, resolved)
+                    }))
                     .or_else(|| {
                         if meta.versions.len() == 1 {
                             meta.versions.values().next()

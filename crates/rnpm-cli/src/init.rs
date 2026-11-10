@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
+use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue as Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -303,13 +303,13 @@ pub fn run_init<R: BufRead, W: Write>(
         let mut map = if let Some(Value::Object(m)) = existing_val {
             m
         } else {
-            let mut fresh = serde_json::Map::new();
+            let mut fresh = OrderedJsonMap::new();
             fresh.insert("name".to_string(), Value::String(default_name.clone()));
             fresh.insert("version".to_string(), Value::String("1.0.0".to_string()));
             fresh.insert("description".to_string(), Value::String("".to_string()));
             fresh.insert("main".to_string(), Value::String("index.js".to_string()));
 
-            let mut scripts = serde_json::Map::new();
+            let mut scripts = OrderedJsonMap::new();
             scripts.insert(
                 "test".to_string(),
                 Value::String("echo \"Error: no test specified\" && exit 1".to_string()),
@@ -338,7 +338,7 @@ pub fn run_init<R: BufRead, W: Write>(
             map.insert("main".to_string(), Value::String("index.js".to_string()));
         }
         if !map.contains_key("scripts") {
-            let mut scripts = serde_json::Map::new();
+            let mut scripts = OrderedJsonMap::new();
             scripts.insert(
                 "test".to_string(),
                 Value::String("echo \"Error: no test specified\" && exit 1".to_string()),
@@ -361,6 +361,9 @@ pub fn run_init<R: BufRead, W: Write>(
         if !map.contains_key("license") {
             map.insert("license".to_string(), Value::String("ISC".to_string()));
         }
+        if !map.contains_key("type") {
+            map.insert("type".to_string(), Value::String("commonjs".to_string()));
+        }
 
         let mut formatted = serde_json::to_string_pretty(&Value::Object(map))?;
         formatted.push('\n');
@@ -369,7 +372,7 @@ pub fn run_init<R: BufRead, W: Write>(
         std::fs::write(&manifest_path, &formatted)?;
         writeln!(
             writer,
-            "Wrote to {}:\n\n{}",
+            "Wrote to {}:\n\n{}\n",
             manifest_path.display(),
             formatted
         )?;
@@ -413,7 +416,7 @@ pub fn run_init<R: BufRead, W: Write>(
     let mut map = if let Some(Value::Object(m)) = existing_val {
         m
     } else {
-        serde_json::Map::new()
+        OrderedJsonMap::new()
     };
 
     map.insert("name".to_string(), Value::String(name));
@@ -421,9 +424,9 @@ pub fn run_init<R: BufRead, W: Write>(
     map.insert("description".to_string(), Value::String(description));
     map.insert("main".to_string(), Value::String(entry_point));
 
-    let mut scripts_map = match map.remove("scripts") {
+    let mut scripts_map = match map.shift_remove("scripts") {
         Some(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
+        _ => OrderedJsonMap::new(),
     };
     if !test_command.is_empty() {
         scripts_map.insert("test".to_string(), Value::String(test_command));
@@ -436,7 +439,7 @@ pub fn run_init<R: BufRead, W: Write>(
     map.insert("scripts".to_string(), Value::Object(scripts_map));
 
     if !git_repo.is_empty() {
-        let mut repo = serde_json::Map::new();
+        let mut repo = OrderedJsonMap::new();
         repo.insert("type".to_string(), Value::String("git".to_string()));
         repo.insert("url".to_string(), Value::String(git_repo));
         map.insert("repository".to_string(), Value::Object(repo));
@@ -449,7 +452,7 @@ pub fn run_init<R: BufRead, W: Write>(
             .filter(|s| !s.is_empty())
             .map(|s| Value::String(s.to_string()))
             .collect()
-    } else if let Some(Value::Array(k)) = map.remove("keywords") {
+    } else if let Some(Value::Array(k)) = map.shift_remove("keywords") {
         k
     } else {
         Vec::new()
@@ -487,6 +490,7 @@ pub fn run_init<R: BufRead, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::io::Cursor;
     use tempfile::tempdir;
 

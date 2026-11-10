@@ -11,6 +11,14 @@ pub enum PlacementDecision {
     PlaceNew(String),
 }
 
+/// File specs can retain an older spelling in installed metadata and lockfiles.
+pub(crate) fn file_target_matches_resolved(target: &std::path::Path, resolved: &str) -> bool {
+    matches!(
+        PackageTarget::parse(resolved),
+        Ok(PackageTarget::File(path)) if path == target
+    )
+}
+
 /// Checks if an exact version string satisfies a package target specification.
 pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bool {
     let Ok(v) = Version::parse(version_str) else {
@@ -154,8 +162,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
             return node.resolved.as_deref() == Some(u.as_str());
         }
         PackageTarget::File(p) => {
-            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
-            return node.resolved.as_deref() == Some(&expected);
+            return node.resolved.as_deref().is_some_and(|resolved| {
+                file_target_matches_resolved(p, resolved)
+            });
         }
         PackageTarget::Git { url, committish } => {
             return node
@@ -814,6 +823,16 @@ mod tests {
             &peer_meta,
         );
         assert!(has_conflict_without);
+    }
+
+    #[test]
+    fn file_target_reuses_equivalent_relative_resolution() {
+        let mut node = make_test_node("node_modules/test", "test", "1.0.0");
+        node.resolved = Some("file:./pkgs/test.tgz".to_string());
+        let target = PackageTarget::parse("file:pkgs/test.tgz").unwrap();
+        assert!(node_satisfies_target(&node, &target));
+        node.resolved = Some("file:./other/test.tgz".to_string());
+        assert!(!node_satisfies_target(&node, &target));
     }
 
     #[test]

@@ -850,7 +850,10 @@ pub async fn run_post_install_audit(
         return Ok(());
     }
     if let Ok((report, _)) = build_audit_report(project_dir, registry_url).await {
-        print_concise_audit_summary(&report);
+        let config = rnpm_config::Config::load(Some(project_dir))?;
+        if config.get("loglevel") != Some("silent") {
+            print_concise_audit_summary(&report);
+        }
     }
     Ok(())
 }
