@@ -1115,6 +1115,13 @@ pub(crate) fn clean_empty_bin_dirs(root_nm: &Path) {
         }
     }
     visit(root_nm, true);
+    if root_nm.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(root_nm) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(root_nm);
+            }
+        }
+    }
 }
 
 /// Cleans up a specific `.bin` directory if it exists and is empty.
@@ -3751,9 +3758,17 @@ impl Installer {
             }
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
-            lockfile
-                .save_hidden(&loc_base_dir)
-                .context("Failed to save hidden package-lock.json")?;
+            let has_packages = graph.nodes.keys().any(|k| !k.is_empty());
+            if has_packages {
+                lockfile
+                    .save_hidden(&loc_base_dir)
+                    .context("Failed to save hidden package-lock.json")?;
+            } else {
+                let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");
+                if hidden_path.exists() {
+                    let _ = std::fs::remove_file(&hidden_path);
+                }
+            }
         }
 
         if !self.options.dry_run && !self.options.package_lock_only {
@@ -5126,7 +5141,8 @@ impl Installer {
         }
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
-        if self.options.package_lock_enabled() && !self.options.dry_run {
+        let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
+        if self.options.package_lock_enabled() && !self.options.dry_run && has_packages {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             lockfile
                 .save_hidden(&self.options.project_dir)
