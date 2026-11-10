@@ -19,3 +19,4 @@ pub mod sbom;
 pub mod view;
 pub mod search;
 pub mod dist_tag;
+pub mod owner;

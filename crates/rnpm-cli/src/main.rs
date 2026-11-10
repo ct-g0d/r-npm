@@ -3925,42 +3925,6 @@ pub(crate) fn make_registry_client(
 }
 
 
-async fn execute_owner(
-    current_dir: &Path,
-    action: OwnerAction,
-    registry: Option<String>,
-    json: bool,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    match action {
-        OwnerAction::Ls { package } => {
-            let value = client.package_owners(Some(&registry_url), &package).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(map) = value.as_object() {
-                for (name, role) in map {
-                    println!("{name}\t{}", role.as_str().unwrap_or("owner"));
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-        }
-        OwnerAction::Add { user, package } => {
-            client
-                .package_owner_add(Some(&registry_url), &package, &user, otp.as_deref())
-                .await?;
-            println!("added {user} to {package}");
-        }
-        OwnerAction::Rm { user, package } => {
-            client
-                .package_owner_remove(Some(&registry_url), &package, &user, otp.as_deref())
-                .await?;
-            println!("removed {user} from {package}");
-        }
-    }
-    Ok(())
-}
 
 async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow::Result<()> {
     match command {
@@ -6053,7 +6017,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             json,
             otp,
-        } => execute_owner(&current_dir, action, registry, json, otp).await?,
+        } => commands::owner::run(current_dir, action, registry, json, otp).await?,
         Commands::Unpublish {
             package,
             version,
