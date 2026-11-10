@@ -374,6 +374,13 @@ pub(crate) fn clean_empty_bin_dirs(root_nm: &Path) {
         }
     }
     visit(root_nm, true);
+    if root_nm.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(root_nm) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(root_nm);
+            }
+        }
+    }
 }
 
 /// Cleans up a specific `.bin` directory if it exists and is empty.

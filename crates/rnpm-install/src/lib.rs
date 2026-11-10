@@ -1171,6 +1171,7 @@ pub struct InstallOptions {
     pub package_lock: bool,
     pub no_package_lock: bool,
     pub dry_run: bool,
+    pub silent: bool,
     pub os: Option<String>,
     pub cpu: Option<String>,
     pub libc: Option<String>,
@@ -1250,6 +1251,7 @@ impl Default for InstallOptions {
             package_lock: true,
             no_package_lock: false,
             dry_run: false,
+            silent: false,
             os: None,
             cpu: None,
             libc: None,
@@ -2104,7 +2106,7 @@ impl Installer {
                     &workspace_members,
                     &targeted_workspace_indices,
                 )?;
-            } else if self.options.dry_run {
+            } else if self.options.dry_run && !self.options.silent {
                 for added in &added_pkgs {
                     println!("rnpm: would add {} to package.json", added.name);
                 }
@@ -2280,10 +2282,12 @@ impl Installer {
                         continue;
                     }
                 }
-                println!(
-                    "rnpm: would install {}@{} at {}",
-                    node.name, node.version, loc
-                );
+                if !self.options.silent {
+                    println!(
+                        "rnpm: would install {}@{} at {}",
+                        node.name, node.version, loc
+                    );
+                }
                 packages_installed += 1;
             }
 
@@ -3528,9 +3532,25 @@ impl Installer {
             }
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
-            lockfile
-                .save_hidden(&loc_base_dir)
-                .context("Failed to save hidden package-lock.json")?;
+            let has_packages = graph.nodes.keys().any(|k| !k.is_empty());
+            if has_packages {
+                lockfile
+                    .save_hidden(&loc_base_dir)
+                    .context("Failed to save hidden package-lock.json")?;
+            } else {
+                let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");
+                if hidden_path.exists() {
+                    let _ = std::fs::remove_file(&hidden_path);
+                }
+                let nm_dir = loc_base_dir.join("node_modules");
+                if nm_dir.exists() {
+                    if let Ok(mut entries) = std::fs::read_dir(&nm_dir) {
+                        if entries.next().is_none() {
+                            let _ = std::fs::remove_dir(&nm_dir);
+                        }
+                    }
+                }
+            }
         }
 
         if !self.options.dry_run && !self.options.package_lock_only {
@@ -3834,7 +3854,9 @@ impl Installer {
                 if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
                     continue;
                 }
-                println!("rnpm: would install {}", pkg_key);
+                if !self.options.silent {
+                    println!("rnpm: would install {}", pkg_key);
+                }
                 packages_installed += 1;
             }
             return Ok(InstallSummary {
