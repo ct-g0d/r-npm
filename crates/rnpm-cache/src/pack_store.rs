@@ -1941,6 +1941,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         let mut archive = tar::Archive::new(reader);
         let limits = rnpm_fs::TarLimits::default();
         let mut files = Vec::new();
+        let mut file_indices: HashMap<PathBuf, usize> = HashMap::new();
         let mut dirs = vec![target_dir.to_path_buf()];
         let mut symlinks = Vec::new();
         let mut entry_count = 0usize;
@@ -2051,12 +2052,18 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }));
             }
 
-            files.push(rnpm_fs::MaterializeFile {
-                path: full_path,
+            let mat_file = rnpm_fs::MaterializeFile {
+                path: full_path.clone(),
                 data,
                 mode,
                 package_id: Some(pkg_key.to_string()),
-            });
+            };
+            if let Some(&idx) = file_indices.get(&full_path) {
+                files[idx] = mat_file;
+            } else {
+                file_indices.insert(full_path, files.len());
+                files.push(mat_file);
+            }
         }
 
         Ok(DecodedPackage { files, dirs, symlinks })
@@ -3145,5 +3152,46 @@ mod tests {
             fs::read(target.path().join("index.js")).unwrap(),
             original_data
         );
+    }
+
+    #[test]
+    fn test_decode_package_tarball_duplicate_entries_differing_content_later_wins() {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_size(b"first version of file".len() as u64);
+            header1.set_mode(0o644);
+            header1.set_cksum();
+            tar.append_data(&mut header1, "package/lib/index.js", &b"first version of file"[..])
+                .unwrap();
+
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_size(b"second version of file (later wins)".len() as u64);
+            header2.set_mode(0o755);
+            header2.set_cksum();
+            tar.append_data(
+                &mut header2,
+                "package/./lib/index.js",
+                &b"second version of file (later wins)"[..],
+            )
+            .unwrap();
+
+            tar.finish().unwrap();
+        }
+        let tarball_bytes = enc.finish().unwrap();
+        let target_dir = tempdir().unwrap();
+        let decoded = PackStore::decode_package_tarball(
+            &tarball_bytes,
+            target_dir.path(),
+            "test-dup-pkg",
+        )
+        .expect("decode_package_tarball must succeed with duplicate entries");
+
+        // Must be deduplicated to exactly 1 file entry, with the later content and mode winning
+        assert_eq!(decoded.files.len(), 1);
+        assert_eq!(decoded.files[0].data, b"second version of file (later wins)");
+        assert_eq!(decoded.files[0].mode, 0o755);
     }
 }

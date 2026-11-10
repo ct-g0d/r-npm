@@ -429,7 +429,7 @@ pub fn write_file_fast(
             }
             wide.push(0);
 
-            const FILE_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | 0x08000000; // FILE_FLAG_SEQUENTIAL_SCAN
+            const FILE_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | 0x08000000 | 0x02000000; // FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS
 
             let mut h = unsafe {
                 CreateFileW(

@@ -3496,3 +3496,20 @@ fn test_junction_points_to_and_read_target() {
     assert!(junction_points_to(&link, &target2));
     assert!(!junction_points_to(&link, &target1));
 }
+
+#[test]
+fn test_symlink_creation_after_writer_target_exists() {
+    let dir = tempdir().unwrap();
+    let target_file = dir.path().join("target_file.txt");
+    let link_file = dir.path().join("link_file.txt");
+
+    // Write target file using write_file_fast
+    crate::writer::write_file_fast(&target_file, b"sample target content", 0o644, 65536).unwrap();
+
+    // Create link or copy
+    crate::create_link_or_copy(&link_file, &target_file).unwrap();
+
+    assert!(link_file.exists());
+    let content = std::fs::read(&link_file).unwrap();
+    assert_eq!(content, b"sample target content");
+}

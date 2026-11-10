@@ -4307,31 +4307,8 @@ impl Installer {
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let (blob_tx, blob_rx) = std::sync::mpsc::channel::<(Vec<u8>, String)>();
-            let blob_rx = Arc::new(std::sync::Mutex::new(blob_rx));
-            let cache_clone = self.cache.clone();
-            let mut blob_handles = Vec::with_capacity(8);
-            for _ in 0..8 {
-                let rx = Arc::clone(&blob_rx);
-                let c = cache_clone.clone();
-                blob_handles.push(std::thread::spawn(move || {
-                    loop {
-                        let item = {
-                            let Ok(guard) = rx.lock() else { break; };
-                            guard.recv().ok()
-                        };
-                        let Some((bytes, hex)) = item else { break; };
-                        let _ = c.put_blob_direct(&bytes, &hex);
-                    }
-                }));
-            }
-
-            let node_writer = if rnpm_fs::NodeWriter::is_available() {
-                rnpm_fs::NodeWriter::spawn().ok()
-            } else {
-                None
-            };
-            let node_sender = node_writer.as_ref().map(|nw| nw.sender());
+            let async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
                 let sem = Arc::clone(&semaphore);
@@ -4347,7 +4324,7 @@ impl Installer {
                 let resolved_url = resolved_url.clone();
                 let integrity_str = integrity_str.clone();
                 let is_optional = *is_optional;
-                let node_sender_clone = node_sender.clone();
+                let writer_sender_clone = writer_sender.clone();
 
                 join_set.spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -4522,31 +4499,39 @@ impl Installer {
                             let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, populate_cas);
                         }
 
-                        if let Some(ref sender) = node_sender_clone {
+                        if let Some(ref sender) = writer_sender_clone {
                             for file in decoded.files {
                                 rnpm_fs::record_file_created(file.data.len() as u64);
-                                let _ = sender.send(rnpm_fs::NodeWriterMsg::File {
-                                    path: file.path.to_string_lossy().to_string(),
-                                    data: file.data,
-                                });
+                                sender
+                                    .send(file.path, file.data, file.mode)
+                                    .map_err(|e| anyhow!("{e}"))?;
                             }
                         } else {
                             for file in &decoded.files {
                                 let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
                             }
                         }
-                        for (link_path, target_path) in &decoded.symlinks {
-                            let _ = rnpm_fs::create_link_or_copy(link_path, target_path);
+
+                        if let Some((blob_bytes, sha512_hex)) = to_cache {
+                            let target_path = cache.blob_path(&sha512_hex);
+                            if !target_path.exists() {
+                                if let Some(ref sender) = writer_sender_clone {
+                                    let _ = sender.send(target_path, blob_bytes, 0o644);
+                                } else {
+                                    let _ = cache.put_blob_direct(&blob_bytes, &sha512_hex);
+                                }
+                            }
                         }
-                        Ok::<(), anyhow::Error>(())
+
+                        Ok::<Vec<(PathBuf, PathBuf)>, anyhow::Error>(decoded.symlinks)
                     })
                     .await
                     .map_err(|e| anyhow!("pack worker panicked: {e}"))?;
 
                     match pack_res {
-                        Ok(()) => {
+                        Ok(symlinks) => {
                             worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                            Ok(Some((idx, was_hit, to_cache)))
+                            Ok(Some((idx, was_hit, symlinks)))
                         }
                         Err(e) => {
                             if is_optional {
@@ -4560,33 +4545,36 @@ impl Installer {
                 });
             }
 
+            let mut all_pending_symlinks = Vec::new();
             while let Some(join_res) = join_set.join_next().await {
                 let item_opt =
                     join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
-                if let Some((idx, was_hit, blob_opt)) = item_opt {
+                if let Some((idx, was_hit, symlinks)) = item_opt {
                     missing_pack_results.insert(idx, was_hit);
-                    if let Some(blob) = blob_opt {
-                        let _ = blob_tx.send(blob);
-                    }
+                    all_pending_symlinks.extend(symlinks);
                 }
             }
-            let t_blobs = std::time::Instant::now();
-            drop(blob_tx);
 
-            for h in blob_handles {
-                let _ = h.join();
+            if let Some(w) = async_writer {
+                let t_w = std::time::Instant::now();
+                w.finish().map_err(|e| anyhow!("AsyncFileWriter failed: {e}"))?;
+                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                    eprintln!("[TIMING_PROFILE] async_writer finish: {:.2}s", t_w.elapsed().as_secs_f64());
+                }
             }
 
-            if let Some(nw) = node_writer {
-                let t_nw = std::time::Instant::now();
-                nw.finish().map_err(|e| anyhow!("NodeWriter failed: {e}"))?;
-                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                    eprintln!("[TIMING_PROFILE] node_writer finish: {:.2}s", t_nw.elapsed().as_secs_f64());
+            for (link_path, target_path) in all_pending_symlinks {
+                if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
+                    warn!(
+                        "Failed to create link or copy from '{}' to '{}': {e}",
+                        link_path.display(),
+                        target_path.display()
+                    );
                 }
             }
 
             if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                eprintln!("[TIMING_PROFILE] blob_handles join: {:.2}s, total missing_packs: {:.2}s", t_blobs.elapsed().as_secs_f64(), t_missing_start.elapsed().as_secs_f64());
+                eprintln!("[TIMING_PROFILE] total missing_packs: {:.2}s", t_missing_start.elapsed().as_secs_f64());
             }
 
             if missing_pack_results.len() < missing_packs.len() {

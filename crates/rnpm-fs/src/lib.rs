@@ -14,7 +14,9 @@ pub mod path;
 pub mod tarball;
 pub mod writer;
 
-pub use node_writer::{NodeWriter, NodeWriterMsg};
+pub use node_writer::{
+    AsyncFileWriter, AsyncFileWriterSender, NodeWriter, NodeWriterMsg, RustWriterPool, WriteTask,
+};
 
 pub use atomic::{extract_and_replace, recover_atomic_writes, replace_dir_with_retries};
 pub use block_clone::{
