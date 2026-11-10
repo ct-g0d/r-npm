@@ -526,13 +526,13 @@ fn normalize_link_output(text: &str, global_prefix: &std::path::Path, pkg_dir: &
         let end_num = after.find(|c: char| !c.is_numeric() && c != '.');
         if let Some(num_len) = end_num {
             let suffix = &after[num_len..];
-            if suffix.starts_with("ms") {
+            if let Some(stripped) = suffix.strip_prefix("ms") {
                 normalized.push_str("<TIME>");
-                rest = &suffix[2..];
+                rest = stripped;
                 continue;
-            } else if suffix.starts_with('s') {
+            } else if let Some(stripped) = suffix.strip_prefix('s') {
                 normalized.push_str("<TIME>");
-                rest = &suffix[1..];
+                rest = stripped;
                 continue;
             }
         }
