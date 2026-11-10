@@ -532,6 +532,13 @@ impl PackagePack {
                     if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
                         copied = true;
                         rnpm_fs::record_file_created(entry.size);
+                    } else {
+                        // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
+                        let _ = PackStore::write_cas_file_safe(cas_path, slice);
+                        if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                            copied = true;
+                            rnpm_fs::record_file_created(entry.size);
+                        }
                     }
                 }
             }
