@@ -14,7 +14,7 @@ let head = 0;
 let inflight = 0;
 let stdinEnded = false;
 let failed = false;
-const concurrency = 16;
+const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '16', 10);
 
 function pump() {
   while (inflight < concurrency && head < q.length) {
@@ -105,8 +105,15 @@ pub struct NodeWriter {
 impl NodeWriter {
     /// Spawns a background Node.js process and begins listening for file write commands.
     pub fn spawn() -> Result<Self, std::io::Error> {
+        let uv_size = std::env::var("UV_THREADPOOL_SIZE")
+            .or_else(|_| std::env::var("RNPM_UV_THREADPOOL_SIZE"))
+            .unwrap_or_else(|_| "64".to_string());
         let mut child = Command::new("node")
-            .env("UV_THREADPOOL_SIZE", "32")
+            .env("UV_THREADPOOL_SIZE", uv_size)
+            .env(
+                "RNPM_NODE_WRITER_CONCURRENCY",
+                std::env::var("RNPM_NODE_WRITER_CONCURRENCY").unwrap_or_else(|_| "16".to_string()),
+            )
             .arg("-e")
             .arg(NODE_WRITER_SCRIPT)
             .stdin(Stdio::piped())
