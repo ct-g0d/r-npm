@@ -5958,23 +5958,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             registry,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = client
-                .starred_packages(Some(&registry_url), user.as_deref())
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(packages) = value.as_array() {
-                for package in packages {
-                    if let Some(name) = package.as_str() {
-                        println!("{name}");
-                    } else if let Some(name) = package.get("name").and_then(|v| v.as_str()) {
-                        println!("{name}");
-                    }
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            commands::star::run_stars(user, json, registry, current_dir).await?;
         }
         Commands::Star {
             packages,
@@ -5982,18 +5966,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             no_unicode: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            if packages.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error star requires at least one package"
-                ));
-            }
-            for package in packages {
-                client
-                    .star_package(Some(&registry_url), &package, otp.as_deref())
-                    .await?;
-                println!("starred {package}");
-            }
+            commands::star::run_star(packages, registry, otp, current_dir).await?;
         }
         Commands::Unstar {
             packages,
@@ -6001,18 +5974,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             no_unicode: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            if packages.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error unstar requires at least one package"
-                ));
-            }
-            for package in packages {
-                client
-                    .unstar_package(Some(&registry_url), &package, otp.as_deref())
-                    .await?;
-                println!("unstarred {package}");
-            }
+            commands::star::run_unstar(packages, registry, otp, current_dir).await?;
         }
         Commands::Profile {
             action,
