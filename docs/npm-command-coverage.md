@@ -74,7 +74,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `set` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `set foo=bar` on fresh fixture directory |
 | `shrinkwrap` | - | **matching** | Renames `package-lock.json` to `npm-shrinkwrap.json`, outputs notice to stderr and keeps stdout empty matching npm | Ran `shrinkwrap` against npm parity test |
 | `stage` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `stage --help` on fresh fixture directory |
-| `star` | - | **partial** | Remote authentication requirement: starring a package modifies user profile stars on registry requiring write auth; verified via mock registry integration test | Ran `star` against mock registry |
+| `star` | - | **matching** | Package star mutation, stdout formatting `(*) <pkg>`, and identical mock registry requests match npm parity | Ran `star` against mock registry and live npm parity test |
 | `stars` | - | **partial** | User starred packages query: fetches user starred package list via registry client; verified via mock registry integration test | Ran `stars` against mock registry |
 | `start` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `start` on fresh fixture directory |
 | `stop` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `stop` on fresh fixture directory |

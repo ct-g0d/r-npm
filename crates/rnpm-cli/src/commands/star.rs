@@ -17,7 +17,7 @@ pub(crate) async fn run_star(
         client
             .star_package(Some(&registry_url), &package, otp.as_deref())
             .await?;
-        println!("starred {package}");
+        println!("(*) {package}");
     }
     Ok(())
 }
