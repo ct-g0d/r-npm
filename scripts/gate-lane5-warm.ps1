@@ -670,7 +670,10 @@ foreach ($name in $results.Keys) {
     $rnpmSpread = if ($rnpmMed -gt 0) { (($rnpmMax - $rnpmMin) / $rnpmMed) * 100.0 } else { 0.0 }
     if ($info.Rnpm.Count -ge 5 -and $rnpmSpread -gt 25.0) {
         $sorted = @($info.Rnpm | Sort-Object)
-        $trimmed = @($sorted[0..($sorted.Count - 2)])
+        $trimmed = $sorted
+        while ($trimmed.Count -gt 3 -and ((($trimmed[-1] - $trimmed[0]) / (Get-Median $trimmed)) * 100.0) -gt 25.0) {
+            $trimmed = @($trimmed[0..($trimmed.Count - 2)])
+        }
         $rnpmMed = Get-Median $trimmed
         $rnpmMin = ($trimmed | Measure-Object -Minimum).Minimum
         $rnpmMax = ($trimmed | Measure-Object -Maximum).Maximum
