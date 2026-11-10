@@ -749,3 +749,35 @@ fn test_workspace_root_install_options() {
         "root dependency must also be installed with --workspace-root"
     );
 }
+
+#[test]
+fn test_install_silent_dry_run_prints_nothing() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let temp = tempdir().unwrap();
+    setup_base_fixture(temp.path());
+
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{
+            "name": "silent-dry-run-pkg",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-prod": "file:./packages/pkg-prod"
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .current_dir(temp.path())
+        .args(["install", "--silent", "--dry-run"])
+        .output()
+        .expect("Failed to execute rnpm");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.trim().is_empty(), "stdout must be empty, but got: {stdout}");
+    assert!(stderr.trim().is_empty(), "stderr must be empty, but got: {stderr}");
+    assert!(!temp.path().join("node_modules").exists());
+}

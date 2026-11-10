@@ -1455,6 +1455,7 @@ pub struct InstallOptions {
     pub package_lock: bool,
     pub no_package_lock: bool,
     pub dry_run: bool,
+    pub silent: bool,
     pub os: Option<String>,
     pub cpu: Option<String>,
     pub libc: Option<String>,
@@ -1534,6 +1535,7 @@ impl Default for InstallOptions {
             package_lock: true,
             no_package_lock: false,
             dry_run: false,
+            silent: false,
             os: None,
             cpu: None,
             libc: None,
@@ -2497,7 +2499,7 @@ impl Installer {
                     &workspace_members,
                     &targeted_workspace_indices,
                 )?;
-            } else if self.options.dry_run {
+            } else if self.options.dry_run && !self.options.silent {
                 for added in &added_pkgs {
                     println!("rnpm: would add {} to package.json", added.name);
                 }
@@ -2673,10 +2675,12 @@ impl Installer {
                         continue;
                     }
                 }
-                println!(
-                    "rnpm: would install {}@{} at {}",
-                    node.name, node.version, loc
-                );
+                if !self.options.silent {
+                    println!(
+                        "rnpm: would install {}@{} at {}",
+                        node.name, node.version, loc
+                    );
+                }
                 packages_installed += 1;
             }
 
@@ -4053,7 +4057,9 @@ impl Installer {
                 if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
                     continue;
                 }
-                println!("rnpm: would install {}", pkg_key);
+                if !self.options.silent {
+                    println!("rnpm: would install {}", pkg_key);
+                }
                 packages_installed += 1;
             }
             return Ok(InstallSummary {

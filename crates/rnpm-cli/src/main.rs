@@ -5229,6 +5229,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 install_strategy: effective_strategy,
                 wait_for_trash,
                 detached_trash,
+                silent,
                 ..Default::default()
             };
 
@@ -5839,6 +5840,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 legacy_peer_deps,
                 strict_peer_deps,
                 dry_run,
+                silent,
                 unlocked_packages,
                 ..Default::default()
             };
