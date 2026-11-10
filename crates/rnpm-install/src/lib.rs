@@ -4298,8 +4298,13 @@ impl Installer {
         let mut failed_optional_indices: HashSet<usize> = HashSet::new();
 
         if !missing_packs.is_empty() {
+            let t_missing_start = std::time::Instant::now();
+            let node_modules_dir_v = rnpm_fs::to_verbatim_path(&node_modules_dir);
+            let bin_dir_v = rnpm_fs::to_verbatim_path(&bin_dir);
+            let _ = rnpm_fs::writer::precreate_directories(vec![node_modules_dir_v.as_path(), bin_dir_v.as_path()]);
+
             let semaphore = Arc::clone(&self.io_semaphore);
-            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(24));
+            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let mut join_set = tokio::task::JoinSet::new();
 
             let (blob_tx, blob_rx) = std::sync::mpsc::channel::<(Vec<u8>, String)>();
@@ -4500,8 +4505,19 @@ impl Installer {
                     let pack_res = tokio::task::spawn_blocking(move || {
                         let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
                             .map_err(|e| anyhow!("{e}"))?;
+
+                        let dir_refs: Vec<&Path> = decoded.dirs.iter().map(|p| p.as_path()).collect();
+                        let _ = rnpm_fs::writer::precreate_directories(dir_refs);
+                        for file in &decoded.files {
+                            let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
+                        }
+                        for (link_path, target_path) in &decoded.symlinks {
+                            let _ = rnpm_fs::create_link_or_copy(link_path, target_path);
+                        }
+
+                        let populate_cas = idx < 5;
                         if !integrity_str.is_empty() {
-                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, false);
+                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, populate_cas);
                         }
                         Ok::<rnpm_cache::DecodedPackage, anyhow::Error>(decoded)
                     })
@@ -4535,10 +4551,14 @@ impl Installer {
                     }
                 }
             }
+            let t_blobs = std::time::Instant::now();
             drop(blob_tx);
 
             for h in blob_handles {
                 let _ = h.join();
+            }
+            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                eprintln!("[TIMING_PROFILE] blob_handles join: {:.2}s, total missing_packs: {:.2}s", t_blobs.elapsed().as_secs_f64(), t_missing_start.elapsed().as_secs_f64());
             }
 
             if missing_pack_results.len() < missing_packs.len() {
@@ -4560,6 +4580,9 @@ impl Installer {
             }
         }
 
+        let all_direct_materialized = !missing_pack_results.is_empty()
+            && missing_pack_results.len() == packages_to_process.len();
+
         let all_packs_available = !packages_to_process.is_empty()
             && packages_to_process
                 .iter()
@@ -4571,7 +4594,42 @@ impl Installer {
         let mut bin_packages = packages_to_process.clone();
         sort_packages_for_bin_linking(&mut bin_packages);
 
-        if all_packs_available {
+        if all_direct_materialized {
+            used_fast_path = true;
+            for (
+                pkg_key,
+                resolved_url,
+                _,
+                is_optional,
+                declared_dependencies,
+                has_bins_or_scripts,
+            ) in &bin_packages
+            {
+                let target_path = loc_base_dir.join(pkg_key);
+                if *has_bins_or_scripts {
+                    if let Some(l_node) = process_installed_pkg_manifest_without_bins(
+                        &target_path,
+                        pkg_key,
+                        resolved_url,
+                        declared_dependencies,
+                        *is_optional,
+                    ) {
+                        lifecycle_nodes.push(l_node);
+                    }
+                }
+                packages_installed += 1;
+            }
+
+            for was_hit in missing_pack_results.values() {
+                if *was_hit {
+                    cache_hits += 1;
+                    collector.record_cache_hit();
+                } else {
+                    cache_misses += 1;
+                    collector.record_cache_miss();
+                }
+            }
+        } else if all_packs_available {
             let t_mat = std::time::Instant::now();
             let mut loaded_packs = Vec::with_capacity(packages_to_process.len());
             let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
@@ -4581,6 +4639,7 @@ impl Installer {
 
             let mut load_success = true;
 
+            let t_lp = std::time::Instant::now();
             for (pkg_key, _, integrity_str, _, _, _) in packages_to_process.iter() {
                 let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
                     pkg_key.replace('/', "\\")
@@ -4612,8 +4671,12 @@ impl Installer {
                     }
                 }
             }
+            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                eprintln!("[TIMING_PROFILE] loaded_packs: {:.2}s", t_lp.elapsed().as_secs_f64());
+            }
 
             if load_success {
+                let t_refs = std::time::Instant::now();
                 let mut all_file_refs = Vec::with_capacity(16384);
                 let mut all_symlinks = Vec::new();
 
@@ -4629,14 +4692,19 @@ impl Installer {
                             all_dirs.insert(parent.to_path_buf());
                         }
                         if let Some(slice) = pack.get_file_slice(&entry.path) {
+                            let source_path = if entry.cas_verified {
+                                entry.cas_path.as_deref()
+                            } else {
+                                None
+                            };
                             all_file_refs.push(rnpm_fs::MaterializeFileRef {
                                 path: full_path,
                                 data: slice,
                                 mode: entry.mode,
                                 package_id: Some(pkg_key.as_str()),
-                                source_path: entry.cas_path.as_deref(),
+                                source_path,
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: true,
+                                source_verified: entry.cas_verified,
                             });
                         } else {
                             warn!(
@@ -4661,32 +4729,30 @@ impl Installer {
                         all_symlinks.push((pkg_target.join(clean_link), pkg_target.join(clean_target)));
                     }
                 }
+                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                    eprintln!("[TIMING_PROFILE] all_file_refs: {:.2}s ({} files)", t_refs.elapsed().as_secs_f64(), all_file_refs.len());
+                }
 
                 if load_success {
                     used_fast_path = true;
 
                     if !all_file_refs.is_empty() {
                         // 1. Precreate all directories breadth-first in a single pass
+                        let t_dirs = std::time::Instant::now();
                         let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                         precreate_directories(dir_refs)
                             .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
-
-                        // 2. Populate all unique CAS files in parallel across 16 threads
-                        let t_cas = std::time::Instant::now();
-                        let cas_inputs: Vec<(&Path, &[u8])> = all_file_refs
-                            .iter()
-                            .filter_map(|r| r.source_path.map(|p| (p, r.data)))
-                            .collect();
-                        self.pack_store.populate_cas_global(&cas_inputs);
-                        let cas_dur = t_cas.elapsed();
                         if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                            eprintln!("[CAS_TIMING] populate_cas_global: {:.2}s for {} files", cas_dur.as_secs_f64(), cas_inputs.len());
+                            eprintln!("[TIMING_PROFILE] precreate_directories: {:.2}s", t_dirs.elapsed().as_secs_f64());
                         }
-                        collector.record_phase(Phase::StoreWrite, cas_dur);
 
-                        // 3. Materialize all files globally parallel across threads
+                        // 2. Materialize all files globally parallel across threads
+                        let t_mat_w = std::time::Instant::now();
                         rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
                             .map_err(|e| anyhow!("{e}"))?;
+                        if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                            eprintln!("[TIMING_PROFILE] materialize_files_parallel_refs: {:.2}s", t_mat_w.elapsed().as_secs_f64());
+                        }
 
                         // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                         for (link_path, target_path) in all_symlinks {

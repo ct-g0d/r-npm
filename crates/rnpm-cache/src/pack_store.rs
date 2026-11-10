@@ -587,6 +587,7 @@ pub struct PackStore {
     mmap_cache: Arc<Mutex<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
+    has_cas_files: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PackStore {
@@ -598,15 +599,24 @@ impl PackStore {
         fs::create_dir_all(root.join("tmp"))?;
         let cas_dir = root.join("cas");
         fs::create_dir_all(&cas_dir)?;
+        let mut has_cas = false;
         for b in 0..=255u8 {
             let hex_sub = format!("{:02x}", b);
-            let _ = fs::create_dir(cas_dir.join(hex_sub));
+            let sub = cas_dir.join(&hex_sub);
+            if fs::create_dir(&sub).is_err() && !has_cas {
+                if let Ok(mut it) = fs::read_dir(&sub) {
+                    if it.next().is_some() {
+                        has_cas = true;
+                    }
+                }
+            }
         }
         Ok(Self {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
+            has_cas_files: Arc::new(std::sync::atomic::AtomicBool::new(has_cas)),
         })
     }
 
@@ -949,9 +959,8 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             let _ = fs::create_dir_all(&parent);
         }
 
-        let pid = std::process::id();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let num_workers = 16.min(files.len());
+        let num_workers = 32.min(files.len());
         std::thread::scope(|scope| {
             for _ in 0..num_workers {
                 scope.spawn(|| loop {
@@ -960,40 +969,11 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    if dst.exists() && is_destination_valid(dst) {
-                        if let Ok(meta) = dst.metadata() {
-                            if let Some(mtime) = mtime_to_timestamp(&meta) {
-                                self.set_cas_stamp(dst, meta.len(), mtime);
-                            }
-                        }
-                        continue;
-                    }
-                    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    let tmp_dst = dst.with_extension(format!("tmp_{pid}_{counter}"));
-                    if rnpm_fs::copy_file_fast(src, &tmp_dst).is_ok() {
-                        let renamed = match fs::rename(&tmp_dst, dst) {
-                            Ok(()) => true,
-                            Err(_) => {
-                                if !dst.exists() || !is_destination_valid(dst) {
-                                    let _ = fs::remove_file(dst);
-                                    fs::rename(&tmp_dst, dst).is_ok()
-                                } else {
-                                    false
-                                }
-                            }
-                        };
-                        let _ = fs::remove_file(&tmp_dst);
-                        if renamed {
-                            if let Ok(meta) = dst.metadata() {
-                                if let Some(mtime) = mtime_to_timestamp(&meta) {
-                                    self.set_cas_stamp(dst, meta.len(), mtime);
-                                }
-                            }
-                        }
-                    }
+                    let _ = rnpm_fs::copy_file_fast(src, dst);
                 });
             }
         });
+        self.has_cas_files.store(true, Ordering::Relaxed);
     }
 
     /// Returns the (pack_path, idx_path) tuple for an integrity hash.
@@ -1287,6 +1267,11 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             let cas_file = self.cas_file_path(&sha);
             entry.cas_path = Some(cas_file.clone());
 
+            if !self.has_cas_files.load(Ordering::Relaxed) {
+                entry.cas_verified = false;
+                continue;
+            }
+
             let start = entry.offset as usize;
             let end = start.saturating_add(entry.size as usize);
             let slice = if end <= buf_data.len() {
@@ -1543,7 +1528,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 aligned_offset: aligned_offset as u64,
                 sha256: Some(sha256_hex),
                 cas_path: Some(cas_path),
-                cas_verified: true,
+                cas_verified: populate_cas,
                 cas_mtime: None,
             });
         }
@@ -1634,6 +1619,7 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }
             }
         }
+        self.has_cas_files.store(true, Ordering::Relaxed);
     }
 
     /// Extract a tarball into the pack store atomically.

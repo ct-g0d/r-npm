@@ -429,7 +429,7 @@ pub fn write_file_fast(
             }
             wide.push(0);
 
-            const FILE_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL;
+            const FILE_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | 0x08000000; // FILE_FLAG_SEQUENTIAL_SCAN
 
             let mut h = unsafe {
                 CreateFileW(
@@ -816,28 +816,46 @@ pub fn materialize_files_parallel_refs<'a>(
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(1, 24)
+        config.worker_threads.clamp(1, 32)
     };
 
-    let mut package_groups: std::collections::HashMap<&str, Vec<MaterializeFileRef<'a>>> =
-        std::collections::HashMap::new();
-    let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
+    let batches: Vec<Vec<MaterializeFileRef<'a>>> = if config.is_hdd {
+        let mut package_groups: std::collections::HashMap<&str, Vec<MaterializeFileRef<'a>>> =
+            std::collections::HashMap::new();
+        let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
 
-    for file in files {
-        if let Some(pkg_id) = file.package_id {
-            package_groups.entry(pkg_id).or_default().push(file);
-        } else {
-            ungrouped.push(file);
+        for file in files {
+            if let Some(pkg_id) = file.package_id {
+                package_groups.entry(pkg_id).or_default().push(file);
+            } else {
+                ungrouped.push(file);
+            }
         }
-    }
 
-    let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
-    // Sort batches largest first (LPT scheduling) so large packages (lodash, caniuse-lite) start immediately
-    batches.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        let mut b: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
+        // Sort batches largest first (LPT scheduling) so large packages (lodash, caniuse-lite) start immediately
+        b.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-    if !ungrouped.is_empty() {
-        batches.push(ungrouped);
-    }
+        if !ungrouped.is_empty() {
+            b.push(ungrouped);
+        }
+        b
+    } else {
+        // SSD: Chunk files evenly in small batches of 16 to eliminate convoy latency
+        const CHUNK_SIZE: usize = 16;
+        let mut b = Vec::with_capacity(files.len() / CHUNK_SIZE + 1);
+        let mut current = Vec::with_capacity(CHUNK_SIZE);
+        for file in files {
+            current.push(file);
+            if current.len() >= CHUNK_SIZE {
+                b.push(std::mem::replace(&mut current, Vec::with_capacity(CHUNK_SIZE)));
+            }
+        }
+        if !current.is_empty() {
+            b.push(current);
+        }
+        b
+    };
 
     let total_batches = batches.len();
     if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
