@@ -16,3 +16,4 @@ pub mod query;
 pub mod install_test;
 pub mod shrinkwrap;
 pub mod sbom;
+pub mod view;

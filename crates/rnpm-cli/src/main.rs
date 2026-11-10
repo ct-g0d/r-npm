@@ -5981,18 +5981,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             registry,
         } => {
-            let opts = view::ViewOptions {
-                args,
-                json,
-                registry,
-            };
-            let code = view::run_view(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "view finished with non-zero exit code".to_string(),
-                }));
-            }
+            commands::view::run(args, json, registry, current_dir).await?;
         }
         Commands::Query {
             selector,
