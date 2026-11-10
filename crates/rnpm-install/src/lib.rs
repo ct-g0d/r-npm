@@ -3739,6 +3739,7 @@ impl Installer {
         if !self.options.no_save && self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir);
+            self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if !self.options.is_global {
                 lockfile
@@ -5158,17 +5159,26 @@ impl Installer {
 
         let mut names = std::collections::BTreeSet::new();
         for (location, package) in &lockfile.packages {
-            if location.is_empty()
-                || package.link == Some(true)
-                || (package.license.is_some() && package.libc.is_some())
-            {
+            if location.is_empty() || package.link == Some(true) {
+                continue;
+            }
+            let is_linux_package = package
+                .os
+                .as_ref()
+                .map(|os_list| os_list.iter().any(|os| os == "linux"))
+                .unwrap_or(false);
+            let needs_license = package.license.is_none();
+            let needs_libc = is_linux_package && package.libc.is_none();
+            if !needs_license && !needs_libc {
                 continue;
             }
             let name = package.name.clone().or_else(|| {
-                let leaf = location.rsplit("/node_modules/").next().unwrap_or(location);
-                location
-                    .strip_prefix("node_modules/")
-                    .map(|_| leaf.to_string())
+                location.strip_prefix("node_modules/").map(|leaf| {
+                    leaf.rsplit("/node_modules/")
+                        .next()
+                        .unwrap_or(leaf)
+                        .to_string()
+                })
             });
             if let Some(name) = name {
                 names.insert(name);
@@ -6806,7 +6816,12 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
             if let Some(bin) = &manifest.bin {
                 let lock_bin = match bin {
                     rnpm_core::manifest::PackageBin::Single(s) => {
-                        rnpm_lockfile::PackageBin::Single(s.clone())
+                        let clean = s.strip_prefix("./").unwrap_or(s);
+                        let pkg_name = manifest.name.as_deref().unwrap_or("");
+                        let bin_name = pkg_name.rsplit('/').next().unwrap_or(pkg_name);
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(bin_name.to_string(), clean.to_string());
+                        rnpm_lockfile::PackageBin::Map(m)
                     }
                     rnpm_core::manifest::PackageBin::Map(m) => {
                         rnpm_lockfile::PackageBin::Map(m.clone())
@@ -6814,6 +6829,13 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
                 };
                 package.bin = Some(lock_bin);
             }
+        } else if let Some(rnpm_lockfile::PackageBin::Single(s)) = &package.bin {
+            let clean = s.strip_prefix("./").unwrap_or(s);
+            let pkg_name = manifest.name.as_deref().unwrap_or("");
+            let bin_name = pkg_name.rsplit('/').next().unwrap_or(pkg_name);
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(bin_name.to_string(), clean.to_string());
+            package.bin = Some(rnpm_lockfile::PackageBin::Map(m));
         }
         if package.os.is_none() {
             if let Some(os) = &manifest.os {

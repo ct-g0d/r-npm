@@ -5453,3 +5453,44 @@ fn test_workspace_lockfile_package_names_and_prune_reachability() {
     assert!(graph.nodes.contains_key("node_modules/@scope/pkg-a"));
     assert!(graph.nodes.contains_key("node_modules/sub-dep"));
 }
+
+#[test]
+fn test_lockfile_normalizes_single_bin_string_to_map() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("@scope/parser", "1.0.0", |version| {
+        version.bin = Some(rnpm_lockfile::PackageBin::Single("./bin/parser.js".to_string()));
+    });
+    provider.add_version("single-tool", "1.0.0", |version| {
+        version.bin = Some(rnpm_lockfile::PackageBin::Single("bin/tool.js".to_string()));
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("single-bin-app".to_string());
+    manifest
+        .dependencies
+        .insert("@scope/parser".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("single-tool".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let lockfile = graph.to_lockfile_v3("single-bin-app", Some("1.0.0"));
+
+    let scoped_pkg = lockfile.packages.get("node_modules/@scope/parser").unwrap();
+    assert_eq!(
+        scoped_pkg.bin,
+        Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "parser".to_string(),
+            "bin/parser.js".to_string(),
+        )])))
+    );
+
+    let unscoped_pkg = lockfile.packages.get("node_modules/single-tool").unwrap();
+    assert_eq!(
+        unscoped_pkg.bin,
+        Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "single-tool".to_string(),
+            "bin/tool.js".to_string(),
+        )])))
+    );
+}

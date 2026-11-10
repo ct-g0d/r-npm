@@ -2,10 +2,14 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-fn normalize_bin_paths(bin: Option<PackageBin>) -> Option<PackageBin> {
+fn normalize_bin_paths(bin: Option<PackageBin>, package_name: &str) -> Option<PackageBin> {
     bin.map(|bin| match bin {
         PackageBin::Single(path) => {
-            PackageBin::Single(path.strip_prefix("./").unwrap_or(&path).to_string())
+            let clean = path.strip_prefix("./").unwrap_or(&path).to_string();
+            let bin_name = package_name.rsplit('/').next().unwrap_or(package_name);
+            let mut map = BTreeMap::new();
+            map.insert(bin_name.to_string(), clean);
+            PackageBin::Map(map)
         }
         PackageBin::Map(paths) => PackageBin::Map(
             paths
@@ -410,7 +414,7 @@ impl DependencyGraph {
                         root_pkg.optional_dependencies = Some(node.optional_dependencies.clone());
                     }
                     if let Some(bin) = &node.bin {
-                        root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
+                        root_pkg.bin = normalize_bin_paths(Some(bin.clone()), &node.name);
                     }
                     if node.flags.has_install_script {
                         root_pkg.has_install_script = Some(true);
@@ -610,7 +614,7 @@ impl DependencyGraph {
                     os,
                     cpu,
                     libc,
-                    bin: normalize_bin_paths(node.bin.clone()),
+                    bin: normalize_bin_paths(node.bin.clone(), &node.name),
                     license,
                     engines: if node.engines.is_empty() {
                         None
