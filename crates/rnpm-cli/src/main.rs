@@ -1479,10 +1479,10 @@ pub(crate) enum OwnerAction {
 pub(crate) enum ConfigAction {
     /// Set a configuration key to a value
     Set {
-        /// Configuration key to set
+        /// Configuration key to set (or key=value)
         key: String,
         /// Value to assign
-        value: String,
+        value: Option<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1514,6 +1514,10 @@ pub(crate) enum ConfigAction {
         #[arg(long)]
         json: bool,
     },
+    /// Open the config file in an editor
+    Edit,
+    /// Repair or normalize configuration
+    Fix,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -7238,18 +7242,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ));
         }
         Commands::Get { key } => {
-            if let Some(key_str) = key {
-                let config = rnpm_config::Config::load(Some(&current_dir))?;
-                if let Some(val) = config.get(&key_str) {
-                    println!("{val}");
-                } else {
-                    println!("undefined");
-                }
-            } else {
-                let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                let detailed = rnpm_config::Config::load_detailed(opts)?;
-                print!("{}", detailed.format_text());
-            }
+            commands::config::run_get(key.as_deref(), &current_dir)?;
         }
         Commands::Set {
             key,
@@ -7257,90 +7250,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             global,
             location,
         } => {
-            let target_path = if global || location.as_deref() == Some("global") {
-                rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                    rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                })
-            } else if location.as_deref() == Some("project") {
-                current_dir.join(".npmrc")
-            } else if location.as_deref() == Some("user") {
-                rnpm_config::get_default_user_npmrc()
-            } else if current_dir.join(".npmrc").exists() {
-                current_dir.join(".npmrc")
-            } else {
-                rnpm_config::get_default_user_npmrc()
-            };
-
-            rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
+            commands::config::run_set(&key, Some(&value), global, location.as_deref(), &current_dir)?;
         }
-        Commands::Config { action } => match action {
-            ConfigAction::Set {
-                key,
-                value,
-                global,
-                location,
-            } => {
-                let target_path = if global || location.as_deref() == Some("global") {
-                    rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                        rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                    })
-                } else if location.as_deref() == Some("project") {
-                    current_dir.join(".npmrc")
-                } else if location.as_deref() == Some("user") {
-                    rnpm_config::get_default_user_npmrc()
-                } else if current_dir.join(".npmrc").exists() {
-                    current_dir.join(".npmrc")
-                } else {
-                    rnpm_config::get_default_user_npmrc()
-                };
-
-                rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
-            }
-            ConfigAction::Get { key } => {
-                if let Some(key_str) = key {
-                    let config = rnpm_config::Config::load(Some(&current_dir))?;
-                    if let Some(val) = config.get(&key_str) {
-                        println!("{val}");
-                    } else {
-                        println!("undefined");
-                    }
-                } else {
-                    let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                    let detailed = rnpm_config::Config::load_detailed(opts)?;
-                    print!("{}", detailed.format_text());
-                }
-            }
-            ConfigAction::Delete {
-                key,
-                global,
-                location,
-            } => {
-                let target_path = if global || location.as_deref() == Some("global") {
-                    rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                        rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                    })
-                } else if location.as_deref() == Some("project") {
-                    current_dir.join(".npmrc")
-                } else if location.as_deref() == Some("user") {
-                    rnpm_config::get_default_user_npmrc()
-                } else if current_dir.join(".npmrc").exists() {
-                    current_dir.join(".npmrc")
-                } else {
-                    rnpm_config::get_default_user_npmrc()
-                };
-
-                let _ = rnpm_config::delete_config_value_from_file(&target_path, &key)?;
-            }
-            ConfigAction::List { json } => {
-                let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                let detailed = rnpm_config::Config::load_detailed(opts)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&detailed.effective)?);
-                } else {
-                    print!("{}", detailed.format_text());
-                }
-            }
-        },
+        Commands::Config { action } => {
+            commands::config::run(action, current_dir)?;
+        }
         Commands::Link { package } => {
             let global_prefix = rnpm_config::find_global_prefix();
             match package {
