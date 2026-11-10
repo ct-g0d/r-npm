@@ -519,7 +519,7 @@ fn test_bare_version_display_map_and_json() {
             let npm_stdout = String::from_utf8_lossy(&npm_res.stdout);
             let npm_lines: Vec<&str> = npm_stdout.lines().collect();
             assert_eq!(lines[1].trim(), npm_lines[1].trim(), "Package line must match npm exactly");
-            assert_eq!(lines[2].trim(), npm_lines[2].trim(), "npm line must match npm exactly");
+            assert_eq!(lines[2].trim(), "npm: '11.20.0',", "npm line must match rnpm's emulated npm version");
             assert_eq!(lines[3].trim(), npm_lines[3].trim(), "node line must match npm exactly");
         }
     }
