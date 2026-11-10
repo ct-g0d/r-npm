@@ -143,6 +143,7 @@ async fn test_cli_update_command_integration() {
             strict_sandbox: false,
             legacy_peer_deps: false,
             strict_peer_deps: false,
+            json: false,
         },
     };
 
@@ -1392,6 +1393,7 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             prefix: None,
             wait_for_trash: false,
             detached_trash: true,
+            json: false,
         },
     };
 
