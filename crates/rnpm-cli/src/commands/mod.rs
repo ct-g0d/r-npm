@@ -22,3 +22,4 @@ pub mod dist_tag;
 pub mod owner;
 pub mod ping;
 pub mod whoami;
+pub mod publish;

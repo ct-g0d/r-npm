@@ -3298,7 +3298,7 @@ pub(crate) fn run_lifecycle_hook(
     Ok(())
 }
 
-async fn execute_publish(
+pub(crate) async fn execute_publish(
     current_dir: PathBuf,
     target: PathBuf,
     tag: String,
@@ -5838,17 +5838,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ignore_scripts,
             json,
         } => {
-            execute_publish(
+            commands::publish::run(
+                commands::publish::PublishArgs {
+                    target,
+                    tag,
+                    access,
+                    dry_run,
+                    otp,
+                    provenance,
+                    registry,
+                    ignore_scripts,
+                    json,
+                },
                 current_dir,
-                target,
-                tag,
-                access,
-                dry_run,
-                otp,
-                provenance,
-                registry,
-                ignore_scripts,
-                json,
             )
             .await?;
         }
