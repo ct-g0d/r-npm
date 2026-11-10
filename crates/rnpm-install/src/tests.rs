@@ -4130,3 +4130,37 @@ async fn test_stale_shim_removed_on_upgrade() {
         "stale tool2 POSIX shim must be removed"
     );
 }
+
+#[test]
+fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let nm = project_dir.join("node_modules").join("legacy-pkg");
+    fs::create_dir_all(&nm).unwrap();
+    let legacy_json = serde_json::json!({
+        "name": "legacy-pkg",
+        "version": "1.0.0",
+        "licenses": [
+            { "type": "MIT", "url": "http://example.com" }
+        ]
+    });
+    fs::write(nm.join("package.json"), serde_json::to_string(&legacy_json).unwrap()).unwrap();
+
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/legacy-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    crate::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir);
+
+    let pkg = lockfile.packages.get("node_modules/legacy-pkg").unwrap();
+    assert_eq!(
+        pkg.license, None,
+        "Deprecated licenses array must not synthesize a license field, matching npm 11"
+    );
+}
