@@ -2,6 +2,35 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+fn isolated_cmd(
+    bin: &str,
+    dir: &std::path::Path,
+    user_home: &std::path::Path,
+    global_prefix: &std::path::Path,
+) -> Command {
+    let appdata = user_home.join("AppData").join("Roaming");
+    let localappdata = user_home.join("AppData").join("Local");
+    let cache_dir = user_home.join(".npm-cache");
+    let user_npmrc = user_home.join(".npmrc");
+    let global_npmrc = global_prefix.join("etc").join("npmrc");
+    let _ = fs::create_dir_all(&appdata);
+    let _ = fs::create_dir_all(&localappdata);
+    let _ = fs::create_dir_all(global_prefix.join("etc"));
+
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(dir);
+    cmd.env("USERPROFILE", user_home);
+    cmd.env("HOME", user_home);
+    cmd.env("APPDATA", &appdata);
+    cmd.env("LOCALAPPDATA", &localappdata);
+    cmd.env("PREFIX", global_prefix);
+    cmd.env("NPM_CONFIG_PREFIX", global_prefix);
+    cmd.env("NPM_CONFIG_USERCONFIG", &user_npmrc);
+    cmd.env("NPM_CONFIG_GLOBALCONFIG", &global_npmrc);
+    cmd.env("NPM_CONFIG_CACHE", &cache_dir);
+    cmd
+}
+
 #[test]
 fn test_config_cli_set_get_delete_list() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
@@ -19,24 +48,14 @@ fn test_config_cli_set_get_delete_list() {
     fs::write(proj_dir.join("package.json"), pkg_json).unwrap();
 
     // 1. Config set in local/project .npmrc
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "set", "test-key", "test-value-123"])
         .output()
         .expect("config set failed");
     assert!(out.status.success());
 
     // 2. Config get
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "get", "test-key"])
         .output()
         .expect("config get failed");
@@ -45,24 +64,14 @@ fn test_config_cli_set_get_delete_list() {
     assert_eq!(stdout.trim(), "test-value-123");
 
     // 3. Config set --global
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "set", "global-key", "global-val-456", "--global"])
         .output()
         .expect("config set global failed");
     assert!(out.status.success());
 
     // Config get global
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "get", "global-key"])
         .output()
         .expect("config get global failed");
@@ -71,12 +80,7 @@ fn test_config_cli_set_get_delete_list() {
     assert_eq!(stdout.trim(), "global-val-456");
 
     // 4. Config list --json
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "list", "--json"])
         .output()
         .expect("config list --json failed");
@@ -86,12 +90,7 @@ fn test_config_cli_set_get_delete_list() {
     assert_eq!(json_val["global-key"], "global-val-456");
 
     // 5. Config list text format
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "list"])
         .output()
         .expect("config list failed");
@@ -102,23 +101,13 @@ fn test_config_cli_set_get_delete_list() {
     assert!(list_stdout.contains("npm global prefix ="));
 
     // 6. Config delete
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "delete", "test-key"])
         .output()
         .expect("config delete failed");
     assert!(out.status.success());
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "get", "test-key"])
         .output()
         .expect("config get deleted key failed");
@@ -127,23 +116,13 @@ fn test_config_cli_set_get_delete_list() {
     assert_eq!(stdout.trim(), "undefined");
 
     // 7. Config delete --global
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "delete", "global-key", "--global"])
         .output()
         .expect("config delete global failed");
     assert!(out.status.success());
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["config", "get", "global-key"])
         .output()
         .expect("config get deleted global key failed");
@@ -161,10 +140,7 @@ fn test_top_level_get_set_aliases() {
     let user_home = tmp.path().join("userhome");
     fs::create_dir_all(&user_home).unwrap();
 
-    let set = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
+    let set = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &proj_dir)
         .args(["set", "alias-key", "alias-value", "--location", "project"])
         .output()
         .unwrap();
@@ -174,10 +150,7 @@ fn test_top_level_get_set_aliases() {
         String::from_utf8_lossy(&set.stderr)
     );
 
-    let get = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("USERPROFILE", &user_home)
-        .env("HOME", &user_home)
+    let get = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &proj_dir)
         .args(["get", "alias-key"])
         .output()
         .unwrap();
@@ -197,14 +170,14 @@ fn test_prefix_root_bin_cli() {
     fs::create_dir_all(&proj_dir).unwrap();
     fs::write(proj_dir.join("package.json"), r#"{"name": "my-app"}"#).unwrap();
 
+    let user_home = tmp.path().join("userhome");
+    fs::create_dir_all(&user_home).unwrap();
+
     let global_prefix = tmp.path().join("global-pref");
     fs::create_dir_all(&global_prefix).unwrap();
 
     // 1. Local prefix, root, bin
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .arg("prefix")
         .output()
         .unwrap();
@@ -214,10 +187,7 @@ fn test_prefix_root_bin_cli() {
         proj_dir.to_string_lossy()
     );
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .arg("root")
         .output()
         .unwrap();
@@ -227,10 +197,7 @@ fn test_prefix_root_bin_cli() {
         proj_dir.join("node_modules").to_string_lossy()
     );
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .arg("bin")
         .output()
         .unwrap();
@@ -241,10 +208,7 @@ fn test_prefix_root_bin_cli() {
     );
 
     // 2. Global prefix, root, bin
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["prefix", "-g"])
         .output()
         .unwrap();
@@ -254,10 +218,7 @@ fn test_prefix_root_bin_cli() {
         global_prefix.to_string_lossy()
     );
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["root", "--global"])
         .output()
         .unwrap();
@@ -272,10 +233,7 @@ fn test_prefix_root_bin_cli() {
         expected_root.to_string_lossy()
     );
 
-    let out = Command::new(rnpm_bin)
-        .current_dir(&proj_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)
         .args(["bin", "-g"])
         .output()
         .unwrap();
@@ -296,6 +254,9 @@ fn test_link_and_unlink_cli() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
     let root = tmp.path();
+
+    let user_home = root.join("userhome");
+    fs::create_dir_all(&user_home).unwrap();
 
     let global_prefix = root.join("global-link-root");
     fs::create_dir_all(&global_prefix).unwrap();
@@ -321,10 +282,7 @@ fn test_link_and_unlink_cli() {
     .unwrap();
 
     // 2. npm link in pkg-source
-    let out = Command::new(rnpm_bin)
-        .current_dir(&pkg_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &pkg_dir, &user_home, &global_prefix)
         .arg("link")
         .output()
         .expect("npm link in source failed");
@@ -359,10 +317,7 @@ fn test_link_and_unlink_cli() {
     .unwrap();
 
     // 4. npm link my-cli-linked in consumer-app
-    let out = Command::new(rnpm_bin)
-        .current_dir(&consumer_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &consumer_dir, &user_home, &global_prefix)
         .args(["link", "my-cli-linked"])
         .output()
         .expect("npm link in consumer failed");
@@ -379,10 +334,7 @@ fn test_link_and_unlink_cli() {
     assert!(local_bin.join("my-cli-cmd").exists());
 
     // 5. npm unlink my-cli-linked in consumer-app
-    let out = Command::new(rnpm_bin)
-        .current_dir(&consumer_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &consumer_dir, &user_home, &global_prefix)
         .args(["unlink", "my-cli-linked"])
         .output()
         .expect("npm unlink in consumer failed");
@@ -394,10 +346,7 @@ fn test_link_and_unlink_cli() {
     assert!(!local_bin.join("my-cli-cmd").exists());
 
     // 6. npm unlink in pkg-source
-    let out = Command::new(rnpm_bin)
-        .current_dir(&pkg_dir)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, &pkg_dir, &user_home, &global_prefix)
         .arg("unlink")
         .output()
         .expect("npm unlink in source failed");
@@ -414,6 +363,9 @@ fn test_global_install_and_uninstall_cli() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
     let root = tmp.path();
+
+    let user_home = root.join("userhome");
+    fs::create_dir_all(&user_home).unwrap();
 
     let global_prefix = root.join("global-cli-env");
     fs::create_dir_all(&global_prefix).unwrap();
@@ -441,10 +393,7 @@ fn test_global_install_and_uninstall_cli() {
     let spec = format!("glob-cli-pkg@file:{}", tool_dir.display());
 
     // 2. rnpm install -g <pkg>
-    let out = Command::new(rnpm_bin)
-        .current_dir(root)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, root, &user_home, &global_prefix)
         .args(["install", "-g", &spec])
         .output()
         .expect("rnpm install -g failed");
@@ -473,10 +422,7 @@ fn test_global_install_and_uninstall_cli() {
     assert!(global_bin.join("glob-runner").exists());
 
     // 3. rnpm uninstall --global glob-cli-pkg
-    let out = Command::new(rnpm_bin)
-        .current_dir(root)
-        .env("PREFIX", &global_prefix)
-        .env("NPM_CONFIG_PREFIX", &global_prefix)
+    let out = isolated_cmd(rnpm_bin, root, &user_home, &global_prefix)
         .args(["uninstall", "--global", "glob-cli-pkg"])
         .output()
         .expect("rnpm uninstall --global failed");
