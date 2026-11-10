@@ -3896,7 +3896,7 @@ async fn execute_token(
     Ok(())
 }
 
-fn make_registry_client(
+pub(crate) fn make_registry_client(
     current_dir: &Path,
     registry: Option<String>,
 ) -> anyhow::Result<(Url, rnpm_registry::RegistryClient)> {
@@ -6172,30 +6172,18 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             no_description,
             registry,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let text = terms.join(" ");
-            let value = client
-                .search(Some(&registry_url), &text, search_limit, 0)
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
-                for item in objects {
-                    let p = item.get("package").unwrap_or(item);
-                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let version = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
-                    let description = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                    if parseable {
-                        println!("{name}\t{version}\t{description}");
-                    } else if no_description {
-                        println!("{name}@{version}");
-                    } else {
-                        println!("{name}@{version}\t{description}");
-                    }
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            commands::search::run(
+                commands::search::SearchArgs {
+                    terms,
+                    search_limit,
+                    json,
+                    parseable,
+                    no_description,
+                    registry,
+                },
+                current_dir,
+            )
+            .await?;
         }
         Commands::Stars {
             user,
