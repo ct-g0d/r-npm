@@ -543,6 +543,9 @@ async fn test_cli_exec_local_binary_success() {
             registry: None,
             cache: None,
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -582,6 +585,9 @@ async fn test_cli_exec_exit_code_fidelity() {
             registry: None,
             cache: None,
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -770,6 +776,9 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -951,6 +960,9 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -1088,6 +1100,9 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 

@@ -455,6 +455,18 @@ pub(crate) enum Commands {
         /// Offline mode (only use cache)
         #[arg(long)]
         offline: bool,
+
+        /// Target specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Target all workspace packages
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Pack project into a tarball archive
@@ -474,6 +486,14 @@ pub(crate) enum Commands {
         /// Directory where the tarball should be created
         #[arg(long)]
         pack_destination: Option<PathBuf>,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
     },
 
     /// Remove a package from project dependencies
@@ -791,6 +811,18 @@ pub(crate) enum Commands {
 
         #[arg(long = "json")]
         json: bool,
+
+        /// Target specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Target all workspace packages
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        include_workspace_root: bool,
     },
 
     /// List installed packages
@@ -834,6 +866,18 @@ pub(crate) enum Commands {
         /// Custom prefix directory
         #[arg(long = "prefix")]
         prefix: Option<PathBuf>,
+
+        /// Target specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Target all workspace packages
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Check for outdated packages
@@ -1529,7 +1573,7 @@ where
 
     let first = &args[1];
 
-    let unsupported_commands: [&str; 0] = [];
+    let unsupported_commands: [&str; 1] = ["definitely-unknown-command"];
 
     if unsupported_commands.contains(&first.as_str()) {
         return Some((
@@ -1964,210 +2008,81 @@ async fn execute_run(
 
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
-        let discovered =
-            rnpm_core::workspace::discover_workspaces_from_manifest(&current_dir, &manifest)
-                .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
-
-        if discovered.is_empty() {
-            return Err(anyhow::anyhow!(
-                "npm error code ENOWORKSPACES\nnpm error No workspaces found in {}",
-                current_dir.display()
-            ));
-        }
-
-        let graph = rnpm_solver::WorkspaceDependencyGraph::construct(&discovered)
-            .map_err(|e| anyhow::anyhow!("Workspace dependency graph error: {e}"))?;
-
-        let members: Vec<rnpm_lifecycle::WorkspaceScriptMember> = discovered
-            .into_iter()
-            .map(|m| rnpm_lifecycle::WorkspaceScriptMember {
-                name: m.name,
-                path: m.path,
-                manifest: m.manifest,
-            })
-            .collect();
-
-        let mut combined_filters = Vec::new();
-        combined_filters.extend(workspace);
-        combined_filters.extend(filter);
-        combined_filters.extend(scope);
-
-        let filter_opt = if combined_filters.is_empty() {
-            None
-        } else {
-            Some(combined_filters)
-        };
-
-        let ws_opts = rnpm_lifecycle::WorkspaceRunOptions {
-            script,
-            args,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            if_present,
-            filter_members: filter_opt,
-        };
-
-        let summary = rnpm_lifecycle::execute_workspace_scripts_topological(
-            &current_dir,
-            &members,
-            &graph.topological_order,
-            &ws_opts,
-        )
-        .await?;
-
-        println!(
-            "rnpm: executed script in {} workspace package(s) ({} skipped)",
-            summary.executed_packages.len(),
-            summary.skipped_packages.len()
-        );
-
-        if workspace_root {
-            if let Some(cmd) = manifest.scripts.get(&ws_opts.script) {
-                let full_cmd = if ws_opts.args.is_empty() {
-                    cmd.clone()
+        let mut filters = workspace;
+        filters.extend(filter);
+        filters.extend(scope);
+        let members = select_workspace_members(&current_dir, &filters, workspace_root)?;
+        let mut failed = false;
+        for member in members {
+            let result = execute_run_sync(
+                member.path.clone(), script.clone(), args.clone(), if_present,
+                ignore_scripts, foreground_scripts, strict_sandbox,
+            );
+            if let Err(err) = result {
+                if failed { eprintln!(); }
+                failed = true;
+                eprintln!("npm error Lifecycle script \x60{script}\x60 failed with error:");
+                if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+                    eprintln!("npm error code {}", exit.exit_code);
+                }
+                let id = member.manifest.version.as_ref()
+                    .map(|v| format!("{}@{v}", member.name)).unwrap_or_else(|| member.name.clone());
+                eprintln!("npm error workspace {id}");
+                eprintln!("npm error location {}", member.path.display());
+                if !member.manifest.scripts.contains_key(&script) {
+                    eprintln!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run --workspace={id}");
                 } else {
-                    let formatted_args: Vec<String> = ws_opts
-                        .args
-                        .iter()
-                        .map(|a| {
-                            if a.contains(' ') || a.contains('\t') || a.contains('"') {
-                                format!("\"{}\"", a.replace('"', "\\\""))
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-                    format!("{cmd} {}", formatted_args.join(" "))
-                };
-
-                let pkg_name = manifest
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "project".to_string());
-                let is_silent = rnpm_config::get_process_cli_overrides()
-                    .as_ref()
-                    .and_then(|m| m.get("loglevel"))
-                    .map(|s| s == "silent")
-                    .unwrap_or(false);
-                if !is_silent && !ignore_scripts {
-                    println!(
-                        "\n> {}@{} {} {}",
-                        pkg_name,
-                        manifest.version.as_deref().unwrap_or("0.0.0"),
-                        ws_opts.script,
-                        current_dir.display()
-                    );
-                    println!("> {full_cmd}\n");
+                    eprintln!("npm error command failed");
+                    eprintln!("npm error command {}", member.manifest.scripts[&script]);
                 }
-
-                let mut ctx = LifecycleContext::new(
-                    &current_dir,
-                    &current_dir,
-                    &pkg_name,
-                    &ws_opts.script,
-                    &full_cmd,
-                );
-                ctx.package_version = manifest.version.clone();
-
-                if !ignore_scripts {
-                    let status = execute_lifecycle_script(&ctx)?;
-                    if !status.success() {
-                        let code = rnpm_lifecycle::extract_exit_status_code(&status);
-                        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                            exit_code: code,
-                            message: format!(
-                                "Workspace root script '{}' failed with exit code: {}",
-                                ws_opts.script, code
-                            ),
-                        }));
-                    }
-                }
-            } else if !if_present && !has_filter {
-                return Err(anyhow::anyhow!(
-                    "npm error Missing script: \"{}\"\n\
-                     npm error\n\
-                     npm error To see a list of scripts, run:\n\
-                     npm error   npm run",
-                    ws_opts.script
-                ));
             }
         }
+        if failed {
+            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                exit_code: 1, message: format!("Workspace script '{script}' failed"),
+            }));
+        }
+        Ok(())
     } else {
-        let script_cmd = match manifest.scripts.get(&script) {
-            Some(cmd) => cmd,
-            None => {
-                if if_present {
-                    return Ok(());
-                }
-                return Err(anyhow::anyhow!(
-                    "npm error Missing script: \"{script}\"\n\
-                     npm error\n\
-                     npm error To see a list of scripts, run:\n\
-                     npm error   npm run"
-                ));
-            }
-        };
+        execute_run_sync(current_dir, script, args, if_present, ignore_scripts,
+            foreground_scripts, strict_sandbox)
+    }
+}
 
-        let full_cmd = if args.is_empty() {
-            script_cmd.clone()
-        } else {
-            let formatted_args: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    if a.contains(' ') || a.contains('\t') || a.contains('"') {
-                        format!("\"{}\"", a.replace('"', "\\\""))
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect();
-            format!("{script_cmd} {}", formatted_args.join(" "))
-        };
-
-        let pkg_name = manifest
-            .name
-            .clone()
-            .unwrap_or_else(|| "project".to_string());
-
-        let is_silent = rnpm_config::get_process_cli_overrides()
-            .as_ref()
-            .and_then(|m| m.get("loglevel"))
-            .map(|s| s == "silent")
-            .unwrap_or(false);
-        if !is_silent && !ignore_scripts {
-            let ver = manifest.version.as_deref().unwrap_or("1.0.0");
-            println!("\n> {pkg_name}@{ver} {script}");
-            println!("> {full_cmd}\n");
-        }
-
-        let mut ctx =
-            LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
-        ctx.package_version = manifest.version.clone();
-        ctx.foreground_scripts = foreground_scripts;
-        if foreground_scripts {
-            ctx.capture_output = false;
-        }
-        if strict_sandbox {
-            ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted();
-        }
-
-        if !ignore_scripts {
-            let status = execute_lifecycle_script(&ctx)?;
-            if !status.success() {
-                let code = rnpm_lifecycle::extract_exit_status_code(&status);
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: format!(
-                        "Lifecycle script '{}' failed with exit code: {}",
-                        script, code
-                    ),
-                }));
-            }
+fn select_workspace_members(
+    root: &Path,
+    filters: &[String],
+    include_root: bool,
+) -> anyhow::Result<Vec<rnpm_core::workspace::WorkspaceMember>> {
+    let mut members = rnpm_core::workspace::discover_workspaces(root)?;
+    if members.is_empty() {
+        anyhow::bail!("npm error code ENOWORKSPACES\nnpm error No workspaces found!");
+    }
+    for filter in filters {
+        if !members.iter().any(|m| rnpm_lifecycle::matches_filter(filter, &m.name, &m.path, root)) {
+            anyhow::bail!("npm error No workspaces found:\nnpm error   --workspace={filter}");
         }
     }
-
-    Ok(())
+    if let Ok(graph) = rnpm_solver::WorkspaceDependencyGraph::construct(&members) {
+        let order_map: std::collections::HashMap<&str, usize> = graph
+            .topological_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        members.sort_by_key(|m| order_map.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+    }
+    members.retain(|m| filters.is_empty() || filters.iter()
+        .any(|f| rnpm_lifecycle::matches_filter(f, &m.name, &m.path, root)));
+    if include_root {
+        let manifest = Manifest::from_file(root.join("package.json"))?;
+        members.insert(0, rnpm_core::workspace::WorkspaceMember {
+            name: manifest.name.clone().unwrap_or_default(),
+            version: manifest.version.clone(), path: root.to_path_buf(),
+            relative_path: String::new(), manifest,
+        });
+    }
+    Ok(members)
 }
 
 pub(crate) fn normalize_cli_args<I, T>(raw_args: I) -> Vec<String>
@@ -2474,6 +2389,33 @@ fn preprocess_exec_args(
             continue;
         }
         if token.starts_with("--registry=") || token.starts_with("--cache=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "-w" || token == "--workspace" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--workspace=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--workspaces" || token == "-ws" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--include-workspace-root" || token == "--workspace-root" {
             clap_flags.push(token.clone());
             i += 1;
             continue;
@@ -3283,24 +3225,36 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
     Ok(())
 }
 
-async fn run_publish_lifecycle_hook(
+fn run_lifecycle_hook(
     package_dir: &std::path::Path,
     manifest: &Manifest,
     hook_name: &str,
     ignore_scripts: bool,
+    foreground_scripts: bool,
+    is_silent: bool,
 ) -> anyhow::Result<()> {
     if ignore_scripts {
         return Ok(());
     }
 
     if let Some(script_cmd) = manifest.scripts.get(hook_name) {
-        let pkg_name = manifest
-            .name
-            .clone()
-            .unwrap_or_else(|| "package".to_string());
+        if !is_silent {
+            let id = match (&manifest.name, &manifest.version) {
+                (Some(name), Some(version)) => format!("{name}@{version}"),
+                (Some(name), None) => name.clone(),
+                _ => String::new(),
+            };
+            println!(
+                "\n> {}{hook_name}\n> {script_cmd}\n",
+                if id.is_empty() { id } else { format!("{id} ") }
+            );
+        }
         let mut ctx =
-            LifecycleContext::new(package_dir, package_dir, &pkg_name, hook_name, script_cmd);
+            LifecycleContext::new(package_dir, package_dir, manifest.name.as_deref().unwrap_or(""), hook_name, script_cmd);
         ctx.package_version = manifest.version.clone();
+        ctx.foreground_scripts = foreground_scripts;
+        ctx.capture_output = is_silent;
+        ctx.extra_env = lifecycle_config_env(package_dir);
         let status = execute_lifecycle_script(&ctx)?;
         if !status.success() {
             let code = rnpm_lifecycle::extract_exit_status_code(&status);
@@ -3395,11 +3349,18 @@ async fn execute_publish(
         }
     }
 
+    let is_silent = json
+        || rnpm_config::get_process_cli_overrides()
+            .as_ref()
+            .and_then(|o| o.get("loglevel"))
+            .map(|s| s == "silent")
+            .unwrap_or(false);
+
     // 1. prepublishOnly
-    run_publish_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts).await?;
+    run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, false, is_silent)?;
 
     // 2. prepack
-    run_publish_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts).await?;
+    run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, false, is_silent)?;
 
     let updated_manifest = Manifest::from_file(&manifest_path).unwrap_or_else(|_| manifest.clone());
     let updated_manifest_content =
@@ -3416,12 +3377,18 @@ async fn execute_publish(
     };
 
     // 4. postpack
-    run_publish_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts).await?;
+    run_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts, false, is_silent)?;
 
     if dry_run {
         if json {
-            let json_output = serde_json::json!({
-                "id": format!("{}@{}", summary.name, summary.version),
+            let id = format!("{}@{}", summary.name, summary.version);
+            let files_json = summary.files.iter().map(|f| serde_json::json!({
+                "path": f.path,
+                "size": f.size,
+                "mode": f.mode,
+            })).collect::<Vec<_>>();
+            let pkg_details = serde_json::json!({
+                "id": id,
                 "name": summary.name,
                 "version": summary.version,
                 "size": summary.package_size,
@@ -3429,24 +3396,30 @@ async fn execute_publish(
                 "shasum": summary.shasum,
                 "integrity": summary.integrity,
                 "filename": summary.filename,
-                "files": summary.files.iter().map(|f| serde_json::json!({
-                    "path": f.path,
-                    "size": f.size,
-                    "mode": f.mode,
-                })).collect::<Vec<_>>(),
+                "files": files_json,
                 "entryCount": summary.entry_count,
                 "bundled": summary.bundled,
-                "tag": tag,
-                "access": access.as_deref().or_else(|| {
-                    updated_manifest_json.get("publishConfig")
-                        .and_then(|c| c.get("access"))
-                        .and_then(|a| a.as_str())
-                }),
+            });
+            let json_output = serde_json::json!({
+                "id": id,
+                "name": summary.name,
+                "version": summary.version,
+                "size": summary.package_size,
+                "unpackedSize": summary.unpacked_size,
+                "shasum": summary.shasum,
+                "integrity": summary.integrity,
+                "filename": summary.filename,
+                "files": files_json,
+                "entryCount": summary.entry_count,
+                "bundled": summary.bundled,
                 "dryRun": true,
+                summary.name.clone(): pkg_details,
             });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else {
-            print_pack_notices(&summary);
+            if !is_silent {
+                print_pack_notices(&summary);
+            }
             if provenance {
                 eprintln!(
                     "npm notice provenance would be generated and verified in CI environment"
@@ -3458,7 +3431,7 @@ async fn execute_publish(
     }
 
     // 5. publish
-    run_publish_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts).await?;
+    run_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts, false, is_silent)?;
 
     let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
@@ -3534,27 +3507,29 @@ async fn execute_publish(
 
     if json {
         let json_output = serde_json::json!({
-            "id": format!("{}@{}", summary.name, summary.version),
-            "name": summary.name,
-            "version": summary.version,
-            "size": summary.package_size,
-            "unpackedSize": summary.unpacked_size,
-            "shasum": summary.shasum,
-            "integrity": summary.integrity,
-            "filename": summary.filename,
-            "files": summary.files.iter().map(|f| serde_json::json!({
-                "path": f.path,
-                "size": f.size,
-                "mode": f.mode,
-            })).collect::<Vec<_>>(),
-            "entryCount": summary.entry_count,
-            "bundled": summary.bundled,
-            "tag": tag,
-            "access": effective_access,
+            summary.name.clone(): {
+                "id": format!("{}@{}", summary.name, summary.version),
+                "name": summary.name,
+                "version": summary.version,
+                "size": summary.package_size,
+                "unpackedSize": summary.unpacked_size,
+                "shasum": summary.shasum,
+                "integrity": summary.integrity,
+                "filename": summary.filename,
+                "files": summary.files.iter().map(|f| serde_json::json!({
+                    "path": f.path,
+                    "size": f.size,
+                    "mode": f.mode,
+                })).collect::<Vec<_>>(),
+                "entryCount": summary.entry_count,
+                "bundled": summary.bundled,
+            }
         });
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else {
-        print_pack_notices(&summary);
+        if !is_silent {
+            print_pack_notices(&summary);
+        }
         if provenance {
             eprintln!("npm notice published with provenance attestations");
         }
@@ -3562,13 +3537,14 @@ async fn execute_publish(
     }
 
     // 6. postpublish
-    run_publish_lifecycle_hook(
+    run_lifecycle_hook(
         &package_dir,
         &updated_manifest,
         "postpublish",
         ignore_scripts,
-    )
-    .await?;
+        false,
+        is_silent,
+    )?;
 
     Ok(())
 }
@@ -5572,62 +5548,74 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             cache,
             offline,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
-            if let Some(cmd_str) = call {
-                let full_cmd = if args.is_empty() {
-                    cmd_str
-                } else {
-                    let formatted_args: Vec<String> = args
-                        .iter()
-                        .map(|a| {
-                            if a.contains(' ') || a.contains('\t') || a.contains('"') {
-                                format!("\"{}\"", a.replace('"', "\\\""))
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-                    format!("{cmd_str} {}", formatted_args.join(" "))
-                };
-                let ctx = LifecycleContext::new(
-                    &current_dir,
-                    &current_dir,
-                    "exec",
-                    "call",
-                    &full_cmd,
-                );
-                let status = execute_lifecycle_script(&ctx)?;
-                if !status.success() {
-                    let code = rnpm_lifecycle::extract_exit_status_code(&status);
-                    return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                        exit_code: code,
-                        message: format!("Process exited with status code: {}", code),
-                    }));
-                }
-                return Ok(());
-            }
-
-            let (target_command, target_args) = if package.is_empty() {
-                if !args.is_empty() {
-                    (args[0].clone(), args[1..].to_vec())
-                } else if packages.len() == 1 {
-                    (packages[0].clone(), vec![])
-                } else {
-                    (String::new(), vec![])
-                }
+            let has_ws = workspaces || !workspace.is_empty();
+            let targets: Vec<PathBuf> = if has_ws {
+                let members = select_workspace_members(&current_dir, &workspace, workspace_root)?;
+                members.into_iter().map(|m| m.path).collect()
             } else {
-                (package, args)
+                vec![current_dir.clone()]
             };
-            execute_exec(
-                &current_dir,
-                &target_command,
-                &packages,
-                &target_args,
-                registry,
-                cache,
-                offline,
-            )
-            .await?;
+
+            for target_dir in targets {
+                if let Some(cmd_str) = &call {
+                    let full_cmd = if args.is_empty() {
+                        cmd_str.clone()
+                    } else {
+                        let formatted_args: Vec<String> = args
+                            .iter()
+                            .map(|a| {
+                                if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                                    format!("\"{}\"", a.replace('"', "\\\""))
+                                } else {
+                                    a.clone()
+                                }
+                            })
+                            .collect();
+                        format!("{cmd_str} {}", formatted_args.join(" "))
+                    };
+                    let ctx = LifecycleContext::new(
+                        &target_dir,
+                        &target_dir,
+                        "exec",
+                        "call",
+                        &full_cmd,
+                    );
+                    let status = execute_lifecycle_script(&ctx)?;
+                    if !status.success() {
+                        let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                            exit_code: code,
+                            message: format!("Process exited with status code: {}", code),
+                        }));
+                    }
+                } else {
+                    let (target_command, target_args) = if package.is_empty() {
+                        if !args.is_empty() {
+                            (args[0].clone(), args[1..].to_vec())
+                        } else if packages.len() == 1 {
+                            (packages[0].clone(), vec![])
+                        } else {
+                            (String::new(), vec![])
+                        }
+                    } else {
+                        (package.clone(), args.clone())
+                    };
+                    execute_exec(
+                        &target_dir,
+                        &target_command,
+                        &packages,
+                        &target_args,
+                        registry.clone(),
+                        cache.clone(),
+                        offline,
+                    )
+                    .await?;
+                }
+            }
         }
         Commands::Init {
             initializer,
@@ -5668,6 +5656,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             dry_run,
             json,
             pack_destination,
+            ignore_scripts,
+            foreground_scripts,
         } => {
             let package_dir = if target.is_absolute() {
                 target
@@ -5678,10 +5668,26 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let manifest_path = package_dir.join("package.json");
             if !manifest_path.exists() {
                 return Err(anyhow::anyhow!(
-                    "code ENOENT: package.json not found in {}",
+                    "package.json not found in {}",
                     package_dir.display()
                 ));
             }
+
+            let manifest = Manifest::from_file(&manifest_path)?;
+            let config = rnpm_config::Config::load(Some(&package_dir)).ok();
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let effective_ignore = ignore_scripts
+                || cli_overrides.as_ref().and_then(|o| o.get("ignore-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
+                || config.as_ref().and_then(|c| c.get_bool("ignore-scripts")).unwrap_or(false);
+            let effective_foreground = foreground_scripts
+                || cli_overrides.as_ref().and_then(|o| o.get("foreground-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
+                || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(false);
+            let is_silent = json
+                || cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
+                || config.as_ref().and_then(|c| c.get("loglevel")).map(|s| s == "silent").unwrap_or(false);
+
+            run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent)?;
+            run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent)?;
 
             let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
                 Ok(res) => res,
@@ -5689,6 +5695,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     return Err(anyhow::anyhow!("pack failed: {e}"));
                 }
             };
+
+            run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent)?;
 
             let dest_dir = pack_destination.unwrap_or_else(|| current_dir.clone());
             let final_tarball_path = dest_dir.join(&summary.filename);
@@ -5724,7 +5732,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ]);
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
             } else {
-                print_pack_notices(&summary);
+                if !is_silent {
+                    print_pack_notices(&summary);
+                }
                 println!("{}", summary.filename);
             }
         }
@@ -6307,6 +6317,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             force,
             ignore_scripts,
             json,
+            workspace,
+            workspaces,
+            include_workspace_root,
         } => {
             let options = version::VersionOptions {
                 newversion,
@@ -6321,10 +6334,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 json,
             };
 
-            version::execute_version(&current_dir, options).await?;
+            let has_ws = workspaces || !workspace.is_empty();
+            if has_ws {
+                let members = select_workspace_members(&current_dir, &workspace, include_workspace_root)?;
+                for member in members {
+                    println!("{}", member.name);
+                    version::execute_version(&member.path, options.clone()).await?;
+                }
+            } else {
+                version::execute_version(&current_dir, options).await?;
+            }
         }
         Commands::List {
-            packages,
+            mut packages,
             depth,
             all,
             json,
@@ -6334,6 +6356,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             omit,
             global,
             prefix,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
             let is_global = global || prefix.is_some();
             let target_dir = if let Some(p) = prefix {
@@ -6354,19 +6379,21 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
 
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let ws_in_overrides = cli_overrides.as_ref().map(|o| {
+            let ws_in_overrides = workspaces || !workspace.is_empty() || cli_overrides.as_ref().map(|o| {
                 o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
                     || o.contains_key("workspace")
             }).unwrap_or(false);
             if ws_in_overrides {
-                let has_ws = if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
-                    content.contains("\"workspaces\"")
+                let ws_filters = if !workspace.is_empty() {
+                    workspace.clone()
+                } else if let Some(ref o) = cli_overrides {
+                    o.get("workspace").map(|w| vec![w.clone()]).unwrap_or_default()
                 } else {
-                    false
+                    Vec::new()
                 };
-                if !has_ws {
-                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", target_dir.display());
-                    std::process::exit(1);
+                select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
+                if packages.is_empty() && !ws_filters.is_empty() {
+                    packages.extend(ws_filters);
                 }
             }
 
@@ -7575,155 +7602,81 @@ fn execute_run_sync(
 ) -> anyhow::Result<()> {
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
-        return Err(anyhow::anyhow!(
-            "package.json not found in {}",
-            current_dir.display()
-        ));
+        return Err(anyhow::anyhow!("package.json not found in {}", current_dir.display()));
     }
-
-    #[derive(serde::Deserialize)]
-    struct FastManifest {
-        name: Option<String>,
-        version: Option<String>,
-        #[serde(default)]
-        scripts: std::collections::BTreeMap<String, String>,
-    }
-
-    let manifest_bytes = std::fs::read(&manifest_path)?;
-    let manifest: FastManifest = serde_json::from_slice(&manifest_bytes)?;
-
-    let script_cmd = match manifest.scripts.get(&script) {
-        Some(cmd) => cmd,
-        None => {
-            if if_present {
-                return Ok(());
-            }
-            return Err(anyhow::anyhow!(
-                "npm error Missing script: \"{script}\"\n\
-                 npm error\n\
-                 npm error To see a list of scripts, run:\n\
-                 npm error   npm run"
-            ));
-        }
-    };
-
-    let full_cmd = if args.is_empty() {
-        script_cmd.clone()
-    } else {
-        let formatted_args: Vec<String> = args
-            .iter()
-            .map(|a| {
-                if a.contains(' ') || a.contains('\t') || a.contains('"') {
-                    format!("\"{}\"", a.replace('"', "\\\""))
-                } else {
-                    a.clone()
-                }
-            })
-            .collect();
-        format!("{script_cmd} {}", formatted_args.join(" "))
-    };
-
-    let pkg_name = manifest
-        .name
-        .clone()
-        .unwrap_or_else(|| "project".to_string());
-
-    let is_silent = rnpm_config::get_process_cli_overrides()
-        .as_ref()
-        .and_then(|m| m.get("loglevel"))
-        .map(|s| s == "silent")
-        .unwrap_or(false);
-    if !is_silent && !ignore_scripts {
-        let ver = manifest.version.as_deref().unwrap_or("1.0.0");
-        println!("\n> {pkg_name}@{ver} {script}");
-        println!("> {full_cmd}\n");
-    }
-
-    let mut ctx =
-        LifecycleContext::new(&current_dir, &current_dir, &pkg_name, &script, &full_cmd);
-    ctx.package_version = manifest.version.clone();
-    ctx.foreground_scripts = foreground_scripts;
-    if foreground_scripts {
-        ctx.capture_output = false;
-    }
-    if strict_sandbox {
-        ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted();
-    }
-
-    if !ignore_scripts {
-        if strict_sandbox {
-            let status = execute_lifecycle_script(&ctx)?;
-            if !status.success() {
-                let code = rnpm_lifecycle::extract_exit_status_code(&status);
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: format!(
-                        "Lifecycle script '{}' failed with exit code: {}",
-                        script, code
-                    ),
-                }));
-            }
+    let mut manifest = Manifest::from_file(&manifest_path)?;
+    if !manifest.scripts.contains_key(&script) {
+        if script == "start" && current_dir.join("server.js").exists() {
+            manifest.scripts.insert("start".to_string(), "node server.js".to_string());
         } else {
-            #[cfg(windows)]
-            let mut cmd = {
-                use std::os::windows::process::CommandExt;
-                let mut c = std::process::Command::new("cmd.exe");
-                c.raw_arg(format!("/d /s /c {}", full_cmd));
-                c
-            };
-
-            #[cfg(not(windows))]
-            let mut cmd = {
-                let mut c = std::process::Command::new("/bin/sh");
-                c.arg("-c").arg(&full_cmd);
-                c
-            };
-
-            cmd.current_dir(&current_dir);
-            cmd.stdin(std::process::Stdio::inherit());
-            cmd.stdout(std::process::Stdio::inherit());
-            cmd.stderr(std::process::Stdio::inherit());
-
-            let node_exe = std::env::var("NODE").unwrap_or_else(|_| "node".to_string());
-            cmd.env("NODE", &node_exe);
-            cmd.env("npm_node_execpath", &node_exe);
-            let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm"));
-            cmd.env("npm_execpath", &current_exe);
-            cmd.env("INIT_CWD", &current_dir);
-            cmd.env("npm_lifecycle_event", &script);
-            cmd.env("npm_lifecycle_script", &full_cmd);
-            cmd.env("npm_package_name", &pkg_name);
-            if let Some(ref ver) = manifest.version {
-                cmd.env("npm_package_version", ver);
-            }
-            cmd.env("npm_package_json", &manifest_path);
-
-            let local_bin = current_dir.join("node_modules").join(".bin");
-            let sys_path = std::env::var("PATH").or_else(|_| std::env::var("Path")).unwrap_or_default();
-            let final_path = if local_bin.exists() {
-                format!("{};{}", local_bin.display(), sys_path)
-            } else {
-                sys_path
-            };
-            cmd.env("PATH", &final_path);
-            #[cfg(windows)]
-            cmd.env("Path", &final_path);
-
-            let status = cmd.status()?;
-            if !status.success() {
-                let code = status.code().unwrap_or(1);
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: format!(
-                        "Lifecycle script '{}' failed with exit code: {}",
-                        script, code
-                    ),
-                }));
-            }
+            if if_present { return Ok(()); }
+            anyhow::bail!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run");
         }
     }
-
+    let config = rnpm_config::Config::load(Some(&current_dir))?;
+    let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+    let foreground_scripts = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+    let is_silent = config.get("loglevel") == Some("silent");
+    let pre = format!("pre{script}");
+    let post = format!("post{script}");
+    for hook in [&pre, &script, &post] {
+        if ignore_scripts && hook != &script { continue; }
+        let Some(cmd) = manifest.scripts.get(hook) else { continue; };
+        let full_cmd = if hook == &script && !args.is_empty() {
+            let formatted: Vec<String> = args.iter().map(|arg| {
+                if arg.contains([' ', '\t', '"']) {
+                    format!("\"{}\"", arg.replace('"', "\\\""))
+                } else { arg.clone() }
+            }).collect();
+            format!("{cmd} {}", formatted.join(" "))
+        } else { cmd.clone() };
+        if !is_silent {
+            let id = match (&manifest.name, &manifest.version) {
+                (Some(name), Some(version)) => format!("{name}@{version}"),
+                (Some(name), None) => name.clone(),
+                _ => String::new(),
+            };
+            println!("\n> {}{hook}\n> {full_cmd}\n", if id.is_empty() { id } else { format!("{id} ") });
+        }
+        let mut ctx = LifecycleContext::new(
+            &current_dir, &current_dir, manifest.name.as_deref().unwrap_or(""), hook, &full_cmd,
+        );
+        ctx.package_version = manifest.version.clone();
+        ctx.foreground_scripts = foreground_scripts;
+        ctx.extra_env = lifecycle_config_env(&current_dir);
+        if ignore_scripts { ctx.extra_env.insert("npm_config_ignore_scripts".into(), "true".into()); }
+        if foreground_scripts { ctx.extra_env.insert("npm_config_foreground_scripts".into(), "true".into()); }
+        if strict_sandbox { ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted(); }
+        let status = execute_lifecycle_script(&ctx)?;
+        if !status.success() {
+            let code = rnpm_lifecycle::extract_exit_status_code(&status);
+            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                exit_code: code, message: format!("Lifecycle script '{hook}' failed with exit code: {code}"),
+            }));
+        }
+    }
     Ok(())
+}
+
+fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if let Ok(config) = rnpm_config::Config::load(Some(dir)) {
+        for (key, value) in config.npmrc.settings {
+            env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+        }
+    }
+    env
+}
+
+fn finish_cli_error(err: &anyhow::Error) -> ! {
+    if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+        std::process::exit(exit.exit_code);
+    }
+    let diagnostic = diagnostics::classify_error(err);
+    if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
+    else { print_structured_error(err); }
+    let missing_manifest = format!("{err:#}").contains("package.json not found");
+    std::process::exit(if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 });
 }
 
 fn main() {
@@ -7845,11 +7798,7 @@ fn main() {
                 effective_foreground,
                 effective_strict,
             ) {
-                if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
-                    std::process::exit(exit_err.exit_code);
-                }
-                eprintln!("{err:?}");
-                std::process::exit(1);
+                finish_cli_error(&err);
             }
             std::process::exit(0);
         }
@@ -7865,11 +7814,7 @@ fn main() {
             let rendered = e.render().to_string();
             if rendered.contains("unrecognized subcommand") {
                 let first_arg = filtered_args.get(1).cloned().unwrap_or_default();
-                eprintln!("npm error code ERR_UNSUPPORTED_COMMAND");
-                eprintln!(
-                    "npm error The command '{first_arg}' is not currently implemented in rnpm."
-                );
-                eprintln!("npm error See docs/compatibility-contract.md for the active compatibility surface.");
+                println!("Unknown command: \"{first_arg}\"\n\nTo see a list of supported npm commands, run:\n  npm help");
             } else {
                 eprintln!("{rendered}");
             }
@@ -7939,11 +7884,7 @@ fn main() {
                 effective_foreground,
                 effective_strict,
             ) {
-                if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
-                    std::process::exit(exit_err.exit_code);
-                }
-                eprintln!("{err:?}");
-                std::process::exit(1);
+                finish_cli_error(&err);
             }
             std::process::exit(0);
         }
@@ -7955,14 +7896,10 @@ fn main() {
         .expect("Failed to initialize async runtime");
 
     if let Err(err) = rt.block_on(run_cli(cli, None)) {
-        if let Some(exit_err) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
-            std::process::exit(exit_err.exit_code);
-        }
         if err.is::<audit::AuditThresholdError>() {
             std::process::exit(1);
         }
-        print_structured_error(&err);
-        std::process::exit(1);
+        finish_cli_error(&err);
     }
 }
 
