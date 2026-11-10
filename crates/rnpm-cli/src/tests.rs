@@ -2487,7 +2487,7 @@ fn test_thread5_cli_command_parsing() {
             },
         } => {
             assert_eq!(key, "foo");
-            assert_eq!(value, "bar");
+            assert_eq!(value.as_deref(), Some("bar"));
             assert!(!global);
         }
         _ => panic!("Expected Config Set"),
