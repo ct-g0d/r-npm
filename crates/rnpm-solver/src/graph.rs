@@ -351,10 +351,11 @@ impl DependencyGraph {
             queue.push_back(self.root_location.as_str());
 
             for (loc, node) in &self.nodes {
-                if !loc.is_empty() && (!loc.starts_with("node_modules/") || node.flags.link) {
-                    if reachable.insert(loc.clone()) {
-                        queue.push_back(loc.as_str());
-                    }
+                if !loc.is_empty()
+                    && (!loc.starts_with("node_modules/") || node.flags.link)
+                    && reachable.insert(loc.clone())
+                {
+                    queue.push_back(loc.as_str());
                 }
             }
 

@@ -643,7 +643,6 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 }
                 extra
             },
-            ..Default::default()
         };
         graph.nodes.insert(member_loc.clone(), member_node);
 
