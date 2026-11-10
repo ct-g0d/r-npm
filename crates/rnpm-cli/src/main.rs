@@ -5829,83 +5829,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             legacy_peer_deps,
             strict_peer_deps,
         } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-            let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
-
-            // update() reads a newly written lockfile to construct its summary.
-            // Dry runs instead use the install simulation with the same unlock set.
-            let dry_run = config.get_bool("dry-run").unwrap_or(false);
-            let mut unlocked_packages = std::collections::HashSet::new();
-            if dry_run {
-                if packages.is_empty() {
-                    let manifest = Manifest::from_file(current_dir.join("package.json"))?;
-                    unlocked_packages.extend(manifest.dependencies.into_keys());
-                    unlocked_packages.extend(manifest.dev_dependencies.into_keys());
-                    unlocked_packages.extend(manifest.optional_dependencies.into_keys());
-                } else {
-                    for package in &packages {
-                        let name = package.rsplit("node_modules/").next().unwrap_or(package);
-                        unlocked_packages.insert(rnpm_core::spec::PackageSpec::parse(name)?.name);
-                    }
-                }
-            }
-
-            let options = InstallOptions {
-                project_dir: current_dir,
-                registry_url: registry,
-                cache_dir: cache,
+            let opts = commands::update::UpdateOptions {
+                packages,
+                registry,
+                cache,
                 offline,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
                 legacy_peer_deps,
                 strict_peer_deps,
-                dry_run,
-                unlocked_packages,
-                ..Default::default()
+                silent,
             };
-
-            let mut installer = Installer::new(options)?;
-            if dry_run {
-                let summary = installer.run().await?;
-                if !silent {
-                    println!(
-                        "rnpm: dry-run: would install {} package(s)",
-                        summary.packages_installed
-                    );
-                }
-                return Ok(());
-            }
-            let summary = installer.update(&packages).await?;
-
-            if silent {
-                return Ok(());
-            } else if summary.packages_updated == 0 {
-                println!("rnpm: up to date");
-            } else {
-                for pkg in &summary.updated_packages {
-                    let old_v = summary
-                        .old_versions
-                        .get(pkg)
-                        .map(|s| s.as_str())
-                        .unwrap_or("none");
-                    let new_v = summary
-                        .new_versions
-                        .get(pkg)
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    println!("rnpm: updated {pkg} {old_v} -> {new_v}");
-                }
-                println!(
-                    "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
-                    summary.packages_updated, summary.cache_hits, summary.cache_misses
-                );
-            }
+            commands::update::run(opts, current_dir).await?;
         }
         Commands::Prune {
             omit,
