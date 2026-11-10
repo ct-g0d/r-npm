@@ -488,8 +488,11 @@ pub fn build_dependency_tree(
         }
         if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m) {
             for member in members {
-                let ver_req = member.version.clone().unwrap_or_else(|| "*".to_string());
-                direct_deps.insert(member.name.clone(), (ver_req, "prod", false));
+                let expected_loc = format!("node_modules/{}", member.name);
+                if disk_packages.contains_key(&expected_loc) {
+                    let ver_req = member.version.clone().unwrap_or_else(|| "*".to_string());
+                    direct_deps.insert(member.name.clone(), (ver_req, "prod", false));
+                }
             }
         }
     } else if options.is_global {
