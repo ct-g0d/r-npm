@@ -8,10 +8,13 @@ pub mod atomic;
 pub mod block_clone;
 pub mod error;
 pub mod junction;
+pub mod node_writer;
 pub mod parallel;
 pub mod path;
 pub mod tarball;
 pub mod writer;
+
+pub use node_writer::{NodeWriter, NodeWriterMsg};
 
 pub use atomic::{extract_and_replace, recover_atomic_writes, replace_dir_with_retries};
 pub use block_clone::{

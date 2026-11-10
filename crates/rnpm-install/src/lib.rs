@@ -4326,6 +4326,13 @@ impl Installer {
                 }));
             }
 
+            let node_writer = if rnpm_fs::NodeWriter::is_available() {
+                rnpm_fs::NodeWriter::spawn().ok()
+            } else {
+                None
+            };
+            let node_sender = node_writer.as_ref().map(|nw| nw.sender());
+
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
                 let sem = Arc::clone(&semaphore);
                 let cpu_sem = Arc::clone(&cpu_semaphore);
@@ -4340,6 +4347,7 @@ impl Installer {
                 let resolved_url = resolved_url.clone();
                 let integrity_str = integrity_str.clone();
                 let is_optional = *is_optional;
+                let node_sender_clone = node_sender.clone();
 
                 join_set.spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -4508,26 +4516,37 @@ impl Installer {
 
                         let dir_refs: Vec<&Path> = decoded.dirs.iter().map(|p| p.as_path()).collect();
                         let _ = rnpm_fs::writer::precreate_directories(dir_refs);
-                        for file in &decoded.files {
-                            let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
-                        }
-                        for (link_path, target_path) in &decoded.symlinks {
-                            let _ = rnpm_fs::create_link_or_copy(link_path, target_path);
-                        }
 
                         let populate_cas = idx < 5;
                         if !integrity_str.is_empty() {
                             let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, populate_cas);
                         }
-                        Ok::<rnpm_cache::DecodedPackage, anyhow::Error>(decoded)
+
+                        if let Some(ref sender) = node_sender_clone {
+                            for file in decoded.files {
+                                rnpm_fs::record_file_created(file.data.len() as u64);
+                                let _ = sender.send(rnpm_fs::NodeWriterMsg::File {
+                                    path: file.path.to_string_lossy().to_string(),
+                                    data: file.data,
+                                });
+                            }
+                        } else {
+                            for file in &decoded.files {
+                                let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
+                            }
+                        }
+                        for (link_path, target_path) in &decoded.symlinks {
+                            let _ = rnpm_fs::create_link_or_copy(link_path, target_path);
+                        }
+                        Ok::<(), anyhow::Error>(())
                     })
                     .await
                     .map_err(|e| anyhow!("pack worker panicked: {e}"))?;
 
                     match pack_res {
-                        Ok(decoded) => {
+                        Ok(()) => {
                             worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                            Ok(Some((idx, was_hit, pkg_key, decoded, to_cache)))
+                            Ok(Some((idx, was_hit, to_cache)))
                         }
                         Err(e) => {
                             if is_optional {
@@ -4544,7 +4563,7 @@ impl Installer {
             while let Some(join_res) = join_set.join_next().await {
                 let item_opt =
                     join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
-                if let Some((idx, was_hit, _pkg_k, _decoded, blob_opt)) = item_opt {
+                if let Some((idx, was_hit, blob_opt)) = item_opt {
                     missing_pack_results.insert(idx, was_hit);
                     if let Some(blob) = blob_opt {
                         let _ = blob_tx.send(blob);
@@ -4557,6 +4576,15 @@ impl Installer {
             for h in blob_handles {
                 let _ = h.join();
             }
+
+            if let Some(nw) = node_writer {
+                let t_nw = std::time::Instant::now();
+                nw.finish().map_err(|e| anyhow!("NodeWriter failed: {e}"))?;
+                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                    eprintln!("[TIMING_PROFILE] node_writer finish: {:.2}s", t_nw.elapsed().as_secs_f64());
+                }
+            }
+
             if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
                 eprintln!("[TIMING_PROFILE] blob_handles join: {:.2}s, total missing_packs: {:.2}s", t_blobs.elapsed().as_secs_f64(), t_missing_start.elapsed().as_secs_f64());
             }
