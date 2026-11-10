@@ -229,18 +229,13 @@ pub struct Cache {
     root: PathBuf,
     lock_timeout: Duration,
     stale_threshold: Duration,
-    has_content: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Cache {
     /// Initialize a cache instance at the given root directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        let content_sha512 = root.join("content-v2").join("sha512");
-        let initial_has_content = fs::read_dir(&content_sha512)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        fs::create_dir_all(&content_sha512)?;
+        fs::create_dir_all(root.join("content-v2").join("sha512"))?;
         fs::create_dir_all(root.join("index-v5"))?;
         fs::create_dir_all(root.join("tmp"))?;
         fs::create_dir_all(root.join("locks"))?;
@@ -248,7 +243,6 @@ impl Cache {
             root,
             lock_timeout: CacheLock::DEFAULT_TIMEOUT,
             stale_threshold: CacheLock::DEFAULT_STALE_THRESHOLD,
-            has_content: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(initial_has_content)),
         })
     }
 
@@ -461,7 +455,6 @@ impl Cache {
             let _ = remove_file_with_retries(&temp_path);
             return Err(CacheError::Io(err));
         }
-        self.has_content.store(true, std::sync::atomic::Ordering::Release);
         debug!("Atomically stored blob {}", target_path.display());
 
         Ok(sha512_hex)
@@ -471,14 +464,12 @@ impl Cache {
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let target_path = self.blob_path(sha512_hex);
         if target_path.exists() {
-            self.has_content.store(true, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
         if let Some(parent) = target_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let _ = rnpm_fs::write_file_fast(&target_path, data, 0o644, 0);
-        self.has_content.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1033,16 +1024,6 @@ impl Cache {
     /// Retrieve a blob by its SSRI Integrity descriptor.
     /// If corrupted, auto-purges the corrupt blob, logs a diagnostic, and returns `Ok(None)` for clean re-fetching.
     pub fn get_by_integrity(&self, integrity: &Integrity) -> Result<Option<Vec<u8>>, CacheError> {
-        if !self.has_content.load(std::sync::atomic::Ordering::Acquire) {
-            let content_v2 = self.root.join("content-v2");
-            let any_entry = fs::read_dir(&content_v2)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-            if !any_entry {
-                return Ok(None);
-            }
-            self.has_content.store(true, std::sync::atomic::Ordering::Release);
-        }
         let mut sorted_entries = integrity.entries.clone();
         sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
 
