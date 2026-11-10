@@ -24,7 +24,9 @@ param(
         "real-optional-platform",
         "real-peer-conflicts",
         "real-lifecycle-scripts",
-        "real-bundled-deps"
+        "real-bundled-deps",
+        "project-486",
+        "real-angular-cli"
     ),
     [switch]$KeepTemp = $false,
     [string]$NewPkg = "is-sorted@1.0.2",
@@ -82,26 +84,49 @@ function walk(dir, base, map) {
     for (const e of entries) {
         if (e.name.startsWith('.rnpm')) continue;
         const full = path.join(dir, e.name);
-        const rel = path.relative(base, full).replace(/\\/g, '/');
         if (e.isDirectory()) {
             walk(full, base, map);
         } else if (e.isFile()) {
-            const buf = fs.readFileSync(full);
-            map[rel] = crypto.createHash('sha256').update(buf).digest('hex');
+            const rel = path.relative(base, full).replace(/\\/g, '/');
+            const stat = fs.statSync(full);
+            map.set(rel, stat.size);
         }
     }
 }
 
-const mapA = {}, mapB = {};
+const mapA = new Map(), mapB = new Map();
 walk(process.argv[1], process.argv[1], mapA);
 walk(process.argv[2], process.argv[2], mapB);
 
-const missingInB = Object.keys(mapA).filter(k => !(k in mapB));
-const missingInA = Object.keys(mapB).filter(k => !(k in mapA));
-const hashMismatches = Object.keys(mapA).filter(k => (k in mapB) && mapA[k] !== mapB[k]);
+const missingInB = [];
+const missingInA = [];
+const hashMismatches = [];
 
-const countA = Object.keys(mapA).length;
-const countB = Object.keys(mapB).length;
+for (const [k, sizeA] of mapA) {
+    if (!mapB.has(k)) {
+        missingInB.push(k);
+    } else {
+        const sizeB = mapB.get(k);
+        if (sizeA !== sizeB) {
+            hashMismatches.push(k);
+        } else {
+            const bufA = fs.readFileSync(path.join(process.argv[1], k));
+            const bufB = fs.readFileSync(path.join(process.argv[2], k));
+            if (!bufA.equals(bufB)) {
+                hashMismatches.push(k);
+            }
+        }
+    }
+}
+
+for (const k of mapB.keys()) {
+    if (!mapA.has(k)) {
+        missingInA.push(k);
+    }
+}
+
+const countA = mapA.size;
+const countB = mapB.size;
 const identical = missingInB.length === 0 && missingInA.length === 0 && hashMismatches.length === 0;
 
 console.log(JSON.stringify({
@@ -301,6 +326,9 @@ foreach ($fixtureName in $Fixtures) {
             Write-Host "    CI Mismatch details:" -ForegroundColor Red
             Write-Host "      Exit codes: npm=$ciNpmExit, rnpm=$ciRnpmExit (Match: $ciExitMatch)" -ForegroundColor Yellow
             Write-Host "      node_modules: $($ciTreeCmp.Reason)" -ForegroundColor Yellow
+            if ($ciTreeCmp.MissingInRnpm) { Write-Host "        Missing in rnpm: $($ciTreeCmp.MissingInRnpm -join ', ')" -ForegroundColor DarkYellow }
+            if ($ciTreeCmp.MissingInNpm) { Write-Host "        Missing in npm: $($ciTreeCmp.MissingInNpm -join ', ')" -ForegroundColor DarkYellow }
+            if ($ciTreeCmp.HashMismatches) { Write-Host "        Hash mismatches: $($ciTreeCmp.HashMismatches -join ', ')" -ForegroundColor DarkYellow }
             Write-Host "      .bin:         $($ciBinCmp.Reason)" -ForegroundColor Yellow
             Write-Host "      lockfile:     $($ciLockCmp.Reason)" -ForegroundColor Yellow
             Write-Host "      package.json: $($ciPkgCmp.Reason)" -ForegroundColor Yellow
@@ -339,6 +367,9 @@ foreach ($fixtureName in $Fixtures) {
         if (-not $stepInstallPass) {
             Write-Host "    Install Mismatch details:" -ForegroundColor Red
             Write-Host "      Exit codes: npm=$installNpmExit, rnpm=$installRnpmExit (Match: $instExitMatch)" -ForegroundColor Yellow
+            if ($installRnpmExit -ne 0) {
+                Write-Host "      rnpm install output: $installRnpmOut" -ForegroundColor DarkRed
+            }
             Write-Host "      node_modules: $($instTreeCmp.Reason)" -ForegroundColor Yellow
             Write-Host "      .bin:         $($instBinCmp.Reason)" -ForegroundColor Yellow
             Write-Host "      lockfile:     $($instLockCmp.Reason)" -ForegroundColor Yellow
@@ -454,7 +485,10 @@ foreach ($fixtureName in $Fixtures) {
 
     } finally {
         if (-not $KeepTemp) {
-            Remove-Item $tempBase -Recurse -Force -ErrorAction SilentlyContinue
+            cmd.exe /c "rd /s /q `"$tempBase`"" 2>$null
+            if (Test-Path $tempBase) {
+                Remove-Item $tempBase -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
