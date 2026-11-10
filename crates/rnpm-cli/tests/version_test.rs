@@ -503,21 +503,26 @@ fn test_bare_version_display_map_and_json() {
         .unwrap();
     assert!(out.status.success(), "Bare version failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("sample-bare-app': '3.2.1'"),
-        "Output should contain package name and version: {}",
-        stdout
-    );
-    assert!(
-        stdout.contains("npm: '11.20.0'"),
-        "Output should contain npm version: {}",
-        stdout
-    );
-    assert!(
-        stdout.contains("node: '"),
-        "Output should contain node version: {}",
-        stdout
-    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 4, "Must have opening brace, at least 3 entries, and closing brace");
+    assert!(lines[1].contains("'sample-bare-app': '3.2.1'"), "First entry must be package name/version: {}", lines[1]);
+    assert!(lines[2].contains("npm: '11.20.0'"), "Second entry must be npm version: {}", lines[2]);
+    assert!(lines[3].contains("node: '"), "Third entry must be node version: {}", lines[3]);
+
+    // Compare directly against npm version if available
+    let npm_out = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "version"])
+        .current_dir(project_dir)
+        .output();
+    if let Ok(npm_res) = npm_out {
+        if npm_res.status.success() {
+            let npm_stdout = String::from_utf8_lossy(&npm_res.stdout);
+            let npm_lines: Vec<&str> = npm_stdout.lines().collect();
+            assert_eq!(lines[1].trim(), npm_lines[1].trim(), "Package line must match npm exactly");
+            assert_eq!(lines[2].trim(), npm_lines[2].trim(), "npm line must match npm exactly");
+            assert_eq!(lines[3].trim(), npm_lines[3].trim(), "node line must match npm exactly");
+        }
+    }
 
     // 2. Bare rnpm version --json
     let out_json = Command::new(rnpm_bin())
@@ -535,6 +540,11 @@ fn test_bare_version_display_map_and_json() {
     assert_eq!(parsed["sample-bare-app"], "3.2.1");
     assert_eq!(parsed["npm"], "11.20.0");
     assert!(parsed.get("node").is_some());
+
+    let json_keys: Vec<&str> = parsed.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    assert_eq!(json_keys[0], "sample-bare-app", "First JSON key must be package name");
+    assert_eq!(json_keys[1], "npm", "Second JSON key must be npm");
+    assert_eq!(json_keys[2], "node", "Third JSON key must be node");
 }
 
 #[test]
