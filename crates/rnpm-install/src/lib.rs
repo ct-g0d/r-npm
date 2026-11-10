@@ -1115,6 +1115,13 @@ pub(crate) fn clean_empty_bin_dirs(root_nm: &Path) {
         }
     }
     visit(root_nm, true);
+    if root_nm.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(root_nm) {
+            if entries.next().is_none() {
+                let _ = std::fs::remove_dir(root_nm);
+            }
+        }
+    }
 }
 
 /// Cleans up a specific `.bin` directory if it exists and is empty.
@@ -1455,6 +1462,7 @@ pub struct InstallOptions {
     pub package_lock: bool,
     pub no_package_lock: bool,
     pub dry_run: bool,
+    pub silent: bool,
     pub os: Option<String>,
     pub cpu: Option<String>,
     pub libc: Option<String>,
@@ -1534,6 +1542,7 @@ impl Default for InstallOptions {
             package_lock: true,
             no_package_lock: false,
             dry_run: false,
+            silent: false,
             os: None,
             cpu: None,
             libc: None,
@@ -2118,13 +2127,27 @@ impl Installer {
                 PackageTarget::Version(v) => v.to_string(),
                 PackageTarget::File(p) => {
                     let rel = if p.is_absolute() {
-                        rnpm_shim::path::compute_relative_path(&self.options.project_dir, p)
-                            .unwrap_or_else(|_| rnpm_core::to_posix_path(&p.to_string_lossy()))
+                        let rel_res = rnpm_shim::path::compute_relative_path(&self.options.project_dir, p);
+                        match rel_res {
+                            Ok(r) => r,
+                            Err(_) => {
+                                if let (Ok(cp), Ok(ct)) = (
+                                    std::fs::canonicalize(&self.options.project_dir),
+                                    std::fs::canonicalize(p),
+                                ) {
+                                    rnpm_shim::path::compute_relative_path(&cp, &ct)
+                                        .unwrap_or_else(|_| rnpm_core::to_posix_path(&p.to_string_lossy()))
+                                } else {
+                                    rnpm_core::to_posix_path(&p.to_string_lossy())
+                                }
+                            }
+                        }
                     } else {
                         rnpm_core::to_posix_path(&p.to_string_lossy())
                     };
-                    spec.target = PackageTarget::File(PathBuf::from(&rel));
-                    format!("file:{rel}")
+                    let clean_rel = rel.strip_prefix("./").unwrap_or(&rel).to_string();
+                    spec.target = PackageTarget::File(PathBuf::from(&clean_rel));
+                    format!("file:{clean_rel}")
                 }
                 PackageTarget::Git { url, committish } => {
                     format!(
@@ -2497,7 +2520,7 @@ impl Installer {
                     &workspace_members,
                     &targeted_workspace_indices,
                 )?;
-            } else if self.options.dry_run {
+            } else if self.options.dry_run && !self.options.silent {
                 for added in &added_pkgs {
                     println!("rnpm: would add {} to package.json", added.name);
                 }
@@ -2673,10 +2696,12 @@ impl Installer {
                         continue;
                     }
                 }
-                println!(
-                    "rnpm: would install {}@{} at {}",
-                    node.name, node.version, loc
-                );
+                if !self.options.silent {
+                    println!(
+                        "rnpm: would install {}@{} at {}",
+                        node.name, node.version, loc
+                    );
+                }
                 packages_installed += 1;
             }
 
@@ -3747,9 +3772,17 @@ impl Installer {
             }
 
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
-            lockfile
-                .save_hidden(&loc_base_dir)
-                .context("Failed to save hidden package-lock.json")?;
+            let has_packages = graph.nodes.keys().any(|k| !k.is_empty());
+            if has_packages {
+                lockfile
+                    .save_hidden(&loc_base_dir)
+                    .context("Failed to save hidden package-lock.json")?;
+            } else {
+                let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");
+                if hidden_path.exists() {
+                    let _ = std::fs::remove_file(&hidden_path);
+                }
+            }
         }
 
         if !self.options.dry_run && !self.options.package_lock_only {
@@ -4053,7 +4086,9 @@ impl Installer {
                 if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
                     continue;
                 }
-                println!("rnpm: would install {}", pkg_key);
+                if !self.options.silent {
+                    println!("rnpm: would install {}", pkg_key);
+                }
                 packages_installed += 1;
             }
             return Ok(InstallSummary {
@@ -5120,7 +5155,8 @@ impl Installer {
         }
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
-        if self.options.package_lock_enabled() && !self.options.dry_run {
+        let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
+        if self.options.package_lock_enabled() && !self.options.dry_run && has_packages {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             lockfile
                 .save_hidden(&self.options.project_dir)

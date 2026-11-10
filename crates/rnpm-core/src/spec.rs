@@ -40,8 +40,8 @@ impl PackageTarget {
         }
 
         // file: specifier
-        if let Some(path_str) = s.strip_prefix("file:") {
-            return Ok(PackageTarget::File(path_clean::clean(path_str)));
+        if s.starts_with("file:") {
+            return Ok(PackageTarget::File(parse_file_path(s)));
         }
 
         // npm: alias specifier (e.g. npm:foo@^1.0.0 or npm:@scope/foo@~2.0.0)
@@ -273,9 +273,9 @@ impl PackageSpec {
             });
         }
 
-        // Direct "file:" specifier without name (e.g. "file:../foo")
-        if let Some(path_str) = trimmed.strip_prefix("file:") {
-            let path = path_clean::clean(path_str);
+        // Direct "file:" specifier without name (e.g. "file:../foo", "file:///abs")
+        if trimmed.starts_with("file:") {
+            let path = parse_file_path(trimmed);
             let name = extract_path_package_name(&path);
             return Ok(Self {
                 name,
@@ -496,4 +496,35 @@ fn extract_url_package_name(url_str: &str) -> String {
         }
     }
     "unnamed".to_string()
+}
+
+/// Normalizes a `file:` path or URL specifier (e.g. `file:./x`, `file:x`, `file:../x`, `file:///abs`, `file://localhost/...`).
+pub fn parse_file_path(spec: &str) -> std::path::PathBuf {
+    if let Ok(url) = Url::parse(spec) {
+        if url.scheme() == "file" {
+            if let Ok(file_path) = url.to_file_path() {
+                return path_clean::clean(file_path);
+            }
+        }
+    }
+
+    let path_str = spec.strip_prefix("file:").unwrap_or(spec);
+
+    if path_str.starts_with("///") || path_str.starts_with("//") {
+        let trimmed = path_str.trim_start_matches('/');
+        #[cfg(windows)]
+        {
+            if trimmed.len() > 1 && trimmed.as_bytes()[1] == b':' {
+                return path_clean::clean(trimmed);
+            }
+        }
+        return path_clean::clean(format!("/{trimmed}"));
+    }
+
+    let cleaned = path_clean::clean(path_str);
+    if let Ok(stripped) = cleaned.strip_prefix(".") {
+        stripped.to_path_buf()
+    } else {
+        cleaned
+    }
 }
