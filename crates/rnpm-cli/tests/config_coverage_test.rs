@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -58,3 +59,133 @@ fn test_config_lifecycle() {
         .expect("verify get failed");
     assert_eq!(String::from_utf8_lossy(&verify_get.stdout).trim(), "undefined");
 }
+
+fn normalize_output(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .lines()
+        .filter(|line| !line.contains("A complete log of this run can be found in:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn test_config_get_set_delete_live_npm_parity() {
+    let tmp_rnpm = tempdir().unwrap();
+    let tmp_npm = tempdir().unwrap();
+
+    let iso_rnpm = tmp_rnpm.path().join("iso");
+    let iso_npm = tmp_npm.path().join("iso");
+    fs::create_dir_all(&iso_rnpm).unwrap();
+    fs::create_dir_all(&iso_npm).unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    // Test 1: config get registry (default)
+    let rnpm_get_reg = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .env("USERCONFIG", iso_rnpm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
+        .env("CACHE", iso_rnpm.join("cache"))
+        .env("APPDATA", iso_rnpm.join("appdata"))
+        .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
+        .args(["config", "get", "registry"])
+        .output()
+        .expect("rnpm config get registry failed");
+
+    let npm_get_reg = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "config", "get", "registry"])
+        .current_dir(tmp_npm.path())
+        .env("USERCONFIG", iso_npm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
+        .env("CACHE", iso_npm.join("cache"))
+        .env("APPDATA", iso_npm.join("appdata"))
+        .env("LOCALAPPDATA", iso_npm.join("localappdata"))
+        .output();
+
+    if let Ok(npm_res) = npm_get_reg {
+        if npm_res.status.success() {
+            assert_eq!(rnpm_get_reg.status.code(), npm_res.status.code());
+            assert_eq!(
+                normalize_output(&String::from_utf8_lossy(&rnpm_get_reg.stdout)),
+                normalize_output(&String::from_utf8_lossy(&npm_res.stdout))
+            );
+            assert_eq!(
+                normalize_output(&String::from_utf8_lossy(&rnpm_get_reg.stderr)),
+                normalize_output(&String::from_utf8_lossy(&npm_res.stderr))
+            );
+        }
+    }
+
+    // Test 2: config set custom_key=custom_val
+    let rnpm_set = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .env("USERCONFIG", iso_rnpm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
+        .env("CACHE", iso_rnpm.join("cache"))
+        .env("APPDATA", iso_rnpm.join("appdata"))
+        .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
+        .args(["config", "set", "custom_key=custom_val"])
+        .output()
+        .expect("rnpm config set failed");
+
+    let npm_set = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "config", "set", "custom_key=custom_val"])
+        .current_dir(tmp_npm.path())
+        .env("USERCONFIG", iso_npm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
+        .env("CACHE", iso_npm.join("cache"))
+        .env("APPDATA", iso_npm.join("appdata"))
+        .env("LOCALAPPDATA", iso_npm.join("localappdata"))
+        .output();
+
+    if let Ok(npm_res) = npm_set {
+        if npm_res.status.success() {
+            assert_eq!(rnpm_set.status.code(), npm_res.status.code());
+            assert_eq!(
+                normalize_output(&String::from_utf8_lossy(&rnpm_set.stdout)),
+                normalize_output(&String::from_utf8_lossy(&npm_res.stdout))
+            );
+        }
+    }
+
+    // Test 3: config get custom_key
+    let rnpm_get_custom = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .env("USERCONFIG", iso_rnpm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
+        .env("CACHE", iso_rnpm.join("cache"))
+        .env("APPDATA", iso_rnpm.join("appdata"))
+        .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
+        .args(["config", "get", "custom_key"])
+        .output()
+        .expect("rnpm config get custom_key failed");
+
+    let npm_get_custom = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "config", "get", "custom_key"])
+        .current_dir(tmp_npm.path())
+        .env("USERCONFIG", iso_npm.join(".npmrc"))
+        .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
+        .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
+        .env("CACHE", iso_npm.join("cache"))
+        .env("APPDATA", iso_npm.join("appdata"))
+        .env("LOCALAPPDATA", iso_npm.join("localappdata"))
+        .output();
+
+    if let Ok(npm_res) = npm_get_custom {
+        if npm_res.status.success() {
+            assert_eq!(rnpm_get_custom.status.code(), npm_res.status.code());
+            assert_eq!(
+                normalize_output(&String::from_utf8_lossy(&rnpm_get_custom.stdout)),
+                normalize_output(&String::from_utf8_lossy(&npm_res.stdout))
+            );
+        }
+    }
+}
+
