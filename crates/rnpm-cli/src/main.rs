@@ -3924,46 +3924,6 @@ pub(crate) fn make_registry_client(
     ))
 }
 
-async fn execute_dist_tag(
-    current_dir: &Path,
-    action: DistTagAction,
-    registry: Option<String>,
-    json: bool,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    match action {
-        DistTagAction::Ls { package } => {
-            let package = package.unwrap_or(package_name_from_manifest(current_dir)?);
-            let value = client.dist_tags(Some(&registry_url), &package).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(tags) = value.as_object() {
-                for (tag, version) in tags {
-                    println!("{tag}: {version}");
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-        }
-        DistTagAction::Add { package, tag } => {
-            let (name, version) = split_package_version(&package)?;
-            let tag = tag.unwrap_or_else(|| "latest".to_string());
-            client
-                .dist_tag_add(Some(&registry_url), name, &tag, version, otp.as_deref())
-                .await?;
-            println!("+ {name}@{version} ({tag})");
-        }
-        DistTagAction::Rm { package, tag } => {
-            let name = package_name_from_spec(&package);
-            client
-                .dist_tag_remove(Some(&registry_url), name, &tag, otp.as_deref())
-                .await?;
-            println!("- {name} {tag}");
-        }
-    }
-    Ok(())
-}
 
 async fn execute_owner(
     current_dir: &Path,
@@ -4122,7 +4082,7 @@ async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow:
     Ok(())
 }
 
-fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
+pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     let at = if let Some(stripped) = spec.strip_prefix('@') {
         stripped.rfind('@').map(|i| i + 1)
     } else {
@@ -4139,7 +4099,7 @@ fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     Ok((name, version))
 }
 
-fn package_name_from_spec(spec: &str) -> &str {
+pub(crate) fn package_name_from_spec(spec: &str) -> &str {
     if let Some(stripped) = spec.strip_prefix('@') {
         stripped
             .rfind('@')
@@ -4150,7 +4110,7 @@ fn package_name_from_spec(spec: &str) -> &str {
     }
 }
 
-fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
+pub(crate) fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
     let path = current_dir.join("package.json");
     let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     value
@@ -6087,7 +6047,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             json,
             otp,
-        } => execute_dist_tag(&current_dir, action, registry, json, otp).await?,
+        } => commands::dist_tag::run(current_dir, action, registry, json, otp).await?,
         Commands::Owner {
             action,
             registry,
