@@ -1,0 +1,11 @@
+{
+  "name": "real-git-deps",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"console.log('git-deps ok')\""
+  },
+  "dependencies": {
+    "inherits": "git+https://github.com/isaacs/inherits.git#v2.0.4"
+  }
+}
