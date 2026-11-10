@@ -49,10 +49,10 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `install-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `install-scripts --help` on fresh fixture directory |
 | `install-test` | `it` | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `install-test --help` on fresh fixture directory |
 | `link` | `ln` | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `link --help` on fresh fixture directory |
-| `ll` | `la` | **partial** | Dependency tree visualizer: npm renders Arborist Unicode branch glyphs, whereas rnpm prints a compact listing for unpopulated dependencies | Ran `ll` on fresh fixture directory |
+| `ll` | `la` | **matching** | Extended dependency tree visualizer with unmet dependency markers, ELSPROBLEMS exit status, and JSON output matching npm | Ran `ll` against npm parity test |
 | `login` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `login --help` on fresh fixture directory |
 | `logout` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `logout --help` on fresh fixture directory |
-| `ls` | `list` | **partial** | Dependency tree visualizer: npm renders Arborist Unicode branch glyphs, whereas rnpm prints a compact listing for unpopulated dependencies | Ran `ls` on fresh fixture directory |
+| `ls` | `list` | **matching** | Dependency tree visualizer with unmet dependency markers, ELSPROBLEMS exit status, and JSON output matching npm | Ran `ls` against npm parity test |
 | `org` | `ogr` | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `org --help` on fresh fixture directory |
 | `outdated` | - | **matching** | Tabular column layout (`-` for missing packages) and omission of `current`/`location` in `--json` match npm | Ran `outdated` on fresh fixture directory |
 | `owner` | `author` | **matching** | Formatted as `name <email>` matching npm parity | Ran `owner ls is-number` on fresh fixture directory |

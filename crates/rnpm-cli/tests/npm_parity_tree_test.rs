@@ -104,3 +104,77 @@ fn explain_shared_dependency_keeps_each_requesting_spec() {
     assert_eq!(edges[1]["spec"], "~1.2.0");
     assert_eq!(edges[1]["from"]["dependents"][0]["spec"], "1.0.0");
 }
+
+#[test]
+fn test_ls_and_ll_live_npm_parity() {
+    let tmp = tempdir().unwrap();
+    let pkg_json = r#"{
+  "name": "test-pkg",
+  "version": "1.0.0",
+  "dependencies": {
+    "is-number": "7.0.0"
+  }
+}
+"#;
+    fs::write(tmp.path().join("package.json"), pkg_json).unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    // 1. Text ls with unmet dependency: exits code 1, ELSPROBLEMS on stderr
+    let rnpm_ls = Command::new(rnpm_bin)
+        .current_dir(tmp.path())
+        .arg("ls")
+        .output()
+        .expect("rnpm ls failed");
+    assert_eq!(rnpm_ls.status.code(), Some(1));
+    let rnpm_stderr = String::from_utf8_lossy(&rnpm_ls.stderr);
+    let rnpm_stdout = String::from_utf8_lossy(&rnpm_ls.stdout);
+    assert!(rnpm_stderr.contains("ELSPROBLEMS"));
+    assert!(rnpm_stdout.contains("UNMET DEPENDENCY is-number@7.0.0"));
+
+    // 2. JSON ls
+    let rnpm_json = Command::new(rnpm_bin)
+        .current_dir(tmp.path())
+        .args(["ls", "--json"])
+        .output()
+        .expect("rnpm ls --json failed");
+    assert_eq!(rnpm_json.status.code(), Some(1));
+    let rnpm_val: serde_json::Value = serde_json::from_slice(&rnpm_json.stdout)
+        .expect("rnpm ls --json must be valid JSON");
+    assert_eq!(rnpm_val["name"], "test-pkg");
+    assert_eq!(rnpm_val["dependencies"]["is-number"]["required"], "7.0.0");
+    assert_eq!(rnpm_val["dependencies"]["is-number"]["missing"], true);
+
+    // 3. Compare with live npm.cmd
+    let npm_res = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "ls", "--json"])
+        .current_dir(tmp.path())
+        .output();
+    if let Ok(npm_out) = npm_res {
+        assert_eq!(npm_out.status.code(), Some(1));
+        let npm_val: serde_json::Value = serde_json::from_slice(&npm_out.stdout)
+            .expect("npm ls --json must be valid JSON");
+        assert_eq!(rnpm_val["name"], npm_val["name"]);
+        assert_eq!(rnpm_val["version"], npm_val["version"]);
+        assert_eq!(
+            rnpm_val["dependencies"]["is-number"]["required"],
+            npm_val["dependencies"]["is-number"]["required"]
+        );
+        assert_eq!(
+            rnpm_val["dependencies"]["is-number"]["missing"],
+            npm_val["dependencies"]["is-number"]["missing"]
+        );
+    }
+
+    // 4. Test ll (long list)
+    let rnpm_ll = Command::new(rnpm_bin)
+        .current_dir(tmp.path())
+        .arg("ll")
+        .output()
+        .expect("rnpm ll failed");
+    assert_eq!(rnpm_ll.status.code(), Some(1));
+    let rnpm_ll_stdout = String::from_utf8_lossy(&rnpm_ll.stdout);
+    assert!(rnpm_ll_stdout.contains("test-pkg@1.0.0"));
+    assert!(rnpm_ll_stdout.contains("UNMET DEPENDENCY is-number@7.0.0"));
+}
+
