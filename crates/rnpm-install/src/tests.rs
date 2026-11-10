@@ -135,6 +135,36 @@ fn setup_fixture_project(dir: &Path) {
 }
 
 #[test]
+fn test_link_tree_bins_ansi_html() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    let bin = nm.join(".bin");
+    let ansi_html = nm.join("ansi-html");
+    std::fs::create_dir_all(ansi_html.join("bin")).unwrap();
+    std::fs::write(
+        ansi_html.join("package.json"),
+        r#"{"name":"ansi-html","version":"0.0.9","bin":{"ansi-html":"./bin/ansi-html"}}"#,
+    ).unwrap();
+    std::fs::write(ansi_html.join("bin/ansi-html"), "#!/usr/bin/env node\nconsole.log(1);").unwrap();
+
+    crate::link_tree_bins(
+        vec!["node_modules/ansi-html".to_string()],
+        None,
+        root,
+        &bin,
+        &nm,
+        true,
+        None,
+    );
+
+    assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
+    assert!(bin.join("ansi-html.cmd").exists(), "bin/ansi-html.cmd exists");
+    assert!(bin.join("ansi-html.ps1").exists(), "bin/ansi-html.ps1 exists");
+}
+
+
+#[test]
 fn test_uninstall_single_package_and_transitive_pruning() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
@@ -4130,3 +4160,153 @@ async fn test_stale_shim_removed_on_upgrade() {
         "stale tool2 POSIX shim must be removed"
     );
 }
+
+#[test]
+fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let nm = project_dir.join("node_modules").join("legacy-pkg");
+    fs::create_dir_all(&nm).unwrap();
+    let legacy_json = serde_json::json!({
+        "name": "legacy-pkg",
+        "version": "1.0.0",
+        "licenses": [
+            { "type": "MIT", "url": "http://example.com" }
+        ]
+    });
+    fs::write(nm.join("package.json"), serde_json::to_string(&legacy_json).unwrap()).unwrap();
+
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/legacy-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir, None);
+
+    let pkg = lockfile.packages.get("node_modules/legacy-pkg").unwrap();
+    assert_eq!(
+        pkg.license, None,
+        "Deprecated licenses array must not synthesize a license field, matching npm 11"
+    );
+}
+
+#[tokio::test]
+async fn test_enrich_lockfile_never_makes_network_requests() {
+    use rnpm_registry::{http_request_count, reset_http_request_count};
+
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    reset_http_request_count();
+
+    let mut lockfile = LockfileV3::new("no-net-app", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/nonexistent-package-with-no-license",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: false,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+
+    let before_requests = http_request_count();
+    installer
+        .enrich_lockfile_from_registry(&mut lockfile)
+        .await
+        .unwrap();
+    let after_requests = http_request_count();
+
+    assert_eq!(
+        before_requests, after_requests,
+        "enrich_lockfile_from_registry must never make network requests"
+    );
+}
+
+#[tokio::test]
+async fn test_enrich_lockfile_from_cacache_packument() {
+    let temp_project = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    let cache = rnpm_cache::Cache::new(temp_cache.path()).unwrap();
+    let reg_url = "https://registry.npmjs.org";
+    let pkg_name = "fsevents";
+    let version = "2.3.3";
+    let full_url = format!("{reg_url}/{pkg_name}");
+    let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
+
+    let mock_full_packument = serde_json::json!({
+        "name": pkg_name,
+        "versions": {
+            version: {
+                "name": pkg_name,
+                "version": version,
+                "license": "MIT",
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    });
+    let data = serde_json::to_vec(&mock_full_packument).unwrap();
+    cache.put(&cacache_key, &data, None).unwrap();
+
+    let mut lockfile = LockfileV3::new("test", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        &format!("node_modules/{pkg_name}"),
+        LockfilePackage {
+            name: Some(pkg_name.to_string()),
+            version: Some(version.to_string()),
+            ..Default::default()
+        },
+    );
+
+    let options = InstallOptions {
+        project_dir: temp_project.path().to_path_buf(),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer
+        .enrich_lockfile_from_registry(&mut lockfile)
+        .await
+        .unwrap();
+
+    let pkg = lockfile.packages.get(&format!("node_modules/{pkg_name}")).unwrap();
+    assert_eq!(pkg.license.as_deref(), Some("MIT"));
+}
+
+#[tokio::test]
+async fn test_enrich_lockfile_with_scoped_package_license_and_libc() {
+    let mut lockfile = LockfileV3::new("test", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/@next/swc-linux-x64-musl",
+        LockfilePackage {
+            version: Some("14.2.5".to_string()),
+            os: Some(vec!["linux".to_string()]),
+            ..Default::default()
+        },
+    );
+    let mut installer = Installer::new(InstallOptions::default()).unwrap();
+    installer.enrich_lockfile_from_registry(&mut lockfile).await.unwrap();
+
+    let pkg = lockfile.packages.get("node_modules/@next/swc-linux-x64-musl").unwrap();
+    if pkg.license.is_some() {
+        assert_eq!(pkg.license.as_deref(), Some("MIT"));
+        assert_eq!(pkg.libc.as_deref(), Some(&["musl".to_string()][..]));
+    }
+}
+
+

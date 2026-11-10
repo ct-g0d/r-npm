@@ -7,49 +7,52 @@ fn rnpm_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rnpm")
 }
 
+fn git_cmd(path: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(path);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_CONFIG_GLOBAL", path.join(".empty_gitconfig"));
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 fn init_git_repo(path: &Path) {
-    let out = Command::new("git")
+    let _ = fs::write(path.join(".empty_gitconfig"), "");
+    let out = git_cmd(path)
         .args(["init"])
-        .current_dir(path)
         .output()
         .expect("git init failed");
     assert!(out.status.success(), "git init failed: {:?}", out);
 
-    Command::new("git")
+    git_cmd(path)
         .args(["config", "user.name", "Test User"])
-        .current_dir(path)
         .output()
         .expect("git config user.name failed");
 
-    Command::new("git")
+    git_cmd(path)
         .args(["config", "user.email", "test@example.com"])
-        .current_dir(path)
         .output()
         .expect("git config user.email failed");
 
-    Command::new("git")
+    git_cmd(path)
         .args(["config", "commit.gpgSign", "false"])
-        .current_dir(path)
         .output()
         .expect("git config commit.gpgSign failed");
 
-    Command::new("git")
+    git_cmd(path)
         .args(["config", "tag.gpgSign", "false"])
-        .current_dir(path)
         .output()
         .expect("git config tag.gpgSign failed");
 }
 
 fn git_commit_all(path: &Path, msg: &str) {
-    Command::new("git")
+    git_cmd(path)
         .args(["add", "."])
-        .current_dir(path)
         .output()
         .expect("git add failed");
 
-    let out = Command::new("git")
+    let out = git_cmd(path)
         .args(["commit", "-m", msg])
-        .current_dir(path)
         .output()
         .expect("git commit failed");
     assert!(out.status.success(), "git commit failed: {:?}", out);

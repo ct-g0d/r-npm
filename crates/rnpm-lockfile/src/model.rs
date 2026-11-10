@@ -341,6 +341,9 @@ pub struct LockfilePackage {
     )]
     pub has_shrinkwrap: Option<bool>,
 
+    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    pub extraneous: Option<bool>,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub license: Option<String>,
 
@@ -455,6 +458,12 @@ impl LockfilePackage {
     /// Returns true if this package contains a shrinkwrap file (`hasShrinkwrap: true`).
     pub fn has_shrinkwrap(&self) -> bool {
         self.has_shrinkwrap == Some(true)
+    }
+
+    /// Returns true if this package is marked extraneous (`extraneous: true`).
+    pub fn is_extraneous(&self) -> bool {
+        self.extraneous == Some(true)
+            || self.extra.get("extraneous") == Some(&serde_json::Value::Bool(true))
     }
 
     /// Returns true if this package is a symlink or workspace link (`link: true`).
@@ -1792,6 +1801,39 @@ fn indent_spaces(out: &mut String, indent: &str, level: usize) {
     }
 }
 
+const NPM_CHAR_RANK: [u8; 256] = [
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    0, 6, 12, 25, 35, 26, 24, 10, 13, 14, 20, 29, 3, 2, 8, 21,
+    36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 5, 4, 30, 31, 32, 7,
+    19, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75,
+    77, 79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 15, 23, 16, 28, 1,
+    27, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74,
+    76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 17, 33, 18, 34, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+];
+
+pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let n = a_bytes.len().min(b_bytes.len());
+    for i in 0..n {
+        let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
+        let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
+        if ra != rb {
+            return ra.cmp(&rb);
+        }
+    }
+    a_bytes.len().cmp(&b_bytes.len())
+}
+
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
     stringify_npm_nice_indent(val, "  ", indent_level, out);
 }
@@ -1852,7 +1894,7 @@ pub(crate) fn stringify_npm_nice_indent(
                         (Some(pa), Some(pb)) => pa.cmp(&pb),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => ak.cmp(bk),
+                        (None, None) => npm_key_compare(ak, bk),
                     }
                 });
 

@@ -180,6 +180,7 @@ pub struct ParallelWriterConfig {
     pub worker_threads: usize,
     pub is_hdd: bool,
     pub preallocate_threshold: usize,
+    pub skip_existing_matching: bool,
 }
 
 impl Default for ParallelWriterConfig {
@@ -188,6 +189,7 @@ impl Default for ParallelWriterConfig {
             worker_threads: 0,
             is_hdd: false,
             preallocate_threshold: 64 * 1024, // 64 KiB
+            skip_existing_matching: false,
         }
     }
 }
@@ -218,6 +220,7 @@ pub fn determine_writer_config(
         worker_threads: threads,
         is_hdd,
         preallocate_threshold: 64 * 1024,
+        skip_existing_matching: false,
     }
 }
 
@@ -254,7 +257,7 @@ where
 {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
         extern "system" {
             fn CreateDirectoryW(
@@ -273,29 +276,56 @@ where
                 if parent.as_os_str().is_empty() || parent == curr {
                     break;
                 }
-                all_dirs.insert(parent.to_path_buf());
+                if !all_dirs.insert(parent.to_path_buf()) {
+                    // Ancestors already inserted by another child
+                    break;
+                }
                 curr = parent;
             }
             all_dirs.insert(verbatim);
         }
 
-        // Sort breadth-first / by depth (component count ascending, then length)
-        let mut sorted_dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-        sorted_dirs.sort_by_key(|p| (p.components().count(), p.as_os_str().len()));
-
-        for dir in sorted_dirs {
+        // Group directories by depth (component count)
+        let mut dirs_by_depth: BTreeMap<usize, Vec<Vec<u16>>> = BTreeMap::new();
+        for dir in all_dirs {
+            let depth = dir.components().count();
             let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-            let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
-            if ret == 0 {
-                let err = unsafe { GetLastError() };
-                if err != ERROR_ALREADY_EXISTS {
-                    // Fallback to create_dir_all for resilience
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        if e.kind() != std::io::ErrorKind::AlreadyExists {
-                            return Err(e);
+            dirs_by_depth.entry(depth).or_default().push(wide);
+        }
+
+        // Create directories breadth-first level by level, parallelizing large levels across 16 threads
+        for (_depth, level_dirs) in dirs_by_depth {
+            let total = level_dirs.len();
+            if total <= 16 {
+                for wide in &level_dirs {
+                    let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                    if ret == 0 {
+                        let err = unsafe { GetLastError() };
+                        if err != ERROR_ALREADY_EXISTS {
+                            let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
+                            let _ = std::fs::create_dir_all(&dir_path);
                         }
                     }
                 }
+            } else {
+                let num_threads = 16.min(total);
+                let chunk_size = total.div_ceil(num_threads);
+                std::thread::scope(|scope| {
+                    for chunk in level_dirs.chunks(chunk_size) {
+                        scope.spawn(move || {
+                            for wide in chunk {
+                                let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                                if ret == 0 {
+                                    let err = unsafe { GetLastError() };
+                                    if err != ERROR_ALREADY_EXISTS {
+                                        let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
+                                        let _ = std::fs::create_dir_all(&dir_path);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
             }
         }
 
@@ -524,47 +554,92 @@ pub fn write_file_fast(
     }
 }
 
+#[cfg(windows)]
+fn path_to_wide_buf(path: &Path, buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    buf.clear();
+    if let Some(s) = path.to_str() {
+        if s.starts_with(r"\\?\") {
+            buf.extend(path.as_os_str().encode_wide());
+            buf.push(0);
+            return;
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            buf.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+            for &b in bytes {
+                if b == b'/' {
+                    buf.push(b'\\' as u16);
+                } else {
+                    buf.push(b as u16);
+                }
+            }
+            buf.push(0);
+            return;
+        }
+    }
+    let verbatim = crate::path::to_verbatim_path(path);
+    buf.extend(verbatim.as_os_str().encode_wide());
+    buf.push(0);
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    let mut wide = Vec::with_capacity(path.as_os_str().len() + 8);
+    path_to_wide_buf(path, &mut wide);
+    wide
+}
+
+/// Copies or hardlinks a file using native OS primitives (CreateHardLinkW / CopyFileExW on Windows) reusing caller wide-string buffers.
+#[cfg(windows)]
+pub fn copy_file_fast_buf(
+    source: &Path,
+    destination: &Path,
+    src_buf: &mut Vec<u16>,
+    dst_buf: &mut Vec<u16>,
+) -> std::io::Result<()> {
+    extern "system" {
+        fn CopyFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            lpProgressRoutine: *mut std::ffi::c_void,
+            lpData: *mut std::ffi::c_void,
+            pbCancel: *mut i32,
+            dwCopyFlags: u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    path_to_wide_buf(source, src_buf);
+    path_to_wide_buf(destination, dst_buf);
+
+    let ret = unsafe {
+        CopyFileExW(
+            src_buf.as_ptr(),
+            dst_buf.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        Err(std::io::Error::from_raw_os_error(err as i32))
+    } else {
+        Ok(())
+    }
+}
+
 /// Copies a file using native OS primitives (CopyFileExW on Windows).
 pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
-        extern "system" {
-            fn CopyFileExW(
-                lpExistingFileName: *const u16,
-                lpNewFileName: *const u16,
-                lpProgressRoutine: *mut std::ffi::c_void,
-                lpData: *mut std::ffi::c_void,
-                pbCancel: *mut i32,
-                dwCopyFlags: u32,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-
-        let src_v = crate::path::to_verbatim_path(source);
-        let dst_v = crate::path::to_verbatim_path(destination);
-
-        let src_wide: Vec<u16> = src_v.as_os_str().encode_wide().chain(Some(0)).collect();
-        let dst_wide: Vec<u16> = dst_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
-        let ret = unsafe {
-            CopyFileExW(
-                src_wide.as_ptr(),
-                dst_wide.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if ret == 0 {
-            let err = unsafe { GetLastError() };
-            Err(std::io::Error::from_raw_os_error(err as i32))
-        } else {
-            Ok(())
-        }
+        let mut src_buf = Vec::with_capacity(260);
+        let mut dst_buf = Vec::with_capacity(260);
+        copy_file_fast_buf(source, destination, &mut src_buf, &mut dst_buf)
     }
 
     #[cfg(not(windows))]
@@ -625,14 +700,14 @@ fn cas_file_is_valid(
     expected_sha256: Option<&str>,
     source_verified: bool,
 ) -> bool {
+    if source_verified {
+        return true;
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
     if meta.len() != data_len as u64 {
         return false;
-    }
-    if source_verified {
-        return true;
     }
     if let Some(expected) = expected_sha256 {
         if let Ok(bytes) = std::fs::read(path) {
@@ -707,6 +782,11 @@ pub fn materialize_files_parallel_refs<'a>(
 
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    #[cfg(windows)]
+                    let mut src_buf = Vec::with_capacity(260);
+                    #[cfg(windows)]
+                    let mut dst_buf = Vec::with_capacity(260);
+
                     loop {
                         let start =
                             next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
@@ -715,6 +795,14 @@ pub fn materialize_files_parallel_refs<'a>(
                         }
                         let end = (start + chunk_size).min(total_files);
                         for file in &files_slice[start..end] {
+                            if config.skip_existing_matching {
+                                if let Ok(meta) = std::fs::metadata(&file.path) {
+                                    if meta.len() == file.data.len() as u64 {
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let mut copied = false;
                             if let Some(src) = file.source_path {
                                 let mut cas_valid = cas_file_is_valid(
@@ -732,7 +820,12 @@ pub fn materialize_files_parallel_refs<'a>(
                                         true,
                                     );
                                 }
-                                if cas_valid && copy_file_fast(src, &file.path).is_ok() {
+                                #[cfg(windows)]
+                                let copy_ok = cas_valid && copy_file_fast_buf(src, &file.path, &mut src_buf, &mut dst_buf).is_ok();
+                                #[cfg(not(windows))]
+                                let copy_ok = cas_valid && copy_file_fast(src, &file.path).is_ok();
+
+                                if copy_ok {
                                     copied = true;
                                     #[cfg(unix)]
                                     {
@@ -931,6 +1024,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut file_order: Vec<String> = Vec::new();
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
+    let mut saw_npmignores: HashSet<PathBuf> = HashSet::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -995,7 +1089,7 @@ pub fn decode_tar_entries<R: Read>(
 
         validate_entry_path(&raw_path)?;
 
-        let relative_path = match strip_package_prefix(&raw_path) {
+        let mut relative_path = match strip_package_prefix(&raw_path) {
             Some(p) => {
                 let cleaned: PathBuf = p
                     .components()
@@ -1008,6 +1102,20 @@ pub fn decode_tar_entries<R: Read>(
             }
             None => continue,
         };
+
+        // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+        // unless a .npmignore file is already present.
+        if entry_type.is_file() {
+            if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                saw_npmignores.insert(relative_path.clone());
+            } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+                let ni = relative_path.with_file_name(".npmignore");
+                if saw_npmignores.contains(&ni) {
+                    continue;
+                }
+                relative_path = ni;
+            }
+        }
 
         validate_entry_path(&relative_path)?;
 

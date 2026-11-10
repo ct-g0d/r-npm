@@ -1,0 +1,11 @@
+{
+  "name": "real-electron",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"console.log('electron ok')\""
+  },
+  "devDependencies": {
+    "electron": "^28.3.3"
+  }
+}

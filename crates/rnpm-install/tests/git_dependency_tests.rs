@@ -6,24 +6,30 @@ use rnpm_install::{InstallOptions, Installer};
 use rnpm_lockfile::LockfileV3;
 
 fn run_git(dir: &Path, args: &[&str]) {
+    let _ = std::fs::write(dir.join(".empty_gitconfig"), "");
     let status = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".empty_gitconfig"))
         .status()
         .expect("Failed to execute git command");
     assert!(status.success(), "Git command failed: git {:?}", args);
 }
 
 fn get_git_output(dir: &Path, args: &[&str]) -> String {
+    let _ = std::fs::write(dir.join(".empty_gitconfig"), "");
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".empty_gitconfig"))
         .output()
         .expect("Failed to execute git command");
     assert!(

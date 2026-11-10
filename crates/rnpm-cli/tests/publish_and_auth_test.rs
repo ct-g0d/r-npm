@@ -164,6 +164,30 @@ fn rnpm_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rnpm"))
 }
 
+fn isolated_rnpm(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(rnpm_bin());
+    let fake_home = dir.join(".fake_home");
+    let fake_appdata = fake_home.join("AppData").join("Roaming");
+    let fake_localappdata = fake_home.join("AppData").join("Local");
+    let fake_global = dir.join(".fake_global");
+    let _ = std::fs::create_dir_all(&fake_home);
+    let _ = std::fs::create_dir_all(&fake_appdata);
+    let _ = std::fs::create_dir_all(&fake_localappdata);
+    let _ = std::fs::create_dir_all(&fake_global);
+
+    cmd.current_dir(dir);
+    cmd.env("USERPROFILE", &fake_home);
+    cmd.env("HOME", &fake_home);
+    cmd.env("APPDATA", &fake_appdata);
+    cmd.env("LOCALAPPDATA", &fake_localappdata);
+    cmd.env("PREFIX", &fake_global);
+    cmd.env("NPM_CONFIG_PREFIX", &fake_global);
+    cmd.env("NPM_CONFIG_USERCONFIG", fake_home.join(".npmrc"));
+    cmd.env("NPM_CONFIG_GLOBALCONFIG", fake_global.join("etc").join("npmrc"));
+    cmd.env("NPM_CONFIG_CACHE", fake_home.join(".npm-cache"));
+    cmd
+}
+
 #[test]
 fn test_cli_publish_dry_run() {
     let tmp = tempdir().unwrap();
@@ -184,10 +208,9 @@ fn test_cli_publish_dry_run() {
     std::fs::write(pkg_dir.join("index.js"), "console.log('hello');").unwrap();
 
     // 1. Text notices output
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--dry-run")
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to run rnpm publish");
 
@@ -217,11 +240,10 @@ fn test_cli_publish_dry_run() {
     );
 
     // 2. JSON mode output
-    let json_output = Command::new(rnpm_bin())
+    let json_output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--dry-run")
         .arg("--json")
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to run rnpm publish --json");
 
@@ -244,7 +266,7 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&project).unwrap();
 
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(&project)
         .args([
             "login",
             "--registry",
@@ -252,9 +274,9 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
             "--scope",
             "@acme",
         ])
-        .current_dir(&project)
         .env("USERPROFILE", &home)
         .env("HOME", &home)
+        .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
         .env("NPM_TOKEN", "secret-login-token")
         .output()
         .expect("failed to run rnpm login");
@@ -317,11 +339,10 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
     let npmrc_content = format!("//{host}/:_authToken=secret-lifecycle-token\n");
     std::fs::write(pkg_dir.join(".npmrc"), npmrc_content).unwrap();
 
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to run rnpm publish");
 
@@ -382,11 +403,10 @@ async fn test_cli_publish_prepack_failure_halts_before_packaging() {
     )
     .unwrap();
 
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--registry")
         .arg(server.url())
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to execute publish");
 
@@ -424,11 +444,10 @@ fn test_cli_publish_ignore_scripts_bypasses_failing_hooks() {
     )
     .unwrap();
 
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--dry-run")
         .arg("--ignore-scripts")
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to execute publish");
 
@@ -479,7 +498,7 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
     )
     .unwrap();
 
-    let output = Command::new(rnpm_bin())
+    let output = isolated_rnpm(pkg_dir)
         .arg("publish")
         .arg("--registry")
         .arg(&server_url)
@@ -488,7 +507,6 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         .arg("--access=public")
         .arg("--otp")
         .arg("654321")
-        .current_dir(pkg_dir)
         .output()
         .expect("failed to run publish");
 
@@ -579,11 +597,10 @@ async fn test_cli_publish_error_codes_diagnostics() {
     )
     .unwrap();
 
-    let out1 = Command::new(rnpm_bin())
+    let out1 = isolated_rnpm(tmp1.path())
         .arg("publish")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(tmp1.path())
         .output()
         .unwrap();
 
@@ -609,11 +626,10 @@ async fn test_cli_publish_error_codes_diagnostics() {
     )
     .unwrap();
 
-    let out2 = Command::new(rnpm_bin())
+    let out2 = isolated_rnpm(tmp2.path())
         .arg("publish")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(tmp2.path())
         .output()
         .unwrap();
 
@@ -638,11 +654,10 @@ async fn test_cli_publish_error_codes_diagnostics() {
     )
     .unwrap();
 
-    let out3 = Command::new(rnpm_bin())
+    let out3 = isolated_rnpm(tmp3.path())
         .arg("publish")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(tmp3.path())
         .output()
         .unwrap();
 
@@ -692,11 +707,10 @@ async fn test_cli_whoami_and_ping() {
     .unwrap();
 
     // 1. whoami text
-    let whoami_out = Command::new(rnpm_bin())
+    let whoami_out = isolated_rnpm(tmp.path())
         .arg("whoami")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(tmp.path())
         .output()
         .unwrap();
 
@@ -709,12 +723,11 @@ async fn test_cli_whoami_and_ping() {
     assert_eq!(stdout.trim(), "ferris_rustacean");
 
     // 2. whoami JSON
-    let whoami_json = Command::new(rnpm_bin())
+    let whoami_json = isolated_rnpm(tmp.path())
         .arg("whoami")
         .arg("--registry")
         .arg(&server_url)
         .arg("--json")
-        .current_dir(tmp.path())
         .output()
         .unwrap();
 
@@ -724,11 +737,10 @@ async fn test_cli_whoami_and_ping() {
 
     // 3. whoami without token fails with ENEEDAUTH
     let empty_dir = tempdir().unwrap();
-    let unauth_whoami = Command::new(rnpm_bin())
+    let unauth_whoami = isolated_rnpm(empty_dir.path())
         .arg("whoami")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(empty_dir.path())
         .output()
         .unwrap();
 
@@ -740,11 +752,10 @@ async fn test_cli_whoami_and_ping() {
     );
 
     // 4. ping
-    let ping_out = Command::new(rnpm_bin())
+    let ping_out = isolated_rnpm(tmp.path())
         .arg("ping")
         .arg("--registry")
         .arg(&server_url)
-        .current_dir(tmp.path())
         .output()
         .unwrap();
 
@@ -754,12 +765,11 @@ async fn test_cli_whoami_and_ping() {
     assert!(ping_err.contains("npm notice PONG"));
 
     // 5. ping JSON
-    let ping_json = Command::new(rnpm_bin())
+    let ping_json = isolated_rnpm(tmp.path())
         .arg("ping")
         .arg("--registry")
         .arg(&server_url)
         .arg("--json")
-        .current_dir(tmp.path())
         .output()
         .unwrap();
 
@@ -775,6 +785,10 @@ async fn test_cli_whoami_and_ping() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cli_auth_helpers_login_and_logout() {
     let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
 
     let server = TestMockRegistry::start(|_req| {
         (
@@ -787,9 +801,11 @@ async fn test_cli_auth_helpers_login_and_logout() {
     let reg_url = server.url();
 
     // 1. Non-interactive login requires an explicit credential source.
-    let login_out = Command::new(rnpm_bin())
+    let login_out = isolated_rnpm(&project)
         .arg("login")
-        .current_dir(tmp.path())
+        .env("USERPROFILE", &home)
+        .env("HOME", &home)
+        .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
         .output()
         .unwrap();
 
@@ -798,7 +814,7 @@ async fn test_cli_auth_helpers_login_and_logout() {
     assert!(login_err.contains("npm error code ENEEDAUTH"));
 
     // 2. logout with existing token removes token from .npmrc and contacts mock registry
-    let local_npmrc = tmp.path().join(".npmrc");
+    let local_npmrc = project.join(".npmrc");
     std::fs::write(
         &local_npmrc,
         format!(
@@ -808,9 +824,11 @@ async fn test_cli_auth_helpers_login_and_logout() {
     )
     .unwrap();
 
-    let logout_out = Command::new(rnpm_bin())
+    let logout_out = isolated_rnpm(&project)
         .arg("logout")
-        .current_dir(tmp.path())
+        .env("USERPROFILE", &home)
+        .env("HOME", &home)
+        .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
         .output()
         .unwrap();
 

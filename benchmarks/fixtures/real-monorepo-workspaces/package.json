@@ -1,0 +1,14 @@
+{
+  "name": "real-monorepo-workspaces",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node -e \"console.log('monorepo ok')\""
+  },
+  "devDependencies": {
+    "prettier": "^3.2.5"
+  }
+}

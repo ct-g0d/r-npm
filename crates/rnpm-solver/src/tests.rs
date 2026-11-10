@@ -5334,3 +5334,274 @@ fn test_strict_peer_deps_succeeds_when_peers_are_satisfied() {
     assert!(graph.nodes.contains_key("node_modules/core-lib"));
     assert!(graph.nodes.contains_key("node_modules/plugin-ok"));
 }
+
+#[test]
+fn test_root_bundled_dependencies_preserved_in_lockfile() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("bundled-dep", "1.0.0", |_| {});
+    provider.add_version("regular-dep", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("bundled-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.bundled_dependencies = Some(rnpm_core::manifest::BundledDependencies::List(vec![
+        "bundled-dep".to_string(),
+    ]));
+    manifest
+        .dependencies
+        .insert("bundled-dep".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("regular-dep".to_string(), "^1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let node_bundled = graph.nodes.get("node_modules/bundled-dep").unwrap();
+    assert!(node_bundled.flags.bundled);
+
+    let node_regular = graph.nodes.get("node_modules/regular-dep").unwrap();
+    assert!(!node_regular.flags.bundled);
+
+    let lockfile = graph.to_lockfile_v3("bundled-app", Some("1.0.0"));
+    let root_entry = lockfile.packages.get("").unwrap();
+    assert_eq!(
+        root_entry.bundled_package_names(),
+        vec!["bundled-dep".to_string()]
+    );
+
+    let bundled_entry = lockfile.packages.get("node_modules/bundled-dep").unwrap();
+    assert_eq!(bundled_entry.in_bundle, Some(true));
+
+    let regular_entry = lockfile.packages.get("node_modules/regular-dep").unwrap();
+    assert_eq!(regular_entry.in_bundle, None);
+}
+
+#[test]
+fn test_root_lifecycle_scripts_set_has_install_script_in_lockfile() {
+    let provider = InMemoryPackageProvider::new();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("lifecycle-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .scripts
+        .insert("postinstall".to_string(), "echo ok".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let root_node = graph.nodes.get("").unwrap();
+    assert!(root_node.flags.has_install_script);
+
+    let lockfile = graph.to_lockfile_v3("lifecycle-app", Some("1.0.0"));
+    let root_entry = lockfile.packages.get("").unwrap();
+    assert_eq!(root_entry.has_install_script, Some(true));
+}
+
+#[test]
+fn test_workspace_lockfile_package_names_and_prune_reachability() {
+    use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
+    use std::path::PathBuf;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("extra-dep", "1.0.0", |_| {});
+    provider.add_version("sub-dep", "1.0.0", |_| {});
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("ws-prune-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+    root_manifest
+        .dependencies
+        .insert("extra-dep".to_string(), "^1.0.0".to_string());
+
+    let mut manifest_a = Manifest::default();
+    manifest_a.name = Some("@scope/pkg-a".to_string());
+    manifest_a.version = Some("1.0.0".to_string());
+    manifest_a
+        .dependencies
+        .insert("sub-dep".to_string(), "^1.0.0".to_string());
+
+    let member_a = WorkspaceMember {
+        name: "@scope/pkg-a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-a"),
+        relative_path: "packages/pkg-a".to_string(),
+        manifest: manifest_a,
+    };
+
+    let options = ResolverOptions::default();
+    let mut graph = resolve_workspace_graph(&root_manifest, &[member_a], &provider, &options).unwrap();
+
+    // Verify lockfile generation has "name" for non-standard location packages/pkg-a
+    let lockfile = graph.to_lockfile_v3("ws-prune-root", Some("1.0.0"));
+    let pkg_a_lock = lockfile.packages.get("packages/pkg-a").expect("packages/pkg-a in lockfile");
+    assert_eq!(pkg_a_lock.name.as_deref(), Some("@scope/pkg-a"));
+
+    // Verify prune_unreferenced after removing root dependency extra-dep
+    assert!(graph.remove_root_dependency("extra-dep"));
+    let pruned = graph.prune_unreferenced();
+    assert!(pruned.contains("node_modules/extra-dep"));
+
+    // packages/pkg-a, node_modules/@scope/pkg-a link, and sub-dep MUST NOT be pruned!
+    assert!(!pruned.contains("packages/pkg-a"));
+    assert!(!pruned.contains("node_modules/@scope/pkg-a"));
+    assert!(!pruned.contains("node_modules/sub-dep"));
+
+    assert!(graph.nodes.contains_key("packages/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/@scope/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/sub-dep"));
+}
+
+#[test]
+fn test_lockfile_normalizes_single_bin_string_to_map() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("@scope/parser", "1.0.0", |version| {
+        version.bin = Some(rnpm_lockfile::PackageBin::Single("./bin/parser.js".to_string()));
+    });
+    provider.add_version("single-tool", "1.0.0", |version| {
+        version.bin = Some(rnpm_lockfile::PackageBin::Single("bin/tool.js".to_string()));
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("single-bin-app".to_string());
+    manifest
+        .dependencies
+        .insert("@scope/parser".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("single-tool".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let lockfile = graph.to_lockfile_v3("single-bin-app", Some("1.0.0"));
+
+    let scoped_pkg = lockfile.packages.get("node_modules/@scope/parser").unwrap();
+    assert_eq!(
+        scoped_pkg.bin,
+        Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "parser".to_string(),
+            "bin/parser.js".to_string(),
+        )])))
+    );
+
+    let unscoped_pkg = lockfile.packages.get("node_modules/single-tool").unwrap();
+    assert_eq!(
+        unscoped_pkg.bin,
+        Some(rnpm_lockfile::PackageBin::Map(BTreeMap::from([(
+            "single-tool".to_string(),
+            "bin/tool.js".to_string(),
+        )])))
+    );
+}
+
+#[test]
+fn test_lockfile_omits_name_for_nested_node_modules_standard_packages() {
+    use crate::graph::DependencyGraph;
+    use crate::graph::Node;
+
+    let mut graph = DependencyGraph::new();
+    graph.nodes.insert(
+        "".to_string(),
+        Node {
+            location: "".to_string(),
+            name: "root-app".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    // Nested package: node_modules/parent/node_modules/child
+    graph.nodes.insert(
+        "node_modules/parent/node_modules/child".to_string(),
+        Node {
+            location: "node_modules/parent/node_modules/child".to_string(),
+            name: "child".to_string(),
+            install_name: "child".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    // Nested scoped package: node_modules/parent/node_modules/@scope/scoped-child
+    graph.nodes.insert(
+        "node_modules/parent/node_modules/@scope/scoped-child".to_string(),
+        Node {
+            location: "node_modules/parent/node_modules/@scope/scoped-child".to_string(),
+            name: "@scope/scoped-child".to_string(),
+            install_name: "@scope/scoped-child".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = graph.to_lockfile_v3("root-app", Some("1.0.0"));
+
+    let child_lock = lockfile
+        .packages
+        .get("node_modules/parent/node_modules/child")
+        .expect("child lock entry");
+    assert_eq!(
+        child_lock.name, None,
+        "Standard nested package location must omit name in lockfile"
+    );
+
+    let scoped_child_lock = lockfile
+        .packages
+        .get("node_modules/parent/node_modules/@scope/scoped-child")
+        .expect("scoped child lock entry");
+    assert_eq!(
+        scoped_child_lock.name, None,
+        "Standard nested scoped package location must omit name in lockfile"
+    );
+}
+
+#[test]
+fn test_breadth_first_dependency_depth_prevents_premature_hoisting_from_deep_branches() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // pkg-a (alphabetically earlier) has deep transitive dep on shared@2.0.0 (depth 3)
+    provider.add_version("pkg-a", "1.0.0", |v| {
+        v.dependencies
+            .insert("sub-a".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("sub-a", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared".to_string(), "^2.0.0".to_string());
+    });
+    provider.add_version("shared", "2.0.0", |_| {});
+
+    // pkg-b (alphabetically later) has direct dependency on shared@1.0.0 (depth 2)
+    provider.add_version("pkg-b", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("shared", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("bfs-app".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+
+    // Shallower branch (pkg-b -> shared@1.0.0 at depth 2) must claim root node_modules/shared
+    let root_shared = graph
+        .nodes
+        .get("node_modules/shared")
+        .expect("root node_modules/shared");
+    assert_eq!(
+        root_shared.version, "1.0.0",
+        "Shallower dependency branch must claim root slot before deeper transitive branch"
+    );
+
+    // Deeper branch (pkg-a -> sub-a -> shared@2.0.0 at depth 3) must be nested
+    assert!(
+        graph.nodes.contains_key("node_modules/sub-a/node_modules/shared")
+            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/sub-a/node_modules/shared")
+            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/shared")
+    );
+}
+

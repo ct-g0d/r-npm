@@ -268,108 +268,137 @@ struct DiskPackage {
     pub raw_json: Option<Value>,
 }
 
-/// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
-fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
-    let mut result = HashMap::new();
-    let root_nm = project_dir.join("node_modules");
-    if !root_nm.is_dir() {
-        return result;
-    }
-    scan_nm_dir(project_dir, "node_modules", &mut result);
-    result
+struct RawDiskEntry {
+    location: String,
+    dir_path: PathBuf,
+    fallback_name: String,
 }
 
-fn scan_nm_dir(project_dir: &Path, nm_rel: &str, result: &mut HashMap<String, DiskPackage>) {
-    let full_path = project_dir.join(nm_rel);
-    let entries = match std::fs::read_dir(&full_path) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+/// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
+fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
+    let root_nm = project_dir.join("node_modules");
+    if !root_nm.is_dir() {
+        return HashMap::new();
+    }
 
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if name_str.starts_with('.') {
-            continue;
-        }
+    let mut raw_entries = Vec::new();
+    let mut nm_queue = VecDeque::new();
+    nm_queue.push_back("node_modules".to_string());
 
-        let entry_path = entry.path();
-        let is_junc = is_junction(&entry_path).unwrap_or(false);
-        if !entry_path.is_dir() && !is_junc {
-            continue;
-        }
+    while let Some(nm_rel) = nm_queue.pop_front() {
+        let full_path = project_dir.join(&nm_rel);
+        let entries = match std::fs::read_dir(&full_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-        if name_str.starts_with('@') {
-            // Scoped packages
-            if let Ok(scoped_entries) = std::fs::read_dir(&entry_path) {
-                for scoped_entry in scoped_entries.flatten() {
-                    let sub_name = scoped_entry.file_name();
-                    let sub_name_str = sub_name.to_string_lossy();
-                    if sub_name_str.starts_with('.') {
-                        continue;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+
+            let entry_path = entry.path();
+            let is_junc = is_junction(&entry_path).unwrap_or(false);
+            if !entry_path.is_dir() && !is_junc {
+                continue;
+            }
+
+            if name_str.starts_with('@') {
+                // Scoped packages
+                if let Ok(scoped_entries) = std::fs::read_dir(&entry_path) {
+                    for scoped_entry in scoped_entries.flatten() {
+                        let sub_name = scoped_entry.file_name();
+                        let sub_name_str = sub_name.to_string_lossy();
+                        if sub_name_str.starts_with('.') {
+                            continue;
+                        }
+                        let sub_path = scoped_entry.path();
+                        let sub_junc = is_junction(&sub_path).unwrap_or(false);
+                        if !sub_path.is_dir() && !sub_junc {
+                            continue;
+                        }
+
+                        let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
+                        let pkg_name = format!("{name_str}/{sub_name_str}");
+                        if !sub_junc && sub_path.join("node_modules").is_dir() {
+                            nm_queue.push_back(format!("{loc}/node_modules"));
+                        }
+                        raw_entries.push(RawDiskEntry {
+                            location: loc,
+                            dir_path: sub_path,
+                            fallback_name: pkg_name,
+                        });
                     }
-                    let sub_path = scoped_entry.path();
-                    let sub_junc = is_junction(&sub_path).unwrap_or(false);
-                    if !sub_path.is_dir() && !sub_junc {
-                        continue;
-                    }
+                }
+            } else {
+                let loc = format!("{nm_rel}/{name_str}");
+                let pkg_name = name_str.to_string();
+                if !is_junc && entry_path.join("node_modules").is_dir() {
+                    nm_queue.push_back(format!("{loc}/node_modules"));
+                }
+                raw_entries.push(RawDiskEntry {
+                    location: loc,
+                    dir_path: entry_path,
+                    fallback_name: pkg_name,
+                });
+            }
+        }
+    }
 
-                    let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
-                    let pkg_name = format!("{name_str}/{sub_name_str}");
-                    let (manifest, raw_json, version) = load_package_manifest(&sub_path);
+    if raw_entries.is_empty() {
+        return HashMap::new();
+    }
 
-                    result.insert(
-                        loc.clone(),
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(4, 16))
+        .unwrap_or(8)
+        .min(raw_entries.len());
+
+    let chunk_size = raw_entries.len().div_ceil(num_threads);
+
+    let parsed_chunks: Vec<Vec<(String, DiskPackage)>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for chunk in raw_entries.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(chunk.len());
+                for item in chunk {
+                    let (manifest, raw_json, version) = load_package_manifest(&item.dir_path);
+                    let name = manifest
+                        .as_ref()
+                        .and_then(|m| m.name.clone())
+                        .unwrap_or_else(|| item.fallback_name.clone());
+
+                    out.push((
+                        item.location.clone(),
                         DiskPackage {
-                            location: loc.clone(),
-                            dir_path: sub_path.clone(),
-                            name: manifest
-                                .as_ref()
-                                .and_then(|m| m.name.clone())
-                                .unwrap_or(pkg_name),
+                            location: item.location.clone(),
+                            dir_path: item.dir_path.clone(),
+                            name,
                             version,
                             manifest,
                             raw_json,
                         },
-                    );
-
-                    if !sub_junc {
-                        let nested_nm = sub_path.join("node_modules");
-                        if nested_nm.is_dir() {
-                            scan_nm_dir(project_dir, &format!("{loc}/node_modules"), result);
-                        }
-                    }
+                    ));
                 }
-            }
-        } else {
-            // Standard package
-            let loc = format!("{nm_rel}/{name_str}");
-            let pkg_name = name_str.to_string();
-            let (manifest, raw_json, version) = load_package_manifest(&entry_path);
+                out
+            }));
+        }
 
-            result.insert(
-                loc.clone(),
-                DiskPackage {
-                    location: loc.clone(),
-                    dir_path: entry_path.clone(),
-                    name: manifest
-                        .as_ref()
-                        .and_then(|m| m.name.clone())
-                        .unwrap_or(pkg_name),
-                    version,
-                    manifest,
-                    raw_json,
-                },
-            );
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
 
-            if !is_junc {
-                let nested_nm = entry_path.join("node_modules");
-                if nested_nm.is_dir() {
-                    scan_nm_dir(project_dir, &format!("{loc}/node_modules"), result);
-                }
-            }
+    let mut result = HashMap::with_capacity(raw_entries.len());
+    for chunk in parsed_chunks {
+        for (loc, pkg) in chunk {
+            result.insert(loc, pkg);
         }
     }
+    result
 }
 
 fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option<String>) {
@@ -377,16 +406,19 @@ fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         let manifest = serde_json::from_str::<Manifest>(&content).ok();
         let raw_json = serde_json::from_str::<Value>(&content).ok();
-        let version = raw_json
+        let version = manifest
             .as_ref()
-            .and_then(|j| j.get("version"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| manifest.as_ref().and_then(|m| m.version.clone()));
-        (manifest, raw_json, version)
-    } else {
-        (None, None, None)
+            .and_then(|m| m.version.clone())
+            .or_else(|| {
+                raw_json
+                    .as_ref()
+                    .and_then(|j| j.get("version"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        return (manifest, raw_json, version);
     }
+    (None, None, None)
 }
 
 /// Candidate locations in resolution order: from most nested to root node_modules.
@@ -508,6 +540,15 @@ pub fn build_dependency_tree(
                 direct_deps
                     .entry(name.clone())
                     .or_insert((req.clone(), "peer", is_opt));
+            }
+        }
+        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m) {
+            for member in members {
+                let expected_loc = format!("node_modules/{}", member.name);
+                if disk_packages.contains_key(&expected_loc) {
+                    let ver_req = member.version.clone().unwrap_or_else(|| "*".to_string());
+                    direct_deps.insert(member.name.clone(), (ver_req, "prod", false));
+                }
             }
         }
     } else if options.is_global {
@@ -994,6 +1035,19 @@ fn build_tree_from_lockfile(
             if let Some(peer_deps) = &r.peer_dependencies {
                 for (k, v) in peer_deps {
                     direct_deps.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        if r.workspaces.is_some() {
+            for (loc, pkg) in &lockfile.packages {
+                if pkg.link == Some(true) {
+                    if let Some(dep_name) = loc.strip_prefix("node_modules/") {
+                        if !dep_name.contains("/node_modules/") {
+                            direct_deps
+                                .entry(dep_name.to_string())
+                                .or_insert_with(|| "*".to_string());
+                        }
+                    }
                 }
             }
         }

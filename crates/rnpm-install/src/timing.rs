@@ -72,6 +72,8 @@ pub struct TimingMetrics {
     pub bytes_written: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub http_requests: u64,
+    pub http_304s: u64,
 }
 
 impl TimingMetrics {
@@ -113,6 +115,8 @@ impl TimingMetrics {
         ));
         out.push_str(&format!("  Cache hits:         {}\n", self.cache_hits));
         out.push_str(&format!("  Cache misses:       {}\n", self.cache_misses));
+        out.push_str(&format!("  HTTP requests:      {}\n", self.http_requests));
+        out.push_str(&format!("  HTTP 304s (cached): {}\n", self.http_304s));
         out
     }
 
@@ -283,7 +287,17 @@ impl TimingCollector {
             bytes_written: rnpm_fs::bytes_written().saturating_sub(self.initial_bytes_written),
             cache_hits: self.cache_hits.load(Ordering::Acquire),
             cache_misses: self.cache_misses.load(Ordering::Acquire),
+            http_requests: 0,
+            http_304s: 0,
         }
+    }
+
+    /// Finishes collection and populates HTTP request and 304 counters from the registry client.
+    pub fn finish_with_client(&self, client: &rnpm_registry::client::RegistryClient) -> TimingMetrics {
+        let mut metrics = self.finish();
+        metrics.http_requests = client.http_requests();
+        metrics.http_304s = client.http_304s();
+        metrics
     }
 }
 
