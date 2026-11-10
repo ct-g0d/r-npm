@@ -5996,18 +5996,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             package_lock_only,
             registry,
         } => {
-            let opts = query::QueryOptions {
-                selector,
-                package_lock_only,
-                registry,
-            };
-            let code = query::run_query(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "query finished with non-zero exit code".to_string(),
-                }));
-            }
+            commands::query::run(selector, package_lock_only, registry, current_dir).await?;
         }
         Commands::Publish {
             target,

@@ -12,3 +12,4 @@ pub mod dedupe;
 pub mod rebuild;
 pub mod link;
 pub mod init;
+pub mod query;
