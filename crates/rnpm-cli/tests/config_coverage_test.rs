@@ -85,6 +85,10 @@ fn test_config_get_set_delete_live_npm_parity() {
     // Test 1: config get registry (default)
     let rnpm_get_reg = Command::new(rnpm_bin)
         .current_dir(tmp_rnpm.path())
+        .env("HOME", &iso_rnpm)
+        .env("USERPROFILE", &iso_rnpm)
+        .env("npm_config_userconfig", iso_rnpm.join(".npmrc"))
+        .env("npm_config_globalconfig", iso_rnpm.join("global.npmrc"))
         .env("USERCONFIG", iso_rnpm.join(".npmrc"))
         .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
@@ -98,6 +102,10 @@ fn test_config_get_set_delete_live_npm_parity() {
     let npm_get_reg = Command::new("cmd.exe")
         .args(["/d", "/s", "/c", "npm.cmd", "config", "get", "registry"])
         .current_dir(tmp_npm.path())
+        .env("HOME", &iso_npm)
+        .env("USERPROFILE", &iso_npm)
+        .env("npm_config_userconfig", iso_npm.join(".npmrc"))
+        .env("npm_config_globalconfig", iso_npm.join("global.npmrc"))
         .env("USERCONFIG", iso_npm.join(".npmrc"))
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
@@ -120,23 +128,44 @@ fn test_config_get_set_delete_live_npm_parity() {
         }
     }
 
-    // Test 2: config set custom_key=custom_val
+    // Test 2: config set init-author-name=TestAuthor
+    let userconfig_rnpm = iso_rnpm.join(".npmrc");
+    let userconfig_npm = iso_npm.join(".npmrc");
+
     let rnpm_set = Command::new(rnpm_bin)
         .current_dir(tmp_rnpm.path())
-        .env("USERCONFIG", iso_rnpm.join(".npmrc"))
+        .env("HOME", &iso_rnpm)
+        .env("USERPROFILE", &iso_rnpm)
+        .env("npm_config_userconfig", &userconfig_rnpm)
+        .env("npm_config_globalconfig", iso_rnpm.join("global.npmrc"))
+        .env("USERCONFIG", &userconfig_rnpm)
         .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
         .env("CACHE", iso_rnpm.join("cache"))
         .env("APPDATA", iso_rnpm.join("appdata"))
         .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
-        .args(["config", "set", "custom_key=custom_val"])
+        .args(["config", "set", "init-author-name=TestAuthor", "--userconfig", userconfig_rnpm.to_str().unwrap()])
         .output()
         .expect("rnpm config set failed");
 
     let npm_set = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "config", "set", "custom_key=custom_val"])
+        .args([
+            "/d",
+            "/s",
+            "/c",
+            "npm.cmd",
+            "config",
+            "set",
+            "init-author-name=TestAuthor",
+            "--userconfig",
+            userconfig_npm.to_str().unwrap(),
+        ])
         .current_dir(tmp_npm.path())
-        .env("USERCONFIG", iso_npm.join(".npmrc"))
+        .env("HOME", &iso_npm)
+        .env("USERPROFILE", &iso_npm)
+        .env("npm_config_userconfig", &userconfig_npm)
+        .env("npm_config_globalconfig", iso_npm.join("global.npmrc"))
+        .env("USERCONFIG", &userconfig_npm)
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
         .env("CACHE", iso_npm.join("cache"))
@@ -154,23 +183,41 @@ fn test_config_get_set_delete_live_npm_parity() {
         }
     }
 
-    // Test 3: config get custom_key
+    // Test 3: config get init-author-name
     let rnpm_get_custom = Command::new(rnpm_bin)
         .current_dir(tmp_rnpm.path())
-        .env("USERCONFIG", iso_rnpm.join(".npmrc"))
+        .env("HOME", &iso_rnpm)
+        .env("USERPROFILE", &iso_rnpm)
+        .env("npm_config_userconfig", &userconfig_rnpm)
+        .env("npm_config_globalconfig", iso_rnpm.join("global.npmrc"))
+        .env("USERCONFIG", &userconfig_rnpm)
         .env("GLOBALCONFIG", iso_rnpm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_rnpm.join("prefix"))
         .env("CACHE", iso_rnpm.join("cache"))
         .env("APPDATA", iso_rnpm.join("appdata"))
         .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
-        .args(["config", "get", "custom_key"])
+        .args(["config", "get", "init-author-name", "--userconfig", userconfig_rnpm.to_str().unwrap()])
         .output()
-        .expect("rnpm config get custom_key failed");
+        .expect("rnpm config get init-author-name failed");
 
     let npm_get_custom = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "config", "get", "custom_key"])
+        .args([
+            "/d",
+            "/s",
+            "/c",
+            "npm.cmd",
+            "config",
+            "get",
+            "init-author-name",
+            "--userconfig",
+            userconfig_npm.to_str().unwrap(),
+        ])
         .current_dir(tmp_npm.path())
-        .env("USERCONFIG", iso_npm.join(".npmrc"))
+        .env("HOME", &iso_npm)
+        .env("USERPROFILE", &iso_npm)
+        .env("npm_config_userconfig", &userconfig_npm)
+        .env("npm_config_globalconfig", iso_npm.join("global.npmrc"))
+        .env("USERCONFIG", &userconfig_npm)
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
         .env("CACHE", iso_npm.join("cache"))

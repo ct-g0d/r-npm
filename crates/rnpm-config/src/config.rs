@@ -585,6 +585,12 @@ pub fn find_user_npmrc_with_env<LookupFn>(lookup: LookupFn) -> Option<PathBuf>
 where
     LookupFn: Fn(&str) -> Option<String>,
 {
+    if let Some(userconfig) = lookup("NPM_CONFIG_USERCONFIG")
+        .or_else(|| lookup("npm_config_userconfig"))
+        .or_else(|| lookup("USERCONFIG"))
+    {
+        return Some(PathBuf::from(userconfig));
+    }
     if let Some(userprofile) = lookup("USERPROFILE") {
         let path = PathBuf::from(userprofile).join(".npmrc");
         return Some(path);
@@ -740,11 +746,23 @@ pub fn find_local_node_modules(start_dir: &Path) -> PathBuf {
 
 /// Returns default path for global .npmrc given a prefix.
 pub fn get_default_global_npmrc(prefix: &Path) -> PathBuf {
+    if let Some(globalconfig) = get_process_globalconfig() {
+        return globalconfig;
+    }
+    if let Ok(globalconfig) = env::var("NPM_CONFIG_GLOBALCONFIG")
+        .or_else(|_| env::var("npm_config_globalconfig"))
+        .or_else(|_| env::var("GLOBALCONFIG"))
+    {
+        return PathBuf::from(globalconfig);
+    }
     prefix.join("etc").join("npmrc")
 }
 
 /// Returns default path for user .npmrc.
 pub fn get_default_user_npmrc() -> PathBuf {
+    if let Some(userconfig) = get_process_userconfig() {
+        return userconfig;
+    }
     if let Some(user) = find_user_npmrc() {
         return user;
     }
