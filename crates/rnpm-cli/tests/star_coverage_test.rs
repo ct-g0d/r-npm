@@ -295,7 +295,6 @@ async fn test_cli_star_unstar_stars_parity() {
         assert!(rnpm_unstar.status.success());
     }
 
-    /*
     // 3. Test stars testuser
     let rnpm_stars = Command::new(rnpm_bin)
         .current_dir(tmp.path())
@@ -353,7 +352,6 @@ async fn test_cli_star_unstar_stars_parity() {
     } else {
         assert!(rnpm_stars.status.success());
     }
-    */
 
     let _ = tx.send(());
 }
