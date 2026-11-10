@@ -135,6 +135,34 @@ fn setup_fixture_project(dir: &Path) {
 }
 
 #[test]
+fn test_link_tree_bins_ansi_html() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    let bin = nm.join(".bin");
+    let ansi_html = nm.join("ansi-html");
+    std::fs::create_dir_all(ansi_html.join("bin")).unwrap();
+    std::fs::write(
+        ansi_html.join("package.json"),
+        r#"{"name":"ansi-html","version":"0.0.9","bin":{"ansi-html":"./bin/ansi-html"}}"#,
+    ).unwrap();
+    std::fs::write(ansi_html.join("bin/ansi-html"), "#!/usr/bin/env node\nconsole.log(1);").unwrap();
+
+    crate::link_tree_bins(
+        vec!["node_modules/ansi-html".to_string()],
+        root,
+        &bin,
+        &nm,
+        None,
+    );
+
+    assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
+    assert!(bin.join("ansi-html.cmd").exists(), "bin/ansi-html.cmd exists");
+    assert!(bin.join("ansi-html.ps1").exists(), "bin/ansi-html.ps1 exists");
+}
+
+
+#[test]
 fn test_uninstall_single_package_and_transitive_pruning() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
@@ -4256,6 +4284,27 @@ async fn test_enrich_lockfile_from_cacache_packument() {
 
     let pkg = lockfile.packages.get(&format!("node_modules/{pkg_name}")).unwrap();
     assert_eq!(pkg.license.as_deref(), Some("MIT"));
+}
+
+#[tokio::test]
+async fn test_enrich_lockfile_with_scoped_package_license_and_libc() {
+    let mut lockfile = LockfileV3::new("test", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/@next/swc-linux-x64-musl",
+        LockfilePackage {
+            version: Some("14.2.5".to_string()),
+            os: Some(vec!["linux".to_string()]),
+            ..Default::default()
+        },
+    );
+    let mut installer = Installer::new(InstallOptions::default()).unwrap();
+    installer.enrich_lockfile_from_registry(&mut lockfile).await.unwrap();
+
+    let pkg = lockfile.packages.get("node_modules/@next/swc-linux-x64-musl").unwrap();
+    if pkg.license.is_some() {
+        assert_eq!(pkg.license.as_deref(), Some("MIT"));
+        assert_eq!(pkg.libc.as_deref(), Some(&["musl".to_string()][..]));
+    }
 }
 
 

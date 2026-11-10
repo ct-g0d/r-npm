@@ -1312,6 +1312,10 @@ pub(crate) fn link_tree_bins(
                     &script_path,
                 );
 
+                if bin_name == "ansi-html" {
+                    eprintln!("DEBUG_LINK: after link_single_pkg_bin, cmd_exists={}", pkg_bin_dir.join("ansi-html.cmd").exists());
+                }
+
                 wanted_set.insert(bin_name.clone());
                 wanted_set.insert(format!("{bin_name}.cmd"));
                 wanted_set.insert(format!("{bin_name}.ps1"));
@@ -3817,7 +3821,7 @@ impl Installer {
         let _meta_span = tracing::info_span!("metadata").entered();
 
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
-        let lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
+        let mut lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
             .with_context(|| format!("Failed to parse {lockfile_name}"))?;
         let platform_skipped_packages =
             lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
@@ -3946,7 +3950,7 @@ impl Installer {
         let overrides = rnpm_solver::Overrides::from_manifest(&manifest).ok();
         let mut missing_dependencies = Vec::new();
         for (pkg_key, pkg_info) in &lockfile.packages {
-            if platform_skipped_packages.contains(pkg_key) {
+            if platform_skipped_packages.contains(pkg_key) || pkg_info.is_extraneous() {
                 continue;
             }
             if self.options.omit_dev && pkg_info.dev == Some(true) {
@@ -4017,7 +4021,7 @@ impl Installer {
             let host_platform = self.options.platform();
             let mut packages_installed = 0;
             for (pkg_key, pkg_info) in &lockfile.packages {
-                if pkg_key.is_empty() {
+                if pkg_key.is_empty() || pkg_info.is_extraneous() {
                     continue;
                 }
                 let is_dev = pkg_info.dev.unwrap_or(false);
@@ -4095,7 +4099,10 @@ impl Installer {
         {
             let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
             for (pkg_key, pkg_info) in &lockfile.packages {
-                if pkg_key.is_empty() || platform_skipped_packages.contains(pkg_key) {
+                if pkg_key.is_empty()
+                    || platform_skipped_packages.contains(pkg_key)
+                    || pkg_info.is_extraneous()
+                {
                     continue;
                 }
                 let is_dev = pkg_info.dev.unwrap_or(false);
@@ -4216,7 +4223,7 @@ impl Installer {
         let mut packages_to_process: Vec<CiPackage> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
-            if pkg_key.is_empty() {
+            if pkg_key.is_empty() || pkg_info.is_extraneous() {
                 continue;
             }
 
@@ -5123,6 +5130,7 @@ impl Installer {
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         if self.options.package_lock_enabled() && !self.options.dry_run {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
+            lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
                 .save_hidden(&self.options.project_dir)
                 .context("Failed to save hidden package-lock.json")?;
@@ -5185,28 +5193,73 @@ impl Installer {
             }
         }
 
+        let mut full_packument_cache: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+
+        let npm_cacache_path = std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|l| std::path::PathBuf::from(l).join("npm-cache").join("_cacache"));
+        let npm_cacache = npm_cacache_path
+            .as_ref()
+            .filter(|p| p.exists())
+            .and_then(|p| rnpm_cache::Cache::new(p).ok());
+
         for name in &names {
-            if !self.metadata_cache.contains_key(name) {
-                let registry_url = self.registry_client.registry_for_package(name).as_str();
-                let cached_bytes = self
-                    .cache
-                    .get_packument(registry_url, name)
-                    .ok()
-                    .flatten()
-                    .map(|(_entry, bytes)| bytes)
-                    .or_else(|| {
-                        let full_url = format!("{}/{}", registry_url.trim_end_matches('/'), name);
-                        let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
-                        self.cache
-                            .get(&cacache_key)
+            let registry_url = self.registry_client.registry_for_package(name).as_str();
+            let encoded_name = rnpm_registry::encode_package_name(name);
+            let full_url_enc = format!("{}/{}", registry_url.trim_end_matches('/'), encoded_name);
+            let cacache_key_enc = format!("make-fetch-happen:request-cache:{full_url_enc}");
+            let full_url_raw = format!("{}/{}", registry_url.trim_end_matches('/'), name);
+            let cacache_key_raw = format!("make-fetch-happen:request-cache:{full_url_raw}");
+
+            let cached_bytes = self
+                .cache
+                .get(&cacache_key_enc)
+                .ok()
+                .flatten()
+                .or_else(|| self.cache.get(&cacache_key_raw).ok().flatten())
+                .or_else(|| self.cache.get(&full_url_enc).ok().flatten())
+                .or_else(|| self.cache.get(&full_url_raw).ok().flatten())
+                .or_else(|| {
+                    npm_cacache.as_ref().and_then(|c| {
+                        c.get(&cacache_key_enc)
                             .ok()
                             .flatten()
-                            .or_else(|| self.cache.get(&full_url).ok().flatten())
-                            .map(|(_entry, bytes)| bytes)
-                    });
-                if let Some(bytes) = cached_bytes {
+                            .or_else(|| c.get(&cacache_key_raw).ok().flatten())
+                            .or_else(|| c.get(&full_url_enc).ok().flatten())
+                            .or_else(|| c.get(&full_url_raw).ok().flatten())
+                    })
+                })
+                .or_else(|| {
+                    self.cache
+                        .get_packument_with_accept(registry_url, name, Some(NPM_INSTALL_V1_JSON))
+                        .ok()
+                        .flatten()
+                        .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
+                })
+                .map(|(_entry, bytes)| bytes);
+
+            if let Some(bytes) = cached_bytes {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    full_packument_cache.insert(name.clone(), val);
+                }
+                if !self.metadata_cache.contains_key(name) {
                     if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&bytes) {
                         self.metadata_cache.insert(name.clone(), meta);
+                    }
+                }
+            }
+
+            // Always supplement full_packument_cache from npm_cacache if available
+            if let Some(ref c) = npm_cacache {
+                if let Some((_, full_bytes)) = c
+                    .get(&cacache_key_enc)
+                    .ok()
+                    .flatten()
+                    .or_else(|| c.get(&cacache_key_raw).ok().flatten())
+                {
+                    if let Ok(full_val) = serde_json::from_slice::<serde_json::Value>(&full_bytes) {
+                        full_packument_cache.insert(name.clone(), full_val);
                     }
                 }
             }
@@ -5229,6 +5282,37 @@ impl Installer {
             let Some(version) = package.version.as_deref() else {
                 continue;
             };
+
+            // 1. Try filling license and libc from cached full packument
+            if let Some(val) = full_packument_cache.get(&name) {
+                if let Some(ver_val) = val.get("versions").and_then(|v| v.get(version)) {
+                    if package.license.is_none() {
+                        if let Some(lic) = ver_val.get("license").and_then(|l| l.as_str()) {
+                            package.license = Some(lic.to_string());
+                        } else if let Some(lic_obj) = ver_val.get("license").and_then(|l| l.as_object()) {
+                            if let Some(t) = lic_obj.get("type").and_then(|t| t.as_str()) {
+                                package.license = Some(t.to_string());
+                            }
+                        }
+                    }
+                    if package.libc.is_none() {
+                        if let Some(libc_val) = ver_val.get("libc") {
+                            if let Some(s) = libc_val.as_str() {
+                                package.libc = Some(vec![s.to_string()]);
+                            } else if let Some(arr) = libc_val.as_array() {
+                                let list: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect();
+                                if !list.is_empty() {
+                                    package.libc = Some(list);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let Some(metadata) = self.metadata_cache.get(&name) else {
                 continue;
             };
@@ -5238,30 +5322,6 @@ impl Installer {
 
             if package.license.is_none() {
                 package.license = version_meta.license.clone();
-                if package.license.is_none() {
-                    let reg_url = self.registry_client.registry_for_package(&name);
-                    let full_url = format!("{}/{}", reg_url.as_str().trim_end_matches('/'), name);
-                    let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
-                    let cached_bytes = self
-                        .cache
-                        .get(&cacache_key)
-                        .ok()
-                        .flatten()
-                        .or_else(|| self.cache.get(&full_url).ok().flatten())
-                        .map(|(_entry, bytes)| bytes);
-                    if let Some(bytes) = cached_bytes {
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                            if let Some(lic) = val
-                                .get("versions")
-                                .and_then(|v| v.get(version))
-                                .and_then(|ver| ver.get("license"))
-                                .and_then(|l| l.as_str())
-                            {
-                                package.license = Some(lic.to_string());
-                            }
-                        }
-                    }
-                }
             }
             if package.engines.is_none() && !version_meta.engines.is_empty() {
                 package.engines = Some(rnpm_lockfile::PackageEngines::Map(
@@ -6827,8 +6887,21 @@ fn enrich_lockfile_from_installed_manifests(lockfile: &mut LockfileV3, project_d
                 });
         }
 
-        if package.engines.is_none() && !manifest.engines.is_empty() {
-            package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+        if package.engines.is_none() {
+            if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
+                    if let Some(engines_val) = json.get("engines") {
+                        if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(engines_val.clone()) {
+                            if !engines.is_empty() {
+                                package.engines = Some(engines);
+                            }
+                        }
+                    }
+                }
+            }
+            if package.engines.is_none() && !manifest.engines.is_empty() {
+                package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+            }
         }
         if package.bin.is_none() {
             if let Some(bin) = &manifest.bin {
