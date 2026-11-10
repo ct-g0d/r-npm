@@ -3621,49 +3621,6 @@ async fn execute_whoami(
     Ok(())
 }
 
-async fn execute_ping(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    if let Some(tok) = config.npmrc.get_auth_token(&registry_url) {
-        client_config.auth_token = Some(tok.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-    let duration = client.ping(Some(&registry_url)).await?;
-
-    if json {
-        let json_out = serde_json::json!({
-            "registry": registry_url.to_string(),
-            "time": duration.as_millis(),
-            "details": {}
-        });
-        println!("{}", serde_json::to_string_pretty(&json_out)?);
-    } else {
-        eprintln!("npm notice PING {registry_url}");
-        eprintln!("npm notice PONG {}ms", duration.as_millis());
-    }
-
-    Ok(())
-}
 
 async fn execute_login(
     current_dir: &std::path::Path,
@@ -5943,7 +5900,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             execute_whoami(&current_dir, registry, json).await?;
         }
         Commands::Ping { registry, json } => {
-            execute_ping(&current_dir, registry, json).await?;
+            commands::ping::run(registry, json, current_dir).await?;
         }
         Commands::Login {
             registry,
