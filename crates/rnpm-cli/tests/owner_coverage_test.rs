@@ -40,10 +40,37 @@ async fn test_cli_owner_ls() {
     });
 
     let tmp = tempdir().unwrap();
+    let iso = tempdir().unwrap();
+    let cache_dir = iso.path().join("cache");
+    let prefix_dir = iso.path().join("prefix");
+    let appdata = iso.path().join("appdata");
+    let localappdata = iso.path().join("localappdata");
+    let userconfig = iso.path().join(".npmrc");
+    let globalconfig = iso.path().join("global.npmrc");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&prefix_dir).unwrap();
+    std::fs::create_dir_all(&appdata).unwrap();
+    std::fs::create_dir_all(&localappdata).unwrap();
+    std::fs::write(&userconfig, "").unwrap();
+    std::fs::write(&globalconfig, "").unwrap();
+
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     let out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .args([
             "owner",
             "--registry",
@@ -67,6 +94,19 @@ async fn test_cli_owner_ls() {
             &format!("http://{addr}/"),
         ])
         .current_dir(tmp.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .output();
 
     let _ = tx.send(());

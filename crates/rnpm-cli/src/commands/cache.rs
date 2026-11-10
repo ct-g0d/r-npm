@@ -27,12 +27,14 @@ pub(crate) fn run(action: CacheAction, cache_arg: Option<PathBuf>, current_dir: 
     match action {
         CacheAction::Clean { force, .. } => {
             if !force {
-                eprintln!("npm error code EUSAGE");
-                eprintln!("npm error As of npm@5, the npm cache self-heals from corruption issues");
-                eprintln!("npm error and data extracted from the cache is guaranteed to be valid.");
-                eprintln!("npm error If you want to make sure everything is healthy, use 'rnpm cache verify' instead.");
-                eprintln!("npm error If you are sure you want to delete the entire cache, run:");
-                eprintln!("npm error   rnpm cache clean --force");
+                eprintln!("npm error As of npm@5, the npm cache self-heals from corruption issues by treating integrity mismatches as cache misses.");
+                eprintln!("npm error As a result, data extracted from the cache is guaranteed to be valid.");
+                eprintln!("npm error If you want to make sure everything is consistent, use `npm cache verify` instead.");
+                eprintln!("npm error Deleting the cache can only make npm go slower, and is not likely to correct any problems you may be encountering!");
+                eprintln!("npm error");
+                eprintln!("npm error On the other hand, if you're debugging an issue with the installer, or race conditions that depend on the timing of writing to an empty cache, you can use `npm install --cache /tmp/empty-cache` to use a temporary cache instead of removing the actual one.");
+                eprintln!("npm error");
+                eprintln!("npm error If you're sure you want to delete the entire cache, rerun this command with --force.");
                 std::process::exit(1);
             }
             cache.clean()?;
@@ -42,7 +44,7 @@ pub(crate) fn run(action: CacheAction, cache_arg: Option<PathBuf>, current_dir: 
             let start = std::time::Instant::now();
             let report = cache.verify()?;
             let elapsed = start.elapsed().as_secs_f64();
-            println!("Cache verified and compacted ({})", cache_path.display());
+            println!("Cache verified and compacted ({}):", cache_path.display());
             println!(
                 "Content verified: {} ({} bytes)",
                 report.verified_blobs, report.total_blob_bytes

@@ -3524,6 +3524,7 @@ impl Installer {
         if !self.options.no_save && self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir, Some(&in_memory_manifests));
+            self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if !self.options.is_global {
                 lockfile
@@ -3617,7 +3618,7 @@ impl Installer {
         let _meta_span = tracing::info_span!("metadata").entered();
 
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
-        let lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
+        let mut lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
             .with_context(|| format!("Failed to parse {lockfile_name}"))?;
         let platform_skipped_packages =
             lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
@@ -3746,7 +3747,7 @@ impl Installer {
         let overrides = rnpm_solver::Overrides::from_manifest(&manifest).ok();
         let mut missing_dependencies = Vec::new();
         for (pkg_key, pkg_info) in &lockfile.packages {
-            if platform_skipped_packages.contains(pkg_key) {
+            if platform_skipped_packages.contains(pkg_key) || pkg_info.is_extraneous() {
                 continue;
             }
             if self.options.omit_dev && pkg_info.dev == Some(true) {
@@ -3817,7 +3818,7 @@ impl Installer {
             let host_platform = self.options.platform();
             let mut packages_installed = 0;
             for (pkg_key, pkg_info) in &lockfile.packages {
-                if pkg_key.is_empty() {
+                if pkg_key.is_empty() || pkg_info.is_extraneous() {
                     continue;
                 }
                 let is_dev = pkg_info.dev.unwrap_or(false);
@@ -3897,7 +3898,10 @@ impl Installer {
         {
             let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
             for (pkg_key, pkg_info) in &lockfile.packages {
-                if pkg_key.is_empty() || platform_skipped_packages.contains(pkg_key) {
+                if pkg_key.is_empty()
+                    || platform_skipped_packages.contains(pkg_key)
+                    || pkg_info.is_extraneous()
+                {
                     continue;
                 }
                 let is_dev = pkg_info.dev.unwrap_or(false);
@@ -4009,7 +4013,7 @@ impl Installer {
         let mut packages_to_process: Vec<CiPackage> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
-            if pkg_key.is_empty() {
+            if pkg_key.is_empty() || pkg_info.is_extraneous() {
                 continue;
             }
 
@@ -4986,6 +4990,7 @@ impl Installer {
         let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
         if !used_fast_path && self.options.package_lock_enabled() && !self.options.dry_run && has_packages {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
+            lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
                 .save_hidden(&self.options.project_dir)
                 .context("Failed to save hidden package-lock.json")?;
@@ -5022,38 +5027,101 @@ impl Installer {
 
         let mut names = std::collections::BTreeSet::new();
         for (location, package) in &lockfile.packages {
-            if location.is_empty()
-                || package.link == Some(true)
-                || (package.license.is_some() && package.libc.is_some())
-            {
+            if location.is_empty() || package.link == Some(true) {
+                continue;
+            }
+            let is_linux_package = package
+                .os
+                .as_ref()
+                .map(|os_list| os_list.iter().any(|os| os == "linux"))
+                .unwrap_or(false);
+            let needs_license = package.license.is_none();
+            let needs_libc = is_linux_package && package.libc.is_none();
+            if !needs_license && !needs_libc {
                 continue;
             }
             let name = package.name.clone().or_else(|| {
-                let leaf = location.rsplit("/node_modules/").next().unwrap_or(location);
-                location
-                    .strip_prefix("node_modules/")
-                    .map(|_| leaf.to_string())
+                location.strip_prefix("node_modules/").map(|leaf| {
+                    leaf.rsplit("/node_modules/")
+                        .next()
+                        .unwrap_or(leaf)
+                        .to_string()
+                })
             });
             if let Some(name) = name {
                 names.insert(name);
             }
         }
 
-        let client = self.registry_client.clone();
-        let mut jobs = tokio::task::JoinSet::new();
-        for name in names {
-            let client = client.clone();
-            jobs.spawn(async move {
-                let result = client.get_package_metadata_full(&name).await;
-                (name, result)
-            });
-        }
+        let mut full_packument_cache: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
 
-        while let Some(result) = jobs.join_next().await {
-            let (name, metadata) =
-                result.map_err(|e| anyhow!("metadata enrichment task failed: {e}"))?;
-            if let Ok(metadata) = metadata {
-                self.metadata_cache.insert(name, metadata);
+        let npm_cacache_path = std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|l| std::path::PathBuf::from(l).join("npm-cache").join("_cacache"));
+        let npm_cacache = npm_cacache_path
+            .as_ref()
+            .filter(|p| p.exists())
+            .and_then(|p| rnpm_cache::Cache::new(p).ok());
+
+        for name in &names {
+            let registry_url = self.registry_client.registry_for_package(name).as_str();
+            let encoded_name = rnpm_registry::encode_package_name(name);
+            let full_url_enc = format!("{}/{}", registry_url.trim_end_matches('/'), encoded_name);
+            let cacache_key_enc = format!("make-fetch-happen:request-cache:{full_url_enc}");
+            let full_url_raw = format!("{}/{}", registry_url.trim_end_matches('/'), name);
+            let cacache_key_raw = format!("make-fetch-happen:request-cache:{full_url_raw}");
+
+            let cached_bytes = self
+                .cache
+                .get(&cacache_key_enc)
+                .ok()
+                .flatten()
+                .or_else(|| self.cache.get(&cacache_key_raw).ok().flatten())
+                .or_else(|| self.cache.get(&full_url_enc).ok().flatten())
+                .or_else(|| self.cache.get(&full_url_raw).ok().flatten())
+                .or_else(|| {
+                    npm_cacache.as_ref().and_then(|c| {
+                        c.get(&cacache_key_enc)
+                            .ok()
+                            .flatten()
+                            .or_else(|| c.get(&cacache_key_raw).ok().flatten())
+                            .or_else(|| c.get(&full_url_enc).ok().flatten())
+                            .or_else(|| c.get(&full_url_raw).ok().flatten())
+                    })
+                })
+                .or_else(|| {
+                    self.cache
+                        .get_packument_with_accept(registry_url, name, Some(NPM_INSTALL_V1_JSON))
+                        .ok()
+                        .flatten()
+                        .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
+                })
+                .map(|(_entry, bytes)| bytes);
+
+            if let Some(bytes) = cached_bytes {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    full_packument_cache.insert(name.clone(), val);
+                }
+                if !self.metadata_cache.contains_key(name) {
+                    if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&bytes) {
+                        self.metadata_cache.insert(name.clone(), meta);
+                    }
+                }
+            }
+
+            // Always supplement full_packument_cache from npm_cacache if available
+            if let Some(ref c) = npm_cacache {
+                if let Some((_, full_bytes)) = c
+                    .get(&cacache_key_enc)
+                    .ok()
+                    .flatten()
+                    .or_else(|| c.get(&cacache_key_raw).ok().flatten())
+                {
+                    if let Ok(full_val) = serde_json::from_slice::<serde_json::Value>(&full_bytes) {
+                        full_packument_cache.insert(name.clone(), full_val);
+                    }
+                }
             }
         }
 
@@ -5074,6 +5142,37 @@ impl Installer {
             let Some(version) = package.version.as_deref() else {
                 continue;
             };
+
+            // 1. Try filling license and libc from cached full packument
+            if let Some(val) = full_packument_cache.get(&name) {
+                if let Some(ver_val) = val.get("versions").and_then(|v| v.get(version)) {
+                    if package.license.is_none() {
+                        if let Some(lic) = ver_val.get("license").and_then(|l| l.as_str()) {
+                            package.license = Some(lic.to_string());
+                        } else if let Some(lic_obj) = ver_val.get("license").and_then(|l| l.as_object()) {
+                            if let Some(t) = lic_obj.get("type").and_then(|t| t.as_str()) {
+                                package.license = Some(t.to_string());
+                            }
+                        }
+                    }
+                    if package.libc.is_none() {
+                        if let Some(libc_val) = ver_val.get("libc") {
+                            if let Some(s) = libc_val.as_str() {
+                                package.libc = Some(vec![s.to_string()]);
+                            } else if let Some(arr) = libc_val.as_array() {
+                                let list: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect();
+                                if !list.is_empty() {
+                                    package.libc = Some(list);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let Some(metadata) = self.metadata_cache.get(&name) else {
                 continue;
             };

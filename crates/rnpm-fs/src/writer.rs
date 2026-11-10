@@ -1024,6 +1024,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut file_order: Vec<String> = Vec::new();
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
+    let mut saw_npmignores: HashSet<PathBuf> = HashSet::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -1088,7 +1089,7 @@ pub fn decode_tar_entries<R: Read>(
 
         validate_entry_path(&raw_path)?;
 
-        let relative_path = match strip_package_prefix(&raw_path) {
+        let mut relative_path = match strip_package_prefix(&raw_path) {
             Some(p) => {
                 let cleaned: PathBuf = p
                     .components()
@@ -1101,6 +1102,20 @@ pub fn decode_tar_entries<R: Read>(
             }
             None => continue,
         };
+
+        // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+        // unless a .npmignore file is already present.
+        if entry_type.is_file() {
+            if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                saw_npmignores.insert(relative_path.clone());
+            } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+                let ni = relative_path.with_file_name(".npmignore");
+                if saw_npmignores.contains(&ni) {
+                    continue;
+                }
+                relative_path = ni;
+            }
+        }
 
         validate_entry_path(&relative_path)?;
 

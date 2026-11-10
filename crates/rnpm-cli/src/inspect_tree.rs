@@ -542,6 +542,15 @@ pub fn build_dependency_tree(
                     .or_insert((req.clone(), "peer", is_opt));
             }
         }
+        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m) {
+            for member in members {
+                let expected_loc = format!("node_modules/{}", member.name);
+                if disk_packages.contains_key(&expected_loc) {
+                    let ver_req = member.version.clone().unwrap_or_else(|| "*".to_string());
+                    direct_deps.insert(member.name.clone(), (ver_req, "prod", false));
+                }
+            }
+        }
     } else if options.is_global {
         // In global prefix, the top-level packages directly under node_modules constitute the installed packages
         for (loc, pkg) in &disk_packages {
@@ -1026,6 +1035,19 @@ fn build_tree_from_lockfile(
             if let Some(peer_deps) = &r.peer_dependencies {
                 for (k, v) in peer_deps {
                     direct_deps.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        if r.workspaces.is_some() {
+            for (loc, pkg) in &lockfile.packages {
+                if pkg.link == Some(true) {
+                    if let Some(dep_name) = loc.strip_prefix("node_modules/") {
+                        if !dep_name.contains("/node_modules/") {
+                            direct_deps
+                                .entry(dep_name.to_string())
+                                .or_insert_with(|| "*".to_string());
+                        }
+                    }
                 }
             }
         }
