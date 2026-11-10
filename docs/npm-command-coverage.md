@@ -59,7 +59,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `pack` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `pack --dry-run` on fresh fixture directory |
 | `ping` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `ping` on fresh fixture directory |
 | `pkg` | - | **matching** | Quoted JSON string output for `pkg get name` matches npm parity | Ran `pkg get name` on fresh fixture directory |
-| `prefix` | - | **partial** | Path canonicalization: npm resolves Windows short 8.3/case variations, whereas rnpm returns the canonicalized filesystem PathBuf | Ran `prefix` on fresh fixture directory |
+| `prefix` | - | **matching** | Resolves local and global prefix directory paths matching npm output | Ran `prefix` against npm parity test |
 | `profile` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `profile --help` on fresh fixture directory |
 | `prune` | - | **matching** | Full dependency tree reification, lockfile generation, and summary line wording match npm parity | Ran `prune` on fresh fixture directory |
 | `publish` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `publish --dry-run` on fresh fixture directory |
@@ -67,7 +67,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `rebuild` | `rb` | **matching** | Output `rebuilt dependencies successfully` matches npm parity | Ran `rebuild` on fresh fixture directory |
 | `repo` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `repo` on fresh fixture directory |
 | `restart` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `restart` on fresh fixture directory |
-| `root` | - | **partial** | Path canonicalization: npm resolves Windows short 8.3/case variations, whereas rnpm returns the canonicalized filesystem PathBuf | Ran `root` on fresh fixture directory |
+| `root` | - | **matching** | Resolves local and global node_modules directory paths matching npm output | Ran `root` against npm parity test |
 | `run` | `run-script`, `rum`, `urn` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `run test` on fresh fixture directory |
 | `sbom` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `sbom --help` on fresh fixture directory |
 | `search` | `find`, `s`, `se` | **matching** | Block text format and JSON array output match npm 11 parity | Ran `search is-number` on fresh fixture directory |
