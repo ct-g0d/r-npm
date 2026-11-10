@@ -27,6 +27,9 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         }
     }
 
+    let nm_dir = current_dir.join("node_modules");
+    let had_nm = nm_dir.exists();
+
     let install_options = InstallOptions {
         project_dir: current_dir.clone(),
         omit_dev,
@@ -53,6 +56,10 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         let summary = installer.prune(&prune_options)?;
         summary.removed_packages.len()
     };
+
+    if !had_nm && install_summary.packages_installed == 0 && nm_dir.exists() {
+        let _ = std::fs::remove_dir_all(&nm_dir);
+    }
 
     let total_added = install_summary.packages_installed;
     let total_removed = removed;
