@@ -3794,11 +3794,7 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
     )?)?)
 }
 
-/// Return installed dependency identities that can execute install-time code.
-/// The walk follows the actual node_modules tree, so nested and multi-version
-/// dependencies are classified independently just like Arborist's actual tree.
-
-
+/// Parse a team entity in `@scope:team` format.
 fn split_team_entity(entity: &str) -> anyhow::Result<(&str, &str)> {
     let entity = entity.trim_start_matches('@');
     entity.split_once(':').ok_or_else(|| {

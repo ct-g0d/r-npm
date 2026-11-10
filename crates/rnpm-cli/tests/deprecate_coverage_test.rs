@@ -143,6 +143,8 @@ async fn test_cli_deprecate_mock() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .args([
@@ -184,6 +186,8 @@ async fn test_cli_deprecate_mock() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .output();

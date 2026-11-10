@@ -68,10 +68,8 @@ pub(crate) async fn run_stars(
             .filter_map(|r| {
                 if let Some(s) = r.get("value").and_then(|v| v.as_str()) {
                     Some(s.to_string())
-                } else if let Some(s) = r.as_str() {
-                    Some(s.to_string())
                 } else {
-                    None
+                    r.as_str().map(|s| s.to_string())
                 }
             })
             .collect()

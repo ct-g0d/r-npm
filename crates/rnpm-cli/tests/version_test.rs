@@ -510,9 +510,36 @@ fn test_bare_version_display_map_and_json() {
     assert!(lines[3].contains("node: '"), "Third entry must be node version: {}", lines[3]);
 
     // Compare directly against npm version if available
+    let iso = tempdir().unwrap();
+    let cache_dir = iso.path().join("cache");
+    let prefix_dir = iso.path().join("prefix");
+    let appdata = iso.path().join("appdata");
+    let localappdata = iso.path().join("localappdata");
+    let userconfig = iso.path().join(".npmrc");
+    let globalconfig = iso.path().join("global.npmrc");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&prefix_dir).unwrap();
+    fs::create_dir_all(&appdata).unwrap();
+    fs::create_dir_all(&localappdata).unwrap();
+    fs::write(&userconfig, "").unwrap();
+    fs::write(&globalconfig, "").unwrap();
+
     let npm_out = Command::new("cmd.exe")
         .args(["/d", "/s", "/c", "npm.cmd", "version"])
         .current_dir(project_dir)
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .output();
     if let Ok(npm_res) = npm_out {
         if npm_res.status.success() {

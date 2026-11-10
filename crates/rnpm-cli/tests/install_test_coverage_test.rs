@@ -5,6 +5,20 @@ use tempfile::tempdir;
 #[test]
 fn test_install_test_execution() {
     let tmp = tempdir().unwrap();
+    let iso = tmp.path().join("iso");
+    let cache_dir = iso.join("cache");
+    let prefix_dir = iso.join("prefix");
+    let appdata = iso.join("appdata");
+    let localappdata = iso.join("localappdata");
+    let userconfig = iso.join(".npmrc");
+    let globalconfig = iso.join("global.npmrc");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&prefix_dir).unwrap();
+    fs::create_dir_all(&appdata).unwrap();
+    fs::create_dir_all(&localappdata).unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&globalconfig, "").unwrap();
+
     let pkg_json = r#"{
   "name": "install-test-pkg",
   "version": "1.0.0",
@@ -19,6 +33,19 @@ fn test_install_test_execution() {
 
     let out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
+        .env("HOME", &iso)
+        .env("USERPROFILE", &iso)
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
         .args(["install-test", "--package-lock-only"])
@@ -70,6 +97,20 @@ fn test_install_test_live_npm_parity() {
     let tmp_rnpm = tempdir().unwrap();
     let tmp_npm = tempdir().unwrap();
 
+    let iso = tempdir().unwrap();
+    let cache_dir = iso.path().join("cache");
+    let prefix_dir = iso.path().join("prefix");
+    let appdata = iso.path().join("appdata");
+    let localappdata = iso.path().join("localappdata");
+    let userconfig = iso.path().join(".npmrc");
+    let globalconfig = iso.path().join("global.npmrc");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&prefix_dir).unwrap();
+    fs::create_dir_all(&appdata).unwrap();
+    fs::create_dir_all(&localappdata).unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&globalconfig, "").unwrap();
+
     let pkg_json = r#"{
   "name": "install-test-parity",
   "version": "1.0.0",
@@ -103,6 +144,19 @@ fn test_install_test_live_npm_parity() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let rnpm_res = Command::new(rnpm_bin)
         .current_dir(tmp_rnpm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
         .args(["install-test"])
@@ -112,6 +166,19 @@ fn test_install_test_live_npm_parity() {
     let npm_res = Command::new("cmd.exe")
         .args(["/d", "/s", "/c", "npm.cmd", "install-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .output();
 
     if let Ok(npm_out) = npm_res {
@@ -128,6 +195,20 @@ fn test_install_test_live_npm_parity() {
 fn test_install_ci_test_live_npm_parity() {
     let tmp_rnpm = tempdir().unwrap();
     let tmp_npm = tempdir().unwrap();
+
+    let iso = tempdir().unwrap();
+    let cache_dir = iso.path().join("cache");
+    let prefix_dir = iso.path().join("prefix");
+    let appdata = iso.path().join("appdata");
+    let localappdata = iso.path().join("localappdata");
+    let userconfig = iso.path().join(".npmrc");
+    let globalconfig = iso.path().join("global.npmrc");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(&prefix_dir).unwrap();
+    fs::create_dir_all(&appdata).unwrap();
+    fs::create_dir_all(&localappdata).unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&globalconfig, "").unwrap();
 
     let pkg_json = r#"{
   "name": "install-ci-test-parity",
@@ -162,6 +243,19 @@ fn test_install_ci_test_live_npm_parity() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let rnpm_res = Command::new(rnpm_bin)
         .current_dir(tmp_rnpm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
         .args(["install-ci-test"])
@@ -171,6 +265,19 @@ fn test_install_ci_test_live_npm_parity() {
     let npm_res = Command::new("cmd.exe")
         .args(["/d", "/s", "/c", "npm.cmd", "install-ci-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
         .output();
 
     if let Ok(npm_out) = npm_res {

@@ -509,10 +509,36 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
     );
 
     // 4. Verify npm ls --all and npm ci succeed if npm is installed on machine
+    let iso_dir = tmp.path().join("iso");
+    let iso_cache = iso_dir.join("cache");
+    let iso_prefix = iso_dir.join("prefix");
+    let iso_userconfig = iso_dir.join(".npmrc");
+    let iso_globalconfig = iso_dir.join("global.npmrc");
+    let iso_appdata = iso_dir.join("appdata");
+    let iso_localappdata = iso_dir.join("localappdata");
+    let _ = fs::create_dir_all(&iso_cache);
+    let _ = fs::create_dir_all(&iso_prefix);
+    let _ = fs::create_dir_all(&iso_appdata);
+    let _ = fs::create_dir_all(&iso_localappdata);
+    let _ = fs::write(&iso_userconfig, "");
+
     let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
     if let Ok(npm_ls) = Command::new(npm_cmd)
         .args(["ls", "--all"])
         .current_dir(project_dir)
+        .env("HOME", &iso_dir)
+        .env("USERPROFILE", &iso_dir)
+        .env("npm_config_userconfig", &iso_userconfig)
+        .env("npm_config_globalconfig", &iso_globalconfig)
+        .env("NPM_CONFIG_PREFIX", &iso_prefix)
+        .env("PREFIX", &iso_prefix)
+        .env("USERCONFIG", &iso_userconfig)
+        .env("GLOBALCONFIG", &iso_globalconfig)
+        .env("CACHE", &iso_cache)
+        .env("NPM_CONFIG_CACHE", &iso_cache)
+        .env("npm_config_cache", &iso_cache)
+        .env("APPDATA", &iso_appdata)
+        .env("LOCALAPPDATA", &iso_localappdata)
         .output()
     {
         assert!(
@@ -524,6 +550,19 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
     if let Ok(npm_ci) = Command::new(npm_cmd)
         .args(["ci"])
         .current_dir(project_dir)
+        .env("HOME", &iso_dir)
+        .env("USERPROFILE", &iso_dir)
+        .env("npm_config_userconfig", &iso_userconfig)
+        .env("npm_config_globalconfig", &iso_globalconfig)
+        .env("NPM_CONFIG_PREFIX", &iso_prefix)
+        .env("PREFIX", &iso_prefix)
+        .env("USERCONFIG", &iso_userconfig)
+        .env("GLOBALCONFIG", &iso_globalconfig)
+        .env("CACHE", &iso_cache)
+        .env("NPM_CONFIG_CACHE", &iso_cache)
+        .env("npm_config_cache", &iso_cache)
+        .env("APPDATA", &iso_appdata)
+        .env("LOCALAPPDATA", &iso_localappdata)
         .output()
     {
         assert!(

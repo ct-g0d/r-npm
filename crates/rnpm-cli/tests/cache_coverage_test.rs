@@ -115,6 +115,8 @@ fn test_cache_clean_eusage_live_npm_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .args(["cache", "clean"])
@@ -135,6 +137,8 @@ fn test_cache_clean_eusage_live_npm_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .output();

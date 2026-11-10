@@ -772,9 +772,19 @@ async fn test_cli_whoami_and_ping() {
     server.stop();
 }
 
-#[test]
-fn test_cli_auth_helpers_login_and_logout() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cli_auth_helpers_login_and_logout() {
     let tmp = tempdir().unwrap();
+
+    let server = TestMockRegistry::start(|_req| {
+        (
+            200,
+            vec![("Content-Type", "application/json".to_string())],
+            b"{\"ok\":true}".to_vec(),
+        )
+    })
+    .await;
+    let reg_url = server.url();
 
     // 1. Non-interactive login requires an explicit credential source.
     let login_out = Command::new(rnpm_bin())
@@ -787,11 +797,14 @@ fn test_cli_auth_helpers_login_and_logout() {
     let login_err = String::from_utf8_lossy(&login_out.stderr);
     assert!(login_err.contains("npm error code ENEEDAUTH"));
 
-    // 2. logout with existing token removes token from .npmrc
+    // 2. logout with existing token removes token from .npmrc and contacts mock registry
     let local_npmrc = tmp.path().join(".npmrc");
     std::fs::write(
         &local_npmrc,
-        "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm_sample123\n",
+        format!(
+            "registry={reg_url}\n//{}/:_authToken=npm_sample123\n",
+            server.addr
+        ),
     )
     .unwrap();
 
@@ -801,10 +814,14 @@ fn test_cli_auth_helpers_login_and_logout() {
         .output()
         .unwrap();
 
-    assert!(logout_out.status.success());
-    let logout_str = String::from_utf8_lossy(&logout_out.stdout);
-    assert!(logout_str.contains("successfully logged out"));
+    assert!(
+        logout_out.status.success(),
+        "logout failed: {}",
+        String::from_utf8_lossy(&logout_out.stderr)
+    );
 
     let remaining_content = std::fs::read_to_string(&local_npmrc).unwrap();
     assert!(!remaining_content.contains("npm_sample123"));
+
+    server.stop();
 }

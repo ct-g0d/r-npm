@@ -29,6 +29,58 @@ fn normalize_output(text: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cli_unpublish_dry_run_parity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        tokio::spawn(async move {
+                            let mut buf = Vec::new();
+                            let mut temp = [0u8; 4096];
+                            let mut header_end = None;
+
+                            while let Ok(n) = stream.read(&mut temp).await {
+                                if n == 0 {
+                                    break;
+                                }
+                                buf.extend_from_slice(&temp[..n]);
+                                if header_end.is_none() {
+                                    if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        header_end = Some(idx + 4);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if header_end.is_some() {
+                                let doc = serde_json::json!({
+                                    "name": "sample-pkg",
+                                    "versions": {
+                                        "1.0.0": { "name": "sample-pkg", "version": "1.0.0" },
+                                        "2.0.0": { "name": "sample-pkg", "version": "2.0.0" }
+                                    }
+                                });
+                                let body = serde_json::to_vec(&doc).unwrap();
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
     let tmp = tempdir().unwrap();
     let iso = tmp.path().join("iso");
     let cache_dir = iso.join("cache");
@@ -41,6 +93,11 @@ async fn test_cli_unpublish_dry_run_parity() {
     std::fs::create_dir_all(&prefix_dir).unwrap();
     std::fs::create_dir_all(&appdata).unwrap();
     std::fs::create_dir_all(&localappdata).unwrap();
+    std::fs::write(
+        &userconfig,
+        format!("//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"),
+    )
+    .unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
@@ -56,9 +113,18 @@ async fn test_cli_unpublish_dry_run_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["unpublish", "sample-pkg", "--dry-run", "--force"])
+        .args([
+            "unpublish",
+            "sample-pkg",
+            "--dry-run",
+            "--force",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm unpublish failed");
 
@@ -72,6 +138,8 @@ async fn test_cli_unpublish_dry_run_parity() {
             "sample-pkg",
             "--dry-run",
             "--force",
+            "--registry",
+            &format!("http://{addr}/"),
             "--no-update-notifier",
         ])
         .current_dir(tmp.path())
@@ -84,6 +152,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .output();
@@ -114,9 +184,17 @@ async fn test_cli_unpublish_dry_run_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["unpublish", "sample-pkg@1.0.0", "--dry-run"])
+        .args([
+            "unpublish",
+            "sample-pkg@1.0.0",
+            "--dry-run",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm unpublish failed");
 
@@ -129,6 +207,8 @@ async fn test_cli_unpublish_dry_run_parity() {
             "unpublish",
             "sample-pkg@1.0.0",
             "--dry-run",
+            "--registry",
+            &format!("http://{addr}/"),
             "--no-update-notifier",
         ])
         .current_dir(tmp.path())
@@ -141,6 +221,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .output();
@@ -158,6 +240,8 @@ async fn test_cli_unpublish_dry_run_parity() {
     } else {
         assert!(rnpm_res_v.status.success());
     }
+
+    let _ = tx.send(());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -254,6 +338,8 @@ async fn test_cli_unpublish_mock_registry() {
         .env("USERCONFIG", &userconfig)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .args([

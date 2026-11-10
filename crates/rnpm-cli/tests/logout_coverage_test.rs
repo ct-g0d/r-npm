@@ -157,6 +157,8 @@ async fn test_cli_logout_parity() {
         .env("USERCONFIG", &userconfig_npm)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .output();
@@ -173,6 +175,8 @@ async fn test_cli_logout_parity() {
         .env("USERCONFIG", &userconfig_rnpm)
         .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .args(["logout", "--registry", &format!("http://{addr}/")])

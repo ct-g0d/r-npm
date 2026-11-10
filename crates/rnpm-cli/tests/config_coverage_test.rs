@@ -110,6 +110,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
         .env("CACHE", iso_npm.join("cache"))
+        .env("NPM_CONFIG_CACHE", iso_npm.join("cache"))
+        .env("npm_config_cache", iso_npm.join("cache"))
         .env("APPDATA", iso_npm.join("appdata"))
         .env("LOCALAPPDATA", iso_npm.join("localappdata"))
         .output();
@@ -169,6 +171,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
         .env("CACHE", iso_npm.join("cache"))
+        .env("NPM_CONFIG_CACHE", iso_npm.join("cache"))
+        .env("npm_config_cache", iso_npm.join("cache"))
         .env("APPDATA", iso_npm.join("appdata"))
         .env("LOCALAPPDATA", iso_npm.join("localappdata"))
         .output();
@@ -221,6 +225,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .env("GLOBALCONFIG", iso_npm.join("global.npmrc"))
         .env("NPM_CONFIG_PREFIX", iso_npm.join("prefix"))
         .env("CACHE", iso_npm.join("cache"))
+        .env("NPM_CONFIG_CACHE", iso_npm.join("cache"))
+        .env("npm_config_cache", iso_npm.join("cache"))
         .env("APPDATA", iso_npm.join("appdata"))
         .env("LOCALAPPDATA", iso_npm.join("localappdata"))
         .output();
