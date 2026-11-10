@@ -11,3 +11,4 @@ pub mod prune;
 pub mod dedupe;
 pub mod rebuild;
 pub mod link;
+pub mod init;

@@ -5653,30 +5653,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
         } => {
-            if let Some(init_pkg) = initializer {
-                let transformed = init::transform_initializer(&init_pkg);
-                execute_exec(
-                    &current_dir,
-                    &transformed,
-                    &[],
-                    &args,
-                    registry,
-                    cache,
-                    offline,
-                )
-                .await?;
-            } else {
-                let init_opts = init::InitOptions {
-                    yes,
-                    scope,
-                    directory: current_dir,
-                };
-                let stdin = std::io::stdin();
-                let mut stdin_lock = stdin.lock();
-                let stdout = std::io::stdout();
-                let mut stdout_lock = stdout.lock();
-                init::run_init(&init_opts, &mut stdin_lock, &mut stdout_lock)?;
-            }
+            let init_args = commands::init::InitCommandArgs {
+                initializer,
+                args,
+                yes,
+                scope,
+                registry,
+                cache,
+                offline,
+            };
+            commands::init::run(init_args, current_dir).await?;
         }
         Commands::Pack {
             target,
