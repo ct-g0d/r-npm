@@ -24,7 +24,14 @@ async fn test_cli_search() {
                                         "package": {
                                             "name": "foo-pkg",
                                             "version": "1.0.0",
-                                            "description": "A package for testing search"
+                                            "description": "A package for testing search",
+                                            "date": "2024-01-01T12:00:00.000Z",
+                                            "publisher": { "username": "alice" },
+                                            "maintainers": [
+                                                { "username": "alice" },
+                                                { "username": "bob" }
+                                            ],
+                                            "keywords": ["test", "search"]
                                         }
                                     }
                                 ],
@@ -48,7 +55,8 @@ async fn test_cli_search() {
     let tmp = tempdir().unwrap();
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
-    let out = Command::new(rnpm_bin)
+    // 1. Test --json format (must be JSON array of packages)
+    let json_out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
         .args([
             "search",
@@ -58,11 +66,29 @@ async fn test_cli_search() {
             "--json",
         ])
         .output()
-        .expect("search failed");
+        .expect("search --json failed");
+
+    assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
+    let json_val: serde_json::Value = serde_json::from_slice(&json_out.stdout)
+        .expect("must be valid JSON array");
+    assert!(json_val.is_array());
+    assert_eq!(json_val[0]["name"], "foo-pkg");
+
+    // 2. Test default text format (must match npm 11 block format)
+    let text_out = Command::new(rnpm_bin)
+        .current_dir(tmp.path())
+        .args([
+            "search",
+            "foo",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
+        .output()
+        .expect("search text failed");
 
     let _ = tx.send(());
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("foo-pkg"));
+    assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
+    let stdout = String::from_utf8_lossy(&text_out.stdout);
+    assert!(stdout.contains("foo-pkg\nA package for testing search\nVersion 1.0.0 published 2024-01-01 by alice\nMaintainers: alice bob\nKeywords: test search\nhttps://npm.im/foo-pkg"));
 }
