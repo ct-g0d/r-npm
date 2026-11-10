@@ -5849,16 +5849,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Sbom {
             sbom_format,
             sbom_type,
-            package_lock_only: _,
+            package_lock_only,
             omit,
         } => {
-            let options = sbom::SbomOptions {
-                format: sbom_format,
-                sbom_type,
-                package_lock_only: false,
-                omit,
-            };
-            sbom::run_sbom(&current_dir, options).await?;
+            commands::sbom::run(
+                commands::sbom::SbomCommandArgs {
+                    sbom_format,
+                    sbom_type,
+                    package_lock_only,
+                    omit,
+                },
+                current_dir,
+            )
+            .await?;
         }
         Commands::Version {
             newversion,
