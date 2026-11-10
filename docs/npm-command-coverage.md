@@ -23,7 +23,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `approve-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `approve-scripts --help` on fresh fixture directory |
 | `audit` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `audit` on fresh fixture directory |
 | `bugs` | `issues` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `bugs` on fresh fixture directory |
-| `cache` | - | **partial** | Cache engine architecture: npm dumps `make-fetch-happen` HTTP request-cache indices, while rnpm manages a content-addressable storage (CAS) store layout (`store-v1`) | Ran `cache ls` on fresh fixture directory |
+| `cache` | - | **partial** | Cache management: `cache clean` error contract and exit code match npm parity; `cache ls` reflects rnpm's content-addressable store layout (`store-v1`) rather than make-fetch-happen HTTP cache index | Ran `cache clean` against npm parity test |
 | `ci` | `clean-install`, `ic`, `install-clean`, `isntall-clean` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `ci` on fresh fixture directory |
 | `completion` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `completion` on fresh fixture directory |
 | `config` | `c` | **partial** | Built-in environment resolution: npm prints node-gyp and npm installation paths (`C:\Program Files\nodejs\...`), whereas rnpm outputs environment settings and local `.npmrc` configuration directly used by the Rust engine | Ran `config list` on fresh fixture directory |
