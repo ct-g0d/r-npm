@@ -546,6 +546,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Update packages
@@ -589,6 +597,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -650,6 +666,14 @@ pub(crate) enum Commands {
         /// Report deduplication actions without modifying files or lockfile
         #[arg(long)]
         dry_run: bool,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Find duplicate packages across nesting levels (equivalent to dedupe --dry-run)
@@ -4936,7 +4960,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let timing_val = timing || config.get_bool("timing").unwrap_or(false);
+            let timing_val = timing
+                || config.get_bool("timing").unwrap_or(false)
+                || std::env::var("RNPM_TIMING")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             let effective_ignore =
                 ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
             let effective_foreground =
@@ -5145,7 +5173,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let timing_val = timing || config.get_bool("timing").unwrap_or(false);
+            let timing_val = timing
+                || config.get_bool("timing").unwrap_or(false)
+                || std::env::var("RNPM_TIMING")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             let effective_ignore =
                 ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
             let effective_foreground =
@@ -5524,6 +5556,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspaces,
             workspace_root,
             json,
+            ..
         } => {
             if packages.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -5603,6 +5636,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             legacy_peer_deps,
             strict_peer_deps,
             json,
+            ..
         } => {
             let opts = commands::update::UpdateOptions {
                 packages,
@@ -5636,7 +5670,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             };
             commands::prune::run(args, current_dir).await?;
         }
-        Commands::Dedupe { packages, dry_run } => {
+        Commands::Dedupe {
+            packages,
+            dry_run,
+            ..
+        } => {
             commands::dedupe::run_dedupe(packages, dry_run, current_dir).await?;
         }
         Commands::FindDupes { packages } => {
