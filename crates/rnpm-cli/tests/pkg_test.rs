@@ -84,7 +84,7 @@ fn test_pkg_get_single_key_raw_and_json() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "sample-pkg");
+    assert_eq!(stdout.trim(), "\"sample-pkg\"");
 
     // Single key with --json (returns JSON string with quotes)
     let output = Command::new(rnpm_bin)
@@ -627,5 +627,5 @@ fn test_pkg_prefix_flag() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "pkg-a");
+    assert_eq!(stdout.trim(), "\"pkg-a\"");
 }

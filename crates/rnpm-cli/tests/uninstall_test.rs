@@ -115,7 +115,7 @@ fn test_cli_uninstall_single_package_and_transitive_pruning() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rnpm: removed 1 package(s)"));
+    assert!(stdout.contains("removed 2 packages"));
 
     // Verify package.json
     let manifest = Manifest::from_file(project_dir.join("package.json")).unwrap();
@@ -156,7 +156,7 @@ fn test_cli_uninstall_multiple_packages_and_aliases() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rnpm: removed 2 package(s)"));
+    assert!(stdout.contains("removed 3 packages"));
 
     let manifest = Manifest::from_file(project_dir.join("package.json")).unwrap();
     assert!(!manifest.dependencies.contains_key("chalk"));

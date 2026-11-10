@@ -141,24 +141,48 @@ impl InspectedNode {
     /// Emits query representation matching npm query node schema.
     pub fn to_query_json(&self) -> Value {
         let mut map = serde_json::Map::new();
-        map.insert("name".to_string(), Value::String(self.name.clone()));
-        if let Some(v) = &self.version {
-            map.insert("version".to_string(), Value::String(v.clone()));
-        }
-        if let Some(desc) = &self.description {
-            map.insert("description".to_string(), Value::String(desc.clone()));
-        }
-        if let Some(lic) = &self.license {
-            map.insert("license".to_string(), Value::String(lic.clone()));
-        }
-        if let Some(repo) = &self.repository {
-            map.insert("repository".to_string(), repo.clone());
-        }
-        if let Some(eng) = &self.engines {
-            map.insert(
-                "engines".to_string(),
-                serde_json::to_value(eng).unwrap_or(Value::Null),
-            );
+
+        if let Some(Value::Object(raw)) = &self.raw_manifest {
+            for (k, v) in raw {
+                if !matches!(
+                    k.as_str(),
+                    "_id"
+                        | "pkgid"
+                        | "location"
+                        | "path"
+                        | "realpath"
+                        | "resolved"
+                        | "from"
+                        | "to"
+                        | "dev"
+                        | "inBundle"
+                        | "deduped"
+                        | "overridden"
+                        | "queryContext"
+                ) {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+        } else {
+            map.insert("name".to_string(), Value::String(self.name.clone()));
+            if let Some(v) = &self.version {
+                map.insert("version".to_string(), Value::String(v.clone()));
+            }
+            if let Some(desc) = &self.description {
+                map.insert("description".to_string(), Value::String(desc.clone()));
+            }
+            if let Some(lic) = &self.license {
+                map.insert("license".to_string(), Value::String(lic.clone()));
+            }
+            if let Some(repo) = &self.repository {
+                map.insert("repository".to_string(), repo.clone());
+            }
+            if let Some(eng) = &self.engines {
+                map.insert(
+                    "engines".to_string(),
+                    serde_json::to_value(eng).unwrap_or(Value::Null),
+                );
+            }
         }
 
         let pkgid = self.pkgid.clone().unwrap_or_else(|| match &self.version {
@@ -542,9 +566,9 @@ pub fn build_dependency_tree(
 
     for (dep_name, (dep_req, dep_type, is_optional)) in &direct_deps {
         let expected_loc = format!("node_modules/{dep_name}");
-        root.to.push(expected_loc.clone());
 
         if let Some(disk_pkg) = disk_packages.get(&expected_loc) {
+            root.to.push(expected_loc.clone());
             reachable_locations.insert(expected_loc.clone());
             let mut node = create_node_from_disk(
                 project_dir,
