@@ -40,8 +40,8 @@ impl PackageTarget {
         }
 
         // file: specifier
-        if let Some(path_str) = s.strip_prefix("file:") {
-            return Ok(PackageTarget::File(PathBuf::from(path_str)));
+        if s.starts_with("file:") {
+            return Ok(PackageTarget::File(parse_file_path(s)));
         }
 
         // npm: alias specifier (e.g. npm:foo@^1.0.0 or npm:@scope/foo@~2.0.0)
@@ -273,14 +273,10 @@ impl PackageSpec {
             });
         }
 
-        // Direct "file:" specifier without name (e.g. "file:../foo")
-        if let Some(path_str) = trimmed.strip_prefix("file:") {
-            let path = PathBuf::from(path_str);
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unnamed")
-                .to_string();
+        // Direct "file:" specifier without name (e.g. "file:../foo", "file:///abs")
+        if trimmed.starts_with("file:") {
+            let path = parse_file_path(trimmed);
+            let name = extract_path_package_name(&path);
             return Ok(Self {
                 name,
                 target: PackageTarget::File(path),
@@ -419,29 +415,116 @@ fn extract_git_repo_name(spec: &str) -> String {
     }
 }
 
-fn extract_url_package_name(url_str: &str) -> String {
-    if let Ok(u) = Url::parse(url_str) {
-        if let Some(mut last_seg) = u.path_segments().and_then(|mut s| s.next_back()) {
-            if last_seg.ends_with(".tgz") {
-                last_seg = &last_seg[..last_seg.len() - 4];
-            } else if last_seg.ends_with(".tar.gz") {
-                last_seg = &last_seg[..last_seg.len() - 7];
-            }
-            if let Some(dash_idx) = last_seg.rfind('-') {
-                let suffix = &last_seg[dash_idx + 1..];
-                if suffix
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
-                {
-                    return last_seg[..dash_idx].to_string();
+fn extract_path_package_name(path: &std::path::Path) -> String {
+    if path.is_dir() {
+        let pkg_json = path.join("package.json");
+        if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
+                    return n.to_string();
                 }
             }
-            if !last_seg.is_empty() {
-                return last_seg.to_string();
+        }
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed");
+    let mut stripped = filename;
+    if stripped.ends_with(".tgz") {
+        stripped = &stripped[..stripped.len() - 4];
+    } else if stripped.ends_with(".tar.gz") {
+        stripped = &stripped[..stripped.len() - 7];
+    } else if stripped.ends_with(".tar") {
+        stripped = &stripped[..stripped.len() - 4];
+    }
+    if let Some(dash_idx) = stripped.rfind('-') {
+        let suffix = &stripped[dash_idx + 1..];
+        if suffix
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            return stripped[..dash_idx].to_string();
+        }
+    }
+    stripped.to_string()
+}
+
+fn extract_url_package_name(url_str: &str) -> String {
+    if let Ok(u) = Url::parse(url_str) {
+        if u.scheme() == "file" {
+            if let Ok(path) = u.to_file_path() {
+                return extract_path_package_name(&path);
+            }
+        }
+        if let Some(segments) = u.path_segments() {
+            let segs: Vec<&str> = segments.collect();
+            // npm registry tarball format: .../[@scope/]pkg/-/pkg-version.tgz
+            if let Some(dash_pos) = segs.iter().position(|&s| s == "-") {
+                if dash_pos > 0 {
+                    if dash_pos >= 2 && segs[dash_pos - 2].starts_with('@') {
+                        return format!("{}/{}", segs[dash_pos - 2], segs[dash_pos - 1]);
+                    }
+                    return segs[dash_pos - 1].to_string();
+                }
+            }
+            if let Some(mut last_seg) = segs.last().copied() {
+                if last_seg.ends_with(".tgz") {
+                    last_seg = &last_seg[..last_seg.len() - 4];
+                } else if last_seg.ends_with(".tar.gz") {
+                    last_seg = &last_seg[..last_seg.len() - 7];
+                } else if last_seg.ends_with(".tar") {
+                    last_seg = &last_seg[..last_seg.len() - 4];
+                }
+                if let Some(dash_idx) = last_seg.rfind('-') {
+                    let suffix = &last_seg[dash_idx + 1..];
+                    if suffix
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
+                        return last_seg[..dash_idx].to_string();
+                    }
+                }
+                if !last_seg.is_empty() {
+                    return last_seg.to_string();
+                }
             }
         }
     }
     "unnamed".to_string()
+}
+
+/// Normalizes a `file:` path or URL specifier (e.g. `file:./x`, `file:x`, `file:../x`, `file:///abs`, `file://localhost/...`).
+pub fn parse_file_path(spec: &str) -> std::path::PathBuf {
+    if let Ok(url) = Url::parse(spec) {
+        if url.scheme() == "file" {
+            if let Ok(file_path) = url.to_file_path() {
+                return path_clean::clean(file_path);
+            }
+        }
+    }
+
+    let path_str = spec.strip_prefix("file:").unwrap_or(spec);
+
+    if path_str.starts_with("///") || path_str.starts_with("//") {
+        let trimmed = path_str.trim_start_matches('/');
+        #[cfg(windows)]
+        {
+            if trimmed.len() > 1 && trimmed.as_bytes()[1] == b':' {
+                return path_clean::clean(trimmed);
+            }
+        }
+        return path_clean::clean(format!("/{trimmed}"));
+    }
+
+    let cleaned = path_clean::clean(path_str);
+    if let Ok(stripped) = cleaned.strip_prefix(".") {
+        stripped.to_path_buf()
+    } else {
+        cleaned
+    }
 }

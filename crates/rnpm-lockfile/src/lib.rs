@@ -417,6 +417,24 @@ mod tests {
     }
 
     #[test]
+    fn hidden_lockfile_preserves_indent_and_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("package.json"), "\u{feff}{\r\n\t\"name\": \"app\"\r\n}\r\n").unwrap();
+        let lock = LockfileV3::new("app", None);
+        lock.save_hidden(project).unwrap();
+        let hidden = project.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+        let text = std::fs::read_to_string(&hidden).unwrap();
+        assert!(text.starts_with("{\r\n\t\"name\""), "{text:?}");
+        assert!(!text.starts_with('\u{feff}'));
+        // Existing lockfile formatting wins over the manifest on subsequent saves.
+        std::fs::write(&hidden, "{\n    \"name\": \"app\"\n}\n").unwrap();
+        lock.save_hidden(project).unwrap();
+        let text = std::fs::read_to_string(hidden).unwrap();
+        assert!(text.starts_with("{\n    \"name\""), "{text:?}");
+    }
+
+    #[test]
     fn test_hidden_lockfile_roundtrip_and_extra_metadata() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path();

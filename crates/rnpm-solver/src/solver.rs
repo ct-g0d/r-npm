@@ -66,6 +66,7 @@ struct ResolveTask {
     raw_spec: String,
     dep_type: DependencyType,
     dev_path: bool,
+    parent_depth: usize,
     ancestors: std::sync::Arc<Vec<String>>,
 }
 
@@ -77,6 +78,44 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     peer_ctx: PeerContext,
     graph: DependencyGraph,
     queue: VecDeque<ResolveTask>,
+}
+
+/// Compares two strings using Arborist-compatible collation.
+/// Arborist sorts depsQueue by depth then `a.path.localeCompare(b.path, 'en') || a.name.localeCompare(b.name, 'en')`.
+pub fn arborist_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let min_len = a_bytes.len().min(b_bytes.len());
+    for i in 0..min_len {
+        let ca = a_bytes[i].to_ascii_lowercase();
+        let cb = b_bytes[i].to_ascii_lowercase();
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+    }
+    match a_bytes.len().cmp(&b_bytes.len()) {
+        std::cmp::Ordering::Equal => {
+            // Case tie-breaker: in JavaScript 'en' localeCompare, lowercase comes before uppercase ('a' < 'A')
+            for i in 0..min_len {
+                let ca = a_bytes[i];
+                let cb = b_bytes[i];
+                if ca != cb {
+                    let is_ca_lower = ca.is_ascii_lowercase();
+                    let is_cb_lower = cb.is_ascii_lowercase();
+                    if is_ca_lower != is_cb_lower {
+                        return if is_ca_lower {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                    }
+                    return ca.cmp(&cb);
+                }
+            }
+            std::cmp::Ordering::Equal
+        }
+        ord => ord,
+    }
 }
 
 impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
@@ -121,28 +160,36 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         if dep_type == DependencyType::Peer || dep_type == DependencyType::PeerOptional {
             self.peer_ctx.enter(&parent_package_name, &install_name);
         }
-        self.queue.push_back(ResolveTask {
+        let parent_depth = if parent_location.is_empty() {
+            0
+        } else {
+            parent_location.matches("node_modules").count()
+        };
+        self.push_task(ResolveTask {
             parent_location,
             parent_package_name,
             install_name,
             raw_spec,
             dep_type,
             dev_path: dep_type == DependencyType::Dev,
+            parent_depth,
             ancestors,
         });
     }
 
     fn push_task(&mut self, task: ResolveTask) {
-        if task.dev_path {
-            self.queue.push_back(task);
-            return;
-        }
-        let insert_at = self
+        let pos = self
             .queue
-            .iter()
-            .position(|queued| queued.dev_path)
-            .unwrap_or(self.queue.len());
-        self.queue.insert(insert_at, task);
+            .binary_search_by(|queued| {
+                queued
+                    .dev_path
+                    .cmp(&task.dev_path)
+                    .then_with(|| queued.parent_depth.cmp(&task.parent_depth))
+                    .then_with(|| arborist_compare(&queued.parent_location, &task.parent_location))
+                    .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
+            })
+            .unwrap_or_else(|e| e);
+        self.queue.insert(pos, task);
     }
 
     /// Processes all queued dependency resolution tasks until completion.
@@ -280,6 +327,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         raw_spec,
                         dep_type,
                         dev_path: dep_type == DependencyType::Dev,
+                        parent_depth: 0,
                         ancestors: root_ancestors.clone(),
                     });
                 }
@@ -306,6 +354,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         for install_name in root_deps.keys() {
             enqueue_root(install_name, &mut self, &mut queued);
         }
+
+        let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
+        self.provider.prefetch_packages(&root_names);
 
         // Process resolution queue
         while let Some(task) = self.queue.pop_front() {
@@ -666,6 +717,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &dep_spec.install_name,
             &dep_spec.package_name,
             &dep_spec.target,
+            &chosen_version.dependencies,
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
         );
@@ -767,6 +819,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &dep_spec.install_name,
                 &dep_spec.package_name,
                 &dep_spec.target,
+                &chosen_version.dependencies,
                 &chosen_version.peer_dependencies,
                 &chosen_version.peer_dependencies_meta,
             );
@@ -936,6 +989,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // a shared hoisted slot (for example Express's `ms`).  The
                 // BTreeMap keeps traversal deterministic and matches npm's
                 // lockfile dependency ordering.
+                let child_depth = target_loc.matches("node_modules").count();
                 let child_tasks = child_deps
                     .into_iter()
                     .map(|(c_name, (c_spec, c_type))| ResolveTask {
@@ -945,6 +999,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         raw_spec: c_spec,
                         dep_type: c_type,
                         dev_path: task.dev_path || c_type == DependencyType::Dev,
+                        parent_depth: child_depth,
                         ancestors: child_ancestors.clone(),
                     })
                     .collect::<Vec<_>>();
@@ -953,6 +1008,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // placement pass and lets a later direct dependency claim a
                 // compatible root slot before an earlier sibling's nested
                 // subtree is expanded.
+                let child_names: Vec<&str> =
+                    child_tasks.iter().map(|t| t.install_name.as_str()).collect();
+                self.provider.prefetch_packages(&child_names);
                 for child_task in child_tasks {
                     self.push_task(child_task);
                 }
@@ -1200,8 +1258,54 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             PackageTarget::Alias { target, .. } => {
                 self.select_version(parent_location, pkg_name, meta, target)
             }
-            PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
-                select_max_semver_version(meta)
+            PackageTarget::Url(u) => {
+                let u_str = u.as_str();
+                meta.versions
+                    .values()
+                    .find(|v| v.dist_tarball.as_deref() == Some(u_str))
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
+            }
+            PackageTarget::File(p) => {
+                meta.versions
+                    .values()
+                    .find(|v| v.dist_tarball.as_deref().is_some_and(|resolved| {
+                        crate::hoisting::file_target_matches_resolved(p, resolved)
+                    }))
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
+            }
+            PackageTarget::Git { url, committish } => {
+                meta.versions
+                    .values()
+                    .find(|v| {
+                        if let Some(ref dt) = v.dist_tarball {
+                            crate::hoisting::git_target_matches_resolved(
+                                url,
+                                committish.as_deref(),
+                                dt,
+                            )
+                        } else {
+                            false
+                        }
+                    })
+                    .or_else(|| {
+                        if meta.versions.len() == 1 {
+                            meta.versions.values().next()
+                        } else {
+                            None
+                        }
+                    })
             }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
@@ -1515,4 +1619,30 @@ pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
     );
     let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arborist_compare_collation() {
+        assert_eq!(arborist_compare("a", "b"), std::cmp::Ordering::Less);
+        assert_eq!(arborist_compare("b", "a"), std::cmp::Ordering::Greater);
+        assert_eq!(arborist_compare("a", "a"), std::cmp::Ordering::Equal);
+
+        // Lowercase comes before uppercase in en locale collation tie-break
+        assert_eq!(arborist_compare("a", "A"), std::cmp::Ordering::Less);
+        assert_eq!(arborist_compare("A", "b"), std::cmp::Ordering::Less);
+
+        // Scoped package vs unscoped package
+        assert_eq!(
+            arborist_compare("@eslint/js", "axios"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            arborist_compare("@eslint-community/regexpp", "@eslint/js"),
+            std::cmp::Ordering::Less
+        );
+    }
 }

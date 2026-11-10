@@ -431,10 +431,6 @@ impl GitFetcher {
         let (checkout_ok, _, checkout_err) = run_git_cmd(
             &[
                 "-c",
-                "core.autocrlf=false",
-                "-c",
-                "core.eol=lf",
-                "-c",
                 "core.bare=false",
                 "--git-dir",
                 &remote_dir_str,
@@ -647,10 +643,6 @@ async fn run_git_archive(remote_dir: &Path, commit_sha: &str) -> Result<Vec<u8>>
     let remote_dir_str = remote_dir.to_string_lossy();
     let mut cmd = tokio::process::Command::new("git");
     cmd.args([
-        "-c",
-        "core.autocrlf=false",
-        "-c",
-        "core.eol=lf",
         "--git-dir",
         &remote_dir_str,
         "archive",

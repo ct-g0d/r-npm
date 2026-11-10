@@ -44,74 +44,75 @@ function Compare-Directories {
         return @{ Identical = $false; Reason = "One directory missing (A: $(Test-Path $PathA), B: $(Test-Path $PathB))" }
     }
 
-    $filesA = Get-ChildItem -Path $PathA -Recurse -File | Where-Object {
-        $_.FullName.Substring($PathA.Length).TrimStart('\', '/') -notmatch '(^|[\\/])\.rnpm[^\\/]*([\\/]|$)'
-    }
-    $filesB = Get-ChildItem -Path $PathB -Recurse -File | Where-Object {
-        $_.FullName.Substring($PathB.Length).TrimStart('\', '/') -notmatch '(^|[\\/])\.rnpm[^\\/]*([\\/]|$)'
-    }
+    $nodeScript = @'
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $mapA = @{}
-    foreach ($f in $filesA) {
-        $rel = $f.FullName.Substring($PathA.Length).TrimStart('\', '/')
-        $s = [System.IO.File]::OpenRead($f.FullName)
-        $h = $sha.ComputeHash($s)
-        $s.Close()
-        $mapA[$rel] = [System.BitConverter]::ToString($h).Replace('-', '').ToLowerInvariant()
-    }
-
-    $mapB = @{}
-    foreach ($f in $filesB) {
-        $rel = $f.FullName.Substring($PathB.Length).TrimStart('\', '/')
-        $s = [System.IO.File]::OpenRead($f.FullName)
-        $h = $sha.ComputeHash($s)
-        $s.Close()
-        $mapB[$rel] = [System.BitConverter]::ToString($h).Replace('-', '').ToLowerInvariant()
-    }
-
-    $missingInB = @()
-    foreach ($k in $mapA.Keys) {
-        if (-not $mapB.ContainsKey($k)) {
-            $missingInB += $k
+function walk(dir, base, map) {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+        if (e.name.startsWith('.rnpm')) continue;
+        const full = path.join(dir, e.name);
+        const rel = path.relative(base, full).replace(/\\/g, '/');
+        if (e.isDirectory()) {
+            walk(full, base, map);
+        } else if (e.isFile()) {
+            const buf = fs.readFileSync(full);
+            map[rel] = crypto.createHash('sha256').update(buf).digest('hex');
         }
     }
+}
 
-    $missingInA = @()
-    foreach ($k in $mapB.Keys) {
-        if (-not $mapA.ContainsKey($k)) {
-            $missingInA += $k
+const mapA = {}, mapB = {};
+walk(process.argv[1], process.argv[1], mapA);
+walk(process.argv[2], process.argv[2], mapB);
+
+const missingInB = Object.keys(mapA).filter(k => !(k in mapB));
+const missingInA = Object.keys(mapB).filter(k => !(k in mapA));
+const hashMismatches = Object.keys(mapA).filter(k => (k in mapB) && mapA[k] !== mapB[k]);
+
+const countA = Object.keys(mapA).length;
+const countB = Object.keys(mapB).length;
+const identical = missingInB.length === 0 && missingInA.length === 0 && hashMismatches.length === 0;
+
+console.log(JSON.stringify({
+    identical,
+    countA,
+    countB,
+    missingInB,
+    missingInA,
+    hashMismatches
+}));
+'@
+
+    $jsonStr = & node -e $nodeScript $PathA $PathB
+    $res = $jsonStr | ConvertFrom-Json
+    if (-not $res.identical) {
+        if ($res.missingInB.Count -gt 0) {
+            $pkgsA = $res.missingInB | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
+            Write-Host "    Missing in rnpm: $($pkgsA -join ', ')" -ForegroundColor DarkYellow
         }
-    }
-
-    $hashMismatches = @()
-    foreach ($k in $mapA.Keys) {
-        if ($mapB.ContainsKey($k) -and $mapA[$k] -ne $mapB[$k]) {
-            $hashMismatches += $k
+        if ($res.missingInA.Count -gt 0) {
+            $pkgsB = $res.missingInA | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
+            Write-Host "    Missing in npm: $($pkgsB -join ', ')" -ForegroundColor DarkYellow
         }
-    }
-
-    if ($missingInB.Count -gt 0 -or $missingInA.Count -gt 0 -or $hashMismatches.Count -gt 0) {
-        $pkgsA = $missingInB | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
-        $pkgsB = $missingInA | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
-        if ($pkgsA) { Write-Host "    Missing in rnpm: $($pkgsA -join ', ')" -ForegroundColor DarkYellow }
-        if ($pkgsB) { Write-Host "    Missing in npm: $($pkgsB -join ', ')" -ForegroundColor DarkYellow }
-        if ($hashMismatches.Count -gt 0) {
-            $hashPkgs = $hashMismatches | ForEach-Object { ($_ -split '[\\/]')[0] } | Select-Object -Unique
-            Write-Host "    Content hash mismatch: $($hashMismatches -join ', ')" -ForegroundColor DarkYellow
+        if ($res.hashMismatches.Count -gt 0) {
+            Write-Host "    Content hash mismatch: $($res.hashMismatches -join ', ')" -ForegroundColor DarkYellow
         }
         return @{
             Identical = $false
-            CountA = $mapA.Count
-            CountB = $mapB.Count
-            MissingInRnpm = $missingInB
-            MissingInNpm = $missingInA
-            HashMismatches = $hashMismatches
-            Reason = "Tree/content mismatch (npm: $($mapA.Count), rnpm: $($mapB.Count)). Missing in rnpm: $($missingInB.Count), missing in npm: $($missingInA.Count), hash mismatches: $($hashMismatches.Count)"
+            CountA = $res.countA
+            CountB = $res.countB
+            MissingInRnpm = $res.missingInB
+            MissingInNpm = $res.missingInA
+            HashMismatches = $res.hashMismatches
+            Reason = "Tree/content mismatch (npm: $($res.countA), rnpm: $($res.countB)). Missing in rnpm: $($res.missingInB.Count), missing in npm: $($res.missingInA.Count), hash mismatches: $($res.hashMismatches.Count)"
         }
     }
 
-    return @{ Identical = $true; Count = $mapA.Count }
+    return @{ Identical = $true; Count = $res.countA; CountB = $res.countB }
 }
 
 function Compare-FilesByteForByte {

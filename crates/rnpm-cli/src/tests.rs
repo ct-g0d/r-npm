@@ -186,7 +186,7 @@ fn test_unsupported_commands_gate_e_diagnostics() {
 
 #[test]
 fn test_unsupported_flags_gate_e_diagnostics() {
-    let flags = ["--save-bundle", "--production"];
+    let flags = ["--production", "--save-bundle"];
     for flag in flags {
         let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
         assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
@@ -535,6 +535,7 @@ async fn test_cli_exec_local_binary_success() {
 
     let cli = Cli {
         command: Commands::Exec {
+            call: None,
             package: "echo-tool".to_string(),
             args: vec![],
             yes: false,
@@ -542,6 +543,9 @@ async fn test_cli_exec_local_binary_success() {
             registry: None,
             cache: None,
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -573,6 +577,7 @@ async fn test_cli_exec_exit_code_fidelity() {
 
     let cli = Cli {
         command: Commands::Exec {
+            call: None,
             package: "fail-tool".to_string(),
             args: vec![],
             yes: false,
@@ -580,6 +585,9 @@ async fn test_cli_exec_exit_code_fidelity() {
             registry: None,
             cache: None,
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -760,6 +768,7 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
 
     let cli = Cli {
         command: Commands::Exec {
+            call: None,
             package: "mock-cli-tool".to_string(),
             args: vec![],
             yes: false,
@@ -767,6 +776,9 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -791,7 +803,13 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
 fn test_cli_exec_parsing_package_flags() {
     // 1. Single -p with command and args (matching `rnpm exec -y -p typescript@5.4.5 tsc --version`)
     let cli = Cli::try_parse_from(vec![
-        "rnpm", "exec", "-y", "-p", "typescript@5.4.5", "tsc", "--version",
+        "rnpm",
+        "exec",
+        "-y",
+        "-p",
+        "typescript@5.4.5",
+        "tsc",
+        "--version",
     ])
     .unwrap();
     match cli.command {
@@ -812,7 +830,15 @@ fn test_cli_exec_parsing_package_flags() {
 
     // 2. Multiple -p flags with command (matching `rnpm exec -p a -p b cmd`)
     let cli = Cli::try_parse_from(vec![
-        "rnpm", "exec", "-p", "pkg-a@1.0.0", "-p", "pkg-b@2.0.0", "custom-bin", "arg1", "arg2",
+        "rnpm",
+        "exec",
+        "-p",
+        "pkg-a@1.0.0",
+        "-p",
+        "pkg-b@2.0.0",
+        "custom-bin",
+        "arg1",
+        "arg2",
     ])
     .unwrap();
     match cli.command {
@@ -853,7 +879,8 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
 
     let marker_file = project_dir.path().join("flag_exec_marker.txt");
     let escaped_marker = marker_file.to_string_lossy().replace('\\', "/");
-    let script = format!("require('fs').writeFileSync('{escaped_marker}', process.argv[2] || 'no-arg');\n");
+    let script =
+        format!("require('fs').writeFileSync('{escaped_marker}', process.argv[2] || 'no-arg');\n");
 
     let pkg_tar = make_tarball_with_bin("custom-tool-pkg", "1.0.0", "custom-runner", &script);
     let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
@@ -925,6 +952,7 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
 
     let cli = Cli {
         command: Commands::Exec {
+            call: None,
             package: "custom-runner".to_string(),
             args: vec!["test-arg".to_string()],
             yes: true,
@@ -932,6 +960,9 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
@@ -944,7 +975,10 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
     let npx_dir = cache_dir.path().join("_npx").join("custom-tool-pkg_1.0.0");
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
-    assert!(manifest_str.contains("custom-tool-pkg"), "Manifest must list custom-tool-pkg in dependencies");
+    assert!(
+        manifest_str.contains("custom-tool-pkg"),
+        "Manifest must list custom-tool-pkg in dependencies"
+    );
 
     let _ = tx.send(());
 }
@@ -963,7 +997,12 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
     let pkg_runner_tar = make_tarball_with_bin("pkg-runner", "1.0.0", "multi-runner", &script);
     let pkg_runner_int = Integrity::from_bytes(&pkg_runner_tar, Algorithm::Sha512).to_string();
 
-    let pkg_data_tar = make_tarball_with_file("pkg-data", "1.0.0", "data.json", r#"{"val":"multi-pkg-success"}"#);
+    let pkg_data_tar = make_tarball_with_file(
+        "pkg-data",
+        "1.0.0",
+        "data.json",
+        r#"{"val":"multi-pkg-success"}"#,
+    );
     let pkg_data_int = Integrity::from_bytes(&pkg_data_tar, Algorithm::Sha512).to_string();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1053,6 +1092,7 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
 
     let cli = Cli {
         command: Commands::Exec {
+            call: None,
             package: "multi-runner".to_string(),
             args: vec![],
             yes: true,
@@ -1060,20 +1100,36 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
             offline: false,
+            workspace: vec![],
+            workspaces: false,
+            workspace_root: false,
         },
     };
 
     let res = run_cli(cli, Some(project_dir.path().to_path_buf())).await;
-    assert!(res.is_ok(), "Exec with multiple -p should succeed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "Exec with multiple -p should succeed: {:?}",
+        res.err()
+    );
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
     assert_eq!(marker_content.trim(), "multi-pkg-success");
 
-    let npx_dir = cache_dir.path().join("_npx").join("pkg-data_1.0.0_pkg-runner_1.0.0");
+    let npx_dir = cache_dir
+        .path()
+        .join("_npx")
+        .join("pkg-data_1.0.0_pkg-runner_1.0.0");
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
-    assert!(manifest_str.contains("pkg-data"), "Manifest must list pkg-data in dependencies");
-    assert!(manifest_str.contains("pkg-runner"), "Manifest must list pkg-runner in dependencies");
+    assert!(
+        manifest_str.contains("pkg-data"),
+        "Manifest must list pkg-data in dependencies"
+    );
+    assert!(
+        manifest_str.contains("pkg-runner"),
+        "Manifest must list pkg-runner in dependencies"
+    );
 
     let _ = tx.send(());
 }
@@ -1191,7 +1247,7 @@ async fn test_cli_audit_unsupported_command_filtering() {
 
 #[tokio::test]
 async fn test_cli_unsupported_flags_filtering() {
-    let test_flags = ["--save-bundle", "--production"];
+    let test_flags = ["--production"];
 
     for flag in test_flags {
         let check = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
@@ -1326,6 +1382,7 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             save_prod: false,
             save_optional: false,
             save_peer: false,
+            save_prefix: None,
             no_save: false,
             package_lock_only: false,
             global: false,
@@ -2685,9 +2742,7 @@ fn test_cli_list_uninstall_prefix_and_global() {
     // 1. list -g and --prefix
     let cli = Cli::try_parse_from(["rnpm", "list", "-g"]).unwrap();
     match cli.command {
-        Commands::List {
-            global, prefix, ..
-        } => {
+        Commands::List { global, prefix, .. } => {
             assert!(global);
             assert!(prefix.is_none());
         }
@@ -2696,9 +2751,7 @@ fn test_cli_list_uninstall_prefix_and_global() {
 
     let cli = Cli::try_parse_from(["rnpm", "ls", "--prefix", "/custom/prefix"]).unwrap();
     match cli.command {
-        Commands::List {
-            global, prefix, ..
-        } => {
+        Commands::List { global, prefix, .. } => {
             assert!(!global);
             assert_eq!(prefix, Some(PathBuf::from("/custom/prefix")));
         }
@@ -2706,7 +2759,8 @@ fn test_cli_list_uninstall_prefix_and_global() {
     }
 
     // 2. uninstall --prefix
-    let cli = Cli::try_parse_from(["rnpm", "uninstall", "--prefix", "/custom/prefix", "cowsay"]).unwrap();
+    let cli =
+        Cli::try_parse_from(["rnpm", "uninstall", "--prefix", "/custom/prefix", "cowsay"]).unwrap();
     match cli.command {
         Commands::Uninstall {
             global,
@@ -2720,4 +2774,103 @@ fn test_cli_list_uninstall_prefix_and_global() {
         }
         _ => panic!("Expected Commands::Uninstall with --prefix"),
     }
+}
+
+#[test]
+fn test_lane3_preprocessing_edge_cases() {
+    // 1. Unknown key directly followed by positional:
+    // In npm: `npm run echoargs --foo bar` -> `--foo` is unknown flag (boolean), `bar` is preserved as positional
+    let raw = ["rnpm", "run", "echoargs", "--foo", "bar"];
+    let prep = preprocess_cli_args(raw);
+    assert_eq!(
+        prep,
+        vec!["rnpm", "run", "echoargs", "--", "bar"],
+        "Unknown key without '=' must NOT consume subsequent positional argument"
+    );
+
+    // 2. Unknown key with '=': `--foo=bar`
+    let raw = ["rnpm", "run", "echoargs", "--foo=bar"];
+    let prep = preprocess_cli_args(raw);
+    assert_eq!(
+        prep,
+        vec!["rnpm", "run", "echoargs"],
+        "Unknown key with '=' is stripped as config override without creating positional"
+    );
+
+    // 3. Known key with separated value: `--registry https://registry.npmjs.org/ is-number`
+    let raw = ["rnpm", "install", "--dry-run", "--registry", "https://registry.npmjs.org/", "is-number"];
+    let prep = preprocess_cli_args(raw);
+    assert_eq!(
+        prep,
+        vec!["rnpm", "install", "--dry-run", "--registry", "https://registry.npmjs.org/", "is-number"],
+        "Known clap arguments like --registry on install must not be consumed as global config overrides"
+    );
+
+    // 4. Inverted boolean key: `--no-audit` / `--no-fund`
+    let raw = ["rnpm", "install", "--no-audit", "--no-fund"];
+    let prep = preprocess_cli_args(raw);
+    assert_eq!(
+        prep,
+        vec!["rnpm", "install", "--no-audit", "--no-fund"],
+        "Clap recognized inverted flags must remain intact on subcommand"
+    );
+
+    // 5. Flags after '--' delimiter must never be processed or stripped
+    let raw = ["rnpm", "run", "echoargs", "--", "--registry", "https://example.com", "-s", "--foo=bar"];
+    let prep = preprocess_cli_args(raw);
+    assert_eq!(
+        prep,
+        vec!["rnpm", "run", "echoargs", "--", "--registry", "https://example.com", "-s", "--foo=bar"],
+        "Arguments after '--' must remain verbatim"
+    );
+
+    // 6. -w vs --workspace
+    let raw_w = ["rnpm", "run", "test", "-w", "pkg-a"];
+    let prep_w = preprocess_cli_args(raw_w);
+    assert!(
+        prep_w.contains(&"--workspace".to_string()) && prep_w.contains(&"pkg-a".to_string()),
+        "-w must be normalized or retained as workspace option: {:?}", prep_w
+    );
+
+    let raw_ws = ["rnpm", "run", "test", "--workspaces"];
+    let prep_ws = preprocess_cli_args(raw_ws);
+    assert!(
+        prep_ws.contains(&"--workspaces".to_string()),
+        "--workspaces must be retained"
+    );
+
+    // 7. Short flag cluster: '-s' loglevel silent
+    let raw_s = ["rnpm", "run", "echoargs", "-s"];
+    let prep_s = preprocess_cli_args(raw_s);
+    assert_eq!(
+        prep_s,
+        vec!["rnpm", "run", "echoargs"],
+        "-s must be extracted as loglevel silent"
+    );
+    let overrides = rnpm_config::get_process_cli_overrides();
+    assert_eq!(
+        overrides.as_ref().and_then(|o| o.get("loglevel")),
+        Some(&"silent".to_string())
+    );
+
+    // 8. exec -c / --call command
+    let raw_exec = ["rnpm", "exec", "-c", "echo hello", "world"];
+    let prep_exec = preprocess_cli_args(raw_exec);
+    assert!(
+        prep_exec.contains(&"-c".to_string()) && prep_exec.contains(&"echo hello".to_string()),
+        "exec -c must pass the call command correctly: {:?}", prep_exec
+    );
+
+    // 9. Mixed flags after script: `run echoargs foo --if-present bar`
+    let raw_mixed = ["rnpm", "run", "echoargs", "foo", "--if-present", "bar"];
+    let prep_mixed = preprocess_cli_args(raw_mixed);
+    assert!(
+        prep_mixed.contains(&"--if-present".to_string()),
+        "--if-present anywhere before '--' must be recognized as clap flag"
+    );
+    assert_eq!(
+        &prep_mixed[prep_mixed.len() - 2..],
+        &["foo".to_string(), "bar".to_string()],
+        "Positionals foo and bar must be forwarded to script"
+    );
 }

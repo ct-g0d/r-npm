@@ -67,7 +67,7 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 
     if options.json {
         let json_val = format_tree_json(&root_node, effective_depth, options.long);
-        println!("{}", serde_json::to_string_pretty(&json_val)?);
+        println!("{}", serde_json::to_string_pretty(&ordered_node_json(&json_val))?);
     } else if options.parseable {
         let mut paths = Vec::new();
         let mut seen_paths = HashSet::new();
@@ -91,6 +91,26 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
     }
 }
 
+/// Preserve npm's field order without changing serde_json's workspace-wide map type.
+fn ordered_node_json(value: &Value) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
+    let Some(map) = value.as_object() else {
+        return value.clone().into();
+    };
+    let mut ordered = OrderedJsonMap::new();
+    for key in ["version", "name", "resolved", "overridden", "required", "missing", "extraneous", "invalid", "deduped", "description", "license", "problems", "dependencies", "error"] {
+        if let Some(value) = map.get(key) {
+            let value = if key == "dependencies" {
+                OrderedJsonValue::Object(value.as_object().into_iter().flatten().map(|(name, child)| (name.clone(), ordered_node_json(child))).collect())
+            } else {
+                value.clone().into()
+            };
+            ordered.insert(key.to_string(), value);
+        }
+    }
+    OrderedJsonValue::Object(ordered)
+}
+
 /// Recursively collects unique problem lines from a node and its descendants.
 fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut HashSet<String>) {
     for p in &node.problems {
@@ -101,10 +121,12 @@ fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut Hash
 
     if node.problems.is_empty() {
         if node.missing {
-            let req = node.required.as_deref().unwrap_or("*");
-            let p = format!("missing: {}@{}", node.name, req);
-            if seen.insert(p.clone()) {
-                out.push(p);
+            if !node.optional {
+                let req = node.required.as_deref().unwrap_or("*");
+                let p = format!("missing: {}@{}", node.name, req);
+                if seen.insert(p.clone()) {
+                    out.push(p);
+                }
             }
         } else if node.extraneous {
             let p = format!(
@@ -217,13 +239,22 @@ pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> S
         out.push_str(&format!("{}@{} {}\n", root.name, version_str, path_display));
     }
 
-    let dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
+    let mut dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
+    dep_keys.sort_by(|a, b| {
+        let child_a = root.dependencies.get(a).unwrap();
+        let child_b = root.dependencies.get(b).unwrap();
+        let id_a = child_a.pkgid.as_deref().unwrap_or(a);
+        let id_b = child_b.pkgid.as_deref().unwrap_or(b);
+        id_a.cmp(id_b)
+    });
+
     for (idx, name) in dep_keys.iter().enumerate() {
         let is_last = idx == dep_keys.len() - 1;
         let child = root.dependencies.get(name).unwrap();
         format_child_text(child, max_depth, 0, "", is_last, long, &mut out);
     }
 
+    out.push('\n');
     out
 }
 
@@ -240,10 +271,17 @@ fn format_child_text(
 
     if node.missing {
         let req = node.required.as_deref().unwrap_or("*");
-        out.push_str(&format!(
-            "{prefix}{branch}UNMET DEPENDENCY {}@{}\n",
-            node.name, req
-        ));
+        if node.optional {
+            out.push_str(&format!(
+                "{prefix}{branch}UNMET OPTIONAL DEPENDENCY {}@{}\n",
+                node.name, req
+            ));
+        } else {
+            out.push_str(&format!(
+                "{prefix}{branch}UNMET DEPENDENCY {}@{}\n",
+                node.name, req
+            ));
+        }
     } else {
         let ver = node.version.as_deref().unwrap_or("unknown");
         let mut marker = String::new();
@@ -260,7 +298,7 @@ fn format_child_text(
         ));
     }
 
-    let continuation = if is_last { "    " } else { "|   " };
+    let continuation = if is_last { "  " } else { "| " };
     let child_prefix = format!("{prefix}{continuation}");
 
     if long {
@@ -273,7 +311,15 @@ fn format_child_text(
     }
 
     if current_depth < max_depth && !node.deduped && !node.missing {
-        let dep_keys: Vec<String> = node.dependencies.keys().cloned().collect();
+        let mut dep_keys: Vec<String> = node.dependencies.keys().cloned().collect();
+        dep_keys.sort_by(|a, b| {
+            let child_a = node.dependencies.get(a).unwrap();
+            let child_b = node.dependencies.get(b).unwrap();
+            let id_a = child_a.pkgid.as_deref().unwrap_or(a);
+            let id_b = child_b.pkgid.as_deref().unwrap_or(b);
+            id_a.cmp(id_b)
+        });
+
         for (idx, name) in dep_keys.iter().enumerate() {
             let child_is_last = idx == dep_keys.len() - 1;
             let child = node.dependencies.get(name).unwrap();
@@ -342,6 +388,9 @@ fn format_child_json(
     let mut map = serde_json::Map::new();
 
     if node.missing {
+        if node.optional {
+            return Value::Object(map);
+        }
         if let Some(req) = &node.required {
             map.insert("required".to_string(), Value::String(req.clone()));
         }
@@ -593,8 +642,8 @@ mod tests {
         assert_eq!(lines[1], "| /app");
         assert_eq!(lines[2], "| Root application");
         assert_eq!(lines[3], "`-- dep@2.0.0");
-        assert_eq!(lines[4], "    | /app/node_modules/dep");
-        assert_eq!(lines[5], "    | A dependency description");
+        assert_eq!(lines[4], "  | /app/node_modules/dep");
+        assert_eq!(lines[5], "  | A dependency description");
     }
 
     #[test]
@@ -938,10 +987,10 @@ mod tests {
 
         assert_eq!(lines[0], "root@1.0.0 /app");
         assert_eq!(lines[1], "+-- last@1.0.0");
-        assert_eq!(lines[2], "|   `-- end1@1.0.0");
+        assert_eq!(lines[2], "| `-- end1@1.0.0");
         assert_eq!(lines[3], "`-- mid@1.0.0");
-        assert_eq!(lines[4], "    +-- sub1@1.0.0");
-        assert_eq!(lines[5], "    `-- sub2@1.0.0");
+        assert_eq!(lines[4], "  +-- sub1@1.0.0");
+        assert_eq!(lines[5], "  `-- sub2@1.0.0");
     }
 
     #[test]

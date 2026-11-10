@@ -517,32 +517,21 @@ impl PackagePack {
             let src_h = None;
 
             let mut copied = false;
-            if let Some(ref cas_path) = entry.cas_path {
-                if let Ok(meta) = cas_path.metadata() {
-                    let mut cas_valid = false;
-                    if meta.len() == entry.size {
-                        if entry.cas_verified {
-                            cas_valid = true;
-                        } else if let Some(ref expected_sha) = entry.sha256 {
-                            if let Ok(bytes) = fs::read(cas_path) {
-                                let actual = HEXLOWER.encode(&Sha256::digest(&bytes));
-                                cas_valid = actual.eq_ignore_ascii_case(expected_sha);
-                            }
-                        } else {
-                            cas_valid = true;
-                        }
-                    }
-                    if cas_valid {
-                        if link_or_copy_file(cas_path, &full_path).is_ok() {
-                            copied = true;
-                            rnpm_fs::record_file_created(entry.size);
-                        }
-                    } else {
-                        let _ = PackStore::write_cas_file_direct(cas_path, slice);
-                        if link_or_copy_file(cas_path, &full_path).is_ok() {
-                            copied = true;
-                            rnpm_fs::record_file_created(entry.size);
-                        }
+            if !can_block_clone {
+                if let Some(ref cas_path) = entry.cas_path {
+                    let cas_valid = entry.cas_verified
+                        && cas_path
+                            .metadata()
+                            .map(|metadata| {
+                                metadata.len() == entry.size
+                                    && entry
+                                        .cas_mtime
+                                        .is_none_or(|m| mtime_to_timestamp(&metadata) == Some(m))
+                            })
+                            .unwrap_or(false);
+                    if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
+                        copied = true;
+                        rnpm_fs::record_file_created(entry.size);
                     }
                 }
             }
@@ -698,227 +687,59 @@ impl PackStore {
     }
 
     /// Atomically writes file data into CAS safely using a temp file and atomic rename.
+    /// Atomically writes file data into CAS safely using a temp file and atomic rename.
     pub fn write_cas_file(&self, cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-        Self::write_cas_file_direct(cas_path, data)
+        Self::write_cas_file_safe(cas_path, data)
     }
 
-    /// Direct write into CAS with FILE_FLAG_SEQUENTIAL_SCAN without temp file, flush, or rename.
+    /// Atomically writes file data into CAS safely using a temp file and atomic rename.
+    pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if let Ok(meta) = cas_path.metadata() {
+            if meta.len() == data.len() as u64 {
+                if let Ok(existing) = fs::read(cas_path) {
+                    if existing == data {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some(parent) = cas_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
+
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            f.write_all(data)?;
+            f.flush()?;
+        }
+
+        match fs::rename(&tmp_path, cas_path) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = fs::remove_file(cas_path);
+                let res = fs::rename(&tmp_path, cas_path);
+                let _ = fs::remove_file(&tmp_path);
+                res
+            }
+        }
+    }
+
+    /// Helper for direct CAS write delegating to write_cas_file_safe.
     pub fn write_cas_file_direct(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            extern "system" {
-                fn CreateFileW(
-                    lpFileName: *const u16,
-                    dwDesiredAccess: u32,
-                    dwShareMode: u32,
-                    lpSecurityAttributes: *mut std::ffi::c_void,
-                    dwCreationDisposition: u32,
-                    dwFlagsAndAttributes: u32,
-                    hTemplateFile: *mut std::ffi::c_void,
-                ) -> *mut std::ffi::c_void;
-                fn GetLastError() -> u32;
-            }
-
-            const GENERIC_WRITE: u32 = 0x40000000;
-            const FILE_SHARE_READ: u32 = 1;
-            const FILE_SHARE_WRITE: u32 = 2;
-            const FILE_SHARE_DELETE: u32 = 4;
-            const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-            const CREATE_ALWAYS: u32 = 2;
-            const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
-            const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-
-            let path_v = to_verbatim_path(cas_path);
-            let path_wide: Vec<u16> = path_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
-            let mut handle = unsafe {
-                CreateFileW(
-                    path_wide.as_ptr(),
-                    GENERIC_WRITE,
-                    FILE_SHARE_ALL,
-                    std::ptr::null_mut(),
-                    CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if handle == INVALID_HANDLE_VALUE {
-                let err = unsafe { GetLastError() };
-                const ERROR_PATH_NOT_FOUND: u32 = 3;
-                if err == ERROR_PATH_NOT_FOUND {
-                    if let Some(parent) = cas_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    handle = unsafe {
-                        CreateFileW(
-                            path_wide.as_ptr(),
-                            GENERIC_WRITE,
-                            FILE_SHARE_ALL,
-                            std::ptr::null_mut(),
-                            CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                }
-            }
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
-            }
-
-            Self::write_handle_bytes(handle, data)
-        }
-        #[cfg(not(windows))]
-        {
-            if let Some(parent) = cas_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            fs::write(cas_path, data)
-        }
+        Self::write_cas_file_safe(cas_path, data)
     }
 
-    #[cfg(windows)]
-    fn write_handle_bytes(handle: *mut std::ffi::c_void, data: &[u8]) -> std::io::Result<()> {
-        extern "system" {
-            fn WriteFile(
-                hFile: *mut std::ffi::c_void,
-                lpBuffer: *const std::ffi::c_void,
-                nNumberOfBytesToWrite: u32,
-                lpNumberOfBytesWritten: *mut u32,
-                lpOverlapped: *mut std::ffi::c_void,
-            ) -> i32;
-            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-            fn GetLastError() -> u32;
-        }
-
-        let data_len = data.len();
-        if data_len > 0 {
-            let mut offset = 0usize;
-            while offset < data_len {
-                let chunk_len = ((data_len - offset).min(u32::MAX as usize)) as u32;
-                let mut written = 0u32;
-                let ok = unsafe {
-                    WriteFile(
-                        handle,
-                        data[offset..].as_ptr() as *const std::ffi::c_void,
-                        chunk_len,
-                        &mut written,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    let err = unsafe { GetLastError() };
-                    unsafe { CloseHandle(handle); }
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-                if written == 0 {
-                    unsafe { CloseHandle(handle); }
-                    return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "WriteFile wrote 0 bytes"));
-                }
-                offset += written as usize;
-            }
-        }
-
-        unsafe { CloseHandle(handle); }
-        Ok(())
-    }
-
-    /// Writes file data into CAS using CREATE_NEW, succeeding immediately if file already exists.
+    /// Helper for CAS write create new delegating to write_cas_file_safe.
     pub fn write_cas_file_create_new(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::ffi::OsStrExt;
-            extern "system" {
-                fn CreateFileW(
-                    lpFileName: *const u16,
-                    dwDesiredAccess: u32,
-                    dwShareMode: u32,
-                    lpSecurityAttributes: *mut std::ffi::c_void,
-                    dwCreationDisposition: u32,
-                    dwFlagsAndAttributes: u32,
-                    hTemplateFile: *mut std::ffi::c_void,
-                ) -> *mut std::ffi::c_void;
-                fn GetLastError() -> u32;
-            }
-
-            const GENERIC_WRITE: u32 = 0x40000000;
-            const FILE_SHARE_READ: u32 = 1;
-            const FILE_SHARE_WRITE: u32 = 2;
-            const FILE_SHARE_DELETE: u32 = 4;
-            const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-            const CREATE_NEW: u32 = 1;
-            const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
-            const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-            const ERROR_FILE_EXISTS: u32 = 80;
-            const ERROR_ALREADY_EXISTS: u32 = 183;
-
-            let path_v = to_verbatim_path(cas_path);
-            let path_wide: Vec<u16> = path_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
-            let mut handle = unsafe {
-                CreateFileW(
-                    path_wide.as_ptr(),
-                    GENERIC_WRITE,
-                    FILE_SHARE_ALL,
-                    std::ptr::null_mut(),
-                    CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if handle == INVALID_HANDLE_VALUE {
-                let err = unsafe { GetLastError() };
-                if err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS {
-                    return Ok(());
-                }
-                const ERROR_PATH_NOT_FOUND: u32 = 3;
-                if err == ERROR_PATH_NOT_FOUND {
-                    if let Some(parent) = cas_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    handle = unsafe {
-                        CreateFileW(
-                            path_wide.as_ptr(),
-                            GENERIC_WRITE,
-                            FILE_SHARE_ALL,
-                            std::ptr::null_mut(),
-                            CREATE_NEW,
-                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if handle == INVALID_HANDLE_VALUE {
-                        let err2 = unsafe { GetLastError() };
-                        if err2 == ERROR_FILE_EXISTS || err2 == ERROR_ALREADY_EXISTS {
-                            return Ok(());
-                        }
-                        return Err(std::io::Error::from_raw_os_error(err2 as i32));
-                    }
-                } else {
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-            }
-
-            Self::write_handle_bytes(handle, data)
-        }
-        #[cfg(not(windows))]
-        {
-            if cas_path.exists() {
-                return Ok(());
-            }
-            fs::write(cas_path, data)
-        }
+        Self::write_cas_file_safe(cas_path, data)
     }
-
-/// Atomically writes file data into CAS safely using direct write.
-pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    PackStore::write_cas_file_direct(cas_path, data)
-}
 
     /// Fills the CAS by writing all uncompressed file payloads across 16 parallel threads.
     pub fn populate_cas_global(&self, files: &[(&Path, &[u8])]) {
@@ -3197,10 +3018,7 @@ mod tests {
         );
 
         // Verify pack slice matches original data
-        assert_eq!(
-            pack.get_file_slice("index.js").unwrap(),
-            original_data
-        );
+        assert_eq!(pack.get_file_slice("index.js").unwrap(), original_data);
 
         // Verify materialization uses the repaired CAS blob cleanly
         let target = tempdir().unwrap();
