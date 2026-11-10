@@ -22,16 +22,16 @@ use flate2::read::GzDecoder;
 use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
-use rnpm_fs::writer::{link_or_copy_file, ParallelWriterConfig};
+use rnpm_fs::writer::ParallelWriterConfig;
 use rnpm_fs::{
     clone_or_write_pack_file, is_block_cloning_supported, is_refs_volume, is_same_volume,
-    to_verbatim_path, ExtractionSummary, RawFileHandle,
+    ExtractionSummary, RawFileHandle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

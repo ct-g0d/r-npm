@@ -1294,7 +1294,6 @@ pub(crate) fn link_tree_bins_opt(
     // 2. Track claimed bin names per .bin directory in memory for the current run.
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    let mut bins_to_create: Vec<(PathBuf, PathBuf, String, String, PathBuf)> = Vec::new();
 
     for loc in &package_locs {
         let target_path = loc_base_dir.join(loc);
@@ -1341,21 +1340,6 @@ pub(crate) fn link_tree_bins_opt(
                 );
             }
         }
-    }
-
-    if !bins_to_create.is_empty() {
-        let num_threads = 16.min(bins_to_create.len()).max(1);
-        let chunk_size = bins_to_create.len().div_ceil(num_threads);
-        let bins_slice = &bins_to_create[..];
-        std::thread::scope(|s| {
-            for chunk in bins_slice.chunks(chunk_size) {
-                s.spawn(move || {
-                    for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
-                        link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
-                    }
-                });
-            }
-        });
     }
 
     // 3. Clean up stale shims only if not a fresh clean slate install
