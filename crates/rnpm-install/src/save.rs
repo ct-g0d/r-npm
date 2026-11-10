@@ -50,7 +50,9 @@ pub fn compute_save_spec(
 
     match target {
         PackageTarget::File(p) => {
-            format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()))
+            let s = rnpm_core::to_posix_path(&p.to_string_lossy());
+            let clean = s.strip_prefix("./").unwrap_or(&s);
+            format!("file:{clean}")
         }
         PackageTarget::Git { url, committish } => {
             format!(

@@ -53,6 +53,7 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         legacy_peer_deps: opts.legacy_peer_deps,
         strict_peer_deps: opts.strict_peer_deps,
         dry_run,
+        silent: opts.silent,
         unlocked_packages,
         ..Default::default()
     };
