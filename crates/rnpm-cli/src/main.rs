@@ -3695,63 +3695,7 @@ fn auth_key_for_registry(registry: &Url) -> String {
     format!("//{host}{port}{path}:_authToken")
 }
 
-async fn execute_logout(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    scope: Option<String>,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else if let Some(ref sc) = scope {
-        let sc_norm = if sc.starts_with('@') {
-            sc.clone()
-        } else {
-            format!("@{sc}")
-        };
-        config
-            .npmrc
-            .scoped_registries
-            .get(&sc_norm.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| config.npmrc.registry.clone())
-    } else {
-        config.npmrc.registry.clone()
-    };
 
-    let user_home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok();
-    let mut modified = false;
-
-    let auth_key = auth_key_for_registry(&registry_url);
-    if let Some(home) = user_home {
-        let user_npmrc = PathBuf::from(home).join(".npmrc");
-        if user_npmrc.is_file() {
-            modified |=
-                rnpm_config::delete_config_value_from_file(&user_npmrc, &auth_key).unwrap_or(false);
-        }
-    }
-
-    let local_npmrc = current_dir.join(".npmrc");
-    if local_npmrc.is_file() {
-        modified |=
-            rnpm_config::delete_config_value_from_file(&local_npmrc, &auth_key).unwrap_or(false);
-    }
-
-    if modified {
-        println!("rnpm: successfully logged out of {registry_url}");
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error need auth not logged in to {registry_url}, so can't log out"
-        ))
-    }
-}
 
 
 pub(crate) fn make_registry_client(
@@ -5773,7 +5717,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             execute_login(&current_dir, registry, auth_type, scope, otp).await?;
         }
         Commands::Logout { registry, scope } => {
-            execute_logout(&current_dir, registry, scope).await?;
+            commands::logout::run(&current_dir, registry, scope).await?;
         }
         Commands::Token {
             action,
