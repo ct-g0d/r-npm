@@ -85,7 +85,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `undeprecate` | - | **matching** | Package undeprecation notice, packument update, and identical mock registry requests match npm parity | Ran `undeprecate` against mock registry parity test |
 | `uninstall` | `unlink`, `remove`, `rm`, `r`, `un` | **matching** | Package removal, manifest/lockfile updates, and summary line output match npm | Ran `uninstall` against npm parity test |
 | `unpublish` | - | **matching** | Package removal safeguards, force warnings, dry-run removal output, and mock registry deletion requests match npm | Ran `unpublish` against mock registry and live npm parity test |
-| `unstar` | - | **partial** | Remote authentication requirement: unstarring a package modifies user profile stars on registry requiring write auth; verified via mock registry integration test | Ran `unstar` against mock registry |
+| `unstar` | - | **matching** | Outputs `( ) {package}` and performs unstar package requests against registry; verified against mock registry and live npm parity test | Ran `unstar` against mock registry and live npm parity test |
 | `update` | `u`, `up`, `upgrade`, `udpate` | **matching** | Summary line wording (`added N packages in Xs` / `up to date in Xs`) matches npm parity | Ran `update` on fresh fixture directory |
 | `version` | `verison` | **matching** | Root package listed first, followed by npm and node in canonical order, matching npm parity | Ran `version` on fresh fixture directory |
 | `view` | `info`, `show`, `v` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `view is-number version` on fresh fixture directory |
