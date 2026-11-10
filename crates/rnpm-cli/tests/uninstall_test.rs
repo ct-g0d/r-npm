@@ -222,3 +222,120 @@ fn test_cli_uninstall_requires_package_argument() {
         "Uninstall without arguments must exit with error"
     );
 }
+
+fn normalize_output(text: &str, dir: &std::path::Path) -> String {
+    let mut s = text.replace("\r\n", "\n");
+    let dir_str = dir.to_string_lossy();
+    s = s.replace(&dir_str.to_string(), "<DIR>");
+    s = s.replace(&dir_str.replace('\\', "/"), "<DIR>");
+    if let Ok(canon) = dir.canonicalize() {
+        let canon_str = canon.to_string_lossy();
+        s = s.replace(&canon_str.to_string(), "<DIR>");
+        s = s.replace(&canon_str.replace('\\', "/"), "<DIR>");
+        let unc = canon_str.trim_start_matches(r"\\?\");
+        s = s.replace(unc, "<DIR>");
+        s = s.replace(&unc.replace('\\', "/"), "<DIR>");
+    }
+
+    // Normalize timings like "in 123ms" or "in 1.2s"
+    let mut normalized = String::new();
+    let mut rest = s.as_str();
+    while let Some(idx) = rest.find(" in ") {
+        normalized.push_str(&rest[..idx + 4]);
+        let after = &rest[idx + 4..];
+        let end_num = after.find(|c: char| !c.is_numeric() && c != '.');
+        if let Some(num_len) = end_num {
+            let suffix = &after[num_len..];
+            if suffix.starts_with("ms") {
+                normalized.push_str("<TIME>");
+                rest = &suffix[2..];
+                continue;
+            } else if suffix.starts_with('s') {
+                normalized.push_str("<TIME>");
+                rest = &suffix[1..];
+                continue;
+            }
+        }
+        normalized.push_str(&rest[idx + 4..idx + 5]);
+        rest = &rest[idx + 5..];
+    }
+    normalized.push_str(rest);
+
+    // Filter log lines
+    normalized
+        .lines()
+        .filter(|line| !line.contains("A complete log of this run can be found in:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn test_uninstall_live_npm_parity() {
+    let tmp_rnpm = tempdir().unwrap();
+    let tmp_npm = tempdir().unwrap();
+
+    let pkg_json = r#"{
+  "name": "test-uninst",
+  "version": "1.0.0",
+  "dependencies": {
+    "is-number": "7.0.0"
+  }
+}
+"#;
+    let lock_json = r#"{
+  "name": "test-uninst",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "test-uninst",
+      "version": "1.0.0",
+      "dependencies": {
+        "is-number": "7.0.0"
+      }
+    },
+    "node_modules/is-number": {
+      "version": "7.0.0",
+      "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+      "integrity": "sha512-41Cifkg6e8TylhCSTQAqqWG0MSu0egZnncOS2Z394nV4VU4I9XHvaCz7Au34OBuoIdnH91WD54NypKW/hxbfhA=="
+    }
+  }
+}
+"#;
+    fs::write(tmp_rnpm.path().join("package.json"), pkg_json).unwrap();
+    fs::write(tmp_rnpm.path().join("package-lock.json"), lock_json).unwrap();
+    fs::create_dir_all(tmp_rnpm.path().join("node_modules").join("is-number")).unwrap();
+
+    fs::write(tmp_npm.path().join("package.json"), pkg_json).unwrap();
+    fs::write(tmp_npm.path().join("package-lock.json"), lock_json).unwrap();
+    fs::create_dir_all(tmp_npm.path().join("node_modules").join("is-number")).unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let rnpm_out = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .args(["uninstall", "is-number", "--no-audit", "--no-fund"])
+        .output()
+        .expect("rnpm uninstall failed");
+
+    let npm_res = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "uninstall", "is-number", "--no-audit", "--no-fund"])
+        .current_dir(tmp_npm.path())
+        .output();
+
+    if let Ok(npm_out) = npm_res {
+        if npm_out.status.success() {
+            assert_eq!(rnpm_out.status.code(), npm_out.status.code());
+            let rnpm_norm_stdout = normalize_output(&String::from_utf8_lossy(&rnpm_out.stdout), tmp_rnpm.path());
+            let npm_norm_stdout = normalize_output(&String::from_utf8_lossy(&npm_out.stdout), tmp_npm.path());
+            assert_eq!(rnpm_norm_stdout, npm_norm_stdout, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_norm_stdout, npm_norm_stdout);
+
+            let rnpm_norm_stderr = normalize_output(&String::from_utf8_lossy(&rnpm_out.stderr), tmp_rnpm.path());
+            let npm_norm_stderr = normalize_output(&String::from_utf8_lossy(&npm_out.stderr), tmp_npm.path());
+            assert_eq!(rnpm_norm_stderr, npm_norm_stderr, "stderr mismatch: rnpm={:?} vs npm={:?}", rnpm_norm_stderr, npm_norm_stderr);
+        }
+    }
+}
+
