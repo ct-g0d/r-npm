@@ -33,7 +33,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `diff` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `diff` on fresh fixture directory |
 | `dist-tag` | `dist-tags` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `dist-tag ls is-number` on fresh fixture directory |
 | `docs` | `home` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `docs` on fresh fixture directory |
-| `doctor` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `doctor --help` on fresh fixture directory |
+| `doctor` | - | **partial** | Diagnostic scope: rnpm doctor evaluates platform, Dev Drive, filesystem block cloning, and storage seek penalty rather than npm's node-gyp / npm ping network diagnostics | Ran `doctor` on fresh fixture directory |
 | `edit` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `edit --help` on fresh fixture directory |
 | `exec` | `x` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `exec -- node -e console.log("exec_ok")` on fresh fixture directory |
 | `explain` | `why` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `explain is-number` on fresh fixture directory |
