@@ -51,11 +51,13 @@ impl OutdatedPackage {
 /// JSON output structure for each outdated package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutdatedJsonEntry {
-    pub current: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
     pub wanted: String,
     pub latest: String,
     pub dependent: String,
-    pub location: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]
     pub package_type: Option<String>,
@@ -421,11 +423,12 @@ pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
     ];
 
     for pkg in packages {
+        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
         col_widths[0] = col_widths[0].max(pkg.name.len());
         col_widths[1] = col_widths[1].max(pkg.current.len());
         col_widths[2] = col_widths[2].max(pkg.wanted.len());
         col_widths[3] = col_widths[3].max(pkg.latest.len());
-        col_widths[4] = col_widths[4].max(pkg.location.len());
+        col_widths[4] = col_widths[4].max(loc.len());
         col_widths[5] = col_widths[5].max(pkg.dependent.len());
     }
 
@@ -450,12 +453,13 @@ pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
 
     // Format rows
     for pkg in packages {
+        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
         let cols = [
             pkg.name.as_str(),
             pkg.current.as_str(),
             pkg.wanted.as_str(),
             pkg.latest.as_str(),
-            pkg.location.as_str(),
+            loc,
             pkg.dependent.as_str(),
         ];
 
@@ -481,7 +485,7 @@ pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
 
 /// Format long tabular mode (`--long` / `-l`).
 ///
-/// Header: `Package  Current  Wanted  Latest  Location  Depended by  Package Type  Homepage  Depended By Location`
+/// Header: `Package  Current  Wanted  Latest  Location  Depended by  Package Type  Homepage`
 pub fn format_long(packages: &[OutdatedPackage]) -> String {
     let headers = [
         "Package",
@@ -492,9 +496,8 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
         "Depended by",
         "Package Type",
         "Homepage",
-        "Depended By Location",
     ];
-    let is_right_aligned = [false, true, true, true, false, false, false, false, false];
+    let is_right_aligned = [false, true, true, true, false, false, false, false];
 
     let mut col_widths = [
         headers[0].len(),
@@ -505,19 +508,18 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
         headers[5].len(),
         headers[6].len(),
         headers[7].len(),
-        headers[8].len(),
     ];
 
     for pkg in packages {
+        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
         col_widths[0] = col_widths[0].max(pkg.name.len());
         col_widths[1] = col_widths[1].max(pkg.current.len());
         col_widths[2] = col_widths[2].max(pkg.wanted.len());
         col_widths[3] = col_widths[3].max(pkg.latest.len());
-        col_widths[4] = col_widths[4].max(pkg.location.len());
+        col_widths[4] = col_widths[4].max(loc.len());
         col_widths[5] = col_widths[5].max(pkg.dependent.len());
         col_widths[6] = col_widths[6].max(pkg.package_type.len());
         col_widths[7] = col_widths[7].max(pkg.homepage.as_deref().unwrap_or("").len());
-        col_widths[8] = col_widths[8].max(pkg.dependent_location.len());
     }
 
     let mut lines = Vec::new();
@@ -541,17 +543,17 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
 
     // Format rows
     for pkg in packages {
+        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
         let hp_str = pkg.homepage.as_deref().unwrap_or("");
         let cols = [
             pkg.name.as_str(),
             pkg.current.as_str(),
             pkg.wanted.as_str(),
             pkg.latest.as_str(),
-            pkg.location.as_str(),
+            loc,
             pkg.dependent.as_str(),
             pkg.package_type.as_str(),
             hp_str,
-            pkg.dependent_location.as_str(),
         ];
 
         let row_line = cols
@@ -579,12 +581,18 @@ pub fn format_json(packages: &[OutdatedPackage], long: bool) -> serde_json::Valu
     let mut map = serde_json::Map::new();
 
     for pkg in packages {
+        let (current, location) = if pkg.current == "MISSING" {
+            (None, None)
+        } else {
+            (Some(pkg.current.clone()), Some(pkg.absolute_location.clone()))
+        };
+
         let entry = OutdatedJsonEntry {
-            current: pkg.current.clone(),
+            current,
             wanted: pkg.wanted.clone(),
             latest: pkg.latest.clone(),
             dependent: pkg.dependent.clone(),
-            location: pkg.absolute_location.clone(),
+            location,
             package_type: if long {
                 Some(pkg.package_type.clone())
             } else {
