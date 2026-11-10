@@ -37,8 +37,8 @@
   {
     "command": "cache",
     "aliases": "",
-    "status": "missing",
-    "diffs": "Command not implemented in rnpm (reports unknown command); stdout format differs: npm=\"make-fetch-happen:request-cache:http://127.0.0.1:19876/custom.tgz make-fetch-hap...\" vs rnpm=\"Unknown command: \"cache\"  To see a list of supported npm commands, run:   npm he...\"",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"make-fetch-happen:request-cache:http://127.0.0.1:19876/custom.tgz make-fetch-hap...\" vs rnpm=\"...\"",
     "checkMethod": "Ran `cache ls` on fresh fixture directory"
   },
   {
@@ -93,8 +93,8 @@
   {
     "command": "dist-tag",
     "aliases": "dist-tags",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"latest: 7.0.0...\" vs rnpm=\"latest: \"7.0.0\"...\"",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
     "checkMethod": "Ran `dist-tag ls is-number` on fresh fixture directory"
   },
   {
@@ -143,7 +143,7 @@
     "command": "find-dupes",
     "aliases": "",
     "status": "partial",
-    "diffs": "stdout format differs: npm=\"add is-number 7.0.0  added 1 package in 717ms...\" vs rnpm=\"rnpm: find-dupes: no duplicate packages found...\"",
+    "diffs": "stdout format differs: npm=\"add is-number 7.0.0  added 1 package in 687ms...\" vs rnpm=\"rnpm: find-dupes: no duplicate packages found...\"",
     "checkMethod": "Ran `find-dupes` on fresh fixture directory"
   },
   {
@@ -185,7 +185,7 @@
     "command": "install",
     "aliases": "add, i, in, ins, inst, insta, instal, isnt, isnta, isntal, isntall",
     "status": "partial",
-    "diffs": "stdout format differs: npm=\"up to date in 1s...\" vs rnpm=\"rnpm: successfully installed 0 package(s) (cache hits: 0, misses: 0)...\"",
+    "diffs": "stdout format differs: npm=\"up to date in 860ms...\" vs rnpm=\"rnpm: successfully installed 0 package(s) (cache hits: 0, misses: 0)...\"",
     "checkMethod": "Ran `install --package-lock-only` on fresh fixture directory"
   },
   {
@@ -304,7 +304,7 @@
     "command": "prune",
     "aliases": "",
     "status": "partial",
-    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json, package-lock.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 832ms...\" vs rnpm=\"rnpm: no extraneous packages pruned...\"",
+    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json, package-lock.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 1s...\" vs rnpm=\"rnpm: no extraneous packages pruned...\"",
     "checkMethod": "Ran `prune` on fresh fixture directory"
   },
   {
@@ -429,8 +429,8 @@
   {
     "command": "test",
     "aliases": "tst, t",
-    "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "status": "partial",
+    "diffs": "Exit code mismatch: npm=null, rnpm=0; stdout format differs: npm=\"> test-pkg@1.0.0 test > node -e \"console.log('tested')\"...\" vs rnpm=\"> test-pkg@1.0.0 test > node -e \"console.log('tested')\"  tested...\"",
     "checkMethod": "Ran `test` on fresh fixture directory"
   },
   {
@@ -479,7 +479,7 @@
     "command": "update",
     "aliases": "u, up, upgrade, udpate",
     "status": "partial",
-    "diffs": "stdout format differs: npm=\"added 1 package in 760ms...\" vs rnpm=\"rnpm: updated is-number none -> 7.0.0 rnpm: successfully updated 1 package(s) (c...\"",
+    "diffs": "stdout format differs: npm=\"added 1 package in 1s...\" vs rnpm=\"rnpm: updated is-number none -> 7.0.0 rnpm: successfully updated 1 package(s) (c...\"",
     "checkMethod": "Ran `update` on fresh fixture directory"
   },
   {
