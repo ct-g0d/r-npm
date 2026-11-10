@@ -6837,42 +6837,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             commands::config::run(action, current_dir)?;
         }
         Commands::Link { package } => {
-            let global_prefix = rnpm_config::find_global_prefix();
-            match package {
-                None => {
-                    let target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
-                    println!("{} -> {}", target_link.display(), current_dir.display());
-                }
-                Some(pkg) => {
-                    let target_link =
-                        rnpm_install::link_package_from_global(&current_dir, &pkg, &global_prefix)?;
-                    let global_nm = rnpm_config::find_global_node_modules(&global_prefix);
-                    println!(
-                        "{} -> {}",
-                        target_link.display(),
-                        global_nm.join(&pkg).display()
-                    );
-                }
-            }
+            commands::link::run_link(package, current_dir)?;
         }
         Commands::Unlink { package } => {
-            let global_prefix = rnpm_config::find_global_prefix();
-            match package {
-                None => {
-                    if let Some(target) =
-                        rnpm_install::unlink_package(&current_dir, &global_prefix)?
-                    {
-                        println!("unlinked {}", target.display());
-                    }
-                }
-                Some(pkg) => {
-                    if let Some(target) =
-                        rnpm_install::unlink_package_from_consumer(&current_dir, &pkg)?
-                    {
-                        println!("unlinked {}", target.display());
-                    }
-                }
-            }
+            commands::link::run_unlink(package, current_dir)?;
         }
         Commands::Prefix { global } => {
             if global {
