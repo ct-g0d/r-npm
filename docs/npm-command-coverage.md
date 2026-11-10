@@ -3,7 +3,7 @@
 ## Overview
 
 This document tracks command parity between `rnpm` and `npm` 11.20.0 running on Windows with Node v26.13.0.
-Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated commands was evaluated by executing both tools against identical fixtures in fresh temporary directories, comparing stdout, stderr, process exit code, and filesystem mutations.
+Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated commands was evaluated by executing both tools against identical fixtures in fresh temporary directories, comparing stdout, stderr, process exit code, and filesystem mutations. Raw comparative evaluation outputs and test results are recorded in [docs/npm-command-coverage-raw.json](file:///C:/Users/charl_qez1ct5/.t3/worktrees/npm-rust/npm-command-coverage/docs/npm-command-coverage-raw.json).
 
 ## Coverage Summary (Before vs After)
 
