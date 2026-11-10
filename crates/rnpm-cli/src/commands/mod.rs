@@ -14,3 +14,4 @@ pub mod link;
 pub mod init;
 pub mod query;
 pub mod install_test;
+pub mod shrinkwrap;
