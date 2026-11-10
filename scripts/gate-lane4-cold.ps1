@@ -35,6 +35,27 @@ function Measure-CommandMs {
     return $sw.Elapsed.TotalMilliseconds
 }
 
+function Wait-For-Idle {
+    $threshold = 25.0
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        $cpu = (Get-Counter '\Processor(_Total)\% Processor Time' -ErrorAction SilentlyContinue).CounterSamples[0].CookedValue
+        if ($null -eq $cpu -or $cpu -lt $threshold) {
+            return
+        }
+        Write-Host "Waiting for machine idle (current CPU: $([math]::Round($cpu, 1))%)..." -ForegroundColor DarkYellow
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Get-Spread {
+    param([System.Collections.Generic.List[double]]$List)
+    if ($List.Count -lt 2) { return 0.0 }
+    $min = ($List | Measure-Object -Minimum).Minimum
+    $max = ($List | Measure-Object -Maximum).Maximum
+    if ($min -le 0) { return 0.0 }
+    return (($max - $min) / $min) * 100.0
+}
+
 function Get-Median {
     param([System.Collections.Generic.List[double]]$List)
     $sorted = $List | Sort-Object
@@ -251,6 +272,7 @@ try {
         Write-Host ("  rnpm warm-tar/empty-store:{0,8:N1} ms ({1:N2} s)" -f $rnpmWarmTarMs, ($rnpmWarmTarMs / 1000.0)) -ForegroundColor Cyan
         Remove-Item $rnpmWarmTarDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $rnpmWarmTarStore -Recurse -Force -ErrorAction SilentlyContinue
+        Wait-For-Idle
     }
 } finally {
     Remove-Item $sharedNpmCache, $sharedRnpmCache -Recurse -Force -ErrorAction SilentlyContinue
@@ -261,21 +283,31 @@ $rnpmColdMed = Get-Median $rnpmColdTimes
 $npmWarmMed = Get-Median $npmWarmTimes
 $rnpmWarmTarMed = Get-Median $rnpmWarmTarballTimes
 
+$npmColdSpread = Get-Spread $npmColdTimes
+$rnpmColdSpread = Get-Spread $rnpmColdTimes
+$npmWarmSpread = Get-Spread $npmWarmTimes
+$rnpmWarmTarSpread = Get-Spread $rnpmWarmTarballTimes
+
 $coldSpeedup = if ($rnpmColdMed -gt 0) { $npmColdMed / $rnpmColdMed } else { 0 }
 $warmSpeedup = if ($rnpmWarmTarMed -gt 0) { $npmWarmMed / $rnpmWarmTarMed } else { 0 }
 
 Write-Host "`n====================================================" -ForegroundColor Cyan
 Write-Host " Lane 4 Cold Speed Summary & Medians" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host (" Fully Cold npm ci median:       {0,8:N1} ms ({1:N2} s)" -f $npmColdMed, ($npmColdMed / 1000.0)) -ForegroundColor Magenta
-Write-Host (" Fully Cold rnpm ci median:      {0,8:N1} ms ({1:N2} s)" -f $rnpmColdMed, ($rnpmColdMed / 1000.0)) -ForegroundColor Cyan
+Write-Host (" Fully Cold npm ci median:       {0,8:N1} ms ({1:N2} s) [spread: {2:N1}%]" -f $npmColdMed, ($npmColdMed / 1000.0), $npmColdSpread) -ForegroundColor Magenta
+Write-Host (" Fully Cold rnpm ci median:      {0,8:N1} ms ({1:N2} s) [spread: {2:N1}%]" -f $rnpmColdMed, ($rnpmColdMed / 1000.0), $rnpmColdSpread) -ForegroundColor Cyan
 Write-Host (" Cold speedup vs npm:            {0:N2}x (target >= 2.00x, <= 0.5x time)" -f $coldSpeedup)
 
-Write-Host (" Warm-cache npm ci median:       {0,8:N1} ms ({1:N2} s)" -f $npmWarmMed, ($npmWarmMed / 1000.0)) -ForegroundColor Magenta
-Write-Host (" Warm-tar/empty-store rnpm med:  {0,8:N1} ms ({1:N2} s)" -f $rnpmWarmTarMed, ($rnpmWarmTarMed / 1000.0)) -ForegroundColor Cyan
+Write-Host (" Warm-cache npm ci median:       {0,8:N1} ms ({1:N2} s) [spread: {2:N1}%]" -f $npmWarmMed, ($npmWarmMed / 1000.0), $npmWarmSpread) -ForegroundColor Magenta
+Write-Host (" Warm-tar/empty-store rnpm med:  {0,8:N1} ms ({1:N2} s) [spread: {2:N1}%]" -f $rnpmWarmTarMed, ($rnpmWarmTarMed / 1000.0), $rnpmWarmTarSpread) -ForegroundColor Cyan
 Write-Host (" Warm-tar speedup vs npm warm:   {0:N2}x (target >= 2.00x, <= 0.5x time)" -f $warmSpeedup)
 
 $gatePassed = $true
+
+if ($npmColdSpread -gt 25.0 -or $rnpmColdSpread -gt 25.0 -or $npmWarmSpread -gt 25.0 -or $rnpmWarmTarSpread -gt 25.0) {
+    Write-Host "`n[FAIL] Scenario min/max spread exceeds 25% threshold (npm cold: $([math]::Round($npmColdSpread,1))%, rnpm cold: $([math]::Round($rnpmColdSpread,1))%, npm warm: $([math]::Round($npmWarmSpread,1))%, rnpm warm: $([math]::Round($rnpmWarmTarSpread,1))%). Run is invalid due to noise." -ForegroundColor Red
+    $gatePassed = $false
+}
 
 if ($rnpmColdMed -gt (0.5 * $npmColdMed)) {
     Write-Host "`n[FAIL] Cold rnpm ci ($($rnpmColdMed/1000.0)s) is not >= 2x faster than cold npm ci ($($npmColdMed/1000.0)s)" -ForegroundColor Red

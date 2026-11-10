@@ -31,10 +31,10 @@ pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 pub const MAX_REDIRECTS: usize = 10;
 
 /// Default maximum concurrent requests allowed across the client.
-pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 
 /// Default maximum idle connections per host in the connection pool.
-pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
+pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 128;
 
 /// Default TCP keep-alive interval.
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
@@ -2027,7 +2027,11 @@ impl RegistryClient {
                 }
             }
 
-            let mut bytes = Vec::new();
+            let mut bytes = if let Some(content_length) = expected_content_length {
+                Vec::with_capacity(content_length as usize)
+            } else {
+                Vec::new()
+            };
             let mut stream_err = None;
 
             loop {

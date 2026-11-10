@@ -4491,13 +4491,35 @@ impl Installer {
                         let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
                             .map_err(|e| anyhow!("{e}"))?;
 
-                        let dir_refs: Vec<&Path> = decoded.dirs.iter().map(|p| p.as_path()).collect();
-                        let _ = rnpm_fs::writer::precreate_directories(dir_refs);
+                        if writer_sender_clone.is_none() {
+                            let dir_refs: Vec<&Path> = decoded.dirs.iter().map(|p| p.as_path()).collect();
+                            let _ = rnpm_fs::writer::precreate_directories(dir_refs);
+                        }
 
                         let populate_cas = idx < 5;
-                        if !integrity_str.is_empty() {
-                            let _ = pack_store.put_package_pack_from_decoded(&integrity_str, &pkg_target, &decoded.files, populate_cas);
-                        }
+                        let deferred_pack_files = if !integrity_str.is_empty() {
+                            if writer_sender_clone.is_some() {
+                                pack_store
+                                    .put_package_pack_from_decoded_deferred(
+                                        &integrity_str,
+                                        &pkg_target,
+                                        &decoded.files,
+                                        populate_cas,
+                                    )
+                                    .ok()
+                                    .map(|(_, payloads)| payloads)
+                            } else {
+                                let _ = pack_store.put_package_pack_from_decoded(
+                                    &integrity_str,
+                                    &pkg_target,
+                                    &decoded.files,
+                                    populate_cas,
+                                );
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
                         if let Some(ref sender) = writer_sender_clone {
                             for file in decoded.files {
@@ -4505,6 +4527,10 @@ impl Installer {
                                 sender
                                     .send(file.path, file.data, file.mode)
                                     .map_err(|e| anyhow!("{e}"))?;
+                            }
+                            if let Some(payloads) = deferred_pack_files {
+                                let _ = sender.send(payloads.pack.0, payloads.pack.1, 0o644);
+                                let _ = sender.send(payloads.idx.0, payloads.idx.1, 0o644);
                             }
                         } else {
                             for file in &decoded.files {

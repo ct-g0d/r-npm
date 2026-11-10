@@ -577,6 +577,13 @@ impl PackagePack {
     }
 }
 
+/// Serialized .pack and .idx payloads ready for deferred writing.
+#[derive(Debug, Clone)]
+pub struct DeferredPackPayloads {
+    pub pack: (PathBuf, Vec<u8>),
+    pub idx: (PathBuf, Vec<u8>),
+}
+
 /// The Pack Store manager.
 ///
 /// Stores packages as 4 KiB-aligned `.pack` blobs and `.idx` indices under
@@ -1426,12 +1433,49 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             .map(|p| p.index)
     }
 
+    /// Builds a pack/index from decoded in-memory files and returns the serialized .pack and .idx
+    /// payloads so disk writes can be offloaded asynchronously to the background file writer.
+    pub fn put_package_pack_from_decoded_deferred(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        files: &[rnpm_fs::MaterializeFile],
+        populate_cas: bool,
+    ) -> Result<(PackIndex, DeferredPackPayloads), CacheError> {
+        let input_files: Vec<PackInputFile<'_>> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.path.strip_prefix(pkg_target).ok()?;
+                let clean = rel.to_string_lossy().replace('\\', "/");
+                Some(PackInputFile {
+                    path: clean,
+                    mode: f.mode,
+                    data: f.data.as_slice(),
+                })
+            })
+            .collect();
+
+        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, false)
+            .map(|(p, payloads)| (p.index, payloads))
+    }
+
     fn put_package_pack_with_cas(
         &self,
         integrity: &str,
         files: &[PackInputFile<'_>],
         populate_cas: bool,
     ) -> Result<PackagePack, CacheError> {
+        self.put_package_pack_with_cas_inner(integrity, files, populate_cas, true)
+            .map(|(p, _)| p)
+    }
+
+    fn put_package_pack_with_cas_inner(
+        &self,
+        integrity: &str,
+        files: &[PackInputFile<'_>],
+        populate_cas: bool,
+        write_files: bool,
+    ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
         let (prefix, safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
 
         let limits = rnpm_fs::TarLimits::default();
@@ -1518,16 +1562,21 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
                 }));
             }
 
-            let sha256_hex = HEXLOWER.encode(&Sha256::digest(file.data));
-            let cas_path = self.cas_file_path(&sha256_hex);
+            let (sha256, cas_path) = if populate_cas {
+                let h = HEXLOWER.encode(&Sha256::digest(file.data));
+                let p = self.cas_file_path(&h);
+                (Some(h), Some(p))
+            } else {
+                (None, None)
+            };
             index_files.push(PackFileEntry {
                 path: file.path,
                 mode: file.mode,
                 size: file.data.len() as u64,
                 offset: aligned_offset as u64,
                 aligned_offset: aligned_offset as u64,
-                sha256: Some(sha256_hex),
-                cas_path: Some(cas_path),
+                sha256,
+                cas_path,
                 cas_verified: populate_cas,
                 cas_mtime: None,
             });
@@ -1564,28 +1613,30 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
         // 2. Direct write to packs directory (skip temp files and rename retry loops)
-        let t_p = std::time::Instant::now();
         let prefix_dir = self.packs_dir().join(&prefix);
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
-        let _ = Self::write_cas_file_direct(&final_pack, &pack_bytes);
-        let _ = Self::write_cas_file_direct(&final_idx, &idx_bytes);
-        TIME_PACK_WRITE.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if write_files {
+            let t_p = std::time::Instant::now();
+            let _ = Self::write_cas_file_direct(&final_pack, &pack_bytes);
+            let _ = Self::write_cas_file_direct(&final_idx, &idx_bytes);
+            TIME_PACK_WRITE.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
 
         // 4. Update memory-map cache
         let buffer = if pack_bytes.is_empty() {
             Arc::new(PackBuffer::Empty)
         } else {
-            Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes)))
+            Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes.clone())))
         };
 
         let pack = PackagePack {
             index: index.clone(),
             buffer,
-            pack_path: final_pack,
-            idx_path: final_idx,
+            pack_path: final_pack.clone(),
+            idx_path: final_idx.clone(),
         };
 
         {
@@ -1605,7 +1656,13 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             }
         }
 
-        Ok(pack)
+        Ok((
+            pack,
+            DeferredPackPayloads {
+                pack: (final_pack, pack_bytes),
+                idx: (final_idx, idx_bytes),
+            },
+        ))
     }
 
     fn populate_cas_parallel(&self, entries: &mut [PackFileEntry], pack_bytes: &[u8]) {

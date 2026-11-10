@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -21,11 +21,22 @@ function pump() {
     const item = q[head++];
     inflight++;
     const dir = path.dirname(item.p);
-    if (!dirs.has(dir)) {
-      try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-      dirs.add(dir);
+    let cur = dir;
+    let needMkdir = false;
+    while (cur && !dirs.has(cur)) {
+      dirs.add(cur);
+      needMkdir = true;
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
     }
-    fs.promises.writeFile(item.p, item.b, { mode: item.m })
+    if (needMkdir) {
+      try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+    }
+    const writePromise = (item.m === 0o644)
+      ? fs.promises.writeFile(item.p, item.b)
+      : fs.promises.writeFile(item.p, item.b, { mode: item.m });
+    writePromise
       .then(() => {
         inflight--;
         pump();
@@ -46,22 +57,25 @@ function pump() {
   }
 }
 
-let buf = Buffer.alloc(0);
+let hdr = null;
 
-process.stdin.on('data', chunk => {
-  buf = Buffer.concat([buf, chunk]);
-  while (buf.length >= 12) {
-    const pathLen = buf.readUInt32LE(0);
-    const mode = buf.readUInt32LE(4);
-    const dataLen = buf.readUInt32LE(8);
-    const frameLen = 12 + pathLen + dataLen;
-    if (buf.length < frameLen) break;
-
-    const pStr = buf.toString('utf8', 12, 12 + pathLen);
-    const bSlice = buf.subarray(12 + pathLen, frameLen);
-
-    q.push({ p: pStr, b: Buffer.from(bSlice), m: mode });
-    buf = buf.subarray(frameLen);
+process.stdin.on('readable', () => {
+  while (true) {
+    if (!hdr) {
+      const h = process.stdin.read(12);
+      if (!h) break;
+      hdr = {
+        pLen: h.readUInt32LE(0),
+        mode: h.readUInt32LE(4),
+        dLen: h.readUInt32LE(8)
+      };
+    }
+    const body = process.stdin.read(hdr.pLen + hdr.dLen);
+    if (!body) break;
+    const p = body.toString('utf8', 0, hdr.pLen);
+    const b = body.subarray(hdr.pLen);
+    q.push({ p, b, m: hdr.mode });
+    hdr = null;
   }
   pump();
 });
@@ -84,7 +98,7 @@ pub enum NodeWriterMsg {
 /// A background Node.js worker that writes files concurrently using libuv/fs.promises.
 pub struct NodeWriter {
     child: Child,
-    sender: SyncSender<NodeWriterMsg>,
+    sender: Sender<NodeWriterMsg>,
     thread_handle: Option<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -92,7 +106,7 @@ impl NodeWriter {
     /// Spawns a background Node.js process and begins listening for file write commands.
     pub fn spawn() -> Result<Self, std::io::Error> {
         let mut child = Command::new("node")
-            .env("UV_THREADPOOL_SIZE", "16")
+            .env("UV_THREADPOOL_SIZE", "32")
             .arg("-e")
             .arg(NODE_WRITER_SCRIPT)
             .stdin(Stdio::piped())
@@ -101,7 +115,7 @@ impl NodeWriter {
             .spawn()?;
 
         let mut stdin = std::io::BufWriter::with_capacity(1024 * 1024, child.stdin.take().unwrap());
-        let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(4096);
+        let (tx, rx): (Sender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = channel();
 
         let handle = thread::spawn(move || -> std::io::Result<()> {
             while let Ok(msg) = rx.recv() {
@@ -130,7 +144,7 @@ impl NodeWriter {
     }
 
     /// Obtains a cloned channel sender for worker threads.
-    pub fn sender(&self) -> SyncSender<NodeWriterMsg> {
+    pub fn sender(&self) -> Sender<NodeWriterMsg> {
         self.sender.clone()
     }
 
@@ -253,7 +267,7 @@ impl RustWriterPool {
 /// Cloneable sender for async file writes across worker threads.
 #[derive(Clone)]
 pub enum AsyncFileWriterSender {
-    Node(SyncSender<NodeWriterMsg>),
+    Node(Sender<NodeWriterMsg>),
     Rust(SyncSender<WriteTask>),
 }
 
