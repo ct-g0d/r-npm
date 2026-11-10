@@ -24,6 +24,47 @@ if (-not (Test-Path $rnpmBin)) {
     exit 1
 }
 
+function Restore-EnvVar([string]$name, $origVal) {
+    if ($null -eq $origVal) {
+        Remove-Item "env:$name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item "env:$name" $origVal
+    }
+}
+
+# Preserve original environment
+$origNpmConfigPrefix       = $env:NPM_CONFIG_PREFIX
+$origNpmConfigUserconfig   = $env:NPM_CONFIG_USERCONFIG
+$origNpmConfigGlobalconfig = $env:NPM_CONFIG_GLOBALCONFIG
+$origNpmConfigCache        = $env:NPM_CONFIG_CACHE
+$origAppData               = $env:APPDATA
+$origLocalAppData          = $env:LOCALAPPDATA
+
+# Setup isolated environment
+$isolationBase = Join-Path $env:TEMP "parity-gate-env-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+$isolatedPrefix = Join-Path $isolationBase "isolated-prefix"
+$isolatedCache = Join-Path $isolationBase "isolated-cache"
+$isolatedAppData = Join-Path $isolationBase "isolated-appdata\Roaming"
+$isolatedLocalAppData = Join-Path $isolationBase "isolated-appdata\Local"
+$isolatedUserconfig = Join-Path $isolationBase "isolated-user.npmrc"
+$isolatedGlobalconfig = Join-Path $isolationBase "isolated-global.npmrc"
+
+New-Item -ItemType Directory -Path $isolatedPrefix -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedCache -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedAppData -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedLocalAppData -Force | Out-Null
+Set-Content $isolatedUserconfig ""
+Set-Content $isolatedGlobalconfig ""
+
+$env:NPM_CONFIG_PREFIX       = $isolatedPrefix
+$env:NPM_CONFIG_USERCONFIG   = $isolatedUserconfig
+$env:NPM_CONFIG_GLOBALCONFIG = $isolatedGlobalconfig
+$env:NPM_CONFIG_CACHE        = $isolatedCache
+$env:APPDATA                 = $isolatedAppData
+$env:LOCALAPPDATA            = $isolatedLocalAppData
+
+try {
+
 $npmVer = & npm.cmd --version
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host " rnpm Parity Gate Harness" -ForegroundColor Cyan
@@ -597,4 +638,16 @@ if ($failing.Count -gt 0) {
 } else {
     Write-Host "`n[SUCCESS] All gates passed with 100% parity!" -ForegroundColor Green
     exit 0
+}
+} finally {
+    Restore-EnvVar "NPM_CONFIG_PREFIX"       $origNpmConfigPrefix
+    Restore-EnvVar "NPM_CONFIG_USERCONFIG"   $origNpmConfigUserconfig
+    Restore-EnvVar "NPM_CONFIG_GLOBALCONFIG" $origNpmConfigGlobalconfig
+    Restore-EnvVar "NPM_CONFIG_CACHE"        $origNpmConfigCache
+    Restore-EnvVar "APPDATA"                 $origAppData
+    Restore-EnvVar "LOCALAPPDATA"            $origLocalAppData
+
+    if (-not $KeepTemp) {
+        Remove-Item $isolationBase -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
