@@ -1,0 +1,513 @@
+[
+  {
+    "command": "access",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `access 2fa-required` on fresh fixture directory"
+  },
+  {
+    "command": "adduser",
+    "aliases": "add-user",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Add a registry user account  Usage: npm adduser  Options: [--registry <registry>...\" vs rnpm=\"Log in to a registry  Usage: rnpm.exe login [OPTIONS]  Options:       --registry...\"",
+    "checkMethod": "Ran `adduser --help` on fresh fixture directory"
+  },
+  {
+    "command": "approve-scripts",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Approve install scripts for specific dependencies  Usage: npm approve-scripts <p...\" vs rnpm=\"Manage lifecycle script approval policy  Usage: rnpm.exe approve-scripts [OPTION...\"",
+    "checkMethod": "Ran `approve-scripts --help` on fresh fixture directory"
+  },
+  {
+    "command": "audit",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `audit` on fresh fixture directory"
+  },
+  {
+    "command": "bugs",
+    "aliases": "issues",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `bugs` on fresh fixture directory"
+  },
+  {
+    "command": "cache",
+    "aliases": "",
+    "status": "missing",
+    "diffs": "Command not implemented in rnpm (reports unknown command); stdout format differs: npm=\"make-fetch-happen:request-cache:http://127.0.0.1:19876/custom.tgz make-fetch-hap...\" vs rnpm=\"Unknown command: \"cache\"  To see a list of supported npm commands, run:   npm he...\"",
+    "checkMethod": "Ran `cache ls` on fresh fixture directory"
+  },
+  {
+    "command": "ci",
+    "aliases": "clean-install, ic, install-clean, isntall-clean",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `ci` on fresh fixture directory"
+  },
+  {
+    "command": "completion",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `completion` on fresh fixture directory"
+  },
+  {
+    "command": "config",
+    "aliases": "c",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"; \"builtin\" config from C:\\Program Files\\nodejs\\node_modules\\npm\\npmrc  prefix =...\" vs rnpm=\"; environment-related config audit = \"false\" fund = \"false\" update-notifier = \"f...\"",
+    "checkMethod": "Ran `config list` on fresh fixture directory"
+  },
+  {
+    "command": "dedupe",
+    "aliases": "ddp",
+    "status": "partial",
+    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 2s...\" vs rnpm=\"rnpm: tree is already deduplicated...\"",
+    "checkMethod": "Ran `dedupe` on fresh fixture directory"
+  },
+  {
+    "command": "deny-scripts",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Deny install scripts for specific dependencies  Usage: npm deny-scripts <pkg> [<...\" vs rnpm=\"Remove lifecycle script approval entries  Usage: rnpm.exe deny-scripts [OPTIONS]...\"",
+    "checkMethod": "Ran `deny-scripts --help` on fresh fixture directory"
+  },
+  {
+    "command": "deprecate",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Deprecate a version of a package  Usage: npm deprecate <package-spec> <message> ...\" vs rnpm=\"Mark package versions as deprecated  Usage: rnpm.exe deprecate [OPTIONS] <PACKAG...\"",
+    "checkMethod": "Ran `deprecate --help` on fresh fixture directory"
+  },
+  {
+    "command": "diff",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `diff` on fresh fixture directory"
+  },
+  {
+    "command": "dist-tag",
+    "aliases": "dist-tags",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"latest: 7.0.0...\" vs rnpm=\"latest: \"7.0.0\"...\"",
+    "checkMethod": "Ran `dist-tag ls is-number` on fresh fixture directory"
+  },
+  {
+    "command": "docs",
+    "aliases": "home",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `docs` on fresh fixture directory"
+  },
+  {
+    "command": "doctor",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Check the health of your npm environment  Usage: npm doctor [connection] [regist...\" vs rnpm=\"Check the local npm/rnpm installation and machine performance diagnostics  Usage...\"",
+    "checkMethod": "Ran `doctor --help` on fresh fixture directory"
+  },
+  {
+    "command": "edit",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Edit an installed package  Usage: npm edit <pkg>[/<subpkg>...]  Options: [--edit...\" vs rnpm=\"Edit a package in the configured editor  Usage: rnpm.exe edit [OPTIONS] <PACKAGE...\"",
+    "checkMethod": "Ran `edit --help` on fresh fixture directory"
+  },
+  {
+    "command": "exec",
+    "aliases": "x",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `exec -- node -e console.log(\"exec_ok\")` on fresh fixture directory"
+  },
+  {
+    "command": "explain",
+    "aliases": "why",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `explain is-number` on fresh fixture directory"
+  },
+  {
+    "command": "explore",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Browse an installed package  Usage: npm explore <pkg> [ -- <command>]  Options: ...\" vs rnpm=\"Explore a package in a shell  Usage: rnpm.exe explore [OPTIONS] <PACKAGE>  Argum...\"",
+    "checkMethod": "Ran `explore --help` on fresh fixture directory"
+  },
+  {
+    "command": "find-dupes",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"add is-number 7.0.0  added 1 package in 717ms...\" vs rnpm=\"rnpm: find-dupes: no duplicate packages found...\"",
+    "checkMethod": "Ran `find-dupes` on fresh fixture directory"
+  },
+  {
+    "command": "fund",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"test-pkg@1.0.0...\" vs rnpm=\"0 packages are looking for funding...\"",
+    "checkMethod": "Ran `fund` on fresh fixture directory"
+  },
+  {
+    "command": "get",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `get registry` on fresh fixture directory"
+  },
+  {
+    "command": "help",
+    "aliases": "hlep",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"npm <command>  Usage:  npm install        install all the dependencies in your p...\" vs rnpm=\"High performance Rust implementation of npm workflows  Usage: rnpm <COMMAND>  Co...\"",
+    "checkMethod": "Ran `help` on fresh fixture directory"
+  },
+  {
+    "command": "help-search",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Top hits for \"install\" —————————————————————————————————————————————————————————...\" vs rnpm=\"install\tMinimal JavaScript module loader @antfu/install-pkg\tInstall package prog...\"",
+    "checkMethod": "Ran `help-search install` on fresh fixture directory"
+  },
+  {
+    "command": "init",
+    "aliases": "create, innit",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Wrote to C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UE...\" vs rnpm=\"Wrote to C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UE...\"",
+    "checkMethod": "Ran `init -y` on fresh fixture directory"
+  },
+  {
+    "command": "install",
+    "aliases": "add, i, in, ins, inst, insta, instal, isnt, isnta, isntal, isntall",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"up to date in 1s...\" vs rnpm=\"rnpm: successfully installed 0 package(s) (cache hits: 0, misses: 0)...\"",
+    "checkMethod": "Ran `install --package-lock-only` on fresh fixture directory"
+  },
+  {
+    "command": "install-ci-test",
+    "aliases": "cit, clean-install-test, sit",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Install a project with a clean slate and run tests  Usage: npm install-ci-test  ...\" vs rnpm=\"Install dependencies and run the CI test script  Usage: rnpm.exe install-ci-test...\"",
+    "checkMethod": "Ran `install-ci-test --help` on fresh fixture directory"
+  },
+  {
+    "command": "install-scripts",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Manage install-script approvals for dependencies  Usage: npm install-scripts app...\" vs rnpm=\"Install dependencies and run install scripts  Usage: rnpm.exe install-scripts [O...\"",
+    "checkMethod": "Ran `install-scripts --help` on fresh fixture directory"
+  },
+  {
+    "command": "install-test",
+    "aliases": "it",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Install package(s) and run tests  Usage: npm install-test [<package-spec> ...]  ...\" vs rnpm=\"Install dependencies and run the test script  Usage: rnpm.exe install-test [ARGS...\"",
+    "checkMethod": "Ran `install-test --help` on fresh fixture directory"
+  },
+  {
+    "command": "link",
+    "aliases": "ln",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Symlink a package folder  Usage: npm link [<package-spec>]  Options: [-S|--save|...\" vs rnpm=\"Link a package folder locally or globally  Usage: rnpm.exe link [PACKAGE]  Argum...\"",
+    "checkMethod": "Ran `link --help` on fresh fixture directory"
+  },
+  {
+    "command": "ll",
+    "aliases": "la",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"...\" vs rnpm=\"test-pkg@1.0.0 | C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bc...\"",
+    "checkMethod": "Ran `ll` on fresh fixture directory"
+  },
+  {
+    "command": "login",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Login to a registry user account  Usage: npm login  Options: [--registry <regist...\" vs rnpm=\"Log in to a registry  Usage: rnpm.exe login [OPTIONS]  Options:       --registry...\"",
+    "checkMethod": "Ran `login --help` on fresh fixture directory"
+  },
+  {
+    "command": "logout",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Log out of the registry  Usage: npm logout  Options: [--registry <registry>] [--...\" vs rnpm=\"Log out of a registry  Usage: rnpm.exe logout [OPTIONS]  Options:       --regist...\"",
+    "checkMethod": "Ran `logout --help` on fresh fixture directory"
+  },
+  {
+    "command": "ls",
+    "aliases": "list",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"test-pkg@1.0.0 C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\...\" vs rnpm=\"test-pkg@1.0.0 C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\...\"",
+    "checkMethod": "Ran `ls` on fresh fixture directory"
+  },
+  {
+    "command": "org",
+    "aliases": "ogr",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Manage orgs  Usage: npm org set orgname username [developer | admin | owner] npm...\" vs rnpm=\"Manage npm organizations  Usage: rnpm.exe org [OPTIONS] [ACTION] [ARGS]...  Argu...\"",
+    "checkMethod": "Ran `org --help` on fresh fixture directory"
+  },
+  {
+    "command": "outdated",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Package    Current  Wanted  Latest  Location  Depended by is-number  MISSING   7...\" vs rnpm=\"Package    Current  Wanted  Latest  Location                Depended by is-numbe...\"",
+    "checkMethod": "Ran `outdated` on fresh fixture directory"
+  },
+  {
+    "command": "owner",
+    "aliases": "author",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"doowb <brian.woodward@gmail.com> jonschlinkert <github@sellside.com> realityking...\" vs rnpm=\"doowb\twrite jonschlinkert\twrite realityking\twrite...\"",
+    "checkMethod": "Ran `owner ls is-number` on fresh fixture directory"
+  },
+  {
+    "command": "pack",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `pack --dry-run` on fresh fixture directory"
+  },
+  {
+    "command": "ping",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `ping` on fresh fixture directory"
+  },
+  {
+    "command": "pkg",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"\"test-pkg\"...\" vs rnpm=\"test-pkg...\"",
+    "checkMethod": "Ran `pkg get name` on fresh fixture directory"
+  },
+  {
+    "command": "prefix",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\" vs rnpm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\"",
+    "checkMethod": "Ran `prefix` on fresh fixture directory"
+  },
+  {
+    "command": "profile",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Change settings on your registry profile  Usage: npm profile enable-2fa [auth-on...\" vs rnpm=\"Manage npm profile information  Usage: rnpm.exe profile [OPTIONS] [ACTION] [ARGS...\"",
+    "checkMethod": "Ran `profile --help` on fresh fixture directory"
+  },
+  {
+    "command": "prune",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json, package-lock.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 832ms...\" vs rnpm=\"rnpm: no extraneous packages pruned...\"",
+    "checkMethod": "Ran `prune` on fresh fixture directory"
+  },
+  {
+    "command": "publish",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `publish --dry-run` on fresh fixture directory"
+  },
+  {
+    "command": "query",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"[   {     \"name\": \"test-pkg\",     \"version\": \"1.0.0\",     \"description\": \"test f...\" vs rnpm=\"[   {     \"_id\": \"test-pkg@1.0.0\",     \"deduped\": false,     \"description\": \"tes...\"",
+    "checkMethod": "Ran `query :root` on fresh fixture directory"
+  },
+  {
+    "command": "rebuild",
+    "aliases": "rb",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"rebuilt dependencies successfully...\" vs rnpm=\"rnpm: rebuild: no packages required rebuilding...\"",
+    "checkMethod": "Ran `rebuild` on fresh fixture directory"
+  },
+  {
+    "command": "repo",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `repo` on fresh fixture directory"
+  },
+  {
+    "command": "restart",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `restart` on fresh fixture directory"
+  },
+  {
+    "command": "root",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\" vs rnpm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\"",
+    "checkMethod": "Ran `root` on fresh fixture directory"
+  },
+  {
+    "command": "run",
+    "aliases": "run-script, rum, urn",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `run test` on fresh fixture directory"
+  },
+  {
+    "command": "sbom",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Generate a Software Bill of Materials (SBOM)  Usage: npm sbom  Options: [--omit ...\" vs rnpm=\"Generate Software Bill of Materials (SBOM)  Usage: rnpm.exe sbom [OPTIONS]  Opti...\"",
+    "checkMethod": "Ran `sbom --help` on fresh fixture directory"
+  },
+  {
+    "command": "search",
+    "aliases": "find, s, se",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"is-number Returns true if a number or string value is a finite number. Useful fo...\" vs rnpm=\"is-number@7.0.0\tReturns true if a number or string value is a finite number. Use...\"",
+    "checkMethod": "Ran `search is-number` on fresh fixture directory"
+  },
+  {
+    "command": "set",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `set foo=bar` on fresh fixture directory"
+  },
+  {
+    "command": "shrinkwrap",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"...\" vs rnpm=\"npm-shrinkwrap.json up to date...\"",
+    "checkMethod": "Ran `shrinkwrap` on fresh fixture directory"
+  },
+  {
+    "command": "stage",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Stage packages for publishing, deferring proof-of-presence (2FA) to a later poin...\" vs rnpm=\"Manage staged package versions  Usage: rnpm.exe stage [OPTIONS] [ACTION] [ARGS]....\"",
+    "checkMethod": "Ran `stage --help` on fresh fixture directory"
+  },
+  {
+    "command": "star",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Mark your favorite packages  Usage: npm star [<package-spec>...]  Options: [--re...\" vs rnpm=\"Star a package  Usage: rnpm.exe star [OPTIONS] [PACKAGES]...  Arguments:   [PACK...\"",
+    "checkMethod": "Ran `star --help` on fresh fixture directory"
+  },
+  {
+    "command": "stars",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"View packages marked as favorites  Usage: npm stars [<user>]  Options: [--regist...\" vs rnpm=\"Show packages starred by the current user  Usage: rnpm.exe stars [OPTIONS] [USER...\"",
+    "checkMethod": "Ran `stars --help` on fresh fixture directory"
+  },
+  {
+    "command": "start",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `start` on fresh fixture directory"
+  },
+  {
+    "command": "stop",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `stop` on fresh fixture directory"
+  },
+  {
+    "command": "team",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Manage organization teams and team memberships  Usage: npm team create <scope:te...\" vs rnpm=\"Manage npm teams  Usage: rnpm.exe team [OPTIONS] [ACTION] [ARGS]...  Arguments: ...\"",
+    "checkMethod": "Ran `team --help` on fresh fixture directory"
+  },
+  {
+    "command": "test",
+    "aliases": "tst, t",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `test` on fresh fixture directory"
+  },
+  {
+    "command": "token",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Manage your authentication tokens  Usage: npm token list npm token revoke <id|to...\" vs rnpm=\"Manage registry authentication tokens  Usage: rnpm.exe token [OPTIONS] [COMMAND]...\"",
+    "checkMethod": "Ran `token --help` on fresh fixture directory"
+  },
+  {
+    "command": "trust",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Create a trusted relationship between a package and a OIDC provider  Usage: npm ...\" vs rnpm=\"Record package trust metadata  Usage: rnpm.exe trust [OPTIONS] [ACTION] [ARGS].....\"",
+    "checkMethod": "Ran `trust --help` on fresh fixture directory"
+  },
+  {
+    "command": "undeprecate",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Undeprecate a version of a package  Usage: npm undeprecate <package-spec>  Optio...\" vs rnpm=\"Remove a package deprecation notice  Usage: rnpm.exe undeprecate [OPTIONS] <PACK...\"",
+    "checkMethod": "Ran `undeprecate --help` on fresh fixture directory"
+  },
+  {
+    "command": "uninstall",
+    "aliases": "unlink, remove, rm, r, un",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Remove a package  Usage: npm uninstall [<@scope>/]<pkg>...  Options: [-S|--save|...\" vs rnpm=\"Remove a package from project dependencies  Usage: rnpm.exe uninstall [OPTIONS] ...\"",
+    "checkMethod": "Ran `uninstall --help` on fresh fixture directory"
+  },
+  {
+    "command": "unpublish",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Remove a package from the registry  Usage: npm unpublish [<package-spec>]  Optio...\" vs rnpm=\"Remove a package or package version from a registry  Usage: rnpm.exe unpublish [...\"",
+    "checkMethod": "Ran `unpublish --help` on fresh fixture directory"
+  },
+  {
+    "command": "unstar",
+    "aliases": "",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"Remove an item from your favorite packages  Usage: npm unstar [<package-spec>......\" vs rnpm=\"Unstar a package  Usage: rnpm.exe unstar [OPTIONS] [PACKAGES]...  Arguments:   [...\"",
+    "checkMethod": "Ran `unstar --help` on fresh fixture directory"
+  },
+  {
+    "command": "update",
+    "aliases": "u, up, upgrade, udpate",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"added 1 package in 760ms...\" vs rnpm=\"rnpm: updated is-number none -> 7.0.0 rnpm: successfully updated 1 package(s) (c...\"",
+    "checkMethod": "Ran `update` on fresh fixture directory"
+  },
+  {
+    "command": "version",
+    "aliases": "verison",
+    "status": "partial",
+    "diffs": "stdout format differs: npm=\"{   'test-pkg': '1.0.0',   npm: '11.20.0',   node: '26.13.0',   acorn: '8.19.0',...\" vs rnpm=\"{   acorn: '8.19.0',   ada: '4.0.0',   amaro: '1.1.11',   ares: '1.34.9',   brot...\"",
+    "checkMethod": "Ran `version` on fresh fixture directory"
+  },
+  {
+    "command": "view",
+    "aliases": "info, show, v",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `view is-number version` on fresh fixture directory"
+  },
+  {
+    "command": "whoami",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `whoami` on fresh fixture directory"
+  },
+  {
+    "command": "set-script",
+    "aliases": "",
+    "status": "matching",
+    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
+    "checkMethod": "Ran `set-script --help` on fresh fixture directory"
+  }
+]

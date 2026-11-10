@@ -623,7 +623,7 @@ pub fn resolve_manifest_path(manifest_path: &Path) -> PathBuf {
 ///   - If the field does not exist, returns `{}`.
 /// - If multiple fields:
 ///   - Returns a JSON object with `{ field_path: resolved_value, ... }` formatted as pretty-printed JSON.
-pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Result<String> {
+pub fn pkg_get(manifest_path: &Path, field_paths: &[String], _json: bool) -> Result<String> {
     let resolved_path = resolve_manifest_path(manifest_path);
     let content = std::fs::read_to_string(&resolved_path).with_context(|| {
         format!(
@@ -653,11 +653,6 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], json: bool) -> Resu
             None => return Ok("{}".to_string()),
         };
 
-        if let OrderedJsonValue::String(s) = value {
-            if !json {
-                return Ok(s.clone());
-            }
-        }
         return Ok(Manifest::format_json_value(
             value,
             &ManifestFormat::default(),

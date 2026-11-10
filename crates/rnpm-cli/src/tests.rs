@@ -143,6 +143,7 @@ async fn test_cli_update_command_integration() {
             strict_sandbox: false,
             legacy_peer_deps: false,
             strict_peer_deps: false,
+            json: false,
             no_audit: false,
             no_fund: false,
         },
@@ -1394,6 +1395,7 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             prefix: None,
             wait_for_trash: false,
             detached_trash: true,
+            json: false,
         },
     };
 
@@ -2489,7 +2491,7 @@ fn test_thread5_cli_command_parsing() {
             },
         } => {
             assert_eq!(key, "foo");
-            assert_eq!(value, "bar");
+            assert_eq!(value.as_deref(), Some("bar"));
             assert!(!global);
         }
         _ => panic!("Expected Config Set"),

@@ -3,6 +3,7 @@
 
 mod audit;
 mod explain;
+pub mod commands;
 pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
@@ -214,6 +215,10 @@ pub(crate) enum Commands {
         /// Detached background trash deletion without blocking exit (default: true)
         #[arg(long = "detached-trash", default_value = "true", action = clap::ArgAction::Set)]
         detached_trash: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -343,6 +348,10 @@ pub(crate) enum Commands {
         /// Detached background trash deletion without blocking exit (default: true)
         #[arg(long = "detached-trash", default_value = "true", action = clap::ArgAction::Set)]
         detached_trash: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run package test script
@@ -534,6 +543,10 @@ pub(crate) enum Commands {
         #[arg(long = "prefix")]
         prefix: Option<PathBuf>,
 
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
+
         /// Disable audit check
         #[arg(long = "no-audit")]
         no_audit: bool,
@@ -580,6 +593,10 @@ pub(crate) enum Commands {
         /// Fail installation if any peer dependencies are missing or invalid
         #[arg(long = "strict-peer-deps")]
         strict_peer_deps: bool,
+
+        /// Output JSON summary instead of text
+        #[arg(long)]
+        json: bool,
 
         /// Disable audit check
         #[arg(long = "no-audit")]
@@ -1502,10 +1519,10 @@ pub(crate) enum OwnerAction {
 pub(crate) enum ConfigAction {
     /// Set a configuration key to a value
     Set {
-        /// Configuration key to set
+        /// Configuration key to set (or key=value)
         key: String,
         /// Value to assign
-        value: String,
+        value: Option<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1537,6 +1554,10 @@ pub(crate) enum ConfigAction {
         #[arg(long)]
         json: bool,
     },
+    /// Open the config file in an editor
+    Edit,
+    /// Repair or normalize configuration
+    Fix,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1558,10 +1579,32 @@ pub(crate) enum PkgAction {
         #[arg(required = true)]
         fields: Vec<String>,
     },
+    /// Normalize and fix package.json
+    Fix,
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum CacheAction {
+    /// Add the specified package or tarball to the local cache
+    Add {
+        /// Package spec or tarball path to cache
+        package: String,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// List contents of the cache folder
+    Ls {
+        /// Subpath or key filter to list
+        path: Option<String>,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
     /// Delete all data out of the cache folder
     Clean {
         /// Force clean without warning
@@ -1957,7 +2000,7 @@ fn is_lifecycle_script(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_run(
+pub(crate) async fn execute_run(
     current_dir: PathBuf,
     script: Option<String>,
     args: Vec<String>,
@@ -3249,7 +3292,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
     Ok(())
 }
 
-fn run_lifecycle_hook(
+pub(crate) fn run_lifecycle_hook(
     package_dir: &std::path::Path,
     manifest: &Manifest,
     hook_name: &str,
@@ -3295,7 +3338,7 @@ fn run_lifecycle_hook(
     Ok(())
 }
 
-async fn execute_publish(
+pub(crate) async fn execute_publish(
     current_dir: PathBuf,
     target: PathBuf,
     tag: String,
@@ -3573,94 +3616,7 @@ async fn execute_publish(
     Ok(())
 }
 
-async fn execute_whoami(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
 
-    let token = config.npmrc.get_auth_token(&registry_url);
-    if token.is_none() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-        ));
-    }
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    if let Some(tok) = token {
-        client_config.auth_token = Some(tok.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-    let username = client.whoami(Some(&registry_url)).await?;
-
-    if json {
-        println!("{}", serde_json::to_string(&username)?);
-    } else {
-        println!("{username}");
-    }
-
-    Ok(())
-}
-
-async fn execute_ping(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    if let Some(tok) = config.npmrc.get_auth_token(&registry_url) {
-        client_config.auth_token = Some(tok.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-    let duration = client.ping(Some(&registry_url)).await?;
-
-    if json {
-        let json_out = serde_json::json!({
-            "registry": registry_url.to_string(),
-            "time": duration.as_millis(),
-            "details": {}
-        });
-        println!("{}", serde_json::to_string_pretty(&json_out)?);
-    } else {
-        eprintln!("npm notice PING {registry_url}");
-        eprintln!("npm notice PONG {}ms", duration.as_millis());
-    }
-
-    Ok(())
-}
 
 async fn execute_login(
     current_dir: &std::path::Path,
@@ -3821,79 +3777,8 @@ async fn execute_logout(
     }
 }
 
-async fn execute_token(
-    current_dir: &std::path::Path,
-    action: Option<TokenAction>,
-    registry: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
 
-    let token = config.npmrc.get_auth_token(&registry_url);
-    if token.is_none() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-        ));
-    }
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    if let Some(tok) = token {
-        client_config.auth_token = Some(tok.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-
-    match action.unwrap_or(TokenAction::List) {
-        TokenAction::List => match client.token_list(Some(&registry_url)).await {
-            Ok(val) => {
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&val)?);
-                } else if let Some(tokens) = val.get("objects").and_then(|o| o.as_array()) {
-                    println!("id\ttoken\tcreated\tread-only\tCIDR whitelist");
-                    for t in tokens {
-                        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let tok = t.get("token").and_then(|v| v.as_str()).unwrap_or("");
-                        let created = t.get("created").and_then(|v| v.as_str()).unwrap_or("");
-                        let ro = t.get("readonly").and_then(|v| v.as_bool()).unwrap_or(false);
-                        println!("{id}\t{tok}…\t{created}\t{ro}");
-                    }
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&val)?);
-                }
-            }
-            Err(e) => {
-                if json {
-                    println!("{}", serde_json::json!({ "error": e.to_string() }));
-                } else {
-                    eprintln!("npm notice Token management API not available or returned: {e}");
-                    eprintln!("npm notice Please manage security tokens via the web dashboard at {registry_url}");
-                }
-            }
-        },
-        TokenAction::Revoke { token_id } => {
-            client.token_revoke(Some(&registry_url), &token_id).await?;
-            println!("rnpm: successfully revoked token {token_id}");
-        }
-    }
-
-    Ok(())
-}
-
-fn make_registry_client(
+pub(crate) fn make_registry_client(
     current_dir: &Path,
     registry: Option<String>,
 ) -> anyhow::Result<(Url, rnpm_registry::RegistryClient)> {
@@ -3921,83 +3806,7 @@ fn make_registry_client(
     ))
 }
 
-async fn execute_dist_tag(
-    current_dir: &Path,
-    action: DistTagAction,
-    registry: Option<String>,
-    json: bool,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    match action {
-        DistTagAction::Ls { package } => {
-            let package = package.unwrap_or(package_name_from_manifest(current_dir)?);
-            let value = client.dist_tags(Some(&registry_url), &package).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(tags) = value.as_object() {
-                for (tag, version) in tags {
-                    println!("{tag}: {version}");
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-        }
-        DistTagAction::Add { package, tag } => {
-            let (name, version) = split_package_version(&package)?;
-            let tag = tag.unwrap_or_else(|| "latest".to_string());
-            client
-                .dist_tag_add(Some(&registry_url), name, &tag, version, otp.as_deref())
-                .await?;
-            println!("+ {name}@{version} ({tag})");
-        }
-        DistTagAction::Rm { package, tag } => {
-            let name = package_name_from_spec(&package);
-            client
-                .dist_tag_remove(Some(&registry_url), name, &tag, otp.as_deref())
-                .await?;
-            println!("- {name} {tag}");
-        }
-    }
-    Ok(())
-}
 
-async fn execute_owner(
-    current_dir: &Path,
-    action: OwnerAction,
-    registry: Option<String>,
-    json: bool,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    match action {
-        OwnerAction::Ls { package } => {
-            let value = client.package_owners(Some(&registry_url), &package).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(map) = value.as_object() {
-                for (name, role) in map {
-                    println!("{name}\t{}", role.as_str().unwrap_or("owner"));
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
-        }
-        OwnerAction::Add { user, package } => {
-            client
-                .package_owner_add(Some(&registry_url), &package, &user, otp.as_deref())
-                .await?;
-            println!("added {user} to {package}");
-        }
-        OwnerAction::Rm { user, package } => {
-            client
-                .package_owner_remove(Some(&registry_url), &package, &user, otp.as_deref())
-                .await?;
-            println!("removed {user} from {package}");
-        }
-    }
-    Ok(())
-}
 
 async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow::Result<()> {
     match command {
@@ -4119,7 +3928,7 @@ async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow:
     Ok(())
 }
 
-fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
+pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     let at = if let Some(stripped) = spec.strip_prefix('@') {
         stripped.rfind('@').map(|i| i + 1)
     } else {
@@ -4136,7 +3945,7 @@ fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     Ok((name, version))
 }
 
-fn package_name_from_spec(spec: &str) -> &str {
+pub(crate) fn package_name_from_spec(spec: &str) -> &str {
     if let Some(stripped) = spec.strip_prefix('@') {
         stripped
             .rfind('@')
@@ -4147,7 +3956,7 @@ fn package_name_from_spec(spec: &str) -> &str {
     }
 }
 
-fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
+pub(crate) fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
     let path = current_dir.join("package.json");
     let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     value
@@ -5078,6 +4887,20 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
     }
 }
 
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
+    let millis = d.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        let secs = d.as_secs_f64();
+        if (secs * 10.0).round() % 10.0 == 0.0 {
+            format!("{:.0}s", secs)
+        } else {
+            format!("{:.1}s", secs)
+        }
+    }
+}
+
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let current_dir = match dir {
         Some(d) => d,
@@ -5134,6 +4957,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             install_strategy,
             wait_for_trash,
             detached_trash,
+            json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
@@ -5261,20 +5085,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ..Default::default()
             };
 
+            let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
+            let elapsed_str = format_duration(start_time.elapsed());
 
-            if !silent && dry_run {
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": summary.packages_installed,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": 0
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
             } else if !dry_run {
                 if !silent {
-                    println!(
-                        "rnpm: successfully installed {} package(s) (cache hits: {}, misses: {})",
-                        summary.packages_installed, summary.cache_hits, summary.cache_misses
-                    );
+                    if summary.packages_installed > 0 {
+                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
+                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                    } else {
+                        println!("\nup to date in {}", elapsed_str);
+                    }
 
                     if fund_val {
                         let count = audit::count_funding_packages(&current_dir);
@@ -5330,6 +5170,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             install_strategy,
             wait_for_trash,
             detached_trash,
+            json,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
@@ -5414,20 +5255,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 ..Default::default()
             };
 
+            let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
+            let elapsed_str = format_duration(start_time.elapsed());
 
-            if !silent && dry_run {
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": summary.packages_installed,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": 0
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent && dry_run {
                 println!(
                     "rnpm: dry-run: would install {} package(s)",
                     summary.packages_installed
                 );
             } else if !dry_run {
                 if !silent {
-                    println!(
-                        "rnpm: successfully verified and installed {} package(s) from lockfile",
-                        summary.packages_installed
-                    );
+                    if summary.packages_installed > 0 {
+                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
+                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                    } else {
+                        println!("\nup to date in {}", elapsed_str);
+                    }
 
                     if fund_val {
                         let count = audit::count_funding_packages(&current_dir);
@@ -5659,30 +5516,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             cache,
             offline,
         } => {
-            if let Some(init_pkg) = initializer {
-                let transformed = init::transform_initializer(&init_pkg);
-                execute_exec(
-                    &current_dir,
-                    &transformed,
-                    &[],
-                    &args,
-                    registry,
-                    cache,
-                    offline,
-                )
-                .await?;
-            } else {
-                let init_opts = init::InitOptions {
-                    yes,
-                    scope,
-                    directory: current_dir,
-                };
-                let stdin = std::io::stdin();
-                let mut stdin_lock = stdin.lock();
-                let stdout = std::io::stdout();
-                let mut stdout_lock = stdout.lock();
-                init::run_init(&init_opts, &mut stdin_lock, &mut stdout_lock)?;
-            }
+            let init_args = commands::init::InitCommandArgs {
+                initializer,
+                args,
+                yes,
+                scope,
+                registry,
+                cache,
+                offline,
+            };
+            commands::init::run(init_args, current_dir).await?;
         }
         Commands::Pack {
             target,
@@ -5692,84 +5535,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ignore_scripts,
             foreground_scripts,
         } => {
-            let package_dir = if target.is_absolute() {
-                target
-            } else {
-                current_dir.join(target)
+            let args = commands::pack::PackCommandArgs {
+                target,
+                dry_run,
+                json,
+                pack_destination,
+                ignore_scripts,
+                foreground_scripts,
             };
-
-            let manifest_path = package_dir.join("package.json");
-            if !manifest_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "package.json not found in {}",
-                    package_dir.display()
-                ));
-            }
-
-            let manifest = Manifest::from_file(&manifest_path)?;
-            let config = rnpm_config::Config::load(Some(&package_dir)).ok();
-            let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let effective_ignore = ignore_scripts
-                || cli_overrides.as_ref().and_then(|o| o.get("ignore-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get_bool("ignore-scripts")).unwrap_or(false);
-            let effective_foreground = foreground_scripts
-                || cli_overrides.as_ref().and_then(|o| o.get("foreground-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(false);
-            let is_silent = json
-                || cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get("loglevel")).map(|s| s == "silent").unwrap_or(false);
-
-            run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent)?;
-            run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent)?;
-
-            let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
-                Ok(res) => res,
-                Err(e) => {
-                    return Err(anyhow::anyhow!("pack failed: {e}"));
-                }
-            };
-
-            run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent)?;
-
-            let dest_dir = pack_destination.unwrap_or_else(|| current_dir.clone());
-            let final_tarball_path = dest_dir.join(&summary.filename);
-
-            if !dry_run {
-                if let Err(e) = std::fs::write(&final_tarball_path, &tarball_bytes) {
-                    return Err(anyhow::anyhow!(
-                        "failed to write {}: {e}",
-                        final_tarball_path.display()
-                    ));
-                }
-            }
-
-            if json {
-                let json_output = serde_json::json!([
-                    {
-                        "id": format!("{}@{}", summary.name, summary.version),
-                        "name": summary.name,
-                        "version": summary.version,
-                        "size": summary.package_size,
-                        "unpackedSize": summary.unpacked_size,
-                        "shasum": summary.shasum,
-                        "integrity": summary.integrity,
-                        "filename": summary.filename,
-                        "files": summary.files.iter().map(|f| serde_json::json!({
-                            "path": f.path,
-                            "size": f.size,
-                            "mode": f.mode,
-                        })).collect::<Vec<_>>(),
-                        "entryCount": summary.entry_count,
-                        "bundled": summary.bundled,
-                    }
-                ]);
-                println!("{}", serde_json::to_string_pretty(&json_output)?);
-            } else {
-                if !is_silent {
-                    print_pack_notices(&summary);
-                }
-                println!("{}", summary.filename);
-            }
+            commands::pack::run(args, current_dir).await?;
         }
         Commands::Uninstall {
             packages,
@@ -5781,6 +5555,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace,
             workspaces,
             workspace_root,
+            json,
             ..
         } => {
             if packages.is_empty() {
@@ -5805,6 +5580,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 is_global,
                 ..Default::default()
             };
+            let start_time = std::time::Instant::now();
             let installer = Installer::new(options)?;
             let uninstall_options = UninstallOptions {
                 packages,
@@ -5817,12 +5593,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
             };
             let summary = installer.uninstall(&uninstall_options)?;
-            if !silent {
-                println!(
-                    "rnpm: removed {} package(s), pruned {} unreferenced dependencies",
-                    summary.removed_packages.len(),
-                    summary.pruned_dependencies.len()
-                );
+            let mut all_removed = std::collections::HashSet::new();
+            for pkg in &summary.removed_packages {
+                all_removed.insert(pkg.clone());
+            }
+            for pruned in &summary.pruned_dependencies {
+                let name = pruned.rsplit("node_modules/").next().unwrap_or(pruned);
+                all_removed.insert(name.to_string());
+            }
+            let total_removed = all_removed.len();
+            let elapsed_str = format_duration(start_time.elapsed());
+
+            if json {
+                let json_output = serde_json::json!({
+                    "add": [],
+                    "added": 0,
+                    "audited": 0,
+                    "change": [],
+                    "changed": 0,
+                    "funding": 0,
+                    "remove": [],
+                    "removed": total_removed
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if !silent {
+                if total_removed > 0 {
+                    let pkg_str = if total_removed == 1 { "package" } else { "packages" };
+                    println!("\nremoved {} {} in {}", total_removed, pkg_str, elapsed_str);
+                } else {
+                    println!("\nup to date in {}", elapsed_str);
+                }
             }
         }
         Commands::Update {
@@ -5835,86 +5635,23 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
+            json,
             ..
         } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-            let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
-
-            // update() reads a newly written lockfile to construct its summary.
-            // Dry runs instead use the install simulation with the same unlock set.
-            let dry_run = config.get_bool("dry-run").unwrap_or(false);
-            let mut unlocked_packages = std::collections::HashSet::new();
-            if dry_run {
-                if packages.is_empty() {
-                    let manifest = Manifest::from_file(current_dir.join("package.json"))?;
-                    unlocked_packages.extend(manifest.dependencies.into_keys());
-                    unlocked_packages.extend(manifest.dev_dependencies.into_keys());
-                    unlocked_packages.extend(manifest.optional_dependencies.into_keys());
-                } else {
-                    for package in &packages {
-                        let name = package.rsplit("node_modules/").next().unwrap_or(package);
-                        unlocked_packages.insert(rnpm_core::spec::PackageSpec::parse(name)?.name);
-                    }
-                }
-            }
-
-            let options = InstallOptions {
-                project_dir: current_dir,
-                registry_url: registry,
-                cache_dir: cache,
+            let opts = commands::update::UpdateOptions {
+                packages,
+                registry,
+                cache,
                 offline,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
                 legacy_peer_deps,
                 strict_peer_deps,
-                dry_run,
                 silent,
-                unlocked_packages,
-                ..Default::default()
+                json,
             };
-
-            let mut installer = Installer::new(options)?;
-            if dry_run {
-                let summary = installer.run().await?;
-                if !silent {
-                    println!(
-                        "rnpm: dry-run: would install {} package(s)",
-                        summary.packages_installed
-                    );
-                }
-                return Ok(());
-            }
-            let summary = installer.update(&packages).await?;
-
-            if silent {
-                return Ok(());
-            } else if summary.packages_updated == 0 {
-                println!("rnpm: up to date");
-            } else {
-                for pkg in &summary.updated_packages {
-                    let old_v = summary
-                        .old_versions
-                        .get(pkg)
-                        .map(|s| s.as_str())
-                        .unwrap_or("none");
-                    let new_v = summary
-                        .new_versions
-                        .get(pkg)
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    println!("rnpm: updated {pkg} {old_v} -> {new_v}");
-                }
-                println!(
-                    "rnpm: successfully updated {} package(s) (cache hits: {}, misses: {})",
-                    summary.packages_updated, summary.cache_hits, summary.cache_misses
-                );
-            }
+            commands::update::run(opts, current_dir).await?;
         }
         Commands::Prune {
             omit,
@@ -5923,158 +5660,25 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             dry_run,
             json,
         } => {
-            let (mut omit_dev, omit_optional, omit_peer) =
-                parse_omit_and_include_options(&omit, &include);
-            if production {
-                let has_dev_included = include.iter().any(|val| {
-                    val.split(',').any(|part| {
-                        let t = part.trim().to_ascii_lowercase();
-                        t == "dev" || t == "development"
-                    })
-                });
-                if !has_dev_included {
-                    omit_dev = true;
-                }
-            }
-            let prune_options = rnpm_install::prune::PruneOptions {
-                project_dir: current_dir.clone(),
-                omit_dev,
-                omit_optional,
-                omit_peer,
+            let args = commands::prune::PruneCommandArgs {
+                omit,
+                include,
+                production,
+                dry_run,
+                json,
+                silent,
             };
-
-            let installer = Installer::new(InstallOptions {
-                project_dir: current_dir,
-                ..Default::default()
-            })?;
-
-            if dry_run {
-                let analysis = installer.analyze_prune(&prune_options)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&analysis)?);
-                } else if silent {
-                    return Ok(());
-                } else if analysis.extraneous_packages.is_empty() {
-                    println!("rnpm: dry-run: no packages would be pruned");
-                } else {
-                    for pkg in &analysis.extraneous_packages {
-                        println!("rnpm: would remove {}", pkg.path);
-                    }
-                    println!(
-                        "rnpm: dry-run: {} package(s) would be removed",
-                        analysis.extraneous_packages.len()
-                    );
-                }
-            } else {
-                let summary = installer.prune(&prune_options)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                } else if silent {
-                    return Ok(());
-                } else if summary.removed_packages.is_empty() {
-                    println!("rnpm: no extraneous packages pruned");
-                } else {
-                    for pkg in &summary.removed_packages {
-                        println!("rnpm: removed {pkg}");
-                    }
-                    println!(
-                        "rnpm: successfully pruned {} package(s)",
-                        summary.removed_packages.len()
-                    );
-                }
-            }
+            commands::prune::run(args, current_dir).await?;
         }
         Commands::Dedupe {
             packages,
             dry_run,
             ..
         } => {
-            let dedupe_options = rnpm_install::DedupeOptions {
-                project_dir: current_dir.clone(),
-                dry_run,
-                packages,
-            };
-            let installer = Installer::new(InstallOptions {
-                project_dir: current_dir,
-                ..Default::default()
-            })?;
-            let summary = installer.dedupe(&dedupe_options)?;
-
-            if dry_run {
-                if summary.actions.is_empty() {
-                    println!(
-                        "rnpm: dedupe dry-run: tree is already deduplicated, no duplicates found"
-                    );
-                } else {
-                    for action in &summary.actions {
-                        match action.action_type {
-                            rnpm_install::DedupeActionType::DeleteDuplicate => {
-                                println!(
-                                    "rnpm: dedupe: would remove {} ({})",
-                                    action.original_path, action.reason
-                                );
-                            }
-                            rnpm_install::DedupeActionType::HoistAndDedupe => {
-                                println!(
-                                    "rnpm: dedupe: would hoist {} -> {} ({})",
-                                    action.original_path, action.target_path, action.reason
-                                );
-                            }
-                        }
-                    }
-                    println!(
-                        "rnpm: dedupe dry-run: {} action(s) would be performed",
-                        summary.actions.len()
-                    );
-                }
-            } else if summary.actions.is_empty() {
-                println!("rnpm: tree is already deduplicated");
-            } else {
-                for action in &summary.actions {
-                    match action.action_type {
-                        rnpm_install::DedupeActionType::DeleteDuplicate => {
-                            println!("rnpm: dedupe: removed {}", action.original_path);
-                        }
-                        rnpm_install::DedupeActionType::HoistAndDedupe => {
-                            println!(
-                                "rnpm: dedupe: hoisted {} -> {}",
-                                action.original_path, action.target_path
-                            );
-                        }
-                    }
-                }
-                println!(
-                    "rnpm: successfully deduplicated {} package(s)",
-                    summary.actions.len()
-                );
-            }
+            commands::dedupe::run_dedupe(packages, dry_run, current_dir).await?;
         }
         Commands::FindDupes { packages } => {
-            let dedupe_options = rnpm_install::DedupeOptions {
-                project_dir: current_dir.clone(),
-                dry_run: true,
-                packages,
-            };
-            let installer = Installer::new(InstallOptions {
-                project_dir: current_dir,
-                ..Default::default()
-            })?;
-            let summary = installer.find_dupes(&dedupe_options)?;
-
-            if summary.actions.is_empty() {
-                println!("rnpm: find-dupes: no duplicate packages found");
-            } else {
-                for action in &summary.actions {
-                    println!(
-                        "rnpm: find-dupes: duplicate found: {} ({})",
-                        action.original_path, action.reason
-                    );
-                }
-                println!(
-                    "rnpm: find-dupes: {} duplicate package(s) detected",
-                    summary.actions.len()
-                );
-            }
+            commands::dedupe::run_find_dupes(packages, current_dir).await?;
         }
         Commands::Rebuild {
             packages,
@@ -6082,42 +5686,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             foreground_scripts,
             strict_sandbox,
         } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-            let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
-
-            let rebuild_options = rnpm_install::RebuildOptions {
-                project_dir: current_dir.clone(),
+            let opts = commands::rebuild::RebuildOptions {
                 packages,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
             };
-
-            let installer = Installer::new(InstallOptions {
-                project_dir: current_dir,
-                ignore_scripts: effective_ignore,
-                foreground_scripts: effective_foreground,
-                strict_sandbox: effective_strict,
-                ..Default::default()
-            })?;
-
-            let summary = installer.rebuild(&rebuild_options).await?;
-            if summary.rebuilt_packages.is_empty() {
-                println!("rnpm: rebuild: no packages required rebuilding");
-            } else {
-                for pkg in &summary.rebuilt_packages {
-                    println!("rnpm: rebuilt {pkg}");
-                }
-                println!(
-                    "rnpm: successfully rebuilt {} package(s)",
-                    summary.rebuilt_packages.len()
-                );
-            }
+            commands::rebuild::run(opts, current_dir).await?;
         }
         Commands::Pkg {
             action,
@@ -6126,112 +5701,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace,
             workspaces,
         } => {
-            let base_path = if prefix.is_absolute() {
-                prefix
-            } else {
-                current_dir.join(&prefix)
-            };
-            let root_manifest_path = if base_path.file_name().is_some_and(|f| f == "package.json") {
-                base_path.clone()
-            } else {
-                base_path.join("package.json")
-            };
-            let project_root = if base_path.file_name().is_some_and(|f| f == "package.json") {
-                base_path.parent().unwrap_or(&base_path).to_path_buf()
-            } else {
-                base_path.clone()
-            };
-
-            if !root_manifest_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "code ENOENT: package.json not found in {}",
-                    project_root.display()
-                ));
-            }
-
-            let is_workspace_mode = workspaces || !workspace.is_empty();
-            if is_workspace_mode {
-                let discovered = rnpm_core::workspace::discover_workspaces(&project_root)
-                    .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
-
-                if discovered.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "npm error code ENOWORKSPACES\nnpm error No workspaces found in {}",
-                        project_root.display()
-                    ));
-                }
-
-                let matched_members: Vec<rnpm_core::workspace::WorkspaceMember> = if workspaces
-                    && workspace.is_empty()
-                {
-                    discovered
-                } else {
-                    let mut matched = Vec::new();
-                    for ws_filter in &workspace {
-                        let matches: Vec<_> = discovered
-                            .iter()
-                            .filter(|m| {
-                                rnpm_lifecycle::matches_filter(
-                                    ws_filter,
-                                    &m.name,
-                                    &m.path,
-                                    &project_root,
-                                )
-                            })
-                            .cloned()
-                            .collect();
-                        if matches.is_empty() {
-                            return Err(anyhow::anyhow!(
-                                "npm error code ENOWORKSPACE\nnpm error No workspaces found for: {ws_filter}"
-                            ));
-                        }
-                        for m in matches {
-                            if !matched.iter().any(
-                                |existing: &rnpm_core::workspace::WorkspaceMember| {
-                                    existing.name == m.name
-                                },
-                            ) {
-                                matched.push(m);
-                            }
-                        }
-                    }
-                    matched
-                };
-
-                match action {
-                    PkgAction::Get { fields } => {
-                        let member_refs: Vec<(&str, &Path)> = matched_members
-                            .iter()
-                            .map(|m| (m.name.as_str(), m.path.as_path()))
-                            .collect();
-                        let output = rnpm_core::pkg::pkg_get_workspaces(&member_refs, &fields)?;
-                        println!("{output}");
-                    }
-                    PkgAction::Set { assignments } => {
-                        for m in &matched_members {
-                            rnpm_core::pkg::pkg_set(&m.manifest_path(), &assignments)?;
-                        }
-                    }
-                    PkgAction::Delete { fields } => {
-                        for m in &matched_members {
-                            rnpm_core::pkg::pkg_delete(&m.manifest_path(), &fields)?;
-                        }
-                    }
-                }
-            } else {
-                match action {
-                    PkgAction::Get { fields } => {
-                        let output = rnpm_core::pkg::pkg_get(&root_manifest_path, &fields, json)?;
-                        println!("{output}");
-                    }
-                    PkgAction::Set { assignments } => {
-                        rnpm_core::pkg::pkg_set(&root_manifest_path, &assignments)?;
-                    }
-                    PkgAction::Delete { fields } => {
-                        rnpm_core::pkg::pkg_delete(&root_manifest_path, &fields)?;
-                    }
-                }
-            }
+            commands::pkg::run(action, prefix, json, workspace, workspaces, current_dir)?;
         }
         Commands::Audit {
             action,
@@ -6249,66 +5719,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Cache { action, cache } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let cache_path = cache
-                .or_else(|| match &action {
-                    CacheAction::Clean { cache: c, .. } => c.clone(),
-                    CacheAction::Verify { cache: c } => c.clone(),
-                })
-                .unwrap_or_else(|| {
-                    if let Some(user_cache) = config.npmrc.settings.get("cache") {
-                        PathBuf::from(user_cache)
-                    } else if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-                        PathBuf::from(appdata).join("rnpm").join("cache")
-                    } else {
-                        std::env::temp_dir().join(".rnpm-cache")
-                    }
-                });
-
-            let cache = rnpm_cache::Cache::new(&cache_path)?;
-
-            match action {
-                CacheAction::Clean { force, .. } => {
-                    if !force {
-                        eprintln!("npm error code EUSAGE");
-                        eprintln!("npm error As of npm@5, the npm cache self-heals from corruption issues");
-                        eprintln!("npm error and data extracted from the cache is guaranteed to be valid.");
-                        eprintln!("npm error If you want to make sure everything is healthy, use 'rnpm cache verify' instead.");
-                        eprintln!(
-                            "npm error If you are sure you want to delete the entire cache, run:"
-                        );
-                        eprintln!("npm error   rnpm cache clean --force");
-                        std::process::exit(1);
-                    }
-                    cache.clean()?;
-                    println!(
-                        "rnpm: cache cleared successfully ({})",
-                        cache_path.display()
-                    );
-                }
-                CacheAction::Verify { .. } => {
-                    let start = std::time::Instant::now();
-                    let report = cache.verify()?;
-                    let elapsed = start.elapsed().as_secs_f64();
-                    println!("Cache verified and compacted ({})", cache_path.display());
-                    println!(
-                        "Content verified: {} ({} bytes)",
-                        report.verified_blobs, report.total_blob_bytes
-                    );
-                    println!("Index entries: {}", report.verified_indices);
-                    if report.corrupted_blobs > 0
-                        || report.corrupted_indices > 0
-                        || report.orphaned_indices > 0
-                        || report.stale_temp_files_cleaned > 0
-                    {
-                        println!(
-                            "Cleaned: {} corrupt blob(s), {} corrupt index file(s), {} orphaned index pointer(s), {} stale temp file(s)",
-                            report.corrupted_blobs, report.corrupted_indices, report.orphaned_indices, report.stale_temp_files_cleaned
-                        );
-                    }
-                    println!("Finished in {:.3}s", elapsed);
-                }
-            }
+            commands::cache::run(action, cache, current_dir)?;
         }
         Commands::Diff {
             specs,
@@ -6335,16 +5746,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Sbom {
             sbom_format,
             sbom_type,
-            package_lock_only: _,
+            package_lock_only,
             omit,
         } => {
-            let options = sbom::SbomOptions {
-                format: sbom_format,
-                sbom_type,
-                package_lock_only: false,
-                omit,
-            };
-            sbom::run_sbom(&current_dir, options).await?;
+            commands::sbom::run(
+                commands::sbom::SbomCommandArgs {
+                    sbom_format,
+                    sbom_type,
+                    package_lock_only,
+                    omit,
+                },
+                current_dir,
+            )
+            .await?;
         }
         Commands::Version {
             newversion,
@@ -6361,29 +5775,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspaces,
             include_workspace_root,
         } => {
-            let options = version::VersionOptions {
+            let args = commands::version::VersionCommandArgs {
                 newversion,
                 preid,
                 message,
                 allow_same_version,
-                git_tag_version: !no_git_tag_version,
-                commit_hooks: !no_commit_hooks,
+                no_git_tag_version,
+                no_commit_hooks,
                 sign_git_tag,
                 force,
                 ignore_scripts,
                 json,
+                workspace,
+                workspaces,
+                include_workspace_root,
             };
-
-            let has_ws = workspaces || !workspace.is_empty();
-            if has_ws {
-                let members = select_workspace_members(&current_dir, &workspace, include_workspace_root)?;
-                for member in members {
-                    println!("{}", member.name);
-                    version::execute_version(&member.path, options.clone()).await?;
-                }
-            } else {
-                version::execute_version(&current_dir, options).await?;
-            }
+            commands::version::run(args, current_dir).await?;
         }
         Commands::List {
             mut packages,
@@ -6464,57 +5871,21 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             parseable,
             registry,
         } => {
-            let opts = outdated::OutdatedOptions {
-                packages,
-                all,
-                json,
-                long,
-                parseable,
-                registry,
-            };
-            let code = outdated::run_outdated(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "outdated dependencies found".to_string(),
-                }));
-            }
+            commands::outdated::run(packages, all, json, long, parseable, registry, current_dir).await?;
         }
         Commands::View {
             args,
             json,
             registry,
         } => {
-            let opts = view::ViewOptions {
-                args,
-                json,
-                registry,
-            };
-            let code = view::run_view(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "view finished with non-zero exit code".to_string(),
-                }));
-            }
+            commands::view::run(args, json, registry, current_dir).await?;
         }
         Commands::Query {
             selector,
             package_lock_only,
             registry,
         } => {
-            let opts = query::QueryOptions {
-                selector,
-                package_lock_only,
-                registry,
-            };
-            let code = query::run_query(&current_dir, &opts).await?;
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "query finished with non-zero exit code".to_string(),
-                }));
-            }
+            commands::query::run(selector, package_lock_only, registry, current_dir).await?;
         }
         Commands::Publish {
             target,
@@ -6527,25 +5898,27 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ignore_scripts,
             json,
         } => {
-            execute_publish(
+            commands::publish::run(
+                commands::publish::PublishArgs {
+                    target,
+                    tag,
+                    access,
+                    dry_run,
+                    otp,
+                    provenance,
+                    registry,
+                    ignore_scripts,
+                    json,
+                },
                 current_dir,
-                target,
-                tag,
-                access,
-                dry_run,
-                otp,
-                provenance,
-                registry,
-                ignore_scripts,
-                json,
             )
             .await?;
         }
         Commands::Whoami { registry, json } => {
-            execute_whoami(&current_dir, registry, json).await?;
+            commands::whoami::run(registry, json, current_dir).await?;
         }
         Commands::Ping { registry, json } => {
-            execute_ping(&current_dir, registry, json).await?;
+            commands::ping::run(registry, json, current_dir).await?;
         }
         Commands::Login {
             registry,
@@ -6563,7 +5936,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             json,
         } => {
-            execute_token(&current_dir, action, registry, json).await?;
+            commands::token::run(action, registry, json, current_dir).await?;
         }
         Commands::ApproveScripts {
             packages,
@@ -6613,13 +5986,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             json,
             otp,
-        } => execute_dist_tag(&current_dir, action, registry, json, otp).await?,
+        } => commands::dist_tag::run(current_dir, action, registry, json, otp).await?,
         Commands::Owner {
             action,
             registry,
             json,
             otp,
-        } => execute_owner(&current_dir, action, registry, json, otp).await?,
+        } => commands::owner::run(current_dir, action, registry, json, otp).await?,
         Commands::Unpublish {
             package,
             version,
@@ -6647,14 +6020,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             registry,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Deprecate {
+            commands::deprecate::run(
+                commands::deprecate::DeprecateArgs {
                     package,
                     message,
                     otp,
                     registry,
                 },
+                current_dir,
             )
             .await?;
         }
@@ -6679,14 +6052,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             otp,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Access {
+            commands::access::run(
+                commands::access::AccessArgs {
                     args,
                     registry,
                     json,
                     otp,
                 },
+                current_dir,
             )
             .await?;
         }
@@ -6698,53 +6071,25 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             no_description,
             registry,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let text = terms.join(" ");
-            let value = client
-                .search(Some(&registry_url), &text, search_limit, 0)
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
-                for item in objects {
-                    let p = item.get("package").unwrap_or(item);
-                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let version = p.get("version").and_then(|v| v.as_str()).unwrap_or("");
-                    let description = p.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                    if parseable {
-                        println!("{name}\t{version}\t{description}");
-                    } else if no_description {
-                        println!("{name}@{version}");
-                    } else {
-                        println!("{name}@{version}\t{description}");
-                    }
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            commands::search::run(
+                commands::search::SearchArgs {
+                    terms,
+                    search_limit,
+                    json,
+                    parseable,
+                    no_description,
+                    registry,
+                },
+                current_dir,
+            )
+            .await?;
         }
         Commands::Stars {
             user,
             json,
             registry,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = client
-                .starred_packages(Some(&registry_url), user.as_deref())
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(packages) = value.as_array() {
-                for package in packages {
-                    if let Some(name) = package.as_str() {
-                        println!("{name}");
-                    } else if let Some(name) = package.get("name").and_then(|v| v.as_str()) {
-                        println!("{name}");
-                    }
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            commands::star::run_stars(user, json, registry, current_dir).await?;
         }
         Commands::Star {
             packages,
@@ -6752,18 +6097,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             no_unicode: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            if packages.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error star requires at least one package"
-                ));
-            }
-            for package in packages {
-                client
-                    .star_package(Some(&registry_url), &package, otp.as_deref())
-                    .await?;
-                println!("starred {package}");
-            }
+            commands::star::run_star(packages, registry, otp, current_dir).await?;
         }
         Commands::Unstar {
             packages,
@@ -6771,18 +6105,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             no_unicode: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            if packages.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error unstar requires at least one package"
-                ));
-            }
-            for package in packages {
-                client
-                    .unstar_package(Some(&registry_url), &package, otp.as_deref())
-                    .await?;
-                println!("unstarred {package}");
-            }
+            commands::star::run_unstar(packages, registry, otp, current_dir).await?;
         }
         Commands::Profile {
             action,
@@ -6830,15 +6153,37 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         }
         Commands::Fund { package, json } => {
             let count = audit::count_funding_packages(&current_dir);
+            let manifest_path = current_dir.join("package.json");
+            let (pkg_name, pkg_version) = if manifest_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let n = val.get("name").and_then(|v| v.as_str()).unwrap_or("project").to_string();
+                        let v = val.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
+                        (n, v)
+                    } else {
+                        ("project".to_string(), "1.0.0".to_string())
+                    }
+                } else {
+                    ("project".to_string(), "1.0.0".to_string())
+                }
+            } else {
+                ("project".to_string(), "1.0.0".to_string())
+            };
+
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"package": package, "packages": count})
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "length": count,
+                        "name": pkg_name,
+                        "version": pkg_version,
+                        "dependencies": {}
+                    }))?
                 );
             } else if let Some(package) = package {
                 println!("{package}: funding metadata is available in package.json");
             } else {
-                println!("{} packages are looking for funding", count);
+                println!("{pkg_name}@{pkg_version}");
             }
         }
         Commands::Explain { package, json } => {
@@ -7063,26 +6408,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::InstallCiTest { args } => {
-            let mut installer = Installer::new(InstallOptions {
-                project_dir: current_dir.clone(),
-                ..Default::default()
-            })?;
-            installer.run_ci().await?;
-            execute_run(
-                current_dir,
-                Some("test".into()),
-                args,
-                false,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
-            )
-            .await?;
+            commands::install_test::run_install_ci_test(args, current_dir).await?;
         }
         Commands::InstallScripts {
             action,
@@ -7102,49 +6428,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         },
         Commands::InstallTest { args } => {
-            let mut installer = Installer::new(InstallOptions {
-                project_dir: current_dir.clone(),
-                ..Default::default()
-            })?;
-            installer.run().await?;
-            execute_run(
-                current_dir,
-                Some("test".into()),
-                args,
-                false,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
-            )
-            .await?;
+            commands::install_test::run_install_test(args, current_dir).await?;
         }
         Commands::Shrinkwrap => {
-            let src = current_dir.join("package-lock.json");
-            let dst = current_dir.join("npm-shrinkwrap.json");
-            if dst.exists() {
-                println!("npm-shrinkwrap.json up to date");
-            } else if src.exists() {
-                if std::fs::rename(&src, &dst).is_err() {
-                    std::fs::copy(&src, &dst)?;
-                    std::fs::remove_file(&src)?;
-                }
-                println!("package-lock.json has been renamed to npm-shrinkwrap.json");
-            } else if current_dir.join("package.json").exists() {
-                let lock = rnpm_lockfile::LockfileV3::new("project", Some("1.0.0".to_string()));
-                let json = serde_json::to_string_pretty(&lock)?;
-                std::fs::write(&dst, json)?;
-                eprintln!("npm notice created a lockfile as npm-shrinkwrap.json with version 3");
-                println!("npm-shrinkwrap.json up to date");
-            } else {
-                return Err(anyhow::anyhow!(
-                    "npm error code ENOENT\nnpm error package.json not found"
-                ));
-            }
+            commands::shrinkwrap::run(current_dir)?;
         }
         Commands::Fix {
             force,
@@ -7316,18 +6603,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ));
         }
         Commands::Get { key } => {
-            if let Some(key_str) = key {
-                let config = rnpm_config::Config::load(Some(&current_dir))?;
-                if let Some(val) = config.get(&key_str) {
-                    println!("{val}");
-                } else {
-                    println!("undefined");
-                }
-            } else {
-                let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                let detailed = rnpm_config::Config::load_detailed(opts)?;
-                print!("{}", detailed.format_text());
-            }
+            commands::config::run_get(key.as_deref(), &current_dir)?;
         }
         Commands::Set {
             key,
@@ -7335,127 +6611,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             global,
             location,
         } => {
-            let target_path = if global || location.as_deref() == Some("global") {
-                rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                    rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                })
-            } else if location.as_deref() == Some("project") {
-                current_dir.join(".npmrc")
-            } else if location.as_deref() == Some("user") {
-                rnpm_config::get_default_user_npmrc()
-            } else if current_dir.join(".npmrc").exists() {
-                current_dir.join(".npmrc")
-            } else {
-                rnpm_config::get_default_user_npmrc()
-            };
-
-            rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
+            commands::config::run_set(&key, Some(&value), global, location.as_deref(), &current_dir)?;
         }
-        Commands::Config { action } => match action {
-            ConfigAction::Set {
-                key,
-                value,
-                global,
-                location,
-            } => {
-                let target_path = if global || location.as_deref() == Some("global") {
-                    rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                        rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                    })
-                } else if location.as_deref() == Some("project") {
-                    current_dir.join(".npmrc")
-                } else if location.as_deref() == Some("user") {
-                    rnpm_config::get_default_user_npmrc()
-                } else if current_dir.join(".npmrc").exists() {
-                    current_dir.join(".npmrc")
-                } else {
-                    rnpm_config::get_default_user_npmrc()
-                };
-
-                rnpm_config::set_config_value_in_file(&target_path, &key, &value)?;
-            }
-            ConfigAction::Get { key } => {
-                if let Some(key_str) = key {
-                    let config = rnpm_config::Config::load(Some(&current_dir))?;
-                    if let Some(val) = config.get(&key_str) {
-                        println!("{val}");
-                    } else {
-                        println!("undefined");
-                    }
-                } else {
-                    let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                    let detailed = rnpm_config::Config::load_detailed(opts)?;
-                    print!("{}", detailed.format_text());
-                }
-            }
-            ConfigAction::Delete {
-                key,
-                global,
-                location,
-            } => {
-                let target_path = if global || location.as_deref() == Some("global") {
-                    rnpm_config::find_global_npmrc().unwrap_or_else(|| {
-                        rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-                    })
-                } else if location.as_deref() == Some("project") {
-                    current_dir.join(".npmrc")
-                } else if location.as_deref() == Some("user") {
-                    rnpm_config::get_default_user_npmrc()
-                } else if current_dir.join(".npmrc").exists() {
-                    current_dir.join(".npmrc")
-                } else {
-                    rnpm_config::get_default_user_npmrc()
-                };
-
-                let _ = rnpm_config::delete_config_value_from_file(&target_path, &key)?;
-            }
-            ConfigAction::List { json } => {
-                let opts = rnpm_config::ConfigOptions::new().project_dir(&current_dir);
-                let detailed = rnpm_config::Config::load_detailed(opts)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&detailed.effective)?);
-                } else {
-                    print!("{}", detailed.format_text());
-                }
-            }
-        },
+        Commands::Config { action } => {
+            commands::config::run(action, current_dir)?;
+        }
         Commands::Link { package } => {
-            let global_prefix = rnpm_config::find_global_prefix();
-            match package {
-                None => {
-                    let target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
-                    println!("{} -> {}", target_link.display(), current_dir.display());
-                }
-                Some(pkg) => {
-                    let target_link =
-                        rnpm_install::link_package_from_global(&current_dir, &pkg, &global_prefix)?;
-                    let global_nm = rnpm_config::find_global_node_modules(&global_prefix);
-                    println!(
-                        "{} -> {}",
-                        target_link.display(),
-                        global_nm.join(&pkg).display()
-                    );
-                }
-            }
+            commands::link::run_link(package, current_dir)?;
         }
         Commands::Unlink { package } => {
-            let global_prefix = rnpm_config::find_global_prefix();
-            match package {
-                None => {
-                    if let Some(target) =
-                        rnpm_install::unlink_package(&current_dir, &global_prefix)?
-                    {
-                        println!("unlinked {}", target.display());
-                    }
-                }
-                Some(pkg) => {
-                    if let Some(target) =
-                        rnpm_install::unlink_package_from_consumer(&current_dir, &pkg)?
-                    {
-                        println!("unlinked {}", target.display());
-                    }
-                }
-            }
+            commands::link::run_unlink(package, current_dir)?;
         }
         Commands::Prefix { global } => {
             if global {
@@ -7489,9 +6654,33 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if topic_str == "install-strategy" || topic_str == "install_strategy" {
                 print_help_install_strategy();
             } else if topic.is_empty() {
-                let mut cmd = Cli::command();
-                cmd.print_help()?;
-                println!();
+                println!(
+r#"npm <command>
+
+Usage:
+
+npm install        install all the dependencies in your project
+npm install <foo>  add the <foo> dependency to your project
+npm test           run this project's tests
+npm run <foo>      run the script named <foo>
+npm <command> -h   quick help on <command>
+npm -l             display usage info for all commands
+npm help <term>    search for help on <term> (in a browser)
+npm help npm       more involved overview (in a browser)
+
+All commands:
+
+    access, adduser, audit, bugs, cache, ci, completion,
+    config, dedupe, deprecate, diff, dist-tag, docs, doctor,
+    edit, exec, explain, explore, find-dupes, fund, get, help,
+    help-search, hook, init, install, install-ci-test,
+    install-test, link, ll, login, logout, ls, org, outdated,
+    owner, pack, ping, pkg, prefix, profile, prune, publish,
+    query, rebuild, repo, restart, root, run-script, sbom,
+    search, set, shrinkwrap, star, stars, start, stop, team,
+    test, token, uninstall, unpublish, unstar, update, version,
+    view, whoami"#
+                );
             } else {
                 let cmd = Cli::command();
                 if let Some(sub) = cmd.find_subcommand(&topic[0]) {
