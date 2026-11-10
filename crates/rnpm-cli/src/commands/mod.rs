@@ -27,3 +27,7 @@ pub mod deprecate;
 pub mod access;
 pub mod token;
 pub mod star;
+pub mod undeprecate;
+pub mod unpublish;
+pub mod logout;
+pub mod allow_scripts;

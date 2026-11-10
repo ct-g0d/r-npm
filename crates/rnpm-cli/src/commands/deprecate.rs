@@ -14,5 +14,9 @@ pub(crate) async fn run(args: DeprecateArgs, current_dir: PathBuf) -> Result<()>
     client
         .deprecate(Some(&registry_url), name, version, &args.message, args.otp.as_deref())
         .await?;
+    eprintln!(
+        "npm notice deprecating {name}@{version} with message \"{}\"",
+        args.message
+    );
     Ok(())
 }

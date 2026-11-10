@@ -438,3 +438,142 @@ fn test_global_install_and_uninstall_cli() {
     #[cfg(not(windows))]
     assert!(!global_bin.join("glob-runner").exists());
 }
+
+fn normalize_link_output(text: &str, global_prefix: &std::path::Path, pkg_dir: &std::path::Path) -> String {
+    let mut s = text.replace("\r\n", "\n");
+    let gp_str = global_prefix.to_string_lossy();
+    s = s.replace(&gp_str.to_string(), "<PREFIX>");
+    s = s.replace(&gp_str.replace('\\', "/"), "<PREFIX>");
+    let pkg_str = pkg_dir.to_string_lossy();
+    s = s.replace(&pkg_str.to_string(), "<PKG>");
+    s = s.replace(&pkg_str.replace('\\', "/"), "<PKG>");
+
+    if let Ok(canon) = global_prefix.canonicalize() {
+        let unc = canon.to_string_lossy();
+        let unc_clean = unc.trim_start_matches(r"\\?\");
+        s = s.replace(&unc.to_string(), "<PREFIX>");
+        s = s.replace(unc_clean, "<PREFIX>");
+        s = s.replace(&unc_clean.replace('\\', "/"), "<PREFIX>");
+    }
+    if let Ok(canon) = pkg_dir.canonicalize() {
+        let unc = canon.to_string_lossy();
+        let unc_clean = unc.trim_start_matches(r"\\?\");
+        s = s.replace(&unc.to_string(), "<PKG>");
+        s = s.replace(unc_clean, "<PKG>");
+        s = s.replace(&unc_clean.replace('\\', "/"), "<PKG>");
+    }
+
+    // Normalize timings
+    let mut normalized = String::new();
+    let mut rest = s.as_str();
+    while let Some(idx) = rest.find(" in ") {
+        normalized.push_str(&rest[..idx + 4]);
+        let after = &rest[idx + 4..];
+        let end_num = after.find(|c: char| !c.is_numeric() && c != '.');
+        if let Some(num_len) = end_num {
+            let suffix = &after[num_len..];
+            if let Some(stripped) = suffix.strip_prefix("ms") {
+                normalized.push_str("<TIME>");
+                rest = stripped;
+                continue;
+            } else if let Some(stripped) = suffix.strip_prefix('s') {
+                normalized.push_str("<TIME>");
+                rest = stripped;
+                continue;
+            }
+        }
+        normalized.push_str(&rest[idx + 4..idx + 5]);
+        rest = &rest[idx + 5..];
+    }
+    normalized.push_str(rest);
+
+    normalized
+        .lines()
+        .filter(|line| !line.contains("A complete log of this run can be found in:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn test_link_live_npm_parity() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    let rnpm_prefix = root.join("rnpm-prefix");
+    let npm_prefix = root.join("npm-prefix");
+    fs::create_dir_all(&rnpm_prefix).unwrap();
+    fs::create_dir_all(&npm_prefix).unwrap();
+
+    let rnpm_pkg = root.join("rnpm-pkg");
+    let npm_pkg = root.join("npm-pkg");
+    fs::create_dir_all(&rnpm_pkg).unwrap();
+    fs::create_dir_all(&npm_pkg).unwrap();
+
+    let pkg_json = r#"{
+  "name": "link-parity-test",
+  "version": "1.0.0"
+}
+"#;
+    fs::write(rnpm_pkg.join("package.json"), pkg_json).unwrap();
+    fs::write(npm_pkg.join("package.json"), pkg_json).unwrap();
+
+    let iso_appdata = root.join("appdata");
+    let iso_localappdata = root.join("localappdata");
+    let iso_cache = root.join("cache");
+    let iso_userconfig = root.join(".npmrc");
+    let iso_globalconfig = root.join("global.npmrc");
+    fs::create_dir_all(&iso_appdata).unwrap();
+    fs::create_dir_all(&iso_localappdata).unwrap();
+    fs::create_dir_all(&iso_cache).unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    let rnpm_out = Command::new(rnpm_bin)
+        .current_dir(&rnpm_pkg)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("npm_config_userconfig", &iso_userconfig)
+        .env("npm_config_globalconfig", &iso_globalconfig)
+        .env("PREFIX", &rnpm_prefix)
+        .env("NPM_CONFIG_PREFIX", &rnpm_prefix)
+        .env("USERCONFIG", &iso_userconfig)
+        .env("GLOBALCONFIG", &iso_globalconfig)
+        .env("CACHE", &iso_cache)
+        .env("NPM_CONFIG_CACHE", &iso_cache)
+        .env("npm_config_cache", &iso_cache)
+        .env("APPDATA", &iso_appdata)
+        .env("LOCALAPPDATA", &iso_localappdata)
+        .args(["link", "--no-audit", "--no-fund"])
+        .output()
+        .expect("rnpm link failed");
+
+    let npm_res = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "link", "--no-audit", "--no-fund"])
+        .current_dir(&npm_pkg)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("npm_config_userconfig", &iso_userconfig)
+        .env("npm_config_globalconfig", &iso_globalconfig)
+        .env("PREFIX", &npm_prefix)
+        .env("NPM_CONFIG_PREFIX", &npm_prefix)
+        .env("USERCONFIG", &iso_userconfig)
+        .env("GLOBALCONFIG", &iso_globalconfig)
+        .env("CACHE", &iso_cache)
+        .env("NPM_CONFIG_CACHE", &iso_cache)
+        .env("npm_config_cache", &iso_cache)
+        .env("APPDATA", &iso_appdata)
+        .env("LOCALAPPDATA", &iso_localappdata)
+        .output();
+
+    if let Ok(npm_out) = npm_res {
+        if npm_out.status.success() {
+            assert_eq!(rnpm_out.status.code(), npm_out.status.code());
+            let rnpm_norm = normalize_link_output(&String::from_utf8_lossy(&rnpm_out.stdout), &rnpm_prefix, &rnpm_pkg);
+            let npm_norm = normalize_link_output(&String::from_utf8_lossy(&npm_out.stdout), &npm_prefix, &npm_pkg);
+            assert_eq!(rnpm_norm, npm_norm, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_norm, npm_norm);
+        }
+    }
+}
+
