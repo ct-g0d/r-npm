@@ -1051,11 +1051,11 @@ pub(crate) enum Commands {
         action: Option<TokenAction>,
 
         /// Custom registry URL
-        #[arg(long)]
+        #[arg(long, global = true)]
         registry: Option<String>,
 
         /// Output in JSON format
-        #[arg(long)]
+        #[arg(long, global = true)]
         json: bool,
     },
 

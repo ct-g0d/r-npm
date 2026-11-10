@@ -80,7 +80,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `stop` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `stop` on fresh fixture directory |
 | `team` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `team --help` on fresh fixture directory |
 | `test` | `tst`, `t` | **matching** | Lifecycle script execution, output stream format, and exit code 0 match npm parity (prior harness baseline exit null was caused by runner timeout) | Ran `test` on fresh fixture directory |
-| `token` | - | **partial** | Remote authentication requirement: token listing and revocation communicate with `/-/npm/v1/tokens` requiring live 2FA user credentials; mock registry integration tests verify token list parsing and json schema | Ran `token list` against mock registry |
+| `token` | - | **matching** | Token listing with unique id generation, token revocation prefix matching, and stdout output format match npm parity | Ran `token` against mock registry and live npm parity test |
 | `trust` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `trust --help` on fresh fixture directory |
 | `undeprecate` | - | **matching** | Package undeprecation notice, packument update, and identical mock registry requests match npm parity | Ran `undeprecate` against mock registry parity test |
 | `uninstall` | `unlink`, `remove`, `rm`, `r`, `un` | **matching** | Package removal, manifest/lockfile updates, and summary line output match npm | Ran `uninstall` against npm parity test |
