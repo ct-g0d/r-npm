@@ -4202,3 +4202,60 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
         "enrich_lockfile_from_registry must never make network requests"
     );
 }
+
+#[tokio::test]
+async fn test_enrich_lockfile_from_cacache_packument() {
+    let temp_project = tempfile::tempdir().unwrap();
+    let temp_cache = tempfile::tempdir().unwrap();
+
+    let cache = rnpm_cache::Cache::new(temp_cache.path()).unwrap();
+    let reg_url = "https://registry.npmjs.org";
+    let pkg_name = "fsevents";
+    let version = "2.3.3";
+    let full_url = format!("{reg_url}/{pkg_name}");
+    let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
+
+    let mock_full_packument = serde_json::json!({
+        "name": pkg_name,
+        "versions": {
+            version: {
+                "name": pkg_name,
+                "version": version,
+                "license": "MIT",
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        }
+    });
+    let data = serde_json::to_vec(&mock_full_packument).unwrap();
+    cache.put(&cacache_key, &data, None).unwrap();
+
+    let mut lockfile = LockfileV3::new("test", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        &format!("node_modules/{pkg_name}"),
+        LockfilePackage {
+            name: Some(pkg_name.to_string()),
+            version: Some(version.to_string()),
+            ..Default::default()
+        },
+    );
+
+    let options = InstallOptions {
+        project_dir: temp_project.path().to_path_buf(),
+        cache_dir: Some(temp_cache.path().to_path_buf()),
+        offline: false,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer
+        .enrich_lockfile_from_registry(&mut lockfile)
+        .await
+        .unwrap();
+
+    let pkg = lockfile.packages.get(&format!("node_modules/{pkg_name}")).unwrap();
+    assert_eq!(pkg.license.as_deref(), Some("MIT"));
+}
+
+

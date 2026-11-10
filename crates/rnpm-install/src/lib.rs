@@ -5188,7 +5188,23 @@ impl Installer {
         for name in &names {
             if !self.metadata_cache.contains_key(name) {
                 let registry_url = self.registry_client.registry_for_package(name).as_str();
-                if let Ok(Some((_entry, bytes))) = self.cache.get_packument(registry_url, name) {
+                let cached_bytes = self
+                    .cache
+                    .get_packument(registry_url, name)
+                    .ok()
+                    .flatten()
+                    .map(|(_entry, bytes)| bytes)
+                    .or_else(|| {
+                        let full_url = format!("{}/{}", registry_url.trim_end_matches('/'), name);
+                        let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
+                        self.cache
+                            .get(&cacache_key)
+                            .ok()
+                            .flatten()
+                            .or_else(|| self.cache.get(&full_url).ok().flatten())
+                            .map(|(_entry, bytes)| bytes)
+                    });
+                if let Some(bytes) = cached_bytes {
                     if let Ok(meta) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&bytes) {
                         self.metadata_cache.insert(name.clone(), meta);
                     }
@@ -5222,6 +5238,30 @@ impl Installer {
 
             if package.license.is_none() {
                 package.license = version_meta.license.clone();
+                if package.license.is_none() {
+                    let reg_url = self.registry_client.registry_for_package(&name);
+                    let full_url = format!("{}/{}", reg_url.as_str().trim_end_matches('/'), name);
+                    let cacache_key = format!("make-fetch-happen:request-cache:{full_url}");
+                    let cached_bytes = self
+                        .cache
+                        .get(&cacache_key)
+                        .ok()
+                        .flatten()
+                        .or_else(|| self.cache.get(&full_url).ok().flatten())
+                        .map(|(_entry, bytes)| bytes);
+                    if let Some(bytes) = cached_bytes {
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(lic) = val
+                                .get("versions")
+                                .and_then(|v| v.get(version))
+                                .and_then(|ver| ver.get("license"))
+                                .and_then(|l| l.as_str())
+                            {
+                                package.license = Some(lic.to_string());
+                            }
+                        }
+                    }
+                }
             }
             if package.engines.is_none() && !version_meta.engines.is_empty() {
                 package.engines = Some(rnpm_lockfile::PackageEngines::Map(
