@@ -72,7 +72,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `sbom` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `sbom --help` on fresh fixture directory |
 | `search` | `find`, `s`, `se` | **matching** | Block text format and JSON array output match npm 11 parity | Ran `search is-number` on fresh fixture directory |
 | `set` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `set foo=bar` on fresh fixture directory |
-| `shrinkwrap` | - | **partial** | Command feedback: npm creates `npm-shrinkwrap.json` silently without stdout, whereas rnpm prints confirmation of written lockfile | Ran `shrinkwrap` on fresh fixture directory |
+| `shrinkwrap` | - | **matching** | Renames `package-lock.json` to `npm-shrinkwrap.json`, outputs notice to stderr and keeps stdout empty matching npm | Ran `shrinkwrap` against npm parity test |
 | `stage` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `stage --help` on fresh fixture directory |
 | `star` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `star --help` on fresh fixture directory |
 | `stars` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `stars --help` on fresh fixture directory |
