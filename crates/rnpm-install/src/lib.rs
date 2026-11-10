@@ -813,37 +813,64 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             return;
         }
 
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
+        let chunk_size = (missing.len() + num_threads - 1) / num_threads;
+        let thread_results: Vec<(Vec<(String, PackageMetadata)>, Vec<RevalidationItem>)> =
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for chunk in missing.chunks(chunk_size.max(1)) {
+                    handles.push(s.spawn(move || {
+                        let mut local_fresh = Vec::new();
+                        let mut local_reval = Vec::new();
+                        for name in chunk {
+                            let name = name.as_str();
+                            let is_in_lockfile = self
+                                .lockfile
+                                .as_ref()
+                                .and_then(|lf| package_metadata_from_lockfile(name, lf))
+                                .is_some();
+
+                            if let Some((entry, data)) = self.get_cached_packument(name) {
+                                if let Ok(abbrev) =
+                                    serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                                {
+                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
+                                    self.merge_lockfile_metadata(name, &mut meta);
+                                    if is_in_lockfile
+                                        || is_packument_fresh(&entry, self.prefer_offline, false)
+                                    {
+                                        local_fresh.push((name.to_string(), meta));
+                                        continue;
+                                    }
+                                }
+                                let stored_etag = extract_stored_etag(entry.metadata.as_ref());
+                                local_reval.push((name.to_string(), stored_etag, Some((entry, data))));
+                            } else if is_in_lockfile {
+                                if let Some(ref lf) = self.lockfile {
+                                    if let Some(meta) = package_metadata_from_lockfile(name, lf) {
+                                        local_fresh.push((name.to_string(), meta));
+                                        continue;
+                                    }
+                                }
+                                local_reval.push((name.to_string(), None, None));
+                            } else {
+                                local_reval.push((name.to_string(), None, None));
+                            }
+                        }
+                        (local_fresh, local_reval)
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
         let mut fresh_metas = Vec::new();
         let mut to_revalidate: Vec<RevalidationItem> = Vec::new();
-        for name in missing {
-            let is_in_lockfile = self
-                .lockfile
-                .as_ref()
-                .and_then(|lf| package_metadata_from_lockfile(&name, lf))
-                .is_some();
-
-            if let Some((entry, data)) = self.get_cached_packument(&name) {
-                if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
-                    let mut meta = abbreviated_to_package_metadata(&abbrev);
-                    self.merge_lockfile_metadata(&name, &mut meta);
-                    if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, false) {
-                        fresh_metas.push((name, meta));
-                        continue;
-                    }
-                }
-                let stored_etag = extract_stored_etag(entry.metadata.as_ref());
-                to_revalidate.push((name, stored_etag, Some((entry, data))));
-            } else if is_in_lockfile {
-                if let Some(ref lf) = self.lockfile {
-                    if let Some(meta) = package_metadata_from_lockfile(&name, lf) {
-                        fresh_metas.push((name, meta));
-                        continue;
-                    }
-                }
-                to_revalidate.push((name, None, None));
-            } else {
-                to_revalidate.push((name, None, None));
-            }
+        for (f, r) in thread_results {
+            fresh_metas.extend(f);
+            to_revalidate.extend(r);
         }
 
         if !fresh_metas.is_empty() {
