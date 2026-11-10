@@ -23,3 +23,4 @@ pub mod owner;
 pub mod ping;
 pub mod whoami;
 pub mod publish;
+pub mod deprecate;

@@ -5960,14 +5960,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             otp,
             registry,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Deprecate {
+            commands::deprecate::run(
+                commands::deprecate::DeprecateArgs {
                     package,
                     message,
                     otp,
                     registry,
                 },
+                current_dir,
             )
             .await?;
         }
