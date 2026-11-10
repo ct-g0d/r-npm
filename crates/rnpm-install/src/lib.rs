@@ -4961,7 +4961,8 @@ impl Installer {
         }
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
-        if !used_fast_path && self.options.package_lock_enabled() && !self.options.dry_run {
+        let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
+        if !used_fast_path && self.options.package_lock_enabled() && !self.options.dry_run && has_packages {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             lockfile
                 .save_hidden(&self.options.project_dir)
