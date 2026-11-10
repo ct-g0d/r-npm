@@ -5398,3 +5398,58 @@ fn test_root_lifecycle_scripts_set_has_install_script_in_lockfile() {
     let root_entry = lockfile.packages.get("").unwrap();
     assert_eq!(root_entry.has_install_script, Some(true));
 }
+
+#[test]
+fn test_workspace_lockfile_package_names_and_prune_reachability() {
+    use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
+    use std::path::PathBuf;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("extra-dep", "1.0.0", |_| {});
+    provider.add_version("sub-dep", "1.0.0", |_| {});
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("ws-prune-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+    root_manifest
+        .dependencies
+        .insert("extra-dep".to_string(), "^1.0.0".to_string());
+
+    let mut manifest_a = Manifest::default();
+    manifest_a.name = Some("@scope/pkg-a".to_string());
+    manifest_a.version = Some("1.0.0".to_string());
+    manifest_a
+        .dependencies
+        .insert("sub-dep".to_string(), "^1.0.0".to_string());
+
+    let member_a = WorkspaceMember {
+        name: "@scope/pkg-a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/pkg-a"),
+        relative_path: "packages/pkg-a".to_string(),
+        manifest: manifest_a,
+    };
+
+    let options = ResolverOptions::default();
+    let mut graph = resolve_workspace_graph(&root_manifest, &[member_a], &provider, &options).unwrap();
+
+    // Verify lockfile generation has "name" for non-standard location packages/pkg-a
+    let lockfile = graph.to_lockfile_v3("ws-prune-root", Some("1.0.0"));
+    let pkg_a_lock = lockfile.packages.get("packages/pkg-a").expect("packages/pkg-a in lockfile");
+    assert_eq!(pkg_a_lock.name.as_deref(), Some("@scope/pkg-a"));
+
+    // Verify prune_unreferenced after removing root dependency extra-dep
+    assert!(graph.remove_root_dependency("extra-dep"));
+    let pruned = graph.prune_unreferenced();
+    assert!(pruned.contains("node_modules/extra-dep"));
+
+    // packages/pkg-a, node_modules/@scope/pkg-a link, and sub-dep MUST NOT be pruned!
+    assert!(!pruned.contains("packages/pkg-a"));
+    assert!(!pruned.contains("node_modules/@scope/pkg-a"));
+    assert!(!pruned.contains("node_modules/sub-dep"));
+
+    assert!(graph.nodes.contains_key("packages/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/@scope/pkg-a"));
+    assert!(graph.nodes.contains_key("node_modules/sub-dep"));
+}

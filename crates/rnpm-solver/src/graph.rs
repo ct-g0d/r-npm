@@ -346,6 +346,14 @@ impl DependencyGraph {
             let mut queue = VecDeque::new();
             queue.push_back(self.root_location.as_str());
 
+            for (loc, node) in &self.nodes {
+                if !loc.is_empty() && (!loc.starts_with("node_modules/") || node.flags.link) {
+                    if reachable.insert(loc.clone()) {
+                        queue.push_back(loc.as_str());
+                    }
+                }
+            }
+
             while let Some(curr) = queue.pop_front() {
                 if let Some(targets) = adj.get(curr) {
                     for &target in targets {
@@ -547,9 +555,13 @@ impl DependencyGraph {
                     }
                 }
 
+                let is_standard_nm_loc = loc
+                    .strip_prefix("node_modules/")
+                    .or_else(|| loc.split_once("/node_modules/").map(|(_, rest)| rest))
+                    == Some(&node.name);
                 let pkg = LockfilePackage {
                     preserve_dev_optional_split: true,
-                    name: if node.install_name != node.name {
+                    name: if !is_standard_nm_loc {
                         Some(node.name.clone())
                     } else {
                         None
