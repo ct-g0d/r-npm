@@ -150,19 +150,83 @@ function Compare-NodeModules-Hashes {
     }
 }
 
-# Step 0: Ensure caches are warm
-Write-Host "`n[Setup] Populating warm caches for npm and rnpm..." -ForegroundColor Gray
-$warmSetupDir = Join-Path $env:TEMP "rnpm-gate-warm-setup-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
-New-Item -ItemType Directory -Path $warmSetupDir -Force | Out-Null
-Copy-Item (Join-Path $fixtureDir "package.json") $warmSetupDir
-Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmSetupDir
-Push-Location $warmSetupDir
-& npm.cmd ci --no-audit --no-fund 2>&1 | Out-Null
-& npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null
-& $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
-& $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null
-Pop-Location
-Remove-Item $warmSetupDir -Recurse -Force -ErrorAction SilentlyContinue
+# Save original environment variables for restoration
+$origEnv = @{
+    NPM_CONFIG_CACHE = $env:NPM_CONFIG_CACHE
+    PREFIX           = $env:PREFIX
+    USERCONFIG       = $env:USERCONFIG
+    GLOBALCONFIG     = $env:GLOBALCONFIG
+    APPDATA          = $env:APPDATA
+    LOCALAPPDATA     = $env:LOCALAPPDATA
+    RNPM_STORE_DIR   = $env:RNPM_STORE_DIR
+}
+
+# Preserve rnpm store directory before overriding LOCALAPPDATA
+$storeDir = if ($env:RNPM_STORE_DIR) { $env:RNPM_STORE_DIR } else {
+    if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "rnpm\store-v1" } else { Join-Path $env:TEMP ".rnpm-store-v1" }
+}
+$env:RNPM_STORE_DIR = $storeDir
+
+# Setup isolated environment directories
+$isoRoot = Join-Path $env:TEMP ("npm-isolated-" + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
+$isoCache = Join-Path $isoRoot "cache"
+$isoPrefix = Join-Path $isoRoot "prefix"
+$isoAppData = Join-Path $isoRoot "appdata"
+$isoLocalAppData = Join-Path $isoRoot "localappdata"
+$isoUserConfig = Join-Path $isoRoot ".npmrc"
+$isoGlobalConfig = Join-Path $isoRoot "global.npmrc"
+
+New-Item -ItemType Directory -Path $isoCache, $isoPrefix, $isoAppData, $isoLocalAppData -Force | Out-Null
+Set-Content -Path $isoUserConfig -Value ""
+Set-Content -Path $isoGlobalConfig -Value ""
+
+# Link rnpm cache and store so rnpm retains its genuine warm cache under overridden LOCALAPPDATA
+if ($origEnv.LOCALAPPDATA -and (Test-Path (Join-Path $origEnv.LOCALAPPDATA "rnpm"))) {
+    $rnpmTarget = Join-Path $origEnv.LOCALAPPDATA "rnpm"
+    $rnpmJunc = Join-Path $isoLocalAppData "rnpm"
+    cmd.exe /c "mklink /J `"$rnpmJunc`" `"$rnpmTarget`"" | Out-Null
+}
+
+# Pre-seed isolated cache from real npm cache if available so warm timing numbers remain genuine
+$realNpmCache = if ($origEnv.LOCALAPPDATA -and (Test-Path (Join-Path $origEnv.LOCALAPPDATA "npm-cache\_cacache"))) {
+    Join-Path $origEnv.LOCALAPPDATA "npm-cache\_cacache"
+} elseif ($origEnv.APPDATA -and (Test-Path (Join-Path $origEnv.APPDATA "npm-cache\_cacache"))) {
+    Join-Path $origEnv.APPDATA "npm-cache\_cacache"
+} else {
+    $null
+}
+
+if ($realNpmCache) {
+    Write-Host "[Setup] Pre-seeding isolated npm cache from real cache..." -ForegroundColor Gray
+    robocopy $realNpmCache (Join-Path $isoCache "_cacache") /E /MT:16 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+}
+
+try {
+    # Apply isolated environment variables to all subsequent npm.cmd calls
+    $env:NPM_CONFIG_CACHE = $isoCache
+    $env:npm_config_cache = $isoCache
+    $env:PREFIX = $isoPrefix
+    $env:npm_config_prefix = $isoPrefix
+    $env:USERCONFIG = $isoUserConfig
+    $env:npm_config_userconfig = $isoUserConfig
+    $env:GLOBALCONFIG = $isoGlobalConfig
+    $env:npm_config_globalconfig = $isoGlobalConfig
+    $env:APPDATA = $isoAppData
+    $env:LOCALAPPDATA = $isoLocalAppData
+
+    # Step 0: Ensure caches are warm
+    Write-Host "`n[Setup] Populating warm caches for npm and rnpm..." -ForegroundColor Gray
+    $warmSetupDir = Join-Path $env:TEMP "rnpm-gate-warm-setup-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -ItemType Directory -Path $warmSetupDir -Force | Out-Null
+    Copy-Item (Join-Path $fixtureDir "package.json") $warmSetupDir
+    Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmSetupDir
+    Push-Location $warmSetupDir
+    & npm.cmd ci --no-audit --no-fund 2>&1 | Out-Null
+    & npm.cmd install is-odd --no-audit --no-fund 2>&1 | Out-Null
+    & $rnpmBin ci --no-audit --no-fund 2>&1 | Out-Null
+    & $rnpmBin install is-odd --no-audit --no-fund 2>&1 | Out-Null
+    Pop-Location
+    cmd.exe /c "rd /s /q `"$warmSetupDir`""
 
 # Metrics & Correctness collectors
 $results = [ordered]@{
@@ -709,3 +773,27 @@ if ($allPassed -and $parityPassed -and $casSuitePassed) {
     Write-Host "`n[FAIL] Lane 5 Warm-Path Gate FAILED" -ForegroundColor Red
     exit 1
 }
+} finally {
+    # Restore original environment
+    foreach ($k in $origEnv.Keys) {
+        $val = $origEnv[$k]
+        if ($null -eq $val) {
+            Remove-Item "Env:$k" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item "Env:$k" $val
+        }
+    }
+    Remove-Item "Env:npm_config_cache" -ErrorAction SilentlyContinue
+    Remove-Item "Env:npm_config_prefix" -ErrorAction SilentlyContinue
+    Remove-Item "Env:npm_config_userconfig" -ErrorAction SilentlyContinue
+    Remove-Item "Env:npm_config_globalconfig" -ErrorAction SilentlyContinue
+
+    if (-not $KeepTemp) {
+        $rnpmJunc = Join-Path $isoLocalAppData "rnpm"
+        if (Test-Path $rnpmJunc) {
+            cmd.exe /c "rmdir `"$rnpmJunc`"" | Out-Null
+        }
+        cmd.exe /c "rd /s /q `"$isoRoot`""
+    }
+}
+
