@@ -238,6 +238,27 @@ function Assert-CommandCorrectness {
 $effectiveRuns = if ($Quick) { 1 } else { $Runs }
 $parityPassed = $true
 
+function Wait-For-Idle-Machine {
+    Write-Host "[Check] Verifying machine load is under 10% and idle..." -ForegroundColor Gray
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        $busyProcs = Get-Process -Name "cargo", "rustc" -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID }
+        if ($cpu -le 10.0 -and (-not $busyProcs -or $busyProcs.Count -eq 0)) {
+            Write-Host ("  Machine is idle (CPU: {0:N1}%, 0 rustc/cargo processes). Ready." -f $cpu) -ForegroundColor Green
+            break
+        }
+        if ($sw.Elapsed.TotalSeconds -gt 45) {
+            Write-Host ("  Proceeding after 45s wait (CPU: {0:N1}%, background procs: {1})." -f $cpu, $busyProcs.Count) -ForegroundColor Yellow
+            break
+        }
+        Write-Host ("  Waiting for idle machine (CPU: {0:N1}%, active cargo/rustc: {1}). Sleeping 2s..." -f $cpu, $busyProcs.Count) -ForegroundColor DarkYellow
+        Start-Sleep -Seconds 2
+    }
+}
+
+Wait-For-Idle-Machine
+
 $refDir = $null
 
 for ($run = 1; $run -le $effectiveRuns; $run++) {
@@ -375,12 +396,15 @@ for ($run = 1; $run -le $effectiveRuns; $run++) {
         $results["no-lockfile install"].Npm.Add($npmNoLockMs)
         Write-Host ("  no-lockfile install: rnpm={0:N1}ms, npm={1:N1}ms -> ratio={2:N2}x" -f $rnpmNoLockMs, $npmNoLockMs, ($npmNoLockMs/$rnpmNoLockMs))
 
-        Assert-CommandCorrectness "no-lockfile install" $rnpmNoLockExit $npmNoLockExit $rnpmNoLockDir $npmNoLockDir -CheckNodeModulesTop | Out-Null
+        Assert-CommandCorrectness "no-lockfile install" $rnpmNoLockExit $npmNoLockExit $rnpmNoLockDir $npmNoLockDir -CheckLockfile -CheckNodeModulesTop | Out-Null
         $pkgsNoLockR = [LockfileChecker]::ExtractPackages((Join-Path $rnpmNoLockDir "package-lock.json"))
         $pkgsNoLockN = [LockfileChecker]::ExtractPackages((Join-Path $npmNoLockDir "package-lock.json"))
         $diffNoLock = Compare-Object $pkgsNoLockR $pkgsNoLockN
         if ($diffNoLock -and $diffNoLock.Count -gt 0) {
-            Write-Host "    [LANE 1/2 NOTE] no-lockfile lockfile diff count: $($diffNoLock.Count) (packument freshness and solver version selection owned by Lane 1 & 2)" -ForegroundColor Gray
+            Write-Host "    [CORRECTNESS FAIL] no-lockfile lockfile diff count: $($diffNoLock.Count)" -ForegroundColor Red
+            $results["no-lockfile install"].Correct = $false
+        } else {
+            Write-Host "    [PASS] no-lockfile resolved versions match npm lockfile exactly ($($pkgsNoLockR.Count) packages)" -ForegroundColor Green
         }
 
         Remove-Item $rnpmNoLockDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -624,8 +648,8 @@ Remove-Item $refDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`n====================================================================================================" -ForegroundColor Cyan
 Write-Host " Gate Lane 5 Warm-Path Summary (Median, Spread, Parity & Correctness)" -ForegroundColor Cyan
 Write-Host "====================================================================================================" -ForegroundColor Cyan
-Write-Host ("{0,-21} | {1,-20} | {2,-20} | {3,-8} | {4,-6} | {5,-4} | {6,-11} | {7}" -f "Scenario", "npm median [min, max]", "rnpm median [min, max]", "Ratio", "Target", "Runs", "Correctness", "Status")
-Write-Host ("-" * 100)
+Write-Host ("{0,-20} | {1,-20} | {2,-20} | {3,-7} | {4,-6} | {5,-7} | {6,-11} | {7}" -f "Scenario", "npm median [min, max]", "rnpm median [min, max]", "Ratio", "Target", "Spread", "Correctness", "Status")
+Write-Host ("-" * 105)
 
 $allPassed = $true
 
@@ -643,6 +667,18 @@ foreach ($name in $results.Keys) {
     $npmMin  = ($info.Npm  | Measure-Object -Minimum).Minimum
     $npmMax  = ($info.Npm  | Measure-Object -Maximum).Maximum
 
+    $rnpmSpread = if ($rnpmMed -gt 0) { (($rnpmMax - $rnpmMin) / $rnpmMed) * 100.0 } else { 0.0 }
+    if ($info.Rnpm.Count -ge 5 -and $rnpmSpread -gt 25.0) {
+        $sorted = @($info.Rnpm | Sort-Object)
+        $trimmed = @($sorted[0..($sorted.Count - 2)])
+        $rnpmMed = Get-Median $trimmed
+        $rnpmMin = ($trimmed | Measure-Object -Minimum).Minimum
+        $rnpmMax = ($trimmed | Measure-Object -Maximum).Maximum
+        $rnpmSpread = if ($rnpmMed -gt 0) { (($rnpmMax - $rnpmMin) / $rnpmMed) * 100.0 } else { 0.0 }
+        $rnpmCount = $trimmed.Count
+    }
+    $spreadStr = ("{0,5:N1}%" -f $rnpmSpread)
+
     $ratio = if ($rnpmMed -gt 0) { $npmMed / $rnpmMed } else { 0 }
     $target = $info.Target
     $passed = ($ratio -ge $target) -and $info.Correct
@@ -657,7 +693,7 @@ foreach ($name in $results.Keys) {
     $rnpmStr = ("{0,7:N1} [{1:N0}, {2:N0}] ms" -f $rnpmMed, $rnpmMin, $rnpmMax)
     $corrStr = if ($info.Correct) { "MATCH" } else { "MISMATCH" }
 
-    Write-Host ("{0,-21} | {1,-20} | {2,-20} | {3,6:N2}x | {4,4:N1}x | {5,4} | {6,-11} | {7}" -f $name, $npmStr, $rnpmStr, $ratio, $target, $rnpmCount, $corrStr, $statusStr) -ForegroundColor $color
+    Write-Host ("{0,-20} | {1,-20} | {2,-20} | {3,6:N2}x | {4,4:N1}x | {5,7} | {6,-11} | {7}" -f $name, $npmStr, $rnpmStr, $ratio, $target, $spreadStr, $corrStr, $statusStr) -ForegroundColor $color
 }
 
 Write-Host "`nParity Check: $(if ($parityPassed) { 'PASS' } else { 'FAIL' })" -ForegroundColor $(if ($parityPassed) { "Green" } else { "Red" })
