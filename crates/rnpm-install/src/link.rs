@@ -496,11 +496,9 @@ pub(crate) fn link_tree_bins(
 ) {
     let t_bins = std::time::Instant::now();
 
-    // 1. If known_bins is provided, filter package_locs to only packages that actually have bins or are junctions!
+    // 1. If known_bins is provided, filter package_locs to only packages that actually have bins in memory!
     if let Some(bins) = known_bins {
-        package_locs.retain(|loc| {
-            bins.contains_key(loc) || rnpm_fs::is_junction(&loc_base_dir.join(loc)).unwrap_or(false)
-        });
+        package_locs.retain(|loc| bins.contains_key(loc));
     }
 
     // 2. Walk packages shallowest first (depth based on `node_modules/` count), sorted according to npm precedence.
@@ -517,13 +515,6 @@ pub(crate) fn link_tree_bins(
         let bin_entries = if let Some(bins) = known_bins {
             if let Some(entries) = bins.get(loc) {
                 entries.clone()
-            } else if rnpm_fs::is_junction(&target_path).unwrap_or(false) {
-                let pkg_manifest_path = target_path.join("package.json");
-                if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
-                    m.bin_entries()
-                } else {
-                    continue;
-                }
             } else {
                 continue;
             }

@@ -293,10 +293,10 @@ where
             dirs_by_depth.entry(depth).or_default().push(wide);
         }
 
-        // Create directories breadth-first level by level, parallelizing each level across 16 threads
+        // Create directories breadth-first level by level, parallelizing large levels across 16 threads
         for (_depth, level_dirs) in dirs_by_depth {
             let total = level_dirs.len();
-            if total <= 2 {
+            if total <= 16 {
                 for wide in &level_dirs {
                     let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
                     if ret == 0 {
@@ -767,7 +767,7 @@ pub fn materialize_files_parallel_refs<'a>(
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(1, 32)
+        config.worker_threads.clamp(1, 16)
     };
 
     if !config.is_hdd {
