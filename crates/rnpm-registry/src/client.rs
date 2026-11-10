@@ -2752,6 +2752,19 @@ impl RegistryClient {
     ) -> Result<serde_json::Value, RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
+
+        if let Ok(pkg_url) = Url::parse(&format!(
+            "{}/{}",
+            reg_url.as_str().trim_end_matches('/'),
+            encoded
+        )) {
+            if let Ok(val) = self.admin_json_request(Method::GET, pkg_url, None, None).await {
+                if val.get("maintainers").is_some() {
+                    return Ok(val);
+                }
+            }
+        }
+
         let target = Url::parse(&format!(
             "{}/-/package/{}/collaborators?format=cli",
             reg_url.as_str().trim_end_matches('/'),

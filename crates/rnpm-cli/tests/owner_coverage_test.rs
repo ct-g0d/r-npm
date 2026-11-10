@@ -19,8 +19,10 @@ async fn test_cli_owner_ls() {
                             let mut buf = [0u8; 4096];
                             let _ = stream.read(&mut buf).await;
                             let owners_json = serde_json::json!({
-                                "alice": "write",
-                                "bob": "read"
+                                "maintainers": [
+                                    { "name": "alice", "email": "alice@example.com" },
+                                    { "name": "bob", "email": "bob@example.com" }
+                                ]
                             });
                             let body = serde_json::to_vec(&owners_json).unwrap();
                             let resp = format!(
@@ -52,10 +54,32 @@ async fn test_cli_owner_ls() {
         .output()
         .expect("owner ls failed");
 
+    let npm_out = Command::new("cmd.exe")
+        .args([
+            "/d",
+            "/s",
+            "/c",
+            "npm.cmd",
+            "owner",
+            "ls",
+            "sample-pkg",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
+        .current_dir(tmp.path())
+        .output();
+
     let _ = tx.send(());
 
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("alice\twrite"));
-    assert!(stdout.contains("bob\tread"));
+    assert!(stdout.contains("alice <alice@example.com>"));
+    assert!(stdout.contains("bob <bob@example.com>"));
+
+    if let Ok(npm_res) = npm_out {
+        if npm_res.status.success() {
+            let npm_stdout = String::from_utf8_lossy(&npm_res.stdout);
+            assert_eq!(stdout.trim(), npm_stdout.trim());
+        }
+    }
 }

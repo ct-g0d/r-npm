@@ -14,9 +14,49 @@ pub(crate) async fn run(
             let value = client.package_owners(Some(&registry_url), &package).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if let Some(maintainers) = value.get("maintainers").and_then(|v| v.as_array()) {
+                if maintainers.is_empty() {
+                    println!("no admin found");
+                } else {
+                    for m in maintainers {
+                        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if let Some(email) = m.get("email").and_then(|v| v.as_str()) {
+                            println!("{name} <{email}>");
+                        } else {
+                            println!("{name}");
+                        }
+                    }
+                }
+            } else if let Some(arr) = value.as_array() {
+                if arr.is_empty() {
+                    println!("no admin found");
+                } else {
+                    for m in arr {
+                        if let Some(obj) = m.as_object() {
+                            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(email) = obj.get("email").and_then(|v| v.as_str()) {
+                                println!("{name} <{email}>");
+                            } else {
+                                println!("{name}");
+                            }
+                        } else if let Some(s) = m.as_str() {
+                            println!("{s}");
+                        }
+                    }
+                }
             } else if let Some(map) = value.as_object() {
-                for (name, role) in map {
-                    println!("{name}\t{}", role.as_str().unwrap_or("owner"));
+                if map.is_empty() {
+                    println!("no admin found");
+                } else {
+                    for (name, role_val) in map {
+                        if let Some(email) = role_val.get("email").and_then(|v| v.as_str()) {
+                            println!("{name} <{email}>");
+                        } else if let Some(s) = role_val.as_str() {
+                            println!("{name} <{s}>");
+                        } else {
+                            println!("{name}");
+                        }
+                    }
                 }
             } else {
                 println!("{}", serde_json::to_string_pretty(&value)?);
