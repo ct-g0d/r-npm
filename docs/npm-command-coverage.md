@@ -19,7 +19,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | Command | Aliases | Status | What Differs & Why Difference Remains | How Checked |
 | :--- | :--- | :--- | :--- | :--- |
 | `access` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `access 2fa-required` on fresh fixture directory |
-| `adduser` | `add-user` | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `adduser --help` on fresh fixture directory |
+| `adduser` | `add-user` | **partial** | Authentication workflow: npm executes interactive web/couch credentials flow via stdin TTY, whereas rnpm supports non-interactive automated credentials and token configuration | Ran `adduser` against mock registry |
 | `approve-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `approve-scripts --help` on fresh fixture directory |
 | `audit` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `audit` on fresh fixture directory |
 | `bugs` | `issues` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `bugs` on fresh fixture directory |
