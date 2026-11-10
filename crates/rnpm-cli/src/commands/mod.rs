@@ -28,3 +28,4 @@ pub mod access;
 pub mod token;
 pub mod star;
 pub mod undeprecate;
+pub mod unpublish;

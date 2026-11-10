@@ -3784,125 +3784,7 @@ pub(crate) fn make_registry_client(
 
 
 
-async fn execute_package_admin(current_dir: &Path, command: Commands) -> anyhow::Result<()> {
-    match command {
-        Commands::Unpublish {
-            package,
-            version,
-            force,
-            dry_run,
-            registry,
-            otp,
-        } => {
-            let package = package.unwrap_or(package_name_from_manifest(current_dir)?);
-            if version.is_none() && !force {
-                return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error Refusing to unpublish an entire package without --force"));
-            }
-            if dry_run {
-                println!(
-                    "would remove {}{}",
-                    package,
-                    version
-                        .as_deref()
-                        .map(|v| format!("@{v}"))
-                        .unwrap_or_default()
-                );
-                return Ok(());
-            }
-            let (registry_url, client) = make_registry_client(current_dir, registry)?;
-            client
-                .unpublish(
-                    Some(&registry_url),
-                    &package,
-                    version.as_deref(),
-                    otp.as_deref(),
-                )
-                .await?;
-            println!(
-                "- {}{}",
-                package,
-                version
-                    .as_deref()
-                    .map(|v| format!("@{v}"))
-                    .unwrap_or_default()
-            );
-        }
-        Commands::Deprecate {
-            package,
-            message,
-            otp,
-            registry,
-        } => {
-            let (name, version) = split_package_version(&package)?;
-            let (registry_url, client) = make_registry_client(current_dir, registry)?;
-            client
-                .deprecate(Some(&registry_url), name, version, &message, otp.as_deref())
-                .await?;
-            println!("deprecated {name}@{version}");
-        }
-        Commands::Undeprecate {
-            package,
-            version,
-            registry,
-        } => {
-            let (name, parsed_version): (&str, String) = if let Some(version) = version {
-                (package.as_str(), version)
-            } else {
-                let (name, version) = split_package_version(&package)?;
-                (name, version.to_string())
-            };
-            let (registry_url, client) = make_registry_client(current_dir, registry)?;
-            client
-                .deprecate(Some(&registry_url), name, &parsed_version, "", None)
-                .await?;
-            println!("undeprecated {name}@{parsed_version}");
-        }
-        Commands::Access {
-            args,
-            registry,
-            json,
-            otp,
-        } => {
-            let action = args.first().map(String::as_str).unwrap_or("get");
-            let package = args
-                .last()
-                .filter(|value| !value.contains('='))
-                .cloned()
-                .or_else(|| package_name_from_manifest(current_dir).ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error access requires a package name"
-                    )
-                })?;
-            let level = args
-                .iter()
-                .find_map(|value| value.strip_prefix("status="))
-                .or_else(|| {
-                    args.get(1)
-                        .map(String::as_str)
-                        .filter(|value| *value == "public" || *value == "restricted")
-                })
-                .or(match action {
-                    "public" | "restricted" => Some(action),
-                    _ => None,
-                });
-            let (registry_url, client) = make_registry_client(current_dir, registry)?;
-            let value = match action {
-                "public" | "restricted" => client.package_access(Some(&registry_url), &package, Some(action), otp.as_deref()).await?,
-                "get" | "set" if args.get(1).is_some_and(|value| value == "status" || value.starts_with("status=") || value == "public" || value == "restricted") => client.package_access(Some(&registry_url), &package, level, otp.as_deref()).await?,
-                "list" if args.get(1).is_some_and(|value| value == "collaborators") => client.package_owners(Some(&registry_url), &package).await?,
-                _ => return Err(anyhow::anyhow!("npm error code ENOTSUP\nnpm error this access operation is not supported by the configured registry")),
-            };
-            if json || level.is_none() {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(level) = level {
-                println!("{level}");
-            }
-        }
-        _ => unreachable!(),
-    }
-    Ok(())
-}
+
 
 pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     let at = if let Some(stripped) = spec.strip_prefix('@') {
@@ -5963,9 +5845,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             otp,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Unpublish {
+            commands::unpublish::run(
+                commands::unpublish::UnpublishArgs {
                     package,
                     version,
                     force,
@@ -5973,6 +5854,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     registry,
                     otp,
                 },
+                current_dir,
             )
             .await?;
         }

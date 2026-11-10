@@ -84,7 +84,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `trust` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `trust --help` on fresh fixture directory |
 | `undeprecate` | - | **matching** | Package undeprecation notice, packument update, and identical mock registry requests match npm parity | Ran `undeprecate` against mock registry parity test |
 | `uninstall` | `unlink`, `remove`, `rm`, `r`, `un` | **matching** | Package removal, manifest/lockfile updates, and summary line output match npm | Ran `uninstall` against npm parity test |
-| `unpublish` | - | **partial** | Package removal safeguards: requires --force for full package unpublishing and write authorization on remote registry | Ran `unpublish --dry-run` on fresh fixture directory |
+| `unpublish` | - | **matching** | Package removal safeguards, force warnings, dry-run removal output, and mock registry deletion requests match npm | Ran `unpublish` against mock registry and live npm parity test |
 | `unstar` | - | **partial** | Remote authentication requirement: unstarring a package modifies user profile stars on registry requiring write auth; verified via mock registry integration test | Ran `unstar` against mock registry |
 | `update` | `u`, `up`, `upgrade`, `udpate` | **matching** | Summary line wording (`added N packages in Xs` / `up to date in Xs`) matches npm parity | Ran `update` on fresh fixture directory |
 | `version` | `verison` | **matching** | Root package listed first, followed by npm and node in canonical order, matching npm parity | Ran `version` on fresh fixture directory |
