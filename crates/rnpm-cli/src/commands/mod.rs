@@ -5,3 +5,4 @@ pub mod config;
 pub mod pkg;
 pub mod outdated;
 pub mod update;
+pub mod version;

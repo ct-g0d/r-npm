@@ -6120,29 +6120,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspaces,
             include_workspace_root,
         } => {
-            let options = version::VersionOptions {
+            let args = commands::version::VersionCommandArgs {
                 newversion,
                 preid,
                 message,
                 allow_same_version,
-                git_tag_version: !no_git_tag_version,
-                commit_hooks: !no_commit_hooks,
+                no_git_tag_version,
+                no_commit_hooks,
                 sign_git_tag,
                 force,
                 ignore_scripts,
                 json,
+                workspace,
+                workspaces,
+                include_workspace_root,
             };
-
-            let has_ws = workspaces || !workspace.is_empty();
-            if has_ws {
-                let members = select_workspace_members(&current_dir, &workspace, include_workspace_root)?;
-                for member in members {
-                    println!("{}", member.name);
-                    version::execute_version(&member.path, options.clone()).await?;
-                }
-            } else {
-                version::execute_version(&current_dir, options).await?;
-            }
+            commands::version::run(args, current_dir).await?;
         }
         Commands::List {
             mut packages,
