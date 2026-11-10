@@ -28,7 +28,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `completion` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `completion` on fresh fixture directory |
 | `config` | `c` | **partial** | Configuration key lifecycle: `get`, `set`, and `delete` match npm contract; `config list` omits node-gyp and npm internal installation paths while outputting active `.npmrc` and environment settings | Ran `config` against npm parity test |
 | `dedupe` | `ddp` | **matching** | Full dependency tree reification, lockfile generation, and summary line wording match npm parity | Ran `dedupe` on fresh fixture directory |
-| `deny-scripts` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `deny-scripts --help` on fresh fixture directory |
+| `deny-scripts` | - | **matching** | Install script denial policy writes explicit false `allowScripts` entries and formatted summary output matching npm | Ran `deny-scripts` against live npm parity test |
 | `deprecate` | - | **matching** | Package deprecation notice, packument update, and identical mock registry requests match npm parity | Ran `deprecate` against mock registry parity test |
 | `diff` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `diff` on fresh fixture directory |
 | `dist-tag` | `dist-tags` | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `dist-tag ls is-number` on fresh fixture directory |
