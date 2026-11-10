@@ -17,7 +17,7 @@ pub(crate) async fn run_star(
         client
             .star_package(Some(&registry_url), &package, otp.as_deref())
             .await?;
-        println!("starred {package}");
+        println!("(*) {package}");
     }
     Ok(())
 }
@@ -38,7 +38,7 @@ pub(crate) async fn run_unstar(
         client
             .unstar_package(Some(&registry_url), &package, otp.as_deref())
             .await?;
-        println!("unstarred {package}");
+        println!("( ) {package}");
     }
     Ok(())
 }
@@ -53,18 +53,36 @@ pub(crate) async fn run_stars(
     let value = client
         .starred_packages(Some(&registry_url), user.as_deref())
         .await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if let Some(packages) = value.as_array() {
-        for package in packages {
-            if let Some(name) = package.as_str() {
-                println!("{name}");
-            } else if let Some(name) = package.get("name").and_then(|v| v.as_str()) {
-                println!("{name}");
-            }
-        }
+    let packages: Vec<String> = if let Some(arr) = value.as_array() {
+        arr.iter()
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else {
+                    v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+                }
+            })
+            .collect()
+    } else if let Some(rows) = value.get("rows").and_then(|r| r.as_array()) {
+        rows.iter()
+            .filter_map(|r| {
+                if let Some(s) = r.get("value").and_then(|v| v.as_str()) {
+                    Some(s.to_string())
+                } else {
+                    r.as_str().map(|s| s.to_string())
+                }
+            })
+            .collect()
     } else {
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        Vec::new()
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&packages)?);
+    } else {
+        for package in &packages {
+            println!("{package}");
+        }
     }
     Ok(())
 }

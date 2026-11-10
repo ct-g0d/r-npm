@@ -405,3 +405,82 @@ fn test_sbom_missing_files_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("package.json not found") || stderr.contains("ENOENT"));
 }
+
+#[test]
+fn test_sbom_live_npm_parity() {
+    let tmp_rnpm = tempdir().unwrap();
+    let tmp_npm = tempdir().unwrap();
+    setup_test_project(tmp_rnpm.path());
+    setup_test_project(tmp_npm.path());
+
+    let iso = tempdir().unwrap();
+    let cache_dir = iso.path().join("cache");
+    let prefix_dir = iso.path().join("prefix");
+    let appdata = iso.path().join("appdata");
+    let localappdata = iso.path().join("localappdata");
+    let userconfig = iso.path().join(".npmrc");
+    let globalconfig = iso.path().join("global.npmrc");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&prefix_dir).unwrap();
+    std::fs::create_dir_all(&appdata).unwrap();
+    std::fs::create_dir_all(&localappdata).unwrap();
+    std::fs::write(&userconfig, "").unwrap();
+    std::fs::write(&globalconfig, "").unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let rnpm_res = Command::new(rnpm_bin)
+        .current_dir(tmp_rnpm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
+        .arg("sbom")
+        .output()
+        .expect("rnpm sbom failed");
+
+    let npm_res = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "npm.cmd", "sbom"])
+        .current_dir(tmp_npm.path())
+        .env("HOME", iso.path())
+        .env("USERPROFILE", iso.path())
+        .env("npm_config_userconfig", &userconfig)
+        .env("npm_config_globalconfig", &globalconfig)
+        .env("USERCONFIG", &userconfig)
+        .env("GLOBALCONFIG", &globalconfig)
+        .env("PREFIX", &prefix_dir)
+        .env("NPM_CONFIG_PREFIX", &prefix_dir)
+        .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata)
+        .output();
+
+    if let Ok(npm_out) = npm_res {
+        if npm_out.status.success() {
+            assert_eq!(rnpm_res.status.code(), npm_out.status.code());
+            let rnpm_val: Value = serde_json::from_slice(&rnpm_res.stdout).unwrap();
+            let npm_val: Value = serde_json::from_slice(&npm_out.stdout).unwrap();
+
+            // Compare top-level SPDX fields
+            assert_eq!(rnpm_val["spdxVersion"], npm_val["spdxVersion"]);
+            assert_eq!(rnpm_val["dataLicense"], npm_val["dataLicense"]);
+            assert_eq!(rnpm_val["SPDXID"], npm_val["SPDXID"]);
+            assert_eq!(rnpm_val["name"], npm_val["name"]);
+            assert_eq!(rnpm_val["documentDescribes"], npm_val["documentDescribes"]);
+
+            // Both produce 0 stderr
+            assert!(rnpm_res.stderr.is_empty());
+        }
+    }
+}
+

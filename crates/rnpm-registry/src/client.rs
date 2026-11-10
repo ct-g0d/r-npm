@@ -2972,11 +2972,7 @@ impl RegistryClient {
                 status: 404,
                 body: format!("version {version} not found"),
             })?;
-        if message.is_empty() {
-            if let Some(obj) = version_doc.as_object_mut() {
-                obj.remove("deprecated");
-            }
-        } else if let Some(obj) = version_doc.as_object_mut() {
+        if let Some(obj) = version_doc.as_object_mut() {
             obj.insert(
                 "deprecated".into(),
                 serde_json::Value::String(message.into()),

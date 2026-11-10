@@ -3,20 +3,18 @@ use std::path::PathBuf;
 
 pub(crate) fn run_link(package: Option<String>, current_dir: PathBuf) -> Result<()> {
     let global_prefix = rnpm_config::find_global_prefix();
+    let start_time = std::time::Instant::now();
     match package {
         None => {
-            let target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
-            println!("{} -> {}", target_link.display(), current_dir.display());
+            let _target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
+            let elapsed_str = crate::format_duration(start_time.elapsed());
+            println!("added 1 package in {elapsed_str}");
         }
         Some(pkg) => {
-            let target_link =
+            let _target_link =
                 rnpm_install::link_package_from_global(&current_dir, &pkg, &global_prefix)?;
-            let global_nm = rnpm_config::find_global_node_modules(&global_prefix);
-            println!(
-                "{} -> {}",
-                target_link.display(),
-                global_nm.join(&pkg).display()
-            );
+            let elapsed_str = crate::format_duration(start_time.elapsed());
+            println!("added 1 package in {elapsed_str}");
         }
     }
     Ok(())
@@ -24,19 +22,18 @@ pub(crate) fn run_link(package: Option<String>, current_dir: PathBuf) -> Result<
 
 pub(crate) fn run_unlink(package: Option<String>, current_dir: PathBuf) -> Result<()> {
     let global_prefix = rnpm_config::find_global_prefix();
+    let start_time = std::time::Instant::now();
     match package {
         None => {
-            if let Some(target) =
-                rnpm_install::unlink_package(&current_dir, &global_prefix)?
-            {
-                println!("unlinked {}", target.display());
+            if rnpm_install::unlink_package(&current_dir, &global_prefix)?.is_some() {
+                let elapsed_str = crate::format_duration(start_time.elapsed());
+                println!("removed 1 package in {elapsed_str}");
             }
         }
         Some(pkg) => {
-            if let Some(target) =
-                rnpm_install::unlink_package_from_consumer(&current_dir, &pkg)?
-            {
-                println!("unlinked {}", target.display());
+            if rnpm_install::unlink_package_from_consumer(&current_dir, &pkg)?.is_some() {
+                let elapsed_str = crate::format_duration(start_time.elapsed());
+                println!("removed 1 package in {elapsed_str}");
             }
         }
     }
