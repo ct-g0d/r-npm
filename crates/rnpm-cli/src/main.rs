@@ -5992,14 +5992,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             otp,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Access {
+            commands::access::run(
+                commands::access::AccessArgs {
                     args,
                     registry,
                     json,
                     otp,
                 },
+                current_dir,
             )
             .await?;
         }
