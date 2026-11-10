@@ -4529,8 +4529,8 @@ impl Installer {
                                     .map_err(|e| anyhow!("{e}"))?;
                             }
                             if let Some(payloads) = deferred_pack_files {
-                                let _ = sender.send(payloads.pack.0, payloads.pack.1, 0o644);
-                                let _ = sender.send(payloads.idx.0, payloads.idx.1, 0o644);
+                                let _ = sender.send_arc(payloads.pack.0, payloads.pack.1, 0o644);
+                                let _ = sender.send_arc(payloads.idx.0, payloads.idx.1, 0o644);
                             }
                         } else {
                             for file in &decoded.files {

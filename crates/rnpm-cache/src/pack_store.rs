@@ -580,8 +580,8 @@ impl PackagePack {
 /// Serialized .pack and .idx payloads ready for deferred writing.
 #[derive(Debug, Clone)]
 pub struct DeferredPackPayloads {
-    pub pack: (PathBuf, Vec<u8>),
-    pub idx: (PathBuf, Vec<u8>),
+    pub pack: (PathBuf, Arc<Vec<u8>>),
+    pub idx: (PathBuf, Arc<Vec<u8>>),
 }
 
 /// The Pack Store manager.
@@ -1625,11 +1625,14 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
             TIME_PACK_WRITE.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
+        let pack_bytes_arc = Arc::new(pack_bytes);
+        let idx_bytes_arc = Arc::new(idx_bytes);
+
         // 4. Update memory-map cache
-        let buffer = if pack_bytes.is_empty() {
+        let buffer = if pack_bytes_arc.is_empty() {
             Arc::new(PackBuffer::Empty)
         } else {
-            Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes.clone())))
+            Arc::new(PackBuffer::Bytes(Arc::clone(&pack_bytes_arc)))
         };
 
         let pack = PackagePack {
@@ -1659,8 +1662,8 @@ pub fn write_cas_file_safe(cas_path: &Path, data: &[u8]) -> std::io::Result<()> 
         Ok((
             pack,
             DeferredPackPayloads {
-                pack: (final_pack, pack_bytes),
-                idx: (final_idx, idx_bytes),
+                pack: (final_pack, pack_bytes_arc),
+                idx: (final_idx, idx_bytes_arc),
             },
         ))
     }

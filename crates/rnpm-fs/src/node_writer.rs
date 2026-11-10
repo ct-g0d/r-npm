@@ -89,7 +89,7 @@ process.stdin.on('end', () => {
 pub enum NodeWriterMsg {
     File {
         path: String,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
         mode: u32,
     },
     Close,
@@ -169,7 +169,7 @@ impl NodeWriter {
 pub enum WriteTask {
     File {
         path: PathBuf,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
         mode: u32,
     },
     Close,
@@ -275,6 +275,11 @@ impl AsyncFileWriterSender {
     /// Sends a file write task to the background writer pool/helper.
     /// Fails fast if the background writer has disconnected or encountered an error.
     pub fn send(&self, path: PathBuf, data: Vec<u8>, mode: u32) -> Result<(), std::io::Error> {
+        self.send_arc(path, Arc::new(data), mode)
+    }
+
+    /// Sends a file write task with pre-shared Arc<Vec<u8>> to avoid buffer copies.
+    pub fn send_arc(&self, path: PathBuf, data: Arc<Vec<u8>>, mode: u32) -> Result<(), std::io::Error> {
         match self {
             Self::Node(s) => {
                 let path_str = path.to_string_lossy().to_string();
