@@ -33,37 +33,75 @@ $psi.WorkingDirectory = $testDir
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.EnvironmentVariables["RNPM_STORE_DIR"] = $storeDir
+if ($env:RNPM_CHANNEL_BOUND) {
+    $psi.EnvironmentVariables["RNPM_CHANNEL_BOUND"] = $env:RNPM_CHANNEL_BOUND
+}
 
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
 $proc = [System.Diagnostics.Process]::Start($psi)
+$rootPid = $proc.Id
 
-$peakWs = 0
-$nodePeakWs = 0
+$peakRnpm = 0
+$peakNode = 0
+$peakCombined = 0
+$knownNodePids = [System.Collections.Generic.HashSet[int]]::new()
 
 while (-not $proc.HasExited) {
     try {
-        $ws = $proc.WorkingSet64
-        if ($ws -gt $peakWs) { $peakWs = $ws }
-    } catch {}
+        $proc.Refresh()
+        $rws = $proc.WorkingSet64
+        if ($rws -gt $peakRnpm) { $peakRnpm = $rws }
+    } catch {
+        $rws = 0
+    }
     
-    # Also track any child node processes
+    # Track child node processes belonging to this rnpm run
     try {
         $nodeProcs = Get-Process -Name "node" -ErrorAction SilentlyContinue
         foreach ($np in $nodeProcs) {
-            $nws = $np.WorkingSet64
-            if ($nws -gt $nodePeakWs) { $nodePeakWs = $nws }
+            if ($knownNodePids.Contains($np.Id)) {
+                $nws = $np.WorkingSet64
+                if ($nws -gt $peakNode) { $peakNode = $nws }
+            } else {
+                $parent = (Get-CimInstance Win32_Process -Filter "ProcessId = $($np.Id)" -ErrorAction SilentlyContinue).ParentProcessId
+                if ($parent -eq $rootPid) {
+                    $knownNodePids.Add($np.Id) | Out-Null
+                    $nws = $np.WorkingSet64
+                    if ($nws -gt $peakNode) { $peakNode = $nws }
+                }
+            }
         }
     } catch {}
 
-    Start-Sleep -Milliseconds 10
+    $currentTree = $rws
+    foreach ($npid in $knownNodePids) {
+        try {
+            $np = Get-Process -Id $npid -ErrorAction SilentlyContinue
+            if ($np) {
+                $currentTree += $np.WorkingSet64
+            }
+        } catch {}
+    }
+    if ($currentTree -gt $peakCombined) {
+        $peakCombined = $currentTree
+    }
+
+    Start-Sleep -Milliseconds 15
 }
 
+$proc.WaitForExit()
+$sw.Stop()
+
+Write-Host ("Process exited in {0:N2}s with code {1}" -f $sw.Elapsed.TotalSeconds, $proc.ExitCode)
+
 try {
+    $proc.Refresh()
     $ws = $proc.PeakWorkingSet64
-    if ($ws -gt $peakWs) { $peakWs = $ws }
+    if ($ws -gt $peakRnpm) { $peakRnpm = $ws }
 } catch {}
 
-Write-Host ("[$Scenario] rnpm Peak Working Set: {0:N1} MB ({1:N2} GB)" -f ($peakWs / 1MB), ($peakWs / 1GB))
-Write-Host ("[$Scenario] Node.js Peak Working Set: {0:N1} MB ({1:N2} GB)" -f ($nodePeakWs / 1MB), ($nodePeakWs / 1GB))
-Write-Host ("[$Scenario] Combined Peak Working Set: {0:N1} MB ({1:N2} GB)" -f (($peakWs + $nodePeakWs) / 1MB), (($peakWs + $nodePeakWs) / 1GB))
+Write-Host ("[$Scenario] rnpm Peak Working Set:     {0:N1} MB ({1:N2} GB)" -f ($peakRnpm / 1MB), ($peakRnpm / 1GB))
+Write-Host ("[$Scenario] Node.js Peak Working Set:  {0:N1} MB ({1:N2} GB)" -f ($peakNode / 1MB), ($peakNode / 1GB))
+Write-Host ("[$Scenario] Combined Peak Working Set: {0:N1} MB ({1:N2} GB)" -f ($peakCombined / 1MB), ($peakCombined / 1GB))
 
 Remove-Item $testDir, $cacheDir, $storeDir -Recurse -Force -ErrorAction SilentlyContinue

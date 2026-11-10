@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
@@ -95,10 +94,26 @@ pub enum NodeWriterMsg {
     Close,
 }
 
+/// Channel sender variant for NodeWriter (bounded or unbounded).
+#[derive(Clone)]
+pub enum NodeSender {
+    Bounded(SyncSender<NodeWriterMsg>),
+    Unbounded(Sender<NodeWriterMsg>),
+}
+
+impl NodeSender {
+    pub fn send(&self, msg: NodeWriterMsg) -> Result<(), std::io::Error> {
+        match self {
+            Self::Bounded(s) => s.send(msg).map_err(|e| std::io::Error::other(format!("{e}"))),
+            Self::Unbounded(s) => s.send(msg).map_err(|e| std::io::Error::other(format!("{e}"))),
+        }
+    }
+}
+
 /// A background Node.js worker that writes files concurrently using libuv/fs.promises.
 pub struct NodeWriter {
     child: Child,
-    sender: Sender<NodeWriterMsg>,
+    sender: NodeSender,
     thread_handle: Option<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -122,9 +137,16 @@ impl NodeWriter {
             .spawn()?;
 
         let mut stdin = std::io::BufWriter::with_capacity(1024 * 1024, child.stdin.take().unwrap());
-        let (tx, rx): (Sender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = channel();
+        let (node_sender, rx): (NodeSender, Receiver<NodeWriterMsg>) = if std::env::var("RNPM_CHANNEL_BOUND").as_deref() == Ok("bounded") {
+            let (tx, rx) = sync_channel(4096);
+            (NodeSender::Bounded(tx), rx)
+        } else {
+            let (tx, rx) = channel();
+            (NodeSender::Unbounded(tx), rx)
+        };
 
         let handle = thread::spawn(move || -> std::io::Result<()> {
+            use std::io::Write;
             while let Ok(msg) = rx.recv() {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
@@ -145,13 +167,13 @@ impl NodeWriter {
 
         Ok(Self {
             child,
-            sender: tx,
+            sender: node_sender,
             thread_handle: Some(handle),
         })
     }
 
     /// Obtains a cloned channel sender for worker threads.
-    pub fn sender(&self) -> Sender<NodeWriterMsg> {
+    pub fn sender(&self) -> NodeSender {
         self.sender.clone()
     }
 
@@ -274,7 +296,7 @@ impl RustWriterPool {
 /// Cloneable sender for async file writes across worker threads.
 #[derive(Clone)]
 pub enum AsyncFileWriterSender {
-    Node(Sender<NodeWriterMsg>),
+    Node(NodeSender),
     Rust(SyncSender<WriteTask>),
 }
 

@@ -18,7 +18,66 @@ if (-not (Test-Path $fixtureDir)) {
     exit 1
 }
 
-$npmVer = & npm.cmd --version
+function Invoke-IsolatedNpm {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+        [string]$Cache = $null,
+        [switch]$Measure = $false
+    )
+
+    $isoRoot = Join-Path $env:TEMP ("npm-iso-" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $isoPrefix = Join-Path $isoRoot "prefix"
+    $isoAppData = Join-Path $isoRoot "appdata"
+    $isoLocalAppData = Join-Path $isoRoot "localappdata"
+    $isoUserConfig = Join-Path $isoRoot ".npmrc"
+    $isoGlobalConfig = Join-Path $isoRoot "global.npmrc"
+
+    New-Item -ItemType Directory -Path $isoPrefix, $isoAppData, $isoLocalAppData -Force | Out-Null
+    New-Item -ItemType File -Path $isoUserConfig, $isoGlobalConfig -Force | Out-Null
+
+    $effectiveCache = if ($Cache) { $Cache } else { Join-Path $isoRoot "cache" }
+
+    $origCache = $env:NPM_CONFIG_CACHE
+    $origPrefix = $env:PREFIX
+    $origUserConfig = $env:USERCONFIG
+    $origGlobalConfig = $env:GLOBALCONFIG
+    $origAppData = $env:APPDATA
+    $origLocalAppData = $env:LOCALAPPDATA
+
+    $sw = if ($Measure) { [System.Diagnostics.Stopwatch]::StartNew() } else { $null }
+    $out = $null
+    $exitCode = 0
+
+    try {
+        $env:NPM_CONFIG_CACHE = $effectiveCache
+        $env:PREFIX = $isoPrefix
+        $env:USERCONFIG = $isoUserConfig
+        $env:GLOBALCONFIG = $isoGlobalConfig
+        $env:APPDATA = $isoAppData
+        $env:LOCALAPPDATA = $isoLocalAppData
+
+        $out = & npm.cmd @ArgumentList 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        if ($sw) { $sw.Stop() }
+        $env:NPM_CONFIG_CACHE = $origCache
+        $env:PREFIX = $origPrefix
+        $env:USERCONFIG = $origUserConfig
+        $env:GLOBALCONFIG = $origGlobalConfig
+        $env:APPDATA = $origAppData
+        $env:LOCALAPPDATA = $origLocalAppData
+        Remove-Item -Recurse -Force $isoRoot -ErrorAction SilentlyContinue
+    }
+
+    return @{
+        ExitCode = $exitCode
+        Output = $out
+        ElapsedMs = if ($sw) { $sw.Elapsed.TotalMilliseconds } else { 0 }
+    }
+}
+
+$npmVer = (Invoke-IsolatedNpm -ArgumentList @("--version")).Output
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host " Lane 4: Cold-Path Install Speed Gate" -ForegroundColor Cyan
 Write-Host " npm version:      $npmVer" -ForegroundColor Cyan
@@ -153,16 +212,15 @@ try {
         Copy-Item (Join-Path $fixtureDir "package.json") $npmColdDir
         Copy-Item (Join-Path $fixtureDir "package-lock.json") $npmColdDir
 
-        $npmColdExit = 0
-        $npmColdMs = Measure-CommandMs {
-            Push-Location $npmColdDir
-            try {
-                & npm.cmd ci --no-audit --no-fund --cache $npmColdCache 2>&1 | Out-Null
-                $npmColdExit = $LASTEXITCODE
-            } finally {
-                Pop-Location
-            }
+        $npmResult = $null
+        Push-Location $npmColdDir
+        try {
+            $npmResult = Invoke-IsolatedNpm -ArgumentList @("ci", "--no-audit", "--no-fund", "--cache", $npmColdCache) -Cache $npmColdCache -Measure
+        } finally {
+            Pop-Location
         }
+        $npmColdExit = $npmResult.ExitCode
+        $npmColdMs = $npmResult.ElapsedMs
         if ($npmColdExit -ne 0) {
             Write-Host "[FAIL] npm cold ci exited with code $npmColdExit" -ForegroundColor Red
             exit 1
@@ -229,16 +287,15 @@ try {
         Copy-Item (Join-Path $fixtureDir "package.json") $npmWarmDir
         Copy-Item (Join-Path $fixtureDir "package-lock.json") $npmWarmDir
 
-        $npmWarmExit = 0
-        $npmWarmMs = Measure-CommandMs {
-            Push-Location $npmWarmDir
-            try {
-                & npm.cmd ci --no-audit --no-fund --cache $sharedNpmCache 2>&1 | Out-Null
-                $npmWarmExit = $LASTEXITCODE
-            } finally {
-                Pop-Location
-            }
+        $npmWarmResult = $null
+        Push-Location $npmWarmDir
+        try {
+            $npmWarmResult = Invoke-IsolatedNpm -ArgumentList @("ci", "--no-audit", "--no-fund", "--cache", $sharedNpmCache) -Cache $sharedNpmCache -Measure
+        } finally {
+            Pop-Location
         }
+        $npmWarmExit = $npmWarmResult.ExitCode
+        $npmWarmMs = $npmWarmResult.ElapsedMs
         if ($npmWarmExit -ne 0) {
             Write-Host "[FAIL] npm warm ci exited with code $npmWarmExit" -ForegroundColor Red
             exit 1
@@ -334,10 +391,14 @@ if (-not $parityResult.Identical) {
 }
 
 Write-Host "[Parity Check] Running 'npm ls --all' on rnpm output..." -ForegroundColor Gray
+$lsResult = $null
 Push-Location $lastRnpmDir
-& npm.cmd ls --all 2>&1 | Out-Null
-$lsExit = $LASTEXITCODE
-Pop-Location
+try {
+    $lsResult = Invoke-IsolatedNpm -ArgumentList @("ls", "--all")
+} finally {
+    Pop-Location
+}
+$lsExit = $lsResult.ExitCode
 if ($lsExit -ne 0) {
     Write-Host "[FAIL] 'npm ls --all' failed on rnpm output with exit code $lsExit" -ForegroundColor Red
     $gatePassed = $false
