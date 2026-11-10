@@ -533,6 +533,14 @@ pub(crate) enum Commands {
         /// Custom installation prefix directory
         #[arg(long = "prefix")]
         prefix: Option<PathBuf>,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Update packages
@@ -572,6 +580,14 @@ pub(crate) enum Commands {
         /// Fail installation if any peer dependencies are missing or invalid
         #[arg(long = "strict-peer-deps")]
         strict_peer_deps: bool,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -633,6 +649,14 @@ pub(crate) enum Commands {
         /// Report deduplication actions without modifying files or lockfile
         #[arg(long)]
         dry_run: bool,
+
+        /// Disable audit check
+        #[arg(long = "no-audit")]
+        no_audit: bool,
+
+        /// Disable funding messages
+        #[arg(long = "no-fund")]
+        no_fund: bool,
     },
 
     /// Find duplicate packages across nesting levels (equivalent to dedupe --dry-run)
@@ -5112,7 +5136,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let timing_val = timing || config.get_bool("timing").unwrap_or(false);
+            let timing_val = timing
+                || config.get_bool("timing").unwrap_or(false)
+                || std::env::var("RNPM_TIMING")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             let effective_ignore =
                 ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
             let effective_foreground =
@@ -5304,7 +5332,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-            let timing_val = timing || config.get_bool("timing").unwrap_or(false);
+            let timing_val = timing
+                || config.get_bool("timing").unwrap_or(false)
+                || std::env::var("RNPM_TIMING")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             let effective_ignore =
                 ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
             let effective_foreground =
@@ -5749,6 +5781,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace,
             workspaces,
             workspace_root,
+            ..
         } => {
             if packages.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -5802,6 +5835,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
+            ..
         } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let effective_ignore =
@@ -5950,7 +5984,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::Dedupe { packages, dry_run } => {
+        Commands::Dedupe {
+            packages,
+            dry_run,
+            ..
+        } => {
             let dedupe_options = rnpm_install::DedupeOptions {
                 project_dir: current_dir.clone(),
                 dry_run,
