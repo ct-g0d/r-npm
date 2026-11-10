@@ -118,6 +118,9 @@ pub struct PackIndex {
     /// Whole-pack SHA-256 checksum hex digest of the `.pack` payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_checksum: Option<String>,
+    /// Modified time (nanoseconds since UNIX epoch) of the `.pack` blob when verified/written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_mtime: Option<u64>,
     /// List of file entries in the pack.
     pub files: Vec<PackFileEntry>,
     /// Optional symlinks inside the package (target_rel, symlink_dest).
@@ -138,6 +141,7 @@ impl PackIndex {
             sha512_hex,
             total_pack_size,
             pack_checksum: None,
+            pack_mtime: None,
             files,
             symlinks: Vec::new(),
         }
@@ -156,6 +160,7 @@ impl PackIndex {
             sha512_hex,
             total_pack_size,
             pack_checksum: Some(pack_checksum.into()),
+            pack_mtime: None,
             files,
             symlinks: Vec::new(),
         }
@@ -939,6 +944,9 @@ impl PackStore {
             }
         };
 
+        let mut index = index;
+        let mut index_updated = false;
+
         let pack = PackagePack {
             index: index.clone(),
             buffer,
@@ -946,15 +954,24 @@ impl PackStore {
             idx_path: idx_path.clone(),
         };
 
-        // Verify checksum once upon loading into memory BEFORE touching CAS
-        if let Err(e) = pack.verify_checksum() {
-            let _ = self.purge(integrity);
-            return Err(e);
+        // Fast pack verification: if pack_mtime matches current disk mtime, skip full SHA256 digest.
+        let current_pack_mtime = mtime_to_timestamp(&meta);
+        let pack_verified = index.pack_mtime.is_some()
+            && current_pack_mtime.is_some()
+            && index.pack_mtime == current_pack_mtime;
+
+        if !pack_verified {
+            if let Err(e) = pack.verify_checksum() {
+                let _ = self.purge(integrity);
+                return Err(e);
+            }
+            if let Some(m) = current_pack_mtime {
+                index.pack_mtime = Some(m);
+                index_updated = true;
+            }
         }
 
-        let mut index = index;
         let buf_data = pack.data();
-        let mut index_updated = false;
 
         for entry in &mut index.files {
             let sha = match entry.sha256 {
@@ -1241,14 +1258,6 @@ impl PackStore {
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
-        let index = PackIndex::with_checksum(
-            integrity.to_string(),
-            sha512_hex.clone(),
-            pack_bytes.len() as u64,
-            pack_checksum,
-            index_files,
-        );
-        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
         // 2. Atomic write via temp directory on same filesystem
         let tmp_dir = self.tmp_dir();
@@ -1257,14 +1266,25 @@ impl PackStore {
         let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
         let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
 
-        {
+        let pack_mtime = {
             let mut f_pack = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&tmp_pack)?;
             f_pack.write_all(&pack_bytes)?;
             f_pack.flush()?;
-        }
+            f_pack.metadata().ok().and_then(|m| mtime_to_timestamp(&m))
+        };
+
+        let mut index = PackIndex::with_checksum(
+            integrity.to_string(),
+            sha512_hex.clone(),
+            pack_bytes.len() as u64,
+            pack_checksum,
+            index_files,
+        );
+        index.pack_mtime = pack_mtime;
+        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
         {
             let mut f_idx = OpenOptions::new()

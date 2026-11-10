@@ -580,6 +580,8 @@ pub struct RegistryClient {
     config: RegistryClientConfig,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
+    http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    http_304s: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RegistryClient {
@@ -756,12 +758,30 @@ impl RegistryClient {
             config,
             semaphore,
             circuit_breaker,
+            http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            http_304s: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
     /// Access the client configuration.
     pub fn config(&self) -> &RegistryClientConfig {
         &self.config
+    }
+
+    /// Returns the total number of HTTP requests issued by this client.
+    pub fn http_requests(&self) -> u64 {
+        self.http_requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the total number of HTTP 304 (Not Modified) responses received.
+    pub fn http_304s(&self) -> u64 {
+        self.http_304s.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reset HTTP request and 304 counters.
+    pub fn reset_http_metrics(&self) {
+        self.http_requests.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.http_304s.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Access the bounded concurrency semaphore.
@@ -1082,7 +1102,13 @@ impl RegistryClient {
                     Err(e) => break Err(RegistryError::Http(e)),
                 };
 
+                self.http_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let status = resp.status();
+                if status == StatusCode::NOT_MODIFIED {
+                    self.http_304s
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
                     redirect_count += 1;
@@ -1318,7 +1344,13 @@ impl RegistryClient {
                     Err(e) => break Err(RegistryError::Http(e)),
                 };
 
+                self.http_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let status = resp.status();
+                if status == StatusCode::NOT_MODIFIED {
+                    self.http_304s
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
                     redirect_count += 1;
@@ -1772,6 +1804,39 @@ impl RegistryClient {
         }
 
         let mut results: Vec<Option<Result<AbbreviatedPackageMetadata, RegistryError>>> =
+            (0..packages.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
+    }
+
+    /// Fetch abbreviated install metadata for multiple packages concurrently using conditional ETag revalidation.
+    pub async fn get_package_metadata_conditional_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
+            let client = self.clone();
+            let name = pkg.as_ref().to_string();
+            let etag = if_none_match.clone();
+            join_set.spawn(async move {
+                let res = client
+                    .get_package_metadata_conditional(&name, etag.as_deref())
+                    .await;
+                (idx, res)
+            });
+        }
+
+        let mut results: Vec<Option<Result<MetadataFetchResult, RegistryError>>> =
             (0..packages.len()).map(|_| None).collect();
 
         while let Some(res) = join_set.join_next().await {

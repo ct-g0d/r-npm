@@ -143,6 +143,8 @@ async fn test_cli_update_command_integration() {
             strict_sandbox: false,
             legacy_peer_deps: false,
             strict_peer_deps: false,
+            no_audit: false,
+            no_fund: false,
         },
     };
 

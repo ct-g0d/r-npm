@@ -1325,6 +1325,26 @@ fn file_specs_normalize_relative_current_directory_components() {
         assert_eq!(spec.target, PackageTarget::File("realname-1.0.0.tgz".into()));
     }
     assert_eq!(PackageTarget::parse("file:../sibling.tgz").unwrap(), PackageTarget::File("../sibling.tgz".into()));
+    assert_eq!(PackageTarget::parse("file:x").unwrap(), PackageTarget::File("x".into()));
+    assert_eq!(PackageTarget::parse("file:./x").unwrap(), PackageTarget::File("x".into()));
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            PackageTarget::parse("file:///C:/packages/foo").unwrap(),
+            PackageTarget::File(std::path::PathBuf::from(r"C:\packages\foo"))
+        );
+        assert_eq!(
+            PackageTarget::parse("file://localhost/C:/packages/foo").unwrap(),
+            PackageTarget::File(std::path::PathBuf::from(r"C:\packages\foo"))
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(
+            PackageTarget::parse("file:///packages/foo").unwrap(),
+            PackageTarget::File(std::path::PathBuf::from("/packages/foo"))
+        );
+    }
 }
 
 #[test]
