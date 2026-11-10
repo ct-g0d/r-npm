@@ -192,6 +192,7 @@ pub struct RegistryPackageProvider {
     prefer_offline: bool,
     git_fetcher: crate::git::GitFetcher,
     lockfile: Option<Arc<LockfileV3>>,
+    unlocked_packages: std::collections::HashSet<String>,
 }
 
 fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<PackageMetadata> {
@@ -536,7 +537,20 @@ pub fn extract_stored_etag(metadata: Option<&serde_json::Value>) -> Option<Strin
 }
 
 impl RegistryPackageProvider {
+    fn is_package_locked(&self, name: &str) -> bool {
+        if self.unlocked_packages.contains(name) {
+            return false;
+        }
+        self.lockfile
+            .as_ref()
+            .and_then(|lf| package_metadata_from_lockfile(name, lf))
+            .is_some()
+    }
+
     fn merge_lockfile_metadata(&self, name: &str, meta: &mut PackageMetadata) {
+        if self.unlocked_packages.contains(name) {
+            return;
+        }
         if let Some(ref lf) = self.lockfile {
             if let Some(lf_meta) = package_metadata_from_lockfile(name, lf) {
                 for (v, vm) in lf_meta.versions {
@@ -569,11 +583,7 @@ impl RegistryPackageProvider {
             if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                 self.merge_lockfile_metadata(name, &mut meta);
-                let is_in_lockfile = self
-                    .lockfile
-                    .as_ref()
-                    .and_then(|lf| package_metadata_from_lockfile(name, lf))
-                    .is_some();
+                let is_in_lockfile = self.is_package_locked(name);
                 if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, self.offline) {
                     return Ok(meta);
                 }
@@ -817,8 +827,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             .map(|n| n.get())
             .unwrap_or(8)
             .min(16);
-        let chunk_size = (missing.len() + num_threads - 1) / num_threads;
-        let thread_results: Vec<(Vec<(String, PackageMetadata)>, Vec<RevalidationItem>)> =
+        let chunk_size = missing.len().div_ceil(num_threads);
+        type ThreadBatchResult = (Vec<(String, PackageMetadata)>, Vec<RevalidationItem>);
+        let thread_results: Vec<ThreadBatchResult> =
             std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 for chunk in missing.chunks(chunk_size.max(1)) {
@@ -827,11 +838,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                         let mut local_reval = Vec::new();
                         for name in chunk {
                             let name = name.as_str();
-                            let is_in_lockfile = self
-                                .lockfile
-                                .as_ref()
-                                .and_then(|lf| package_metadata_from_lockfile(name, lf))
-                                .is_some();
+                            let is_in_lockfile = self.is_package_locked(name);
 
                             if let Some((entry, data)) = self.get_cached_packument(name) {
                                 if let Ok(abbrev) =
@@ -2006,6 +2013,7 @@ impl Installer {
             prefer_offline,
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
+            unlocked_packages: self.options.unlocked_packages.clone(),
         };
 
         let resolver_options = ResolverOptions {
