@@ -6,3 +6,4 @@ pub mod pkg;
 pub mod outdated;
 pub mod update;
 pub mod version;
+pub mod pack;

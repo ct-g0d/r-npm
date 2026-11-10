@@ -3252,7 +3252,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
     Ok(())
 }
 
-fn run_lifecycle_hook(
+pub(crate) fn run_lifecycle_hook(
     package_dir: &std::path::Path,
     manifest: &Manifest,
     hook_name: &str,
@@ -5686,84 +5686,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ignore_scripts,
             foreground_scripts,
         } => {
-            let package_dir = if target.is_absolute() {
-                target
-            } else {
-                current_dir.join(target)
+            let args = commands::pack::PackCommandArgs {
+                target,
+                dry_run,
+                json,
+                pack_destination,
+                ignore_scripts,
+                foreground_scripts,
             };
-
-            let manifest_path = package_dir.join("package.json");
-            if !manifest_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "package.json not found in {}",
-                    package_dir.display()
-                ));
-            }
-
-            let manifest = Manifest::from_file(&manifest_path)?;
-            let config = rnpm_config::Config::load(Some(&package_dir)).ok();
-            let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let effective_ignore = ignore_scripts
-                || cli_overrides.as_ref().and_then(|o| o.get("ignore-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get_bool("ignore-scripts")).unwrap_or(false);
-            let effective_foreground = foreground_scripts
-                || cli_overrides.as_ref().and_then(|o| o.get("foreground-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(false);
-            let is_silent = json
-                || cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
-                || config.as_ref().and_then(|c| c.get("loglevel")).map(|s| s == "silent").unwrap_or(false);
-
-            run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent)?;
-            run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent)?;
-
-            let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
-                Ok(res) => res,
-                Err(e) => {
-                    return Err(anyhow::anyhow!("pack failed: {e}"));
-                }
-            };
-
-            run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent)?;
-
-            let dest_dir = pack_destination.unwrap_or_else(|| current_dir.clone());
-            let final_tarball_path = dest_dir.join(&summary.filename);
-
-            if !dry_run {
-                if let Err(e) = std::fs::write(&final_tarball_path, &tarball_bytes) {
-                    return Err(anyhow::anyhow!(
-                        "failed to write {}: {e}",
-                        final_tarball_path.display()
-                    ));
-                }
-            }
-
-            if json {
-                let json_output = serde_json::json!([
-                    {
-                        "id": format!("{}@{}", summary.name, summary.version),
-                        "name": summary.name,
-                        "version": summary.version,
-                        "size": summary.package_size,
-                        "unpackedSize": summary.unpacked_size,
-                        "shasum": summary.shasum,
-                        "integrity": summary.integrity,
-                        "filename": summary.filename,
-                        "files": summary.files.iter().map(|f| serde_json::json!({
-                            "path": f.path,
-                            "size": f.size,
-                            "mode": f.mode,
-                        })).collect::<Vec<_>>(),
-                        "entryCount": summary.entry_count,
-                        "bundled": summary.bundled,
-                    }
-                ]);
-                println!("{}", serde_json::to_string_pretty(&json_output)?);
-            } else {
-                if !is_silent {
-                    print_pack_notices(&summary);
-                }
-                println!("{}", summary.filename);
-            }
+            commands::pack::run(args, current_dir).await?;
         }
         Commands::Uninstall {
             packages,
