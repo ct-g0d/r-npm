@@ -18,6 +18,49 @@ if (-not (Test-Path $fixtureDir)) {
     exit 1
 }
 
+function Restore-EnvVar([string]$name, $origVal) {
+    if ($null -eq $origVal) {
+        Remove-Item "env:$name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item "env:$name" $origVal
+    }
+}
+
+# Preserve original environment
+$origNpmConfigPrefix       = $env:NPM_CONFIG_PREFIX
+$origPrefix                = $env:PREFIX
+$origNpmConfigUserconfig   = $env:NPM_CONFIG_USERCONFIG
+$origNpmConfigGlobalconfig = $env:NPM_CONFIG_GLOBALCONFIG
+$origNpmConfigCache        = $env:NPM_CONFIG_CACHE
+$origAppData               = $env:APPDATA
+$origLocalAppData          = $env:LOCALAPPDATA
+
+# Setup isolated environment
+$isolationBase = Join-Path $env:TEMP "speed-gate-env-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+$isolatedPrefix = Join-Path $isolationBase "isolated-prefix"
+$isolatedCache = Join-Path $isolationBase "isolated-cache"
+$isolatedAppData = Join-Path $isolationBase "isolated-appdata\Roaming"
+$isolatedLocalAppData = Join-Path $isolationBase "isolated-appdata\Local"
+$isolatedUserconfig = Join-Path $isolationBase "isolated-user.npmrc"
+$isolatedGlobalconfig = Join-Path $isolationBase "isolated-global.npmrc"
+
+New-Item -ItemType Directory -Path $isolatedPrefix -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedCache -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedAppData -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedLocalAppData -Force | Out-Null
+Set-Content $isolatedUserconfig ""
+Set-Content $isolatedGlobalconfig ""
+
+$env:NPM_CONFIG_PREFIX       = $isolatedPrefix
+$env:PREFIX                  = $isolatedPrefix
+$env:NPM_CONFIG_USERCONFIG   = $isolatedUserconfig
+$env:NPM_CONFIG_GLOBALCONFIG = $isolatedGlobalconfig
+$env:NPM_CONFIG_CACHE        = $isolatedCache
+$env:APPDATA                 = $isolatedAppData
+$env:LOCALAPPDATA            = $isolatedLocalAppData
+
+try {
+
 $npmVer = & npm.cmd --version
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host " rnpm Speed Gate Harness" -ForegroundColor Cyan
@@ -70,6 +113,26 @@ if ($baselineFileCount -lt 1000) {
     exit 1
 }
 Write-Host "  Baseline file count: $baselineFileCount files" -ForegroundColor Gray
+
+# Pre-warm the isolated npm cache so npm ci runs warm without changing what is timed
+$warmNpmSeedDir = Join-Path $env:TEMP "npm-warm-seed-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+New-Item -ItemType Directory -Path $warmNpmSeedDir -Force | Out-Null
+Copy-Item (Join-Path $fixtureDir "package.json") $warmNpmSeedDir
+Copy-Item (Join-Path $fixtureDir "package-lock.json") $warmNpmSeedDir
+Write-Host "  Pre-warming isolated npm cache..." -ForegroundColor Gray
+Push-Location $warmNpmSeedDir
+try {
+    & npm.cmd ci 2>&1 | Out-Null
+    $npmSetupExitCode = $LASTEXITCODE
+} finally {
+    Pop-Location
+    Remove-Item $warmNpmSeedDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($npmSetupExitCode -ne 0) {
+    Write-Host "[FAIL] Setup npm ci pre-warm failed with exit code $npmSetupExitCode" -ForegroundColor Red
+    exit 1
+}
 
 $robocopyTimes = [System.Collections.Generic.List[double]]::new()
 $rnpmTimes = [System.Collections.Generic.List[double]]::new()
@@ -188,4 +251,17 @@ if ($gatePassed) {
 } else {
     Write-Host "`n[FAIL] Speed Gate FAILED" -ForegroundColor Red
     exit 1
+}
+} finally {
+    Restore-EnvVar "NPM_CONFIG_PREFIX"       $origNpmConfigPrefix
+    Restore-EnvVar "PREFIX"                  $origPrefix
+    Restore-EnvVar "NPM_CONFIG_USERCONFIG"   $origNpmConfigUserconfig
+    Restore-EnvVar "NPM_CONFIG_GLOBALCONFIG" $origNpmConfigGlobalconfig
+    Restore-EnvVar "NPM_CONFIG_CACHE"        $origNpmConfigCache
+    Restore-EnvVar "APPDATA"                 $origAppData
+    Restore-EnvVar "LOCALAPPDATA"            $origLocalAppData
+
+    if (-not $KeepTemp) {
+        Remove-Item $isolationBase -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
