@@ -21,7 +21,7 @@ fn test_cli_cache_clean_requires_force() {
     assert!(!output.status.success(), "Expected failure without --force");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("As of npm@5, the npm cache self-heals"));
-    assert!(stderr.contains("rnpm cache clean --force"));
+    assert!(stderr.contains("rerun this command with --force"));
 }
 
 #[test]
