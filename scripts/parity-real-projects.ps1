@@ -42,7 +42,67 @@ if (-not (Test-Path $rnpmBin)) {
     exit 1
 }
 
-$npmVer = & npm.cmd --version
+function Invoke-IsolatedNpm {
+    param(
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$NpmArgs
+    )
+
+    $isoBase = Join-Path $env:TEMP ("npm-iso-" + [System.Guid]::NewGuid().ToString('N'))
+    $isoCache = Join-Path $isoBase "cache"
+    $isoPrefix = Join-Path $isoBase "prefix"
+    $isoUserConfig = Join-Path $isoBase ".npmrc"
+    $isoGlobalConfig = Join-Path $isoBase "global.npmrc"
+    $isoAppData = Join-Path $isoBase "roaming"
+    $isoLocalAppData = Join-Path $isoBase "local"
+
+    New-Item -ItemType Directory -Path $isoCache, $isoPrefix, $isoAppData, $isoLocalAppData -Force | Out-Null
+    Set-Content -Path $isoUserConfig -Value "" -Encoding utf8
+    Set-Content -Path $isoGlobalConfig -Value "" -Encoding utf8
+
+    $origCache = $env:NPM_CONFIG_CACHE
+    $origCacheLower = $env:npm_config_cache
+    $origPrefix = $env:PREFIX
+    $origPrefixLower = $env:npm_config_prefix
+    $origUserConfig = $env:USERCONFIG
+    $origUserConfigLower = $env:npm_config_userconfig
+    $origGlobalConfig = $env:GLOBALCONFIG
+    $origGlobalConfigLower = $env:npm_config_globalconfig
+    $origAppData = $env:APPDATA
+    $origLocalAppData = $env:LOCALAPPDATA
+
+    try {
+        $env:NPM_CONFIG_CACHE = $isoCache
+        $env:npm_config_cache = $isoCache
+        $env:PREFIX = $isoPrefix
+        $env:npm_config_prefix = $isoPrefix
+        $env:USERCONFIG = $isoUserConfig
+        $env:npm_config_userconfig = $isoUserConfig
+        $env:GLOBALCONFIG = $isoGlobalConfig
+        $env:npm_config_globalconfig = $isoGlobalConfig
+        $env:APPDATA = $isoAppData
+        $env:LOCALAPPDATA = $isoLocalAppData
+
+        $npmOutput = & npm.cmd @NpmArgs 2>&1
+        $script:LastNpmExitCode = $LASTEXITCODE
+        return $npmOutput
+    } finally {
+        $env:NPM_CONFIG_CACHE = $origCache
+        $env:npm_config_cache = $origCacheLower
+        $env:PREFIX = $origPrefix
+        $env:npm_config_prefix = $origPrefixLower
+        $env:USERCONFIG = $origUserConfig
+        $env:npm_config_userconfig = $origUserConfigLower
+        $env:GLOBALCONFIG = $origGlobalConfig
+        $env:npm_config_globalconfig = $origGlobalConfigLower
+        $env:APPDATA = $origAppData
+        $env:LOCALAPPDATA = $origLocalAppData
+
+        cmd.exe /c "rd /s /q `"$isoBase`"" 2>$null
+    }
+}
+
+$npmVer = Invoke-IsolatedNpm --version
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host " rnpm Real-Project Parity Sweep Harness" -ForegroundColor Cyan
 Write-Host " npm version:  $npmVer" -ForegroundColor Cyan
@@ -306,8 +366,8 @@ foreach ($fixtureName in $Fixtures) {
         Copy-Item -Path "$fixtureSource\*" -Destination $ciRnpmDir -Recurse -Force
 
         Push-Location $ciNpmDir
-        $ciNpmOut = & npm.cmd ci --no-audit --no-fund 2>&1
-        $ciNpmExit = $LASTEXITCODE
+        $ciNpmOut = Invoke-IsolatedNpm ci --no-audit --no-fund
+        $ciNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $ciRnpmDir
@@ -348,8 +408,8 @@ foreach ($fixtureName in $Fixtures) {
         # Step 2: install with no lockfile
         Write-Host "  [Step 2/6] Running install with no lockfile..." -ForegroundColor Gray
         Push-Location $flowNpmDir
-        $installNpmOut = & npm.cmd install --no-audit --no-fund 2>&1
-        $installNpmExit = $LASTEXITCODE
+        $installNpmOut = Invoke-IsolatedNpm install --no-audit --no-fund
+        $installNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $flowRnpmDir
@@ -381,8 +441,8 @@ foreach ($fixtureName in $Fixtures) {
         # Step 3: ls --all
         Write-Host "  [Step 3/6] Running ls --all..." -ForegroundColor Gray
         Push-Location $flowNpmDir
-        $lsNpmOut = & npm.cmd ls --all 2>&1
-        $lsNpmExit = $LASTEXITCODE
+        $lsNpmOut = Invoke-IsolatedNpm ls --all
+        $lsNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $flowRnpmDir
@@ -400,8 +460,8 @@ foreach ($fixtureName in $Fixtures) {
         # Step 4: install <one new pkg>
         Write-Host "  [Step 4/6] Running install $NewPkg..." -ForegroundColor Gray
         Push-Location $flowNpmDir
-        $addNpmOut = & npm.cmd install $NewPkg --no-audit --no-fund 2>&1
-        $addNpmExit = $LASTEXITCODE
+        $addNpmOut = Invoke-IsolatedNpm install $NewPkg --no-audit --no-fund
+        $addNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $flowRnpmDir
@@ -411,7 +471,7 @@ foreach ($fixtureName in $Fixtures) {
 
         $addExitMatch = ($addNpmExit -eq $addRnpmExit)
         $addTreeCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules") (Join-Path $flowRnpmDir "node_modules") "node_modules"
-        $addBinCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules\.bin") (Join-Path $flowRnpmDir "node_modules\.bin") ".bin"
+        $addBinCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules\\.bin") (Join-Path $flowRnpmDir "node_modules\\.bin") ".bin"
         $addLockCmp = Compare-LockfilesNormalized (Join-Path $flowNpmDir "package-lock.json") (Join-Path $flowRnpmDir "package-lock.json")
         $addPkgCmp = Compare-PackageJsonBytes (Join-Path $flowNpmDir "package.json") (Join-Path $flowRnpmDir "package.json")
 
@@ -430,8 +490,8 @@ foreach ($fixtureName in $Fixtures) {
         # Step 5: uninstall <pkg>
         Write-Host "  [Step 5/6] Running uninstall $UninstallPkg..." -ForegroundColor Gray
         Push-Location $flowNpmDir
-        $unNpmOut = & npm.cmd uninstall $UninstallPkg --no-audit --no-fund 2>&1
-        $unNpmExit = $LASTEXITCODE
+        $unNpmOut = Invoke-IsolatedNpm uninstall $UninstallPkg --no-audit --no-fund
+        $unNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $flowRnpmDir
@@ -441,7 +501,7 @@ foreach ($fixtureName in $Fixtures) {
 
         $unExitMatch = ($unNpmExit -eq $unRnpmExit)
         $unTreeCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules") (Join-Path $flowRnpmDir "node_modules") "node_modules"
-        $unBinCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules\.bin") (Join-Path $flowRnpmDir "node_modules\.bin") ".bin"
+        $unBinCmp = Compare-DirectoryTrees (Join-Path $flowNpmDir "node_modules\\.bin") (Join-Path $flowRnpmDir "node_modules\\.bin") ".bin"
         $unLockCmp = Compare-LockfilesNormalized (Join-Path $flowNpmDir "package-lock.json") (Join-Path $flowRnpmDir "package-lock.json")
         $unPkgCmp = Compare-PackageJsonBytes (Join-Path $flowNpmDir "package.json") (Join-Path $flowRnpmDir "package.json")
 
@@ -467,8 +527,8 @@ foreach ($fixtureName in $Fixtures) {
 
         Write-Host "  [Step 6/6] Running run $scriptName..." -ForegroundColor Gray
         Push-Location $flowNpmDir
-        $runNpmOut = & npm.cmd run $scriptName 2>&1
-        $runNpmExit = $LASTEXITCODE
+        $runNpmOut = Invoke-IsolatedNpm run $scriptName
+        $runNpmExit = $script:LastNpmExitCode
         Pop-Location
 
         Push-Location $flowRnpmDir
