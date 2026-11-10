@@ -5998,13 +5998,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             version,
             registry,
         } => {
-            execute_package_admin(
-                &current_dir,
-                Commands::Undeprecate {
+            commands::undeprecate::run(
+                commands::undeprecate::UndeprecateArgs {
                     package,
                     version,
                     registry,
                 },
+                current_dir,
             )
             .await?;
         }
