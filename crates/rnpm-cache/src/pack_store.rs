@@ -134,6 +134,9 @@ pub struct PackIndex {
     /// Whole-pack SHA-256 checksum hex digest of the `.pack` payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack_checksum: Option<String>,
+    /// Modified time (nanoseconds since UNIX epoch) of the `.pack` blob when verified/written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_mtime: Option<u64>,
     /// List of file entries in the pack.
     pub files: Vec<PackFileEntry>,
     /// Optional symlinks inside the package (target_rel, symlink_dest).
@@ -154,6 +157,7 @@ impl PackIndex {
             sha512_hex,
             total_pack_size,
             pack_checksum: None,
+            pack_mtime: None,
             files,
             symlinks: Vec::new(),
         }
@@ -172,6 +176,7 @@ impl PackIndex {
             sha512_hex,
             total_pack_size,
             pack_checksum: Some(pack_checksum.into()),
+            pack_mtime: None,
             files,
             symlinks: Vec::new(),
         }
@@ -1066,6 +1071,9 @@ impl PackStore {
             }
         };
 
+        let mut index = index;
+        let mut index_updated = false;
+
         let pack = PackagePack {
             index: index.clone(),
             buffer,
@@ -1073,15 +1081,24 @@ impl PackStore {
             idx_path: idx_path.clone(),
         };
 
-        // Verify checksum once upon loading into memory BEFORE touching CAS
-        if let Err(e) = pack.verify_checksum() {
-            let _ = self.purge(integrity);
-            return Err(e);
+        // Fast pack verification: if pack_mtime matches current disk mtime, skip full SHA256 digest.
+        let current_pack_mtime = mtime_to_timestamp(&meta);
+        let pack_verified = index.pack_mtime.is_some()
+            && current_pack_mtime.is_some()
+            && index.pack_mtime == current_pack_mtime;
+
+        if !pack_verified {
+            if let Err(e) = pack.verify_checksum() {
+                let _ = self.purge(integrity);
+                return Err(e);
+            }
+            if let Some(m) = current_pack_mtime {
+                index.pack_mtime = Some(m);
+                index_updated = true;
+            }
         }
 
-        let mut index = index;
         let buf_data = pack.data();
-        let mut index_updated = false;
 
         for entry in &mut index.files {
             let sha = match entry.sha256 {
@@ -1431,27 +1448,56 @@ impl PackStore {
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
-        let index = PackIndex::with_checksum(
+
+        let mut index = PackIndex::with_checksum(
             integrity.to_string(),
             sha512_hex.clone(),
             pack_bytes.len() as u64,
             pack_checksum,
             index_files,
         );
-        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
-        // 2. Direct write to packs directory (skip temp files and rename retry loops)
         let prefix_dir = self.packs_dir().join(&prefix);
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
         if write_files {
-            let t_p = std::time::Instant::now();
-            let _ = Self::write_cas_file_direct(&final_pack, &pack_bytes);
-            let _ = Self::write_cas_file_direct(&final_idx, &idx_bytes);
-            TIME_PACK_WRITE.fetch_add(t_p.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // Atomic write via temp directory on same filesystem (Lane 5)
+            let tmp_dir = self.tmp_dir();
+            let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
+            let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
+
+            let pack_mtime = {
+                let mut f_pack = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_pack)?;
+                f_pack.write_all(&pack_bytes)?;
+                f_pack.flush()?;
+                f_pack.metadata().ok().and_then(|m| mtime_to_timestamp(&m))
+            };
+
+            index.pack_mtime = pack_mtime;
+            let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
+
+            {
+                let mut f_idx = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_idx)?;
+                f_idx.write_all(&idx_bytes)?;
+                f_idx.flush()?;
+            }
+
+            let _ = fs::create_dir_all(&prefix_dir);
+            rename_atomic(&tmp_pack, &final_pack)?;
+            rename_atomic(&tmp_idx, &final_idx)?;
         }
+
+        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
         let pack_bytes_arc = Arc::new(pack_bytes);
         let idx_bytes_arc = Arc::new(idx_bytes);
@@ -1620,6 +1666,7 @@ impl PackStore {
         let limits = rnpm_fs::TarLimits::default();
         let mut file_payloads_map: HashMap<String, (String, u32, Vec<u8>)> = HashMap::new();
         let mut file_payloads_order = Vec::new();
+        let mut saw_npmignores: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let entries = archive.entries().map_err(CacheError::Io)?;
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
@@ -1663,10 +1710,24 @@ impl PackStore {
             }
 
             let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-            let relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
+            let mut relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
                 Some(p) => p,
                 None => continue,
             };
+
+            // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+            // unless a .npmignore file is already present.
+            if entry_type.is_file() {
+                if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                    saw_npmignores.insert(relative_path.clone());
+                } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+                    let ni = relative_path.with_file_name(".npmignore");
+                    if saw_npmignores.contains(&ni) {
+                        continue;
+                    }
+                    relative_path = ni;
+                }
+            }
 
             rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
 
@@ -1786,6 +1847,7 @@ impl PackStore {
                 sha512_hex,
                 total_pack_size: 0,
                 pack_checksum: None,
+                pack_mtime: None,
                 files: Vec::new(),
                 symlinks: Vec::new(),
             };

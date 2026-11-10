@@ -472,12 +472,18 @@ fn candidate_has_incompatible_peer(
         }
 
         // For required peers: if parent scope has a satisfying peer visible,
+        // or if parent declares a direct dependency on the peer package,
         // do not hoist to candidate_location where the visible peer is incompatible.
         if !parent_location.is_empty() {
             if let Some(parent_peer) =
                 find_visible_peer_node(graph, parent_location, peer_name, peer_name)
             {
                 if node_satisfies_target(parent_peer, &target) {
+                    return true;
+                }
+            }
+            if let Some(parent_node) = graph.nodes.get(parent_location) {
+                if parent_node.dependencies.contains_key(peer_name) {
                     return true;
                 }
             }

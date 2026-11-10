@@ -242,7 +242,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             version: root_version,
             resolved: None,
             integrity: None,
-            flags: NodeFlags::default(),
+            flags: NodeFlags {
+                has_install_script: root_manifest.scripts.contains_key("preinstall")
+                    || root_manifest.scripts.contains_key("install")
+                    || root_manifest.scripts.contains_key("postinstall"),
+                ..Default::default()
+            },
             dependencies: root_manifest.dependencies.clone(),
             dev_dependencies: root_manifest.dev_dependencies.clone(),
             peer_dependencies: root_manifest.peer_dependencies.clone(),
@@ -262,7 +267,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 .map(str::to_owned),
             engines: root_manifest.engines.clone(),
             parsed_version: None,
-            extra: root_manifest.extra.clone(),
+            extra: {
+                let mut extra = root_manifest.extra.clone();
+                if let Some(ref bd) = root_manifest.bundled_dependencies {
+                    if let Ok(val) = serde_json::to_value(bd) {
+                        extra.insert("bundleDependencies".to_string(), val);
+                    }
+                }
+                extra
+            },
         };
         self.graph.nodes.insert(String::new(), root_node);
 
@@ -875,12 +888,33 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     target_loc
                 );
 
+                let is_bundled = if task.parent_location.is_empty() {
+                    self.graph
+                        .nodes
+                        .get("")
+                        .map(|p| {
+                            p.bundled_package_names().contains(&task.install_name)
+                                || p.bundled_package_names().contains(&dep_spec.package_name)
+                        })
+                        .unwrap_or(false)
+                } else {
+                    self.graph
+                        .nodes
+                        .get(&task.parent_location)
+                        .map(|p| {
+                            p.flags.bundled
+                                || p.bundled_package_names().contains(&task.install_name)
+                                || p.bundled_package_names().contains(&dep_spec.package_name)
+                        })
+                        .unwrap_or(false)
+                };
+
                 let flags = NodeFlags {
                     dev: task.dep_type == DependencyType::Dev,
                     optional: task.dep_type == DependencyType::Optional,
                     dev_optional: false,
                     peer: is_peer,
-                    bundled: false,
+                    bundled: is_bundled,
                     has_install_script: chosen_version.has_install_script,
                     skipped: platform_skipped || parent_skipped,
                     link: false,
@@ -1209,13 +1243,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
                         if let Ok(v) = Version::parse(&latest.version) {
-                            if range.satisfies(&v) && is_safe(&v) {
+                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none() {
                                 return Some(latest);
                             }
                         }
                     }
                 }
 
+                let mut best_safe_undeprecated: Option<(&'b PackageVersionMetadata, Version)> = None;
                 let mut best_safe: Option<(&'b PackageVersionMetadata, Version)> = None;
                 let mut best_any: Option<(&'b PackageVersionMetadata, Version)> = None;
 
@@ -1224,6 +1259,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         if range.satisfies(&parsed) {
                             let safe = is_safe(&parsed);
                             if safe {
+                                if v_meta.deprecated.is_none() {
+                                    match &best_safe_undeprecated {
+                                        Some((_, best_v)) => {
+                                            if &parsed > best_v {
+                                                best_safe_undeprecated = Some((v_meta, parsed.clone()));
+                                            }
+                                        }
+                                        None => {
+                                            best_safe_undeprecated = Some((v_meta, parsed.clone()));
+                                        }
+                                    }
+                                }
                                 match &best_safe {
                                     Some((_, best_v)) => {
                                         if &parsed > best_v {
@@ -1249,7 +1296,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                 }
 
-                if let Some((v_meta, _)) = best_safe {
+                if let Some((v_meta, _)) = best_safe_undeprecated {
+                    Some(v_meta)
+                } else if let Some((v_meta, _)) = best_safe {
                     Some(v_meta)
                 } else {
                     best_any.map(|(v_meta, _)| v_meta)

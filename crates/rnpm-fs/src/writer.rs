@@ -7,7 +7,7 @@ use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
 use path_clean::clean;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -18,11 +18,6 @@ pub enum DriveType {
     Ssd,
     Hdd,
     Unknown,
-}
-
-#[cfg(windows)]
-thread_local! {
-    static WIDE_PATH_BUF: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(512));
 }
 
 pub fn wait_all_handles_closed() {}
@@ -187,6 +182,7 @@ pub struct ParallelWriterConfig {
     pub worker_threads: usize,
     pub is_hdd: bool,
     pub preallocate_threshold: usize,
+    pub skip_existing_matching: bool,
 }
 
 impl Default for ParallelWriterConfig {
@@ -195,6 +191,7 @@ impl Default for ParallelWriterConfig {
             worker_threads: 0,
             is_hdd: false,
             preallocate_threshold: 64 * 1024, // 64 KiB
+            skip_existing_matching: false,
         }
     }
 }
@@ -225,6 +222,7 @@ pub fn determine_writer_config(
         worker_threads: threads,
         is_hdd,
         preallocate_threshold: 64 * 1024,
+        skip_existing_matching: false,
     }
 }
 
@@ -261,7 +259,7 @@ where
 {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
         extern "system" {
             fn CreateDirectoryW(
@@ -280,10 +278,8 @@ where
                 if parent.as_os_str().is_empty() || parent == curr {
                     break;
                 }
-                if parent.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
-                    break;
-                }
                 if !all_dirs.insert(parent.to_path_buf()) {
+                    // Ancestors already inserted by another child
                     break;
                 }
                 curr = parent;
@@ -291,23 +287,47 @@ where
             all_dirs.insert(verbatim);
         }
 
-        // Sort breadth-first / by depth (component count ascending, then length)
-        let mut sorted_dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-        sorted_dirs.sort_by_key(|p| (p.components().count(), p.as_os_str().len()));
-
-        for dir in sorted_dirs {
+        // Group directories by depth (component count)
+        let mut dirs_by_depth: BTreeMap<usize, Vec<Vec<u16>>> = BTreeMap::new();
+        for dir in all_dirs {
+            let depth = dir.components().count();
             let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-            let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
-            if ret == 0 {
-                let err = unsafe { GetLastError() };
-                if err != ERROR_ALREADY_EXISTS {
-                    // Fallback to create_dir_all for resilience
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        if e.kind() != std::io::ErrorKind::AlreadyExists {
-                            return Err(e);
+            dirs_by_depth.entry(depth).or_default().push(wide);
+        }
+
+        // Create directories breadth-first level by level, parallelizing large levels across 16 threads
+        for (_depth, level_dirs) in dirs_by_depth {
+            let total = level_dirs.len();
+            if total <= 16 {
+                for wide in &level_dirs {
+                    let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                    if ret == 0 {
+                        let err = unsafe { GetLastError() };
+                        if err != ERROR_ALREADY_EXISTS {
+                            let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
+                            let _ = std::fs::create_dir_all(&dir_path);
                         }
                     }
                 }
+            } else {
+                let num_threads = 16.min(total);
+                let chunk_size = total.div_ceil(num_threads);
+                std::thread::scope(|scope| {
+                    for chunk in level_dirs.chunks(chunk_size) {
+                        scope.spawn(move || {
+                            for wide in chunk {
+                                let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                                if ret == 0 {
+                                    let err = unsafe { GetLastError() };
+                                    if err != ERROR_ALREADY_EXISTS {
+                                        let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
+                                        let _ = std::fs::create_dir_all(&dir_path);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
             }
         }
 
@@ -339,17 +359,6 @@ where
         Ok(())
     }
 }
-
-#[cfg(windows)]
-pub static TIME_CREATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(windows)]
-pub static TIME_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(windows)]
-pub static TIME_CLOSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(windows)]
-pub static COUNT_PATH_NOT_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(windows)]
-pub static COUNT_ACCESS_DENIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Writes a single file using native OS primitives:
 /// - Verbatim `\\?\` path formatting to bypass MAX_PATH limit
@@ -392,7 +401,7 @@ pub fn write_file_fast(
             fn GetLastError() -> u32;
         }
 
-        const FILE_GENERIC_WRITE: u32 = 0x00120116;
+        const GENERIC_WRITE: u32 = 0x40000000;
         const CREATE_ALWAYS: u32 = 2;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -403,97 +412,73 @@ pub fn write_file_fast(
         const FILE_SHARE_DELETE: u32 = 4;
         const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
-        let t_c = std::time::Instant::now();
-        let handle = WIDE_PATH_BUF.with(|cell| {
-            let mut wide = cell.borrow_mut();
-            wide.clear();
+        let path_wide: Vec<u16> = {
             let s = path.as_os_str();
             let bytes = s.as_encoded_bytes();
             if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\") {
-                for c in s.encode_wide() {
-                    wide.push(if c == b'/' as u16 { b'\\' as u16 } else { c });
-                }
-            } else if bytes.len() >= 3
-                && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && (bytes[2] == b'\\' || bytes[2] == b'/')
-                && !bytes.windows(2).any(|w| w == b"..")
-            {
-                wide.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
-                for c in s.encode_wide() {
-                    wide.push(if c == b'/' as u16 { b'\\' as u16 } else { c });
-                }
+                s.encode_wide().chain(Some(0)).collect()
             } else {
                 let verb = crate::path::to_verbatim_path(path);
-                wide.extend(verb.as_os_str().encode_wide());
+                verb.as_os_str().encode_wide().chain(Some(0)).collect()
             }
-            wide.push(0);
+        };
 
-            const FILE_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | 0x08000000 | 0x02000000; // FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS
+        let mut handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_ALL,
+                std::ptr::null_mut(),
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
 
-            let mut h = unsafe {
-                CreateFileW(
-                    wide.as_ptr(),
-                    FILE_GENERIC_WRITE,
-                    FILE_SHARE_ALL,
-                    std::ptr::null_mut(),
-                    CREATE_ALWAYS,
-                    FILE_FLAGS,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            const ERROR_PATH_NOT_FOUND: u32 = 3;
-
-            if h == INVALID_HANDLE_VALUE {
-                let err = unsafe { GetLastError() };
-                if err == ERROR_PATH_NOT_FOUND {
-                    COUNT_PATH_NOT_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    h = unsafe {
-                        CreateFileW(
-                            wide.as_ptr(),
-                            FILE_GENERIC_WRITE,
-                            FILE_SHARE_ALL,
-                            std::ptr::null_mut(),
-                            CREATE_ALWAYS,
-                            FILE_FLAGS,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                } else if err == ERROR_ACCESS_DENIED {
-                    COUNT_ACCESS_DENIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    unlink_target_path(path);
-                    unsafe {
-                        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
-                    }
-                    h = unsafe {
-                        CreateFileW(
-                            wide.as_ptr(),
-                            FILE_GENERIC_WRITE,
-                            FILE_SHARE_ALL,
-                            std::ptr::null_mut(),
-                            CREATE_ALWAYS,
-                            FILE_FLAGS,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                }
-            }
-            h
-        });
-        TIME_CREATE.fetch_add(t_c.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        const ERROR_PATH_NOT_FOUND: u32 = 3;
 
         if handle == INVALID_HANDLE_VALUE {
-            let final_err = unsafe { GetLastError() };
-            return Err(std::io::Error::from_raw_os_error(final_err as i32));
+            let err = unsafe { GetLastError() };
+            if err == ERROR_PATH_NOT_FOUND {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                handle = unsafe {
+                    CreateFileW(
+                        path_wide.as_ptr(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_ALL,
+                        std::ptr::null_mut(),
+                        CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                };
+            } else if err == ERROR_ACCESS_DENIED {
+                unlink_target_path(path);
+                unsafe {
+                    SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                }
+                handle = unsafe {
+                    CreateFileW(
+                        path_wide.as_ptr(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_ALL,
+                        std::ptr::null_mut(),
+                        CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+            if handle == INVALID_HANDLE_VALUE {
+                let final_err = unsafe { GetLastError() };
+                return Err(std::io::Error::from_raw_os_error(final_err as i32));
+            }
         }
 
         let data_len = data.len();
 
-        let t_w = std::time::Instant::now();
         if data_len > 0 {
             let mut offset = 0usize;
             while offset < data_len {
@@ -527,13 +512,10 @@ pub fn write_file_fast(
                 offset += written as usize;
             }
         }
-        TIME_WRITE.fetch_add(t_w.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
-        let t_close = std::time::Instant::now();
         unsafe {
             CloseHandle(handle);
         }
-        TIME_CLOSE.fetch_add(t_close.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         let _ = mode;
         crate::tarball::record_file_created(data_len as u64);
@@ -574,142 +556,97 @@ pub fn write_file_fast(
     }
 }
 
+#[cfg(windows)]
+fn path_to_wide_buf(path: &Path, buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    buf.clear();
+    if let Some(s) = path.to_str() {
+        if s.starts_with(r"\\?\") {
+            buf.extend(path.as_os_str().encode_wide());
+            buf.push(0);
+            return;
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            buf.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+            for &b in bytes {
+                if b == b'/' {
+                    buf.push(b'\\' as u16);
+                } else {
+                    buf.push(b as u16);
+                }
+            }
+            buf.push(0);
+            return;
+        }
+    }
+    let verbatim = crate::path::to_verbatim_path(path);
+    buf.extend(verbatim.as_os_str().encode_wide());
+    buf.push(0);
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    let mut wide = Vec::with_capacity(path.as_os_str().len() + 8);
+    path_to_wide_buf(path, &mut wide);
+    wide
+}
+
+/// Copies or hardlinks a file using native OS primitives (CreateHardLinkW / CopyFileExW on Windows) reusing caller wide-string buffers.
+#[cfg(windows)]
+pub fn copy_file_fast_buf(
+    source: &Path,
+    destination: &Path,
+    src_buf: &mut Vec<u16>,
+    dst_buf: &mut Vec<u16>,
+) -> std::io::Result<()> {
+    extern "system" {
+        fn CopyFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            lpProgressRoutine: *mut std::ffi::c_void,
+            lpData: *mut std::ffi::c_void,
+            pbCancel: *mut i32,
+            dwCopyFlags: u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    path_to_wide_buf(source, src_buf);
+    path_to_wide_buf(destination, dst_buf);
+
+    let ret = unsafe {
+        CopyFileExW(
+            src_buf.as_ptr(),
+            dst_buf.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        Err(std::io::Error::from_raw_os_error(err as i32))
+    } else {
+        Ok(())
+    }
+}
+
 /// Copies a file using native OS primitives (CopyFileExW on Windows).
 pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
-        extern "system" {
-            fn CopyFileExW(
-                lpExistingFileName: *const u16,
-                lpNewFileName: *const u16,
-                lpProgressRoutine: *mut std::ffi::c_void,
-                lpData: *mut std::ffi::c_void,
-                pbCancel: *mut i32,
-                dwCopyFlags: u32,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-
-        let src_v = crate::path::to_verbatim_path(source);
-        let dst_v = crate::path::to_verbatim_path(destination);
-
-        let src_wide: Vec<u16> = src_v.as_os_str().encode_wide().chain(Some(0)).collect();
-        let dst_wide: Vec<u16> = dst_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
-        let ret = unsafe {
-            CopyFileExW(
-                src_wide.as_ptr(),
-                dst_wide.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if ret == 0 {
-            let err = unsafe { GetLastError() };
-            const ERROR_PATH_NOT_FOUND: u32 = 3;
-            if err == ERROR_PATH_NOT_FOUND {
-                if let Some(parent) = destination.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let ret2 = unsafe {
-                    CopyFileExW(
-                        src_wide.as_ptr(),
-                        dst_wide.as_ptr(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        0,
-                    )
-                };
-                if ret2 != 0 {
-                    return Ok(());
-                }
-            }
-            Err(std::io::Error::from_raw_os_error(err as i32))
-        } else {
-            Ok(())
-        }
+        let mut src_buf = Vec::with_capacity(260);
+        let mut dst_buf = Vec::with_capacity(260);
+        copy_file_fast_buf(source, destination, &mut src_buf, &mut dst_buf)
     }
 
     #[cfg(not(windows))]
     {
         std::fs::copy(source, destination).map(|_| ())
-    }
-}
-
-/// Links a file using hard links where possible, falling back to fast copy.
-pub fn link_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        extern "system" {
-            fn CreateHardLinkW(
-                lpFileName: *const u16,
-                lpExistingFileName: *const u16,
-                lpSecurityAttributes: *mut std::ffi::c_void,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-
-        let dst_v = crate::path::to_verbatim_path(destination);
-        let src_v = crate::path::to_verbatim_path(source);
-
-        let dst_wide: Vec<u16> = dst_v.as_os_str().encode_wide().chain(Some(0)).collect();
-        let src_wide: Vec<u16> = src_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
-        let ret = unsafe {
-            CreateHardLinkW(dst_wide.as_ptr(), src_wide.as_ptr(), std::ptr::null_mut())
-        };
-
-        if ret != 0 {
-            return Ok(());
-        }
-
-        let err = unsafe { GetLastError() };
-        const ERROR_PATH_NOT_FOUND: u32 = 3;
-        const ERROR_ALREADY_EXISTS: u32 = 183;
-        const ERROR_FILE_EXISTS: u32 = 80;
-
-        if err == ERROR_PATH_NOT_FOUND {
-            if let Some(parent) = destination.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let ret2 = unsafe {
-                CreateHardLinkW(dst_wide.as_ptr(), src_wide.as_ptr(), std::ptr::null_mut())
-            };
-            if ret2 != 0 {
-                return Ok(());
-            }
-        } else if err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS {
-            let _ = std::fs::remove_file(destination);
-            let ret2 = unsafe {
-                CreateHardLinkW(dst_wide.as_ptr(), src_wide.as_ptr(), std::ptr::null_mut())
-            };
-            if ret2 != 0 {
-                return Ok(());
-            }
-        }
-
-        // Hard link failed (cross volume / unsupported), fall back to CopyFileExW
-        copy_file_fast(source, destination)
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(parent) = destination.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(destination);
-        if std::fs::hard_link(source, destination).is_err() {
-            std::fs::copy(source, destination).map(|_| ())
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -800,6 +737,22 @@ fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usiz
     }
 }
 
+fn file_ref_lpt_priority(file: &MaterializeFileRef<'_>) -> u64 {
+    let size = file.data.len() as u64;
+    let path_str = file.path.to_string_lossy();
+    let is_heavy = size >= 64 * 1024
+        || path_str.ends_with(".node")
+        || path_str.ends_with(".wasm")
+        || path_str.ends_with(".exe")
+        || path_str.ends_with(".dll");
+
+    if is_heavy {
+        (1u64 << 62) | size
+    } else {
+        size
+    }
+}
+
 /// Writes a batch of borrowed file references in parallel according to the optimal disk policy:
 /// - SSD: 24-48 threads, global LPT scheduling across all packages with lock-free atomic chunking.
 /// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
@@ -816,127 +769,192 @@ pub fn materialize_files_parallel_refs<'a>(
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(1, 32)
+        config.worker_threads.clamp(1, 16)
     };
 
-    let batches: Vec<Vec<MaterializeFileRef<'a>>> = if config.is_hdd {
-        let mut package_groups: std::collections::HashMap<&str, Vec<MaterializeFileRef<'a>>> =
-            std::collections::HashMap::new();
+    if !config.is_hdd {
+        // On SSD: chunk-level lock-free atomic scheduling across all files to eliminate thread starvation
+        let total_files = files.len();
+        let chunk_size = 64;
+        let next_file = std::sync::atomic::AtomicUsize::new(0);
+        let files_slice = &files[..];
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    #[cfg(windows)]
+                    let mut src_buf = Vec::with_capacity(260);
+                    #[cfg(windows)]
+                    let mut dst_buf = Vec::with_capacity(260);
+
+                    loop {
+                        let start =
+                            next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                        if start >= total_files {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(total_files);
+                        for file in &files_slice[start..end] {
+                            if config.skip_existing_matching {
+                                if let Ok(meta) = std::fs::metadata(&file.path) {
+                                    if meta.len() == file.data.len() as u64 {
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let mut copied = false;
+                            if let Some(src) = file.source_path {
+                                let mut cas_valid = cas_file_is_valid(
+                                    src,
+                                    file.data.len(),
+                                    file.expected_sha256,
+                                    file.source_verified,
+                                );
+                                if !cas_valid {
+                                    repair_cas_file(src, file.data, file.mode, prealloc_thresh);
+                                    cas_valid = cas_file_is_valid(
+                                        src,
+                                        file.data.len(),
+                                        file.expected_sha256,
+                                        true,
+                                    );
+                                }
+                                #[cfg(windows)]
+                                let copy_ok = cas_valid && copy_file_fast_buf(src, &file.path, &mut src_buf, &mut dst_buf).is_ok();
+                                #[cfg(not(windows))]
+                                let copy_ok = cas_valid && copy_file_fast(src, &file.path).is_ok();
+
+                                if copy_ok {
+                                    copied = true;
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if file.mode & 0o111 != 0 {
+                                            let _ = std::fs::set_permissions(
+                                                &file.path,
+                                                std::fs::Permissions::from_mode(file.mode),
+                                            );
+                                        }
+                                    }
+                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                }
+                            }
+                            if !copied {
+                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
+                                    .map_err(FsError::Io)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
+                })??;
+            }
+
+            Ok(())
+        })
+    } else {
+        // Group files by package to maintain directory locality on HDD
+        let mut package_groups: BTreeMap<String, Vec<MaterializeFileRef<'a>>> = BTreeMap::new();
         let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
 
         for file in files {
-            if let Some(pkg_id) = file.package_id {
-                package_groups.entry(pkg_id).or_default().push(file);
+            if let Some(pkg) = file.package_id {
+                package_groups
+                    .entry(pkg.to_string())
+                    .or_default()
+                    .push(file);
             } else {
                 ungrouped.push(file);
             }
         }
 
-        let mut b: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
-        // Sort batches largest first (LPT scheduling) so large packages (lodash, caniuse-lite) start immediately
-        b.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        for group in package_groups.values_mut() {
+            group.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+        }
+
+        let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
+        batches
+            .sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
 
         if !ungrouped.is_empty() {
-            b.push(ungrouped);
+            ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+            batches.push(ungrouped);
         }
-        b
-    } else {
-        // SSD: Chunk files evenly in small batches of 16 to eliminate convoy latency
-        const CHUNK_SIZE: usize = 16;
-        let mut b = Vec::with_capacity(files.len() / CHUNK_SIZE + 1);
-        let mut current = Vec::with_capacity(CHUNK_SIZE);
-        for file in files {
-            current.push(file);
-            if current.len() >= CHUNK_SIZE {
-                b.push(std::mem::replace(&mut current, Vec::with_capacity(CHUNK_SIZE)));
-            }
-        }
-        if !current.is_empty() {
-            b.push(current);
-        }
-        b
-    };
 
-    let total_batches = batches.len();
-    if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-        eprintln!("[RNPM_WRITER_DEBUG] total_batches: {}, num_threads: {}", total_batches, num_threads);
-    }
-    let next_batch = std::sync::atomic::AtomicUsize::new(0);
-    let batches_slice = &batches[..];
+        let total_batches = batches.len();
+        let next_pkg = std::sync::atomic::AtomicUsize::new(0);
+        let batches_slice = &batches[..];
 
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
 
-        for _ in 0..num_threads {
-            handles.push(scope.spawn(|| -> Result<(), FsError> {
-                loop {
-                    let idx = next_batch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= total_batches {
-                        break;
-                    }
-                    for file in &batches_slice[idx] {
-                        let mut copied = false;
-                        if let Some(src) = file.source_path {
-                            let mut cas_valid = cas_file_is_valid(
-                                src,
-                                file.data.len(),
-                                file.expected_sha256,
-                                file.source_verified,
-                            );
-                            if !cas_valid {
-                                repair_cas_file(src, file.data, file.mode, prealloc_thresh);
-                                cas_valid = cas_file_is_valid(
+            for _ in 0..num_threads {
+                handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    loop {
+                        let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= total_batches {
+                            break;
+                        }
+                        for file in &batches_slice[idx] {
+                            let mut copied = false;
+                            if let Some(src) = file.source_path {
+                                let mut cas_valid = cas_file_is_valid(
                                     src,
                                     file.data.len(),
                                     file.expected_sha256,
-                                    true,
+                                    file.source_verified,
                                 );
-                            }
-                            if cas_valid && copy_file_fast(src, &file.path).is_ok() {
-                                copied = true;
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    if file.mode & 0o111 != 0 {
-                                        let _ = std::fs::set_permissions(
-                                            &file.path,
-                                            std::fs::Permissions::from_mode(file.mode),
-                                        );
-                                    }
+                                if !cas_valid {
+                                    repair_cas_file(src, file.data, file.mode, prealloc_thresh);
+                                    cas_valid = cas_file_is_valid(
+                                        src,
+                                        file.data.len(),
+                                        file.expected_sha256,
+                                        true,
+                                    );
                                 }
-                                crate::tarball::record_file_created(file.data.len() as u64);
+                                if cas_valid && copy_file_fast(src, &file.path).is_ok() {
+                                    copied = true;
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if file.mode & 0o111 != 0 {
+                                            let _ = std::fs::set_permissions(
+                                                &file.path,
+                                                std::fs::Permissions::from_mode(file.mode),
+                                            );
+                                        }
+                                    }
+                                    crate::tarball::record_file_created(file.data.len() as u64);
+                                }
                             }
-                        }
-                        if !copied {
-                            write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
-                                .map_err(FsError::Io)?;
+                            if !copied {
+                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
+                                    .map_err(FsError::Io)?;
+                            }
                         }
                     }
-                }
-                Ok(())
-            }));
-        }
+                    Ok(())
+                }));
+            }
 
-        for handle in handles {
-            handle.join().map_err(|_| {
-                FsError::Io(std::io::Error::other("Materialization worker panicked"))
-            })??;
-        }
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
+                })??;
+            }
 
-        #[cfg(windows)]
-        if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-            eprintln!(
-                "[RNPM_WRITER_DEBUG] CreateFileW: {:.2}s, WriteFile: {:.2}s, CloseHandle: {:.2}s | not_found: {}, access_denied: {}",
-                std::time::Duration::from_nanos(TIME_CREATE.load(std::sync::atomic::Ordering::Relaxed)).as_secs_f64(),
-                std::time::Duration::from_nanos(TIME_WRITE.load(std::sync::atomic::Ordering::Relaxed)).as_secs_f64(),
-                std::time::Duration::from_nanos(TIME_CLOSE.load(std::sync::atomic::Ordering::Relaxed)).as_secs_f64(),
-                COUNT_PATH_NOT_FOUND.load(std::sync::atomic::Ordering::Relaxed),
-                COUNT_ACCESS_DENIED.load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
-
-        Ok(())
-    })
+            Ok(())
+        })
+    }
 }
 
 /// Writes a batch of files in parallel according to the optimal disk policy:
@@ -959,98 +977,6 @@ pub fn materialize_files_parallel(
         })
         .collect();
     materialize_files_parallel_refs(refs, config)
-}
-
-/// An asynchronous, pipelined disk writer pool.
-/// Packages push batches of decompressed files as they finish decompression,
-/// allowing disk writing to completely overlap with tarball decompression.
-pub struct PipelinedWriter {
-    senders: Vec<std::sync::mpsc::Sender<Vec<MaterializeFile>>>,
-    next_worker: std::sync::atomic::AtomicUsize,
-    handles: std::sync::Mutex<Vec<std::thread::JoinHandle<Result<(), FsError>>>>,
-}
-
-impl PipelinedWriter {
-    pub fn new(config: &ParallelWriterConfig) -> Self {
-        let num_threads = if config.is_hdd {
-            config.worker_threads.clamp(1, 4)
-        } else {
-            config.worker_threads.clamp(1, 24)
-        };
-
-        let prealloc_thresh = config.preallocate_threshold;
-        let mut senders = Vec::with_capacity(num_threads);
-        let mut handles = Vec::with_capacity(num_threads);
-
-        for _ in 0..num_threads {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<MaterializeFile>>();
-            senders.push(tx);
-            let handle = std::thread::spawn(move || -> Result<(), FsError> {
-                while let Ok(files) = rx.recv() {
-                    if files.is_empty() {
-                        break;
-                    }
-                    for file in files {
-                        if let Err(e) = write_file_fast(&file.path, &file.data, file.mode, prealloc_thresh) {
-                            return Err(FsError::Io(e));
-                        }
-                    }
-                }
-                Ok(())
-            });
-            handles.push(handle);
-        }
-
-        Self {
-            senders,
-            next_worker: std::sync::atomic::AtomicUsize::new(0),
-            handles: std::sync::Mutex::new(handles),
-        }
-    }
-
-    pub fn push_batch(&self, files: Vec<MaterializeFile>) {
-        if files.is_empty() {
-            return;
-        }
-        let target = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        let _ = self.senders[target].send(files);
-    }
-
-    pub fn finish_and_join(&self) -> Result<(), FsError> {
-        for s in &self.senders {
-            let _ = s.send(Vec::new());
-        }
-
-        let handles: Vec<_> = {
-            let mut lock = self.handles.lock().unwrap();
-            std::mem::take(&mut *lock)
-        };
-
-        let mut first_err = None;
-        for h in handles {
-            match h.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-                Err(_) => {
-                    if first_err.is_none() {
-                        first_err = Some(FsError::Io(std::io::Error::other(
-                            "Writer thread panicked",
-                        )));
-                    }
-                }
-            }
-        }
-
-        if let Some(e) = first_err {
-            Err(e)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 /// A package tarball decoded in memory, ready for parallel materialization.
@@ -1100,6 +1026,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut file_order: Vec<String> = Vec::new();
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
+    let mut saw_npmignores: HashSet<PathBuf> = HashSet::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -1164,7 +1091,7 @@ pub fn decode_tar_entries<R: Read>(
 
         validate_entry_path(&raw_path)?;
 
-        let relative_path = match strip_package_prefix(&raw_path) {
+        let mut relative_path = match strip_package_prefix(&raw_path) {
             Some(p) => {
                 let cleaned: PathBuf = p
                     .components()
@@ -1177,6 +1104,20 @@ pub fn decode_tar_entries<R: Read>(
             }
             None => continue,
         };
+
+        // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+        // unless a .npmignore file is already present.
+        if entry_type.is_file() {
+            if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                saw_npmignores.insert(relative_path.clone());
+            } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+                let ni = relative_path.with_file_name(".npmignore");
+                if saw_npmignores.contains(&ni) {
+                    continue;
+                }
+                relative_path = ni;
+            }
+        }
 
         validate_entry_path(&relative_path)?;
 

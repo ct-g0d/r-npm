@@ -49,6 +49,11 @@ impl IndexEntry {
         let hash = HEXLOWER.encode(&hasher.finalize());
         let p1 = &hash[0..2];
         let p2 = &hash[2..4];
-        cache_dir.join("index-v5").join(p1).join(p2).join(&hash)
+        let npm_style = cache_dir.join("index-v5").join(p1).join(p2).join(&hash[4..]);
+        if npm_style.exists() {
+            npm_style
+        } else {
+            cache_dir.join("index-v5").join(p1).join(p2).join(&hash)
+        }
     }
 }

@@ -1,0 +1,12 @@
+{
+  "name": "real-optional-platform",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"console.log('optional-platform ok')\""
+  },
+  "dependencies": {
+    "esbuild": "^0.20.2",
+    "sharp": "^0.33.4"
+  }
+}

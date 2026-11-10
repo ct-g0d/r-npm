@@ -270,15 +270,7 @@ impl Cache {
 
     /// Compute storage path for a SHA-512 digest hex string.
     pub fn blob_path(&self, sha512_hex: &str) -> PathBuf {
-        let hex = sha512_hex.to_ascii_lowercase();
-        let p1 = if hex.len() >= 2 { &hex[0..2] } else { "xx" };
-        let p2 = if hex.len() >= 4 { &hex[2..4] } else { "yy" };
-        self.root
-            .join("content-v2")
-            .join("sha512")
-            .join(p1)
-            .join(p2)
-            .join(&hex)
+        self.blob_path_for_algo(Algorithm::Sha512, sha512_hex)
     }
 
     /// Compute storage path for a digest hex string under a specific algorithm (cacache content-v2/<algo> layout).
@@ -286,12 +278,23 @@ impl Cache {
         let hex = hex_str.to_ascii_lowercase();
         let p1 = if hex.len() >= 2 { &hex[0..2] } else { "xx" };
         let p2 = if hex.len() >= 4 { &hex[2..4] } else { "yy" };
-        self.root
+        let npm_style = self
+            .root
             .join("content-v2")
             .join(algo.as_str())
             .join(p1)
             .join(p2)
-            .join(&hex)
+            .join(if hex.len() >= 4 { &hex[4..] } else { &hex });
+        if npm_style.exists() {
+            npm_style
+        } else {
+            self.root
+                .join("content-v2")
+                .join(algo.as_str())
+                .join(p1)
+                .join(p2)
+                .join(&hex)
+        }
     }
 
     /// Compute lock file path for a given resource name.

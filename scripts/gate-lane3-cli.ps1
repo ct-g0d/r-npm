@@ -11,6 +11,53 @@ if (-not (Test-Path $rnpmBin)) {
     exit 1
 }
 
+function Restore-EnvVar([string]$name, $origVal) {
+    if ($null -eq $origVal) {
+        Remove-Item "env:$name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item "env:$name" $origVal
+    }
+}
+
+# Preserve original environment
+$origNpmConfigPrefix       = $env:NPM_CONFIG_PREFIX
+$origNpmConfigUserconfig   = $env:NPM_CONFIG_USERCONFIG
+$origNpmConfigGlobalconfig = $env:NPM_CONFIG_GLOBALCONFIG
+$origNpmConfigCache        = $env:NPM_CONFIG_CACHE
+$origAppData               = $env:APPDATA
+$origLocalAppData          = $env:LOCALAPPDATA
+
+# Setup sibling temporary directories and isolated environment
+$tempBase = Join-Path $env:TEMP "lane3-gate-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
+$rnpmDir = Join-Path $tempBase "rnpm-env"
+$npmDir = Join-Path $tempBase "npm-env"
+$wsDir = Join-Path $tempBase "workspaces-env"
+$isolatedPrefix = Join-Path $tempBase "isolated-prefix"
+$isolatedCache = Join-Path $tempBase "isolated-cache"
+$isolatedAppData = Join-Path $tempBase "isolated-appdata\Roaming"
+$isolatedLocalAppData = Join-Path $tempBase "isolated-appdata\Local"
+$isolatedUserconfig = Join-Path $tempBase "isolated-user.npmrc"
+$isolatedGlobalconfig = Join-Path $tempBase "isolated-global.npmrc"
+
+New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
+New-Item -ItemType Directory -Path $npmDir -Force | Out-Null
+New-Item -ItemType Directory -Path $wsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedPrefix -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedCache -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedAppData -Force | Out-Null
+New-Item -ItemType Directory -Path $isolatedLocalAppData -Force | Out-Null
+Set-Content $isolatedUserconfig ""
+Set-Content $isolatedGlobalconfig ""
+
+$env:NPM_CONFIG_PREFIX       = $isolatedPrefix
+$env:NPM_CONFIG_USERCONFIG   = $isolatedUserconfig
+$env:NPM_CONFIG_GLOBALCONFIG = $isolatedGlobalconfig
+$env:NPM_CONFIG_CACHE        = $isolatedCache
+$env:APPDATA                 = $isolatedAppData
+$env:LOCALAPPDATA            = $isolatedLocalAppData
+
+try {
+
 $oraclePath = Join-Path $repoRoot "tests\fixtures\npm-11-keys-oracle.json"
 if (-not (Test-Path $oraclePath)) {
     Write-Host "Oracle file not found at $oraclePath. Generating from real npm..." -ForegroundColor Yellow
@@ -46,15 +93,6 @@ function Invoke-InDir([string]$dir, [scriptblock]$action) {
         [System.IO.Directory]::SetCurrentDirectory($prev)
     }
 }
-
-# Setup sibling temporary directories
-$tempBase = Join-Path $env:TEMP "lane3-gate-$([System.Guid]::NewGuid().ToString('N').Substring(0,8))"
-$rnpmDir = Join-Path $tempBase "rnpm-env"
-$npmDir = Join-Path $tempBase "npm-env"
-$wsDir = Join-Path $tempBase "workspaces-env"
-New-Item -ItemType Directory -Path $rnpmDir -Force | Out-Null
-New-Item -ItemType Directory -Path $npmDir -Force | Out-Null
-New-Item -ItemType Directory -Path $wsDir -Force | Out-Null
 
 $pkgJson = @{
     name = "lane3-test-project"
@@ -734,7 +772,7 @@ if (Test-Path $p486Path) {
             $p486Passed = $false
         }
     } finally {
-        Set-Content (Join-Path $p486Path "package.json") $origP486Json
+        Set-Content (Join-Path $p486Path "package.json") $origP486Json -NoNewline
     }
 }
 
@@ -746,11 +784,6 @@ if (($p486RunRatio -ge 5.0 -or $runRatio -ge 5.0) -and $lsRatio -ge 5.0 -and $p4
     Write-Host "  FAIL: Speed requirements not met (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x; require >=5.0x)." -ForegroundColor Red
     $suiteResults["Part 5: Speed Gate"] = "FAIL (run=${runRatio}x, ls=${lsRatio}x, p486_run=${p486RunRatio}x < 5.0x)"
     $allPassed = $false
-}
-
-# Cleanup
-if (-not $KeepTemp) {
-    Remove-Item $tempBase -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n====================================================" -ForegroundColor Cyan
@@ -766,4 +799,16 @@ if ($allPassed) {
 } else {
     Write-Host "`nLANE 3 GATE FAILED!" -ForegroundColor Red
     exit 1
+}
+} finally {
+    Restore-EnvVar "NPM_CONFIG_PREFIX"       $origNpmConfigPrefix
+    Restore-EnvVar "NPM_CONFIG_USERCONFIG"   $origNpmConfigUserconfig
+    Restore-EnvVar "NPM_CONFIG_GLOBALCONFIG" $origNpmConfigGlobalconfig
+    Restore-EnvVar "NPM_CONFIG_CACHE"        $origNpmConfigCache
+    Restore-EnvVar "APPDATA"                 $origAppData
+    Restore-EnvVar "LOCALAPPDATA"            $origLocalAppData
+
+    if (-not $KeepTemp) {
+        Remove-Item $tempBase -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

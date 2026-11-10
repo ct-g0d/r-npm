@@ -3076,6 +3076,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
         worker_threads: 24,
         is_hdd: false,
         preallocate_threshold: 64 * 1024,
+        skip_existing_matching: false,
     };
     crate::writer::materialize_files_parallel(files.clone(), &ssd_config).unwrap();
 
@@ -3102,6 +3103,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
         worker_threads: 4,
         is_hdd: true,
         preallocate_threshold: 64 * 1024,
+        skip_existing_matching: false,
     };
     // Modify one byte to ensure HDD write overwrites correctly
     files[0].data = b"module.exports = 'pkg-a-hdd';".to_vec();

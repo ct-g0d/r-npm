@@ -1346,3 +1346,14 @@ fn file_specs_normalize_relative_current_directory_components() {
         );
     }
 }
+
+#[test]
+fn test_manifest_compact_single_line_roundtrip() {
+    let single_line = r#"{"name":"compact-pkg","version":"1.0.0","dependencies":{"react":"^18.2.0"}}"#;
+    let manifest = Manifest::from_str(single_line).unwrap();
+    assert_eq!(manifest.format.indent, "");
+    assert_eq!(manifest.format.newline, "");
+    let serialized = manifest.to_json_string().unwrap();
+    assert_eq!(serialized, single_line);
+}
+

@@ -2,10 +2,14 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-fn normalize_bin_paths(bin: Option<PackageBin>) -> Option<PackageBin> {
+fn normalize_bin_paths(bin: Option<PackageBin>, package_name: &str) -> Option<PackageBin> {
     bin.map(|bin| match bin {
         PackageBin::Single(path) => {
-            PackageBin::Single(path.strip_prefix("./").unwrap_or(&path).to_string())
+            let clean = path.strip_prefix("./").unwrap_or(&path).to_string();
+            let bin_name = package_name.rsplit('/').next().unwrap_or(package_name);
+            let mut map = BTreeMap::new();
+            map.insert(bin_name.to_string(), clean);
+            PackageBin::Map(map)
         }
         PackageBin::Map(paths) => PackageBin::Map(
             paths
@@ -96,6 +100,26 @@ pub struct Node {
     /// Preserved hidden-tree metadata or arbitrary package properties.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Node {
+    pub fn bundle_dependencies(&self) -> Option<rnpm_core::manifest::BundledDependencies> {
+        self.extra
+            .get("bundleDependencies")
+            .or_else(|| self.extra.get("bundledDependencies"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    pub fn bundled_package_names(&self) -> Vec<String> {
+        match self.bundle_dependencies() {
+            None => Vec::new(),
+            Some(rnpm_core::manifest::BundledDependencies::Boolean(true)) => {
+                self.dependencies.keys().cloned().collect()
+            }
+            Some(rnpm_core::manifest::BundledDependencies::Boolean(false)) => Vec::new(),
+            Some(rnpm_core::manifest::BundledDependencies::List(list)) => list,
+        }
+    }
 }
 
 /// Complete resolved dependency graph and tree geometry.
@@ -326,6 +350,15 @@ impl DependencyGraph {
             let mut queue = VecDeque::new();
             queue.push_back(self.root_location.as_str());
 
+            for (loc, node) in &self.nodes {
+                if !loc.is_empty()
+                    && (!loc.starts_with("node_modules/") || node.flags.link)
+                    && reachable.insert(loc.clone())
+                {
+                    queue.push_back(loc.as_str());
+                }
+            }
+
             while let Some(curr) = queue.pop_front() {
                 if let Some(targets) = adj.get(curr) {
                     for &target in targets {
@@ -382,7 +415,10 @@ impl DependencyGraph {
                         root_pkg.optional_dependencies = Some(node.optional_dependencies.clone());
                     }
                     if let Some(bin) = &node.bin {
-                        root_pkg.bin = normalize_bin_paths(Some(bin.clone()));
+                        root_pkg.bin = normalize_bin_paths(Some(bin.clone()), &node.name);
+                    }
+                    if node.flags.has_install_script {
+                        root_pkg.has_install_script = Some(true);
                     }
                     root_pkg.license = node.license.clone().or_else(|| {
                         node.extra.get("license").and_then(|v| {
@@ -400,9 +436,18 @@ impl DependencyGraph {
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
                     };
+                    if let Some(bundled) = node.bundle_dependencies() {
+                        root_pkg.bundle_dependencies = Some(bundled);
+                    }
                     let mut filtered_extra = std::collections::BTreeMap::new();
                     for (k, v) in &node.extra {
-                        if k == "overrides" || k == "directories" || k == "license" || k == "libc" {
+                        if k == "overrides"
+                            || k == "directories"
+                            || k == "license"
+                            || k == "libc"
+                            || k == "bundleDependencies"
+                            || k == "bundledDependencies"
+                        {
                             continue;
                         }
                         if k == "deprecated"
@@ -515,9 +560,14 @@ impl DependencyGraph {
                     }
                 }
 
+                let is_standard_nm_loc = loc
+                    .rsplit("/node_modules/")
+                    .next()
+                    .and_then(|leaf| leaf.strip_prefix("node_modules/").or(Some(leaf)))
+                    == Some(node.name.as_str());
                 let pkg = LockfilePackage {
                     preserve_dev_optional_split: true,
-                    name: if node.install_name != node.name {
+                    name: if !is_standard_nm_loc {
                         Some(node.name.clone())
                     } else {
                         None
@@ -566,13 +616,14 @@ impl DependencyGraph {
                     os,
                     cpu,
                     libc,
-                    bin: normalize_bin_paths(node.bin.clone()),
+                    bin: normalize_bin_paths(node.bin.clone(), &node.name),
                     license,
                     engines: if node.engines.is_empty() {
                         None
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
                     },
+                    bundle_dependencies: node.bundle_dependencies(),
                     extra,
                     ..Default::default()
                 };
@@ -647,7 +698,15 @@ impl DependencyGraph {
                 bin: pkg.bin.clone(),
                 license: pkg.license.clone(),
                 engines: pkg.engines_map().unwrap_or_default(),
-                extra: pkg.extra.clone(),
+                extra: {
+                    let mut extra = pkg.extra.clone();
+                    if let Some(ref bd) = pkg.bundle_dependencies {
+                        if let Ok(val) = serde_json::to_value(bd) {
+                            extra.insert("bundleDependencies".to_string(), val);
+                        }
+                    }
+                    extra
+                },
             };
             graph.nodes.insert(loc.clone(), node);
         }
