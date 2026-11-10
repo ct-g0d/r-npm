@@ -39,9 +39,13 @@ function Invoke-IsolatedNpm {
     $effectiveCache = if ($Cache) { $Cache } else { Join-Path $isoRoot "cache" }
 
     $origCache = $env:NPM_CONFIG_CACHE
+    $origCacheLower = $env:npm_config_cache
     $origPrefix = $env:PREFIX
+    $origPrefixLower = $env:npm_config_prefix
     $origUserConfig = $env:USERCONFIG
+    $origUserConfigLower = $env:npm_config_userconfig
     $origGlobalConfig = $env:GLOBALCONFIG
+    $origGlobalConfigLower = $env:npm_config_globalconfig
     $origAppData = $env:APPDATA
     $origLocalAppData = $env:LOCALAPPDATA
 
@@ -51,9 +55,13 @@ function Invoke-IsolatedNpm {
 
     try {
         $env:NPM_CONFIG_CACHE = $effectiveCache
+        $env:npm_config_cache = $effectiveCache
         $env:PREFIX = $isoPrefix
+        $env:npm_config_prefix = $isoPrefix
         $env:USERCONFIG = $isoUserConfig
+        $env:npm_config_userconfig = $isoUserConfig
         $env:GLOBALCONFIG = $isoGlobalConfig
+        $env:npm_config_globalconfig = $isoGlobalConfig
         $env:APPDATA = $isoAppData
         $env:LOCALAPPDATA = $isoLocalAppData
 
@@ -62,12 +70,16 @@ function Invoke-IsolatedNpm {
     } finally {
         if ($sw) { $sw.Stop() }
         $env:NPM_CONFIG_CACHE = $origCache
+        $env:npm_config_cache = $origCacheLower
         $env:PREFIX = $origPrefix
+        $env:npm_config_prefix = $origPrefixLower
         $env:USERCONFIG = $origUserConfig
+        $env:npm_config_userconfig = $origUserConfigLower
         $env:GLOBALCONFIG = $origGlobalConfig
+        $env:npm_config_globalconfig = $origGlobalConfigLower
         $env:APPDATA = $origAppData
         $env:LOCALAPPDATA = $origLocalAppData
-        Remove-Item -Recurse -Force $isoRoot -ErrorAction SilentlyContinue
+        cmd.exe /c "rd /s /q `"$isoRoot`"" 2>$null
     }
 
     return @{
@@ -206,6 +218,7 @@ try {
         # ---------------------------------------------------------
         # 1. Fully Cold npm ci (fresh cache, fresh project dir)
         # ---------------------------------------------------------
+        Wait-For-Idle
         $npmColdDir = Join-Path $env:TEMP "npm-cold-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         $npmColdCache = Join-Path $env:TEMP "npm-cold-cache-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         New-Item -ItemType Directory -Path $npmColdDir -Force | Out-Null
@@ -232,12 +245,13 @@ try {
         if (-not (Test-Path $sharedNpmCache)) {
             Move-Item $npmColdCache $sharedNpmCache -Force
         } else {
-            Remove-Item $npmColdCache -Recurse -Force -ErrorAction SilentlyContinue
+            cmd.exe /c "rd /s /q `"$npmColdCache`"" 2>$null
         }
 
         # ---------------------------------------------------------
         # 2. Fully Cold rnpm ci (fresh cache, fresh store, fresh project dir)
         # ---------------------------------------------------------
+        Wait-For-Idle
         $rnpmColdDir = Join-Path $env:TEMP "rnpm-cold-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         $rnpmColdCache = Join-Path $env:TEMP "rnpm-cold-cache-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         $rnpmColdStore = Join-Path $env:TEMP "rnpm-cold-store-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
@@ -267,21 +281,22 @@ try {
         if (-not (Test-Path $sharedRnpmCache)) {
             Move-Item $rnpmColdCache $sharedRnpmCache -Force
         } else {
-            Remove-Item $rnpmColdCache -Recurse -Force -ErrorAction SilentlyContinue
+            cmd.exe /c "rd /s /q `"$rnpmColdCache`"" 2>$null
         }
-        Remove-Item $rnpmColdStore -Recurse -Force -ErrorAction SilentlyContinue
+        cmd.exe /c "rd /s /q `"$rnpmColdStore`"" 2>$null
 
         if ($i -eq $Runs) {
             $lastNpmDir = $npmColdDir
             $lastRnpmDir = $rnpmColdDir
         } else {
-            Remove-Item $npmColdDir -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item $rnpmColdDir -Recurse -Force -ErrorAction SilentlyContinue
+            cmd.exe /c "rd /s /q `"$npmColdDir`"" 2>$null
+            cmd.exe /c "rd /s /q `"$rnpmColdDir`"" 2>$null
         }
 
         # ---------------------------------------------------------
         # 3. Empty-store, warm-tarball-cache rnpm ci vs warm npm ci
         # ---------------------------------------------------------
+        Wait-For-Idle
         $npmWarmDir = Join-Path $env:TEMP "npm-warm-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         New-Item -ItemType Directory -Path $npmWarmDir -Force | Out-Null
         Copy-Item (Join-Path $fixtureDir "package.json") $npmWarmDir
@@ -302,8 +317,9 @@ try {
         }
         $npmWarmTimes.Add($npmWarmMs)
         Write-Host ("  npm warm ci:              {0,8:N1} ms ({1:N2} s)" -f $npmWarmMs, ($npmWarmMs / 1000.0)) -ForegroundColor Magenta
-        Remove-Item $npmWarmDir -Recurse -Force -ErrorAction SilentlyContinue
+        cmd.exe /c "rd /s /q `"$npmWarmDir`"" 2>$null
 
+        Wait-For-Idle
         $rnpmWarmTarDir = Join-Path $env:TEMP "rnpm-warmtar-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         $rnpmWarmTarStore = Join-Path $env:TEMP "rnpm-warmtar-store-$i-$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
         New-Item -ItemType Directory -Path $rnpmWarmTarDir -Force | Out-Null
@@ -327,8 +343,8 @@ try {
         }
         $rnpmWarmTarballTimes.Add($rnpmWarmTarMs)
         Write-Host ("  rnpm warm-tar/empty-store:{0,8:N1} ms ({1:N2} s)" -f $rnpmWarmTarMs, ($rnpmWarmTarMs / 1000.0)) -ForegroundColor Cyan
-        Remove-Item $rnpmWarmTarDir -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item $rnpmWarmTarStore -Recurse -Force -ErrorAction SilentlyContinue
+        cmd.exe /c "rd /s /q `"$rnpmWarmTarDir`"" 2>$null
+        cmd.exe /c "rd /s /q `"$rnpmWarmTarStore`"" 2>$null
         Wait-For-Idle
     }
 } finally {
