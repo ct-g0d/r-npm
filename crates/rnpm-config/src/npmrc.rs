@@ -134,9 +134,10 @@ impl Npmrc {
 
         // 1. Check if key is the default registry
         if key_trimmed == "registry" {
-            let mut reg_url = Url::parse(value_trimmed)?;
-            ensure_trailing_slash(&mut reg_url);
-            self.registry = reg_url;
+            if let Ok(mut reg_url) = Url::parse(value_trimmed) {
+                ensure_trailing_slash(&mut reg_url);
+                self.registry = reg_url;
+            }
             self.settings
                 .insert(key_trimmed.to_string(), value_trimmed.to_string());
             return Ok(());
@@ -144,10 +145,11 @@ impl Npmrc {
 
         // 2. Check if key is a scoped registry: e.g. "@myorg:registry", "@myorg/registry", or "myorg:registry"
         if let Some(scope) = parse_scoped_registry_key(key_trimmed) {
-            let mut reg_url = Url::parse(value_trimmed)?;
-            ensure_trailing_slash(&mut reg_url);
-            self.scoped_registries
-                .insert(scope.to_ascii_lowercase(), reg_url);
+            if let Ok(mut reg_url) = Url::parse(value_trimmed) {
+                ensure_trailing_slash(&mut reg_url);
+                self.scoped_registries
+                    .insert(scope.to_ascii_lowercase(), reg_url);
+            }
             self.settings
                 .insert(key_trimmed.to_string(), value_trimmed.to_string());
             return Ok(());

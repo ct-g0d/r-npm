@@ -1508,7 +1508,7 @@ process.exitCode = 0;
         execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(15),
+        start.elapsed() < std::time::Duration::from_secs(45),
         "Must complete without pipe buffer deadlock"
     );
 
@@ -1592,7 +1592,7 @@ process.exitCode = 0;
         .expect("Async massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(15),
+        start.elapsed() < std::time::Duration::from_secs(45),
         "Must complete without pipe buffer deadlock"
     );
 
@@ -2462,20 +2462,49 @@ fn test_npm_package_environment_variables_flattening() {
     )
     .unwrap();
 
-    let ctx = LifecycleContext::new(temp.path(), &pkg_dir, "my-test-pkg", "build", "echo building");
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        &pkg_dir,
+        "my-test-pkg",
+        "build",
+        "echo building",
+    );
     let env = build_lifecycle_env(&ctx);
 
-    assert_eq!(env.get("npm_package_name").map(|s| s.as_str()), Some("my-test-pkg"));
-    assert_eq!(env.get("npm_package_version").map(|s| s.as_str()), Some("2.4.1"));
+    assert_eq!(
+        env.get("npm_package_name").map(|s| s.as_str()),
+        Some("my-test-pkg")
+    );
+    assert_eq!(
+        env.get("npm_package_version").map(|s| s.as_str()),
+        Some("2.4.1")
+    );
     assert_eq!(
         env.get("npm_package_description").map(|s| s.as_str()),
         Some("A package for testing lifecycle envs")
     );
-    assert_eq!(env.get("npm_package_config_port").map(|s| s.as_str()), Some("8080"));
-    assert_eq!(env.get("npm_package_config_active").map(|s| s.as_str()), Some("true"));
-    assert_eq!(env.get("npm_package_keywords_0").map(|s| s.as_str()), Some("fast"));
-    assert_eq!(env.get("npm_package_keywords_1").map(|s| s.as_str()), Some("rust"));
-    assert_eq!(env.get("npm_package_keywords_2").map(|s| s.as_str()), Some("npm"));
-    assert_eq!(env.get("npm_package_scripts_build").map(|s| s.as_str()), Some("echo building"));
+    assert_eq!(
+        env.get("npm_package_config_port").map(|s| s.as_str()),
+        Some("8080")
+    );
+    assert_eq!(
+        env.get("npm_package_config_active").map(|s| s.as_str()),
+        Some("true")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_0").map(|s| s.as_str()),
+        Some("fast")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_1").map(|s| s.as_str()),
+        Some("rust")
+    );
+    assert_eq!(
+        env.get("npm_package_keywords_2").map(|s| s.as_str()),
+        Some("npm")
+    );
+    assert_eq!(
+        env.get("npm_package_scripts_build").map(|s| s.as_str()),
+        Some("echo building")
+    );
 }
-

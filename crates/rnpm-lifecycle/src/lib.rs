@@ -862,6 +862,19 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         "INIT_CWD".to_string(),
         ctx.project_root.to_string_lossy().to_string(),
     );
+    if !env.contains_key("npm_command") {
+        let cmd = match ctx.event.as_str() {
+            "preinstall" | "install" | "postinstall" => "install",
+            "prepack" | "postpack" => "pack",
+            "prepublish" | "publish" | "postpublish" | "prepublishOnly" => "publish",
+            "test" | "pretest" | "posttest" => "test",
+            "start" | "prestart" | "poststart" => "start",
+            "restart" | "prerestart" | "postrestart" => "restart",
+            "stop" | "prestop" | "poststop" => "stop",
+            _ => "run",
+        };
+        env.insert("npm_command".to_string(), cmd.to_string());
+    }
     env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
     env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
     env.insert("npm_package_name".to_string(), ctx.package_name.clone());
@@ -2141,8 +2154,9 @@ pub async fn execute_topological_with_abort(
         }
     }
 
-    // Root package lifecycle execution: preinstall -> install -> postinstall -> prepare
-    let root_hooks = ["preinstall", "install", "postinstall", "prepare"];
+    let root_hooks = [
+        "preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
+    ];
     for hook in root_hooks {
         if let Some(script_cmd) = root_manifest.scripts.get(hook) {
             if let Some(ref rx) = abort_rx {
@@ -2181,11 +2195,11 @@ pub async fn execute_topological_with_abort(
 
             let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "Root lifecycle script '{}' failed with exit code: {:?}",
-                    hook,
-                    status.code()
-                ));
+                let code = extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(ScriptExitError {
+                    exit_code: code,
+                    message: format!("Root lifecycle script '{hook}' failed with exit code: {code}"),
+                }));
             }
         }
     }

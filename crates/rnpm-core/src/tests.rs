@@ -1317,3 +1317,12 @@ fn test_semver_zero_version_cascades() {
     assert!(!r3.satisfies(&Version::parse("0.1.0").unwrap()));
     assert!(!r3.satisfies(&Version::parse("0.0.3").unwrap()));
 }
+#[test]
+fn file_specs_normalize_relative_current_directory_components() {
+    use crate::spec::{PackageSpec, PackageTarget};
+    for input in ["file:./realname-1.0.0.tgz", "alias@file:./realname-1.0.0.tgz"] {
+        let spec = PackageSpec::parse(input).unwrap();
+        assert_eq!(spec.target, PackageTarget::File("realname-1.0.0.tgz".into()));
+    }
+    assert_eq!(PackageTarget::parse("file:../sibling.tgz").unwrap(), PackageTarget::File("../sibling.tgz".into()));
+}
