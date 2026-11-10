@@ -1243,13 +1243,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
                         if let Ok(v) = Version::parse(&latest.version) {
-                            if range.satisfies(&v) && is_safe(&v) {
+                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none() {
                                 return Some(latest);
                             }
                         }
                     }
                 }
 
+                let mut best_safe_undeprecated: Option<(&'b PackageVersionMetadata, Version)> = None;
                 let mut best_safe: Option<(&'b PackageVersionMetadata, Version)> = None;
                 let mut best_any: Option<(&'b PackageVersionMetadata, Version)> = None;
 
@@ -1258,6 +1259,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         if range.satisfies(&parsed) {
                             let safe = is_safe(&parsed);
                             if safe {
+                                if v_meta.deprecated.is_none() {
+                                    match &best_safe_undeprecated {
+                                        Some((_, best_v)) => {
+                                            if &parsed > best_v {
+                                                best_safe_undeprecated = Some((v_meta, parsed.clone()));
+                                            }
+                                        }
+                                        None => {
+                                            best_safe_undeprecated = Some((v_meta, parsed.clone()));
+                                        }
+                                    }
+                                }
                                 match &best_safe {
                                     Some((_, best_v)) => {
                                         if &parsed > best_v {
@@ -1283,7 +1296,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                 }
 
-                if let Some((v_meta, _)) = best_safe {
+                if let Some((v_meta, _)) = best_safe_undeprecated {
+                    Some(v_meta)
+                } else if let Some((v_meta, _)) = best_safe {
                     Some(v_meta)
                 } else {
                     best_any.map(|(v_meta, _)| v_meta)

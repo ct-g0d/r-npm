@@ -5553,3 +5553,55 @@ fn test_lockfile_omits_name_for_nested_node_modules_standard_packages() {
         "Standard nested scoped package location must omit name in lockfile"
     );
 }
+
+#[test]
+fn test_breadth_first_dependency_depth_prevents_premature_hoisting_from_deep_branches() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // pkg-a (alphabetically earlier) has deep transitive dep on shared@2.0.0 (depth 3)
+    provider.add_version("pkg-a", "1.0.0", |v| {
+        v.dependencies
+            .insert("sub-a".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("sub-a", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared".to_string(), "^2.0.0".to_string());
+    });
+    provider.add_version("shared", "2.0.0", |_| {});
+
+    // pkg-b (alphabetically later) has direct dependency on shared@1.0.0 (depth 2)
+    provider.add_version("pkg-b", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("shared", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("bfs-app".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-b".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+
+    // Shallower branch (pkg-b -> shared@1.0.0 at depth 2) must claim root node_modules/shared
+    let root_shared = graph
+        .nodes
+        .get("node_modules/shared")
+        .expect("root node_modules/shared");
+    assert_eq!(
+        root_shared.version, "1.0.0",
+        "Shallower dependency branch must claim root slot before deeper transitive branch"
+    );
+
+    // Deeper branch (pkg-a -> sub-a -> shared@2.0.0 at depth 3) must be nested
+    assert!(
+        graph.nodes.contains_key("node_modules/sub-a/node_modules/shared")
+            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/sub-a/node_modules/shared")
+            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/shared")
+    );
+}
+
