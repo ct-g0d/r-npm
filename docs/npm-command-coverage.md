@@ -51,7 +51,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `link` | `ln` | **matching** | Package junction creation, global prefix linking, consumer resolution, and summary output match npm | Ran `link` against npm parity test |
 | `ll` | `la` | **matching** | Extended dependency tree visualizer with unmet dependency markers, ELSPROBLEMS exit status, and JSON output matching npm | Ran `ll` against npm parity test |
 | `login` | - | **partial** | Authentication workflow: npm executes interactive browser/couch credentials flow via stdin TTY, whereas rnpm supports non-interactive automated credentials and token configuration | Ran `login` against mock registry |
-| `logout` | - | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `logout --help` on fresh fixture directory |
+| `logout` | - | **partial** | Session termination: npm invokes remote token revocation HTTP DELETE endpoint, whereas rnpm removes local credentials from `.npmrc` | Ran `logout` against mock registry |
 | `ls` | `list` | **matching** | Dependency tree visualizer with unmet dependency markers, ELSPROBLEMS exit status, and JSON output matching npm | Ran `ls` against npm parity test |
 | `org` | `ogr` | **partial** | CLI parser architecture: rnpm generates clap usage with standard option flags, whereas npm renders custom manpage text templates | Ran `org --help` on fresh fixture directory |
 | `outdated` | - | **matching** | Tabular column layout (`-` for missing packages) and omission of `current`/`location` in `--json` match npm | Ran `outdated` on fresh fixture directory |
