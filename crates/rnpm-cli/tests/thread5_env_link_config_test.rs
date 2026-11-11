@@ -527,6 +527,8 @@ fn test_link_live_npm_parity() {
     fs::create_dir_all(&iso_appdata).unwrap();
     fs::create_dir_all(&iso_localappdata).unwrap();
     fs::create_dir_all(&iso_cache).unwrap();
+    fs::write(&iso_userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&iso_globalconfig, "").unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 

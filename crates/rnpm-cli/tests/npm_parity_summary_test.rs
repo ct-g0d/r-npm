@@ -100,11 +100,11 @@ fn test_install_uninstall_summary_phrasing_and_json_parity() {
     fs::create_dir_all(&prefix_dir).unwrap();
     fs::create_dir_all(&appdata).unwrap();
     fs::create_dir_all(&localappdata).unwrap();
-    fs::write(&userconfig, "").unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
     let npm_inst = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "install", "--no-audit", "--no-fund"])
+        .args(["/d", "/s", "/c", "npm.cmd", "install", "--offline", "--no-audit", "--no-fund"])
         .current_dir(npm_tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

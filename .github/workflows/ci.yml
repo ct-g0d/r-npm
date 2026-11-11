@@ -42,7 +42,7 @@ jobs:
       - name: Clippy Gate (Zero Warnings Enforced)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Check NPM Test Isolation (Report-Only)
+      - name: Check NPM Test Isolation (Enforced)
         run: pwsh ./scripts/check-npm-isolation.ps1
 
       - name: Workspace Tests Gate (100% Pass Required)
