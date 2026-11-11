@@ -1,0 +1,7 @@
+{
+  "name": "@real-ws/bin-provider",
+  "version": "1.0.0",
+  "bin": {
+    "ws-tool": "./bin/ws-tool.js"
+  }
+}

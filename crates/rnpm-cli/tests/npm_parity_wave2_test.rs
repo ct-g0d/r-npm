@@ -89,7 +89,11 @@ fn pack_runs_hooks_even_in_dry_run_and_honors_ignore_scripts() {
         let out = run(temp.path(), &args);
         success(&out);
         assert_eq!(events(temp.path()), if ignore { "" } else { "prepack\nprepare\npostpack\n" });
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), "fixture-1.0.0.tgz\n");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), if ignore {
+            "fixture-1.0.0.tgz\n"
+        } else {
+            "prepack\nprepare\npostpack\nfixture-1.0.0.tgz\n"
+        });
         assert!(!temp.path().join("fixture-1.0.0.tgz").exists());
     }
 }
@@ -129,7 +133,7 @@ fn workspace_missing_script_requires_if_present_and_never_runs_orphan_hooks() {
 fn workspace_version_bumps_only_members() {
     let temp = tempdir().unwrap();
     workspace(temp.path());
-    let out = run(temp.path(), &["version", "patch", "--workspaces", "--no-git-tag-version"]);
+    let out = run(temp.path(), &["version", "patch", "--workspaces", "--no-git-tag-version", "--silent"]);
     success(&out);
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "a\nv1.0.1\nb\nv1.0.1\n");
     for (relative, version) in [("package.json", "1.0.0"), ("packages/a/package.json", "1.0.1"), ("packages/b/package.json", "1.0.1")] {

@@ -240,6 +240,11 @@ pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> S
     }
 
     let mut dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
+    if dep_keys.is_empty() {
+        out.push_str(if crate::use_unicode(root.path.as_deref().unwrap_or(Path::new("."))) {
+            "\u{2514}\u{2500}\u{2500} (empty)\n"
+        } else { "`-- (empty)\n" });
+    }
     dep_keys.sort_by(|a, b| {
         let child_a = root.dependencies.get(a).unwrap();
         let child_b = root.dependencies.get(b).unwrap();

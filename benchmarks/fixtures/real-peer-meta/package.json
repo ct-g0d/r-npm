@@ -1,0 +1,12 @@
+{
+  "name": "real-peer-meta",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"console.log('peer-meta ok')\""
+  },
+  "dependencies": {
+    "pino": "9.0.0",
+    "is-number": "^7.0.0"
+  }
+}

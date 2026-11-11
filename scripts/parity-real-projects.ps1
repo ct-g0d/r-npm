@@ -26,7 +26,13 @@ param(
         "real-lifecycle-scripts",
         "real-bundled-deps",
         "project-486",
-        "real-angular-cli"
+        "real-angular-cli",
+        "real-overrides",
+        "real-npm-aliases",
+        "real-peer-meta",
+        "real-workspaces-bins",
+        "real-bundled-platform",
+        "real-engines-strict"
     ),
     [switch]$KeepTemp = $false,
     [string]$NewPkg = "is-sorted@1.0.2",

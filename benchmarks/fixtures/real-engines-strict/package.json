@@ -1,0 +1,14 @@
+{
+  "name": "real-engines-strict",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "is-number": "^7.0.0"
+  },
+  "scripts": {
+    "test": "node -e \"console.log('engines-strict ok')\""
+  }
+}
