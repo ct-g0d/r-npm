@@ -205,3 +205,18 @@ fn test_ls_and_ll_live_npm_parity() {
     assert!(rnpm_ll_stdout.contains("UNMET DEPENDENCY is-number@7.0.0"));
 }
 
+
+#[test]
+fn test_tree_bom_package_json() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        "\u{feff}{\"name\":\"bom-test\",\"version\":\"1.2.3\",\"dependencies\":{}}",
+    )
+    .unwrap();
+
+    let output = run(tmp.path(), &["ls", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["name"], "bom-test");
+    assert_eq!(json["version"], "1.2.3");
+}
