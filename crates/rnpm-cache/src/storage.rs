@@ -446,7 +446,7 @@ impl Cache {
         }
 
         // Acquire lock and rename atomically
-        let _blob_lock = self.lock_blob(&sha512_hex)?;
+        let _blob_lock = self.lock_blob(sha512_hex)?;
         if target_path.exists() {
             if let Ok(existing_bytes) = fs::read(&target_path) {
                 let mut h = Sha512::new();

@@ -548,7 +548,7 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         );
     }
     if let Ok(npm_ci) = Command::new(npm_cmd)
-        .args(["ci", "--no-audit", "--no-fund"])
+        .args(["ci"])
         .current_dir(project_dir)
         .env("HOME", &iso_dir)
         .env("USERPROFILE", &iso_dir)
