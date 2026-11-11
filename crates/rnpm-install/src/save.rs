@@ -85,6 +85,42 @@ pub fn compute_save_spec(
     }
 }
 
+/// Re-expresses a root-relative `file:` save spec relative to a workspace
+/// member directory, matching npm, which saves local specs relative to the
+/// package.json they are written into. Non-file and absolute specs are
+/// returned unchanged.
+pub fn member_relative_file_spec(spec: &str, member_relative_path: &str) -> String {
+    let Some(path) = spec.strip_prefix("file:") else {
+        return spec.to_string();
+    };
+    let is_absolute = path.starts_with('/')
+        || path.starts_with('\\')
+        || path.as_bytes().get(1) == Some(&b':');
+    if is_absolute {
+        return spec.to_string();
+    }
+    let parts = |s: &str| -> Vec<String> {
+        s.split(['/', '\\'])
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(str::to_string)
+            .collect()
+    };
+    let target = parts(path);
+    let member = parts(member_relative_path);
+    let common = target
+        .iter()
+        .zip(member.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut rel: Vec<String> = vec!["..".to_string(); member.len() - common];
+    rel.extend(target[common..].iter().cloned());
+    if rel.is_empty() {
+        "file:.".to_string()
+    } else {
+        format!("file:{}", rel.join("/"))
+    }
+}
+
 /// Inserts a dependency into the appropriate section of a Manifest.
 pub fn insert_manifest_dep(
     m: &mut Manifest,

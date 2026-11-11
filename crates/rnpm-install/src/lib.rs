@@ -2086,10 +2086,14 @@ impl Installer {
                     );
                 }
                 for &idx in &targeted_workspace_indices {
+                    let member_spec = save::member_relative_file_spec(
+                        &final_spec,
+                        &workspace_members[idx].relative_path,
+                    );
                     save::insert_manifest_dep(
                         &mut workspace_members[idx].manifest,
                         &added.name,
-                        &final_spec,
+                        &member_spec,
                         self.options.save_dev,
                         self.options.save_optional,
                         self.options.save_peer,

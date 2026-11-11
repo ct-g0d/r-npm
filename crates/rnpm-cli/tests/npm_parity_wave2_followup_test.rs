@@ -333,3 +333,52 @@ fn pack_json_hook_banners_go_to_stderr_and_script_output_is_preserved() {
         "\n> fixture@1.0.0 prepack\n> node probe.cjs\n\n"
     );
 }
+
+#[test]
+fn install_json_routes_root_lifecycle_banner_to_stderr() {
+    let temp = tempdir().unwrap();
+    manifest(
+        temp.path(),
+        json!({"name":"root","version":"1.0.0","scripts":{"postinstall":"node -e \"\""}}),
+    );
+    let out = run(temp.path(), &["install", "--json"]);
+    success(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("> root@1.0.0 postinstall"),
+        "banner leaked into JSON stdout: {stdout}"
+    );
+    if !stdout.trim().is_empty() {
+        serde_json::from_str::<Value>(stdout.trim()).expect("stdout must be valid JSON");
+    }
+    assert!(
+        stderr.contains("> root@1.0.0 postinstall"),
+        "banner missing from stderr: {stderr}"
+    );
+}
+
+#[test]
+fn install_from_workspace_member_resolves_relative_spec_against_member_dir() {
+    let temp = tempdir().unwrap();
+    workspaces(temp.path());
+    let member = temp.path().join("packages").join("a");
+    manifest(
+        &member.join("vendor").join("dep"),
+        json!({"name":"dep","version":"1.0.0"}),
+    );
+    let out = run(&member, &["install", "./vendor/dep"]);
+    success(&out);
+    let saved: Value =
+        serde_json::from_slice(&fs::read(member.join("package.json")).unwrap()).unwrap();
+    let spec = saved["dependencies"]["dep"]
+        .as_str()
+        .unwrap_or_else(|| panic!("dep not saved to member manifest: {saved}"))
+        .replace('\\', "/");
+    // npm saves local specs relative to the member package.json.
+    assert_eq!(spec, "file:vendor/dep");
+    assert!(
+        !temp.path().join("vendor").exists(),
+        "spec was resolved against the workspace root"
+    );
+}

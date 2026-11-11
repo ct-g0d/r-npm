@@ -3308,6 +3308,43 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
     Ok(())
 }
 
+/// Rewrites a relative local package spec (`./x`, `../x.tgz`, `file:x`, or an
+/// existing relative path) to an absolute path anchored at `base`. Registry,
+/// git, URL, and absolute specs are returned unchanged.
+fn rebase_local_spec(spec: &str, base: &std::path::Path) -> String {
+    let (prefix, path_part) = match spec.strip_prefix("file:") {
+        Some(rest) => ("file:", rest),
+        None => ("", spec),
+    };
+    let looks_relative = path_part.starts_with("./")
+        || path_part.starts_with("../")
+        || path_part.starts_with(".\\")
+        || path_part.starts_with("..\\")
+        || path_part == "."
+        || path_part == "..";
+    let is_local = !prefix.is_empty() || looks_relative || {
+        let lower = path_part.to_ascii_lowercase();
+        (lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+            && !path_part.contains("://")
+    } || (!path_part.contains(':')
+        && !path_part.starts_with('@')
+        && base.join(path_part).is_dir()
+        && (path_part.contains('/') || path_part.contains('\\')));
+    let path = std::path::Path::new(path_part);
+    if !is_local || path_part.is_empty() || path.is_absolute() || path_part.starts_with("//") {
+        return spec.to_string();
+    }
+    format!("{prefix}{}", base.join(path).display())
+}
+
+/// Records `--json` in the process-wide CLI overrides so lifecycle output
+/// emitted outside this crate can route banners to stderr, as npm does.
+fn mark_json_mode() {
+    let mut overrides = rnpm_config::get_process_cli_overrides().unwrap_or_default();
+    overrides.insert("json".to_string(), "true".to_string());
+    rnpm_config::set_process_cli_overrides(overrides);
+}
+
 pub(crate) fn run_lifecycle_hook(
     package_dir: &std::path::Path,
     manifest: &Manifest,
@@ -4505,6 +4542,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
             json,
         } => {
+            if json {
+                mark_json_mode();
+            }
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
                 || config.get_bool("timing").unwrap_or(false)
@@ -4569,6 +4609,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 } else {
                     current_dir.clone()
                 }
+            };
+            // Relative local specs were typed relative to the invocation directory;
+            // keep them pointing there after switching to the workspace root.
+            let packages: Vec<String> = if target_dir != current_dir {
+                packages
+                    .into_iter()
+                    .map(|spec| rebase_local_spec(&spec, &current_dir))
+                    .collect()
+            } else {
+                packages
             };
 
             let effective_save_prefix = save_prefix
@@ -4729,6 +4779,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
             json,
         } => {
+            if json {
+                mark_json_mode();
+            }
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
                 || config.get_bool("timing").unwrap_or(false)
