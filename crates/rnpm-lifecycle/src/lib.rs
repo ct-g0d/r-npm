@@ -2247,7 +2247,15 @@ pub async fn execute_topological_with_abort(
                 let name = root_manifest.name.as_deref().unwrap_or("");
                 let id = root_manifest.version.as_ref().map(|v| format!("{name}@{v} "))
                     .unwrap_or_else(|| if name.is_empty() { String::new() } else { format!("{name} ") });
-                println!("\n> {id}{hook}\n> {script_cmd}\n");
+                // npm routes lifecycle banners to stderr in JSON mode so stdout stays parseable.
+                let json_mode = rnpm_config::get_process_cli_overrides()
+                    .and_then(|o| o.get("json").cloned())
+                    .is_some_and(|v| v != "false" && v != "0");
+                if json_mode {
+                    eprintln!("\n> {id}{hook}\n> {script_cmd}\n");
+                } else {
+                    println!("\n> {id}{hook}\n> {script_cmd}\n");
+                }
             }
             ctx.timeout = opts.timeout;
             ctx.sandbox_policy = opts.sandbox_policy.clone();
