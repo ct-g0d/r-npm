@@ -34,13 +34,17 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
         || config.as_ref().and_then(|c| c.get_bool("ignore-scripts")).unwrap_or(false);
     let effective_foreground = args.foreground_scripts
         || cli_overrides.as_ref().and_then(|o| o.get("foreground-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-        || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(false);
-    let is_silent = args.json
-        || cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
+        || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(true);
+    let is_silent = cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
         || config.as_ref().and_then(|c| c.get("loglevel")).map(|s| s == "silent").unwrap_or(false);
 
-    crate::run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent)?;
-    crate::run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent)?;
+    if !package_dir.join(".npmignore").is_file() && package_dir.join(".gitignore").is_file()
+        && config.as_ref().and_then(|c| c.get("loglevel")) != Some("silent") {
+        eprintln!("npm warn gitignore-fallback No .npmignore file found, using .gitignore for file exclusion. Consider creating a .npmignore file to explicitly control published files.");
+    }
+
+    crate::run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent, args.json)?;
+    crate::run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent, args.json)?;
 
     let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
         Ok(res) => res,
@@ -49,7 +53,7 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
         }
     };
 
-    crate::run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent)?;
+    crate::run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent, args.json)?;
 
     let dest_dir = args.pack_destination.unwrap_or_else(|| current_dir.clone());
     let final_tarball_path = dest_dir.join(&summary.filename);
@@ -86,55 +90,10 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
         println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else {
         if !is_silent {
-            print_pack_notices(&summary);
+            crate::print_pack_notices(&summary);
         }
         println!("{}", summary.filename);
     }
 
     Ok(())
-}
-
-fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
-    eprintln!("npm notice");
-    eprintln!("npm notice package: {}@{}", summary.name, summary.version);
-    eprintln!("npm notice Tarball Contents");
-    for file in &summary.files {
-        eprintln!(
-            "npm notice {} {}",
-            format_bytes(file.size, false),
-            file.path
-        );
-    }
-    if !summary.bundled.is_empty() {
-        eprintln!("npm notice Bundled Dependencies");
-        for b in &summary.bundled {
-            eprintln!("npm notice {b}");
-        }
-    }
-    eprintln!("npm notice Tarball Details");
-    eprintln!("npm notice name: {}", summary.name);
-    eprintln!("npm notice version: {}", summary.version);
-    eprintln!("npm notice filename: {}", summary.filename);
-    eprintln!(
-        "npm notice package size: {}",
-        format_bytes(summary.package_size, true)
-    );
-    eprintln!(
-        "npm notice unpacked size: {}",
-        format_bytes(summary.unpacked_size, true)
-    );
-    eprintln!("npm notice shasum: {}", summary.shasum);
-    eprintln!("npm notice integrity: {}", summary.integrity);
-    eprintln!("npm notice total files: {}", summary.entry_count);
-    eprintln!("npm notice");
-}
-
-fn format_bytes(bytes: u64, human: bool) -> String {
-    if !human || bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} kB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
 }

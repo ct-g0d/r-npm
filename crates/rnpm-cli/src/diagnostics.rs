@@ -113,6 +113,15 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     for cause in err.chain() {
         if let Some(solver_err) = cause.downcast_ref::<SolverError>() {
             match solver_err {
+                SolverError::UnresolvedDependency { name, spec, message }
+                    if message == "No matching version found satisfying constraint" => {
+                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
+                        .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
+                }
+                SolverError::UnresolvedDependency { message, .. }
+                    if message == "Package not found in metadata provider" => {
+                    return Diagnostic::new("E404", solver_err.to_string());
+                }
                 SolverError::PeerConflict { .. } => {
                     return Diagnostic::new("ERESOLVE", solver_err.to_string());
                 }
@@ -424,5 +433,27 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         Diagnostic::new("ENOENT", err_str)
     } else {
         Diagnostic::new("EUNKNOWN", err_str)
+    }
+}
+
+#[cfg(test)]
+mod wave2_tests {
+    use super::*;
+
+    #[test]
+    fn solver_metadata_errors_preserve_npm_error_codes() {
+        for (message, code) in [
+            ("No matching version found satisfying constraint", "ETARGET"),
+            ("Package not found in metadata provider", "E404"),
+        ] {
+            let error = anyhow::Error::from(SolverError::UnresolvedDependency {
+                name: "fixture".into(), spec: "999.0.0".into(), message: message.into(),
+            });
+            assert_eq!(classify_error(&error).code, code);
+        }
+        let error = anyhow::Error::from(SolverError::UnresolvedDependency {
+            name: "fixture".into(), spec: "999.0.0".into(), message: "network unavailable".into(),
+        });
+        assert_eq!(classify_error(&error).code, "EUNKNOWN");
     }
 }
