@@ -149,12 +149,14 @@ async fn test_cli_logout_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig_npm)
+        .env("USERCONFIG", &userconfig_npm)
         .env("npm_config_userconfig", &userconfig_npm)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig_npm)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -167,12 +169,14 @@ async fn test_cli_logout_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig_rnpm)
+        .env("USERCONFIG", &userconfig_rnpm)
         .env("npm_config_userconfig", &userconfig_rnpm)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig_rnpm)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -183,7 +187,15 @@ async fn test_cli_logout_parity() {
         .expect("rnpm logout failed");
 
     if let Ok(npm_out) = npm_logout {
-        assert_eq!(rnpm_logout.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_logout.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_logout.stdout),
+            String::from_utf8_lossy(&rnpm_logout.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_logout.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))
