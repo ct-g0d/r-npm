@@ -373,6 +373,13 @@ fn run_lifecycle_step(
         .insert("npm_old_version".to_string(), old_version.to_string());
     ctx.extra_env
         .insert("npm_new_version".to_string(), new_version.to_string());
+    if let Ok(cwd) = std::env::current_dir() {
+        ctx.extra_env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
+    }
+
+    if rnpm_config::Config::load(Some(project_dir))?.get("loglevel") != Some("silent") {
+        println!("\n> {script_name}\n> {script_cmd}\n");
+    }
 
     let status = execute_lifecycle_script(&ctx)?;
     if !status.success() {

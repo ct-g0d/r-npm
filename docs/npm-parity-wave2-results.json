@@ -1,0 +1,3731 @@
+{
+  "baseline": "b942b95",
+  "implementation": "7ab5097646791a2ed525811b7a4de035b1948f64",
+  "oracle": {
+    "npm": "11.20.0",
+    "node": "v26.13.0",
+    "platform": "Windows"
+  },
+  "method": "Sequential sibling TEMP fixtures; only temp paths and durations normalized; regular files compared with Buffer.equals, hashes retained as evidence. Error-surface criteria use exit and first error line; raw stderr hashes retain npm log footers.",
+  "scenarios": [
+    {
+      "name": "run-hooks",
+      "args": [
+        "run",
+        "x"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "run-ignore",
+      "args": [
+        "run",
+        "x",
+        "--ignore-scripts"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d414c25798976731a74ce500aab7217eb141aebed21d6eabd1680c128f9c87da",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d414c25798976731a74ce500aab7217eb141aebed21d6eabd1680c128f9c87da",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d414c25798976731a74ce500aab7217eb141aebed21d6eabd1680c128f9c87da",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d414c25798976731a74ce500aab7217eb141aebed21d6eabd1680c128f9c87da",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "run-foreground",
+      "args": [
+        "run",
+        "x",
+        "--foreground-scripts"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f2a12d4ee7e2674aa04736534962be03d33ca9f94450b8fdd9a265f6b498d695",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "run-failure",
+      "args": [
+        "run",
+        "x"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "4b27620556f494e13d850d73a8b4edd7317b2415cb7e7c890e159ec88e6b74ee",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "4b27620556f494e13d850d73a8b4edd7317b2415cb7e7c890e159ec88e6b74ee",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "4b27620556f494e13d850d73a8b4edd7317b2415cb7e7c890e159ec88e6b74ee",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "4b27620556f494e13d850d73a8b4edd7317b2415cb7e7c890e159ec88e6b74ee",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "install-failure",
+      "args": [
+        "install"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": [
+            "package-lock.json"
+          ]
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "60569cc9f03e493df75c044d6c2ca2c1280af86aac0adef37c30678bae855e0a",
+          "stderrSha256": "b8509127ccf5c2ab6546fcecfded8fea1fd8bbba87b07b7867347e7700eb59c5"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "package-lock.json",
+            "npm": "4af0f5c9c9f89247629eb12da08c2f0abc49fa27f1332a3066bd3830949302a5",
+            "rnpm": null
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": [
+            "package-lock.json"
+          ]
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "60569cc9f03e493df75c044d6c2ca2c1280af86aac0adef37c30678bae855e0a",
+          "stderrSha256": "0e1a4c61835c07f24bdd693924f179413b9cad3503d116d6566dc778f3e9fa3c"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "60569cc9f03e493df75c044d6c2ca2c1280af86aac0adef37c30678bae855e0a",
+          "stderrSha256": "ec1089773c0f60f912db0e9872bb1e5a3f2963e9dcfb592c824c317a43fef1af"
+        },
+        "differentFiles": [
+          {
+            "path": "package-lock.json",
+            "npm": "4af0f5c9c9f89247629eb12da08c2f0abc49fa27f1332a3066bd3830949302a5",
+            "rnpm": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "pack-failure",
+      "args": [
+        "pack",
+        "--dry-run"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "e1cb32f609666192e61bc79f8d2a9285e057a6c59c5b2469eb903f6bc434a484",
+          "stderrSha256": "c4f776a9fda2b717c6b2c6411a51871118c7c9e1fb2294cfd2787b3e14eff9fe"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": null,
+          "stdoutSha256": "e1cb32f609666192e61bc79f8d2a9285e057a6c59c5b2469eb903f6bc434a484",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "e1cb32f609666192e61bc79f8d2a9285e057a6c59c5b2469eb903f6bc434a484",
+          "stderrSha256": "b092d709813fdeee46cdd11a0ea3a4546d14e087b87e20171e835fc4a7c515e6"
+        },
+        "rnpm": {
+          "code": 7,
+          "firstErrorLine": "npm error code 7",
+          "stdoutSha256": "e1cb32f609666192e61bc79f8d2a9285e057a6c59c5b2469eb903f6bc434a484",
+          "stderrSha256": "02d542cbfb22ba03caf7c6bfb8f81c648e1cbbd979e6dfe8609733629f20b177"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "run-env",
+      "args": [
+        "run",
+        "x",
+        "--ignore-scripts",
+        "--custom=hello"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "79688dd993af4e14822735bad1133b3c664b3d8c40743d6d2e9c9898cbfa7534",
+          "stderrSha256": "1f3743eb4e3e93d4c14ab95492cd22d28dd0392d37fff7b47da59c6439ea44c6"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "be01171086f60ab297f2733e3365bb204e0b0647b5bae8577bb6dccf93147c36",
+          "stderrSha256": "1f3743eb4e3e93d4c14ab95492cd22d28dd0392d37fff7b47da59c6439ea44c6"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "79688dd993af4e14822735bad1133b3c664b3d8c40743d6d2e9c9898cbfa7534",
+          "stderrSha256": "1f3743eb4e3e93d4c14ab95492cd22d28dd0392d37fff7b47da59c6439ea44c6"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "79688dd993af4e14822735bad1133b3c664b3d8c40743d6d2e9c9898cbfa7534",
+          "stderrSha256": "1f3743eb4e3e93d4c14ab95492cd22d28dd0392d37fff7b47da59c6439ea44c6"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "run-env-foreground",
+      "args": [
+        "run",
+        "x",
+        "--foreground-scripts"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8a937e13cee04244ad5a40d45406e5c80abf142dca556340705cb697f730414a",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "7b31c9b67943e3dd082338f1ebc7b60e70db633a11aa03084525ab4d297b4ba1",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8a937e13cee04244ad5a40d45406e5c80abf142dca556340705cb697f730414a",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8a937e13cee04244ad5a40d45406e5c80abf142dca556340705cb697f730414a",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "install-hooks",
+      "args": [
+        "install"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "75c794b71afaea0d200755dd80fc139a383fed1884de0d97b24631cff017b243",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "install-ignore",
+      "args": [
+        "install",
+        "--ignore-scripts"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a1d69aaeb94125b5bb7f566fa4f30215ae1657d806fc88755c6774e079ea88c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a1d69aaeb94125b5bb7f566fa4f30215ae1657d806fc88755c6774e079ea88c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a1d69aaeb94125b5bb7f566fa4f30215ae1657d806fc88755c6774e079ea88c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a1d69aaeb94125b5bb7f566fa4f30215ae1657d806fc88755c6774e079ea88c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "install-foreground",
+      "args": [
+        "install",
+        "--foreground-scripts"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "75c794b71afaea0d200755dd80fc139a383fed1884de0d97b24631cff017b243",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ci-hooks",
+      "args": [
+        "ci"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "75c794b71afaea0d200755dd80fc139a383fed1884de0d97b24631cff017b243",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "655ae61a7a7ea3b6accf763e93dfd3318e88f8bdf6e32d34f86059072c37f74c",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-hooks",
+      "args": [
+        "pack",
+        "--dry-run"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "ed2df291933e1096395e472368a83bacf5cdb31ca606f12c1f69de0126c5571a",
+          "stderrSha256": "c165b23df513a1e82259476ba5dfb4e9967599b36e0b9291a968bd497d65802a"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "ed2df291933e1096395e472368a83bacf5cdb31ca606f12c1f69de0126c5571a",
+          "stderrSha256": "b70c34e69926bb1ce6a2fcf681cdf5eb891f131bce9efb879013e397e187e477"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "ed2df291933e1096395e472368a83bacf5cdb31ca606f12c1f69de0126c5571a",
+          "stderrSha256": "c165b23df513a1e82259476ba5dfb4e9967599b36e0b9291a968bd497d65802a"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "ed2df291933e1096395e472368a83bacf5cdb31ca606f12c1f69de0126c5571a",
+          "stderrSha256": "3007a4edfd82ee57e8a24e6acbe5de866a3696c4f28a50a2a756785aa228cbfb"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-ignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--ignore-scripts"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9cf29cf38207584fac7597db50a1e7e210f3375248ec98179f7ee427751c514a",
+          "stderrSha256": "5003ca74332d2f5af677feffbc5a6ca8334637717716f492cc94f61e1d2f3539"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9cf29cf38207584fac7597db50a1e7e210f3375248ec98179f7ee427751c514a",
+          "stderrSha256": "708123cc50624b204f5e6495a316bb64d5118459e3ee73dc26a6fa7be391e349"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9cf29cf38207584fac7597db50a1e7e210f3375248ec98179f7ee427751c514a",
+          "stderrSha256": "5003ca74332d2f5af677feffbc5a6ca8334637717716f492cc94f61e1d2f3539"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9cf29cf38207584fac7597db50a1e7e210f3375248ec98179f7ee427751c514a",
+          "stderrSha256": "27c8610beb2fa82724abe514779c11533f2efd0f24f3b28c432d98d874ace3be"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-silent",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--silent"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "5d03f6e6ec6302575767d1012bbfc76dc2d25dca672829f9f79c92a15c4a6dc0",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9cf29cf38207584fac7597db50a1e7e210f3375248ec98179f7ee427751c514a",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "5d03f6e6ec6302575767d1012bbfc76dc2d25dca672829f9f79c92a15c4a6dc0",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "5d03f6e6ec6302575767d1012bbfc76dc2d25dca672829f9f79c92a15c4a6dc0",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-json-hooks",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9ade63675b6ad80b81f447c4b6c366353753784e72810fa19454832e7e1dbb79",
+          "stderrSha256": "eab39d2710c4c4d4740eebd7cf07a210a1ffca97eb479f325dcff53101082944",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 379,
+            "unpackedSize": 740,
+            "shasum": "4de2658e16c9ea93f87952db95f5e10df585232e",
+            "integrity": "sha512-DOS0QQ05S0iWzC87CXRONGXBWSYWo0OdH9tk2ndrgoQh9upTVU4Ku3VoZcEEGvrqUHU5o/zIU5W52WEZwScsIw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "events.txt",
+                "size": 16,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 598,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "80c80f862a63c729635ebb5da3f51f969686193abe44743a8dc0a639ade839e1",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 385,
+            "unpackedSize": 740,
+            "shasum": "c77d7432018304816e6047417d0a795804ccb752",
+            "integrity": "sha512-FSC5l1R2EHfIrxAEWDVrK3OdBPf//H1/eZqsQHdRjsFj+9i0emMNtQRA9f+MiTnicWuZLaf8NaRJf64uEB+9Qw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "events.txt",
+                "size": 16,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 598,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "9ade63675b6ad80b81f447c4b6c366353753784e72810fa19454832e7e1dbb79",
+          "stderrSha256": "eab39d2710c4c4d4740eebd7cf07a210a1ffca97eb479f325dcff53101082944",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 379,
+            "unpackedSize": 740,
+            "shasum": "4de2658e16c9ea93f87952db95f5e10df585232e",
+            "integrity": "sha512-DOS0QQ05S0iWzC87CXRONGXBWSYWo0OdH9tk2ndrgoQh9upTVU4Ku3VoZcEEGvrqUHU5o/zIU5W52WEZwScsIw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "events.txt",
+                "size": 16,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 598,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "5ca543af177fd1cb4d81ea95e93197d942293ea7d71876d5e8d6fdfd15be9452",
+          "stderrSha256": "eab39d2710c4c4d4740eebd7cf07a210a1ffca97eb479f325dcff53101082944",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 385,
+            "unpackedSize": 740,
+            "shasum": "c77d7432018304816e6047417d0a795804ccb752",
+            "integrity": "sha512-FSC5l1R2EHfIrxAEWDVrK3OdBPf//H1/eZqsQHdRjsFj+9i0emMNtQRA9f+MiTnicWuZLaf8NaRJf64uEB+9Qw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "events.txt",
+                "size": 16,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 598,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "version-hooks",
+      "args": [
+        "version",
+        "patch",
+        "--no-git-tag-version"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "7f957a3356701fbb1ac73f6a2f7ba257405cfdc47fd9583525fc1028bcfd7966",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d72c272b0f62d4ac2ca8f97655ec1584bb2fb300ec54919c4e252c1fafb257f6",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "7f957a3356701fbb1ac73f6a2f7ba257405cfdc47fd9583525fc1028bcfd7966",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "7f957a3356701fbb1ac73f6a2f7ba257405cfdc47fd9583525fc1028bcfd7966",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-run",
+      "args": [
+        "run",
+        "x",
+        "-ws"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "92627552b5275ec0ab091e42161a994ec3342cf0ab196d92427a3ca2b4388794",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "dd0c06955164048947ed8b1cbb44775fba7a26130ed5361e6bb67a08a8af348a",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "92627552b5275ec0ab091e42161a994ec3342cf0ab196d92427a3ca2b4388794",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "92627552b5275ec0ab091e42161a994ec3342cf0ab196d92427a3ca2b4388794",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-select",
+      "args": [
+        "run",
+        "x",
+        "-w",
+        "a"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d0e543a67238802507254e93be301abc4569f56ce66b53a74ca38d04ef8fe072",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d0e543a67238802507254e93be301abc4569f56ce66b53a74ca38d04ef8fe072",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d0e543a67238802507254e93be301abc4569f56ce66b53a74ca38d04ef8fe072",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d0e543a67238802507254e93be301abc4569f56ce66b53a74ca38d04ef8fe072",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-root",
+      "args": [
+        "run",
+        "x",
+        "-ws",
+        "--include-workspace-root"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a2d0325758bc270a215fbbcea3f30066f6e4bd4494c87adc07b009f85d74a02",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "d4757661fb777e4117a97b4c33cac93b224141994078bdcebd10d39c459c0284",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a2d0325758bc270a215fbbcea3f30066f6e4bd4494c87adc07b009f85d74a02",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3a2d0325758bc270a215fbbcea3f30066f6e4bd4494c87adc07b009f85d74a02",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-ignore",
+      "args": [
+        "run",
+        "x",
+        "-ws",
+        "--ignore-scripts"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "a71ecc1e4f94c613a6007c2a95c0fb726b4226650334ba4fa4d826836f557e0d",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8267b87b9218a25a040e4fafd82b5a5433963a2690a89c45bc1f20c9371d1d06",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "a71ecc1e4f94c613a6007c2a95c0fb726b4226650334ba4fa4d826836f557e0d",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "a71ecc1e4f94c613a6007c2a95c0fb726b4226650334ba4fa4d826836f557e0d",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-missing",
+      "args": [
+        "run",
+        "absent",
+        "-ws"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error Lifecycle script `absent` failed with error:",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "5cfa6c45e97b5970324cbd08df4f87aad21f940b2091e5fd9d81241f78c3aab8"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error Lifecycle script `absent` failed with error:",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "50e8642932645bc6161c5aab56f6fc9d48fa9be950e4b24125de22a59928b837"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error Lifecycle script `absent` failed with error:",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "5cfa6c45e97b5970324cbd08df4f87aad21f940b2091e5fd9d81241f78c3aab8"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error Lifecycle script `absent` failed with error:",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "5cfa6c45e97b5970324cbd08df4f87aad21f940b2091e5fd9d81241f78c3aab8"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-if-present",
+      "args": [
+        "run",
+        "absent",
+        "-ws",
+        "--if-present"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-exec",
+      "args": [
+        "exec",
+        "-ws",
+        "--call=node probe.cjs"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": [
+            "packages/a/events.txt",
+            "packages/b/events.txt"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "88bcbbb46efb91659b8afe0d01a078c47daf5eda55b2007002cf8a4215c32e2e",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "b7c84d1113e542cc66b5008b53ed3decb69feaf4f99198e1f33856e152faa7d6",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "packages/a/events.txt",
+            "npm": "911039551d14079cc4d45ee1580094bfb09cb714c1c842467c18ae3523a804a7",
+            "rnpm": "472df7efe735cdadef5a6a25ffaee398cbf49d418d82330cd857dea648f09550"
+          },
+          {
+            "path": "packages/b/events.txt",
+            "npm": "911039551d14079cc4d45ee1580094bfb09cb714c1c842467c18ae3523a804a7",
+            "rnpm": "472df7efe735cdadef5a6a25ffaee398cbf49d418d82330cd857dea648f09550"
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "88bcbbb46efb91659b8afe0d01a078c47daf5eda55b2007002cf8a4215c32e2e",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "88bcbbb46efb91659b8afe0d01a078c47daf5eda55b2007002cf8a4215c32e2e",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-version",
+      "args": [
+        "version",
+        "patch",
+        "-ws",
+        "--no-git-tag-version"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": [
+            "node_modules/.package-lock.json",
+            "node_modules/a",
+            "node_modules/b",
+            "package-lock.json",
+            "packages/a/events.txt",
+            "packages/a/node_modules/b/.npmignore",
+            "packages/a/node_modules/b/.travis.yml",
+            "packages/a/node_modules/b/examples/index.js",
+            "packages/a/node_modules/b/History.md",
+            "packages/a/node_modules/b/lib/b.js",
+            "packages/a/node_modules/b/lib/benchmark.js",
+            "packages/a/node_modules/b/lib/reporter.js",
+            "packages/a/node_modules/b/Makefile",
+            "packages/a/node_modules/b/package.json",
+            "packages/a/node_modules/b/Readme.md",
+            "packages/a/node_modules/b/test/b.test.js",
+            "packages/a/node_modules/b/test/benchmark.test.js",
+            "packages/a/node_modules/b/test/reporter.test.js",
+            "packages/a/node_modules/b/test/support/fake_stream.js",
+            "packages/a/node_modules/b/test/support/test_reporter.js",
+            "packages/b/events.txt"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "398a04732d16c887397a4e1916019fbe0235f5b6563001f7dcfbdfc389d10b42",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f0665cee0920836dc2fdee4ff3a351433430734cf6c7d1e241ea17b2b2405d16",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "node_modules/.package-lock.json",
+            "npm": "7d7ae727e19db5312406e0142e7aaa1826da15a0112d92c3c3a44192b4a3084c",
+            "rnpm": null
+          },
+          {
+            "path": "node_modules/a",
+            "npm": "link:<fixture>\\packages\\a",
+            "rnpm": null
+          },
+          {
+            "path": "node_modules/b",
+            "npm": "link:<fixture>\\packages\\b",
+            "rnpm": null
+          },
+          {
+            "path": "package-lock.json",
+            "npm": "4c27d180c62441f195cb5235b3635b4d9c46cc7a0eb1c69c83b0961153afc68b",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/events.txt",
+            "npm": "e5580d48c583ee115ef385ae2d8bd7e2448b2ed386f0ef2abde9ad4e42ae0706",
+            "rnpm": "078e97aff3a22559f219bfc0a5061babb9b0949c1d1090688d565344fe86e4bd"
+          },
+          {
+            "path": "packages/a/node_modules/b/.npmignore",
+            "npm": "53532afe0454d2c19698af0c2272d7990047b8f807d9ce27ff802221af6e00af",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/.travis.yml",
+            "npm": "caf9f72861f3d70817e7c2992cae4cc235e4f111c6b6fb06801be7ac5a520f06",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/examples/index.js",
+            "npm": "09e70438e652e5f5a8c2cb96387247962edd833854bd5f7ac44bdfdebe625e68",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/History.md",
+            "npm": "46369eac1cff0b72f403c363b1ede6066af1fafd92726e7020db1d659cac208a",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/b.js",
+            "npm": "40ce88f4b0c425da386d08e97d97d0da8a75a46a2a381ecbe5fd922aa77e9892",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/benchmark.js",
+            "npm": "be714c648a68caaf2aa1189ea3d0a4a1ab1422529948a29665a3911b300238de",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/reporter.js",
+            "npm": "6a1e922d71a2848efed1d4bc5f2eef7013da52b5f47be5712fd8329ee6e16e30",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/Makefile",
+            "npm": "8ea896b598f6361df48c543499a7bc2d79a3d37945c88a8eaa67711eb8250db4",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/package.json",
+            "npm": "0a8111d4604527809c61845e886fff04ff5dbacc0e3353d4487d2f6764993920",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/Readme.md",
+            "npm": "48427125260f0ece2f5aa66c79d775cd9784c4b2e550b0da95e76d7f7886913b",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/test/b.test.js",
+            "npm": "62dabe13c085f9daab2b12f59ed27eaa8bf5b7a932f867a88a25348c1cd742a2",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/test/benchmark.test.js",
+            "npm": "c8544f595f20886639a0d653a7b844c318764bcad32712fa04fc3ef31854f8e9",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/test/reporter.test.js",
+            "npm": "997452b6edad24087b6f4802ee65b2bd6a1739f43f3b671bac068bd00f1d3d1c",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/test/support/fake_stream.js",
+            "npm": "47da72c2081c07c8343ac0e829628fbe343bc9cd658e088f44b10db1d93ac5e5",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/b/test/support/test_reporter.js",
+            "npm": "e14e75f8dcf6bc4c1bb8c72b1052e2562b9c0cfcf0ee1f72f61a3db2f3442287",
+            "rnpm": null
+          },
+          {
+            "path": "packages/b/events.txt",
+            "npm": "e5580d48c583ee115ef385ae2d8bd7e2448b2ed386f0ef2abde9ad4e42ae0706",
+            "rnpm": "078e97aff3a22559f219bfc0a5061babb9b0949c1d1090688d565344fe86e4bd"
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": [
+            "node_modules/.package-lock.json",
+            "package-lock.json",
+            "packages/a/events.txt",
+            "packages/b/events.txt"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "398a04732d16c887397a4e1916019fbe0235f5b6563001f7dcfbdfc389d10b42",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "398a04732d16c887397a4e1916019fbe0235f5b6563001f7dcfbdfc389d10b42",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": [
+          {
+            "path": "node_modules/.package-lock.json",
+            "npm": "7d7ae727e19db5312406e0142e7aaa1826da15a0112d92c3c3a44192b4a3084c",
+            "rnpm": "db9fbdd7d20716b9d1392a822d915f8cf691a8e0660ad405916e27536cb11fe3"
+          },
+          {
+            "path": "package-lock.json",
+            "npm": "4c27d180c62441f195cb5235b3635b4d9c46cc7a0eb1c69c83b0961153afc68b",
+            "rnpm": "3166b215343bdc7e47c0854a21659f4fe204efcb04522d7e3faa7a45b7081fe7"
+          },
+          {
+            "path": "packages/a/events.txt",
+            "npm": "e5580d48c583ee115ef385ae2d8bd7e2448b2ed386f0ef2abde9ad4e42ae0706",
+            "rnpm": "078e97aff3a22559f219bfc0a5061babb9b0949c1d1090688d565344fe86e4bd"
+          },
+          {
+            "path": "packages/b/events.txt",
+            "npm": "e5580d48c583ee115ef385ae2d8bd7e2448b2ed386f0ef2abde9ad4e42ae0706",
+            "rnpm": "078e97aff3a22559f219bfc0a5061babb9b0949c1d1090688d565344fe86e4bd"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ws-ls",
+      "args": [
+        "ls",
+        "-ws"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e6747b936ed29065b6e99ed6eaa57a6904629162b3aed4c24a069ea6d2d9dea3",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "ade30bf2246dded1bf675cafcd6abc6f0f2c8d71b4e9299ddd405db70befd405",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e6747b936ed29065b6e99ed6eaa57a6904629162b3aed4c24a069ea6d2d9dea3",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "e6747b936ed29065b6e99ed6eaa57a6904629162b3aed4c24a069ea6d2d9dea3",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-preonly",
+      "args": [
+        "run",
+        "x",
+        "-ws",
+        "--if-present"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6608856f20979cd85aec2b4e4ca872b18a80a99923e31f231ae1b8cbe1feed4f",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6608856f20979cd85aec2b4e4ca872b18a80a99923e31f231ae1b8cbe1feed4f",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6608856f20979cd85aec2b4e4ca872b18a80a99923e31f231ae1b8cbe1feed4f",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6608856f20979cd85aec2b4e4ca872b18a80a99923e31f231ae1b8cbe1feed4f",
+          "stderrSha256": "683b79389ab5c01dd5c2fd75de7b26b82071e29e1bca8070e0c9f798f0e64e47"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "ws-install-subdir",
+      "args": [
+        "install",
+        "--ignore-scripts"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": [
+            "node_modules/.package-lock.json",
+            "node_modules/a",
+            "node_modules/b",
+            "package-lock.json",
+            "packages/a/node_modules/.package-lock.json",
+            "packages/a/node_modules/b/.npmignore",
+            "packages/a/node_modules/b/.travis.yml",
+            "packages/a/node_modules/b/examples/index.js",
+            "packages/a/node_modules/b/History.md",
+            "packages/a/node_modules/b/lib/b.js",
+            "packages/a/node_modules/b/lib/benchmark.js",
+            "packages/a/node_modules/b/lib/reporter.js",
+            "packages/a/node_modules/b/Makefile",
+            "packages/a/node_modules/b/package.json",
+            "packages/a/node_modules/b/Readme.md",
+            "packages/a/node_modules/b/test/b.test.js",
+            "packages/a/node_modules/b/test/benchmark.test.js",
+            "packages/a/node_modules/b/test/reporter.test.js",
+            "packages/a/node_modules/b/test/support/fake_stream.js",
+            "packages/a/node_modules/b/test/support/test_reporter.js",
+            "packages/a/package-lock.json"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "c45991f2e32caced7616fae9063471920cee849556206375e9af4835df9b5809",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "92da2ba484a4cda34867fe9bb7e9f4db069682dfe2eda1e678102249b6650bdb",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "node_modules/.package-lock.json",
+            "npm": "f2f17146729b3b2e8a57d99979c38a782daeb4b6a1972ef814d37fcfca9e3bf3",
+            "rnpm": null
+          },
+          {
+            "path": "node_modules/a",
+            "npm": "link:<fixture>\\packages\\a",
+            "rnpm": null
+          },
+          {
+            "path": "node_modules/b",
+            "npm": "link:<fixture>\\packages\\b",
+            "rnpm": null
+          },
+          {
+            "path": "package-lock.json",
+            "npm": "2ed3100d06ed60ea1333f209e056f3b6ea7e592219824773e1d4ddc39bc56d2e",
+            "rnpm": null
+          },
+          {
+            "path": "packages/a/node_modules/.package-lock.json",
+            "npm": null,
+            "rnpm": "fe177ae76938e0eadc13cc3c72da8062d8ed40f2c6136c30a498c10f84e1ca45"
+          },
+          {
+            "path": "packages/a/node_modules/b/.npmignore",
+            "npm": null,
+            "rnpm": "53532afe0454d2c19698af0c2272d7990047b8f807d9ce27ff802221af6e00af"
+          },
+          {
+            "path": "packages/a/node_modules/b/.travis.yml",
+            "npm": null,
+            "rnpm": "caf9f72861f3d70817e7c2992cae4cc235e4f111c6b6fb06801be7ac5a520f06"
+          },
+          {
+            "path": "packages/a/node_modules/b/examples/index.js",
+            "npm": null,
+            "rnpm": "09e70438e652e5f5a8c2cb96387247962edd833854bd5f7ac44bdfdebe625e68"
+          },
+          {
+            "path": "packages/a/node_modules/b/History.md",
+            "npm": null,
+            "rnpm": "46369eac1cff0b72f403c363b1ede6066af1fafd92726e7020db1d659cac208a"
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/b.js",
+            "npm": null,
+            "rnpm": "40ce88f4b0c425da386d08e97d97d0da8a75a46a2a381ecbe5fd922aa77e9892"
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/benchmark.js",
+            "npm": null,
+            "rnpm": "be714c648a68caaf2aa1189ea3d0a4a1ab1422529948a29665a3911b300238de"
+          },
+          {
+            "path": "packages/a/node_modules/b/lib/reporter.js",
+            "npm": null,
+            "rnpm": "6a1e922d71a2848efed1d4bc5f2eef7013da52b5f47be5712fd8329ee6e16e30"
+          },
+          {
+            "path": "packages/a/node_modules/b/Makefile",
+            "npm": null,
+            "rnpm": "8ea896b598f6361df48c543499a7bc2d79a3d37945c88a8eaa67711eb8250db4"
+          },
+          {
+            "path": "packages/a/node_modules/b/package.json",
+            "npm": null,
+            "rnpm": "0a8111d4604527809c61845e886fff04ff5dbacc0e3353d4487d2f6764993920"
+          },
+          {
+            "path": "packages/a/node_modules/b/Readme.md",
+            "npm": null,
+            "rnpm": "48427125260f0ece2f5aa66c79d775cd9784c4b2e550b0da95e76d7f7886913b"
+          },
+          {
+            "path": "packages/a/node_modules/b/test/b.test.js",
+            "npm": null,
+            "rnpm": "62dabe13c085f9daab2b12f59ed27eaa8bf5b7a932f867a88a25348c1cd742a2"
+          },
+          {
+            "path": "packages/a/node_modules/b/test/benchmark.test.js",
+            "npm": null,
+            "rnpm": "c8544f595f20886639a0d653a7b844c318764bcad32712fa04fc3ef31854f8e9"
+          },
+          {
+            "path": "packages/a/node_modules/b/test/reporter.test.js",
+            "npm": null,
+            "rnpm": "997452b6edad24087b6f4802ee65b2bd6a1739f43f3b671bac068bd00f1d3d1c"
+          },
+          {
+            "path": "packages/a/node_modules/b/test/support/fake_stream.js",
+            "npm": null,
+            "rnpm": "47da72c2081c07c8343ac0e829628fbe343bc9cd658e088f44b10db1d93ac5e5"
+          },
+          {
+            "path": "packages/a/node_modules/b/test/support/test_reporter.js",
+            "npm": null,
+            "rnpm": "e14e75f8dcf6bc4c1bb8c72b1052e2562b9c0cfcf0ee1f72f61a3db2f3442287"
+          },
+          {
+            "path": "packages/a/package-lock.json",
+            "npm": null,
+            "rnpm": "7b42611bf5fd5e648f5c5dc901020406d4c13640662c7d40be1aa875278c3653"
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": [
+            "node_modules/.package-lock.json",
+            "package-lock.json"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "c45991f2e32caced7616fae9063471920cee849556206375e9af4835df9b5809",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "c45991f2e32caced7616fae9063471920cee849556206375e9af4835df9b5809",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "node_modules/.package-lock.json",
+            "npm": "f2f17146729b3b2e8a57d99979c38a782daeb4b6a1972ef814d37fcfca9e3bf3",
+            "rnpm": "ec0b00e5c843fd89906a4a79608a2a017ea7bddb6e6aff8ecfc70f13d2b1f1b5"
+          },
+          {
+            "path": "package-lock.json",
+            "npm": "2ed3100d06ed60ea1333f209e056f3b6ea7e592219824773e1d4ddc39bc56d2e",
+            "rnpm": "95d65784c7290007ce64d1809f566ae8b145dcf387f040381a753c367a50ecc6"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pack-files",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fc36e4a98c13abd8ea82b13d114ce210407fb3332bfc49d51d4a51fbf8641799",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 259,
+            "unpackedSize": 128,
+            "shasum": "8eff9bb1201e01eb4699bdcf223c836250e912ea",
+            "integrity": "sha512-d583yg/5zm6ERQLTlSAXsHW+z6l2gVf3WQCbGFMzEP2ppn/QSSBaiOruxWU5xqHh+4AkY18EOH6BeCBY9gEJuw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "af1cff132249552055f75a4065c6956e16d1696d136de82d45c2e05d90226ae1",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 273,
+            "unpackedSize": 128,
+            "shasum": "606814f8c0b438b6bec385a2e3c6765302200f12",
+            "integrity": "sha512-m3ufGv1iFaHtqwhekvNYrCgKAgCTpQpTKVjDBWtvzcgiNohWT5cZ5qNi5SIWBNPcCamTONq3gyRmgfWirdAvqw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fc36e4a98c13abd8ea82b13d114ce210407fb3332bfc49d51d4a51fbf8641799",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 259,
+            "unpackedSize": 128,
+            "shasum": "8eff9bb1201e01eb4699bdcf223c836250e912ea",
+            "integrity": "sha512-d583yg/5zm6ERQLTlSAXsHW+z6l2gVf3WQCbGFMzEP2ppn/QSSBaiOruxWU5xqHh+4AkY18EOH6BeCBY9gEJuw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "af1cff132249552055f75a4065c6956e16d1696d136de82d45c2e05d90226ae1",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 273,
+            "unpackedSize": 128,
+            "shasum": "606814f8c0b438b6bec385a2e3c6765302200f12",
+            "integrity": "sha512-m3ufGv1iFaHtqwhekvNYrCgKAgCTpQpTKVjDBWtvzcgiNohWT5cZ5qNi5SIWBNPcCamTONq3gyRmgfWirdAvqw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-npmignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "1fe94689c20832ec0c561be133ace2245a6f06ab76d36fcac4b23167220e2e93",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 342,
+            "unpackedSize": 222,
+            "shasum": "18ca2ca7b367068cf0cea77a120daf28de344640",
+            "integrity": "sha512-bRk5bA0LSVP340AevQ5D5974xSpKRiFN+wEaUe4ex9Iun/fn2H5hJhQKYFG3s09vnlgFQ5hIBvgnb9sOwFGIbA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f66638f4fc09a7dab8759c3dbef8958b2e2093b621174bc166095dbd7591dea2",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 357,
+            "unpackedSize": 222,
+            "shasum": "ffa74ed8c200423afa8d26d72e3245b041529f22",
+            "integrity": "sha512-0BmN4BJNimbwYZUlWy9s6Be/XqeBiJnlFk4dXZzk02DehDcZWtIzxpIdzGd13NnbKfd1vmnaV1fvQAL7F9FdDQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "1fe94689c20832ec0c561be133ace2245a6f06ab76d36fcac4b23167220e2e93",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 342,
+            "unpackedSize": 222,
+            "shasum": "18ca2ca7b367068cf0cea77a120daf28de344640",
+            "integrity": "sha512-bRk5bA0LSVP340AevQ5D5974xSpKRiFN+wEaUe4ex9Iun/fn2H5hJhQKYFG3s09vnlgFQ5hIBvgnb9sOwFGIbA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f66638f4fc09a7dab8759c3dbef8958b2e2093b621174bc166095dbd7591dea2",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 357,
+            "unpackedSize": 222,
+            "shasum": "ffa74ed8c200423afa8d26d72e3245b041529f22",
+            "integrity": "sha512-0BmN4BJNimbwYZUlWy9s6Be/XqeBiJnlFk4dXZzk02DehDcZWtIzxpIdzGd13NnbKfd1vmnaV1fvQAL7F9FdDQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-gitignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "1fe94689c20832ec0c561be133ace2245a6f06ab76d36fcac4b23167220e2e93",
+          "stderrSha256": "b57caa295919b31f9ae5073e204bb579f2407a75888d109e94a9c5cc64fe39fb",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 342,
+            "unpackedSize": 222,
+            "shasum": "18ca2ca7b367068cf0cea77a120daf28de344640",
+            "integrity": "sha512-bRk5bA0LSVP340AevQ5D5974xSpKRiFN+wEaUe4ex9Iun/fn2H5hJhQKYFG3s09vnlgFQ5hIBvgnb9sOwFGIbA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f66638f4fc09a7dab8759c3dbef8958b2e2093b621174bc166095dbd7591dea2",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 357,
+            "unpackedSize": 222,
+            "shasum": "ffa74ed8c200423afa8d26d72e3245b041529f22",
+            "integrity": "sha512-0BmN4BJNimbwYZUlWy9s6Be/XqeBiJnlFk4dXZzk02DehDcZWtIzxpIdzGd13NnbKfd1vmnaV1fvQAL7F9FdDQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "1fe94689c20832ec0c561be133ace2245a6f06ab76d36fcac4b23167220e2e93",
+          "stderrSha256": "b57caa295919b31f9ae5073e204bb579f2407a75888d109e94a9c5cc64fe39fb",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 342,
+            "unpackedSize": 222,
+            "shasum": "18ca2ca7b367068cf0cea77a120daf28de344640",
+            "integrity": "sha512-bRk5bA0LSVP340AevQ5D5974xSpKRiFN+wEaUe4ex9Iun/fn2H5hJhQKYFG3s09vnlgFQ5hIBvgnb9sOwFGIbA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f66638f4fc09a7dab8759c3dbef8958b2e2093b621174bc166095dbd7591dea2",
+          "stderrSha256": "b57caa295919b31f9ae5073e204bb579f2407a75888d109e94a9c5cc64fe39fb",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 357,
+            "unpackedSize": 222,
+            "shasum": "ffa74ed8c200423afa8d26d72e3245b041529f22",
+            "integrity": "sha512-0BmN4BJNimbwYZUlWy9s6Be/XqeBiJnlFk4dXZzk02DehDcZWtIzxpIdzGd13NnbKfd1vmnaV1fvQAL7F9FdDQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-files-ignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fc36e4a98c13abd8ea82b13d114ce210407fb3332bfc49d51d4a51fbf8641799",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 259,
+            "unpackedSize": 128,
+            "shasum": "8eff9bb1201e01eb4699bdcf223c836250e912ea",
+            "integrity": "sha512-d583yg/5zm6ERQLTlSAXsHW+z6l2gVf3WQCbGFMzEP2ppn/QSSBaiOruxWU5xqHh+4AkY18EOH6BeCBY9gEJuw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8746f82046754d62b4324e4801b89af7e8ebed3e23f73035a14c6bce7e234811",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 246,
+            "unpackedSize": 120,
+            "shasum": "1feae10f23d7b74e720cb47a928ec76466c7f2a2",
+            "integrity": "sha512-TBuUJOO3Rd+uCNXV05u7aIcJ1pJ9bV2k6Vir/AMd+2z4cPDosxIVsQRUm4TQaUH/70lB/868N6yqq3YCGsItzg==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fc36e4a98c13abd8ea82b13d114ce210407fb3332bfc49d51d4a51fbf8641799",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 259,
+            "unpackedSize": 128,
+            "shasum": "8eff9bb1201e01eb4699bdcf223c836250e912ea",
+            "integrity": "sha512-d583yg/5zm6ERQLTlSAXsHW+z6l2gVf3WQCbGFMzEP2ppn/QSSBaiOruxWU5xqHh+4AkY18EOH6BeCBY9gEJuw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8746f82046754d62b4324e4801b89af7e8ebed3e23f73035a14c6bce7e234811",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 246,
+            "unpackedSize": 120,
+            "shasum": "1feae10f23d7b74e720cb47a928ec76466c7f2a2",
+            "integrity": "sha512-TBuUJOO3Rd+uCNXV05u7aIcJ1pJ9bV2k6Vir/AMd+2z4cPDosxIVsQRUm4TQaUH/70lB/868N6yqq3YCGsItzg==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 102,
+                "mode": 420
+              }
+            ],
+            "entryCount": 3,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-nested-ignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f06a93a51e2c4b15780c09569b77445eb37f7154358de32a7ad35a3ed0b150df",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 264,
+            "unpackedSize": 121,
+            "shasum": "d01484dfdb3f85849fc2e56efc8c0e265c72e272",
+            "integrity": "sha512-idI6cXEl8g/KEJ7fjXCG+j6HXz3S+23hbqcJ+illTzISzI1tx0MPsYkZAJqRGySqgbi/Q04gqRYtPEBof5bHsA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "lib/keep.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 98,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6bededa8971d01d32119c0346969ec685e8657d757538c6a4016999dfd6eebeb",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 298,
+            "unpackedSize": 126,
+            "shasum": "47dbac55cabe20c0bdf60d76c89128e4086dca0b",
+            "integrity": "sha512-uS9xTEC8EZuSMxjLLo10IPTG8EolAOFKH4hJqyHaPnsoKNTTFk14rjaKw1MdrzyXNU2w4UAbcvMmIpyPkm5UOQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "lib/keep.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "lib/omit.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 98,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "f06a93a51e2c4b15780c09569b77445eb37f7154358de32a7ad35a3ed0b150df",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 264,
+            "unpackedSize": 121,
+            "shasum": "d01484dfdb3f85849fc2e56efc8c0e265c72e272",
+            "integrity": "sha512-idI6cXEl8g/KEJ7fjXCG+j6HXz3S+23hbqcJ+illTzISzI1tx0MPsYkZAJqRGySqgbi/Q04gqRYtPEBof5bHsA==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "lib/keep.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 98,
+                "mode": 420
+              }
+            ],
+            "entryCount": 4,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "6bededa8971d01d32119c0346969ec685e8657d757538c6a4016999dfd6eebeb",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 298,
+            "unpackedSize": 126,
+            "shasum": "47dbac55cabe20c0bdf60d76c89128e4086dca0b",
+            "integrity": "sha512-uS9xTEC8EZuSMxjLLo10IPTG8EolAOFKH4hJqyHaPnsoKNTTFk14rjaKw1MdrzyXNU2w4UAbcvMmIpyPkm5UOQ==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "lib/keep.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "lib/omit.js",
+                "size": 5,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 98,
+                "mode": 420
+              }
+            ],
+            "entryCount": 5,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "pack-bundle",
+      "args": [
+        "pack",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": [
+            "wave2-1.0.0.tgz"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fdd672a117898ffdd358f30852ae00fb224e67c383faebc1aa9d984b47ba8a48",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 481,
+            "unpackedSize": 350,
+            "shasum": "a131bf9cb90673b8ffa505ad937f84cff9a66dda",
+            "integrity": "sha512-PkQlaCHnZT8bzFiB0WrAkuO2/O38mXHElUGLH67c5q/TFZXMs1jOXVlSkO8nhd5rbuuaIDk/QZkH6Zq6SUqGhg==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/index.js",
+                "size": 3,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/package.json",
+                "size": 32,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 155,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 8,
+            "bundled": [
+              "dep"
+            ]
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3e859ed9f1d4cd170d47398254eb43860f4032134ead2e9b510f676c48bbeefe",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 494,
+            "unpackedSize": 350,
+            "shasum": "01a5be9cbdc006ec50df986b33910f176124466e",
+            "integrity": "sha512-J+PtZaGg8rZxN5ipxGpdTvWMjHSw9r1YAeYXRAs2VhjU0ntw4vrJycPk5qFPzXWzhHalQtVok+yVFEzYPJQjng==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/index.js",
+                "size": 3,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/package.json",
+                "size": 32,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 155,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 8,
+            "bundled": [
+              "dep"
+            ]
+          }
+        },
+        "differentFiles": [
+          {
+            "path": "wave2-1.0.0.tgz",
+            "npm": "e27eb70ac3a8dd930eba6582de35cb7baa99b0e1cb514abd9c0a61941cab59d3",
+            "rnpm": "1f4fad9934c41253ead8d93d9ff0e4d9c9099a4f3c6227aa664c42a6329c7025"
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": [
+            "wave2-1.0.0.tgz"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "fdd672a117898ffdd358f30852ae00fb224e67c383faebc1aa9d984b47ba8a48",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 481,
+            "unpackedSize": 350,
+            "shasum": "a131bf9cb90673b8ffa505ad937f84cff9a66dda",
+            "integrity": "sha512-PkQlaCHnZT8bzFiB0WrAkuO2/O38mXHElUGLH67c5q/TFZXMs1jOXVlSkO8nhd5rbuuaIDk/QZkH6Zq6SUqGhg==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/index.js",
+                "size": 3,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/package.json",
+                "size": 32,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 155,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 8,
+            "bundled": [
+              "dep"
+            ]
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "3e859ed9f1d4cd170d47398254eb43860f4032134ead2e9b510f676c48bbeefe",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 494,
+            "unpackedSize": 350,
+            "shasum": "01a5be9cbdc006ec50df986b33910f176124466e",
+            "integrity": "sha512-J+PtZaGg8rZxN5ipxGpdTvWMjHSw9r1YAeYXRAs2VhjU0ntw4vrJycPk5qFPzXWzhHalQtVok+yVFEzYPJQjng==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/index.js",
+                "size": 3,
+                "mode": 420
+              },
+              {
+                "path": "node_modules/dep/package.json",
+                "size": 32,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 155,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 8,
+            "bundled": [
+              "dep"
+            ]
+          }
+        },
+        "differentFiles": [
+          {
+            "path": "wave2-1.0.0.tgz",
+            "npm": "e27eb70ac3a8dd930eba6582de35cb7baa99b0e1cb514abd9c0a61941cab59d3",
+            "rnpm": "1f4fad9934c41253ead8d93d9ff0e4d9c9099a4f3c6227aa664c42a6329c7025"
+          }
+        ]
+      }
+    },
+    {
+      "name": "publish-dry",
+      "args": [
+        "publish",
+        "--dry-run",
+        "--json"
+      ],
+      "status": "OPEN-blocked-by-constraint",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "db106015dcbef224ea9e99ed6a24c419d40a08451fded16b4a08b3d7006679a0",
+          "stderrSha256": "d07ab2cda8798f4e622ce695a63ac90ad73612a270fb7f0d47bfd80596d15e32",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 361,
+            "unpackedSize": 230,
+            "shasum": "671e2066ee402c7232538f380309c0deb8b23312",
+            "integrity": "sha512-Do/XTHl6DySVR6paBh+zCKIwf+zy2u1xFgw8htqtX5QqbWhgkGGZhvyQHR2erRK+7dh091y2PCRqj2gBEIQvtw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 6,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "715370a8fb29ebcc9a51a3c05f2a22ddd5b7d9270b9659fe523d29d7c7d85e5b",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 377,
+            "unpackedSize": 230,
+            "shasum": "84bc364cdda3dd35d858cc1db86c0732c139c182",
+            "integrity": "sha512-EOGBkjyIHffque3t4h4v/DiohSv7HwZrcEugOgvOvRRmAqm3vXyDblAVEq8I87Nrrfp4H/BSuwfchy2DD9IYhw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 6,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "db106015dcbef224ea9e99ed6a24c419d40a08451fded16b4a08b3d7006679a0",
+          "stderrSha256": "d07ab2cda8798f4e622ce695a63ac90ad73612a270fb7f0d47bfd80596d15e32",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 361,
+            "unpackedSize": 230,
+            "shasum": "671e2066ee402c7232538f380309c0deb8b23312",
+            "integrity": "sha512-Do/XTHl6DySVR6paBh+zCKIwf+zy2u1xFgw8htqtX5QqbWhgkGGZhvyQHR2erRK+7dh091y2PCRqj2gBEIQvtw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 6,
+            "bundled": []
+          }
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "8434f3b0c305483fa9ff5b4010f0c2fea51d74887296674d0200a1ada3f3b7e2",
+          "stderrSha256": "d07ab2cda8798f4e622ce695a63ac90ad73612a270fb7f0d47bfd80596d15e32",
+          "pack": {
+            "id": "wave2@1.0.0",
+            "name": "wave2",
+            "version": "1.0.0",
+            "size": 377,
+            "unpackedSize": 230,
+            "shasum": "84bc364cdda3dd35d858cc1db86c0732c139c182",
+            "integrity": "sha512-EOGBkjyIHffque3t4h4v/DiohSv7HwZrcEugOgvOvRRmAqm3vXyDblAVEq8I87Nrrfp4H/BSuwfchy2DD9IYhw==",
+            "filename": "wave2-1.0.0.tgz",
+            "files": [
+              {
+                "path": "LICENSE",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "README.md",
+                "size": 10,
+                "mode": 420
+              },
+              {
+                "path": "keep.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "omit.js",
+                "size": 8,
+                "mode": 420
+              },
+              {
+                "path": "package.json",
+                "size": 70,
+                "mode": 420
+              },
+              {
+                "path": "probe.cjs",
+                "size": 126,
+                "mode": 420
+              }
+            ],
+            "entryCount": 6,
+            "bundled": []
+          }
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "publish-hooks",
+      "args": [
+        "publish",
+        "--dry-run",
+        "--silent"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": false,
+          "stderr": true,
+          "files": [
+            "events.txt"
+          ]
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "709211400a6f92c04719896d89beb5ab00faab5bc3bc754c7733ebaa0a86413e",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "32c5d1f334470ad88933027db85a8da4d105de104f4a1091829b693d5aaaa259",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": [
+          {
+            "path": "events.txt",
+            "npm": "709211400a6f92c04719896d89beb5ab00faab5bc3bc754c7733ebaa0a86413e",
+            "rnpm": "5798f6a4c65085a22a0090604374af6f8971d7b642cd789531ac224aa12c2b44"
+          }
+        ]
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "709211400a6f92c04719896d89beb5ab00faab5bc3bc754c7733ebaa0a86413e",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 0,
+          "firstErrorLine": null,
+          "stdoutSha256": "709211400a6f92c04719896d89beb5ab00faab5bc3bc754c7733ebaa0a86413e",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-script",
+      "args": [
+        "run",
+        "absent"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error Missing script: \"absent\"",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "dcb76117ab5de96856be87d962a1251bf0e2cdd4745f8e090c8ffb6ee0645148"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error Missing script: \"absent\"",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "bf669bdf9d8ba3c8b100a2f30e8e6ce035cc501559c51118f2d87eafa9143657"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error Missing script: \"absent\"",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "162bbf98b139b73e67ff2a220a7b2c619a2da571672ac94629097b621bc8efb8"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error Missing script: \"absent\"",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "bf669bdf9d8ba3c8b100a2f30e8e6ce035cc501559c51118f2d87eafa9143657"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-no-manifest",
+      "args": [
+        "run",
+        "x"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 4294963238,
+          "firstErrorLine": "npm error code ENOENT",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "cf161317c17210dc111bac8967ceef9091c5d5f3b280c7b8e1fe81b693974c17"
+        },
+        "rnpm": {
+          "code": 4294963238,
+          "firstErrorLine": "npm error code ENOENT",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "2d90b81404e59f44b5e863dc446f4033fdbb79124c2c332e77ebabe7b7aa521b"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 4294963238,
+          "firstErrorLine": "npm error code ENOENT",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "4a2d2a80600ff966f2fe91507b0d4622ea2ef276afc56c00076b7dd79f851858"
+        },
+        "rnpm": {
+          "code": 4294963238,
+          "firstErrorLine": "npm error code ENOENT",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "2d90b81404e59f44b5e863dc446f4033fdbb79124c2c332e77ebabe7b7aa521b"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-invalid",
+      "args": [
+        "run",
+        "x"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EJSONPARSE",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "87860841fe0e47ca8a7c36625b9fe3c36c1c8d746b8c313fde4b69e0b77c235b"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EJSONPARSE",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "08231e94f96a4d47c65d2e62c843149a0c1530b5d1152b8ecde244991ac57e6e"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EJSONPARSE",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "3c0f0dd2c914dff94096ad5ec587d76007dac9f9cf03963e9f783a0441fcfdcf"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EJSONPARSE",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "08231e94f96a4d47c65d2e62c843149a0c1530b5d1152b8ecde244991ac57e6e"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-unknown",
+      "args": [
+        "nonesuch"
+      ],
+      "status": "already-OK",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": null,
+          "stdoutSha256": "ff3b9f75e24e0051b68c88833da54ddf2e360e31fe074cd4b60b86468034a6ad",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": null,
+          "stdoutSha256": "ff3b9f75e24e0051b68c88833da54ddf2e360e31fe074cd4b60b86468034a6ad",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": true,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": null,
+          "stdoutSha256": "ff3b9f75e24e0051b68c88833da54ddf2e360e31fe074cd4b60b86468034a6ad",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": null,
+          "stdoutSha256": "ff3b9f75e24e0051b68c88833da54ddf2e360e31fe074cd4b60b86468034a6ad",
+          "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-target",
+      "args": [
+        "install",
+        "is-number@99999.0.0",
+        "--ignore-scripts"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code ETARGET",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "087dd5b91dc1b2060ffdcc8b401404682dc47a3f5e65f6e0e853a2aab92bc58d"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EUNKNOWN",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "d9d90a7d71f63ba6aff4db205dd7dd024b2d43f04a582ac9d1894d1465db2ef7"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code ETARGET",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "1bfdebeb527346a9be1b92e8b4fc038589ae3ad3b235ecfb394e49feb538f14a"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code ETARGET",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "5855e0bc3ef89a7fa9503412031902effefdfa94aac9d56dd693ef2cd9edafd4"
+        },
+        "differentFiles": []
+      }
+    },
+    {
+      "name": "error-404",
+      "args": [
+        "install",
+        "rnpm-wave2-definitely-nonexistent-8950123",
+        "--ignore-scripts"
+      ],
+      "status": "FIXED",
+      "before": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code E404",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "42571e17300c30c3b2dad1caec2034e2a3fedf29219c82eee34f4c5887ff88a6"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code EUNKNOWN",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "8faede02f987a97bc936327121e1e5e6cdb1e77352de0d8210b053cef1e0e8ca"
+        },
+        "differentFiles": []
+      },
+      "after": {
+        "match": {
+          "code": true,
+          "stdout": true,
+          "stderr": false,
+          "files": []
+        },
+        "npm": {
+          "code": 1,
+          "firstErrorLine": "npm error code E404",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "d963bc55c60876aa100df3778aaadf055543989e1db737474f4ee40a09d8a086"
+        },
+        "rnpm": {
+          "code": 1,
+          "firstErrorLine": "npm error code E404",
+          "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderrSha256": "49623fb08cc92567af67cc945666dc087019cefcc04176adbe61da70af1f4367"
+        },
+        "differentFiles": []
+      }
+    }
+  ],
+  "commits": [
+    "ec260350ab3a310730f05749a05fc0a656fe7a72",
+    "7ab5097646791a2ed525811b7a4de035b1948f64"
+  ]
+}

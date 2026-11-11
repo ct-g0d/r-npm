@@ -185,6 +185,7 @@ fn isolated_rnpm(dir: &std::path::Path) -> Command {
     cmd.env("NPM_CONFIG_USERCONFIG", fake_home.join(".npmrc"));
     cmd.env("NPM_CONFIG_GLOBALCONFIG", fake_global.join("etc").join("npmrc"));
     cmd.env("NPM_CONFIG_CACHE", fake_home.join(".npm-cache"));
+    cmd.env("NPM_CONFIG_UNICODE", "true");
     cmd
 }
 
@@ -227,7 +228,7 @@ fn test_cli_publish_dry_run() {
         "Expected package name and version in stdout: {stdout}"
     );
     assert!(
-        stderr.contains("npm notice package: dry-run-pkg@1.2.3"),
+        stderr.contains("npm notice \u{1f4e6}  dry-run-pkg@1.2.3"),
         "Expected package notice: {stderr}"
     );
     assert!(
@@ -250,12 +251,14 @@ fn test_cli_publish_dry_run() {
     assert!(json_output.status.success());
     let json_str = String::from_utf8_lossy(&json_output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("Valid JSON");
-    assert_eq!(parsed["id"], "dry-run-pkg@1.2.3");
-    assert_eq!(parsed["name"], "dry-run-pkg");
-    assert_eq!(parsed["version"], "1.2.3");
-    assert_eq!(parsed["dryRun"], true);
-    assert!(parsed["shasum"].is_string());
-    assert!(parsed["integrity"].is_string());
+    assert_eq!(parsed.as_object().unwrap().len(), 1);
+    let package = &parsed["dry-run-pkg"];
+    assert_eq!(package["id"], "dry-run-pkg@1.2.3");
+    assert_eq!(package["name"], "dry-run-pkg");
+    assert_eq!(package["version"], "1.2.3");
+    assert!(package.get("dryRun").is_none());
+    assert!(package["shasum"].is_string());
+    assert!(package["integrity"].is_string());
 }
 
 #[test]

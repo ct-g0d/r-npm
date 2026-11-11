@@ -113,6 +113,15 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     for cause in err.chain() {
         if let Some(solver_err) = cause.downcast_ref::<SolverError>() {
             match solver_err {
+                SolverError::UnresolvedDependency { name, spec, message }
+                    if message == "No matching version found satisfying constraint" => {
+                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
+                        .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
+                }
+                SolverError::UnresolvedDependency { message, .. }
+                    if message == "Package not found in metadata provider" => {
+                    return Diagnostic::new("E404", solver_err.to_string());
+                }
                 SolverError::PeerConflict { .. } => {
                     return Diagnostic::new("ERESOLVE", solver_err.to_string());
                 }
@@ -354,6 +363,23 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         }
     }
 
+    // Some installer paths erase the solver type when adding context. Recognize
+    // only its two precise metadata-failure messages, not arbitrary resolution errors.
+    if let Some((_, unresolved)) = err_str.rsplit_once("Unresolved dependency '") {
+        if let Some((package_spec, reason)) = unresolved.split_once("': ") {
+            match reason {
+                "No matching version found satisfying constraint" => {
+                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {package_spec}."))
+                        .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
+                }
+                "Package not found in metadata provider" => {
+                    return Diagnostic::new("E404", err_str);
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pattern matching across error strings
     if err_str.contains("Unsupported URL Type") || err_str.contains("Unsupported protocol") {
         Diagnostic::new("EUNSUPPORTEDPROTOCOL", err_str).with_detail(
@@ -424,5 +450,41 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
         Diagnostic::new("ENOENT", err_str)
     } else {
         Diagnostic::new("EUNKNOWN", err_str)
+    }
+}
+
+#[cfg(test)]
+mod wave2_tests {
+    use super::*;
+
+    #[test]
+    fn solver_metadata_errors_preserve_npm_error_codes() {
+        for (message, code) in [
+            ("No matching version found satisfying constraint", "ETARGET"),
+            ("Package not found in metadata provider", "E404"),
+        ] {
+            let error = anyhow::Error::from(SolverError::UnresolvedDependency {
+                name: "fixture".into(), spec: "999.0.0".into(), message: message.into(),
+            });
+            assert_eq!(classify_error(&error).code, code);
+        }
+        let error = anyhow::Error::from(SolverError::UnresolvedDependency {
+            name: "fixture".into(), spec: "999.0.0".into(), message: "network unavailable".into(),
+        });
+        assert_eq!(classify_error(&error).code, "EUNKNOWN");
+    }
+
+    #[test]
+    fn string_wrapped_solver_metadata_errors_preserve_npm_error_codes() {
+        for (message, code) in [
+            ("No matching version found satisfying constraint", "ETARGET"),
+            ("Package not found in metadata provider", "E404"),
+        ] {
+            let error = anyhow::anyhow!("Unresolved dependency 'fixture@999.0.0': {message}")
+                .context("Install resolution failed");
+            assert_eq!(classify_error(&error).code, code);
+        }
+        let error = anyhow::anyhow!("Unresolved dependency 'fixture@999.0.0': network unavailable");
+        assert_eq!(classify_error(&error).code, "EUNKNOWN");
     }
 }

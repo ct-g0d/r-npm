@@ -2130,7 +2130,12 @@ fn select_workspace_members(
             anyhow::bail!("npm error No workspaces found:\nnpm error   --workspace={filter}");
         }
     }
-    if let Ok(graph) = rnpm_solver::WorkspaceDependencyGraph::construct(&members) {
+    // Preserve the existing topological extension for workspace: specs, which
+    // npm does not accept. npm-compatible manifests use declaration order.
+    let uses_workspace_protocol = members.iter().any(|m| m.manifest.dependencies.values()
+        .chain(m.manifest.dev_dependencies.values()).any(|spec| spec.starts_with("workspace:")));
+    if uses_workspace_protocol {
+        if let Ok(graph) = rnpm_solver::WorkspaceDependencyGraph::construct(&members) {
         let order_map: std::collections::HashMap<&str, usize> = graph
             .topological_order
             .iter()
@@ -2138,6 +2143,14 @@ fn select_workspace_members(
             .map(|(i, name)| (name.as_str(), i))
             .collect();
         members.sort_by_key(|m| order_map.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
+    }
+    } else {
+        let manifest = Manifest::from_file(root.join("package.json"))?;
+        let mut ordered_paths = Vec::new();
+        for pattern in manifest.workspace_patterns().iter().filter(|p| !p.starts_with('!')) {
+            ordered_paths.extend(rnpm_core::workspace::match_glob_patterns(root, std::slice::from_ref(pattern))?);
+        }
+        members.sort_by_key(|m| ordered_paths.iter().position(|p| p == &m.path).unwrap_or(usize::MAX));
     }
     members.retain(|m| filters.is_empty() || filters.iter()
         .any(|f| rnpm_lifecycle::matches_filter(f, &m.name, &m.path, root)));
@@ -3272,12 +3285,15 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
         }
     }
 
+    let mut env = lifecycle_config_env(current_dir);
+    env.insert("npm_lifecycle_event".into(), "npx".into());
+    env.insert("npm_command".into(), "exec".into());
     let status = rnpm_lifecycle::execute_binary_async(
         &binary_to_run,
         args,
         current_dir,
         &path_entries,
-        &std::collections::HashMap::new(),
+        &env,
     )
     .await?;
 
@@ -3292,6 +3308,43 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
     Ok(())
 }
 
+/// Rewrites a relative local package spec (`./x`, `../x.tgz`, `file:x`, or an
+/// existing relative path) to an absolute path anchored at `base`. Registry,
+/// git, URL, and absolute specs are returned unchanged.
+fn rebase_local_spec(spec: &str, base: &std::path::Path) -> String {
+    let (prefix, path_part) = match spec.strip_prefix("file:") {
+        Some(rest) => ("file:", rest),
+        None => ("", spec),
+    };
+    let looks_relative = path_part.starts_with("./")
+        || path_part.starts_with("../")
+        || path_part.starts_with(".\\")
+        || path_part.starts_with("..\\")
+        || path_part == "."
+        || path_part == "..";
+    let is_local = !prefix.is_empty() || looks_relative || {
+        let lower = path_part.to_ascii_lowercase();
+        (lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+            && !path_part.contains("://")
+    } || (!path_part.contains(':')
+        && !path_part.starts_with('@')
+        && base.join(path_part).is_dir()
+        && (path_part.contains('/') || path_part.contains('\\')));
+    let path = std::path::Path::new(path_part);
+    if !is_local || path_part.is_empty() || path.is_absolute() || path_part.starts_with("//") {
+        return spec.to_string();
+    }
+    format!("{prefix}{}", base.join(path).display())
+}
+
+/// Records `--json` in the process-wide CLI overrides so lifecycle output
+/// emitted outside this crate can route banners to stderr, as npm does.
+fn mark_json_mode() {
+    let mut overrides = rnpm_config::get_process_cli_overrides().unwrap_or_default();
+    overrides.insert("json".to_string(), "true".to_string());
+    rnpm_config::set_process_cli_overrides(overrides);
+}
+
 pub(crate) fn run_lifecycle_hook(
     package_dir: &std::path::Path,
     manifest: &Manifest,
@@ -3299,39 +3352,31 @@ pub(crate) fn run_lifecycle_hook(
     ignore_scripts: bool,
     foreground_scripts: bool,
     is_silent: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     if ignore_scripts {
         return Ok(());
     }
 
     if let Some(script_cmd) = manifest.scripts.get(hook_name) {
-        if !is_silent {
+        if !is_silent && foreground_scripts {
             let id = match (&manifest.name, &manifest.version) {
                 (Some(name), Some(version)) => format!("{name}@{version}"),
                 (Some(name), None) => name.clone(),
                 _ => String::new(),
             };
-            println!(
-                "\n> {}{hook_name}\n> {script_cmd}\n",
-                if id.is_empty() { id } else { format!("{id} ") }
-            );
+            let banner = format!("\n> {}{hook_name}\n> {script_cmd}\n", if id.is_empty() { id } else { format!("{id} ") });
+            if json { eprintln!("{banner}"); } else { println!("{banner}"); }
         }
         let mut ctx =
             LifecycleContext::new(package_dir, package_dir, manifest.name.as_deref().unwrap_or(""), hook_name, script_cmd);
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
-        ctx.capture_output = is_silent;
+        ctx.capture_output = !foreground_scripts;
         ctx.extra_env = lifecycle_config_env(package_dir);
         let status = execute_lifecycle_script(&ctx)?;
         if !status.success() {
-            let code = rnpm_lifecycle::extract_exit_status_code(&status);
-            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                exit_code: code,
-                message: format!(
-                    "Lifecycle script '{}' failed with exit code: {}",
-                    hook_name, code
-                ),
-            }));
+            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError::lifecycle_failure(&ctx, &status)));
         }
     }
 
@@ -3416,18 +3461,17 @@ pub(crate) async fn execute_publish(
         }
     }
 
-    let is_silent = json
-        || rnpm_config::get_process_cli_overrides()
-            .as_ref()
-            .and_then(|o| o.get("loglevel"))
-            .map(|s| s == "silent")
-            .unwrap_or(false);
+    let script_config = rnpm_config::Config::load(Some(&package_dir))?;
+    let is_silent = script_config.get("loglevel") == Some("silent");
+    let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
     // 1. prepublishOnly
-    run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, false, is_silent)?;
+    run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
 
     // 2. prepack
-    run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, false, is_silent)?;
+    run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
+
+    run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
 
     let updated_manifest = Manifest::from_file(&manifest_path).unwrap_or_else(|_| manifest.clone());
     let updated_manifest_content =
@@ -3444,7 +3488,7 @@ pub(crate) async fn execute_publish(
     };
 
     // 4. postpack
-    run_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts, false, is_silent)?;
+    run_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts, foreground, is_silent, json)?;
 
     if dry_run {
         if json {
@@ -3467,21 +3511,7 @@ pub(crate) async fn execute_publish(
                 "entryCount": summary.entry_count,
                 "bundled": summary.bundled,
             });
-            let json_output = serde_json::json!({
-                "id": id,
-                "name": summary.name,
-                "version": summary.version,
-                "size": summary.package_size,
-                "unpackedSize": summary.unpacked_size,
-                "shasum": summary.shasum,
-                "integrity": summary.integrity,
-                "filename": summary.filename,
-                "files": files_json,
-                "entryCount": summary.entry_count,
-                "bundled": summary.bundled,
-                "dryRun": true,
-                summary.name.clone(): pkg_details,
-            });
+            let json_output = serde_json::json!({ summary.name.clone(): pkg_details });
             println!("{}", serde_json::to_string_pretty(&json_output)?);
         } else {
             if !is_silent {
@@ -3492,13 +3522,26 @@ pub(crate) async fn execute_publish(
                     "npm notice provenance would be generated and verified in CI environment"
                 );
             }
-            println!("+ {}@{}", summary.name, summary.version);
+            if !is_silent { println!("+ {}@{}", summary.name, summary.version); }
+        }
+        let config = rnpm_config::Config::load(Some(&package_dir))?;
+        if config.get("loglevel") != Some("silent") {
+            let registry = registry.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
+                .and_then(|c| c.get("registry")).and_then(|v| v.as_str()))
+                .unwrap_or(config.npmrc.registry.as_str());
+            let registry_url = Url::parse(registry)?;
+            if config.npmrc.get_auth_token(&registry_url).is_none() {
+                eprintln!("npm warn publish This command requires you to be logged in to {registry_url} (dry-run)");
+            }
+            eprintln!("npm notice Publishing to {registry_url} with tag {tag} and {} access (dry-run)",
+                access.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
+                    .and_then(|c| c.get("access")).and_then(|v| v.as_str())).unwrap_or("default"));
         }
         return Ok(());
     }
 
     // 5. publish
-    run_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts, false, is_silent)?;
+    run_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
 
     let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
@@ -3609,8 +3652,9 @@ pub(crate) async fn execute_publish(
         &updated_manifest,
         "postpublish",
         ignore_scripts,
-        false,
+        foreground,
         is_silent,
+        json,
     )?;
 
     Ok(())
@@ -4498,6 +4542,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
             json,
         } => {
+            if json {
+                mark_json_mode();
+            }
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
                 || config.get_bool("timing").unwrap_or(false)
@@ -4541,6 +4588,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
             };
+            let mut workspace = workspace;
             let target_dir = if let Some(p) = prefix {
                 if p.is_absolute() {
                     p
@@ -4550,7 +4598,27 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else if global {
                 rnpm_config::find_global_prefix()
             } else {
-                current_dir.clone()
+                if let Some(root) = rnpm_config::find_workspace_root(&current_dir) {
+                    if workspace.is_empty() && !workspaces {
+                        if let Some(member) = rnpm_core::workspace::discover_workspaces(&root)?
+                            .into_iter().find(|m| m.path == current_dir) {
+                            workspace.push(member.name);
+                        }
+                    }
+                    root
+                } else {
+                    current_dir.clone()
+                }
+            };
+            // Relative local specs were typed relative to the invocation directory;
+            // keep them pointing there after switching to the workspace root.
+            let packages: Vec<String> = if target_dir != current_dir {
+                packages
+                    .into_iter()
+                    .map(|spec| rebase_local_spec(&spec, &current_dir))
+                    .collect()
+            } else {
+                packages
             };
 
             let effective_save_prefix = save_prefix
@@ -4563,13 +4631,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     || o.contains_key("workspace")
             }).unwrap_or(false);
             if workspaces || !workspace.is_empty() || ws_in_overrides {
-                let has_ws = if let Ok(content) = std::fs::read_to_string(current_dir.join("package.json")) {
+                let has_ws = if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
                     content.contains("\"workspaces\"")
                 } else {
                     false
                 };
                 if !has_ws {
-                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", current_dir.display());
+                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", target_dir.display());
                     std::process::exit(1);
                 }
             }
@@ -4711,6 +4779,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             detached_trash,
             json,
         } => {
+            if json {
+                mark_json_mode();
+            }
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
                 || config.get_bool("timing").unwrap_or(false)
@@ -5006,13 +5077,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                             .collect();
                         format!("{cmd_str} {}", formatted_args.join(" "))
                     };
-                    let ctx = LifecycleContext::new(
+                    let manifest = Manifest::from_file(target_dir.join("package.json")).unwrap_or_default();
+                    let mut ctx = LifecycleContext::new(
                         &target_dir,
                         &target_dir,
-                        "exec",
-                        "call",
+                        manifest.name.as_deref().unwrap_or(""),
+                        "npx",
                         &full_cmd,
                     );
+                    ctx.package_version = manifest.version;
+                    ctx.extra_env = lifecycle_config_env(&target_dir);
                     let status = execute_lifecycle_script(&ctx)?;
                     if !status.success() {
                         let code = rnpm_lifecycle::extract_exit_status_code(&status);
@@ -6293,11 +6367,23 @@ CONFIGURATION
     );
 }
 
-fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
+pub(crate) fn use_unicode(dir: &Path) -> bool {
+    rnpm_config::Config::load(Some(dir)).ok().and_then(|config| config.get_bool("unicode"))
+        .unwrap_or_else(|| {
+            let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter()
+                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                .unwrap_or_default().to_ascii_uppercase();
+            locale.ends_with("UTF8") || locale.ends_with("UTF-8")
+        })
+}
+
+pub(crate) fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
     eprintln!("npm notice");
-    eprintln!("npm notice package: {}@{}", summary.name, summary.version);
+    let unicode = use_unicode(&std::env::current_dir().unwrap_or_default());
+    eprintln!("npm notice {} {}@{}", if unicode { "\u{1f4e6} " } else { "package:" }, summary.name, summary.version);
     eprintln!("npm notice Tarball Contents");
     for file in &summary.files {
+        if file.path.starts_with("node_modules/") { continue; }
         eprintln!(
             "npm notice {} {}",
             format_bytes(file.size, false),
@@ -6327,7 +6413,7 @@ fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
         format!(
             "{}[...]{}",
             &summary.integrity[..20],
-            &summary.integrity[summary.integrity.len().saturating_sub(14)..]
+            &summary.integrity[80..]
         )
     } else {
         summary.integrity.clone()
@@ -6411,6 +6497,7 @@ fn execute_run_sync(
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.extra_env = lifecycle_config_env(&current_dir);
+        ctx.extra_env.insert("npm_lifecycle_script".into(), cmd.clone());
         if ignore_scripts { ctx.extra_env.insert("npm_config_ignore_scripts".into(), "true".into()); }
         if foreground_scripts { ctx.extra_env.insert("npm_config_foreground_scripts".into(), "true".into()); }
         if strict_sandbox { ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted(); }
@@ -6427,6 +6514,9 @@ fn execute_run_sync(
 
 fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
+    }
     if let Ok(config) = rnpm_config::Config::load(Some(dir)) {
         for (key, value) in config.npmrc.settings {
             env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
@@ -6437,6 +6527,7 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
 
 fn finish_cli_error(err: &anyhow::Error) -> ! {
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+        if exit.message.starts_with("npm error ") { eprintln!("{}", exit.message); }
         std::process::exit(exit.exit_code);
     }
     let diagnostic = diagnostics::classify_error(err);
@@ -6475,6 +6566,8 @@ fn main() {
     }
 
     let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
+    let warn_workspaces = filtered_args.iter().take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-ws");
     let filtered_args = normalize_cli_args(filtered_args);
 
     if let Some((_, msg)) = check_unsupported_cli_invocation(&filtered_args) {
@@ -6483,6 +6576,12 @@ fn main() {
     }
 
     let filtered_args = preprocess_cli_args(filtered_args);
+    if warn_workspaces {
+        let config = rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
+        if !matches!(config.get("loglevel"), Some("silent" | "error")) {
+            eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
+        }
+    }
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
     if filtered_args.get(1).map(|s| s.as_str()) == Some("run")

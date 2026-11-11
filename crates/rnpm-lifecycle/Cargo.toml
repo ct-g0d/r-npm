@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 rnpm-core = { workspace = true }
+rnpm-config = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
