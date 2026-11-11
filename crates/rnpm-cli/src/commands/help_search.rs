@@ -27,6 +27,31 @@ pub fn clean_front_matter(content: &str) -> String {
     content.trim().to_string()
 }
 
+/// Emulates JavaScript `content.split(/\n+/)` preserving trailing `\r` on Windows lines.
+pub fn split_by_newlines(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut in_delim = false;
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            if !in_delim {
+                result.push(s[start..i].to_string());
+                in_delim = true;
+            }
+        } else if in_delim {
+            start = i;
+            in_delim = false;
+        }
+    }
+    if in_delim {
+        result.push(String::new());
+    } else {
+        result.push(s[start..].to_string());
+    }
+    result
+}
+
 /// Search documentation entries matching the npm algorithm.
 pub fn search_documents(terms: &[String], docs: &[(String, String)]) -> Vec<SearchResult> {
     if terms.is_empty() {
@@ -45,20 +70,14 @@ pub fn search_documents(terms: &[String], docs: &[(String, String)]) -> Vec<Sear
             continue;
         }
 
-        // Split into non-empty lines (matching content.split(/\n+/))
-        let raw_lines: Vec<&str> = content
-            .lines()
-            .map(|l| l.trim_end_matches('\r'))
-            .collect();
+        // Split into lines matching JavaScript content.split(/\n+/)
+        let raw_lines = split_by_newlines(&content);
 
         // npm line matching logic:
         // if next line has search term, keep current line and skip next 2
         // else if current line has search term, keep current line and skip next 1
         // otherwise, set to null
-        let mut lines: Vec<Option<String>> = Vec::with_capacity(raw_lines.len());
-        for line in &raw_lines {
-            lines.push(Some(line.to_string()));
-        }
+        let mut lines: Vec<Option<String>> = raw_lines.into_iter().map(Some).collect();
 
         let mut i = 0;
         while i < lines.len() {
@@ -87,36 +106,34 @@ pub fn search_documents(terms: &[String], docs: &[(String, String)]) -> Vec<Sear
         // Squish consecutive nulls into a single null
         let mut pruned: Vec<Option<String>> = Vec::new();
         for line in lines {
-            if line.is_none() && pruned.last().map_or(false, |l| l.is_none()) {
+            if line.is_none() && matches!(pruned.last(), Some(None)) {
                 continue;
             }
             pruned.push(line);
         }
 
         // Trim leading and trailing null
-        if pruned.last().map_or(false, |l| l.is_none()) {
+        if matches!(pruned.last(), Some(None)) {
             pruned.pop();
         }
-        if pruned.first().map_or(false, |l| l.is_none()) {
+        if matches!(pruned.first(), Some(None)) {
             pruned.remove(0);
         }
 
-        // Count hits for each search term
+        // Count hits for each search term across non-null lines
         let mut found: BTreeMap<String, usize> = BTreeMap::new();
         let mut total_hits = 0;
-        for line_opt in &pruned {
-            if let Some(line) = line_opt {
-                let line_lower = line.to_lowercase();
-                for term in terms {
-                    let term_lower = term.to_lowercase();
-                    if term_lower.is_empty() {
-                        continue;
-                    }
-                    let count = line_lower.matches(&term_lower).count();
-                    if count > 0 {
-                        *found.entry(term.clone()).or_insert(0) += count;
-                        total_hits += count;
-                    }
+        for line in pruned.iter().flatten() {
+            let line_lower = line.to_lowercase();
+            for term in terms {
+                let term_lower = term.to_lowercase();
+                if term_lower.is_empty() {
+                    continue;
+                }
+                let count = line_lower.matches(&term_lower).count();
+                if count > 0 {
+                    *found.entry(term.clone()).or_insert(0) += count;
+                    total_hits += count;
                 }
             }
         }
@@ -165,50 +182,64 @@ pub fn format_search_results(terms: &[String], results: &[SearchResult], long: b
 
     const COLS: usize = 81; // 80 cols + 1
 
-    let mut parts: Vec<String> = Vec::new();
+    let formatted_output = results
+        .iter()
+        .map(|res| {
+            let out = res.cmd.clone();
+            let r = res
+                .hits
+                .iter()
+                .map(|(k, v)| format!("{k}:{v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
 
-    for res in results {
-        let out = res.cmd.clone();
-        let hits_str = res
-            .hits
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+            let spaces_len = if COLS > out.len() + r.len() + 1 {
+                COLS - out.len() - r.len() - 1
+            } else {
+                1
+            };
+            let line = format!("{}{}{}", out, " ".repeat(spaces_len), r);
 
-        let spaces_len = if COLS > out.len() + hits_str.len() + 1 {
-            COLS - out.len() - hits_str.len() - 1
-        } else {
-            1
-        };
-        let line = format!("{}{}{}", out, " ".repeat(spaces_len), hits_str);
+            if !long {
+                line
+            } else {
+                let mut out_parts = Vec::new();
+                out_parts.push("\n\n".to_string());
+                out_parts.push(line);
+                out_parts.push("\n".to_string());
+                out_parts.push(format!("{}\n", "-".repeat(COLS - 1)));
 
-        if !long {
-            parts.push(line);
-        } else {
-            let mut block = String::new();
-            block.push_str("\n\n");
-            block.push_str(&line);
-            block.push('\n');
-            block.push_str(&"-".repeat(COLS - 1));
-            block.push('\n');
-            let mut printed_lines = 0;
-            for line_opt in &res.lines {
-                if printed_lines >= 4 {
-                    break;
+                for (i, line_opt) in res.lines.iter().enumerate() {
+                    if i > 3 {
+                        break;
+                    }
+                    if let Some(line) = line_opt {
+                        let mut highlight_line = Vec::new();
+                        for arg in terms {
+                            let arg_lower = arg.to_lowercase();
+                            let line_lower = line.to_lowercase();
+                            let mut p = 0;
+                            for part in line_lower.split(&arg_lower) {
+                                highlight_line.push(&line[p..p + part.len()]);
+                                p += part.len();
+                                if p < line.len() {
+                                    let word = &line[p..p + arg.len()];
+                                    highlight_line.push(word);
+                                    p += arg.len();
+                                }
+                            }
+                        }
+                        out_parts.push(format!("{}\n", highlight_line.join("")));
+                    }
                 }
-                if let Some(l) = line_opt {
-                    block.push_str(l);
-                    block.push('\n');
-                    printed_lines += 1;
-                }
+
+                out_parts.join("")
             }
-            parts.push(block);
-        }
-    }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    if !long {
-        let formatted = parts.join("\n");
+    let final_out = if !long {
         let quoted_terms = terms
             .iter()
             .map(|t| format!("\"{t}\""))
@@ -216,11 +247,20 @@ pub fn format_search_results(terms: &[String], results: &[SearchResult], long: b
             .join(" ");
         let separator = "\u{2014}".repeat(COLS - 1);
         format!(
-            "Top hits for {quoted_terms}\n{separator}\n{formatted}\n{separator}\n(run with -l or --long to see more context)"
+            "Top hits for {quoted_terms}\n{separator}\n{formatted_output}\n{separator}\n(run with -l or --long to see more context)"
         )
     } else {
-        parts.join("").trim().to_string()
+        formatted_output
+    };
+
+    let trimmed = final_out.trim();
+    let mut out = String::new();
+    for line in trimmed.split('\n') {
+        let clean = line.strip_suffix('\r').unwrap_or(line);
+        out.push_str(clean);
+        out.push('\n');
     }
+    out
 }
 
 /// Load documentation documents from an explicit directory, standard paths, or embedded data.
@@ -262,7 +302,7 @@ fn walk_md_files(root: &Path, current: &Path, out: &mut Vec<(String, String)>) -
         let path = entry.path();
         if path.is_dir() {
             walk_md_files(root, &path, out)?;
-        } else if path.extension().map_or(false, |ext| ext == "md") {
+        } else if path.extension().is_some_and(|ext| ext == "md") {
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -312,7 +352,7 @@ pub async fn run(
     let docs = load_documentation(custom_docs_dir)?;
     let results = search_documents(&terms, &docs);
     let output = format_search_results(&terms, &results, long);
-    println!("{output}");
+    print!("{output}");
     Ok(())
 }
 
@@ -353,6 +393,23 @@ mod tests {
         assert!(formatted.starts_with("Top hits for \"prune\"\n"));
         assert!(formatted.contains("\u{2014}"));
         assert!(formatted.contains("npm help prune"));
-        assert!(formatted.ends_with("(run with -l or --long to see more context)"));
+        assert!(formatted.contains("(run with -l or --long to see more context)"));
+        assert!(formatted.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_help_search_multiterm_long_parity() {
+        let docs = load_embedded_docs().expect("Embedded docs must decompress");
+        let terms = vec!["install".to_string(), "package".to_string()];
+        let results = search_documents(&terms, &docs);
+        assert!(!results.is_empty());
+        let formatted = format_search_results(&terms, &results, true);
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target_dir = manifest_dir.parent().unwrap().parent().unwrap().join("target");
+        let expected_file = target_dir.join("expected-long.utf8.txt");
+        if expected_file.is_file() {
+            let expected = std::fs::read_to_string(&expected_file).unwrap();
+            assert_eq!(formatted, expected);
+        }
     }
 }

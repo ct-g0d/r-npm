@@ -30,9 +30,8 @@ pub fn parse_editor_command(editor_cmd: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = editor_cmd.chars().peekable();
 
-    while let Some(c) = chars.next() {
+    for c in editor_cmd.chars() {
         match c {
             '\'' if !in_double => {
                 in_single = !in_single;
@@ -184,9 +183,12 @@ pub async fn run(
         ));
     }
 
-    // Post-editor behavior: run rebuild on the edited package directory
+    // Post-editor behavior: run rebuild on the edited package directory.
+    // matches_rebuild_filter matches relative package paths (e.g. node_modules/pkg),
+    // so pass relative selector to target specifically this copy.
+    let rel_selector = format!("node_modules/{subpath}");
     let rebuild_opts = super::rebuild::RebuildOptions {
-        packages: vec![dir.to_string_lossy().to_string()],
+        packages: vec![rel_selector],
         ignore_scripts: false,
         foreground_scripts: false,
         strict_sandbox: false,

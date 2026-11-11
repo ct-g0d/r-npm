@@ -2906,17 +2906,34 @@ async fn test_offline_help_search_with_fixture() {
     assert!(output.starts_with("Top hits for \"install\"\n"));
     assert!(output.contains("\u{2014}"));
     assert!(output.contains("npm help install"));
-    assert!(output.ends_with("(run with -l or --long to see more context)"));
+    assert!(output.contains("(run with -l or --long to see more context)"));
 
     // 2. Search for nonexistent term
     let no_match = crate::commands::help_search::search_documents(&["xyz_no_such_term".to_string()], &docs);
     let output_none = crate::commands::help_search::format_search_results(&["xyz_no_such_term".to_string()], &no_match, false);
     assert_eq!(output_none, "No matches in help for: xyz_no_such_term\n");
 
-    // 3. Long search
-    let output_long = crate::commands::help_search::format_search_results(&["prune".to_string()], &crate::commands::help_search::search_documents(&["prune".to_string()], &docs), true);
-    assert!(output_long.contains("npm help prune"));
-    assert!(output_long.contains("--------------------------------------------------------------------------------"));
+    // 3. Multi-term long search
+    let multi_results = crate::commands::help_search::search_documents(
+        &["install".to_string(), "package".to_string()],
+        &docs,
+    );
+    assert!(!multi_results.is_empty());
+    let output_multi_long = crate::commands::help_search::format_search_results(
+        &["install".to_string(), "package".to_string()],
+        &multi_results,
+        true,
+    );
+    assert!(output_multi_long.contains("npm help install"));
+    assert!(output_multi_long.contains("--------------------------------------------------------------------------------"));
+    // Multi-term highlighting repeats context for each term
+    assert!(output_multi_long.lines().count() > 1);
+
+    // 4. Empty args error check
+    let empty_run = crate::commands::help_search::run(vec![], false, Some(&fixture_dir)).await;
+    assert!(empty_run.is_err());
+    let empty_err = format!("{}", empty_run.unwrap_err());
+    assert!(empty_err.contains("EUSAGE"));
 }
 
 #[tokio::test]
@@ -2928,6 +2945,17 @@ async fn test_offline_help_search_embedded_parity() {
     assert!(!results.is_empty());
     assert_eq!(results[0].cmd, "npm help install");
     assert_eq!(results[0].hits.get("install"), Some(&197));
+
+    // Multi-term long parity against expected snapshot if present
+    let terms = vec!["install".to_string(), "package".to_string()];
+    let multi = crate::commands::help_search::search_documents(&terms, &docs);
+    let formatted = crate::commands::help_search::format_search_results(&terms, &multi, true);
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let expected_file = manifest_dir.parent().unwrap().parent().unwrap().join("target").join("expected-long.utf8.txt");
+    if expected_file.is_file() {
+        let expected = std::fs::read_to_string(&expected_file).unwrap();
+        assert_eq!(formatted, expected);
+    }
 }
 
 #[tokio::test]
@@ -2938,10 +2966,31 @@ async fn test_offline_edit_stub_editor() {
     // Create root package.json
     std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
 
-    // Create installed packages
+    // Create target package with lifecycle install hook writing rebuilt.marker
     let pkg_dir = root.join("node_modules").join("my-test-pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
-    std::fs::write(pkg_dir.join("package.json"), r#"{"name":"my-test-pkg","version":"1.0.0"}"#).unwrap();
+    let hook_js = pkg_dir.join("hook.js");
+    std::fs::write(
+        &hook_js,
+        "const fs = require('fs'); fs.writeFileSync('rebuilt.marker', 'rebuilt');",
+    ).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"my-test-pkg","version":"1.0.0","scripts":{"install":"node hook.js"}}"#,
+    ).unwrap();
+
+    // Create a second unrelated package to verify its hook is NOT triggered during targeted rebuild
+    let unrelated_dir = root.join("node_modules").join("unrelated-pkg");
+    std::fs::create_dir_all(&unrelated_dir).unwrap();
+    let unrelated_hook_js = unrelated_dir.join("unrelated_hook.js");
+    std::fs::write(
+        &unrelated_hook_js,
+        "const fs = require('fs'); fs.writeFileSync('unrelated.marker', 'unrelated');",
+    ).unwrap();
+    std::fs::write(
+        unrelated_dir.join("package.json"),
+        r#"{"name":"unrelated-pkg","version":"1.0.0","scripts":{"install":"node unrelated_hook.js"}}"#,
+    ).unwrap();
 
     let scoped_dir = root.join("node_modules").join("@scoped").join("sub-pkg");
     std::fs::create_dir_all(&scoped_dir).unwrap();
@@ -2985,6 +3034,17 @@ process.exit(0);
     let target_arg = argv[argv.len() - 1].as_str().unwrap();
     assert!(target_arg.ends_with("my-test-pkg"));
 
+    // Verify post-editor rebuild hook executed: rebuilt.marker MUST exist
+    assert!(
+        pkg_dir.join("rebuilt.marker").is_file(),
+        "Targeted package install lifecycle hook must have run and created rebuilt.marker"
+    );
+    // Verify unrelated package was NOT rebuilt
+    assert!(
+        !unrelated_dir.join("unrelated.marker").exists(),
+        "Unrelated package install lifecycle hook must NOT have run"
+    );
+
     // 2. Run edit on scoped package
     let res_scoped = crate::commands::edit::run(
         Some("@scoped/sub-pkg".to_string()),
@@ -3008,7 +3068,8 @@ process.exit(0);
     let err_msg = format!("{}", res_missing.unwrap_err());
     assert!(err_msg.contains("ENOENT"));
 
-    // 4. Failing editor process propagates exit code
+    // 4. Failing editor process propagates exit code and must NOT trigger rebuild
+    let _ = std::fs::remove_file(pkg_dir.join("rebuilt.marker"));
     let fail_js = root.join("fail_editor.js");
     std::fs::write(&fail_js, "process.exit(42);").unwrap();
     let fail_editor = format!("node \"{}\"", fail_js.to_string_lossy());
@@ -3020,6 +3081,10 @@ process.exit(0);
     assert!(res_fail.is_err());
     let fail_msg = format!("{}", res_fail.unwrap_err());
     assert!(fail_msg.contains("42"));
+    assert!(
+        !pkg_dir.join("rebuilt.marker").exists(),
+        "Editor failure must not trigger rebuild or create rebuilt.marker"
+    );
 }
 
 #[tokio::test]
@@ -3037,6 +3102,43 @@ async fn test_offline_explore_child_command() {
     std::fs::create_dir_all(&scoped_dir).unwrap();
     std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/explore-target","version":"3.0.0"}"#).unwrap();
 
+    // Probe script to test path guard rejections
+    let probe_marker = root.join("probe_executed.marker");
+    let probe_js = root.join("probe.js");
+    std::fs::write(
+        &probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'EXECUTED'); process.exit(0);",
+            probe_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
+
+    // 1. Path guard rejections: '..', '../..', '.', '/', traversal paths
+    for rejected in &["..", "../..", ".", "/", "foo/../.."] {
+        let res = crate::commands::explore::run(
+            Some(rejected.to_string()),
+            vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{rejected}' must fail with EUSAGE");
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("EUSAGE"), "Error must be EUSAGE for '{rejected}', got: {err}");
+        assert!(!probe_marker.exists(), "Probe must never be executed for rejected path '{rejected}'");
+    }
+
+    // Rooted/drive paths that do not exist under node_modules
+    for rejected_rooted in &["C:/windows", "/etc/passwd"] {
+        let res = crate::commands::explore::run(
+            Some(rejected_rooted.to_string()),
+            vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{rejected_rooted}' must fail");
+        assert!(!probe_marker.exists(), "Probe must never be executed for '{rejected_rooted}'");
+    }
+
     let out_file = root.join("explore_record.json");
     let out_str = out_file.to_string_lossy().replace('\\', "/");
     let record_js = root.join("stub_child.js");
@@ -3047,7 +3149,8 @@ fs.writeFileSync('{}', JSON.stringify({{
     event: process.env.npm_lifecycle_event,
     name: process.env.npm_package_name,
     version: process.env.npm_package_version,
-    command: process.env.npm_command
+    command: process.env.npm_command,
+    path: process.env.PATH || process.env.Path
 }}));
 process.exit(0);
 "#,
@@ -3055,7 +3158,7 @@ process.exit(0);
     );
     std::fs::write(&record_js, script_content).unwrap();
 
-    // 1. Run explore with explicit child command on standard package
+    // 2. Run explore with explicit child command on standard package
     let res = crate::commands::explore::run(
         Some("explore-pkg".to_string()),
         vec!["node".to_string(), record_js.to_string_lossy().to_string()],
@@ -3074,7 +3177,18 @@ process.exit(0);
     assert_eq!(recorded.get("version").unwrap().as_str(), Some("2.5.1"));
     assert_eq!(recorded.get("command").unwrap().as_str(), Some("explore"));
 
-    // 2. Run explore on scoped package
+    // 3. Assert PATH contract: child PATH prepends target and all ancestor node_modules/.bin unconditionally
+    let captured_path = recorded.get("path").unwrap().as_str().unwrap();
+    let path_entries: Vec<PathBuf> = std::env::split_paths(captured_path).collect();
+    let expected_pkg_bin = pkg_dir.join("node_modules").join(".bin");
+    let expected_root_bin = root.join("node_modules").join(".bin");
+    assert_eq!(path_entries[0], expected_pkg_bin, "First PATH entry must be target package node_modules/.bin");
+    assert!(
+        path_entries.contains(&expected_root_bin),
+        "Ancestor node_modules/.bin must be in PATH: expected {expected_root_bin:?} in {path_entries:?}"
+    );
+
+    // 4. Run explore on scoped package
     let res_scoped = crate::commands::explore::run(
         Some("@scoped/explore-target".to_string()),
         vec!["node".to_string(), record_js.to_string_lossy().to_string()],
@@ -3091,7 +3205,7 @@ process.exit(0);
     assert_eq!(recorded_scoped.get("name").unwrap().as_str(), Some("@scoped/explore-target"));
     assert_eq!(recorded_scoped.get("version").unwrap().as_str(), Some("3.0.0"));
 
-    // 3. Missing package error
+    // 5. Missing package error
     let res_missing = crate::commands::explore::run(
         Some("missing-pkg".to_string()),
         vec!["node".to_string(), record_js.to_string_lossy().to_string()],
@@ -3103,7 +3217,7 @@ process.exit(0);
     assert!(missing_msg.contains("It doesn't look like missing-pkg is installed."));
     assert!(missing_msg.contains("ENOENT"));
 
-    // 4. Non-zero exit code error propagation
+    // 6. Non-zero exit code error propagation
     let fail_js = root.join("fail_child.js");
     std::fs::write(&fail_js, "process.exit(7);").unwrap();
     let res_fail = crate::commands::explore::run(

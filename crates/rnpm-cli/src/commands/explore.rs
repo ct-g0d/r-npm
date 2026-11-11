@@ -2,53 +2,76 @@ use anyhow::Result;
 use rnpm_lifecycle::ScriptExitError;
 use std::path::{Path, PathBuf};
 
-/// Build the PATH environment variable with node_modules/.bin directories prepended.
-pub fn build_explore_path(pkg_dir: &Path, current_dir: &Path) -> String {
-    let mut bin_dirs = Vec::new();
-
-    // 1. Package's own nested node_modules/.bin
-    let pkg_bin = pkg_dir.join("node_modules").join(".bin");
-    if pkg_bin.is_dir() {
-        bin_dirs.push(pkg_bin);
+/// Normalize package target string to emulate npm's `join(this.npm.dir, join('/', pkgname))`
+/// and reject escaping or matching the node_modules root itself.
+pub fn normalize_explore_target(node_modules_dir: &Path, pkgname: &str) -> Option<PathBuf> {
+    let trimmed = pkgname.trim();
+    if trimmed.is_empty() {
+        return None;
     }
 
-    // 2. Ancestor node_modules/.bin up to current_dir
-    let mut cur = pkg_dir.parent();
-    while let Some(parent) = cur {
-        let parent_bin = parent.join(".bin");
-        if parent_bin.is_dir() && !bin_dirs.contains(&parent_bin) {
-            bin_dirs.push(parent_bin);
+    // Split components by both '/' and '\' to match path.join('/', pkgname) semantics
+    let mut stack: Vec<&str> = Vec::new();
+    for part in trimmed.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
         }
-        let nm_bin = parent.join("node_modules").join(".bin");
-        if nm_bin.is_dir() && !bin_dirs.contains(&nm_bin) {
-            bin_dirs.push(nm_bin);
+        if part == ".." {
+            stack.pop();
+        } else {
+            stack.push(part);
         }
-        if parent == current_dir {
-            break;
-        }
-        cur = parent.parent();
     }
 
-    let root_bin = current_dir.join("node_modules").join(".bin");
-    if root_bin.is_dir() && !bin_dirs.contains(&root_bin) {
-        bin_dirs.push(root_bin);
+    // If stack is empty, target resolved to the node_modules root itself (e.g. "..", ".", "/")
+    if stack.is_empty() {
+        return None;
     }
 
-    let bin_strs: Vec<String> = bin_dirs
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
+    let mut target = node_modules_dir.to_path_buf();
+    for part in stack {
+        target.push(part);
+    }
+    Some(target)
+}
+
+/// Build PATH matching `@npmcli/run-script/lib/set-path.js` and `rnpm-lifecycle`:
+/// Unconditionally walk up all directory ancestors from `pkg_dir` to root,
+/// prepending each ancestor's `node_modules/.bin` directory.
+pub fn build_explore_path(pkg_dir: &Path) -> String {
+    let mut bins: Vec<PathBuf> = pkg_dir
+        .ancestors()
+        .map(|dir| dir.join("node_modules").join(".bin"))
         .collect();
 
-    let path_sep = if cfg!(windows) { ";" } else { ":" };
-    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let inherited = std::env::var_os("PATH")
+        .or_else(|| std::env::var_os("Path"))
+        .unwrap_or_default();
+    bins.extend(std::env::split_paths(&inherited));
 
-    if bin_strs.is_empty() {
-        existing_path
-    } else if existing_path.is_empty() {
-        bin_strs.join(path_sep)
-    } else {
-        format!("{}{path_sep}{existing_path}", bin_strs.join(path_sep))
-    }
+    std::env::join_paths(bins)
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn usage_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "npm error code EUSAGE\n\
+         npm error\n\
+         npm error Browse an installed package\n\
+         npm error\n\
+         npm error Usage:\n\
+         npm error npm explore <pkg> [ -- <command>]\n\
+         npm error\n\
+         npm error Options:\n\
+         npm error [--shell <shell>]\n\
+         npm error\n\
+         npm error   --shell\n\
+         npm error     The shell to run for the `npm explore` command.\n\
+         npm error\n\
+         npm error\n\
+         npm error Run \"npm help explore\" for more info"
+    )
 }
 
 /// Execute `npm explore <pkg> [ -- <command>]`.
@@ -58,38 +81,14 @@ pub async fn run(
     shell_opt: Option<String>,
     current_dir: PathBuf,
 ) -> Result<()> {
-    let pkgname = package.ok_or_else(|| {
-        anyhow::anyhow!(
-            "npm error code EUSAGE\n\
-             npm error\n\
-             npm error Browse an installed package\n\
-             npm error\n\
-             npm error Usage:\n\
-             npm error npm explore <pkg> [ -- <command>]\n\
-             npm error\n\
-             npm error Options:\n\
-             npm error [--shell <shell>]\n\
-             npm error\n\
-             npm error   --shell\n\
-             npm error     The shell to run for the `npm explore` command.\n\
-             npm error\n\
-             npm error\n\
-             npm error Run \"npm help explore\" for more info"
-        )
-    })?;
+    let pkgname = package.ok_or_else(usage_error)?;
 
-    if pkgname == "." || pkgname.is_empty() {
-        return Err(anyhow::anyhow!(
-            "npm error code EUSAGE\n\
-             npm error\n\
-             npm error Browse an installed package\n\
-             npm error\n\
-             npm error Usage:\n\
-             npm error npm explore <pkg> [ -- <command>]"
-        ));
-    }
+    let node_modules_dir = current_dir.join("node_modules");
+    let pkg_dir = match normalize_explore_target(&node_modules_dir, &pkgname) {
+        Some(dir) => dir,
+        None => return Err(usage_error()),
+    };
 
-    let pkg_dir = current_dir.join("node_modules").join(&pkgname);
     let manifest_path = pkg_dir.join("package.json");
 
     if !manifest_path.is_file() {
@@ -123,7 +122,7 @@ pub async fn run(
         .unwrap_or("")
         .to_string();
 
-    let new_path = build_explore_path(&pkg_dir, &current_dir);
+    let new_path = build_explore_path(&pkg_dir);
 
     // Determine command to run
     let is_interactive = args.is_empty();
@@ -169,6 +168,7 @@ pub async fn run(
         .args(&cmd_args)
         .current_dir(&pkg_dir)
         .env("PATH", &new_path)
+        .env("Path", &new_path)
         .env("npm_lifecycle_event", "_explore")
         .env("npm_lifecycle_script", &script_str)
         .env("npm_package_name", &pkg_real_name)
@@ -201,13 +201,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_explore_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let current_dir = tmp.path().to_path_buf();
-        let pkg_dir = current_dir.join("node_modules").join("test-pkg");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
+    fn test_normalize_explore_target_rejections() {
+        let nm = PathBuf::from("C:/test/project/node_modules");
+        assert_eq!(normalize_explore_target(&nm, ""), None);
+        assert_eq!(normalize_explore_target(&nm, "."), None);
+        assert_eq!(normalize_explore_target(&nm, ".."), None);
+        assert_eq!(normalize_explore_target(&nm, "../.."), None);
+        assert_eq!(normalize_explore_target(&nm, "/"), None);
+    }
 
-        let path = build_explore_path(&pkg_dir, &current_dir);
+    #[test]
+    fn test_normalize_explore_target_valid() {
+        let nm = PathBuf::from("C:/test/project/node_modules");
+        assert_eq!(
+            normalize_explore_target(&nm, "foo"),
+            Some(nm.join("foo"))
+        );
+        assert_eq!(
+            normalize_explore_target(&nm, "@scope/pkg"),
+            Some(nm.join("@scope").join("pkg"))
+        );
+        assert_eq!(
+            normalize_explore_target(&nm, "../foo"),
+            Some(nm.join("foo"))
+        );
+        assert_eq!(
+            normalize_explore_target(&nm, "foo/../bar"),
+            Some(nm.join("bar"))
+        );
+    }
+
+    #[test]
+    fn test_build_explore_path_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules").join("a").join("node_modules").join("b");
+        let path = build_explore_path(&pkg_dir);
         assert!(!path.is_empty());
+        // Verify both package's node_modules/.bin and ancestor node_modules/.bin are present
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let entries: Vec<&str> = path.split(sep).collect();
+        assert!(entries.iter().any(|e| e.contains("b") && e.contains(".bin")));
+        assert!(entries.iter().any(|e| e.contains("a") && e.contains(".bin")));
     }
 }
