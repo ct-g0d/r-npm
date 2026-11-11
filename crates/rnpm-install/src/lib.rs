@@ -4663,8 +4663,12 @@ impl Installer {
                                     .map_err(|e| anyhow!("{e}"))?;
                             }
                             if let Some(payloads) = deferred_pack_files {
-                                let _ = sender.send_arc(payloads.pack.0, payloads.pack.1, 0o644);
-                                let _ = sender.send_arc(payloads.idx.0, payloads.idx.1, 0o644);
+                                sender
+                                    .send_arc(payloads.pack.0, payloads.pack.1, 0o644)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                                sender
+                                    .send_arc(payloads.idx.0, payloads.idx.1, 0o644)
+                                    .map_err(|e| anyhow!("{e}"))?;
                             }
                         } else {
                             for file in &decoded.files {
@@ -4676,7 +4680,9 @@ impl Installer {
                             let target_path = cache.blob_path(&sha512_hex);
                             if !target_path.exists() {
                                 if let Some(ref sender) = writer_sender_clone {
-                                    let _ = sender.send(target_path, blob_bytes, 0o644);
+                                    sender
+                                        .send(target_path, blob_bytes, 0o644)
+                                        .map_err(|e| anyhow!("{e}"))?;
                                 } else {
                                     let _ = cache.put_blob_direct(&blob_bytes, &sha512_hex);
                                 }

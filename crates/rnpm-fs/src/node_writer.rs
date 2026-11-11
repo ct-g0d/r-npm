@@ -17,7 +17,9 @@ const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '16', 1
 
 function pump() {
   while (inflight < concurrency && head < q.length) {
-    const item = q[head++];
+    const item = q[head];
+    q[head] = null;
+    head++;
     inflight++;
     const dir = path.dirname(item.p);
     let cur = dir;
@@ -47,11 +49,15 @@ function pump() {
         pump();
       });
   }
-  if (head > 1000 && head === q.length) {
-    q.length = 0;
+  if (head > 1024) {
+    q.splice(0, head);
     head = 0;
   }
   if (stdinEnded && inflight === 0 && head === q.length) {
+    if (process.env.RNPM_TIMING_DEBUG) {
+      const mem = process.memoryUsage();
+      console.error(`[TIMING_PROFILE] node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
+    }
     process.exit(failed ? 1 : 0);
   }
 }
@@ -59,6 +65,7 @@ function pump() {
 let hdr = null;
 
 process.stdin.on('readable', () => {
+  let count = 0;
   while (true) {
     if (!hdr) {
       const h = process.stdin.read(12);
@@ -75,6 +82,11 @@ process.stdin.on('readable', () => {
     const b = body.subarray(hdr.pLen);
     q.push({ p, b, m: hdr.mode });
     hdr = null;
+    count++;
+    if (count >= 32) {
+      pump();
+      count = 0;
+    }
   }
   pump();
 });
