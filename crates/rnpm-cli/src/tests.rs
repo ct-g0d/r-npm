@@ -2878,3 +2878,245 @@ fn test_lane3_preprocessing_edge_cases() {
         "Positionals foo and bar must be forwarded to script"
     );
 }
+
+#[tokio::test]
+async fn test_offline_help_search_with_fixture() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fixtures")
+        .join("help-search")
+        .join("content");
+
+    let docs = crate::commands::help_search::load_documentation(Some(&fixture_dir)).unwrap();
+    assert_eq!(docs.len(), 3);
+
+    // 1. Search for "install"
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].cmd, "npm help install");
+    let hits = results[0].hits.get("install").copied().unwrap_or(0);
+    assert!(hits > 0);
+
+    let output = crate::commands::help_search::format_search_results(&["install".to_string()], &results, false);
+    assert!(output.starts_with("Top hits for \"install\"\n"));
+    assert!(output.contains("\u{2014}"));
+    assert!(output.contains("npm help install"));
+    assert!(output.ends_with("(run with -l or --long to see more context)"));
+
+    // 2. Search for nonexistent term
+    let no_match = crate::commands::help_search::search_documents(&["xyz_no_such_term".to_string()], &docs);
+    let output_none = crate::commands::help_search::format_search_results(&["xyz_no_such_term".to_string()], &no_match, false);
+    assert_eq!(output_none, "No matches in help for: xyz_no_such_term\n");
+
+    // 3. Long search
+    let output_long = crate::commands::help_search::format_search_results(&["prune".to_string()], &crate::commands::help_search::search_documents(&["prune".to_string()], &docs), true);
+    assert!(output_long.contains("npm help prune"));
+    assert!(output_long.contains("--------------------------------------------------------------------------------"));
+}
+
+#[tokio::test]
+async fn test_offline_help_search_embedded_parity() {
+    let docs = crate::commands::help_search::load_documentation(None).unwrap();
+    assert_eq!(docs.len(), 91);
+
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].cmd, "npm help install");
+    assert_eq!(results[0].hits.get("install"), Some(&197));
+}
+
+#[tokio::test]
+async fn test_offline_edit_stub_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Create root package.json
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    // Create installed packages
+    let pkg_dir = root.join("node_modules").join("my-test-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("package.json"), r#"{"name":"my-test-pkg","version":"1.0.0"}"#).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("sub-pkg");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/sub-pkg","version":"1.0.0"}"#).unwrap();
+
+    // Stub editor recording script
+    let out_file = root.join("editor_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_editor.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{ argv: process.argv, cwd: process.cwd() }}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    let editor_cmd = format!("node \"{}\" --custom-flag", record_js.to_string_lossy());
+
+    // 1. Run edit on standard package
+    let res = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "edit failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv = recorded.get("argv").unwrap().as_array().unwrap();
+    let cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+
+    // Verify cwd is project root (matching npm behavior)
+    let expected_root_norm = root.canonicalize().unwrap_or(root.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(cwd).canonicalize().unwrap_or(PathBuf::from(cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_root_norm);
+
+    // Verify editor argv contains target package dir as last argument
+    assert!(argv.len() >= 3);
+    assert_eq!(argv[argv.len() - 2].as_str(), Some("--custom-flag"));
+    let target_arg = argv[argv.len() - 1].as_str().unwrap();
+    assert!(target_arg.ends_with("my-test-pkg"));
+
+    // 2. Run edit on scoped package
+    let res_scoped = crate::commands::edit::run(
+        Some("@scoped/sub-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped edit failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv_scoped = recorded_scoped.get("argv").unwrap().as_array().unwrap();
+    let target_arg_scoped = argv_scoped[argv_scoped.len() - 1].as_str().unwrap();
+    assert!(target_arg_scoped.replace('\\', "/").ends_with("@scoped/sub-pkg"));
+
+    // 3. Missing package error
+    let res_missing = crate::commands::edit::run(
+        Some("no-such-package".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let err_msg = format!("{}", res_missing.unwrap_err());
+    assert!(err_msg.contains("ENOENT"));
+
+    // 4. Failing editor process propagates exit code
+    let fail_js = root.join("fail_editor.js");
+    std::fs::write(&fail_js, "process.exit(42);").unwrap();
+    let fail_editor = format!("node \"{}\"", fail_js.to_string_lossy());
+    let res_fail = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(fail_editor),
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let fail_msg = format!("{}", res_fail.unwrap_err());
+    assert!(fail_msg.contains("42"));
+}
+
+#[tokio::test]
+async fn test_offline_explore_child_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    let pkg_dir = root.join("node_modules").join("explore-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("package.json"), r#"{"name":"explore-pkg","version":"2.5.1"}"#).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("explore-target");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/explore-target","version":"3.0.0"}"#).unwrap();
+
+    let out_file = root.join("explore_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_child.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{
+    cwd: process.cwd(),
+    event: process.env.npm_lifecycle_event,
+    name: process.env.npm_package_name,
+    version: process.env.npm_package_version,
+    command: process.env.npm_command
+}}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    // 1. Run explore with explicit child command on standard package
+    let res = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "explore failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+    let expected_pkg_norm = pkg_dir.canonicalize().unwrap_or(pkg_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(actual_cwd).canonicalize().unwrap_or(PathBuf::from(actual_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_pkg_norm);
+    assert_eq!(recorded.get("event").unwrap().as_str(), Some("_explore"));
+    assert_eq!(recorded.get("name").unwrap().as_str(), Some("explore-pkg"));
+    assert_eq!(recorded.get("version").unwrap().as_str(), Some("2.5.1"));
+    assert_eq!(recorded.get("command").unwrap().as_str(), Some("explore"));
+
+    // 2. Run explore on scoped package
+    let res_scoped = crate::commands::explore::run(
+        Some("@scoped/explore-target".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped explore failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_scoped_cwd = recorded_scoped.get("cwd").unwrap().as_str().unwrap();
+    let expected_scoped_norm = scoped_dir.canonicalize().unwrap_or(scoped_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_scoped_norm = PathBuf::from(actual_scoped_cwd).canonicalize().unwrap_or(PathBuf::from(actual_scoped_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_scoped_norm, expected_scoped_norm);
+    assert_eq!(recorded_scoped.get("name").unwrap().as_str(), Some("@scoped/explore-target"));
+    assert_eq!(recorded_scoped.get("version").unwrap().as_str(), Some("3.0.0"));
+
+    // 3. Missing package error
+    let res_missing = crate::commands::explore::run(
+        Some("missing-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let missing_msg = format!("{}", res_missing.unwrap_err());
+    assert!(missing_msg.contains("It doesn't look like missing-pkg is installed."));
+    assert!(missing_msg.contains("ENOENT"));
+
+    // 4. Non-zero exit code error propagation
+    let fail_js = root.join("fail_child.js");
+    std::fs::write(&fail_js, "process.exit(7);").unwrap();
+    let res_fail = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), fail_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let exit_err = res_fail.unwrap_err();
+    if let Some(script_err) = exit_err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+        assert_eq!(script_err.exit_code, 7);
+    } else {
+        panic!("Expected ScriptExitError with exit code 7, got: {:?}", exit_err);
+    }
+}
