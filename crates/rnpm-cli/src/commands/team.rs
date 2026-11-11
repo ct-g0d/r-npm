@@ -1,3 +1,6 @@
+use crate::commands::client_helper::{
+    format_http_error, parse_json_response, url_encode, CommandClient,
+};
 use anyhow::Result;
 use reqwest::Url;
 use std::path::Path;
@@ -10,76 +13,6 @@ pub(crate) struct TeamArgs {
     pub registry: Option<String>,
     pub json: bool,
     pub parseable: bool,
-}
-
-fn resolve_registry_and_token(
-    current_dir: &Path,
-    registry: Option<&str>,
-) -> Result<(Url, String)> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let token = config.npmrc.get_auth_token(&registry_url);
-    let token = match token {
-        Some(t) => t.to_string(),
-        None => {
-            return Err(anyhow::anyhow!(
-                "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-            ));
-        }
-    };
-
-    Ok((registry_url, token))
-}
-
-fn format_http_error(
-    method: &str,
-    target_url: &Url,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> anyhow::Error {
-    let code = status.as_u16();
-    let reason = status.canonical_reason().unwrap_or("Error");
-    let msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("error"))
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                reason.to_ascii_lowercase()
-            } else {
-                body.trim().to_string()
-            }
-        });
-
-    anyhow::anyhow!("npm error code E{code}\nnpm error {code} {reason} - {method} {target_url} - {msg}")
-}
-
-fn url_encode(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for b in input.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(b as char);
-            }
-            _ => {
-                encoded.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    encoded
 }
 
 fn split_entity(raw: &str) -> Option<(String, String)> {
@@ -123,25 +56,25 @@ async fn run_create(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>"))?;
     let entity = format!("{scope}:{team}");
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/org/{}/team", url_encode(&scope)))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let payload = serde_json::json!({
-        "name": team,
-        "description": args.description.as_deref(),
-    });
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("name".to_string(), serde_json::Value::String(team.clone()));
+    if let Some(desc) = &args.description {
+        payload_map.insert(
+            "description".to_string(),
+            serde_json::Value::String(desc.clone()),
+        );
+    }
+    let payload = serde_json::Value::Object(payload_map);
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .put(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let req = client
+        .request(reqwest::Method::PUT, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&payload);
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
 
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -158,7 +91,7 @@ async fn run_create(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if args.parseable {
         println!("{entity}\tcreated");
-    } else {
+    } else if !client.silent {
         println!("+@{entity}");
     }
 
@@ -174,19 +107,20 @@ async fn run_destroy(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>"))?;
     let entity = format!("{scope}:{team}");
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
-    let target = Url::parse(&format!("{base}/-/team/{}/{}", url_encode(&scope), url_encode(&team)))
-        .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
+    let target = Url::parse(&format!(
+        "{base}/-/team/{}/{}",
+        url_encode(&scope),
+        url_encode(&team)
+    ))
+    .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .delete(target.clone())
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
-
+    let req = client.request(
+        reqwest::Method::DELETE,
+        target.clone(),
+        args.otp.as_deref(),
+    );
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -202,7 +136,7 @@ async fn run_destroy(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if args.parseable {
         println!("{entity}\tdeleted");
-    } else {
+    } else if !client.silent {
         println!("-@{entity}");
     }
 
@@ -223,24 +157,23 @@ async fn run_add(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>"))?;
     let entity = format!("{scope}:{team}");
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
-    let target = Url::parse(&format!("{base}/-/team/{}/{}/user", url_encode(&scope), url_encode(&team)))
-        .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
+    let target = Url::parse(&format!(
+        "{base}/-/team/{}/{}/user",
+        url_encode(&scope),
+        url_encode(&team)
+    ))
+    .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
     let payload = serde_json::json!({
         "user": user,
     });
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .put(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let req = client
+        .request(reqwest::Method::PUT, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&payload);
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
 
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -258,7 +191,7 @@ async fn run_add(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if args.parseable {
         println!("{user}\t{entity}\tadded");
-    } else {
+    } else if !client.silent {
         println!("{user} added to @{entity}");
     }
 
@@ -279,24 +212,23 @@ async fn run_rm(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>"))?;
     let entity = format!("{scope}:{team}");
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
-    let target = Url::parse(&format!("{base}/-/team/{}/{}/user", url_encode(&scope), url_encode(&team)))
-        .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
+    let target = Url::parse(&format!(
+        "{base}/-/team/{}/{}/user",
+        url_encode(&scope),
+        url_encode(&team)
+    ))
+    .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
     let payload = serde_json::json!({
         "user": user,
     });
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .delete(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let req = client
+        .request(reqwest::Method::DELETE, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&payload);
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
 
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -314,7 +246,7 @@ async fn run_rm(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if args.parseable {
         println!("{user}\t{entity}\tremoved");
-    } else {
+    } else if !client.silent {
         println!("{user} removed from @{entity}");
     }
 
@@ -328,9 +260,8 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>"))?;
     let entity = raw_entity.trim_start_matches('@');
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
-    let client = reqwest::Client::builder().build()?;
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
 
     if entity.contains(':') {
         let (scope, team) = split_entity(entity)
@@ -342,13 +273,7 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         ))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-        let mut req = client
-            .get(target.clone())
-            .header("authorization", format!("Bearer {token}"));
-        if let Some(otp) = &args.otp {
-            req = req.header("npm-otp", otp);
-        }
-
+        let req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -356,7 +281,17 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
             return Err(format_http_error("GET", &target, status, &body));
         }
 
-        let mut users: Vec<String> = resp.json().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
+        let json_val = parse_json_response(&body, &target)?;
+        let arr = json_val.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json array"
+            )
+        })?;
+        let mut users: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
         users.sort();
 
         if args.json {
@@ -365,7 +300,7 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
             for user in &users {
                 println!("{user}");
             }
-        } else {
+        } else if !client.silent {
             let plural = if users.len() == 1 { "" } else { "s" };
             let more = if users.is_empty() { "" } else { ":" };
             println!("@{scope}:{team} has {} user{plural}{more}", users.len());
@@ -378,13 +313,7 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         let target = Url::parse(&format!("{base}/-/org/{}/team?format=cli", url_encode(scope)))
             .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-        let mut req = client
-            .get(target.clone())
-            .header("authorization", format!("Bearer {token}"));
-        if let Some(otp) = &args.otp {
-            req = req.header("npm-otp", otp);
-        }
-
+        let req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -392,7 +321,17 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
             return Err(format_http_error("GET", &target, status, &body));
         }
 
-        let mut teams: Vec<String> = resp.json().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
+        let json_val = parse_json_response(&body, &target)?;
+        let arr = json_val.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json array"
+            )
+        })?;
+        let mut teams: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
         teams.sort();
 
         if args.json {
@@ -401,7 +340,7 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
             for team in &teams {
                 println!("{team}");
             }
-        } else {
+        } else if !client.silent {
             let plural = if teams.len() == 1 { "" } else { "s" };
             let more = if teams.is_empty() { "" } else { ":" };
             println!("@{scope} has {} team{plural}{more}", teams.len());

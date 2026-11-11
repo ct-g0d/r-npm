@@ -34,3 +34,4 @@ pub mod allow_scripts;
 pub mod org;
 pub mod team;
 pub mod profile;
+pub mod client_helper;

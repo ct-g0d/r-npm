@@ -1,3 +1,4 @@
+use crate::commands::client_helper::{format_http_error, parse_json_response, CommandClient};
 use anyhow::Result;
 use reqwest::Url;
 use std::collections::BTreeMap;
@@ -35,61 +36,6 @@ const WRITABLE_PROFILE_KEYS: &[&str] = &[
     "github",
 ];
 
-fn resolve_registry_and_token(
-    current_dir: &Path,
-    registry: Option<&str>,
-) -> Result<(Url, String)> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let token = config.npmrc.get_auth_token(&registry_url);
-    let token = match token {
-        Some(t) => t.to_string(),
-        None => {
-            return Err(anyhow::anyhow!(
-                "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-            ));
-        }
-    };
-
-    Ok((registry_url, token))
-}
-
-fn format_http_error(
-    method: &str,
-    target_url: &Url,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> anyhow::Error {
-    let code = status.as_u16();
-    let reason = status.canonical_reason().unwrap_or("Error");
-    let msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("error"))
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                reason.to_ascii_lowercase()
-            } else {
-                body.trim().to_string()
-            }
-        });
-
-    anyhow::anyhow!("npm error code E{code}\nnpm error {code} {reason} - {method} {target_url} - {msg}")
-}
-
 pub(crate) async fn run(args: ProfileArgs, current_dir: &Path) -> Result<()> {
     let action_str = match &args.action {
         Some(a) => a.as_str(),
@@ -114,19 +60,12 @@ pub(crate) async fn run(args: ProfileArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_get(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/npm/v1/user"))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .get(target.clone())
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
-
+    let req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -134,12 +73,16 @@ async fn run_get(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         return Err(format_http_error("GET", &target, status, &body));
     }
 
-    let mut info: serde_json::Map<String, serde_json::Value> = resp
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let body = resp.text().await.unwrap_or_default();
+    let json_val = parse_json_response(&body, &target)?;
+    let mut info = json_val
+        .as_object()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
+            )
+        })?
+        .clone();
 
     if let Some(val) = info.get("cidr_whitelist") {
         if val.is_null() || val.as_array().is_some_and(|a| a.is_empty()) {
@@ -222,7 +165,9 @@ async fn run_get(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
             .iter()
             .map(|k| cleaned.get(*k).cloned().unwrap_or_default())
             .collect();
-        println!("{}", values.join("\t"));
+        if !client.silent {
+            println!("{}", values.join("\t"));
+        }
     } else if args.parseable {
         for (k, v) in &info {
             if k == "tfa" {
@@ -233,7 +178,7 @@ async fn run_get(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
                 println!("{k}\t{v}");
             }
         }
-    } else {
+    } else if !client.silent {
         for key in KNOWN_PROFILE_KEYS {
             if let Some(val) = cleaned.get(*key) {
                 println!("{key}: {val}");
@@ -280,20 +225,13 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
 
     let value = args.args[1..].join(" ");
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/npm/v1/user"))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let client = reqwest::Client::builder().build()?;
-
     // 1. Fetch current profile to preserve existing fields
-    let mut get_req = client
-        .get(target.clone())
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(otp) = &args.otp {
-        get_req = get_req.header("npm-otp", otp);
-    }
+    let get_req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
     let get_resp = get_req.send().await?;
     if !get_resp.status().is_success() {
         let status = get_resp.status();
@@ -301,12 +239,13 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         return Err(format_http_error("GET", &target, status, &body));
     }
 
-    let current_profile: serde_json::Map<String, serde_json::Value> = get_resp
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let get_body = get_resp.text().await.unwrap_or_default();
+    let get_val = parse_json_response(&get_body, &target)?;
+    let current_profile = get_val.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
+        )
+    })?;
 
     // 2. Build updated object preserving writable keys and setting new value
     let mut new_user = serde_json::Map::new();
@@ -329,14 +268,10 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         }
     }
 
-    let mut post_req = client
-        .post(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let post_req = client
+        .request(reqwest::Method::POST, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&serde_json::Value::Object(new_user));
-    if let Some(otp) = &args.otp {
-        post_req = post_req.header("npm-otp", otp);
-    }
 
     let post_resp = post_req.send().await?;
     if !post_resp.status().is_success() {
@@ -345,15 +280,19 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         return Err(format_http_error("POST", &target, status, &body));
     }
 
-    let result_obj: serde_json::Map<String, serde_json::Value> = post_resp
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let post_body = post_resp.text().await.unwrap_or_default();
+    let post_val = parse_json_response(&post_body, &target)?;
+    let result_obj = post_val.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
+        )
+    })?;
 
     if args.json {
-        let prop_val = result_obj.get(&prop).cloned().unwrap_or(serde_json::Value::Null);
+        let prop_val = result_obj
+            .get(&prop)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let out = serde_json::json!({
             &prop: prop_val
         });
@@ -364,10 +303,12 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         println!("{prop}\t{prop_str}");
-    } else if let Some(prop_str) = result_obj.get(&prop).and_then(|v| v.as_str()) {
-        println!("Set {prop} to {prop_str}");
-    } else {
-        println!("Set {prop}");
+    } else if !client.silent {
+        if let Some(prop_str) = result_obj.get(&prop).and_then(|v| v.as_str()) {
+            println!("Set {prop} to {prop_str}");
+        } else {
+            println!("Set {prop}");
+        }
     }
 
     Ok(())

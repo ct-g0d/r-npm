@@ -2878,3 +2878,593 @@ fn test_lane3_preprocessing_edge_cases() {
         "Positionals foo and bar must be forwarded to script"
     );
 }
+
+// =========================================================================
+// Account & Registry Management Parity Tests (Org, Team, Profile)
+// =========================================================================
+
+#[derive(Clone, Debug)]
+struct MockHttpExchange {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+#[tokio::test]
+async fn test_org_rm_followup_error_propagation_and_order() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            let mut body_str = String::new();
+                            let mut in_headers = true;
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if in_headers {
+                                    if l.is_empty() {
+                                        in_headers = false;
+                                        continue;
+                                    }
+                                    if let Some((k, v)) = l.split_once(':') {
+                                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                    }
+                                } else {
+                                    body_str.push_str(line);
+                                    body_str.push('\n');
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method: method.clone(),
+                                path: path.clone(),
+                                headers,
+                                body: body_str.trim().to_string(),
+                            });
+
+                            let (status_line, body) = if method == "DELETE" && path == "/-/org/acme/user" {
+                                ("HTTP/1.1 200 OK", "{\"user\":\"alice\"}".to_string())
+                            } else if method == "GET" && path == "/-/org/acme/user" {
+                                ("HTTP/1.1 403 Forbidden", "{\"message\":\"forbidden roster\"}".to_string())
+                            } else {
+                                ("HTTP/1.1 404 Not Found", "{}".to_string())
+                            };
+
+                            let resp = format!(
+                                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // Write .npmrc with Bearer auth token
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "rm", "acme", "alice"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_err(), "org rm must return error when follow-up GET fails");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("npm error code E403"), "Must contain code E403: {err_msg}");
+    assert!(err_msg.contains("403 Forbidden"), "Must contain 403 Forbidden: {err_msg}");
+    assert!(err_msg.contains("forbidden roster"), "Must contain registry message: {err_msg}");
+    assert!(err_msg.contains("In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy"), "Must contain security policy text: {err_msg}");
+
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 2, "Must make exactly 2 requests (DELETE then GET)");
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(reqs[0].path, "/-/org/acme/user");
+    assert_eq!(reqs[0].body, "{\"user\":\"alice\"}");
+    assert_eq!(reqs[1].method, "GET");
+    assert_eq!(reqs[1].path, "/-/org/acme/user");
+}
+
+#[tokio::test]
+async fn test_profile_set_malformed_read_aborts_with_zero_post() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method: method.clone(),
+                                path: path.clone(),
+                                headers: BTreeMap::new(),
+                                body: String::new(),
+                            });
+
+                            let (status_line, body) = if method == "GET" && path == "/-/npm/v1/user" {
+                                ("HTTP/1.1 200 OK", "not-json".to_string())
+                            } else {
+                                ("HTTP/1.1 500 Internal Error", "unexpected".to_string())
+                            };
+
+                            let resp = format!(
+                                "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "profile", "set", "fullname", "Alice Example"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_err(), "profile set must fail on malformed JSON read");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("FETCH_ERROR"), "Error must contain FETCH_ERROR: {err_msg}");
+    assert!(err_msg.contains("invalid json response body"), "Error must describe invalid json: {err_msg}");
+
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 1, "Must only issue GET; ZERO POST requests allowed");
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/-/npm/v1/user");
+}
+
+#[tokio::test]
+async fn test_basic_auth_and_bearer_auth_resolution() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if l.is_empty() { break; }
+                                if let Some((k, v)) = l.split_once(':') {
+                                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: String::new(),
+                            });
+
+                            let body = "{\"alice\":\"owner\"}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // 1. Basic Auth via _auth
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_auth = ZHVtbXk6ZHVtbXk=\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    assert!(res.is_ok(), "org ls with _auth basic credential must succeed: {:?}", res.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let auth_hdr = reqs[0].headers.get("authorization").cloned().unwrap_or_default();
+        assert_eq!(auth_hdr, "Basic ZHVtbXk6ZHVtbXk=");
+    }
+
+    // 2. Bearer Auth via _authToken
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = my-secret-token\n"),
+    ).unwrap();
+
+    let cli2 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_ok(), "org ls with _authToken bearer credential must succeed: {:?}", res2.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 2);
+        let auth_hdr = reqs[1].headers.get("authorization").cloned().unwrap_or_default();
+        assert_eq!(auth_hdr, "Bearer my-secret-token");
+    }
+
+    // 3. Unauthenticated -> ENEEDAUTH
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n"),
+    ).unwrap();
+
+    let cli3 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res3 = run_cli(cli3, Some(tmp.path().to_path_buf())).await;
+    assert!(res3.is_err(), "org ls without credentials must fail with ENEEDAUTH");
+    assert!(res3.unwrap_err().to_string().contains("ENEEDAUTH"));
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_team_create_omits_null_description_and_escapes() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            let mut body_str = String::new();
+                            let mut in_headers = true;
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if in_headers {
+                                    if l.is_empty() {
+                                        in_headers = false;
+                                        continue;
+                                    }
+                                    if let Some((k, v)) = l.split_once(':') {
+                                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                    }
+                                } else {
+                                    body_str.push_str(line);
+                                    body_str.push('\n');
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: body_str.trim().to_string(),
+                            });
+
+                            let body = "{\"created\":true}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    // 1. Without description -> exactly {"name":"dev"}
+    let cli = Cli::try_parse_from(["rnpm", "team", "create", "acme:dev"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    assert!(res.is_ok(), "team create without description must succeed: {:?}", res.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/-/org/acme/team");
+        assert_eq!(reqs[0].body, "{\"name\":\"dev\"}", "Body must strictly omit description field");
+    }
+
+    // 2. With description -> contains description
+    let cli2 = Cli::try_parse_from(["rnpm", "team", "create", "@acme:core", "--description", "Core Developers"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_ok(), "team create with description must succeed: {:?}", res2.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].method, "PUT");
+        assert_eq!(reqs[1].path, "/-/org/acme/team");
+        assert!(reqs[1].body.contains("\"description\":\"Core Developers\""));
+    }
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_silent_flag_and_otp_forwarding() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if l.is_empty() { break; }
+                                if let Some((k, v)) = l.split_once(':') {
+                                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: String::new(),
+                            });
+
+                            let body = "{\"alice\":\"developer\"}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\nloglevel = silent\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "ls", "acme", "--otp", "654321"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_ok(), "org ls with silent config and otp must succeed");
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].headers.get("npm-otp"), Some(&"654321".to_string()));
+}
+
+#[tokio::test]
+async fn test_malformed_json_org_team_profile() {
+    let tmp = tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let body = "not-json-content";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    // 1. org ls with malformed JSON
+    let cli1 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res1 = run_cli(cli1, Some(tmp.path().to_path_buf())).await;
+    assert!(res1.is_err(), "org ls must fail on malformed json");
+    let err1 = res1.unwrap_err().to_string();
+    assert!(err1.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err1}");
+
+    // 2. team ls with malformed JSON
+    let cli2 = Cli::try_parse_from(["rnpm", "team", "ls", "acme"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_err(), "team ls must fail on malformed json");
+    let err2 = res2.unwrap_err().to_string();
+    assert!(err2.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err2}");
+
+    // 3. profile get with malformed JSON
+    let cli3 = Cli::try_parse_from(["rnpm", "profile", "get"]).unwrap();
+    let res3 = run_cli(cli3, Some(tmp.path().to_path_buf())).await;
+    assert!(res3.is_err(), "profile get must fail on malformed json");
+    let err3 = res3.unwrap_err().to_string();
+    assert!(err3.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err3}");
+
+    let _ = tx.send(());
+}
+
+#[test]
+fn test_http_error_formatting_parity() {
+    use crate::commands::client_helper::format_http_error;
+
+    let target = reqwest::Url::parse("http://127.0.0.1:8080/-/npm/v1/user").unwrap();
+
+    // 401
+    let err_401 = format_http_error("GET", &target, reqwest::StatusCode::UNAUTHORIZED, "{\"message\":\"login required\"}");
+    let s_401 = err_401.to_string();
+    assert!(s_401.contains("npm error code E401"), "Got: {s_401}");
+    assert!(s_401.contains("401 Unauthorized - GET http://127.0.0.1:8080/-/npm/v1/user - login required"), "Got: {s_401}");
+
+    // 403 (with security policy note)
+    let err_403 = format_http_error("GET", &target, reqwest::StatusCode::FORBIDDEN, "{\"message\":\"forbidden roster\"}");
+    let s_403 = err_403.to_string();
+    assert!(s_403.contains("npm error code E403"), "Got: {s_403}");
+    assert!(s_403.contains("403 Forbidden - GET http://127.0.0.1:8080/-/npm/v1/user - forbidden roster"), "Got: {s_403}");
+    assert!(s_403.contains("In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy"), "Got: {s_403}");
+
+    // 404
+    let err_404 = format_http_error("GET", &target, reqwest::StatusCode::NOT_FOUND, "{\"error\":\"not found\"}");
+    let s_404 = err_404.to_string();
+    assert!(s_404.contains("npm error code E404"), "Got: {s_404}");
+    assert!(s_404.contains("404 Not Found - GET http://127.0.0.1:8080/-/npm/v1/user - not found"), "Got: {s_404}");
+}
+
+#[test]
+fn test_client_helper_auth_resolution_matrix() {
+    use crate::commands::client_helper::{resolve_auth, RegistryAuth};
+
+    let reg = reqwest::Url::parse("https://registry.npmjs.org/").unwrap();
+
+    // 1. _authToken -> Bearer
+    let mut npmrc1 = rnpm_config::Npmrc::new();
+    npmrc1.settings.insert("//registry.npmjs.org/:_authToken".to_string(), "token-123".to_string());
+    assert_eq!(resolve_auth(&npmrc1, &reg), Some(RegistryAuth::Bearer("token-123".to_string())));
+
+    // 2. _auth -> Basic
+    let mut npmrc2 = rnpm_config::Npmrc::new();
+    npmrc2.settings.insert("//registry.npmjs.org/:_auth".to_string(), "ZHVtbXk6ZHVtbXk=".to_string());
+    assert_eq!(resolve_auth(&npmrc2, &reg), Some(RegistryAuth::Basic("ZHVtbXk6ZHVtbXk=".to_string())));
+
+    // 3. username + _password -> Basic
+    let mut npmrc3 = rnpm_config::Npmrc::new();
+    npmrc3.settings.insert("//registry.npmjs.org/:username".to_string(), "user".to_string());
+    npmrc3.settings.insert("//registry.npmjs.org/:_password".to_string(), "pass".to_string());
+    let encoded = data_encoding::BASE64.encode(b"user:pass");
+    assert_eq!(resolve_auth(&npmrc3, &reg), Some(RegistryAuth::Basic(encoded)));
+
+    // 4. Missing credentials -> None
+    let npmrc4 = rnpm_config::Npmrc::new();
+    assert_eq!(resolve_auth(&npmrc4, &reg), None);
+}
+
+

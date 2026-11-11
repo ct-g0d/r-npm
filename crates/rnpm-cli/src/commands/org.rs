@@ -1,3 +1,6 @@
+use crate::commands::client_helper::{
+    format_http_error, parse_json_response, url_encode, CommandClient,
+};
 use anyhow::Result;
 use reqwest::Url;
 use std::collections::BTreeMap;
@@ -10,76 +13,6 @@ pub(crate) struct OrgArgs {
     pub registry: Option<String>,
     pub json: bool,
     pub parseable: bool,
-}
-
-fn resolve_registry_and_token(
-    current_dir: &Path,
-    registry: Option<&str>,
-) -> Result<(Url, String)> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let token = config.npmrc.get_auth_token(&registry_url);
-    let token = match token {
-        Some(t) => t.to_string(),
-        None => {
-            return Err(anyhow::anyhow!(
-                "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-            ));
-        }
-    };
-
-    Ok((registry_url, token))
-}
-
-fn format_http_error(
-    method: &str,
-    target_url: &Url,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> anyhow::Error {
-    let code = status.as_u16();
-    let reason = status.canonical_reason().unwrap_or("Error");
-    let msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("error"))
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                reason.to_ascii_lowercase()
-            } else {
-                body.trim().to_string()
-            }
-        });
-
-    anyhow::anyhow!("npm error code E{code}\nnpm error {code} {reason} - {method} {target_url} - {msg}")
-}
-
-fn url_encode(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for b in input.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(b as char);
-            }
-            _ => {
-                encoded.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    encoded
 }
 
 pub(crate) async fn run(args: OrgArgs, current_dir: &Path) -> Result<()> {
@@ -110,19 +43,12 @@ async fn run_ls(args: &OrgArgs, current_dir: &Path) -> Result<()> {
     let org = raw_org.trim_start_matches('@').trim_start_matches('~');
     let filter_user = args.args.get(1).map(|u| u.trim_start_matches('@'));
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/org/{}/user", url_encode(org)))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .get(target.clone())
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
-
+    let req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -130,7 +56,20 @@ async fn run_ls(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         return Err(format_http_error("GET", &target, status, &body));
     }
 
-    let roster: BTreeMap<String, String> = resp.json().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_default();
+    let json_val = parse_json_response(&body, &target)?;
+    let roster_obj = json_val.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
+        )
+    })?;
+
+    let mut roster: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in roster_obj {
+        let role = v.as_str().unwrap_or("developer").to_string();
+        roster.insert(k.clone(), role);
+    }
+
     let display_roster: BTreeMap<String, String> = if let Some(user) = filter_user {
         if let Some(role) = roster.get(user) {
             let mut map = BTreeMap::new();
@@ -150,7 +89,7 @@ async fn run_ls(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         for (user, role) in &display_roster {
             println!("{user}\t{role}");
         }
-    } else {
+    } else if !client.silent {
         for (user, role) in &display_roster {
             println!("{user} - {role}");
         }
@@ -183,8 +122,8 @@ async fn run_set(args: &OrgArgs, current_dir: &Path) -> Result<()> {
     let org = raw_org.trim_start_matches('@').trim_start_matches('~');
     let user = raw_user.trim_start_matches('@').trim_start_matches('~');
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/org/{}/user", url_encode(org)))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
@@ -193,15 +132,10 @@ async fn run_set(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         "role": role,
     });
 
-    let client = reqwest::Client::builder().build()?;
-    let mut req = client
-        .put(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let req = client
+        .request(reqwest::Method::PUT, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&payload);
-    if let Some(otp) = &args.otp {
-        req = req.header("npm-otp", otp);
-    }
 
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -210,7 +144,9 @@ async fn run_set(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         return Err(format_http_error("PUT", &target, status, &body));
     }
 
-    let result_json: serde_json::Value = resp.json().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_default();
+    let result_json = parse_json_response(&body, &target)?;
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result_json)?);
     } else if args.parseable {
@@ -234,7 +170,7 @@ async fn run_set(args: &OrgArgs, current_dir: &Path) -> Result<()> {
             .unwrap_or(role);
         println!("org\torgsize\tuser\trole");
         println!("{org_name}\t{org_size}\t{res_user}\t{res_role}");
-    } else {
+    } else if !client.silent {
         let org_name = result_json
             .get("org")
             .and_then(|o| o.get("name"))
@@ -273,8 +209,8 @@ async fn run_rm(args: &OrgArgs, current_dir: &Path) -> Result<()> {
     let org = raw_org.trim_start_matches('@').trim_start_matches('~');
     let user = raw_user.trim_start_matches('@').trim_start_matches('~');
 
-    let (registry_url, token) = resolve_registry_and_token(current_dir, args.registry.as_deref())?;
-    let base = registry_url.as_str().trim_end_matches('/');
+    let client = CommandClient::new(current_dir, args.registry.as_deref())?;
+    let base = client.registry_url.as_str().trim_end_matches('/');
     let target = Url::parse(&format!("{base}/-/org/{}/user", url_encode(org)))
         .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
@@ -282,15 +218,10 @@ async fn run_rm(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         "user": user,
     });
 
-    let client = reqwest::Client::builder().build()?;
-    let mut del_req = client
-        .delete(target.clone())
-        .header("authorization", format!("Bearer {token}"))
+    let del_req = client
+        .request(reqwest::Method::DELETE, target.clone(), args.otp.as_deref())
         .header("content-type", "application/json")
         .json(&payload);
-    if let Some(otp) = &args.otp {
-        del_req = del_req.header("npm-otp", otp);
-    }
 
     let del_resp = del_req.send().await?;
     if !del_resp.status().is_success() {
@@ -300,19 +231,22 @@ async fn run_rm(args: &OrgArgs, current_dir: &Path) -> Result<()> {
     }
 
     // Now query the updated roster to match npm's userCount reporting
-    let mut get_req = client
-        .get(target.clone())
-        .header("authorization", format!("Bearer {token}"));
-    if let Some(otp) = &args.otp {
-        get_req = get_req.header("npm-otp", otp);
-    }
+    let get_req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
     let get_resp = get_req.send().await?;
-    let user_count = if get_resp.status().is_success() {
-        let roster: BTreeMap<String, String> = get_resp.json().await.unwrap_or_default();
-        roster.len()
-    } else {
-        0
-    };
+    if !get_resp.status().is_success() {
+        let status = get_resp.status();
+        let body = get_resp.text().await.unwrap_or_default();
+        return Err(format_http_error("GET", &target, status, &body));
+    }
+
+    let get_body = get_resp.text().await.unwrap_or_default();
+    let get_val = parse_json_response(&get_body, &target)?;
+    let roster_obj = get_val.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
+        )
+    })?;
+    let user_count = roster_obj.len();
 
     if args.json {
         let out = serde_json::json!({
@@ -325,7 +259,7 @@ async fn run_rm(args: &OrgArgs, current_dir: &Path) -> Result<()> {
     } else if args.parseable {
         println!("user\torg\tuserCount\tdeleted");
         println!("{user}\t{org}\t{user_count}\ttrue");
-    } else {
+    } else if !client.silent {
         let plural = if user_count == 1 { "" } else { "s" };
         println!("Successfully removed {user} from {org}. You now have {user_count} member{plural} in this org.");
     }
