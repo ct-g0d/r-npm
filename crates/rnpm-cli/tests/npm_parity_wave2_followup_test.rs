@@ -360,25 +360,91 @@ fn install_json_routes_root_lifecycle_banner_to_stderr() {
 
 #[test]
 fn install_from_workspace_member_resolves_relative_spec_against_member_dir() {
-    let temp = tempdir().unwrap();
-    workspaces(temp.path());
-    let member = temp.path().join("packages").join("a");
-    manifest(
-        &member.join("vendor").join("dep"),
-        json!({"name":"dep","version":"1.0.0"}),
-    );
-    let out = run(&member, &["install", "./vendor/dep"]);
-    success(&out);
-    let saved: Value =
-        serde_json::from_slice(&fs::read(member.join("package.json")).unwrap()).unwrap();
-    let spec = saved["dependencies"]["dep"]
-        .as_str()
-        .unwrap_or_else(|| panic!("dep not saved to member manifest: {saved}"))
-        .replace('\\', "/");
-    // npm saves local specs relative to the member package.json.
-    assert_eq!(spec, "file:vendor/dep");
-    assert!(
-        !temp.path().join("vendor").exists(),
-        "spec was resolved against the workspace root"
-    );
+    // npm 11.20 saves member-relative specs and root-relative resolutions.
+    for (input, saved_spec, resolved, archive) in [
+        (
+            "./vendor/dep.tgz",
+            "file:vendor/dep.tgz",
+            "file:packages/a/vendor/dep.tgz",
+            true,
+        ),
+        (
+            "file:./vendor/dep.tgz",
+            "file:vendor/dep.tgz",
+            "file:packages/a/vendor/dep.tgz",
+            true,
+        ),
+        ("../x", "file:../x", "packages/x", false),
+        ("file:../x", "file:../x", "packages/x", false),
+        ("file:./x", "file:x", "packages/a/x", false),
+        ("./x", "file:x", "packages/a/x", false),
+        (
+            "vendor/dep",
+            "file:vendor/dep",
+            "packages/a/vendor/dep",
+            false,
+        ),
+        // Preserve rnpm's existing support for bare local directory names.
+        ("x", "file:x", "packages/a/x", false),
+    ] {
+        let temp = tempdir().unwrap();
+        manifest(
+            temp.path(),
+            json!({"name":"root","version":"1.0.0","workspaces":["packages/a"]}),
+        );
+        let member = temp.path().join("packages/a");
+        manifest(&member, json!({"name":"a","version":"1.0.0"}));
+        for dir in [
+            member.join("x"),
+            member.join("vendor/dep"),
+            temp.path().join("packages/x"),
+        ] {
+            manifest(&dir, json!({"name":"dep","version":"1.0.0"}));
+        }
+        let package = br#"{"name":"dep","version":"1.0.0"}"#;
+        let file = fs::File::create(member.join("vendor/dep.tgz")).unwrap();
+        let gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(gzip);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(package.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", &package[..])
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let out = run(
+            &member,
+            &["install", input, "--offline", "--ignore-scripts"],
+        );
+        success(&out);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(member.join("package.json")).unwrap()).unwrap();
+        assert_eq!(saved["dependencies"]["dep"], saved_spec, "{input}");
+        let root: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("package.json")).unwrap()).unwrap();
+        assert!(root.get("dependencies").is_none(), "{input}: {root}");
+        let lock: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("package-lock.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            lock["packages"]["packages/a"]["dependencies"]["dep"], saved_spec,
+            "{input}"
+        );
+        let entry = &lock["packages"]["node_modules/dep"];
+        assert_eq!(entry["resolved"], resolved, "{input}");
+        if archive {
+            assert!(entry["integrity"].as_str().unwrap().starts_with("sha512-"));
+            assert_eq!(entry["version"], "1.0.0");
+        } else {
+            assert_eq!(entry["link"], true, "{input}");
+            assert_eq!(lock["packages"][resolved]["version"], "1.0.0");
+        }
+        let installed: Value = serde_json::from_slice(
+            &fs::read(temp.path().join("node_modules/dep/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed["name"], "dep", "{input}");
+        assert!(!member.join("package-lock.json").exists());
+    }
 }
