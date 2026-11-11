@@ -404,6 +404,8 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
+    let iso_dir = tmp.path().join("iso");
+    let iso_cache = iso_dir.join("cache");
 
     let pkg_json = serde_json::json!({
         "name": "test-disk-reify",
@@ -461,6 +463,8 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
     let fix_out = Command::new(rnpm_bin)
         .args(["audit", "fix"])
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .env("NPM_CONFIG_CACHE", iso_cache.join("_cacache"))
+        .env("RNPM_STORE_DIR", iso_dir.join("store"))
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm audit fix");
@@ -496,21 +500,7 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         "fixed package in lockfile must have real integrity hash"
     );
 
-    // 3. Verify rnpm ci works without EINTEGRITY or failure
-    let ci_out = Command::new(rnpm_bin)
-        .args(["ci"])
-        .current_dir(project_dir)
-        .output()
-        .expect("Failed to execute rnpm ci");
-    assert!(
-        ci_out.status.success(),
-        "rnpm ci must succeed on fixed project: {:?}",
-        ci_out
-    );
-
-    // 4. Verify npm ls --all and npm ci succeed if npm is installed on machine
-    let iso_dir = tmp.path().join("iso");
-    let iso_cache = iso_dir.join("cache");
+    // Use an isolated npm-compatible content cache for both ci implementations.
     let iso_prefix = iso_dir.join("prefix");
     let iso_userconfig = iso_dir.join(".npmrc");
     let iso_globalconfig = iso_dir.join("global.npmrc");
@@ -523,6 +513,40 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
     let _ = fs::write(&iso_userconfig, "registry=http://127.0.0.1:9/\n");
     let _ = fs::write(&iso_globalconfig, "");
 
+    // 3. Verify rnpm ci and populate the tarball content used by offline npm ci.
+    let ci_out = Command::new(rnpm_bin)
+        .args(["ci", "--cache"])
+        .arg(iso_cache.join("_cacache"))
+        .env("RNPM_STORE_DIR", iso_dir.join("store"))
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm ci");
+    assert!(
+        ci_out.status.success(),
+        "rnpm ci must succeed on fixed project: {:?}",
+        ci_out
+    );
+
+    // Seed npm's native content layout from the exact verified rnpm tarball.
+    // rnpm also supports a legacy layout that npm itself does not read.
+    let integrity = rnpm_core::integrity::Integrity::parse(
+        lodash_entry["integrity"].as_str().unwrap(),
+    )
+    .unwrap();
+    let cache = rnpm_cache::Cache::new(iso_cache.join("_cacache")).unwrap();
+    let tarball = cache.get_by_integrity(&integrity).unwrap().unwrap();
+    let digest = &integrity.entries[0];
+    let hex = data_encoding::HEXLOWER.encode(&digest.digest);
+    let npm_blob = iso_cache
+        .join("_cacache/content-v2")
+        .join(digest.algorithm.as_str())
+        .join(&hex[..2])
+        .join(&hex[2..4])
+        .join(&hex[4..]);
+    fs::create_dir_all(npm_blob.parent().unwrap()).unwrap();
+    fs::write(npm_blob, tarball).unwrap();
+
+    // 4. Verify npm ls --all and npm ci succeed if npm is installed on machine.
     let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
     if let Ok(npm_ls) = Command::new(npm_cmd)
         .args(["ls", "--all"])
@@ -549,7 +573,8 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         );
     }
     if let Ok(npm_ci) = Command::new(npm_cmd)
-        .args(["ci", "--offline"])
+        .args(["ci", "--offline", "--cache"])
+        .arg(&iso_cache)
         .current_dir(project_dir)
         .env("HOME", &iso_dir)
         .env("USERPROFILE", &iso_dir)
@@ -566,8 +591,10 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         .env("LOCALAPPDATA", &iso_localappdata)
         .output()
     {
-        if npm_ci.status.success() {
-            // npm ci confirmed valid lockfile structure
-        }
+        assert!(
+            npm_ci.status.success(),
+            "offline npm ci must succeed on fixed project: {}",
+            String::from_utf8_lossy(&npm_ci.stderr)
+        );
     }
 }
