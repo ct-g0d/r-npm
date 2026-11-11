@@ -976,7 +976,12 @@ async fn test_execute_binary_exit_code_fidelity() {
 
     // Write a node script that exits with custom non-zero code 42
     let script = root.join("exit_with_code.js");
-    std::fs::write(&script, "process.exit(42);").unwrap();
+    std::fs::write(&script, "#!/usr/bin/env node\nprocess.exit(42);\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
 
     let status = execute_binary_async(&script, &[], root, &[], &HashMap::new())
         .await

@@ -1898,8 +1898,24 @@ where
     #[cfg(not(windows))]
     let mut cmd = {
         use std::os::unix::process::CommandExt;
-        let mut c = Command::new(binary_path);
-        c.args(args);
+        let ext = binary_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let is_js = ext.eq_ignore_ascii_case("js")
+            || ext.eq_ignore_ascii_case("cjs")
+            || ext.eq_ignore_ascii_case("mjs");
+
+        let mut c = if is_js {
+            let mut node_cmd = Command::new("node");
+            node_cmd.arg(binary_path);
+            node_cmd.args(args);
+            node_cmd
+        } else {
+            let mut bin_cmd = Command::new(binary_path);
+            bin_cmd.args(args);
+            bin_cmd
+        };
         c.process_group(0);
         c
     };
