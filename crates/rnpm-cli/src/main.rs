@@ -1307,13 +1307,15 @@ pub(crate) enum Commands {
     },
     /// Edit a package in the configured editor.
     Edit {
-        package: String,
+        package: Option<String>,
         #[arg(long)]
         editor: Option<String>,
     },
     /// Explore a package in a shell.
     Explore {
-        package: String,
+        package: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
         #[arg(long)]
         shell: Option<String>,
     },
@@ -5889,77 +5891,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Edit { package, editor } => {
-            let dir = resolve_local_package_dir(&current_dir, &package)?;
-            let editor = editor
-                .or_else(|| std::env::var("npm_config_editor").ok())
-                .or_else(|| std::env::var("VISUAL").ok())
-                .or_else(|| std::env::var("EDITOR").ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("npm error code ENOENT\nnpm error no editor configured")
-                })?;
-            let status = std::process::Command::new(&editor)
-                .current_dir(dir)
-                .status()?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "npm error code ELIFECYCLE\nnpm error editor exited with {status}"
-                ));
-            }
+            commands::edit::run(package, editor, current_dir).await?;
         }
-        Commands::Explore { package, shell } => {
-            let dir = resolve_local_package_dir(&current_dir, &package)?;
-            #[cfg(windows)]
-            let (program, args): (String, Vec<String>) = (
-                shell
-                    .or_else(|| std::env::var("ComSpec").ok())
-                    .unwrap_or_else(|| "cmd.exe".into()),
-                vec!["/K".into()],
-            );
-            #[cfg(not(windows))]
-            let (program, args): (String, Vec<String>) = (
-                shell
-                    .or_else(|| std::env::var("SHELL").ok())
-                    .unwrap_or_else(|| "/bin/sh".into()),
-                Vec::new(),
-            );
-            let status = std::process::Command::new(program)
-                .args(args)
-                .current_dir(dir)
-                .status()?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "npm error code ELIFECYCLE\nnpm error explore shell exited with {status}"
-                ));
-            }
+        Commands::Explore {
+            package,
+            args,
+            shell,
+        } => {
+            commands::explore::run(package, args, shell, current_dir).await?;
         }
         Commands::HelpSearch {
             terms,
             long,
-            registry,
-            json,
+            registry: _,
+            json: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = client
-                .search(
-                    Some(&registry_url),
-                    &terms.join(" "),
-                    if long { 50 } else { 20 },
-                    0,
-                )
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
-                for object in objects {
-                    let package = object.get("package").unwrap_or(object);
-                    let name = package.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let description = package
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    println!("{name}\t{description}");
-                }
-            }
+            commands::help_search::run(terms, long, None).await?;
         }
         Commands::Stage {
             action,

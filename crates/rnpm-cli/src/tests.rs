@@ -2878,3 +2878,394 @@ fn test_lane3_preprocessing_edge_cases() {
         "Positionals foo and bar must be forwarded to script"
     );
 }
+
+#[tokio::test]
+async fn test_offline_help_search_with_fixture() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fixtures")
+        .join("help-search")
+        .join("content");
+
+    let docs = crate::commands::help_search::load_documentation(Some(&fixture_dir)).unwrap();
+    assert_eq!(docs.len(), 3);
+
+    // 1. Search for "install"
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].cmd, "npm help install");
+    let hits = results[0].hits.get("install").copied().unwrap_or(0);
+    assert!(hits > 0);
+
+    let output = crate::commands::help_search::format_search_results(&["install".to_string()], &results, false);
+    assert!(output.starts_with("Top hits for \"install\"\n"));
+    assert!(output.contains("\u{2014}"));
+    assert!(output.contains("npm help install"));
+    assert!(output.contains("(run with -l or --long to see more context)"));
+
+    // 2. Search for nonexistent term
+    let no_match = crate::commands::help_search::search_documents(&["xyz_no_such_term".to_string()], &docs);
+    let output_none = crate::commands::help_search::format_search_results(&["xyz_no_such_term".to_string()], &no_match, false);
+    assert_eq!(output_none, "No matches in help for: xyz_no_such_term\n");
+
+    // 3. Multi-term long search
+    let multi_results = crate::commands::help_search::search_documents(
+        &["install".to_string(), "package".to_string()],
+        &docs,
+    );
+    assert!(!multi_results.is_empty());
+    let output_multi_long = crate::commands::help_search::format_search_results(
+        &["install".to_string(), "package".to_string()],
+        &multi_results,
+        true,
+    );
+    assert!(output_multi_long.contains("npm help install"));
+    assert!(output_multi_long.contains("--------------------------------------------------------------------------------"));
+    // Multi-term highlighting repeats context for each term
+    assert!(output_multi_long.lines().count() > 1);
+
+    // 4. Empty args error check
+    let empty_run = crate::commands::help_search::run(vec![], false, Some(&fixture_dir)).await;
+    assert!(empty_run.is_err());
+    let empty_err = format!("{}", empty_run.unwrap_err());
+    assert!(empty_err.contains("EUSAGE"));
+}
+
+#[tokio::test]
+async fn test_offline_help_search_embedded_parity() {
+    let docs = crate::commands::help_search::load_documentation(None).unwrap();
+    assert_eq!(docs.len(), 91);
+
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].cmd, "npm help install");
+    assert_eq!(results[0].hits.get("install"), Some(&197));
+
+    // Multi-term long parity against committed oracle snapshot unconditionally
+    let terms = vec!["install".to_string(), "package".to_string()];
+    let multi = crate::commands::help_search::search_documents(&terms, &docs);
+    let formatted = crate::commands::help_search::format_search_results(&terms, &multi, true);
+    let expected = include_str!("../../../tests/fixtures/help-search/expected-long.utf8.txt");
+    assert_eq!(formatted, expected);
+}
+
+#[tokio::test]
+async fn test_offline_edit_stub_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Create root package.json
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    // Create target package with lifecycle install hook writing rebuilt.marker
+    let pkg_dir = root.join("node_modules").join("my-test-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    let hook_js = pkg_dir.join("hook.js");
+    std::fs::write(
+        &hook_js,
+        "const fs = require('fs'); fs.writeFileSync('rebuilt.marker', 'rebuilt');",
+    ).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"my-test-pkg","version":"1.0.0","scripts":{"install":"node hook.js"}}"#,
+    ).unwrap();
+
+    // Create a second unrelated package to verify its hook is NOT triggered during targeted rebuild
+    let unrelated_dir = root.join("node_modules").join("unrelated-pkg");
+    std::fs::create_dir_all(&unrelated_dir).unwrap();
+    let unrelated_hook_js = unrelated_dir.join("unrelated_hook.js");
+    std::fs::write(
+        &unrelated_hook_js,
+        "const fs = require('fs'); fs.writeFileSync('unrelated.marker', 'unrelated');",
+    ).unwrap();
+    std::fs::write(
+        unrelated_dir.join("package.json"),
+        r#"{"name":"unrelated-pkg","version":"1.0.0","scripts":{"install":"node unrelated_hook.js"}}"#,
+    ).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("sub-pkg");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/sub-pkg","version":"1.0.0"}"#).unwrap();
+
+    // Stub editor recording script
+    let out_file = root.join("editor_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_editor.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{ argv: process.argv, cwd: process.cwd() }}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    let editor_cmd = format!("node \"{}\" --custom-flag", record_js.to_string_lossy());
+
+    // 1. Run edit on standard package
+    let res = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "edit failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv = recorded.get("argv").unwrap().as_array().unwrap();
+    let cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+
+    // Verify cwd is project root (matching npm behavior)
+    let expected_root_norm = root.canonicalize().unwrap_or(root.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(cwd).canonicalize().unwrap_or(PathBuf::from(cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_root_norm);
+
+    // Verify editor argv contains target package dir as last argument
+    assert!(argv.len() >= 3);
+    assert_eq!(argv[argv.len() - 2].as_str(), Some("--custom-flag"));
+    let target_arg = argv[argv.len() - 1].as_str().unwrap();
+    assert!(target_arg.ends_with("my-test-pkg"));
+
+    // Verify post-editor rebuild hook executed: rebuilt.marker MUST exist
+    assert!(
+        pkg_dir.join("rebuilt.marker").is_file(),
+        "Targeted package install lifecycle hook must have run and created rebuilt.marker"
+    );
+    // Verify unrelated package was NOT rebuilt
+    assert!(
+        !unrelated_dir.join("unrelated.marker").exists(),
+        "Unrelated package install lifecycle hook must NOT have run"
+    );
+
+    // 2. Run edit on scoped package
+    let res_scoped = crate::commands::edit::run(
+        Some("@scoped/sub-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped edit failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv_scoped = recorded_scoped.get("argv").unwrap().as_array().unwrap();
+    let target_arg_scoped = argv_scoped[argv_scoped.len() - 1].as_str().unwrap();
+    assert!(target_arg_scoped.replace('\\', "/").ends_with("@scoped/sub-pkg"));
+
+    // 3. Missing package error
+    let res_missing = crate::commands::edit::run(
+        Some("no-such-package".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let err_msg = format!("{}", res_missing.unwrap_err());
+    assert!(err_msg.contains("ENOENT"));
+
+    // 4. Failing editor process propagates exit code and must NOT trigger rebuild
+    let _ = std::fs::remove_file(pkg_dir.join("rebuilt.marker"));
+    let fail_js = root.join("fail_editor.js");
+    std::fs::write(&fail_js, "process.exit(42);").unwrap();
+    let fail_editor = format!("node \"{}\"", fail_js.to_string_lossy());
+    let res_fail = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(fail_editor),
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let fail_msg = format!("{}", res_fail.unwrap_err());
+    assert!(fail_msg.contains("42"));
+    assert!(
+        !pkg_dir.join("rebuilt.marker").exists(),
+        "Editor failure must not trigger rebuild or create rebuilt.marker"
+    );
+}
+
+#[tokio::test]
+async fn test_offline_explore_child_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    // Create project root
+    let root = base.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    let pkg_dir = root.join("node_modules").join("explore-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("package.json"), r#"{"name":"explore-pkg","version":"2.5.1"}"#).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("explore-target");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/explore-target","version":"3.0.0"}"#).unwrap();
+
+    // Create a sibling outside/ directory with an EXISTING package.json to test path escape prevention
+    let outside_dir = base.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("package.json"), r#"{"name":"outside","version":"1.0.0"}"#).unwrap();
+
+    let outside_marker = outside_dir.join("outside_executed.marker");
+    let outside_probe_js = base.join("outside_probe.js");
+    std::fs::write(
+        &outside_probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'OUTSIDE_EXECUTED'); process.exit(0);",
+            outside_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
+
+    // Probe script to test path guard rejections
+    let probe_marker = root.join("probe_executed.marker");
+    let probe_js = root.join("probe.js");
+    std::fs::write(
+        &probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'EXECUTED'); process.exit(0);",
+            probe_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
+
+    // 1. Path guard rejections: '..', '../..', '.', '/', traversal paths
+    for rejected in &["..", "../..", ".", "/", "foo/../.."] {
+        let res = crate::commands::explore::run(
+            Some(rejected.to_string()),
+            vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{rejected}' must fail with EUSAGE");
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("EUSAGE"), "Error must be EUSAGE for '{rejected}', got: {err}");
+        assert!(!probe_marker.exists(), "Probe must never be executed for rejected path '{rejected}'");
+    }
+
+    // 2. Drive-relative, other drive, rooted, and UNC paths must NEVER escape node_modules to sibling outside/
+    let escape_attempts = vec![
+        "C:../outside",
+        "D:../outside",
+        "/outside",
+        "\\\\server\\share\\pkg",
+        "C:/outside",
+    ];
+    for escape_target in escape_attempts {
+        let res = crate::commands::explore::run(
+            Some(escape_target.to_string()),
+            vec!["node".to_string(), outside_probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{escape_target}' must fail");
+        assert!(
+            !outside_marker.exists(),
+            "Probe must NEVER execute in sibling outside directory via '{escape_target}'!"
+        );
+    }
+
+    // 3. Legitimate target with '../' rooted normalization (e.g. '../explore-pkg' normalizes to 'explore-pkg')
+    let res_norm = crate::commands::explore::run(
+        Some("../explore-pkg".to_string()),
+        vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_norm.is_ok(), "Legitimate '../explore-pkg' target must succeed: {:?}", res_norm.err());
+    assert!(probe_marker.exists(), "Probe must execute for valid normalized target");
+    let _ = std::fs::remove_file(&probe_marker);
+
+    let out_file = root.join("explore_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_child.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{
+    cwd: process.cwd(),
+    event: process.env.npm_lifecycle_event,
+    name: process.env.npm_package_name,
+    version: process.env.npm_package_version,
+    command: process.env.npm_command,
+    path: process.env.PATH || process.env.Path
+}}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    // 2. Run explore with explicit child command on standard package
+    let res = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "explore failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+    let expected_pkg_norm = pkg_dir.canonicalize().unwrap_or(pkg_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(actual_cwd).canonicalize().unwrap_or(PathBuf::from(actual_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_pkg_norm);
+    assert_eq!(recorded.get("event").unwrap().as_str(), Some("_explore"));
+    assert_eq!(recorded.get("name").unwrap().as_str(), Some("explore-pkg"));
+    assert_eq!(recorded.get("version").unwrap().as_str(), Some("2.5.1"));
+    assert_eq!(recorded.get("command").unwrap().as_str(), Some("explore"));
+
+    // 3. Assert PATH contract: child PATH prepends target and all ancestor node_modules/.bin unconditionally
+    let captured_path = recorded.get("path").unwrap().as_str().unwrap();
+    let path_entries: Vec<PathBuf> = std::env::split_paths(captured_path).collect();
+    let expected_pkg_bin = pkg_dir.join("node_modules").join(".bin");
+    let expected_root_bin = root.join("node_modules").join(".bin");
+    assert_eq!(path_entries[0], expected_pkg_bin, "First PATH entry must be target package node_modules/.bin");
+    assert!(
+        path_entries.contains(&expected_root_bin),
+        "Ancestor node_modules/.bin must be in PATH: expected {expected_root_bin:?} in {path_entries:?}"
+    );
+
+    // 4. Run explore on scoped package
+    let res_scoped = crate::commands::explore::run(
+        Some("@scoped/explore-target".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped explore failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_scoped_cwd = recorded_scoped.get("cwd").unwrap().as_str().unwrap();
+    let expected_scoped_norm = scoped_dir.canonicalize().unwrap_or(scoped_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_scoped_norm = PathBuf::from(actual_scoped_cwd).canonicalize().unwrap_or(PathBuf::from(actual_scoped_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_scoped_norm, expected_scoped_norm);
+    assert_eq!(recorded_scoped.get("name").unwrap().as_str(), Some("@scoped/explore-target"));
+    assert_eq!(recorded_scoped.get("version").unwrap().as_str(), Some("3.0.0"));
+
+    // 5. Missing package error
+    let res_missing = crate::commands::explore::run(
+        Some("missing-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let missing_msg = format!("{}", res_missing.unwrap_err());
+    assert!(missing_msg.contains("It doesn't look like missing-pkg is installed."));
+    assert!(missing_msg.contains("ENOENT"));
+
+    // 6. Non-zero exit code error propagation
+    let fail_js = root.join("fail_child.js");
+    std::fs::write(&fail_js, "process.exit(7);").unwrap();
+    let res_fail = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), fail_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let exit_err = res_fail.unwrap_err();
+    if let Some(script_err) = exit_err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+        assert_eq!(script_err.exit_code, 7);
+    } else {
+        panic!("Expected ScriptExitError with exit code 7, got: {:?}", exit_err);
+    }
+}
