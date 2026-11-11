@@ -97,7 +97,17 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
     let dest_is_reparse = crate::junction::is_junction(destination).unwrap_or(false);
     if !destination.exists() && !dest_is_reparse {
         // Fast-path: Direct atomic rename when destination does not exist
-        return fs::rename(staging, destination);
+        match fs::rename(staging, destination) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || e.raw_os_error() == Some(39)
+                    || e.raw_os_error() == Some(66)
+                    || e.raw_os_error() == Some(145) => {
+                // Another concurrent worker just placed destination; fall through to trash rename
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Opportunistically cleanup any abandoned .rnpm-trash directories in parent
@@ -191,15 +201,16 @@ pub(crate) fn is_retryable_error(err: &std::io::Error) -> bool {
         | ErrorKind::Interrupted
         | ErrorKind::ResourceBusy
         | ErrorKind::NotFound
-        | ErrorKind::AlreadyExists => true,
+        | ErrorKind::AlreadyExists
+        | ErrorKind::DirectoryNotEmpty => true,
         _ => {
-            // Check raw OS error codes for Windows:
-            // ERROR_FILE_NOT_FOUND (2), ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
-            // ERROR_DIR_NOT_EMPTY (145), ERROR_FILE_CHECKED_OUT (149),
-            // ERROR_BUSY (170), ERROR_ALREADY_EXISTS (183), ERROR_USER_MAPPED_FILE (1224)
-            #[cfg(windows)]
             if let Some(code) = err.raw_os_error() {
-                return code == 2
+                // Windows codes:
+                // ERROR_FILE_NOT_FOUND (2), ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33),
+                // ERROR_DIR_NOT_EMPTY (145), ERROR_FILE_CHECKED_OUT (149),
+                // ERROR_BUSY (170), ERROR_ALREADY_EXISTS (183), ERROR_USER_MAPPED_FILE (1224)
+                #[cfg(windows)]
+                if code == 2
                     || code == 5
                     || code == 32
                     || code == 33
@@ -207,14 +218,30 @@ pub(crate) fn is_retryable_error(err: &std::io::Error) -> bool {
                     || code == 149
                     || code == 170
                     || code == 183
-                    || code == 1224;
-            }
-            #[cfg(windows)]
-            {
-                let kind_debug = format!("{:?}", err.kind());
-                if kind_debug == "DirectoryNotEmpty" {
+                    || code == 1224
+                {
                     return true;
                 }
+
+                // Unix codes:
+                // ENOENT (2), EAGAIN (11 Linux), EACCES (13), EBUSY (16), EEXIST (17),
+                // EAGAIN/EWOULDBLOCK (35 macOS), ENOTEMPTY (39 Linux, 66 macOS)
+                #[cfg(not(windows))]
+                if code == 2
+                    || code == 11
+                    || code == 13
+                    || code == 16
+                    || code == 17
+                    || code == 35
+                    || code == 39
+                    || code == 66
+                {
+                    return true;
+                }
+            }
+            let kind_debug = format!("{:?}", err.kind());
+            if kind_debug == "DirectoryNotEmpty" {
+                return true;
             }
             false
         }
