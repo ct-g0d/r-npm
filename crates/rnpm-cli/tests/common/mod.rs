@@ -25,13 +25,24 @@ impl IsolatedNpmEnv {
         let userconfig = root.join(".npmrc");
         let globalconfig = root.join("global.npmrc");
 
-        let _ = fs::create_dir_all(&cache_dir);
-        let _ = fs::create_dir_all(&prefix_dir);
-        let _ = fs::create_dir_all(&appdata);
-        let _ = fs::create_dir_all(&localappdata);
-        let _ = fs::create_dir_all(&logs_dir);
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|e| panic!("Failed to create isolated cache_dir at {:?}: {}", cache_dir, e));
+        fs::create_dir_all(&prefix_dir)
+            .unwrap_or_else(|e| panic!("Failed to create isolated prefix_dir at {:?}: {}", prefix_dir, e));
+        fs::create_dir_all(&appdata)
+            .unwrap_or_else(|e| panic!("Failed to create isolated appdata at {:?}: {}", appdata, e));
+        fs::create_dir_all(&localappdata)
+            .unwrap_or_else(|e| panic!("Failed to create isolated localappdata at {:?}: {}", localappdata, e));
+        fs::create_dir_all(&logs_dir)
+            .unwrap_or_else(|e| panic!("Failed to create isolated logs_dir at {:?}: {}", logs_dir, e));
+
+        if !userconfig.exists() {
+            fs::write(&userconfig, "")
+                .unwrap_or_else(|e| panic!("Failed to initialize isolated userconfig at {:?}: {}", userconfig, e));
+        }
         if !globalconfig.exists() {
-            let _ = fs::write(&globalconfig, "");
+            fs::write(&globalconfig, "")
+                .unwrap_or_else(|e| panic!("Failed to initialize isolated globalconfig at {:?}: {}", globalconfig, e));
         }
 
         Self {
@@ -58,6 +69,27 @@ impl IsolatedNpmEnv {
         self
     }
 
+    /// Case-insensitively removes any inherited `npm_config_*` or shorthand config variables from `cmd`.
+    #[allow(dead_code)]
+    pub fn scrub_env_keys<I, S>(cmd: &mut Command, keys: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for key in keys {
+            let s = key.as_ref();
+            let lower = s.to_ascii_lowercase();
+            if lower.starts_with("npm_config_")
+                || lower == "cache"
+                || lower == "prefix"
+                || lower == "userconfig"
+                || lower == "globalconfig"
+            {
+                cmd.env_remove(s);
+            }
+        }
+    }
+
     pub fn command(&self) -> Command {
         #[cfg(windows)]
         let mut cmd = {
@@ -67,6 +99,9 @@ impl IsolatedNpmEnv {
         };
         #[cfg(not(windows))]
         let mut cmd = Command::new("npm");
+
+        // Scrub all inherited NPM_CONFIG_* / npm_config_* environment variables case-insensitively
+        Self::scrub_env_keys(&mut cmd, std::env::vars().map(|(k, _)| k));
 
         cmd.env("HOME", &self.root)
             .env("USERPROFILE", &self.root)

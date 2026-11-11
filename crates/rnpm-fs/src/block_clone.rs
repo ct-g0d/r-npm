@@ -209,6 +209,18 @@ pub fn get_volume_info(path: &Path) -> Option<(String, u32)> {
     get_volume_details(path).map(|(fs_name, serial, _flags)| (fs_name, serial))
 }
 
+/// Non-Windows stub for `get_volume_details`.
+#[cfg(not(windows))]
+pub fn get_volume_details(_path: &Path) -> Option<(String, u32, u32)> {
+    None
+}
+
+/// Non-Windows stub for `get_volume_info`.
+#[cfg(not(windows))]
+pub fn get_volume_info(_path: &Path) -> Option<(String, u32)> {
+    None
+}
+
 /// Queries the actual filesystem cluster size in bytes for `path` using `GetDiskFreeSpaceW`.
 #[cfg(windows)]
 pub fn get_volume_cluster_size(path: &Path) -> Option<u32> {
@@ -951,6 +963,7 @@ pub fn materialize_pack_entries(
     #[cfg(not(windows))]
     let raw_handle: Option<usize> = None;
     let _ = can_block_clone;
+    let _ = raw_handle;
 
     let mut total_uncompressed_bytes = 0u64;
     for entry in entries {

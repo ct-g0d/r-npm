@@ -92,7 +92,10 @@ jobs:
         with:
           node-version: "24.x"
 
-      - name: Verify Node 24 Version
+      - name: Pin Explicit npm Oracle Version (npm 11.20.0)
+        run: npm install -g npm@11.20.0
+
+      - name: Verify Node 24 and npm Oracle Versions
         shell: pwsh
         run: |
           $nodeVer = (node --version).Trim()
@@ -102,6 +105,12 @@ jobs:
             exit 1
           }
           node -e 'const [m] = process.versions.node.split(".").map(Number); if (m !== 24) { process.exit(1); }'
+          $npmVer = (npm --version).Trim()
+          Write-Host "npm oracle version on Node 24: $npmVer"
+          if ($npmVer -ne "11.20.0") {
+            Write-Error "Expected npm 11.20.0, found: $npmVer"
+            exit 1
+          }
 
       - name: Node 24 Compatibility Tests Gate
         run: cargo test --workspace
