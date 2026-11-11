@@ -10,8 +10,8 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | Metric | Before (Master Baseline) | After Parity Fixes |
 | :--- | :--- | :--- |
 | **Total Commands Evaluated** | 73 | 73 |
-| **Matching Parity** | 23 | **60 (82.2%)** |
-| **Partial (Documented Technical Non-parity)** | 49 | **13 (17.8%)** |
+| **Matching Parity** | 23 | **62 (84.9%)** |
+| **Partial (Documented Technical Non-parity)** | 49 | **11 (15.1%)** |
 | **Missing Commands** | 1 (`cache add`/`ls`) | **0 (Zero Missing Commands - 100% Implemented)** |
 
 ## Command Parity Matrix
@@ -53,14 +53,14 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `login` | - | **partial** | Authentication workflow: npm executes interactive browser OAuth flow (`https://www.npmjs.com/login?otp=...`) or stdin TTY credential prompt, which cannot run in headless automated CI | Ran `login` against mock registry |
 | `logout` | - | **matching** | Remote token revocation HTTP DELETE request, silent stdout/stderr output, and local credential deletion match npm parity | Ran `logout` against mock registry and live npm parity test |
 | `ls` | `list` | **matching** | Dependency tree visualizer with unmet dependency markers, ELSPROBLEMS exit status, and JSON output matching npm | Ran `ls` against npm parity test |
-| `org` | `ogr` | **partial** | Proprietary SaaS API: npm org manages commercial npmjs.com organization endpoints (`/-/org/:org/user`), requiring paid npm organization tier and CouchDB administrative credentials not available in open-source registries | Ran `org --help` on fresh fixture directory |
+| `org` | `ogr` | **partial** | Non-interactive organization management: roster listing (`org ls`), membership mutation (`org set`/`add`), member removal (`org rm`), JSON/parseable formatting, and Basic/Bearer auth match npm 11 wire contract against `/-/org/:org/user`; full human stderr parity across all arbitrary registry HTTP status codes and interactive SaaS billing/creation require npmjs portal | Ran `org ls`, `set`, `rm` against mock registry parity test |
 | `outdated` | - | **matching** | Tabular column layout (`-` for missing packages) and omission of `current`/`location` in `--json` match npm | Ran `outdated` on fresh fixture directory |
 | `owner` | `author` | **matching** | Formatted as `name <email>` matching npm parity | Ran `owner ls is-number` on fresh fixture directory |
 | `pack` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `pack --dry-run` on fresh fixture directory |
 | `ping` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `ping` on fresh fixture directory |
 | `pkg` | - | **matching** | Quoted JSON string output for `pkg get name` matches npm parity | Ran `pkg get name` on fresh fixture directory |
 | `prefix` | - | **matching** | Resolves local and global prefix directory paths matching npm output | Ran `prefix` against npm parity test |
-| `profile` | - | **partial** | Proprietary SaaS API: npm profile manages npmjs.com user profile and 2FA settings (`/-/npm/v1/user`), requiring interactive 2FA WebAuthn/TOTP web sessions not available in headless automation | Ran `profile --help` on fresh fixture directory |
+| `profile` | - | **partial** | Profile lifecycle: non-interactive profile get (all fields, specific/tab-separated keys, json, parseable) and profile set (writable field updates with attribute preservation, zero POST on malformed read) match npm 11 wire contract against `/-/npm/v1/user`; interactive 2FA onboarding (`enable-2fa`/`disable-2fa`) and interactive password prompt honestly preserved as requiring interactive TTY sessions; exact stderr text varies by HTTP error status | Ran `profile get` and `profile set` against mock registry parity test |
 | `prune` | - | **matching** | Full dependency tree reification, lockfile generation, and summary line wording match npm parity | Ran `prune` on fresh fixture directory |
 | `publish` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `publish --dry-run` on fresh fixture directory |
 | `query` | - | **matching** | Field set and order matching Arborist object schema and manifest ordering | Ran `query :root` on fresh fixture directory |
@@ -78,7 +78,7 @@ Every command in `npm help` / `npm <cmd> --help` as well as legacy/deprecated co
 | `stars` | - | **matching** | User starred packages query, CouchDB rows payload extraction, and stdout format match npm parity | Ran `stars` against mock registry and live npm parity test |
 | `start` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `start` on fresh fixture directory |
 | `stop` | - | **matching** | Stdout, stderr, exit code and file changes match expected parity | Ran `stop` on fresh fixture directory |
-| `team` | - | **partial** | Proprietary SaaS API: npm team manages commercial organization teams (`/-/team/:scope:team/user`), requiring commercial npm organization tier and CouchDB credentials not available in open-source registries | Ran `team --help` on fresh fixture directory |
+| `team` | - | **partial** | Organization team lifecycle: team creation (`team create` omitting null description), team destruction (`team destroy`), membership mutation (`team add`/`rm`), team/user listing (`team ls`), JSON/parseable formatting, and Basic/Bearer auth match npm 11 wire contract against `/-/org/:scope/team` and `/-/team/:scope/:team`; full human stderr parity for arbitrary HTTP errors and billing/interactive scope creation require npmjs portal | Ran `team create`, `destroy`, `add`, `rm`, `ls` against mock registry parity test |
 | `test` | `tst`, `t` | **matching** | Lifecycle script execution, output stream format, and exit code 0 match npm parity (prior harness baseline exit null was caused by runner timeout) | Ran `test` on fresh fixture directory |
 | `token` | - | **matching** | Token listing with unique id generation, token revocation prefix matching, and stdout output format match npm parity | Ran `token` against mock registry and live npm parity test |
 | `trust` | - | **partial** | Proprietary SaaS API: npm trust manages npmjs.com trusted publisher OIDC bindings (`/-/npm/v1/trust`), requiring publication credentials and CI OIDC identity tokens not available in local headless environments | Ran `trust --help` on fresh fixture directory |
