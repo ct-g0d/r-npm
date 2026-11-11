@@ -1,0 +1,82 @@
+npm help install                                         install:197 package:156
+--------------------------------------------------------------------------------
+------
+title: npm-installtitle: npm-install
+section: 1section: 1
+description: Install a packagedescription: Install a package
+
+
+
+npm help config                                          install:119 package:148
+--------------------------------------------------------------------------------
+
+* `npm install --prefix /path/to/dir` - Runs npm commands in a different directory without changing the current working directory* `npm install --prefix /path/to/dir` - Runs npm commands in a different directory without changing the current working directory
+* `npm install --global` - Installs packages globally (shorthand: `-g`)* `npm install --global` - Installs packages globally (shorthand: `-g`)
+* `npm install --save-dev` - Saves to devDependencies (shorthand: `-D`)* `npm install --save-dev` - Saves to devDependencies (shorthand: `-D`)
+
+
+
+npm help package-json                                     install:58 package:128
+--------------------------------------------------------------------------------
+------
+title: package.jsontitle: package.json
+section: 5section: 5
+description: Specifics of npm's package.json handlingdescription: Specifics of npm's package.json handling
+
+
+
+npm help install-test                                      install:85 package:59
+--------------------------------------------------------------------------------
+------
+title: npm-install-testtitle: npm-install-test
+section: 1section: 1
+description: Install package(s) and run testsdescription: Install package(s) and run tests
+
+
+
+npm help scripts                                           install:51 package:77
+--------------------------------------------------------------------------------
+
+The `"scripts"` property of your `package.json` file supports a number of built-in scripts and their preset life cycle events as well as arbitrary scripts.The `"scripts"` property of your `package.json` file supports a number of built-in scripts and their preset life cycle events as well as arbitrary scripts.
+These all can be executed by running `npm run <stage>`.These all can be executed by running `npm run <stage>`.
+
+
+
+npm help update                                            install:68 package:59
+--------------------------------------------------------------------------------
+section: 1section: 1
+description: Update packagesdescription: Update packages
+------
+
+
+
+npm help ci                                                install:81 package:41
+--------------------------------------------------------------------------------
+section: 1section: 1
+description: Clean install a projectdescription: Clean install a project
+------
+
+
+
+npm help link                                              install:56 package:64
+--------------------------------------------------------------------------------
+section: 1section: 1
+description: Symlink a package folderdescription: Symlink a package folder
+------
+
+
+
+npm help install-ci-test                                   install:68 package:28
+--------------------------------------------------------------------------------
+------
+title: npm-install-ci-testtitle: npm-install-ci-test
+section: 1section: 1
+description: Install a project with a clean slate and run testsdescription: Install a project with a clean slate and run tests
+
+
+
+npm help exec                                              install:24 package:64
+--------------------------------------------------------------------------------
+section: 1section: 1
+description: Run a command from a local or remote npm packagedescription: Run a command from a local or remote npm package
+------

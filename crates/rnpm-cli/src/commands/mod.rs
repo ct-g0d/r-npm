@@ -35,3 +35,6 @@ pub mod org;
 pub mod team;
 pub mod profile;
 pub mod client_helper;
+pub mod edit;
+pub mod explore;
+pub mod help_search;
