@@ -980,7 +980,8 @@ async fn test_execute_binary_exit_code_fidelity() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("Setting 0o755 permissions on test script must succeed");
     }
 
     let status = execute_binary_async(&script, &[], root, &[], &HashMap::new())
@@ -993,6 +994,88 @@ async fn test_execute_binary_exit_code_fidelity() {
         code, 42,
         "Exit status code must be preserved faithfully as 42"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_execute_binary_unix_shebang_flags_honored() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // Executable tool.js beginning with `#!/usr/bin/env -S node --expose-gc`
+    // must honor the shebang flags when executed via Command::new on Unix.
+    let script = root.join("tool.js");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env -S node --expose-gc\nprocess.exit(typeof global.gc === 'function' ? 0 : 42);\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("Setting 0o755 permissions must succeed");
+
+    let status = execute_binary_async(&script, &[], root, &[], &HashMap::new())
+        .await
+        .expect("Executable tool.js with shebang must execute directly");
+
+    let code = extract_exit_status_code(&status);
+    assert_eq!(
+        code, 0,
+        "Shebang flags (--expose-gc) must be honored so global.gc is defined"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_execute_binary_unix_non_executable_rejected() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    // Mode 0o644 file must NOT be executable simply due to having a .js extension
+    let script = root.join("non_exec.js");
+    std::fs::write(&script, "#!/usr/bin/env node\nprocess.exit(0);\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))
+        .expect("Setting 0o644 permissions must succeed");
+
+    let res = execute_binary_async(&script, &[], root, &[], &HashMap::new()).await;
+    assert!(
+        res.is_err(),
+        "Non-executable .js file must fail to spawn on Unix with permission error"
+    );
+}
+
+#[tokio::test]
+async fn test_execute_binary_with_abort_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let script = root.join("long_running.js");
+    std::fs::write(&script, "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("Setting 0o755 permissions must succeed");
+    }
+
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let abort_fut = async move {
+        let mut rx = abort_rx;
+        let _ = rx.wait_for(|&v| v).await;
+    };
+
+    let script_clone = script.clone();
+    let root_buf = root.to_path_buf();
+    let exec_task = tokio::spawn(async move {
+        execute_binary_with_abort(&script_clone, &[], &root_buf, &[], &HashMap::new(), abort_fut).await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = abort_tx.send(true);
+
+    let res = exec_task.await.unwrap();
+    assert!(res.is_err(), "Binary execution must be aborted upon signal");
 }
 
 #[tokio::test]
