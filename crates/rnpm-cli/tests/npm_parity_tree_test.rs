@@ -5,6 +5,9 @@ use std::{
 };
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn run(dir: &Path, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_rnpm"))
         .current_dir(dir)
@@ -44,29 +47,42 @@ fn optional_missing_peer_has_empty_json_entry() {
 #[test]
 fn explain_json_reports_dependents_without_requiring_lockfile() {
     let tmp = tempdir().unwrap();
+    let tmp_path = tmp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| tmp.path().to_path_buf());
+    #[cfg(windows)]
+    let tmp_path_str = tmp_path
+        .to_str()
+        .unwrap()
+        .strip_prefix(r"\\?\")
+        .unwrap_or(tmp_path.to_str().unwrap());
+    #[cfg(not(windows))]
+    let tmp_path_str = tmp_path.to_str().unwrap();
+
     fs::write(
-        tmp.path().join("package.json"),
+        tmp_path.join("package.json"),
         r#"{"name":"app","version":"1.0.0","dependencies":{"child":"^1.0.0"}}"#,
     )
     .unwrap();
-    let child = tmp.path().join("node_modules/child");
+    let child = tmp_path.join("node_modules/child");
     fs::create_dir_all(&child).unwrap();
     fs::write(
         child.join("package.json"),
         r#"{"name":"child","version":"1.2.0"}"#,
     )
     .unwrap();
-    let output = run(tmp.path(), &["explain", "child", "--json"]);
+    let output = run(&tmp_path, &["explain", "child", "--json"]);
     let explanation: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(explanation[0]["name"], "child");
     assert_eq!(explanation[0]["dependents"][0]["spec"], "^1.0.0");
     assert_eq!(explanation[0]["dependents"][0]["type"], "prod");
     assert_eq!(
         explanation[0]["dependents"][0]["from"]["location"],
-        tmp.path().to_str().unwrap()
+        tmp_path_str
     );
     let missing = Command::new(env!("CARGO_BIN_EXE_rnpm"))
-        .current_dir(tmp.path())
+        .current_dir(&tmp_path)
         .args(["explain", "absent", "--json"])
         .output()
         .unwrap();
@@ -160,8 +176,8 @@ fn test_ls_and_ll_live_npm_parity() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "ls", "--json"])
+    let npm_res = isolated_npm(iso.path())
+        .args(["ls", "--json"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

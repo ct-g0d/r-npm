@@ -1,6 +1,9 @@
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn normalize_output(text: &str) -> String {
     let mut in_notice = false;
     text.replace("\r\n", "\n")
@@ -116,12 +119,8 @@ fn test_cli_approve_scripts_parity() {
         .output()
         .expect("rnpm approve-scripts failed");
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "approve-scripts",
             "my-pkg",
             "--no-update-notifier",
@@ -206,12 +205,8 @@ fn test_cli_deny_scripts_parity() {
         .output()
         .expect("rnpm deny-scripts failed");
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "deny-scripts",
             "my-pkg",
             "--no-update-notifier",
@@ -295,12 +290,8 @@ fn test_cli_install_scripts_parity() {
         .output()
         .expect("rnpm install-scripts failed");
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "install-scripts",
             "approve",
             "my-pkg",

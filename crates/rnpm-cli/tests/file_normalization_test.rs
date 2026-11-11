@@ -6,9 +6,14 @@ use tempfile::tempdir;
 fn test_file_spec_normalization_parity() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let temp = tempdir().unwrap();
+    let temp_path = temp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| temp.path().to_path_buf());
+    let temp_path = rnpm_shim::path::strip_verbatim_prefix(&temp_path);
 
     // 1. Create sibling package
-    let sibling_dir = temp.path().join("sibling");
+    let sibling_dir = temp_path.join("sibling");
     fs::create_dir_all(&sibling_dir).unwrap();
     fs::write(
         sibling_dir.join("package.json"),
@@ -17,7 +22,7 @@ fn test_file_spec_normalization_parity() {
     .unwrap();
 
     // 2. Create absolute target package
-    let abs_dir = temp.path().join("abspkg");
+    let abs_dir = temp_path.join("abspkg");
     fs::create_dir_all(&abs_dir).unwrap();
     fs::write(
         abs_dir.join("package.json"),
@@ -26,7 +31,7 @@ fn test_file_spec_normalization_parity() {
     .unwrap();
 
     // 3. Create consumer app
-    let app_dir = temp.path().join("app");
+    let app_dir = temp_path.join("app");
     fs::create_dir_all(&app_dir).unwrap();
     fs::write(
         app_dir.join("package.json"),

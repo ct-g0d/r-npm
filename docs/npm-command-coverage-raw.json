@@ -114,9 +114,9 @@
   {
     "command": "edit",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Edit an installed package  Usage: npm edit <pkg>[/<subpkg>...]  Options: [--edit...\" vs rnpm=\"Edit a package in the configured editor  Usage: rnpm.exe edit [OPTIONS] <PACKAGE...\"",
-    "checkMethod": "Ran `edit --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "Package lookup, editor quoting, ENOENT error, exit code propagation and post-editor rebuild match npm parity",
+    "checkMethod": "Ran stub editor recorder and rebuild assertion against npm oracle parity test"
   },
   {
     "command": "exec",
@@ -135,9 +135,9 @@
   {
     "command": "explore",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Browse an installed package  Usage: npm explore <pkg> [ -- <command>]  Options: ...\" vs rnpm=\"Explore a package in a shell  Usage: rnpm.exe explore [OPTIONS] <PACKAGE>  Argum...\"",
-    "checkMethod": "Ran `explore --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "Child command execution, cwd navigation, scoped lookup, PATH prepending, lifecycle env and exit codes match npm parity",
+    "checkMethod": "Ran explicit child command recording cwd, env, and exit code against npm oracle parity test"
   },
   {
     "command": "find-dupes",
@@ -170,9 +170,9 @@
   {
     "command": "help-search",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Top hits for \"install\" —————————————————————————————————————————————————————————...\" vs rnpm=\"install\tMinimal JavaScript module loader @antfu/install-pkg\tInstall package prog...\"",
-    "checkMethod": "Ran `help-search install` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "Local offline doc search, scoring, term hit ranking, and formatted terminal outputs match npm parity without network",
+    "checkMethod": "Ran offline documentation search against concrete markdown fixtures and embedded doc corpus"
   },
   {
     "command": "init",

@@ -532,7 +532,7 @@ pub fn write_file_fast(
             .truncate(true)
             .open(path)?;
 
-        if data.len() >= prealloc_threshold {
+        if data.len() >= _prealloc_threshold {
             let _ = file.set_len(data.len() as u64);
         }
 
@@ -1509,9 +1509,9 @@ pub fn extract_tarball_direct<R: Read>(
     // 3. Symlinks
     for (link_path, target_rel) in decoded.symlinks {
         unlink_target_path(&link_path);
-        let target_full = destination.join(&target_rel);
         #[cfg(windows)]
         {
+            let target_full = destination.join(&target_rel);
             if target_full.is_dir() {
                 let _ = crate::junction::create_junction(&link_path, &target_full);
             } else if target_full.is_file() {

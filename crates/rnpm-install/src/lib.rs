@@ -1840,13 +1840,22 @@ impl Installer {
                 PackageTarget::Version(v) => v.to_string(),
                 PackageTarget::File(p) => {
                     let rel = if p.is_absolute() {
-                        rnpm_shim::path::compute_relative_path(&self.options.project_dir, p)
+                        let project_dir = self
+                            .options
+                            .project_dir
+                            .canonicalize()
+                            .unwrap_or_else(|_| self.options.project_dir.clone());
+                        let target_path = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        let proj_stripped = rnpm_shim::path::strip_verbatim_prefix(&project_dir);
+                        let target_stripped = rnpm_shim::path::strip_verbatim_prefix(&target_path);
+                        rnpm_shim::path::compute_relative_path(&proj_stripped, &target_stripped)
                             .unwrap_or_else(|_| rnpm_core::to_posix_path(&p.to_string_lossy()))
                     } else {
                         rnpm_core::to_posix_path(&p.to_string_lossy())
                     };
-                    spec.target = PackageTarget::File(PathBuf::from(&rel));
-                    format!("file:{rel}")
+                    let clean_rel = rel.strip_prefix("./").unwrap_or(&rel).to_string();
+                    spec.target = PackageTarget::File(PathBuf::from(&clean_rel));
+                    format!("file:{clean_rel}")
                 }
                 PackageTarget::Git { url, committish } => {
                     format!(
@@ -2760,6 +2769,9 @@ impl Installer {
                             {
                                 let _ = std::fs::remove_dir_all(&dest_dir);
                             }
+                        }
+                        if let Some(parent) = dest_dir.parent() {
+                            let _ = std::fs::create_dir_all(parent);
                         }
                         rnpm_fs::create_junction(&dest_dir, &abs_file)
                             .map_err(|e| anyhow!("Failed to link file dir {}: {e}", loc))?;

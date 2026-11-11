@@ -1307,13 +1307,15 @@ pub(crate) enum Commands {
     },
     /// Edit a package in the configured editor.
     Edit {
-        package: String,
+        package: Option<String>,
         #[arg(long)]
         editor: Option<String>,
     },
     /// Explore a package in a shell.
     Explore {
-        package: String,
+        package: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
         #[arg(long)]
         shell: Option<String>,
     },
@@ -3862,242 +3864,6 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
     )?)?)
 }
 
-/// Parse a team entity in `@scope:team` format.
-fn split_team_entity(entity: &str) -> anyhow::Result<(&str, &str)> {
-    let entity = entity.trim_start_matches('@');
-    entity.split_once(':').ok_or_else(|| {
-        anyhow::anyhow!("npm error code EUSAGE\nnpm error team entity must use <scope:team> format")
-    })
-}
-
-async fn execute_profile(
-    current_dir: &Path,
-    action: Option<String>,
-    args: Vec<String>,
-    registry: Option<String>,
-    json: bool,
-    otp: Option<String>,
-    _parseable: bool,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    match action.as_deref().unwrap_or("get") {
-        "get" => {
-            let value = client.profile_get(Some(&registry_url)).await?;
-            if let Some(key) = args.first() {
-                let selected = value.get(key).cloned().unwrap_or(serde_json::Value::Null);
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&selected)?);
-                } else {
-                    println!(
-                        "{}",
-                        selected
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| selected.to_string())
-                    );
-                }
-                return Ok(());
-            }
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(object) = value.as_object() {
-                for (key, value) in object {
-                    let rendered = value
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| value.to_string());
-                    println!("{key}: {rendered}");
-                }
-            } else {
-                println!("{}", value);
-            }
-        }
-        "set" => {
-            if args.len() < 2 {
-                return Err(anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error profile set <property> <value>"
-                ));
-            }
-            let value = client
-                .profile_set(
-                    Some(&registry_url),
-                    serde_json::json!({args[0].clone(): args[1..].join(" ")}),
-                    otp.as_deref(),
-                )
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                println!("profile updated");
-            }
-        }
-        "enable-2fa" | "disable-2fa" => {
-            return Err(anyhow::anyhow!(
-            "npm error code ENOTSUP\nnpm error profile action is not supported by this registry"
-        ))
-        }
-        other => {
-            return Err(anyhow::anyhow!(
-                "npm error code EUSAGE\nnpm error Unknown profile command: {other}"
-            ))
-        }
-    }
-    Ok(())
-}
-
-async fn execute_org(
-    current_dir: &Path,
-    action: Option<String>,
-    args: Vec<String>,
-    registry: Option<String>,
-    json: bool,
-    _parseable: bool,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    let action = action.as_deref().unwrap_or("ls");
-    let value = match action {
-        "ls" => {
-            let org = args
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error org ls <org>"))?;
-            client.org_members(Some(&registry_url), org).await?
-        }
-        "add" | "set" => {
-            let org = args.first().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error org add <org> <user> [developer|admin]"
-                )
-            })?;
-            let user = args.get(1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error org add <org> <user> [developer|admin]"
-                )
-            })?;
-            client
-                .org_member_set(
-                    Some(&registry_url),
-                    org,
-                    user,
-                    args.get(2).map(String::as_str),
-                )
-                .await?
-        }
-        "rm" | "remove" => {
-            let org = args.first().ok_or_else(|| {
-                anyhow::anyhow!("npm error code EUSAGE\nnpm error org rm <org> <user>")
-            })?;
-            let user = args.get(1).ok_or_else(|| {
-                anyhow::anyhow!("npm error code EUSAGE\nnpm error org rm <org> <user>")
-            })?;
-            client
-                .org_member_remove(Some(&registry_url), org, user)
-                .await?;
-            serde_json::Value::Null
-        }
-        other => {
-            return Err(anyhow::anyhow!(
-                "npm error code EUSAGE\nnpm error Unknown org command: {other}"
-            ))
-        }
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if let Some(object) = value.as_object() {
-        for (user, role) in object {
-            println!("{user}\t{}", role.as_str().unwrap_or("member"));
-        }
-    } else {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    }
-    Ok(())
-}
-
-async fn execute_team(
-    current_dir: &Path,
-    action: Option<String>,
-    args: Vec<String>,
-    registry: Option<String>,
-    json: bool,
-    description: Option<String>,
-    _parseable: bool,
-) -> anyhow::Result<()> {
-    let (registry_url, client) = make_registry_client(current_dir, registry)?;
-    let action = action.as_deref().unwrap_or("ls");
-    let value = match action {
-        "create" => {
-            let entity = args.first().ok_or_else(|| {
-                anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>")
-            })?;
-            let (scope, team) = split_team_entity(entity)?;
-            client
-                .team_create(Some(&registry_url), scope, team, description.as_deref())
-                .await?
-        }
-        "destroy" => {
-            let entity = args.first().ok_or_else(|| {
-                anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>")
-            })?;
-            let (scope, team) = split_team_entity(entity)?;
-            client
-                .team_destroy(Some(&registry_url), scope, team)
-                .await?;
-            serde_json::Value::Null
-        }
-        "add" | "rm" => {
-            let entity = args.first().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error team {action} <scope:team> <user>"
-                )
-            })?;
-            let user = args.get(1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code EUSAGE\nnpm error team {action} <scope:team> <user>"
-                )
-            })?;
-            let (scope, team) = split_team_entity(entity)?;
-            if action == "add" {
-                client
-                    .team_add_user(Some(&registry_url), scope, team, user)
-                    .await?
-            } else {
-                client
-                    .team_remove_user(Some(&registry_url), scope, team, user)
-                    .await?;
-                serde_json::Value::Null
-            }
-        }
-        "ls" => {
-            let entity = args.first().ok_or_else(|| {
-                anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>")
-            })?;
-            if entity.contains(':') {
-                let (scope, team) = split_team_entity(entity)?;
-                client.team_users(Some(&registry_url), scope, team).await?
-            } else {
-                client.teams(Some(&registry_url), entity).await?
-            }
-        }
-        other => {
-            return Err(anyhow::anyhow!(
-                "npm error code EUSAGE\nnpm error Unknown team command: {other}"
-            ))
-        }
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if let Some(array) = value.as_array() {
-        for item in array {
-            let rendered = item
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| item.to_string());
-            println!("{rendered}");
-        }
-    } else if !value.is_null() {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    }
-    Ok(())
-}
 
 fn print_fixed_summary(
     fixed_vulns: usize,
@@ -5727,34 +5493,63 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             json,
             parseable,
-        } => execute_profile(&current_dir, action, args, registry, json, otp, parseable).await?,
+        } => {
+            commands::profile::run(
+                commands::profile::ProfileArgs {
+                    action,
+                    args,
+                    otp,
+                    registry,
+                    json,
+                    parseable,
+                },
+                &current_dir,
+            )
+            .await?;
+        }
         Commands::Org {
             action,
             args,
-            otp: _,
+            otp,
             registry,
             json,
             parseable,
-        } => execute_org(&current_dir, action, args, registry, json, parseable).await?,
+        } => {
+            commands::org::run(
+                commands::org::OrgArgs {
+                    action,
+                    args,
+                    otp,
+                    registry,
+                    json,
+                    parseable,
+                },
+                &current_dir,
+            )
+            .await?;
+        }
         Commands::Team {
             action,
             args,
-            otp: _,
+            otp,
             description,
             registry,
             json,
             parseable,
         } => {
-            execute_team(
+            commands::team::run(
+                commands::team::TeamArgs {
+                    action,
+                    args,
+                    otp,
+                    description,
+                    registry,
+                    json,
+                    parseable,
+                },
                 &current_dir,
-                action,
-                args,
-                registry,
-                json,
-                description,
-                parseable,
             )
-            .await?
+            .await?;
         }
         Commands::Doctor { action, args, json } => {
             let is_perf = action.as_deref() == Some("perf") || args.iter().any(|a| a == "perf");
@@ -5889,77 +5684,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Edit { package, editor } => {
-            let dir = resolve_local_package_dir(&current_dir, &package)?;
-            let editor = editor
-                .or_else(|| std::env::var("npm_config_editor").ok())
-                .or_else(|| std::env::var("VISUAL").ok())
-                .or_else(|| std::env::var("EDITOR").ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("npm error code ENOENT\nnpm error no editor configured")
-                })?;
-            let status = std::process::Command::new(&editor)
-                .current_dir(dir)
-                .status()?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "npm error code ELIFECYCLE\nnpm error editor exited with {status}"
-                ));
-            }
+            commands::edit::run(package, editor, current_dir).await?;
         }
-        Commands::Explore { package, shell } => {
-            let dir = resolve_local_package_dir(&current_dir, &package)?;
-            #[cfg(windows)]
-            let (program, args): (String, Vec<String>) = (
-                shell
-                    .or_else(|| std::env::var("ComSpec").ok())
-                    .unwrap_or_else(|| "cmd.exe".into()),
-                vec!["/K".into()],
-            );
-            #[cfg(not(windows))]
-            let (program, args): (String, Vec<String>) = (
-                shell
-                    .or_else(|| std::env::var("SHELL").ok())
-                    .unwrap_or_else(|| "/bin/sh".into()),
-                Vec::new(),
-            );
-            let status = std::process::Command::new(program)
-                .args(args)
-                .current_dir(dir)
-                .status()?;
-            if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "npm error code ELIFECYCLE\nnpm error explore shell exited with {status}"
-                ));
-            }
+        Commands::Explore {
+            package,
+            args,
+            shell,
+        } => {
+            commands::explore::run(package, args, shell, current_dir).await?;
         }
         Commands::HelpSearch {
             terms,
             long,
-            registry,
-            json,
+            registry: _,
+            json: _,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = client
-                .search(
-                    Some(&registry_url),
-                    &terms.join(" "),
-                    if long { 50 } else { 20 },
-                    0,
-                )
-                .await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(objects) = value.get("objects").and_then(|v| v.as_array()) {
-                for object in objects {
-                    let package = object.get("package").unwrap_or(object);
-                    let name = package.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let description = package
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    println!("{name}\t{description}");
-                }
-            }
+            commands::help_search::run(terms, long, None).await?;
         }
         Commands::Stage {
             action,

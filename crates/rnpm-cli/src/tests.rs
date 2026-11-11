@@ -2878,3 +2878,1014 @@ fn test_lane3_preprocessing_edge_cases() {
         "Positionals foo and bar must be forwarded to script"
     );
 }
+
+// =========================================================================
+// Account & Registry Management Parity Tests (Org, Team, Profile)
+// =========================================================================
+
+#[derive(Clone, Debug)]
+struct MockHttpExchange {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+#[tokio::test]
+async fn test_org_rm_followup_error_propagation_and_order() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            let mut body_str = String::new();
+                            let mut in_headers = true;
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if in_headers {
+                                    if l.is_empty() {
+                                        in_headers = false;
+                                        continue;
+                                    }
+                                    if let Some((k, v)) = l.split_once(':') {
+                                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                    }
+                                } else {
+                                    body_str.push_str(line);
+                                    body_str.push('\n');
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method: method.clone(),
+                                path: path.clone(),
+                                headers,
+                                body: body_str.trim().to_string(),
+                            });
+
+                            let (status_line, body) = if method == "DELETE" && path == "/-/org/acme/user" {
+                                ("HTTP/1.1 200 OK", "{\"user\":\"alice\"}".to_string())
+                            } else if method == "GET" && path == "/-/org/acme/user" {
+                                ("HTTP/1.1 403 Forbidden", "{\"message\":\"forbidden roster\"}".to_string())
+                            } else {
+                                ("HTTP/1.1 404 Not Found", "{}".to_string())
+                            };
+
+                            let resp = format!(
+                                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // Write .npmrc with Bearer auth token
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "rm", "acme", "alice"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_err(), "org rm must return error when follow-up GET fails");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("npm error code E403"), "Must contain code E403: {err_msg}");
+    assert!(err_msg.contains("403 Forbidden"), "Must contain 403 Forbidden: {err_msg}");
+    assert!(err_msg.contains("forbidden roster"), "Must contain registry message: {err_msg}");
+    assert!(err_msg.contains("In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy"), "Must contain security policy text: {err_msg}");
+
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 2, "Must make exactly 2 requests (DELETE then GET)");
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(reqs[0].path, "/-/org/acme/user");
+    assert_eq!(reqs[0].body, "{\"user\":\"alice\"}");
+    assert_eq!(reqs[1].method, "GET");
+    assert_eq!(reqs[1].path, "/-/org/acme/user");
+}
+
+#[tokio::test]
+async fn test_profile_set_malformed_read_aborts_with_zero_post() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method: method.clone(),
+                                path: path.clone(),
+                                headers: BTreeMap::new(),
+                                body: String::new(),
+                            });
+
+                            let (status_line, body) = if method == "GET" && path == "/-/npm/v1/user" {
+                                ("HTTP/1.1 200 OK", "not-json".to_string())
+                            } else {
+                                ("HTTP/1.1 500 Internal Error", "unexpected".to_string())
+                            };
+
+                            let resp = format!(
+                                "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "profile", "set", "fullname", "Alice Example"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_err(), "profile set must fail on malformed JSON read");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("FETCH_ERROR"), "Error must contain FETCH_ERROR: {err_msg}");
+    assert!(err_msg.contains("invalid json response body"), "Error must describe invalid json: {err_msg}");
+
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 1, "Must only issue GET; ZERO POST requests allowed");
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/-/npm/v1/user");
+}
+
+#[tokio::test]
+async fn test_basic_auth_and_bearer_auth_resolution() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if l.is_empty() { break; }
+                                if let Some((k, v)) = l.split_once(':') {
+                                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: String::new(),
+                            });
+
+                            let body = "{\"alice\":\"owner\"}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // 1. Basic Auth via _auth
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_auth = ZHVtbXk6ZHVtbXk=\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    assert!(res.is_ok(), "org ls with _auth basic credential must succeed: {:?}", res.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let auth_hdr = reqs[0].headers.get("authorization").cloned().unwrap_or_default();
+        assert_eq!(auth_hdr, "Basic ZHVtbXk6ZHVtbXk=");
+    }
+
+    // 2. Bearer Auth via _authToken
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = my-secret-token\n"),
+    ).unwrap();
+
+    let cli2 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_ok(), "org ls with _authToken bearer credential must succeed: {:?}", res2.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 2);
+        let auth_hdr = reqs[1].headers.get("authorization").cloned().unwrap_or_default();
+        assert_eq!(auth_hdr, "Bearer my-secret-token");
+    }
+
+    // 3. Unauthenticated -> succeeds without Authorization header when server returns 200
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n"),
+    ).unwrap();
+
+    let cli3 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res3 = run_cli(cli3, Some(tmp.path().to_path_buf())).await;
+    assert!(res3.is_ok(), "org ls without credentials against public 200 roster must succeed: {:?}", res3.err());
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 3);
+        assert!(!reqs[2].headers.contains_key("authorization"), "Unauthenticated request must not send authorization header");
+    }
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_team_create_omits_null_description_and_escapes() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            let mut body_str = String::new();
+                            let mut in_headers = true;
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if in_headers {
+                                    if l.is_empty() {
+                                        in_headers = false;
+                                        continue;
+                                    }
+                                    if let Some((k, v)) = l.split_once(':') {
+                                        headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                    }
+                                } else {
+                                    body_str.push_str(line);
+                                    body_str.push('\n');
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: body_str.trim().to_string(),
+                            });
+
+                            let body = "{\"created\":true}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    // 1. Without description -> exactly {"name":"dev"}
+    let cli = Cli::try_parse_from(["rnpm", "team", "create", "acme:dev"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    assert!(res.is_ok(), "team create without description must succeed: {:?}", res.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/-/org/acme/team");
+        assert_eq!(reqs[0].body, "{\"name\":\"dev\"}", "Body must strictly omit description field");
+    }
+
+    // 2. With description -> contains description
+    let cli2 = Cli::try_parse_from(["rnpm", "team", "create", "@acme:core", "--description", "Core Developers"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_ok(), "team create with description must succeed: {:?}", res2.err());
+
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].method, "PUT");
+        assert_eq!(reqs[1].path, "/-/org/acme/team");
+        assert!(reqs[1].body.contains("\"description\":\"Core Developers\""));
+    }
+
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn test_silent_flag_and_otp_forwarding() {
+    let tmp = tempdir().unwrap();
+    let recorded_requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<MockHttpExchange>::new()));
+    let rec_c = recorded_requests.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        let rec = rec_c.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let lines: Vec<&str> = req_text.lines().collect();
+                            let req_line = lines.first().copied().unwrap_or("");
+                            let mut parts = req_line.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+
+                            let mut headers = BTreeMap::new();
+                            for line in &lines[1..] {
+                                let l = line.trim_end();
+                                if l.is_empty() { break; }
+                                if let Some((k, v)) = l.split_once(':') {
+                                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+
+                            rec.lock().await.push(MockHttpExchange {
+                                method,
+                                path,
+                                headers,
+                                body: String::new(),
+                            });
+
+                            let body = "{\"alice\":\"developer\"}";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\nloglevel = silent\n"),
+    ).unwrap();
+
+    let cli = Cli::try_parse_from(["rnpm", "org", "ls", "acme", "--otp", "654321"]).unwrap();
+    let res = run_cli(cli, Some(tmp.path().to_path_buf())).await;
+    let _ = tx.send(());
+
+    assert!(res.is_ok(), "org ls with silent config and otp must succeed");
+    let reqs = recorded_requests.lock().await;
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].headers.get("npm-otp"), Some(&"654321".to_string()));
+}
+
+#[tokio::test]
+async fn test_malformed_json_org_team_profile() {
+    let tmp = tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                res = listener.accept() => {
+                    if let Ok((mut stream, _)) = res {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 { return; }
+                            let body = "not-json-content";
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.flush().await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let npmrc_path = tmp.path().join(".npmrc");
+    std::fs::write(
+        &npmrc_path,
+        format!("registry = http://{addr}/\n//{addr}/:_authToken = dummy-token\n"),
+    ).unwrap();
+
+    // 1. org ls with malformed JSON
+    let cli1 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
+    let res1 = run_cli(cli1, Some(tmp.path().to_path_buf())).await;
+    assert!(res1.is_err(), "org ls must fail on malformed json");
+    let err1 = res1.unwrap_err().to_string();
+    assert!(err1.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err1}");
+
+    // 2. team ls with malformed JSON
+    let cli2 = Cli::try_parse_from(["rnpm", "team", "ls", "acme"]).unwrap();
+    let res2 = run_cli(cli2, Some(tmp.path().to_path_buf())).await;
+    assert!(res2.is_err(), "team ls must fail on malformed json");
+    let err2 = res2.unwrap_err().to_string();
+    assert!(err2.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err2}");
+
+    // 3. profile get with malformed JSON
+    let cli3 = Cli::try_parse_from(["rnpm", "profile", "get"]).unwrap();
+    let res3 = run_cli(cli3, Some(tmp.path().to_path_buf())).await;
+    assert!(res3.is_err(), "profile get must fail on malformed json");
+    let err3 = res3.unwrap_err().to_string();
+    assert!(err3.contains("FETCH_ERROR"), "Must contain FETCH_ERROR: {err3}");
+
+    let _ = tx.send(());
+}
+
+#[test]
+fn test_http_error_formatting_parity() {
+    use crate::commands::client_helper::format_http_error;
+
+    let target = reqwest::Url::parse("http://127.0.0.1:8080/-/npm/v1/user").unwrap();
+
+    // 401
+    let err_401 = format_http_error("GET", &target, reqwest::StatusCode::UNAUTHORIZED, "{\"message\":\"login required\"}");
+    let s_401 = err_401.to_string();
+    assert!(s_401.contains("npm error code E401"), "Got: {s_401}");
+    assert!(s_401.contains("401 Unauthorized - GET http://127.0.0.1:8080/-/npm/v1/user - login required"), "Got: {s_401}");
+
+    // 403 (with security policy note)
+    let err_403 = format_http_error("GET", &target, reqwest::StatusCode::FORBIDDEN, "{\"message\":\"forbidden roster\"}");
+    let s_403 = err_403.to_string();
+    assert!(s_403.contains("npm error code E403"), "Got: {s_403}");
+    assert!(s_403.contains("403 Forbidden - GET http://127.0.0.1:8080/-/npm/v1/user - forbidden roster"), "Got: {s_403}");
+    assert!(s_403.contains("In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy"), "Got: {s_403}");
+
+    // 404
+    let err_404 = format_http_error("GET", &target, reqwest::StatusCode::NOT_FOUND, "{\"error\":\"not found\"}");
+    let s_404 = err_404.to_string();
+    assert!(s_404.contains("npm error code E404"), "Got: {s_404}");
+    assert!(s_404.contains("404 Not Found - GET http://127.0.0.1:8080/-/npm/v1/user - not found"), "Got: {s_404}");
+}
+
+#[test]
+fn test_client_helper_auth_resolution_matrix() {
+    use crate::commands::client_helper::{resolve_auth, RegistryAuth};
+
+    let reg = reqwest::Url::parse("https://registry.npmjs.org/").unwrap();
+
+    // 1. _authToken -> Bearer
+    let mut npmrc1 = rnpm_config::Npmrc::new();
+    npmrc1.settings.insert("//registry.npmjs.org/:_authToken".to_string(), "token-123".to_string());
+    assert_eq!(resolve_auth(&npmrc1, &reg), Some(RegistryAuth::Bearer("token-123".to_string())));
+
+    // 2. _auth -> Basic
+    let mut npmrc2 = rnpm_config::Npmrc::new();
+    npmrc2.settings.insert("//registry.npmjs.org/:_auth".to_string(), "ZHVtbXk6ZHVtbXk=".to_string());
+    assert_eq!(resolve_auth(&npmrc2, &reg), Some(RegistryAuth::Basic("ZHVtbXk6ZHVtbXk=".to_string())));
+
+    // 3. username + encoded _password (cGFzcw== is base64 for "pass") -> Basic dXNlcjpwYXNz (user:pass)
+    let mut npmrc3 = rnpm_config::Npmrc::new();
+    npmrc3.settings.insert("//registry.npmjs.org/:username".to_string(), "user".to_string());
+    npmrc3.settings.insert("//registry.npmjs.org/:_password".to_string(), "cGFzcw==".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc3, &reg),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
+
+    // 4. Path-scoped basic over root bearer
+    let reg_nested = reqwest::Url::parse("http://127.0.0.1:58255/nested/").unwrap();
+    let mut npmrc4 = rnpm_config::Npmrc::new();
+    npmrc4.settings.insert("//127.0.0.1:58255/:_authToken".to_string(), "root-dummy".to_string());
+    npmrc4.settings.insert("//127.0.0.1:58255/nested/:_auth".to_string(), "dXNlcjpwYXNz".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc4, &reg_nested),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
+
+    // 5. Parent path scope (/nested/deeper/ matches /nested/)
+    let reg_deeper = reqwest::Url::parse("http://127.0.0.1:58255/nested/deeper/").unwrap();
+    let mut npmrc5 = rnpm_config::Npmrc::new();
+    npmrc5.settings.insert("//127.0.0.1:58255/nested/:_auth".to_string(), "dXNlcjpwYXNz".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc5, &reg_deeper),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
+
+    // 6. Port isolation: explicit port registry must not match portless authority
+    let reg_port = reqwest::Url::parse("http://127.0.0.1:58255/").unwrap();
+    let mut npmrc6 = rnpm_config::Npmrc::new();
+    npmrc6.settings.insert("//127.0.0.1/:_authToken".to_string(), "portless-dummy".to_string());
+    assert_eq!(resolve_auth(&npmrc6, &reg_port), None);
+
+    // 7. Missing credentials -> None
+    let npmrc7 = rnpm_config::Npmrc::new();
+    assert_eq!(resolve_auth(&npmrc7, &reg), None);
+}
+
+
+#[tokio::test]
+async fn test_offline_help_search_with_fixture() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture_dir = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests")
+        .join("fixtures")
+        .join("help-search")
+        .join("content");
+
+    let docs = crate::commands::help_search::load_documentation(Some(&fixture_dir)).unwrap();
+    assert_eq!(docs.len(), 3);
+
+    // 1. Search for "install"
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].cmd, "npm help install");
+    let hits = results[0].hits.get("install").copied().unwrap_or(0);
+    assert!(hits > 0);
+
+    let output = crate::commands::help_search::format_search_results(&["install".to_string()], &results, false);
+    assert!(output.starts_with("Top hits for \"install\"\n"));
+    assert!(output.contains("\u{2014}"));
+    assert!(output.contains("npm help install"));
+    assert!(output.contains("(run with -l or --long to see more context)"));
+
+    // 2. Search for nonexistent term
+    let no_match = crate::commands::help_search::search_documents(&["xyz_no_such_term".to_string()], &docs);
+    let output_none = crate::commands::help_search::format_search_results(&["xyz_no_such_term".to_string()], &no_match, false);
+    assert_eq!(output_none, "No matches in help for: xyz_no_such_term\n");
+
+    // 3. Multi-term long search
+    let multi_results = crate::commands::help_search::search_documents(
+        &["install".to_string(), "package".to_string()],
+        &docs,
+    );
+    assert!(!multi_results.is_empty());
+    let output_multi_long = crate::commands::help_search::format_search_results(
+        &["install".to_string(), "package".to_string()],
+        &multi_results,
+        true,
+    );
+    assert!(output_multi_long.contains("npm help install"));
+    assert!(output_multi_long.contains("--------------------------------------------------------------------------------"));
+    // Multi-term highlighting repeats context for each term
+    assert!(output_multi_long.lines().count() > 1);
+
+    // 4. Empty args error check
+    let empty_run = crate::commands::help_search::run(vec![], false, Some(&fixture_dir)).await;
+    assert!(empty_run.is_err());
+    let empty_err = format!("{}", empty_run.unwrap_err());
+    assert!(empty_err.contains("EUSAGE"));
+}
+
+#[tokio::test]
+async fn test_offline_help_search_embedded_parity() {
+    let docs = crate::commands::help_search::load_documentation(None).unwrap();
+    assert_eq!(docs.len(), 91);
+
+    let results = crate::commands::help_search::search_documents(&["install".to_string()], &docs);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].cmd, "npm help install");
+    assert_eq!(results[0].hits.get("install"), Some(&197));
+
+    // Multi-term long parity against committed oracle snapshot unconditionally
+    let terms = vec!["install".to_string(), "package".to_string()];
+    let multi = crate::commands::help_search::search_documents(&terms, &docs);
+    let formatted = crate::commands::help_search::format_search_results(&terms, &multi, true);
+    let expected = include_str!("../../../tests/fixtures/help-search/expected-long.utf8.txt");
+    assert_eq!(formatted, expected);
+}
+
+#[tokio::test]
+async fn test_offline_edit_stub_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // Create root package.json
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    // Create target package with lifecycle install hook writing rebuilt.marker
+    let pkg_dir = root.join("node_modules").join("my-test-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    let hook_js = pkg_dir.join("hook.js");
+    std::fs::write(
+        &hook_js,
+        "const fs = require('fs'); fs.writeFileSync('rebuilt.marker', 'rebuilt');",
+    ).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"my-test-pkg","version":"1.0.0","scripts":{"install":"node hook.js"}}"#,
+    ).unwrap();
+
+    // Create a second unrelated package to verify its hook is NOT triggered during targeted rebuild
+    let unrelated_dir = root.join("node_modules").join("unrelated-pkg");
+    std::fs::create_dir_all(&unrelated_dir).unwrap();
+    let unrelated_hook_js = unrelated_dir.join("unrelated_hook.js");
+    std::fs::write(
+        &unrelated_hook_js,
+        "const fs = require('fs'); fs.writeFileSync('unrelated.marker', 'unrelated');",
+    ).unwrap();
+    std::fs::write(
+        unrelated_dir.join("package.json"),
+        r#"{"name":"unrelated-pkg","version":"1.0.0","scripts":{"install":"node unrelated_hook.js"}}"#,
+    ).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("sub-pkg");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/sub-pkg","version":"1.0.0"}"#).unwrap();
+
+    // Stub editor recording script
+    let out_file = root.join("editor_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_editor.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{ argv: process.argv, cwd: process.cwd() }}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    let editor_cmd = format!("node \"{}\" --custom-flag", record_js.to_string_lossy());
+
+    // 1. Run edit on standard package
+    let res = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "edit failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv = recorded.get("argv").unwrap().as_array().unwrap();
+    let cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+
+    // Verify cwd is project root (matching npm behavior)
+    let expected_root_norm = root.canonicalize().unwrap_or(root.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(cwd).canonicalize().unwrap_or(PathBuf::from(cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_root_norm);
+
+    // Verify editor argv contains target package dir as last argument
+    assert!(argv.len() >= 3);
+    assert_eq!(argv[argv.len() - 2].as_str(), Some("--custom-flag"));
+    let target_arg = argv[argv.len() - 1].as_str().unwrap();
+    assert!(target_arg.ends_with("my-test-pkg"));
+
+    // Verify post-editor rebuild hook executed: rebuilt.marker MUST exist
+    assert!(
+        pkg_dir.join("rebuilt.marker").is_file(),
+        "Targeted package install lifecycle hook must have run and created rebuilt.marker"
+    );
+    // Verify unrelated package was NOT rebuilt
+    assert!(
+        !unrelated_dir.join("unrelated.marker").exists(),
+        "Unrelated package install lifecycle hook must NOT have run"
+    );
+
+    // 2. Run edit on scoped package
+    let res_scoped = crate::commands::edit::run(
+        Some("@scoped/sub-pkg".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped edit failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let argv_scoped = recorded_scoped.get("argv").unwrap().as_array().unwrap();
+    let target_arg_scoped = argv_scoped[argv_scoped.len() - 1].as_str().unwrap();
+    assert!(target_arg_scoped.replace('\\', "/").ends_with("@scoped/sub-pkg"));
+
+    // 3. Missing package error
+    let res_missing = crate::commands::edit::run(
+        Some("no-such-package".to_string()),
+        Some(editor_cmd.clone()),
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let err_msg = format!("{}", res_missing.unwrap_err());
+    assert!(err_msg.contains("ENOENT"));
+
+    // 4. Failing editor process propagates exit code and must NOT trigger rebuild
+    let _ = std::fs::remove_file(pkg_dir.join("rebuilt.marker"));
+    let fail_js = root.join("fail_editor.js");
+    std::fs::write(&fail_js, "process.exit(42);").unwrap();
+    let fail_editor = format!("node \"{}\"", fail_js.to_string_lossy());
+    let res_fail = crate::commands::edit::run(
+        Some("my-test-pkg".to_string()),
+        Some(fail_editor),
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let fail_msg = format!("{}", res_fail.unwrap_err());
+    assert!(fail_msg.contains("42"));
+    assert!(
+        !pkg_dir.join("rebuilt.marker").exists(),
+        "Editor failure must not trigger rebuild or create rebuilt.marker"
+    );
+}
+
+#[tokio::test]
+async fn test_offline_explore_child_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+
+    // Create project root
+    let root = base.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
+
+    let pkg_dir = root.join("node_modules").join("explore-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("package.json"), r#"{"name":"explore-pkg","version":"2.5.1"}"#).unwrap();
+
+    let scoped_dir = root.join("node_modules").join("@scoped").join("explore-target");
+    std::fs::create_dir_all(&scoped_dir).unwrap();
+    std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/explore-target","version":"3.0.0"}"#).unwrap();
+
+    // Create a sibling outside/ directory with an EXISTING package.json to test path escape prevention
+    let outside_dir = base.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("package.json"), r#"{"name":"outside","version":"1.0.0"}"#).unwrap();
+
+    let outside_marker = outside_dir.join("outside_executed.marker");
+    let outside_probe_js = base.join("outside_probe.js");
+    std::fs::write(
+        &outside_probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'OUTSIDE_EXECUTED'); process.exit(0);",
+            outside_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
+
+    // Probe script to test path guard rejections
+    let probe_marker = root.join("probe_executed.marker");
+    let probe_js = root.join("probe.js");
+    std::fs::write(
+        &probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'EXECUTED'); process.exit(0);",
+            probe_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
+
+    // 1. Path guard rejections: '..', '../..', '.', '/', traversal paths
+    for rejected in &["..", "../..", ".", "/", "foo/../.."] {
+        let res = crate::commands::explore::run(
+            Some(rejected.to_string()),
+            vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{rejected}' must fail with EUSAGE");
+        let err = format!("{}", res.unwrap_err());
+        assert!(err.contains("EUSAGE"), "Error must be EUSAGE for '{rejected}', got: {err}");
+        assert!(!probe_marker.exists(), "Probe must never be executed for rejected path '{rejected}'");
+    }
+
+    // 2. Drive-relative, other drive, rooted, and UNC paths must NEVER escape node_modules to sibling outside/
+    let escape_attempts = vec![
+        "C:../outside",
+        "D:../outside",
+        "/outside",
+        "\\\\server\\share\\pkg",
+        "C:/outside",
+    ];
+    for escape_target in escape_attempts {
+        let res = crate::commands::explore::run(
+            Some(escape_target.to_string()),
+            vec!["node".to_string(), outside_probe_js.to_string_lossy().to_string()],
+            None,
+            root.clone(),
+        ).await;
+        assert!(res.is_err(), "explore '{escape_target}' must fail");
+        assert!(
+            !outside_marker.exists(),
+            "Probe must NEVER execute in sibling outside directory via '{escape_target}'!"
+        );
+    }
+
+    // 3. Legitimate target with '../' rooted normalization (e.g. '../explore-pkg' normalizes to 'explore-pkg')
+    let res_norm = crate::commands::explore::run(
+        Some("../explore-pkg".to_string()),
+        vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_norm.is_ok(), "Legitimate '../explore-pkg' target must succeed: {:?}", res_norm.err());
+    assert!(probe_marker.exists(), "Probe must execute for valid normalized target");
+    let _ = std::fs::remove_file(&probe_marker);
+
+    let out_file = root.join("explore_record.json");
+    let out_str = out_file.to_string_lossy().replace('\\', "/");
+    let record_js = root.join("stub_child.js");
+    let script_content = format!(
+        r#"const fs = require('fs');
+fs.writeFileSync('{}', JSON.stringify({{
+    cwd: process.cwd(),
+    event: process.env.npm_lifecycle_event,
+    name: process.env.npm_package_name,
+    version: process.env.npm_package_version,
+    command: process.env.npm_command,
+    path: process.env.PATH || process.env.Path
+}}));
+process.exit(0);
+"#,
+        out_str
+    );
+    std::fs::write(&record_js, script_content).unwrap();
+
+    // 2. Run explore with explicit child command on standard package
+    let res = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res.is_ok(), "explore failed: {:?}", res.err());
+
+    let recorded: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_cwd = recorded.get("cwd").unwrap().as_str().unwrap();
+    let expected_pkg_norm = pkg_dir.canonicalize().unwrap_or(pkg_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_cwd_norm = PathBuf::from(actual_cwd).canonicalize().unwrap_or(PathBuf::from(actual_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_cwd_norm, expected_pkg_norm);
+    assert_eq!(recorded.get("event").unwrap().as_str(), Some("_explore"));
+    assert_eq!(recorded.get("name").unwrap().as_str(), Some("explore-pkg"));
+    assert_eq!(recorded.get("version").unwrap().as_str(), Some("2.5.1"));
+    assert_eq!(recorded.get("command").unwrap().as_str(), Some("explore"));
+
+    // 3. Assert PATH contract: child PATH prepends target and all ancestor node_modules/.bin unconditionally
+    let captured_path = recorded.get("path").unwrap().as_str().unwrap();
+    let path_entries: Vec<PathBuf> = std::env::split_paths(captured_path).collect();
+    let expected_pkg_bin = pkg_dir.join("node_modules").join(".bin");
+    let expected_root_bin = root.join("node_modules").join(".bin");
+    assert_eq!(path_entries[0], expected_pkg_bin, "First PATH entry must be target package node_modules/.bin");
+    assert!(
+        path_entries.contains(&expected_root_bin),
+        "Ancestor node_modules/.bin must be in PATH: expected {expected_root_bin:?} in {path_entries:?}"
+    );
+
+    // 4. Run explore on scoped package
+    let res_scoped = crate::commands::explore::run(
+        Some("@scoped/explore-target".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_scoped.is_ok(), "scoped explore failed: {:?}", res_scoped.err());
+
+    let recorded_scoped: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    let actual_scoped_cwd = recorded_scoped.get("cwd").unwrap().as_str().unwrap();
+    let expected_scoped_norm = scoped_dir.canonicalize().unwrap_or(scoped_dir.clone()).to_string_lossy().to_lowercase().replace('\\', "/");
+    let actual_scoped_norm = PathBuf::from(actual_scoped_cwd).canonicalize().unwrap_or(PathBuf::from(actual_scoped_cwd)).to_string_lossy().to_lowercase().replace('\\', "/");
+    assert_eq!(actual_scoped_norm, expected_scoped_norm);
+    assert_eq!(recorded_scoped.get("name").unwrap().as_str(), Some("@scoped/explore-target"));
+    assert_eq!(recorded_scoped.get("version").unwrap().as_str(), Some("3.0.0"));
+
+    // 5. Missing package error
+    let res_missing = crate::commands::explore::run(
+        Some("missing-pkg".to_string()),
+        vec!["node".to_string(), record_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_missing.is_err());
+    let missing_msg = format!("{}", res_missing.unwrap_err());
+    assert!(missing_msg.contains("It doesn't look like missing-pkg is installed."));
+    assert!(missing_msg.contains("ENOENT"));
+
+    // 6. Non-zero exit code error propagation
+    let fail_js = root.join("fail_child.js");
+    std::fs::write(&fail_js, "process.exit(7);").unwrap();
+    let res_fail = crate::commands::explore::run(
+        Some("explore-pkg".to_string()),
+        vec!["node".to_string(), fail_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_fail.is_err());
+    let exit_err = res_fail.unwrap_err();
+    if let Some(script_err) = exit_err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
+        assert_eq!(script_err.exit_code, 7);
+    } else {
+        panic!("Expected ScriptExitError with exit code 7, got: {:?}", exit_err);
+    }
+}

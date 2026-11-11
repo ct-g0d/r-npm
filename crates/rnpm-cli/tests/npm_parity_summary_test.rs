@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_install_uninstall_summary_phrasing_and_json_parity() {
     let tmp = tempdir().unwrap();
@@ -103,8 +106,8 @@ fn test_install_uninstall_summary_phrasing_and_json_parity() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_inst = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "install", "--offline", "--no-audit", "--no-fund"])
+    let npm_inst = isolated_npm(iso.path())
+        .args(["install", "--offline", "--no-audit", "--no-fund"])
         .current_dir(npm_tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

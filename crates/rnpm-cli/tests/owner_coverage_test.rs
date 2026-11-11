@@ -1,5 +1,8 @@
 use std::process::Command;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -60,10 +63,12 @@ async fn test_cli_owner_ls() {
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())
-        .env("npm_config_userconfig", &userconfig)
-        .env("npm_config_globalconfig", &globalconfig)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
         .env("USERCONFIG", &userconfig)
+        .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
         .env("GLOBALCONFIG", &globalconfig)
+        .env("npm_config_globalconfig", &globalconfig)
         .env("PREFIX", &prefix_dir)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("CACHE", &cache_dir)
@@ -81,12 +86,8 @@ async fn test_cli_owner_ls() {
         .output()
         .expect("owner ls failed");
 
-    let npm_out = Command::new("cmd.exe")
+    let npm_out = isolated_npm(iso.path())
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "owner",
             "ls",
             "sample-pkg",
@@ -96,10 +97,12 @@ async fn test_cli_owner_ls() {
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())
-        .env("npm_config_userconfig", &userconfig)
-        .env("npm_config_globalconfig", &globalconfig)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
         .env("USERCONFIG", &userconfig)
+        .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
         .env("GLOBALCONFIG", &globalconfig)
+        .env("npm_config_globalconfig", &globalconfig)
         .env("PREFIX", &prefix_dir)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("CACHE", &cache_dir)

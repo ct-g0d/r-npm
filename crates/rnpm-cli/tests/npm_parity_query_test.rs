@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_query_root_npm_parity() {
     let tmp = tempdir().unwrap();
@@ -88,8 +91,8 @@ fn test_query_root_npm_parity() {
     );
 
     // If npm is available, compare directly against npm query :root
-    let npm_out = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "query", ":root"])
+    let npm_out = isolated_npm(iso.path())
+        .args(["query", ":root"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

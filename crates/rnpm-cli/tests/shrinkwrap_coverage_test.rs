@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_shrinkwrap_renames_lockfile() {
     let tmp = tempdir().unwrap();
@@ -46,8 +49,8 @@ fn test_shrinkwrap_renames_lockfile() {
     let tmp_npm = tempdir().unwrap();
     fs::write(tmp_npm.path().join("package.json"), pkg_json).unwrap();
     fs::write(tmp_npm.path().join("package-lock.json"), lock_json).unwrap();
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "shrinkwrap"])
+    let npm_res = isolated_npm(iso.path())
+        .arg("shrinkwrap")
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

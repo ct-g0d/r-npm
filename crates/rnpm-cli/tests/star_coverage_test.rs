@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -184,25 +187,25 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
+        .env("NPM_CONFIG_CACHE", &cache_dir)
+        .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
         .args(["star", "sample-pkg", "--registry", &format!("http://{addr}/")])
         .output()
         .expect("rnpm star failed");
 
-    let npm_star = Command::new("cmd.exe")
+    let npm_star = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "star",
             "sample-pkg",
             "--registry",
@@ -212,12 +215,14 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -226,7 +231,15 @@ async fn test_cli_star_unstar_stars_parity() {
         .output();
 
     if let Ok(npm_out) = npm_star {
-        assert_eq!(rnpm_star.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_star.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch on star!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_star.stdout),
+            String::from_utf8_lossy(&rnpm_star.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_star.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))
@@ -244,12 +257,14 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -259,12 +274,8 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm unstar failed");
 
-    let npm_unstar = Command::new("cmd.exe")
+    let npm_unstar = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unstar",
             "sample-pkg",
             "--registry",
@@ -274,12 +285,14 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -288,7 +301,15 @@ async fn test_cli_star_unstar_stars_parity() {
         .output();
 
     if let Ok(npm_out) = npm_unstar {
-        assert_eq!(rnpm_unstar.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_unstar.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch on unstar!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_unstar.stdout),
+            String::from_utf8_lossy(&rnpm_unstar.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_unstar.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))
@@ -306,12 +327,14 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -321,12 +344,8 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm stars failed");
 
-    let npm_stars = Command::new("cmd.exe")
+    let npm_stars = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "stars",
             "testuser",
             "--registry",
@@ -336,12 +355,14 @@ async fn test_cli_star_unstar_stars_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -350,7 +371,15 @@ async fn test_cli_star_unstar_stars_parity() {
         .output();
 
     if let Ok(npm_out) = npm_stars {
-        assert_eq!(rnpm_stars.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_stars.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch on stars!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_stars.stdout),
+            String::from_utf8_lossy(&rnpm_stars.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_stars.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))
