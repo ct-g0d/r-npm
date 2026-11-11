@@ -169,14 +169,26 @@ fn test_top_level_get_set_aliases() {
 fn test_prefix_root_bin_cli() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
-    let proj_dir = tmp.path().join("my-app");
+    let tmp_path = tmp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| tmp.path().to_path_buf());
+    #[cfg(windows)]
+    let tmp_path = std::path::PathBuf::from(
+        tmp_path
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap_or(tmp_path.to_str().unwrap()),
+    );
+    let proj_dir = tmp_path.join("my-app");
     fs::create_dir_all(&proj_dir).unwrap();
     fs::write(proj_dir.join("package.json"), r#"{"name": "my-app"}"#).unwrap();
 
-    let user_home = tmp.path().join("userhome");
+    let user_home = tmp_path.join("userhome");
     fs::create_dir_all(&user_home).unwrap();
 
-    let global_prefix = tmp.path().join("global-pref");
+    let global_prefix = tmp_path.join("global-pref");
     fs::create_dir_all(&global_prefix).unwrap();
 
     // 1. Local prefix, root, bin
