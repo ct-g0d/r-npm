@@ -3161,7 +3161,7 @@ async fn test_basic_auth_and_bearer_auth_resolution() {
         assert_eq!(auth_hdr, "Bearer my-secret-token");
     }
 
-    // 3. Unauthenticated -> ENEEDAUTH
+    // 3. Unauthenticated -> succeeds without Authorization header when server returns 200
     std::fs::write(
         &npmrc_path,
         format!("registry = http://{addr}/\n"),
@@ -3169,8 +3169,12 @@ async fn test_basic_auth_and_bearer_auth_resolution() {
 
     let cli3 = Cli::try_parse_from(["rnpm", "org", "ls", "acme"]).unwrap();
     let res3 = run_cli(cli3, Some(tmp.path().to_path_buf())).await;
-    assert!(res3.is_err(), "org ls without credentials must fail with ENEEDAUTH");
-    assert!(res3.unwrap_err().to_string().contains("ENEEDAUTH"));
+    assert!(res3.is_ok(), "org ls without credentials against public 200 roster must succeed: {:?}", res3.err());
+    {
+        let reqs = recorded_requests.lock().await;
+        assert_eq!(reqs.len(), 3);
+        assert!(!reqs[2].headers.contains_key("authorization"), "Unauthenticated request must not send authorization header");
+    }
 
     let _ = tx.send(());
 }
@@ -3455,16 +3459,43 @@ fn test_client_helper_auth_resolution_matrix() {
     npmrc2.settings.insert("//registry.npmjs.org/:_auth".to_string(), "ZHVtbXk6ZHVtbXk=".to_string());
     assert_eq!(resolve_auth(&npmrc2, &reg), Some(RegistryAuth::Basic("ZHVtbXk6ZHVtbXk=".to_string())));
 
-    // 3. username + _password -> Basic
+    // 3. username + encoded _password (cGFzcw== is base64 for "pass") -> Basic dXNlcjpwYXNz (user:pass)
     let mut npmrc3 = rnpm_config::Npmrc::new();
     npmrc3.settings.insert("//registry.npmjs.org/:username".to_string(), "user".to_string());
-    npmrc3.settings.insert("//registry.npmjs.org/:_password".to_string(), "pass".to_string());
-    let encoded = data_encoding::BASE64.encode(b"user:pass");
-    assert_eq!(resolve_auth(&npmrc3, &reg), Some(RegistryAuth::Basic(encoded)));
+    npmrc3.settings.insert("//registry.npmjs.org/:_password".to_string(), "cGFzcw==".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc3, &reg),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
 
-    // 4. Missing credentials -> None
-    let npmrc4 = rnpm_config::Npmrc::new();
-    assert_eq!(resolve_auth(&npmrc4, &reg), None);
+    // 4. Path-scoped basic over root bearer
+    let reg_nested = reqwest::Url::parse("http://127.0.0.1:58255/nested/").unwrap();
+    let mut npmrc4 = rnpm_config::Npmrc::new();
+    npmrc4.settings.insert("//127.0.0.1:58255/:_authToken".to_string(), "root-dummy".to_string());
+    npmrc4.settings.insert("//127.0.0.1:58255/nested/:_auth".to_string(), "dXNlcjpwYXNz".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc4, &reg_nested),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
+
+    // 5. Parent path scope (/nested/deeper/ matches /nested/)
+    let reg_deeper = reqwest::Url::parse("http://127.0.0.1:58255/nested/deeper/").unwrap();
+    let mut npmrc5 = rnpm_config::Npmrc::new();
+    npmrc5.settings.insert("//127.0.0.1:58255/nested/:_auth".to_string(), "dXNlcjpwYXNz".to_string());
+    assert_eq!(
+        resolve_auth(&npmrc5, &reg_deeper),
+        Some(RegistryAuth::Basic("dXNlcjpwYXNz".to_string()))
+    );
+
+    // 6. Port isolation: explicit port registry must not match portless authority
+    let reg_port = reqwest::Url::parse("http://127.0.0.1:58255/").unwrap();
+    let mut npmrc6 = rnpm_config::Npmrc::new();
+    npmrc6.settings.insert("//127.0.0.1/:_authToken".to_string(), "portless-dummy".to_string());
+    assert_eq!(resolve_auth(&npmrc6, &reg_port), None);
+
+    // 7. Missing credentials -> None
+    let npmrc7 = rnpm_config::Npmrc::new();
+    assert_eq!(resolve_auth(&npmrc7, &reg), None);
 }
 
 

@@ -11,7 +11,7 @@ pub(crate) enum RegistryAuth {
 pub(crate) struct CommandClient {
     pub client: reqwest::Client,
     pub registry_url: Url,
-    pub auth: RegistryAuth,
+    pub auth: Option<RegistryAuth>,
     pub silent: bool,
 }
 
@@ -28,11 +28,7 @@ impl CommandClient {
             config.npmrc.registry.clone()
         };
 
-        let auth = resolve_auth(&config.npmrc, &registry_url).ok_or_else(|| {
-            anyhow::anyhow!(
-                "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
-            )
-        })?;
+        let auth = resolve_auth(&config.npmrc, &registry_url);
 
         let cli_overrides = rnpm_config::get_process_cli_overrides();
         let silent_override = cli_overrides.as_ref().map(|o| {
@@ -93,12 +89,14 @@ impl CommandClient {
         otp: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let mut req = self.client.request(method, target_url);
-        match &self.auth {
-            RegistryAuth::Bearer(token) => {
-                req = req.header("authorization", format!("Bearer {token}"));
-            }
-            RegistryAuth::Basic(basic) => {
-                req = req.header("authorization", format!("Basic {basic}"));
+        if let Some(auth) = &self.auth {
+            match auth {
+                RegistryAuth::Bearer(token) => {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+                RegistryAuth::Basic(basic) => {
+                    req = req.header("authorization", format!("Basic {basic}"));
+                }
             }
         }
         if let Some(otp_val) = otp {
@@ -116,70 +114,49 @@ pub(crate) fn resolve_auth(npmrc: &rnpm_config::Npmrc, registry_url: &Url) -> Op
         .map(|p| format!(":{p}"))
         .unwrap_or_default();
     let path = registry_url.path();
-    let normalized_path = if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    };
 
-    let prefixes = [
-        format!("//{host_lower}{port_part}{normalized_path}"),
-        format!("//{host_lower}{port_part}{path}"),
-        format!("//{host_lower}{port_part}/"),
-        format!("//{host_lower}/"),
-    ];
-
-    // 1. Check for Bearer token: _authToken
-    for prefix in &prefixes {
-        let key = format!("{prefix}:_authToken");
-        if let Some(tok) = npmrc.settings.get(&key) {
-            if !tok.trim().is_empty() {
-                return Some(RegistryAuth::Bearer(tok.trim().to_string()));
+    let mut reg_key = format!("//{host_lower}{port_part}{path}");
+    while reg_key.len() > "//".len() {
+        // 1. Check for Bearer token: _authToken
+        let token_key = format!("{reg_key}:_authToken");
+        if let Some(tok) = npmrc.settings.get(&token_key) {
+            let trimmed = tok.trim();
+            if !trimmed.is_empty() {
+                return Some(RegistryAuth::Bearer(trimmed.to_string()));
             }
         }
-    }
-    if let Some(tok) = npmrc.get_auth_token(registry_url) {
-        if !tok.trim().is_empty() {
-            return Some(RegistryAuth::Bearer(tok.trim().to_string()));
-        }
-    }
-    if let Some(tok) = npmrc.settings.get("_authToken") {
-        if !tok.trim().is_empty() {
-            return Some(RegistryAuth::Bearer(tok.trim().to_string()));
-        }
-    }
 
-    // 2. Check for Basic token: _auth
-    for prefix in &prefixes {
-        let key = format!("{prefix}:_auth");
-        if let Some(auth_val) = npmrc.settings.get(&key) {
-            if !auth_val.trim().is_empty() {
-                return Some(RegistryAuth::Basic(auth_val.trim().to_string()));
+        // 2. Check for Basic token: _auth
+        let auth_key = format!("{reg_key}:_auth");
+        if let Some(auth_val) = npmrc.settings.get(&auth_key) {
+            let trimmed = auth_val.trim();
+            if !trimmed.is_empty() {
+                return Some(RegistryAuth::Basic(trimmed.to_string()));
             }
         }
-    }
-    if let Some(auth_val) = npmrc.settings.get("_auth") {
-        if !auth_val.trim().is_empty() {
-            return Some(RegistryAuth::Basic(auth_val.trim().to_string()));
-        }
-    }
 
-    // 3. Check for username + password / _password
-    for prefix in &prefixes {
-        let user_key = format!("{prefix}:username");
-        let pass_key = format!("{prefix}:_password");
-        let pass_key2 = format!("{prefix}:password");
+        // 3. Check for username + password / _password (base64 decoded before composing basic auth)
+        let user_key = format!("{reg_key}:username");
+        let pass_key = format!("{reg_key}:_password");
+        let pass_key2 = format!("{reg_key}:password");
         if let Some(user) = npmrc.settings.get(&user_key) {
             if let Some(pass) = npmrc.settings.get(&pass_key).or_else(|| npmrc.settings.get(&pass_key2)) {
-                let encoded = data_encoding::BASE64.encode(format!("{user}:{pass}").as_bytes());
+                let decoded_pass = match data_encoding::BASE64.decode(pass.trim().as_bytes()) {
+                    Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| pass.trim().to_string()),
+                    Err(_) => pass.trim().to_string(),
+                };
+                let encoded = data_encoding::BASE64.encode(format!("{user}:{decoded_pass}").as_bytes());
                 return Some(RegistryAuth::Basic(encoded));
             }
         }
-    }
-    if let Some(user) = npmrc.settings.get("username") {
-        if let Some(pass) = npmrc.settings.get("_password").or_else(|| npmrc.settings.get("password")) {
-            let encoded = data_encoding::BASE64.encode(format!("{user}:{pass}").as_bytes());
-            return Some(RegistryAuth::Basic(encoded));
+
+        // Walk outward by removing either what's after the last slash OR the trailing slash itself
+        if reg_key.ends_with('/') {
+            reg_key.pop();
+        } else if let Some(last_slash) = reg_key.rfind('/') {
+            reg_key.truncate(last_slash + 1);
+        } else {
+            break;
         }
     }
 
