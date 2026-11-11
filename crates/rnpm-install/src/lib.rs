@@ -4630,6 +4630,19 @@ impl Installer {
                             let _ = rnpm_fs::writer::precreate_directories(dir_refs);
                         }
 
+                        if let Some(ref sender) = writer_sender_clone {
+                            for file in &decoded.files {
+                                rnpm_fs::record_file_created(file.data.len() as u64);
+                                sender
+                                    .send_arc(file.path.clone(), Arc::new(file.data.clone()), file.mode)
+                                    .map_err(|e| anyhow!("{e}"))?;
+                            }
+                        } else {
+                            for file in &decoded.files {
+                                let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
+                            }
+                        }
+
                         let populate_cas = idx < 5;
                         let deferred_pack_files = if !integrity_str.is_empty() {
                             if writer_sender_clone.is_some() {
@@ -4656,12 +4669,6 @@ impl Installer {
                         };
 
                         if let Some(ref sender) = writer_sender_clone {
-                            for file in decoded.files {
-                                rnpm_fs::record_file_created(file.data.len() as u64);
-                                sender
-                                    .send(file.path, file.data, file.mode)
-                                    .map_err(|e| anyhow!("{e}"))?;
-                            }
                             if let Some(payloads) = deferred_pack_files {
                                 sender
                                     .send_arc(payloads.pack.0, payloads.pack.1, 0o644)
@@ -4669,10 +4676,6 @@ impl Installer {
                                 sender
                                     .send_arc(payloads.idx.0, payloads.idx.1, 0o644)
                                     .map_err(|e| anyhow!("{e}"))?;
-                            }
-                        } else {
-                            for file in &decoded.files {
-                                let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
                             }
                         }
 
