@@ -28,10 +28,23 @@ pub fn normalize_explore_target(node_modules_dir: &Path, pkgname: &str) -> Optio
         return None;
     }
 
-    let mut target = node_modules_dir.to_path_buf();
+    // Construct target under node_modules_dir safely without using PathBuf::push(part),
+    // because on Windows PathBuf::push on a component with a drive prefix (e.g. "C:..")
+    // or UNC prefix would replace the base path or become a drive-relative prefix.
+    let mut target_str = node_modules_dir.to_string_lossy().to_string();
+    let sep = if cfg!(windows) { '\\' } else { '/' };
     for part in stack {
-        target.push(part);
+        if !target_str.ends_with(sep) && !target_str.ends_with('/') && !target_str.ends_with('\\') {
+            target_str.push(sep);
+        }
+        target_str.push_str(part);
     }
+
+    let target = PathBuf::from(target_str);
+    if !target.starts_with(node_modules_dir) {
+        return None;
+    }
+
     Some(target)
 }
 
@@ -212,22 +225,38 @@ mod tests {
 
     #[test]
     fn test_normalize_explore_target_valid() {
-        let nm = PathBuf::from("C:/test/project/node_modules");
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let nm_str = format!("C:{sep}test{sep}project{sep}node_modules");
+        let nm = PathBuf::from(&nm_str);
+
         assert_eq!(
             normalize_explore_target(&nm, "foo"),
-            Some(nm.join("foo"))
+            Some(PathBuf::from(format!("{nm_str}{sep}foo")))
         );
         assert_eq!(
             normalize_explore_target(&nm, "@scope/pkg"),
-            Some(nm.join("@scope").join("pkg"))
+            Some(PathBuf::from(format!("{nm_str}{sep}@scope{sep}pkg")))
         );
         assert_eq!(
             normalize_explore_target(&nm, "../foo"),
-            Some(nm.join("foo"))
+            Some(PathBuf::from(format!("{nm_str}{sep}foo")))
         );
         assert_eq!(
             normalize_explore_target(&nm, "foo/../bar"),
-            Some(nm.join("bar"))
+            Some(PathBuf::from(format!("{nm_str}{sep}bar")))
+        );
+        // Drive-prefixed components must safely remain under node_modules
+        assert_eq!(
+            normalize_explore_target(&nm, "C:../outside"),
+            Some(PathBuf::from(format!("{nm_str}{sep}C:..{sep}outside")))
+        );
+        assert_eq!(
+            normalize_explore_target(&nm, "D:../outside"),
+            Some(PathBuf::from(format!("{nm_str}{sep}D:..{sep}outside")))
+        );
+        assert_eq!(
+            normalize_explore_target(&nm, "/outside"),
+            Some(PathBuf::from(format!("{nm_str}{sep}outside")))
         );
     }
 

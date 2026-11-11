@@ -214,20 +214,12 @@ pub fn format_search_results(terms: &[String], results: &[SearchResult], long: b
                         break;
                     }
                     if let Some(line) = line_opt {
+                        // For uncolored output (matching npm --color=false), each search term
+                        // repeats the original line context directly as npm does, avoiding
+                        // unsafe byte slicing across multi-byte or expanding Unicode characters.
                         let mut highlight_line = Vec::new();
-                        for arg in terms {
-                            let arg_lower = arg.to_lowercase();
-                            let line_lower = line.to_lowercase();
-                            let mut p = 0;
-                            for part in line_lower.split(&arg_lower) {
-                                highlight_line.push(&line[p..p + part.len()]);
-                                p += part.len();
-                                if p < line.len() {
-                                    let word = &line[p..p + arg.len()];
-                                    highlight_line.push(word);
-                                    p += arg.len();
-                                }
-                            }
+                        for _arg in terms {
+                            highlight_line.push(line.as_str());
                         }
                         out_parts.push(format!("{}\n", highlight_line.join("")));
                     }
@@ -399,17 +391,52 @@ mod tests {
 
     #[test]
     fn test_help_search_multiterm_long_parity() {
+        const ORACLE_EXPECTED_LONG: &str =
+            include_str!("../../../../tests/fixtures/help-search/expected-long.utf8.txt");
         let docs = load_embedded_docs().expect("Embedded docs must decompress");
         let terms = vec!["install".to_string(), "package".to_string()];
         let results = search_documents(&terms, &docs);
         assert!(!results.is_empty());
         let formatted = format_search_results(&terms, &results, true);
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let target_dir = manifest_dir.parent().unwrap().parent().unwrap().join("target");
-        let expected_file = target_dir.join("expected-long.utf8.txt");
-        if expected_file.is_file() {
-            let expected = std::fs::read_to_string(&expected_file).unwrap();
-            assert_eq!(formatted, expected);
-        }
+        assert_eq!(formatted, ORACLE_EXPECTED_LONG);
+    }
+
+    #[test]
+    fn test_help_search_unicode_multibyte_and_lowercase_expansions() {
+        // Turkish dotted I U+0130 expands in lowercase from 2 bytes to 3 bytes (i + combining dot)
+        // German sharp S U+00DF expands in uppercase from 2 bytes to 4 bytes ("SS")
+        // Chinese multibyte characters around match
+        let unicode_docs = vec![(
+            "commands/npm-unicode-test.md".to_string(),
+            "\u{0130} install\n\nContext with \u{4e2d}\u{6587} and \u{00df} test\nMore install details here"
+                .to_string(),
+        )];
+
+        let terms = vec!["install".to_string()];
+        let results = search_documents(&terms, &unicode_docs);
+        assert_eq!(results.len(), 1);
+
+        // Verify long formatting does not panic and contains expected Unicode lines
+        let formatted = format_search_results(&terms, &results, true);
+        assert!(formatted.contains("npm help unicode-test"));
+        assert!(formatted.contains("\u{0130} install"));
+        assert!(formatted.contains("\u{4e2d}\u{6587}"));
+    }
+
+    #[test]
+    fn test_help_search_formatter_edge_cases() {
+        // Empty terms
+        let empty_terms: Vec<String> = Vec::new();
+        let formatted_empty = format_search_results(&empty_terms, &[], false);
+        assert_eq!(formatted_empty, "No matches in help for: \n");
+
+        // No matches with terms (short mode)
+        let terms = vec!["nonexistent_term_123".to_string()];
+        let formatted_no_match = format_search_results(&terms, &[], false);
+        assert_eq!(formatted_no_match, "No matches in help for: nonexistent_term_123\n");
+
+        // No matches with terms (long mode)
+        let formatted_long_no_match = format_search_results(&terms, &[], true);
+        assert_eq!(formatted_long_no_match, "No matches in help for: nonexistent_term_123\n");
     }
 }

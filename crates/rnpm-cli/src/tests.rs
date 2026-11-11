@@ -2946,16 +2946,12 @@ async fn test_offline_help_search_embedded_parity() {
     assert_eq!(results[0].cmd, "npm help install");
     assert_eq!(results[0].hits.get("install"), Some(&197));
 
-    // Multi-term long parity against expected snapshot if present
+    // Multi-term long parity against committed oracle snapshot unconditionally
     let terms = vec!["install".to_string(), "package".to_string()];
     let multi = crate::commands::help_search::search_documents(&terms, &docs);
     let formatted = crate::commands::help_search::format_search_results(&terms, &multi, true);
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let expected_file = manifest_dir.parent().unwrap().parent().unwrap().join("target").join("expected-long.utf8.txt");
-    if expected_file.is_file() {
-        let expected = std::fs::read_to_string(&expected_file).unwrap();
-        assert_eq!(formatted, expected);
-    }
+    let expected = include_str!("../../../tests/fixtures/help-search/expected-long.utf8.txt");
+    assert_eq!(formatted, expected);
 }
 
 #[tokio::test]
@@ -3090,8 +3086,11 @@ process.exit(0);
 #[tokio::test]
 async fn test_offline_explore_child_command() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
+    let base = tmp.path().to_path_buf();
 
+    // Create project root
+    let root = base.join("project");
+    std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("package.json"), r#"{"name":"test-root","version":"1.0.0"}"#).unwrap();
 
     let pkg_dir = root.join("node_modules").join("explore-pkg");
@@ -3101,6 +3100,21 @@ async fn test_offline_explore_child_command() {
     let scoped_dir = root.join("node_modules").join("@scoped").join("explore-target");
     std::fs::create_dir_all(&scoped_dir).unwrap();
     std::fs::write(scoped_dir.join("package.json"), r#"{"name":"@scoped/explore-target","version":"3.0.0"}"#).unwrap();
+
+    // Create a sibling outside/ directory with an EXISTING package.json to test path escape prevention
+    let outside_dir = base.join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("package.json"), r#"{"name":"outside","version":"1.0.0"}"#).unwrap();
+
+    let outside_marker = outside_dir.join("outside_executed.marker");
+    let outside_probe_js = base.join("outside_probe.js");
+    std::fs::write(
+        &outside_probe_js,
+        format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', 'OUTSIDE_EXECUTED'); process.exit(0);",
+            outside_marker.to_string_lossy().replace('\\', "/")
+        ),
+    ).unwrap();
 
     // Probe script to test path guard rejections
     let probe_marker = root.join("probe_executed.marker");
@@ -3127,17 +3141,38 @@ async fn test_offline_explore_child_command() {
         assert!(!probe_marker.exists(), "Probe must never be executed for rejected path '{rejected}'");
     }
 
-    // Rooted/drive paths that do not exist under node_modules
-    for rejected_rooted in &["C:/windows", "/etc/passwd"] {
+    // 2. Drive-relative, other drive, rooted, and UNC paths must NEVER escape node_modules to sibling outside/
+    let escape_attempts = vec![
+        "C:../outside",
+        "D:../outside",
+        "/outside",
+        "\\\\server\\share\\pkg",
+        "C:/outside",
+    ];
+    for escape_target in escape_attempts {
         let res = crate::commands::explore::run(
-            Some(rejected_rooted.to_string()),
-            vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+            Some(escape_target.to_string()),
+            vec!["node".to_string(), outside_probe_js.to_string_lossy().to_string()],
             None,
             root.clone(),
         ).await;
-        assert!(res.is_err(), "explore '{rejected_rooted}' must fail");
-        assert!(!probe_marker.exists(), "Probe must never be executed for '{rejected_rooted}'");
+        assert!(res.is_err(), "explore '{escape_target}' must fail");
+        assert!(
+            !outside_marker.exists(),
+            "Probe must NEVER execute in sibling outside directory via '{escape_target}'!"
+        );
     }
+
+    // 3. Legitimate target with '../' rooted normalization (e.g. '../explore-pkg' normalizes to 'explore-pkg')
+    let res_norm = crate::commands::explore::run(
+        Some("../explore-pkg".to_string()),
+        vec!["node".to_string(), probe_js.to_string_lossy().to_string()],
+        None,
+        root.clone(),
+    ).await;
+    assert!(res_norm.is_ok(), "Legitimate '../explore-pkg' target must succeed: {:?}", res_norm.err());
+    assert!(probe_marker.exists(), "Probe must execute for valid normalized target");
+    let _ = std::fs::remove_file(&probe_marker);
 
     let out_file = root.join("explore_record.json");
     let out_str = out_file.to_string_lossy().replace('\\', "/");
