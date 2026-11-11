@@ -920,6 +920,61 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
 
 /// Spawns and executes a lifecycle script synchronously within the specified context,
 /// enforcing process-tree containment so child and grandchild processes terminate on exit.
+/// The process environment follows npm's current package-field contract. Keep
+/// build_lifecycle_env's full manifest expansion available to existing callers.
+fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
+    let mut env = build_lifecycle_env(ctx);
+    env.retain(|key, _| !key.starts_with("npm_package_") || matches!(
+        key.as_str(), "npm_package_name" | "npm_package_version" | "npm_package_json"
+    ));
+    fn package_env(prefix: &str, value: &serde_json::Value, env: &mut HashMap<String, String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map { package_env(&format!("{prefix}_{key}"), value, env); }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, value) in items.iter().enumerate() { package_env(&format!("{prefix}_{index}"), value, env); }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(false) => { env.insert(prefix.into(), String::new()); }
+            serde_json::Value::String(value) => { env.insert(prefix.into(), value.clone()); }
+            value => { env.insert(prefix.into(), value.to_string()); }
+        }
+    }
+    if let Ok(bytes) = std::fs::read(ctx.package_dir.join("package.json")) {
+        if let Ok(package) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            for key in ["config", "engines", "bin"] {
+                if let Some(value) = package.get(key) { package_env(&format!("npm_package_{key}"), value, &mut env); }
+            }
+        }
+    }
+    if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir)) {
+        for (key, value) in config.npmrc.settings {
+            if !is_sensitive_credential_key(&key) {
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+            }
+        }
+    }
+    // CLI callers explicitly preserve their invocation directory. Library
+    // callers retain the project_root contract of LifecycleContext.
+    if let Some(cwd) = ctx.extra_env.get("INIT_CWD") {
+        env.insert("INIT_CWD".into(), cwd.clone());
+    }
+    // npm inserts every ancestor's .bin directory, even before it exists.
+    let mut bins: Vec<PathBuf> = ctx.package_dir.ancestors()
+        .map(|dir| dir.join("node_modules").join(".bin")).collect();
+    let inherited = std::env::var_os("PATH").or_else(|| std::env::var_os("Path")).unwrap_or_default();
+    bins.extend(std::env::split_paths(&inherited));
+    if let Ok(path) = std::env::join_paths(bins) {
+        env.remove("Path");
+        env.remove("path");
+        env.insert("PATH".into(), path.to_string_lossy().into_owned());
+    }
+    if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
+        env.insert("npm_lifecycle_script".into(), script.clone());
+    }
+    env
+}
+
 pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     info!(
         "Running lifecycle script '{}' for package {} in {}",
@@ -933,7 +988,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let env = build_lifecycle_env(ctx);
+    let env = build_process_env(ctx);
 
     #[cfg(windows)]
     let mut cmd = {
@@ -1091,7 +1146,7 @@ where
         .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let env = build_lifecycle_env(ctx);
+    let env = build_process_env(ctx);
 
     #[cfg(windows)]
     let mut cmd = {
@@ -1374,6 +1429,19 @@ pub struct ScriptExitError {
     pub message: String,
 }
 
+impl ScriptExitError {
+    pub fn lifecycle_failure(ctx: &LifecycleContext, status: &ExitStatus) -> Self {
+        let code = extract_exit_status_code(status);
+        let shell = if cfg!(windows) {
+            format!("{} /d /s /c", std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()))
+        } else { "sh -c".into() };
+        Self {
+            exit_code: code,
+            message: format!("npm error code {code}\nnpm error path {}\nnpm error command failed\nnpm error command {shell} {}", ctx.package_dir.display(), ctx.script_cmd),
+        }
+    }
+}
+
 impl std::fmt::Display for ScriptExitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
@@ -1629,7 +1697,7 @@ pub fn execute_binary(
 
     env.insert(
         "INIT_CWD".to_string(),
-        current_dir.to_string_lossy().to_string(),
+        extra_env.get("INIT_CWD").cloned().unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
     );
 
     #[cfg(windows)]
@@ -1780,7 +1848,7 @@ where
 
     env.insert(
         "INIT_CWD".to_string(),
-        current_dir.to_string_lossy().to_string(),
+        extra_env.get("INIT_CWD").cloned().unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
     );
 
     #[cfg(windows)]
@@ -2175,6 +2243,20 @@ pub async fn execute_topological_with_abort(
                 script_cmd,
             );
             ctx.package_version = root_manifest.version.clone();
+            if rnpm_config::Config::load(Some(&opts.root_dir))?.get("loglevel") != Some("silent") {
+                let name = root_manifest.name.as_deref().unwrap_or("");
+                let id = root_manifest.version.as_ref().map(|v| format!("{name}@{v} "))
+                    .unwrap_or_else(|| if name.is_empty() { String::new() } else { format!("{name} ") });
+                // npm routes lifecycle banners to stderr in JSON mode so stdout stays parseable.
+                let json_mode = rnpm_config::get_process_cli_overrides()
+                    .and_then(|o| o.get("json").cloned())
+                    .is_some_and(|v| v != "false" && v != "0");
+                if json_mode {
+                    eprintln!("\n> {id}{hook}\n> {script_cmd}\n");
+                } else {
+                    println!("\n> {id}{hook}\n> {script_cmd}\n");
+                }
+            }
             ctx.timeout = opts.timeout;
             ctx.sandbox_policy = opts.sandbox_policy.clone();
             ctx.foreground_scripts = opts.foreground_scripts;
@@ -2195,11 +2277,7 @@ pub async fn execute_topological_with_abort(
 
             let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
-                let code = extract_exit_status_code(&status);
-                return Err(anyhow::Error::from(ScriptExitError {
-                    exit_code: code,
-                    message: format!("Root lifecycle script '{hook}' failed with exit code: {code}"),
-                }));
+                return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(&ctx, &status)));
             }
         }
     }
