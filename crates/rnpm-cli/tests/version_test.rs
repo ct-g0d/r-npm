@@ -524,7 +524,7 @@ fn test_bare_version_display_map_and_json() {
     fs::create_dir_all(&prefix_dir).unwrap();
     fs::create_dir_all(&appdata).unwrap();
     fs::create_dir_all(&localappdata).unwrap();
-    fs::write(&userconfig, "").unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
     let npm_out = Command::new("cmd.exe")

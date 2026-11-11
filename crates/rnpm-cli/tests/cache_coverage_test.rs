@@ -101,6 +101,8 @@ fn test_cache_clean_eusage_live_npm_parity() {
     fs::create_dir_all(&prefix_dir).unwrap();
     fs::create_dir_all(&appdata).unwrap();
     fs::create_dir_all(&localappdata).unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&globalconfig, "").unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
