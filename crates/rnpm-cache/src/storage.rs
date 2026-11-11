@@ -408,7 +408,13 @@ impl Cache {
             })?;
         }
 
-        let target_path = self.blob_path(&sha512_hex);
+        self.put_blob_direct(data, &sha512_hex)?;
+        Ok(sha512_hex)
+    }
+
+    /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
+    pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
+        let target_path = self.blob_path(sha512_hex);
         if target_path.exists() {
             // Check if existing file has valid content
             if let Ok(existing_bytes) = fs::read(&target_path) {
@@ -416,7 +422,7 @@ impl Cache {
                 h.update(&existing_bytes);
                 if HEXLOWER.encode(&h.finalize()) == sha512_hex {
                     // Blob already exists and is uncorrupted
-                    return Ok(sha512_hex);
+                    return Ok(());
                 }
             }
             // If existing file is corrupted, remove it first
@@ -448,7 +454,7 @@ impl Cache {
                 if HEXLOWER.encode(&h.finalize()) == sha512_hex {
                     // Another worker already populated target_path; clean up temp and succeed
                     let _ = remove_file_with_retries(&temp_path);
-                    return Ok(sha512_hex);
+                    return Ok(());
                 }
             }
             let _ = remove_file_with_retries(&target_path);
@@ -460,19 +466,6 @@ impl Cache {
         }
         debug!("Atomically stored blob {}", target_path.display());
 
-        Ok(sha512_hex)
-    }
-
-    /// Store a pre-verified blob directly by its known SHA-512 hex digest, skipping redundant hashing.
-    pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
-        let target_path = self.blob_path(sha512_hex);
-        if target_path.exists() {
-            return Ok(());
-        }
-        if let Some(parent) = target_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = rnpm_fs::write_file_fast(&target_path, data, 0o644, 0);
         Ok(())
     }
 

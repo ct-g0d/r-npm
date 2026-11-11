@@ -1184,6 +1184,22 @@ mod tests {
     }
 
     #[test]
+    fn test_direct_blob_write_repairs_corruption_and_reports_io_errors() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let data = b"verified blob payload";
+        let hex = cache.put_blob(data, None).unwrap();
+        let path = cache.blob_path(&hex);
+        std::fs::write(&path, b"corrupt").unwrap();
+        cache.put_blob_direct(data, &hex).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(cache.put_blob_direct(data, &hex).is_err());
+    }
+
+    #[test]
     fn test_put_with_integrity_multi_hash_prioritizes_sha512_and_rejects_mismatch() {
         let dir = tempdir().unwrap();
         let cache = Cache::new(dir.path()).unwrap();

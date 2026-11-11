@@ -36,6 +36,24 @@ fn create_test_tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
 }
 
 #[test]
+fn test_extraction_replaces_existing_hardlink_without_modifying_its_target() {
+    for content in [b"replacement".as_slice(), b"".as_slice()] {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"preserve outside").unwrap();
+        fs::hard_link(&outside, dest.join("file.txt")).unwrap();
+        let tar_bytes = create_test_tarball(&[("package/file.txt", content, 0o644)]);
+
+        extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve outside");
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), content);
+    }
+}
+
+#[test]
 fn test_safe_tarball_extraction_and_package_prefix_stripping() {
     let dir = tempdir().unwrap();
     let dest = dir.path().join("extracted");

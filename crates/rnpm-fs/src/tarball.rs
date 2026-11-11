@@ -631,6 +631,10 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
 
+            // Replace the directory entry before opening it: truncating an existing
+            // symlink or hardlink would modify the linked file, possibly outside dest.
+            unlink_target_path(&target_path);
+
             if let Ok(0) = entry.header().size() {
                 crate::writer::write_file_fast(&target_path, &[], mode, 64 * 1024)
                     .map_err(FsError::Io)?;
