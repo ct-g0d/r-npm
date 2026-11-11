@@ -335,27 +335,36 @@ fn pack_json_hook_banners_go_to_stderr_and_script_output_is_preserved() {
 }
 
 #[test]
-fn install_json_routes_root_lifecycle_banner_to_stderr() {
+fn install_and_ci_json_route_root_lifecycle_banner_to_stderr() {
     let temp = tempdir().unwrap();
     manifest(
         temp.path(),
-        json!({"name":"root","version":"1.0.0","scripts":{"postinstall":"node -e \"\""}}),
+        json!({"name":"root","version":"1.0.0","scripts":{"postinstall":"node hook.cjs"}}),
     );
-    let out = run(temp.path(), &["install", "--json"]);
-    success(&out);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stdout.contains("> root@1.0.0 postinstall"),
-        "banner leaked into JSON stdout: {stdout}"
-    );
-    if !stdout.trim().is_empty() {
-        serde_json::from_str::<Value>(stdout.trim()).expect("stdout must be valid JSON");
+    fs::write(
+        temp.path().join("hook.cjs"),
+        "require('fs').appendFileSync('hooks.txt', 'postinstall\\n')",
+    )
+    .unwrap();
+    for (index, command) in ["install", "ci"].into_iter().enumerate() {
+        // Set only the CLI flag: it must reach the lifecycle crate's JSON check.
+        let out = run(temp.path(), &[command, "--json"]);
+        success(&out);
+        let summary: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+            panic!("{command}: {err}: {}", String::from_utf8_lossy(&out.stdout))
+        });
+        assert_eq!(summary["added"], 0);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "\n> root@1.0.0 postinstall\n> node hook.cjs\n\n",
+            "{command}"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("hooks.txt")).unwrap(),
+            "postinstall\n".repeat(index + 1),
+            "{command}"
+        );
     }
-    assert!(
-        stderr.contains("> root@1.0.0 postinstall"),
-        "banner missing from stderr: {stderr}"
-    );
 }
 
 #[test]
