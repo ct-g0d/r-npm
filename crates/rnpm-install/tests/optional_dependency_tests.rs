@@ -240,7 +240,9 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
     .unwrap();
 
     let summary = installer.run().await.unwrap();
-    assert_eq!(summary.packages_installed, 1);
+    let is_darwin_arm64 = cfg!(target_os = "macos") && cfg!(target_arch = "aarch64");
+    let expected_installed = if is_darwin_arm64 { 2 } else { 1 };
+    assert_eq!(summary.packages_installed, expected_installed);
 
     // Verify normal-pkg was installed
     assert!(temp_proj
@@ -255,8 +257,8 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
         .join("index.js")
         .exists());
 
-    // Verify darwin-pkg was SKIPPED on non-darwin host (or if host is win32)
-    if cfg!(not(target_os = "macos")) {
+    // Verify darwin-pkg was SKIPPED on non-darwin-arm64 host
+    if !is_darwin_arm64 {
         assert!(
             !temp_proj
                 .path()
@@ -272,6 +274,15 @@ async fn test_platform_skipping_incompatible_os_or_cpu() {
         assert!(
             !downloaded_darwin,
             "darwin-pkg tarball must NEVER be downloaded"
+        );
+    } else {
+        assert!(
+            temp_proj
+                .path()
+                .join("node_modules")
+                .join("darwin-pkg")
+                .exists(),
+            "darwin-pkg must be extracted on macos arm64 platform"
         );
     }
 }
