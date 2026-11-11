@@ -454,8 +454,9 @@ pub fn build_dependency_tree(
     let manifest_path = project_dir.join("package.json");
     let (root_manifest, root_raw) = if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)?;
-        let m = serde_json::from_str::<Manifest>(&content).ok();
-        let j = serde_json::from_str::<Value>(&content).ok();
+        let clean = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let m = Manifest::from_str(clean).ok();
+        let j = serde_json::from_str::<Value>(clean).ok();
         (m, j)
     } else {
         (None, None)
