@@ -690,6 +690,7 @@ fn test_post_install_concise_audit_summary_no_full_table() {
     let output = Command::new(rnpm_bin)
         .arg("install")
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .env_remove("NPM_CONFIG_AUDIT")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm install");

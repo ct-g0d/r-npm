@@ -388,6 +388,7 @@ fn test_audit_and_fund_controls() {
 
     let output_def = Command::new(rnpm_bin)
         .current_dir(temp_def.path())
+        .env_remove("NPM_CONFIG_FUND")
         .args(["install"])
         .output()
         .expect("Failed to execute rnpm");
