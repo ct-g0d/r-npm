@@ -157,7 +157,7 @@ fn test_ls_and_ll_live_npm_parity() {
     fs::create_dir_all(&prefix_dir).unwrap();
     fs::create_dir_all(&appdata).unwrap();
     fs::create_dir_all(&localappdata).unwrap();
-    fs::write(&userconfig, "").unwrap();
+    fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
     let npm_res = Command::new("cmd.exe")

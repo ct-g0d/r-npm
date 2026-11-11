@@ -21,6 +21,8 @@ fn test_prefix_root_live_npm_parity() {
     fs::create_dir_all(&isolated_prefix).unwrap();
     fs::create_dir_all(&isolated_appdata).unwrap();
     fs::create_dir_all(&isolated_localappdata).unwrap();
+    fs::write(&isolated_userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    fs::write(&isolated_globalconfig, "").unwrap();
 
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 

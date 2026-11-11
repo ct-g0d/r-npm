@@ -85,7 +85,8 @@ fn test_cli_approve_scripts_parity() {
     std::fs::create_dir_all(&prefix_dir).unwrap();
     std::fs::create_dir_all(&appdata).unwrap();
     std::fs::create_dir_all(&localappdata).unwrap();
-    std::fs::write(&userconfig, "").unwrap();
+    std::fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    std::fs::write(&globalconfig, "").unwrap();
 
     let dir_rnpm = tmp.path().join("rnpm_app");
     let dir_npm = tmp.path().join("npm_app");
@@ -174,7 +175,8 @@ fn test_cli_deny_scripts_parity() {
     std::fs::create_dir_all(&prefix_dir).unwrap();
     std::fs::create_dir_all(&appdata).unwrap();
     std::fs::create_dir_all(&localappdata).unwrap();
-    std::fs::write(&userconfig, "").unwrap();
+    std::fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    std::fs::write(&globalconfig, "").unwrap();
 
     let dir_rnpm = tmp.path().join("rnpm_app");
     let dir_npm = tmp.path().join("npm_app");
@@ -262,7 +264,8 @@ fn test_cli_install_scripts_parity() {
     std::fs::create_dir_all(&prefix_dir).unwrap();
     std::fs::create_dir_all(&appdata).unwrap();
     std::fs::create_dir_all(&localappdata).unwrap();
-    std::fs::write(&userconfig, "").unwrap();
+    std::fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
+    std::fs::write(&globalconfig, "").unwrap();
 
     let dir_rnpm = tmp.path().join("rnpm_app");
     let dir_npm = tmp.path().join("npm_app");
