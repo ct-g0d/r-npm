@@ -182,8 +182,8 @@ impl Config {
                         .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
                 })
                 .or_else(|| {
-                    env_lookup("NPM_CONFIG_GLOBALCONFIG")
-                        .or_else(|| env_lookup("npm_config_globalconfig"))
+                    env_lookup("npm_config_globalconfig")
+                        .or_else(|| env_lookup("NPM_CONFIG_GLOBALCONFIG"))
                         .map(PathBuf::from)
                 })
                 .or_else(|| find_global_npmrc_with_env(env_lookup))
@@ -219,8 +219,8 @@ impl Config {
                         .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
                 })
                 .or_else(|| {
-                    env_lookup("NPM_CONFIG_USERCONFIG")
-                        .or_else(|| env_lookup("npm_config_userconfig"))
+                    env_lookup("npm_config_userconfig")
+                        .or_else(|| env_lookup("NPM_CONFIG_USERCONFIG"))
                         .map(PathBuf::from)
                 })
                 .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
@@ -378,8 +378,8 @@ impl Config {
                         .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
                 })
                 .or_else(|| {
-                    env_lookup("NPM_CONFIG_USERCONFIG")
-                        .or_else(|| env_lookup("npm_config_userconfig"))
+                    env_lookup("npm_config_userconfig")
+                        .or_else(|| env_lookup("NPM_CONFIG_USERCONFIG"))
                         .map(PathBuf::from)
                 })
                 .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
@@ -585,8 +585,8 @@ pub fn find_user_npmrc_with_env<LookupFn>(lookup: LookupFn) -> Option<PathBuf>
 where
     LookupFn: Fn(&str) -> Option<String>,
 {
-    if let Some(userconfig) = lookup("NPM_CONFIG_USERCONFIG")
-        .or_else(|| lookup("npm_config_userconfig"))
+    if let Some(userconfig) = lookup("npm_config_userconfig")
+        .or_else(|| lookup("NPM_CONFIG_USERCONFIG"))
         .or_else(|| lookup("USERCONFIG"))
     {
         return Some(PathBuf::from(userconfig));

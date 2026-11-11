@@ -57,26 +57,47 @@ fn workspaces(dir: &Path) {
     }
 }
 
+fn canonical_temp_path(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    let p = temp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| temp.path().to_path_buf());
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(
+            p.to_str()
+                .unwrap()
+                .strip_prefix(r"\\?\")
+                .unwrap_or(p.to_str().unwrap()),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        p
+    }
+}
+
 #[test]
 fn workspace_run_uses_manifest_order_and_original_init_cwd() {
     let temp = tempdir().unwrap();
-    workspaces(temp.path());
-    let out = run(temp.path(), &["run", "x", "--workspaces", "--silent"]);
+    let temp_path = canonical_temp_path(&temp);
+    workspaces(&temp_path);
+    let out = run(&temp_path, &["run", "x", "--workspaces", "--silent"]);
     success(&out);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!(
             "a\n{}\nb\n{}\n",
-            temp.path().display(),
-            temp.path().display()
+            temp_path.display(),
+            temp_path.display()
         )
     );
     let mut root: Value =
-        serde_json::from_slice(&fs::read(temp.path().join("package.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(temp_path.join("package.json")).unwrap()).unwrap();
     root["workspaces"] = json!(["packages/b", "packages/a"]);
-    manifest(temp.path(), root);
+    manifest(&temp_path, root);
     let out = run(
-        temp.path(),
+        &temp_path,
         &["exec", "--workspaces", "--", "node", "probe.cjs"],
     );
     success(&out);
@@ -84,8 +105,8 @@ fn workspace_run_uses_manifest_order_and_original_init_cwd() {
         String::from_utf8_lossy(&out.stdout),
         format!(
             "b\n{}\na\n{}\n",
-            temp.path().display(),
-            temp.path().display()
+            temp_path.display(),
+            temp_path.display()
         )
     );
 }
@@ -93,19 +114,20 @@ fn workspace_run_uses_manifest_order_and_original_init_cwd() {
 #[test]
 fn run_environment_uses_npm_package_fields_and_all_ancestor_bins() {
     let temp = tempdir().unwrap();
+    let temp_path = canonical_temp_path(&temp);
     manifest(
-        temp.path(),
+        &temp_path,
         json!({"name":"env-fixture","version":"1.0.0","description":"not exported",
         "config":{"enabled":false,"count":3},"engines":{"node":">=20"},"bin":{"tool":"tool.js"},
         "scripts":{"x":"node probe.cjs"}}),
     );
-    fs::write(temp.path().join("probe.cjs"), r#"
+    fs::write(temp_path.join("probe.cjs"), r#"
 const p=require('path');
 const keys=['npm_package_name','npm_package_version','npm_package_description','npm_package_scripts_x','npm_package_config_enabled','npm_package_config_count','npm_package_engines_node','npm_package_bin_tool','npm_config_ignore_scripts'];
 console.log(JSON.stringify(Object.fromEntries(keys.map(k=>[k,process.env[k]??null]))));
 console.log(JSON.stringify(process.env.PATH.split(p.delimiter).slice(0,2)));
 "#).unwrap();
-    let out = run(temp.path(), &["run", "x", "--ignore-scripts", "--silent"]);
+    let out = run(&temp_path, &["run", "x", "--ignore-scripts", "--silent"]);
     success(&out);
     let stdout = String::from_utf8(out.stdout).unwrap();
     let mut lines = stdout.lines();
@@ -121,12 +143,12 @@ console.log(JSON.stringify(process.env.PATH.split(p.delimiter).slice(0,2)));
     assert_eq!(
         bins,
         vec![
-            temp.path()
+            temp_path
                 .join("node_modules")
                 .join(".bin")
                 .display()
                 .to_string(),
-            temp.path()
+            temp_path
                 .parent()
                 .unwrap()
                 .join("node_modules")
@@ -290,24 +312,25 @@ fn workspace_version_refreshes_root_lockfile_and_links() {
 #[test]
 fn empty_workspace_list_and_pack_notices_match_npm() {
     let temp = tempdir().unwrap();
+    let temp_path = canonical_temp_path(&temp);
     manifest(
-        temp.path(),
+        &temp_path,
         json!({"name":"root","version":"1.0.0","workspaces":["packages/*"]}),
     );
     manifest(
-        &temp.path().join("packages/a"),
+        &temp_path.join("packages/a"),
         json!({"name":"a","version":"1.0.0"}),
     );
-    let out = run(temp.path(), &["ls", "--workspaces"]);
+    let out = run(&temp_path, &["ls", "--workspaces"]);
     success(&out);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!(
             "root@1.0.0 {}\n\u{2514}\u{2500}\u{2500} (empty)\n\n",
-            temp.path().display()
+            temp_path.display()
         )
     );
-    let out = run(&temp.path().join("packages/a"), &["pack", "--dry-run"]);
+    let out = run(&temp_path.join("packages/a"), &["pack", "--dry-run"]);
     success(&out);
     let notices = String::from_utf8_lossy(&out.stderr);
     assert!(

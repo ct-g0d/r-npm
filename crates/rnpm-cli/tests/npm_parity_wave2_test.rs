@@ -158,7 +158,7 @@ fn workspace_exec_runs_in_each_member() {
 fn run_manifest_errors_have_npm_first_line() {
     let temp = tempdir().unwrap();
     let out = run(temp.path(), &["run", "x"]);
-    let expected_code = if cfg!(windows) { -4058 } else { 0xfffffffe_u32 as i32 };
+    let expected_code = if cfg!(windows) { -4058 } else { (-2i32 as u8) as i32 };
     assert_eq!(out.status.code(), Some(expected_code));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("npm error code ENOENT\n"));
     fs::write(temp.path().join("package.json"), "{invalid").unwrap();

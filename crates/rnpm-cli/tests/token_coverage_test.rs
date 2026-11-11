@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -165,12 +168,14 @@ async fn test_cli_token_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -180,12 +185,8 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token list failed");
 
-    let npm_list = Command::new("cmd.exe")
+    let npm_list = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "token",
             "list",
             "--registry",
@@ -195,12 +196,14 @@ async fn test_cli_token_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -209,7 +212,15 @@ async fn test_cli_token_parity() {
         .output();
 
     if let Ok(npm_out) = npm_list {
-        assert_eq!(rnpm_list.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_list.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch on token list!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_list.stdout),
+            String::from_utf8_lossy(&rnpm_list.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_list.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))
@@ -227,12 +238,14 @@ async fn test_cli_token_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -242,12 +255,8 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token revoke failed");
 
-    let npm_revoke = Command::new("cmd.exe")
+    let npm_revoke = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "token",
             "revoke",
             "123456",
@@ -258,12 +267,14 @@ async fn test_cli_token_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -272,7 +283,15 @@ async fn test_cli_token_parity() {
         .output();
 
     if let Ok(npm_out) = npm_revoke {
-        assert_eq!(rnpm_revoke.status.code(), npm_out.status.code());
+        assert_eq!(
+            rnpm_revoke.status.code(),
+            npm_out.status.code(),
+            "Exit code mismatch on token revoke!\nrnpm stdout: {}\nrnpm stderr: {}\nnpm stdout: {}\nnpm stderr: {}",
+            String::from_utf8_lossy(&rnpm_revoke.stdout),
+            String::from_utf8_lossy(&rnpm_revoke.stderr),
+            String::from_utf8_lossy(&npm_out.stdout),
+            String::from_utf8_lossy(&npm_out.stderr),
+        );
         assert_eq!(
             normalize_output(&String::from_utf8_lossy(&rnpm_revoke.stdout)),
             normalize_output(&String::from_utf8_lossy(&npm_out.stdout))

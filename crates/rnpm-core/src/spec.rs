@@ -500,10 +500,12 @@ fn extract_url_package_name(url_str: &str) -> String {
 
 /// Normalizes a `file:` path or URL specifier (e.g. `file:./x`, `file:x`, `file:../x`, `file:///abs`, `file://localhost/...`).
 pub fn parse_file_path(spec: &str) -> std::path::PathBuf {
-    if let Ok(url) = Url::parse(spec) {
-        if url.scheme() == "file" {
-            if let Ok(file_path) = url.to_file_path() {
-                return path_clean::clean(file_path);
+    if spec.starts_with("file://") {
+        if let Ok(url) = Url::parse(spec) {
+            if url.scheme() == "file" {
+                if let Ok(file_path) = url.to_file_path() {
+                    return path_clean::clean(file_path);
+                }
             }
         }
     }

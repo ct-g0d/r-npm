@@ -2916,7 +2916,9 @@ fn test_true_case_collision_fails() {
 
 #[test]
 fn test_seek_penalty_detection_on_windows() {
-    use crate::writer::{detect_seek_penalty, determine_writer_config};
+    #[cfg(windows)]
+    use crate::writer::detect_seek_penalty;
+    use crate::writer::determine_writer_config;
     use std::path::Path;
 
     #[cfg(windows)]
@@ -3219,7 +3221,9 @@ fn test_extract_packages_direct_parallel() {
 
 #[test]
 fn test_volume_filesystem_detection_and_refs_check() {
-    use crate::block_clone::{get_volume_filesystem_name, is_refs_volume};
+    #[cfg(windows)]
+    use crate::block_clone::get_volume_filesystem_name;
+    use crate::block_clone::is_refs_volume;
 
     #[cfg(windows)]
     {
@@ -3443,26 +3447,24 @@ fn test_block_clone_fallback_when_unsupported_or_non_refs() {
 }
 
 #[test]
+#[cfg(windows)]
 fn test_volume_cluster_size_and_guid() {
     use crate::block_clone::{
         get_volume_cluster_size, get_volume_guid, is_block_cloning_supported,
     };
 
-    #[cfg(windows)]
-    {
-        let cs_c = get_volume_cluster_size(Path::new("C:\\"));
-        assert!(cs_c.is_some());
-        let cluster_size = cs_c.unwrap();
-        assert!(cluster_size >= 512 && cluster_size.is_power_of_two());
+    let cs_c = get_volume_cluster_size(Path::new("C:\\"));
+    assert!(cs_c.is_some());
+    let cluster_size = cs_c.unwrap();
+    assert!(cluster_size >= 512 && cluster_size.is_power_of_two());
 
-        let guid_c = get_volume_guid(Path::new("C:\\"));
-        assert!(guid_c.is_some());
-        let guid_str = guid_c.unwrap();
-        assert!(guid_str.starts_with(r"\\?\Volume{"));
+    let guid_c = get_volume_guid(Path::new("C:\\"));
+    assert!(guid_c.is_some());
+    let guid_str = guid_c.unwrap();
+    assert!(guid_str.starts_with(r"\\?\Volume{"));
 
-        // C:\ is NTFS, so is_block_cloning_supported should be false
-        assert!(!is_block_cloning_supported(Path::new("C:\\")));
-    }
+    // C:\ is NTFS, so is_block_cloning_supported should be false
+    assert!(!is_block_cloning_supported(Path::new("C:\\")));
 }
 
 #[test]

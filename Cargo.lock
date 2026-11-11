@@ -1190,6 +1190,7 @@ name = "rnpm-lifecycle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rnpm-config",
  "rnpm-core",
  "serde_json",

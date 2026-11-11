@@ -25,8 +25,10 @@ use rnpm_core::{Algorithm, Integrity};
 use rnpm_fs::writer::ParallelWriterConfig;
 use rnpm_fs::{
     clone_or_write_pack_file, is_block_cloning_supported, is_refs_volume, is_same_volume,
-    ExtractionSummary, RawFileHandle,
+    ExtractionSummary,
 };
+#[cfg(windows)]
+use rnpm_fs::RawFileHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
@@ -401,6 +403,7 @@ impl PackagePack {
         #[cfg(not(windows))]
         let raw_pack_handle: Option<usize> = None;
         let _ = can_block_clone;
+        let _ = raw_pack_handle;
 
         // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
         // Since packages are already parallelized across CPU cores at the installer level,

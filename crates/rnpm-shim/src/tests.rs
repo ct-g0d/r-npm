@@ -697,19 +697,17 @@ fn test_shebang_parsing_with_quotes_and_flags() {
 }
 
 #[test]
+#[cfg(windows)]
 fn test_compute_relative_path_case_insensitivity_windows() {
     use crate::path::compute_relative_path;
 
-    #[cfg(windows)]
-    {
-        let from = Path::new(r"C:\Users\Developer\Project\node_modules\.bin");
-        let to = Path::new(r"c:\users\developer\project\node_modules\my-tool\bin\cli.js");
-        let rel = compute_relative_path(from, to).unwrap();
-        assert_eq!(rel, "../my-tool/bin/cli.js");
+    let from = Path::new(r"C:\Users\Developer\Project\node_modules\.bin");
+    let to = Path::new(r"c:\users\developer\project\node_modules\my-tool\bin\cli.js");
+    let rel = compute_relative_path(from, to).unwrap();
+    assert_eq!(rel, "../my-tool/bin/cli.js");
 
-        let from_mixed = Path::new(r"D:\App\Node_Modules\.BIN");
-        let to_mixed = Path::new(r"d:\app\node_modules\PKG\cli.js");
-        let rel_mixed = compute_relative_path(from_mixed, to_mixed).unwrap();
-        assert_eq!(rel_mixed, "../PKG/cli.js");
-    }
+    let from_mixed = Path::new(r"D:\App\Node_Modules\.BIN");
+    let to_mixed = Path::new(r"d:\app\node_modules\PKG\cli.js");
+    let rel_mixed = compute_relative_path(from_mixed, to_mixed).unwrap();
+    assert_eq!(rel_mixed, "../PKG/cli.js");
 }

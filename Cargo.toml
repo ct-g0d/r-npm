@@ -42,6 +42,7 @@ url = "2.5"
 path-clean = "1.0"
 fs4 = { version = "0.12", features = ["tokio"] }
 memmap2 = "0.9"
+libc = "0.2"
 
 # Internal workspace crates
 rnpm-core = { path = "crates/rnpm-core" }

@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -106,12 +109,14 @@ async fn test_cli_unpublish_dry_run_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -128,12 +133,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unpublish",
             "sample-pkg",
             "--dry-run",
@@ -145,12 +146,14 @@ async fn test_cli_unpublish_dry_run_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -177,12 +180,14 @@ async fn test_cli_unpublish_dry_run_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)
@@ -198,12 +203,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res_v = Command::new("cmd.exe")
+    let npm_res_v = isolated_npm(&iso)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unpublish",
             "sample-pkg@1.0.0",
             "--dry-run",
@@ -214,7 +215,11 @@ async fn test_cli_unpublish_dry_run_parity() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
@@ -331,12 +336,14 @@ async fn test_cli_unpublish_mock_registry() {
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("USERCONFIG", &userconfig)
         .env("npm_config_userconfig", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("GLOBALCONFIG", &globalconfig)
         .env("npm_config_globalconfig", &globalconfig)
         .env("NPM_CONFIG_PREFIX", &prefix_dir)
         .env("PREFIX", &prefix_dir)
-        .env("USERCONFIG", &userconfig)
-        .env("GLOBALCONFIG", &globalconfig)
         .env("CACHE", &cache_dir)
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir)

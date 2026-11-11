@@ -22,6 +22,9 @@ pub fn reset_junctions_created() {
 
 /// Create a non-admin directory junction on Windows, or a symlink on Unix.
 pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
+    if let Some(parent) = link.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let link_v = crate::path::to_verbatim_path(link);
     let target_v = crate::path::to_verbatim_path(target);
 

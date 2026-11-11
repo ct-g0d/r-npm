@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_config_lifecycle() {
     let tmp = tempdir().unwrap();
@@ -99,8 +102,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config get registry failed");
 
-    let npm_get_reg = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "config", "get", "registry"])
+    let npm_get_reg = isolated_npm(&iso_npm)
+        .args(["config", "get", "registry"])
         .current_dir(tmp_npm.path())
         .env("HOME", &iso_npm)
         .env("USERPROFILE", &iso_npm)
@@ -150,12 +153,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config set failed");
 
-    let npm_set = Command::new("cmd.exe")
+    let npm_set = isolated_npm(&iso_npm)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "config",
             "set",
             "init-author-name=TestAuthor",
@@ -204,12 +203,8 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config get init-author-name failed");
 
-    let npm_get_custom = Command::new("cmd.exe")
+    let npm_get_custom = isolated_npm(&iso_npm)
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "config",
             "get",
             "init-author-name",

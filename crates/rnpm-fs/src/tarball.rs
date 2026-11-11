@@ -420,6 +420,7 @@ pub fn extract_tar_gz<R: Read>(
                     symlink_paths.insert(normalize_rel_path(&relative_path));
                     #[cfg(unix)]
                     {
+                        let _ = &cleaned_rel;
                         let _ = std::os::unix::fs::symlink(&link_target, &target_path);
                     }
                     #[cfg(windows)]

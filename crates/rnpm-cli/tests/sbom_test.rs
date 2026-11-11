@@ -6,6 +6,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 use rnpm_core::manifest::Manifest;
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
@@ -447,8 +450,8 @@ fn test_sbom_live_npm_parity() {
         .output()
         .expect("rnpm sbom failed");
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "sbom"])
+    let npm_res = isolated_npm(iso.path())
+        .arg("sbom")
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())
