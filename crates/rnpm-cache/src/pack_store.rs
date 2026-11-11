@@ -184,7 +184,7 @@ impl PackIndex {
 
     /// Serialize index to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(self)
+        serde_json::to_vec(self)
     }
 
     /// Deserialize index from JSON bytes.
@@ -610,6 +610,7 @@ impl PackStore {
         let mut has_cas = false;
         for b in 0..=255u8 {
             let hex_sub = format!("{:02x}", b);
+            let _ = fs::create_dir(packs_dir.join(&hex_sub));
             let sub = cas_dir.join(&hex_sub);
             if fs::create_dir(&sub).is_err() && !has_cas {
                 if let Ok(mut it) = fs::read_dir(&sub) {
@@ -1335,8 +1336,8 @@ impl PackStore {
         }
 
         // Deduplicate input files by lowercased path, ensuring LAST entry wins
-        let mut deduped_map: HashMap<String, PackInputFile<'_>> = HashMap::new();
-        let mut deduped_order: Vec<String> = Vec::new();
+        let mut deduped_map: HashMap<String, PackInputFile<'_>> = HashMap::with_capacity(files.len());
+        let mut deduped_order: Vec<String> = Vec::with_capacity(files.len());
 
         for file in files {
             let p = Path::new(&file.path);
@@ -1374,7 +1375,8 @@ impl PackStore {
             .collect();
 
         // 1. Pack construction with 4 KiB alignment
-        let mut pack_bytes = Vec::new();
+        let total_size: usize = deduped_files.iter().map(|f| f.data.len() + PACK_ALIGNMENT).sum();
+        let mut pack_bytes = Vec::with_capacity(total_size);
         let mut index_files = Vec::with_capacity(deduped_files.len());
 
         for file in deduped_files {
@@ -1458,6 +1460,7 @@ impl PackStore {
         );
 
         let prefix_dir = self.packs_dir().join(&prefix);
+        let _ = fs::create_dir_all(&prefix_dir);
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
@@ -2004,7 +2007,7 @@ impl PackStore {
 
             let mat_file = rnpm_fs::MaterializeFile {
                 path: full_path.clone(),
-                data,
+                data: std::sync::Arc::new(data),
                 mode,
                 package_id: Some(pkg_key.to_string()),
             };
@@ -2015,6 +2018,9 @@ impl PackStore {
                 files.push(mat_file);
             }
         }
+
+        dirs.sort_unstable();
+        dirs.dedup();
 
         Ok(DecodedPackage { files, dirs, symlinks })
     }
@@ -2239,6 +2245,9 @@ fn is_destination_valid(to: &Path) -> bool {
 /// mapped the file or holds a lock, and the destination files already exist and are valid,
 /// treat it as success rather than failing the install.
 fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
     let mut attempts = 0;
     let mut delay = Duration::from_millis(5);
     loop {
@@ -3138,7 +3147,7 @@ mod tests {
 
         // Must be deduplicated to exactly 1 file entry, with the later content and mode winning
         assert_eq!(decoded.files.len(), 1);
-        assert_eq!(decoded.files[0].data, b"second version of file (later wins)");
+        assert_eq!(decoded.files[0].data.as_slice(), b"second version of file (later wins)");
         assert_eq!(decoded.files[0].mode, 0o755);
     }
 }

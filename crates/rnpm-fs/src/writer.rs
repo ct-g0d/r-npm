@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tar::Archive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,7 +655,7 @@ pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> 
 #[derive(Debug, Clone)]
 pub struct MaterializeFile {
     pub path: PathBuf,
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub mode: u32,
     pub package_id: Option<String>,
 }
@@ -1415,7 +1416,7 @@ pub fn decode_tar_entries<R: Read>(
 
             let mat_file = MaterializeFile {
                 path: target_path,
-                data: file_buf,
+                data: Arc::new(file_buf),
                 mode: file_mode,
                 package_id: package_id.clone(),
             };

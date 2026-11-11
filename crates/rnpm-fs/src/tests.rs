@@ -3058,7 +3058,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     // File 1: small in pkg-a
     files.push(crate::writer::MaterializeFile {
         path: pkg_a_dir.join("index.js"),
-        data: b"module.exports = 'pkg-a';".to_vec(),
+        data: std::sync::Arc::new(b"module.exports = 'pkg-a';".to_vec()),
         mode: 0o644,
         package_id: Some("pkg-a".to_string()),
     });
@@ -3067,7 +3067,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     let node_binary_data = vec![0xCA; 80 * 1024]; // 80 KiB
     files.push(crate::writer::MaterializeFile {
         path: pkg_a_dir.join("binding.node"),
-        data: node_binary_data.clone(),
+        data: std::sync::Arc::new(node_binary_data.clone()),
         mode: 0o755,
         package_id: Some("pkg-a".to_string()),
     });
@@ -3076,7 +3076,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     let wasm_data = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
     files.push(crate::writer::MaterializeFile {
         path: pkg_b_dir.join("module.wasm"),
-        data: wasm_data.clone(),
+        data: std::sync::Arc::new(wasm_data.clone()),
         mode: 0o644,
         package_id: Some("pkg-b".to_string()),
     });
@@ -3084,7 +3084,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     // File 4: small in pkg-b
     files.push(crate::writer::MaterializeFile {
         path: pkg_b_dir.join("util.js"),
-        data: b"export const x = 1;".to_vec(),
+        data: std::sync::Arc::new(b"export const x = 1;".to_vec()),
         mode: 0o644,
         package_id: Some("pkg-b".to_string()),
     });
@@ -3124,7 +3124,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
         skip_existing_matching: false,
     };
     // Modify one byte to ensure HDD write overwrites correctly
-    files[0].data = b"module.exports = 'pkg-a-hdd';".to_vec();
+    files[0].data = std::sync::Arc::new(b"module.exports = 'pkg-a-hdd';".to_vec());
     crate::writer::materialize_files_parallel(files, &hdd_config).unwrap();
 
     assert_eq!(

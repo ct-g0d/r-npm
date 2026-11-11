@@ -4435,18 +4435,47 @@ impl Installer {
             let t_missing_start = std::time::Instant::now();
             let node_modules_dir_v = rnpm_fs::to_verbatim_path(&node_modules_dir);
             let bin_dir_v = rnpm_fs::to_verbatim_path(&bin_dir);
-            let _ = rnpm_fs::writer::precreate_directories(vec![node_modules_dir_v.as_path(), bin_dir_v.as_path()]);
+            let mut dirs_to_precreate = Vec::with_capacity(missing_packs.len() * 2 + 2);
+            dirs_to_precreate.push(node_modules_dir_v.clone());
+            dirs_to_precreate.push(bin_dir_v.clone());
+            let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
+            for (_, pkg_key, _, _, _) in &missing_packs {
+                let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
+                    pkg_key.replace('/', "\\")
+                } else {
+                    pkg_key.clone()
+                };
+                let target = loc_base_dir_v.join(pkg_key_clean);
+                if let Some(parent) = target.parent() {
+                    dirs_to_precreate.push(parent.to_path_buf());
+                }
+                dirs_to_precreate.push(target);
+            }
+            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+            let _ = rnpm_fs::writer::precreate_directories(dir_refs);
+
+            let timing_debug = std::env::var_os("RNPM_TIMING_DEBUG").is_some();
+            let tm_nm_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let tm_nm_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let tm_first_enqueue = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            let tm_last_enqueue = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
             let semaphore = Arc::clone(&self.io_semaphore);
+            let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let mut init_dirs = std::collections::HashSet::with_capacity(dirs_to_precreate.len());
+            init_dirs.extend(dirs_to_precreate);
+            let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
                 let sem = Arc::clone(&semaphore);
+                let active_sem = Arc::clone(&active_semaphore);
                 let cpu_sem = Arc::clone(&cpu_semaphore);
+                let seen_dirs = Arc::clone(&seen_dirs);
                 let cache = self.cache.clone();
                 let registry_client = self.registry_client.clone();
                 let project_dir = loc_base_dir.clone();
@@ -4459,9 +4488,13 @@ impl Installer {
                 let integrity_str = integrity_str.clone();
                 let is_optional = *is_optional;
                 let writer_sender_clone = writer_sender.clone();
+                let tm_nm_count = Arc::clone(&tm_nm_count);
+                let tm_nm_bytes = Arc::clone(&tm_nm_bytes);
+                let tm_first_enqueue = Arc::clone(&tm_first_enqueue);
+                let tm_last_enqueue = Arc::clone(&tm_last_enqueue);
 
                 join_set.spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                    let _active_permit = Arc::clone(&active_sem).acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
 
                     let (bytes, was_hit, to_cache) = if resolved_url.starts_with("file:") {
                         let file_path = resolved_url.strip_prefix("file:").unwrap().trim();
@@ -4556,7 +4589,10 @@ impl Installer {
                                         "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {pkg_key}"
                                     ));
                                 }
-                                match registry_client.download_tarball_bytes(&resolved_url).await {
+                                let _io_permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                                let dl_res = registry_client.download_tarball_bytes(&resolved_url).await;
+                                drop(_io_permit);
+                                match dl_res {
                                     Ok(fresh_bytes) => {
                                         if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
                                             if is_optional {
@@ -4585,7 +4621,10 @@ impl Installer {
                                 "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
                             ));
                         } else {
-                            match registry_client.download_tarball_bytes(&resolved_url).await {
+                            let _io_permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                            let dl_res = registry_client.download_tarball_bytes(&resolved_url).await;
+                            drop(_io_permit);
+                            match dl_res {
                                 Ok(fresh_bytes) => {
                                     if let Err(fresh_err) = expected_integrity.verify(&fresh_bytes) {
                                         if is_optional {
@@ -4609,128 +4648,155 @@ impl Installer {
                         let to_cache = sha_hex.map(|h| (data.clone(), h));
                         (data, was_hit, to_cache)
                     };
-                    drop(_permit);
 
-                    let _cpu_permit = cpu_sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
-                    let t_sw = std::time::Instant::now();
-                    let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
-                        pkg_key.replace('/', "\\")
-                    } else {
-                        pkg_key.clone()
-                    };
-                    let loc_base_dir_v = rnpm_fs::to_verbatim_path(&project_dir);
-                    let pkg_target = loc_base_dir_v.join(pkg_key_clean);
-                    let pkg_key_for_pack = pkg_key.clone();
-                    let pack_res = tokio::task::spawn_blocking(move || {
-                        let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
-                            .map_err(|e| anyhow!("{e}"))?;
-
-                        if writer_sender_clone.is_none() {
-                            let dir_refs: Vec<&Path> = decoded.dirs.iter().map(|p| p.as_path()).collect();
-                            let _ = rnpm_fs::writer::precreate_directories(dir_refs);
-                        }
-
-                        if let Some(ref sender) = writer_sender_clone {
-                            for file in &decoded.files {
-                                rnpm_fs::record_file_created(file.data.len() as u64);
-                                sender
-                                    .send_arc(file.path.clone(), Arc::new(file.data.clone()), file.mode)
-                                    .map_err(|e| anyhow!("{e}"))?;
-                            }
+                    let decoded_res = {
+                        let _cpu_permit = Arc::clone(&cpu_sem).acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                        let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
+                            pkg_key.replace('/', "\\")
                         } else {
-                            for file in &decoded.files {
-                                let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
-                            }
-                        }
-
-                        let populate_cas = idx < 5;
-                        let deferred_pack_files = if !integrity_str.is_empty() {
-                            if writer_sender_clone.is_some() {
-                                pack_store
-                                    .put_package_pack_from_decoded_deferred(
-                                        &integrity_str,
-                                        &pkg_target,
-                                        &decoded.files,
-                                        populate_cas,
-                                    )
-                                    .ok()
-                                    .map(|(_, payloads)| payloads)
-                            } else {
-                                let _ = pack_store.put_package_pack_from_decoded(
-                                    &integrity_str,
-                                    &pkg_target,
-                                    &decoded.files,
-                                    populate_cas,
-                                );
-                                None
-                            }
-                        } else {
-                            None
+                            pkg_key.clone()
                         };
+                        let loc_base_dir_v = rnpm_fs::to_verbatim_path(&project_dir);
+                        let pkg_target = loc_base_dir_v.join(pkg_key_clean);
+                        let pkg_key_for_pack = pkg_key.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _hold_cpu = _cpu_permit;
+                            let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
+                                .map_err(|e| anyhow!("{e}"))?;
 
-                        if let Some(ref sender) = writer_sender_clone {
-                            if let Some(payloads) = deferred_pack_files {
-                                sender
-                                    .send_arc(payloads.pack.0, payloads.pack.1, 0o644)
-                                    .map_err(|e| anyhow!("{e}"))?;
-                                sender
-                                    .send_arc(payloads.idx.0, payloads.idx.1, 0o644)
-                                    .map_err(|e| anyhow!("{e}"))?;
+                            for d in &decoded.dirs {
+                                let exists = {
+                                    let guard = seen_dirs.read().unwrap();
+                                    guard.contains(d)
+                                };
+                                if !exists {
+                                    let mut guard = seen_dirs.write().unwrap();
+                                    if guard.insert(d.clone()) {
+                                        let _ = std::fs::create_dir_all(d);
+                                        let mut curr = d.as_path();
+                                        while let Some(parent) = curr.parent() {
+                                            if parent == project_dir || parent.as_os_str().is_empty() {
+                                                break;
+                                            }
+                                            guard.insert(parent.to_path_buf());
+                                            curr = parent;
+                                        }
+                                    }
+                                }
                             }
+
+                            if let Some(ref sender) = writer_sender_clone {
+                                if timing_debug {
+                                    let now_ms = t_missing_start.elapsed().as_millis() as u64;
+                                    tm_first_enqueue.fetch_min(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                    tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                    tm_nm_count.fetch_add(decoded.files.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                    let b_sum: u64 = decoded.files.iter().map(|f| f.data.len() as u64).sum();
+                                    tm_nm_bytes.fetch_add(b_sum, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                for file in &decoded.files {
+                                    rnpm_fs::record_file_created(file.data.len() as u64);
+                                    sender
+                                        .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
+                                        .map_err(|e| anyhow!("{e}"))?;
+                                }
+                            } else {
+                                for file in &decoded.files {
+                                    let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
+                                }
+                            }
+
+                            Ok::<(rnpm_cache::DecodedPackage, PathBuf), anyhow::Error>((decoded, pkg_target))
+                        })
+                        .await
+                        .map_err(|e| anyhow!("decode worker panicked: {e}"))?
+                    };
+
+                    let (decoded, pkg_target) = match decoded_res {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if is_optional {
+                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to decode {pkg_key}: {e}");
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!("Failed to decode {pkg_key}: {e}"));
+                            }
+                        }
+                    };
+
+                    let symlinks = decoded.symlinks;
+                    drop(_active_permit);
+                    let pack_task = tokio::task::spawn_blocking(move || {
+                        let populate_cas = idx < 5;
+                        if !integrity_str.is_empty() {
+                            let _ = pack_store.put_package_pack_from_decoded(
+                                &integrity_str,
+                                &pkg_target,
+                                &decoded.files,
+                                populate_cas,
+                            );
                         }
 
                         if let Some((blob_bytes, sha512_hex)) = to_cache {
-                            let target_path = cache.blob_path(&sha512_hex);
-                            if !target_path.exists() {
-                                if let Some(ref sender) = writer_sender_clone {
-                                    sender
-                                        .send(target_path, blob_bytes, 0o644)
-                                        .map_err(|e| anyhow!("{e}"))?;
-                                } else {
-                                    let _ = cache.put_blob_direct(&blob_bytes, &sha512_hex);
-                                }
-                            }
+                            let _ = cache.put_blob_direct(&blob_bytes, &sha512_hex);
                         }
 
-                        Ok::<Vec<(PathBuf, PathBuf)>, anyhow::Error>(decoded.symlinks)
-                    })
-                    .await
-                    .map_err(|e| anyhow!("pack worker panicked: {e}"))?;
+                        Ok::<(), anyhow::Error>(())
+                    });
 
-                    match pack_res {
-                        Ok(symlinks) => {
-                            worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                            Ok(Some((idx, was_hit, symlinks)))
-                        }
-                        Err(e) => {
-                            if is_optional {
-                                warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to create pack for {pkg_key}: {e}");
-                                Ok(None)
-                            } else {
-                                Err(anyhow!("Failed to create pack for {pkg_key}: {e}"))
-                            }
-                        }
-                    }
+                    Ok(Some((idx, was_hit, symlinks, pack_task)))
                 });
             }
 
             let mut all_pending_symlinks = Vec::new();
+            let mut all_pack_tasks = Vec::new();
             while let Some(join_res) = join_set.join_next().await {
                 let item_opt =
                     join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
-                if let Some((idx, was_hit, symlinks)) = item_opt {
+                if let Some((idx, was_hit, symlinks, pack_task)) = item_opt {
                     missing_pack_results.insert(idx, was_hit);
                     all_pending_symlinks.extend(symlinks);
+                    all_pack_tasks.push(pack_task);
                 }
+            }
+            let t_producer_done = t_missing_start.elapsed();
+
+            if let Some(ref mut w) = async_writer {
+                w.close_input();
             }
 
-            if let Some(w) = async_writer {
-                let t_w = std::time::Instant::now();
-                w.finish().map_err(|e| anyhow!("AsyncFileWriter failed: {e}"))?;
-                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                    eprintln!("[TIMING_PROFILE] async_writer finish: {:.2}s", t_w.elapsed().as_secs_f64());
+            let (pack_res, writer_res) = tokio::join!(
+                async {
+                    for task in all_pack_tasks {
+                        task.await.map_err(|e| anyhow!("pack worker panicked: {e}"))??;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                },
+                async {
+                    if let Some(w) = async_writer {
+                        let t_w = std::time::Instant::now();
+                        tokio::task::spawn_blocking(move || {
+                            w.wait().map_err(|e| anyhow!("AsyncFileWriter failed: {e}"))
+                        })
+                        .await
+                        .map_err(|e| anyhow!("AsyncFileWriter panicked: {e}"))??;
+                        let t_writer_done = t_missing_start.elapsed();
+                        if timing_debug {
+                            eprintln!("[TIMING_PROFILE] async_writer finish wait: {:.2}s", t_w.elapsed().as_secs_f64());
+                            eprintln!("[TIMING_PROFILE] missing_packs timeline:");
+                            eprintln!("  first enqueue:        {:>7} ms", tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed));
+                            eprintln!("  last enqueue:         {:>7} ms", tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed));
+                            eprintln!("  producer finished:    {:>7.1} ms", t_producer_done.as_secs_f64() * 1000.0);
+                            eprintln!("  writer finished:      {:>7.1} ms", t_writer_done.as_secs_f64() * 1000.0);
+                            eprintln!("[TIMING_PROFILE] payload counts & bytes:");
+                            eprintln!("  node_modules files:   {:>7} ({:.1} MiB)", tm_nm_count.load(std::sync::atomic::Ordering::Relaxed), tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0 / 1024.0);
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
                 }
-            }
+            );
+            pack_res?;
+            writer_res?;
 
             for (link_path, target_path) in all_pending_symlinks {
                 if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {

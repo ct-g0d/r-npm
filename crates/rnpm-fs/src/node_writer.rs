@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -13,7 +13,18 @@ let head = 0;
 let inflight = 0;
 let stdinEnded = false;
 let failed = false;
-const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '16', 10);
+const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '96', 10);
+
+const timing = !!process.env.RNPM_TIMING_DEBUG;
+const tStart = Date.now();
+let tFirstItem = 0;
+let tStdinEnd = 0;
+let totalEnqueued = 0;
+let totalBytes = 0;
+let writesCompleted = 0;
+let writtenAtStdinEnd = 0;
+let mkdirCount = 0;
+let mkdirTimeMs = 0;
 
 function pump() {
   while (inflight < concurrency && head < q.length) {
@@ -21,42 +32,61 @@ function pump() {
     q[head] = null;
     head++;
     inflight++;
-    const dir = path.dirname(item.p);
-    let cur = dir;
-    let needMkdir = false;
-    while (cur && !dirs.has(cur)) {
-      dirs.add(cur);
-      needMkdir = true;
-      const parent = path.dirname(cur);
-      if (parent === cur) break;
-      cur = parent;
-    }
-    if (needMkdir) {
-      try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-    }
-    const writePromise = (item.m === 0o644)
-      ? fs.promises.writeFile(item.p, item.b)
-      : fs.promises.writeFile(item.p, item.b, { mode: item.m });
-    writePromise
-      .then(() => {
-        inflight--;
-        pump();
-      })
-      .catch(err => {
+    const onWriteDone = (err) => {
+      if (err) {
+        if (err.code === 'ENOENT') {
+          mkdirCount++;
+          const tMkdirStart = timing ? Date.now() : 0;
+          try {
+            fs.mkdirSync(path.dirname(item.p), { recursive: true });
+          } catch (e) {}
+          if (timing) {
+            mkdirTimeMs += Date.now() - tMkdirStart;
+          }
+          const onRetryDone = (retryErr) => {
+            if (retryErr) {
+              console.error('NodeWriter error after mkdir:', item.p, retryErr);
+              failed = true;
+            }
+            writesCompleted++;
+            inflight--;
+            pump();
+          };
+          if (item.m === 0o644) {
+            fs.writeFile(item.p, item.b, onRetryDone);
+          } else {
+            fs.writeFile(item.p, item.b, { mode: item.m }, onRetryDone);
+          }
+          return;
+        }
         console.error('NodeWriter error:', item.p, err);
         failed = true;
-        inflight--;
-        pump();
-      });
+      }
+      writesCompleted++;
+      inflight--;
+      pump();
+    };
+
+    if (item.m === 0o644) {
+      fs.writeFile(item.p, item.b, onWriteDone);
+    } else {
+      fs.writeFile(item.p, item.b, { mode: item.m }, onWriteDone);
+    }
   }
   if (head > 1024) {
     q.splice(0, head);
     head = 0;
   }
   if (stdinEnded && inflight === 0 && head === q.length) {
-    if (process.env.RNPM_TIMING_DEBUG) {
+    if (timing) {
+      const tEnd = Date.now();
       const mem = process.memoryUsage();
-      console.error(`[TIMING_PROFILE] node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
+      console.error(`[TIMING_PROFILE] node_writer stats:`);
+      console.error(`  first item received at: ${tFirstItem ? tFirstItem - tStart : 0} ms`);
+      console.error(`  stdin ended at: ${tStdinEnd ? tStdinEnd - tStart : 0} ms (written so far: ${writtenAtStdinEnd}/${totalEnqueued})`);
+      console.error(`  all writes finished at: ${tEnd - tStart} ms (${writesCompleted} files, ${(totalBytes / 1024 / 1024).toFixed(1)} MiB)`);
+      console.error(`  mkdirSync calls: ${mkdirCount}, total mkdir time: ${mkdirTimeMs.toFixed(1)} ms`);
+      console.error(`  node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
     }
     process.exit(failed ? 1 : 0);
   }
@@ -78,8 +108,11 @@ process.stdin.on('readable', () => {
     }
     const body = process.stdin.read(hdr.pLen + hdr.dLen);
     if (!body) break;
+    if (timing && tFirstItem === 0) tFirstItem = Date.now();
     const p = body.toString('utf8', 0, hdr.pLen);
     const b = body.subarray(hdr.pLen);
+    totalEnqueued++;
+    totalBytes += hdr.dLen;
     q.push({ p, b, m: hdr.mode });
     hdr = null;
     count++;
@@ -93,6 +126,8 @@ process.stdin.on('readable', () => {
 
 process.stdin.on('end', () => {
   stdinEnded = true;
+  tStdinEnd = Date.now();
+  writtenAtStdinEnd = writesCompleted;
   pump();
 });
 "#;
@@ -106,25 +141,17 @@ pub enum NodeWriterMsg {
     Close,
 }
 
-/// A background Node.js worker that writes files concurrently using libuv/fs.promises.
-pub struct NodeWriter {
+struct NodeWriterWorker {
     child: Child,
-    sender: Sender<NodeWriterMsg>,
+    sender: SyncSender<NodeWriterMsg>,
     thread_handle: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-impl NodeWriter {
-    /// Spawns a background Node.js process and begins listening for file write commands.
-    pub fn spawn() -> Result<Self, std::io::Error> {
-        let uv_size = std::env::var("UV_THREADPOOL_SIZE")
-            .or_else(|_| std::env::var("RNPM_UV_THREADPOOL_SIZE"))
-            .unwrap_or_else(|_| "64".to_string());
+impl NodeWriterWorker {
+    fn spawn(uv_size: &str, concurrency: &str) -> Result<Self, std::io::Error> {
         let mut child = Command::new("node")
             .env("UV_THREADPOOL_SIZE", uv_size)
-            .env(
-                "RNPM_NODE_WRITER_CONCURRENCY",
-                std::env::var("RNPM_NODE_WRITER_CONCURRENCY").unwrap_or_else(|_| "16".to_string()),
-            )
+            .env("RNPM_NODE_WRITER_CONCURRENCY", concurrency)
             .arg("-e")
             .arg(NODE_WRITER_SCRIPT)
             .stdin(Stdio::piped())
@@ -132,25 +159,41 @@ impl NodeWriter {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let mut stdin = std::io::BufWriter::with_capacity(1024 * 1024, child.stdin.take().unwrap());
-        let (tx, rx): (Sender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = channel();
+        let mut stdin = std::io::BufWriter::with_capacity(64 * 1024, child.stdin.take().unwrap());
+        let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(256);
 
         let handle = thread::spawn(move || -> std::io::Result<()> {
             use std::io::Write;
+            let mut hdr = [0u8; 12];
             while let Ok(msg) = rx.recv() {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
                         let path_bytes = path.as_bytes();
-                        stdin.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
-                        stdin.write_all(&mode.to_le_bytes())?;
-                        stdin.write_all(&(data.len() as u32).to_le_bytes())?;
-                        stdin.write_all(path_bytes)?;
-                        stdin.write_all(&data)?;
+                        hdr[0..4].copy_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+                        hdr[4..8].copy_from_slice(&mode.to_le_bytes());
+                        hdr[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        if let Err(e) = stdin.write_all(&hdr) {
+                            eprintln!("[NODE_WRITER_ERR] write hdr: {e}");
+                            return Err(e);
+                        }
+                        if let Err(e) = stdin.write_all(path_bytes) {
+                            eprintln!("[NODE_WRITER_ERR] write path: {e}");
+                            return Err(e);
+                        }
+                        for chunk in data.chunks(64 * 1024) {
+                            if let Err(e) = stdin.write_all(chunk) {
+                                eprintln!("[NODE_WRITER_ERR] write data: {e}");
+                                return Err(e);
+                            }
+                        }
                     }
                     NodeWriterMsg::Close => break,
                 }
             }
-            stdin.flush()?;
+            if let Err(e) = stdin.flush() {
+                eprintln!("[NODE_WRITER_ERR] flush: {e}");
+                return Err(e);
+            }
             drop(stdin);
             Ok(())
         });
@@ -162,14 +205,11 @@ impl NodeWriter {
         })
     }
 
-    /// Obtains a cloned channel sender for worker threads.
-    pub fn sender(&self) -> Sender<NodeWriterMsg> {
-        self.sender.clone()
+    fn close_input(&mut self) {
+        let _ = self.sender.send(NodeWriterMsg::Close);
     }
 
-    /// Flushes all pending writes, waits for Node.js to finish writing all files to disk, and exits.
-    pub fn finish(mut self) -> Result<(), std::io::Error> {
-        let _ = self.sender.send(NodeWriterMsg::Close);
+    fn wait(mut self) -> Result<(), std::io::Error> {
         if let Some(h) = self.thread_handle.take() {
             h.join()
                 .map_err(|_| std::io::Error::other("NodeWriter thread panicked"))??;
@@ -181,6 +221,90 @@ impl NodeWriter {
             )));
         }
         Ok(())
+    }
+}
+
+/// A background Node.js worker pool that writes files concurrently using libuv/fs.writeFile.
+pub struct NodeWriter {
+    workers: Vec<NodeWriterWorker>,
+    senders: Arc<Vec<SyncSender<NodeWriterMsg>>>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl NodeWriter {
+    /// Spawns background Node.js worker process(es) and begins listening for file write commands.
+    pub fn spawn() -> Result<Self, std::io::Error> {
+        let num_workers: usize = std::env::var("RNPM_NODE_WRITER_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
+        let uv_size = std::env::var("UV_THREADPOOL_SIZE")
+            .or_else(|_| std::env::var("RNPM_UV_THREADPOOL_SIZE"))
+            .unwrap_or_else(|_| "128".to_string());
+
+        let concurrency = std::env::var("RNPM_NODE_WRITER_CONCURRENCY")
+            .unwrap_or_else(|_| "128".to_string());
+
+        let mut workers = Vec::with_capacity(num_workers);
+        let mut senders = Vec::with_capacity(num_workers);
+
+        for _ in 0..num_workers {
+            let worker = NodeWriterWorker::spawn(&uv_size, &concurrency)?;
+            senders.push(worker.sender.clone());
+            workers.push(worker);
+        }
+
+        Ok(Self {
+            workers,
+            senders: Arc::new(senders),
+            counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// Obtains a cloned channel sender for worker threads.
+    pub fn sender(&self) -> NodeWriterSender {
+        NodeWriterSender {
+            senders: Arc::clone(&self.senders),
+            counter: Arc::clone(&self.counter),
+        }
+    }
+
+    /// Signals that no more files will be sent, closing the input stream to Node.js.
+    pub fn close_input(&mut self) {
+        for worker in &mut self.workers {
+            worker.close_input();
+        }
+    }
+
+    /// Waits for Node.js worker(s) to finish writing all files to disk and exit.
+    pub fn wait(self) -> Result<(), std::io::Error> {
+        for worker in self.workers {
+            worker.wait()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes all pending writes, waits for Node.js to finish writing all files to disk, and exits.
+    pub fn finish(mut self) -> Result<(), std::io::Error> {
+        self.close_input();
+        self.wait()
+    }
+}
+
+/// Cloneable sender that distributes write tasks round-robin across NodeWriter worker processes.
+#[derive(Clone)]
+pub struct NodeWriterSender {
+    senders: Arc<Vec<SyncSender<NodeWriterMsg>>>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl NodeWriterSender {
+    pub fn send(&self, msg: NodeWriterMsg) -> Result<(), std::io::Error> {
+        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        self.senders[idx]
+            .send(msg)
+            .map_err(|e| std::io::Error::other(format!("NodeWriter disconnected: {e}")))
     }
 }
 
@@ -268,25 +392,35 @@ impl RustWriterPool {
         self.sender.as_ref().unwrap().clone()
     }
 
-    /// Sends close sentinels to all worker threads and joins them.
-    pub fn finish(mut self) -> Result<(), std::io::Error> {
+    /// Signals workers that no more tasks will be enqueued.
+    pub fn close_input(&mut self) {
         if let Some(s) = self.sender.take() {
             for _ in 0..self.handles.len() {
                 let _ = s.send(WriteTask::Close);
             }
         }
-        for h in self.handles {
+    }
+
+    /// Waits for all worker threads to finish.
+    pub fn wait(mut self) -> Result<(), std::io::Error> {
+        for h in self.handles.drain(..) {
             h.join()
                 .map_err(|_| std::io::Error::other("RustWriterPool worker panicked"))??;
         }
         Ok(())
+    }
+
+    /// Sends close sentinels to all worker threads and joins them.
+    pub fn finish(mut self) -> Result<(), std::io::Error> {
+        self.close_input();
+        self.wait()
     }
 }
 
 /// Cloneable sender for async file writes across worker threads.
 #[derive(Clone)]
 pub enum AsyncFileWriterSender {
-    Node(Sender<NodeWriterMsg>),
+    Node(NodeWriterSender),
     Rust(SyncSender<WriteTask>),
 }
 
@@ -307,7 +441,6 @@ impl AsyncFileWriterSender {
                     data,
                     mode,
                 })
-                .map_err(|e| std::io::Error::other(format!("NodeWriter disconnected: {e}")))
             }
             Self::Rust(s) => s
                 .send(WriteTask::File { path, data, mode })
@@ -352,11 +485,25 @@ impl AsyncFileWriter {
         }
     }
 
-    /// Flushes all pending writes and waits for completion.
-    pub fn finish(self) -> Result<(), std::io::Error> {
+    /// Signals that no more files will be sent, closing input to background worker(s).
+    pub fn close_input(&mut self) {
         match self {
-            Self::Node(nw) => nw.finish(),
-            Self::Rust(rw) => rw.finish(),
+            Self::Node(nw) => nw.close_input(),
+            Self::Rust(rw) => rw.close_input(),
         }
+    }
+
+    /// Waits for all pending writes to complete on disk and worker(s) to exit.
+    pub fn wait(self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Node(nw) => nw.wait(),
+            Self::Rust(rw) => rw.wait(),
+        }
+    }
+
+    /// Flushes all pending writes and waits for completion.
+    pub fn finish(mut self) -> Result<(), std::io::Error> {
+        self.close_input();
+        self.wait()
     }
 }
