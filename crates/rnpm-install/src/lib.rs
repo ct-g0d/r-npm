@@ -2765,6 +2765,9 @@ impl Installer {
                                 let _ = std::fs::remove_dir_all(&dest_dir);
                             }
                         }
+                        if let Some(parent) = dest_dir.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
                         rnpm_fs::create_junction(&dest_dir, &abs_file)
                             .map_err(|e| anyhow!("Failed to link file dir {}: {e}", loc))?;
                         packages_installed += 1;
