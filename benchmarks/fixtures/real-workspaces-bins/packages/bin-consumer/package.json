@@ -1,0 +1,11 @@
+{
+  "name": "@real-ws/bin-consumer",
+  "version": "1.0.0",
+  "dependencies": {
+    "@real-ws/bin-provider": "*",
+    "is-number": "^7.0.0"
+  },
+  "scripts": {
+    "test": "node -e \"console.log('consumer ok')\""
+  }
+}

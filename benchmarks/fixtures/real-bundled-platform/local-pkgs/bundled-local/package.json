@@ -1,0 +1,10 @@
+{
+  "name": "bundled-local",
+  "version": "1.0.0",
+  "bundleDependencies": [
+    "bundled-child"
+  ],
+  "dependencies": {
+    "bundled-child": "file:./bundled-child"
+  }
+}

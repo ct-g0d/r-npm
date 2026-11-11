@@ -1,0 +1,12 @@
+{
+  "name": "real-npm-aliases",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"console.log('npm-aliases ok')\""
+  },
+  "dependencies": {
+    "string-width-alias": "npm:string-width@^4.2.3",
+    "is-number-alias": "npm:is-number@^7.0.0"
+  }
+}
