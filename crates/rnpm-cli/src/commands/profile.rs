@@ -142,7 +142,7 @@ async fn run_get(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         .unwrap_or_default();
 
     if let Some(val) = info.get("cidr_whitelist") {
-        if val.is_null() || val.as_array().map_or(false, |a| a.is_empty()) {
+        if val.is_null() || val.as_array().is_some_and(|a| a.is_empty()) {
             info.remove("cidr_whitelist");
         }
     }
