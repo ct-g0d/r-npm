@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_cache_add_and_ls_and_verify() {
     let tmp = tempdir().unwrap();
@@ -127,8 +130,8 @@ fn test_cache_clean_eusage_live_npm_parity() {
 
     assert_eq!(rnpm_res.status.code(), Some(1));
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "cache", "clean"])
+    let npm_res = isolated_npm()
+        .args(["cache", "clean"])
         .current_dir(tmp.path())
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)

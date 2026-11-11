@@ -5,6 +5,9 @@ use std::{
 };
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn run(dir: &Path, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_rnpm"))
         .current_dir(dir)
@@ -89,8 +92,8 @@ fn test_init_live_npm_comparison() {
         .expect("rnpm init -y failed");
     assert!(rnpm_res.status.success());
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "init", "-y"])
+    let npm_res = isolated_npm()
+        .args(["init", "-y"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

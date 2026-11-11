@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_prefix_root_live_npm_parity() {
     let tmp = tempdir().unwrap();
@@ -115,8 +118,8 @@ fn test_prefix_root_live_npm_parity() {
     let rnpm_groot_out = String::from_utf8_lossy(&rnpm_groot.stdout).trim().to_string();
 
     // Now compare with live npm.cmd
-    let npm_prefix = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "prefix"])
+    let npm_prefix = isolated_npm()
+        .arg("prefix")
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
         .env("USERPROFILE", &isolated_env)
@@ -147,8 +150,8 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_root = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "root"])
+    let npm_root = isolated_npm()
+        .arg("root")
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
         .env("USERPROFILE", &isolated_env)
@@ -178,8 +181,8 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_gprefix = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "prefix", "-g"])
+    let npm_gprefix = isolated_npm()
+        .args(["prefix", "-g"])
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
         .env("USERPROFILE", &isolated_env)
@@ -209,8 +212,8 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_groot = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "root", "-g"])
+    let npm_groot = isolated_npm()
+        .args(["root", "-g"])
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
         .env("USERPROFILE", &isolated_env)

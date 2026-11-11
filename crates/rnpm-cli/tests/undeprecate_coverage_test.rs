@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -164,12 +167,8 @@ async fn test_cli_undeprecate_mock() {
         v
     };
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "undeprecate",
             "sample-pkg@1.0.0",
             "--registry",

@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_pkg_get_name_npm_parity() {
     let tmp = tempdir().unwrap();
@@ -50,8 +53,8 @@ fn test_pkg_get_name_npm_parity() {
     let rnpm_stdout = String::from_utf8_lossy(&rnpm_out.stdout);
     assert_eq!(rnpm_stdout.trim(), "\"test-pkg\"");
 
-    let npm_out = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "pkg", "get", "name"])
+    let npm_out = isolated_npm()
+        .args(["pkg", "get", "name"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

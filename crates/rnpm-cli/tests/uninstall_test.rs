@@ -5,6 +5,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 use rnpm_core::manifest::Manifest;
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
@@ -347,8 +350,8 @@ fn test_uninstall_live_npm_parity() {
         .output()
         .expect("rnpm uninstall failed");
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "uninstall", "is-number", "--no-audit", "--no-fund"])
+    let npm_res = isolated_npm()
+        .args(["uninstall", "is-number", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

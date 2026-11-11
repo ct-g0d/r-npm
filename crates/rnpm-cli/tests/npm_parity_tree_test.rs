@@ -5,6 +5,9 @@ use std::{
 };
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn run(dir: &Path, args: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_rnpm"))
         .current_dir(dir)
@@ -160,8 +163,8 @@ fn test_ls_and_ll_live_npm_parity() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "ls", "--json"])
+    let npm_res = isolated_npm()
+        .args(["ls", "--json"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

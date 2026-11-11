@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -128,12 +131,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res = Command::new("cmd.exe")
+    let npm_res = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unpublish",
             "sample-pkg",
             "--dry-run",
@@ -198,12 +197,8 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res_v = Command::new("cmd.exe")
+    let npm_res_v = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unpublish",
             "sample-pkg@1.0.0",
             "--dry-run",

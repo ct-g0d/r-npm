@@ -3,6 +3,9 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn rnpm_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rnpm")
 }
@@ -527,8 +530,8 @@ fn test_bare_version_display_map_and_json() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_out = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "version"])
+    let npm_out = isolated_npm()
+        .arg("version")
         .current_dir(project_dir)
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

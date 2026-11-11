@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_install_test_execution() {
     let tmp = tempdir().unwrap();
@@ -163,8 +166,8 @@ fn test_install_test_live_npm_parity() {
         .output()
         .expect("rnpm install-test failed");
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "install-test", "--no-audit", "--no-fund"])
+    let npm_res = isolated_npm()
+        .args(["install-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())
@@ -262,8 +265,8 @@ fn test_install_ci_test_live_npm_parity() {
         .output()
         .expect("rnpm install-ci-test failed");
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "install-ci-test", "--no-audit", "--no-fund"])
+    let npm_res = isolated_npm()
+        .args(["install-ci-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

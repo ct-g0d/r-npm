@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 #[test]
 fn test_fund_header_npm_parity() {
     let tmp = tempdir().unwrap();
@@ -78,8 +81,8 @@ fn test_fund_header_npm_parity() {
     assert_eq!(json_val["name"], "test-pkg");
     assert_eq!(json_val["version"], "1.0.0");
 
-    let npm_out = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "fund"])
+    let npm_out = isolated_npm()
+        .arg("fund")
         .current_dir(tmp.path())
         .env("HOME", iso.path())
         .env("USERPROFILE", iso.path())

@@ -2,6 +2,9 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+use common::isolated_npm;
+
 fn isolated_cmd(
     bin: &str,
     dir: &std::path::Path,
@@ -551,8 +554,8 @@ fn test_link_live_npm_parity() {
         .output()
         .expect("rnpm link failed");
 
-    let npm_res = Command::new("cmd.exe")
-        .args(["/d", "/s", "/c", "npm.cmd", "link", "--no-audit", "--no-fund"])
+    let npm_res = isolated_npm()
+        .args(["link", "--no-audit", "--no-fund"])
         .current_dir(&npm_pkg)
         .env("HOME", root)
         .env("USERPROFILE", root)

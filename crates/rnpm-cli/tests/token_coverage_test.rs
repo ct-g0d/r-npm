@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -180,12 +183,8 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token list failed");
 
-    let npm_list = Command::new("cmd.exe")
+    let npm_list = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "token",
             "list",
             "--registry",
@@ -242,12 +241,8 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token revoke failed");
 
-    let npm_revoke = Command::new("cmd.exe")
+    let npm_revoke = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "token",
             "revoke",
             "123456",

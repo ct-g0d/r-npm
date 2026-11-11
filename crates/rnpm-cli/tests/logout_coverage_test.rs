@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -136,12 +139,8 @@ async fn test_cli_logout_parity() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     // 1. Run live npm logout
-    let npm_logout = Command::new("cmd.exe")
+    let npm_logout = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "logout",
             "--registry",
             &format!("http://{addr}/"),

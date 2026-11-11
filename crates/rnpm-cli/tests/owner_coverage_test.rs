@@ -1,5 +1,8 @@
 use std::process::Command;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -81,12 +84,8 @@ async fn test_cli_owner_ls() {
         .output()
         .expect("owner ls failed");
 
-    let npm_out = Command::new("cmd.exe")
+    let npm_out = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "owner",
             "ls",
             "sample-pkg",

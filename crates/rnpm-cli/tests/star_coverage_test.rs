@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+mod common;
+use common::isolated_npm;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -197,12 +200,8 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm star failed");
 
-    let npm_star = Command::new("cmd.exe")
+    let npm_star = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "star",
             "sample-pkg",
             "--registry",
@@ -259,12 +258,8 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm unstar failed");
 
-    let npm_unstar = Command::new("cmd.exe")
+    let npm_unstar = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "unstar",
             "sample-pkg",
             "--registry",
@@ -321,12 +316,8 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm stars failed");
 
-    let npm_stars = Command::new("cmd.exe")
+    let npm_stars = isolated_npm()
         .args([
-            "/d",
-            "/s",
-            "/c",
-            "npm.cmd",
             "stars",
             "testuser",
             "--registry",
