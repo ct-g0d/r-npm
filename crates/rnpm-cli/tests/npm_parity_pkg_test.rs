@@ -53,7 +53,7 @@ fn test_pkg_get_name_npm_parity() {
     let rnpm_stdout = String::from_utf8_lossy(&rnpm_out.stdout);
     assert_eq!(rnpm_stdout.trim(), "\"test-pkg\"");
 
-    let npm_out = isolated_npm()
+    let npm_out = isolated_npm(iso.path())
         .args(["pkg", "get", "name"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())

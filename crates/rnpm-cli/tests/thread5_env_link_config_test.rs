@@ -554,7 +554,7 @@ fn test_link_live_npm_parity() {
         .output()
         .expect("rnpm link failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(root)
         .args(["link", "--no-audit", "--no-fund"])
         .current_dir(&npm_pkg)
         .env("HOME", root)

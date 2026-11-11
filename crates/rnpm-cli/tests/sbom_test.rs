@@ -450,7 +450,7 @@ fn test_sbom_live_npm_parity() {
         .output()
         .expect("rnpm sbom failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .arg("sbom")
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())

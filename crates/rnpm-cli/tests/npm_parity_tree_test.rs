@@ -163,7 +163,7 @@ fn test_ls_and_ll_live_npm_parity() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .args(["ls", "--json"])
         .current_dir(tmp.path())
         .env("HOME", iso.path())

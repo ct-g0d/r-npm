@@ -166,7 +166,7 @@ fn test_install_test_live_npm_parity() {
         .output()
         .expect("rnpm install-test failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .args(["install-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())
@@ -265,7 +265,7 @@ fn test_install_ci_test_live_npm_parity() {
         .output()
         .expect("rnpm install-ci-test failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .args(["install-ci-test", "--no-audit", "--no-fund"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())

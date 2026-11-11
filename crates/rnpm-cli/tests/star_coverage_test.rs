@@ -200,7 +200,7 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm star failed");
 
-    let npm_star = isolated_npm()
+    let npm_star = isolated_npm(&iso)
         .args([
             "star",
             "sample-pkg",
@@ -258,7 +258,7 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm unstar failed");
 
-    let npm_unstar = isolated_npm()
+    let npm_unstar = isolated_npm(&iso)
         .args([
             "unstar",
             "sample-pkg",
@@ -316,7 +316,7 @@ async fn test_cli_star_unstar_stars_parity() {
         .output()
         .expect("rnpm stars failed");
 
-    let npm_stars = isolated_npm()
+    let npm_stars = isolated_npm(&iso)
         .args([
             "stars",
             "testuser",

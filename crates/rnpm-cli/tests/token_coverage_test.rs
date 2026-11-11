@@ -183,7 +183,7 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token list failed");
 
-    let npm_list = isolated_npm()
+    let npm_list = isolated_npm(&iso)
         .args([
             "token",
             "list",
@@ -241,7 +241,7 @@ async fn test_cli_token_parity() {
         .output()
         .expect("rnpm token revoke failed");
 
-    let npm_revoke = isolated_npm()
+    let npm_revoke = isolated_npm(&iso)
         .args([
             "token",
             "revoke",

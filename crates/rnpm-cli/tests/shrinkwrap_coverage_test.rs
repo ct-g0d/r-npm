@@ -49,7 +49,7 @@ fn test_shrinkwrap_renames_lockfile() {
     let tmp_npm = tempdir().unwrap();
     fs::write(tmp_npm.path().join("package.json"), pkg_json).unwrap();
     fs::write(tmp_npm.path().join("package-lock.json"), lock_json).unwrap();
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .arg("shrinkwrap")
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())

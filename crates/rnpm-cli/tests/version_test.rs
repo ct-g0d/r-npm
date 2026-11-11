@@ -530,7 +530,7 @@ fn test_bare_version_display_map_and_json() {
     fs::write(&userconfig, "registry=http://127.0.0.1:9/\n").unwrap();
     fs::write(&globalconfig, "").unwrap();
 
-    let npm_out = isolated_npm()
+    let npm_out = isolated_npm(iso.path())
         .arg("version")
         .current_dir(project_dir)
         .env("HOME", iso.path())

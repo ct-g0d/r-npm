@@ -118,7 +118,7 @@ fn test_prefix_root_live_npm_parity() {
     let rnpm_groot_out = String::from_utf8_lossy(&rnpm_groot.stdout).trim().to_string();
 
     // Now compare with live npm.cmd
-    let npm_prefix = isolated_npm()
+    let npm_prefix = isolated_npm(&isolated_env)
         .arg("prefix")
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
@@ -150,7 +150,7 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_root = isolated_npm()
+    let npm_root = isolated_npm(&isolated_env)
         .arg("root")
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
@@ -181,7 +181,7 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_gprefix = isolated_npm()
+    let npm_gprefix = isolated_npm(&isolated_env)
         .args(["prefix", "-g"])
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)
@@ -212,7 +212,7 @@ fn test_prefix_root_live_npm_parity() {
         }
     }
 
-    let npm_groot = isolated_npm()
+    let npm_groot = isolated_npm(&isolated_env)
         .args(["root", "-g"])
         .current_dir(&proj_dir)
         .env("HOME", &isolated_env)

@@ -139,7 +139,7 @@ async fn test_cli_logout_parity() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
 
     // 1. Run live npm logout
-    let npm_logout = isolated_npm()
+    let npm_logout = isolated_npm(&iso)
         .args([
             "logout",
             "--registry",

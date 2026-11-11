@@ -119,7 +119,7 @@ fn test_cli_approve_scripts_parity() {
         .output()
         .expect("rnpm approve-scripts failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args([
             "approve-scripts",
             "my-pkg",
@@ -205,7 +205,7 @@ fn test_cli_deny_scripts_parity() {
         .output()
         .expect("rnpm deny-scripts failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args([
             "deny-scripts",
             "my-pkg",
@@ -290,7 +290,7 @@ fn test_cli_install_scripts_parity() {
         .output()
         .expect("rnpm install-scripts failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args([
             "install-scripts",
             "approve",

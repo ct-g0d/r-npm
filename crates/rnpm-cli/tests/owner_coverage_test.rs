@@ -84,7 +84,7 @@ async fn test_cli_owner_ls() {
         .output()
         .expect("owner ls failed");
 
-    let npm_out = isolated_npm()
+    let npm_out = isolated_npm(iso.path())
         .args([
             "owner",
             "ls",

@@ -131,7 +131,7 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args([
             "unpublish",
             "sample-pkg",
@@ -197,7 +197,7 @@ async fn test_cli_unpublish_dry_run_parity() {
         .output()
         .expect("rnpm unpublish failed");
 
-    let npm_res_v = isolated_npm()
+    let npm_res_v = isolated_npm(&iso)
         .args([
             "unpublish",
             "sample-pkg@1.0.0",

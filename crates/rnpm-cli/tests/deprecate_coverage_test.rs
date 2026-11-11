@@ -167,7 +167,7 @@ async fn test_cli_deprecate_mock() {
         v
     };
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args([
             "deprecate",
             "sample-pkg@1.0.0",

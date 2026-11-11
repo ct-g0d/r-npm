@@ -102,7 +102,7 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config get registry failed");
 
-    let npm_get_reg = isolated_npm()
+    let npm_get_reg = isolated_npm(&iso_npm)
         .args(["config", "get", "registry"])
         .current_dir(tmp_npm.path())
         .env("HOME", &iso_npm)
@@ -153,7 +153,7 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config set failed");
 
-    let npm_set = isolated_npm()
+    let npm_set = isolated_npm(&iso_npm)
         .args([
             "config",
             "set",
@@ -203,7 +203,7 @@ fn test_config_get_set_delete_live_npm_parity() {
         .output()
         .expect("rnpm config get init-author-name failed");
 
-    let npm_get_custom = isolated_npm()
+    let npm_get_custom = isolated_npm(&iso_npm)
         .args([
             "config",
             "get",

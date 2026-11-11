@@ -130,7 +130,7 @@ fn test_cache_clean_eusage_live_npm_parity() {
 
     assert_eq!(rnpm_res.status.code(), Some(1));
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(&iso)
         .args(["cache", "clean"])
         .current_dir(tmp.path())
         .env("HOME", &iso)

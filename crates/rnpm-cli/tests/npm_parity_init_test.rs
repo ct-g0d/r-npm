@@ -92,7 +92,7 @@ fn test_init_live_npm_comparison() {
         .expect("rnpm init -y failed");
     assert!(rnpm_res.status.success());
 
-    let npm_res = isolated_npm()
+    let npm_res = isolated_npm(iso.path())
         .args(["init", "-y"])
         .current_dir(tmp_npm.path())
         .env("HOME", iso.path())

@@ -81,7 +81,7 @@ fn test_fund_header_npm_parity() {
     assert_eq!(json_val["name"], "test-pkg");
     assert_eq!(json_val["version"], "1.0.0");
 
-    let npm_out = isolated_npm()
+    let npm_out = isolated_npm(iso.path())
         .arg("fund")
         .current_dir(tmp.path())
         .env("HOME", iso.path())
