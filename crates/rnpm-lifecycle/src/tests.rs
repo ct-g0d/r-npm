@@ -1028,7 +1028,7 @@ async fn test_execute_binary_unix_shebang_flags_honored() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_execute_binary_unix_non_executable_rejected() {
-    let temp = tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
 
     // Mode 0o644 file must NOT be executable simply due to having a .js extension
