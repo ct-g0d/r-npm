@@ -63,7 +63,7 @@ const report = {
   source_diff_sha256: createHash('sha256').update(git('diff', 'HEAD')).digest('hex'),
   binary_sha256: digest(binary), fixture_lock_sha256: digest(path.join(fixture, 'package-lock.json')),
   environment: { os: `${os.platform()} ${os.release()}`, node: process.version, npm: execFileSync(process.execPath, [npmCli, '--version'], { env: { ...cleanEnv, ...isolation }, encoding: 'utf8' }).trim(), cpu_count: os.availableParallelism(), writer: 'default', load_before: os.loadavg() },
-  conditions: { runs, order: 'npm/rnpm on odd rounds, rnpm/npm on even rounds; cold then warm', cache: 'empty per cold invocation; separate tarball caches seeded before warm samples; store empty per rnpm invocation', logs: path.basename(logDir) },
+  conditions: { runs, command_timeout_ms: 120000, order: 'npm/rnpm on odd rounds, rnpm/npm on even rounds; cold then warm', cache: 'empty per cold invocation; separate tarball caches seeded before warm samples; store empty per rnpm invocation', logs: path.basename(logDir) },
   samples: [], setup: [], thresholds: { speedup: 2, spread_pct: 25 }, gate_passed: false,
 };
 
@@ -74,13 +74,24 @@ async function invoke(tool, argv, cwd, cache, store, label) {
   const stdout = fs.openSync(path.join(logDir, label + '.stdout'), 'w');
   const stderr = fs.openSync(path.join(logDir, label + '.stderr'), 'w');
   const start = performance.now();
+  let timedOut = false;
   try {
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(exe, cliArgs, { cwd, env, windowsHide: true, stdio: ['ignore', stdout, stderr] });
-      child.on('error', reject);
-      child.on('close', (code, signal) => resolve({ code, signal }));
+      const child = spawn(exe, cliArgs, { cwd, env, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', stdout, stderr] });
+      // Kill only the process tree created by this invocation, retaining its
+      // failure and logs instead of leaving a stalled gate or orphan writer.
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        try {
+          if (process.platform === 'win32') {
+            execFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+          } else process.kill(-child.pid, 'SIGKILL');
+        } catch { child.kill(); }
+      }, report.conditions.command_timeout_ms);
+      child.on('error', error => { clearTimeout(timeout); reject(error); });
+      child.on('close', (code, signal) => { clearTimeout(timeout); resolve({ code, signal }); });
     });
-    return { tool, elapsed_ms: performance.now() - start, exit_code: result.code, signal: result.signal, log: label };
+    return { tool, elapsed_ms: performance.now() - start, exit_code: result.code, signal: result.signal, timed_out: timedOut, log: label };
   } finally { fs.closeSync(stdout); fs.closeSync(stderr); }
 }
 function successful(sample) {

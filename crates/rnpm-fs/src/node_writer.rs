@@ -13,6 +13,7 @@ let head = 0;
 let inflight = 0;
 let stdinEnded = false;
 let failed = false;
+let completed = false;
 const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '96', 10);
 const maxQueue = concurrency * 2;
 
@@ -101,7 +102,8 @@ function pump() {
     q.splice(0, head);
     head = 0;
   }
-  if (stdinEnded && inflight === 0 && head === q.length) {
+  if (stdinEnded && inflight === 0 && head === q.length && !completed) {
+    completed = true;
     if (timing) {
       const tEnd = Date.now();
       const mem = process.memoryUsage();
@@ -116,7 +118,10 @@ function pump() {
       console.error(`[TIMING_PROFILE]   mkdirSync calls: ${mkdirCount}, total mkdir time: ${mkdirTimeMs.toFixed(1)} ms`);
       console.error(`[TIMING_PROFILE]   node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
     }
-    process.exit(failed ? 1 : 0);
+    // Let the stdin end/close callbacks unwind before Node tears down libuv.
+    // Forcing exit inside a Windows pipe callback can stall process shutdown
+    // even after every file callback and the final timing banner completed.
+    process.exitCode = failed ? 1 : 0;
   }
 }
 
@@ -243,6 +248,51 @@ mod worker_tests {
             .to_string()
             .contains("injected pipe error"));
         assert_eq!(std::fs::read(marker).unwrap(), b"done");
+    }
+
+    #[test]
+    fn writer_exits_after_eof_under_default_parallelism() {
+        for round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer = NodeWriterWorker::spawn("128", "128").unwrap();
+            let payload = Arc::new(vec![round; 8192]);
+            for file in 0..2048 {
+                writer
+                    .sender
+                    .send(NodeWriterMsg::File {
+                        path: dir
+                            .path()
+                            .join(format!("{file}.js"))
+                            .to_string_lossy()
+                            .into_owned(),
+                        data: payload.clone(),
+                        mode: 0o644,
+                    })
+                    .unwrap();
+            }
+            writer.close_input();
+            writer
+                .thread_handle
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = writer.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    writer.child.kill().unwrap();
+                    writer.child.wait().unwrap();
+                    panic!("Node writer did not exit after EOF in round {round}");
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read(dir.path().join("2047.js")).unwrap(), *payload);
+        }
     }
 }
 
