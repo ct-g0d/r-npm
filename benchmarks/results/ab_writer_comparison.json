@@ -1,0 +1,74 @@
+{
+  "benchmark": "RNPM_WRITER A/B Comparison on project-486 (warm-tarball / empty-store)",
+  "date": "2026-11-12T23:09:08+13:00",
+  "fixture": "benchmarks/fixtures/project-486",
+  "files_expected": 10298,
+  "runs": [
+    {
+      "pair": 1,
+      "writer": "node",
+      "elapsed_ms": 4656.6,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 1.32,
+      "pack_tasks_finish_wait_s": 0.13,
+      "missing_packs_total_s": 4.38
+    },
+    {
+      "pair": 1,
+      "writer": "rust",
+      "elapsed_ms": 18358.7,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 9.06,
+      "pack_tasks_finish_wait_s": 3.89,
+      "missing_packs_total_s": 17.98
+    },
+    {
+      "pair": 2,
+      "writer": "node",
+      "elapsed_ms": 5938.3,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 1.91,
+      "pack_tasks_finish_wait_s": 1.49,
+      "missing_packs_total_s": 5.49
+    },
+    {
+      "pair": 2,
+      "writer": "rust",
+      "elapsed_ms": 17971.3,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 8.88,
+      "pack_tasks_finish_wait_s": 1.22,
+      "missing_packs_total_s": 17.62
+    },
+    {
+      "pair": 3,
+      "writer": "node",
+      "elapsed_ms": 5861.5,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 2.59,
+      "pack_tasks_finish_wait_s": 0.84,
+      "missing_packs_total_s": 5.47
+    },
+    {
+      "pair": 3,
+      "writer": "rust",
+      "elapsed_ms": 18154.7,
+      "exit_code": 0,
+      "files_written": 10298,
+      "async_writer_finish_wait_s": 7.04,
+      "pack_tasks_finish_wait_s": 0.97,
+      "missing_packs_total_s": 16.32
+    }
+  ],
+  "medians": {
+    "node_ms": 5861.5,
+    "rust_ms": 18154.7,
+    "speedup_ratio_node_vs_rust": 3.1
+  },
+  "provenance_note": "Legacy worker summary without source/binary provenance or accompanying raw logs; not used as final acceptance evidence."
+}

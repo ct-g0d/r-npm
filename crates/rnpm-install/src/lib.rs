@@ -65,6 +65,20 @@ pub use save::*;
 pub mod linked;
 pub use linked::*;
 
+/// Wait for every persistence job even when an earlier job fails.
+async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> Result<()> {
+    let mut first_error = None;
+    for task in tasks {
+        let result = task.await.map_err(|e| anyhow!("pack worker panicked: {e}"));
+        if let Err(error) = result.and_then(|result| result) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Resolves the committed lockfile path for a project directory, giving `npm-shrinkwrap.json` precedence over `package-lock.json`.
 /// Returns `(lockfile_path, is_shrinkwrap)`.
 pub fn resolve_lockfile_path(project_dir: &Path) -> (PathBuf, bool) {
@@ -4529,6 +4543,7 @@ impl Installer {
             let semaphore = Arc::clone(&self.io_semaphore);
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let mut init_dirs = std::collections::HashSet::with_capacity(dirs_to_precreate.len());
             init_dirs.extend(dirs_to_precreate);
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
@@ -4541,6 +4556,7 @@ impl Installer {
                 let sem = Arc::clone(&semaphore);
                 let active_sem = Arc::clone(&active_semaphore);
                 let cpu_sem = Arc::clone(&cpu_semaphore);
+                let pack_persist_sem = Arc::clone(&pack_persist_semaphore);
                 let seen_dirs = Arc::clone(&seen_dirs);
                 let cache = self.cache.clone();
                 let registry_client = self.registry_client.clone();
@@ -4800,28 +4816,43 @@ impl Installer {
                         }
                     };
 
-                    let symlinks = decoded.symlinks;
+                    let symlinks = decoded.symlinks.clone();
                     drop(_active_permit);
-                    let pack_task = tokio::task::spawn_blocking(move || {
-                        let populate_cas = idx < 5;
-                        if !integrity_str.is_empty() {
-                            pack_store
-                                .put_package_pack_from_decoded(
-                                    &integrity_str,
-                                    &pkg_target,
-                                    &decoded.files,
-                                    populate_cas,
-                                )
-                                .map_err(|e| anyhow!("Failed to persist pack for {pkg_key} ({integrity_str}): {e}"))?;
-                        }
+                    let pack_task = tokio::task::spawn(async move {
+                        let _permit = pack_persist_sem
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| anyhow!("{e}"))?;
+                        tokio::task::spawn_blocking(move || {
+                            let _hold_permit = _permit;
+                            let populate_cas = idx < 5;
+                            if !integrity_str.is_empty() {
+                                pack_store
+                                    .put_decoded_package(
+                                        &integrity_str,
+                                        &pkg_target,
+                                        &decoded,
+                                        populate_cas,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!(
+                                            "Failed to persist pack for {pkg_key} ({integrity_str}): {e}"
+                                        )
+                                    })?;
+                            }
 
-                        if let Some((blob_bytes, sha512_hex)) = to_cache {
-                            cache
-                                .put_blob_direct(&blob_bytes, &sha512_hex)
-                                .map_err(|e| anyhow!("Failed to write cache blob for {pkg_key} ({sha512_hex}): {e}"))?;
-                        }
+                            if let Some((blob_bytes, sha512_hex)) = to_cache {
+                                cache.put_blob_direct(&blob_bytes, &sha512_hex).map_err(|e| {
+                                    anyhow!(
+                                        "Failed to write cache blob for {pkg_key} ({sha512_hex}): {e}"
+                                    )
+                                })?;
+                            }
 
-                        Ok::<(), anyhow::Error>(())
+                            Ok::<(), anyhow::Error>(())
+                        })
+                        .await
+                        .map_err(|e| anyhow!("pack worker panicked: {e}"))?
                     });
 
                     Ok(Some((idx, was_hit, symlinks, pack_task)))
@@ -4862,22 +4893,7 @@ impl Installer {
             let (pack_res, writer_res) = tokio::join!(
                 async {
                     let t_p = std::time::Instant::now();
-                    let mut first_pack_err: Option<anyhow::Error> = None;
-                    for task in all_pack_tasks {
-                        match task.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                if first_pack_err.is_none() {
-                                    first_pack_err = Some(e);
-                                }
-                            }
-                            Err(e) => {
-                                if first_pack_err.is_none() {
-                                    first_pack_err = Some(anyhow!("pack worker panicked: {e}"));
-                                }
-                            }
-                        }
-                    }
+                    let result = finish_pack_tasks(all_pack_tasks).await;
                     let p_done_ms = t_missing_start.elapsed().as_millis() as u64;
                     tm_pack_done.store(p_done_ms, std::sync::atomic::Ordering::Relaxed);
                     if timing_debug {
@@ -4886,11 +4902,7 @@ impl Installer {
                             t_p.elapsed().as_secs_f64()
                         );
                     }
-                    if let Some(err) = first_pack_err {
-                        Err(err)
-                    } else {
-                        Ok(())
-                    }
+                    result
                 },
                 async {
                     if let Some(w) = async_writer {
@@ -4908,28 +4920,28 @@ impl Installer {
                             );
                             eprintln!("[TIMING_PROFILE] missing_packs timeline:");
                             eprintln!(
-                                "  first enqueue:        {:>7} ms",
+                                "[TIMING_PROFILE]   first enqueue:        {:>7} ms",
                                 tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed)
                             );
                             eprintln!(
-                                "  last enqueue:         {:>7} ms",
+                                "[TIMING_PROFILE]   last enqueue:         {:>7} ms",
                                 tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed)
                             );
                             eprintln!(
-                                "  producer finished:    {:>7.1} ms",
+                                "[TIMING_PROFILE]   producer finished:    {:>7.1} ms",
                                 t_producer_done.as_secs_f64() * 1000.0
                             );
                             eprintln!(
-                                "  writer finished:      {:>7.1} ms",
+                                "[TIMING_PROFILE]   writer finished:      {:>7.1} ms",
                                 t_writer_done.as_secs_f64() * 1000.0
                             );
                             eprintln!(
-                                "  pack tasks finished:  {:>7} ms",
+                                "[TIMING_PROFILE]   pack tasks finished:  {:>7} ms",
                                 tm_pack_done.load(std::sync::atomic::Ordering::Relaxed)
                             );
                             eprintln!("[TIMING_PROFILE] payload counts & bytes:");
                             eprintln!(
-                                "  node_modules files:   {:>7} ({:.1} MiB)",
+                                "[TIMING_PROFILE]   node_modules files:   {:>7} ({:.1} MiB)",
                                 tm_nm_count.load(std::sync::atomic::Ordering::Relaxed),
                                 tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
                                     / 1024.0

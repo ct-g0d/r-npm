@@ -1298,6 +1298,45 @@ impl PackStore {
             .map(|p| p.index)
     }
 
+    /// Persist both regular payloads and validated link metadata from one decode.
+    pub fn put_decoded_package(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        decoded: &DecodedPackage,
+        populate_cas: bool,
+    ) -> Result<PackIndex, CacheError> {
+        let base = rnpm_fs::to_verbatim_path(pkg_target);
+        let mut input_files = Vec::with_capacity(decoded.files.len());
+        for file in &decoded.files {
+            let relative = file.path.strip_prefix(&base).map_err(|_| {
+                CacheError::InvalidPack(format!("File escapes package: {}", file.path.display()))
+            })?;
+            input_files.push(PackInputFile {
+                path: relative.to_string_lossy().replace('\\', "/"),
+                mode: file.mode,
+                data: file.data.as_slice(),
+            });
+        }
+        let mut links = Vec::with_capacity(decoded.symlinks.len());
+        for (link, target) in &decoded.symlinks {
+            let relative_link = link
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link escapes package".into()))?;
+            let relative_target = target
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link target escapes package".into()))?;
+            rnpm_fs::validate_entry_path(relative_link).map_err(CacheError::Fs)?;
+            rnpm_fs::validate_entry_path(relative_target).map_err(CacheError::Fs)?;
+            links.push((
+                relative_link.to_string_lossy().replace('\\', "/"),
+                relative_target.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, true, &links)
+            .map(|(pack, _)| pack.index)
+    }
+
     /// Builds a pack/index from decoded in-memory files and returns the serialized .pack and .idx
     /// payloads so disk writes can be offloaded asynchronously to the background file writer.
     pub fn put_package_pack_from_decoded_deferred(
@@ -1320,7 +1359,7 @@ impl PackStore {
             })
             .collect();
 
-        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, false)
+        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, false, &[])
             .map(|(p, payloads)| (p.index, payloads))
     }
 
@@ -1330,7 +1369,7 @@ impl PackStore {
         files: &[PackInputFile<'_>],
         populate_cas: bool,
     ) -> Result<PackagePack, CacheError> {
-        self.put_package_pack_with_cas_inner(integrity, files, populate_cas, true)
+        self.put_package_pack_with_cas_inner(integrity, files, populate_cas, true, &[])
             .map(|(p, _)| p)
     }
 
@@ -1340,6 +1379,7 @@ impl PackStore {
         files: &[PackInputFile<'_>],
         populate_cas: bool,
         write_files: bool,
+        links: &[(String, String)],
     ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
         let (prefix, safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
 
@@ -1481,6 +1521,8 @@ impl PackStore {
             pack_checksum,
             index_files,
         );
+
+        index.symlinks = links.to_vec();
 
         let prefix_dir = self.ensure_pack_prefix_dir(&prefix).map_err(|e| {
             CacheError::Io(std::io::Error::new(
@@ -1916,142 +1958,45 @@ impl PackStore {
         target_dir: &Path,
         pkg_key: &str,
     ) -> Result<DecodedPackage, CacheError> {
-        let reader: Box<dyn Read> = if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
-            Box::new(GzDecoder::new(tarball_bytes))
-        } else {
-            Box::new(tarball_bytes)
-        };
-        let mut archive = tar::Archive::new(reader);
-        let limits = rnpm_fs::TarLimits::default();
-        let mut files = Vec::new();
-        let mut file_indices: HashMap<PathBuf, usize> = HashMap::new();
-        let mut dirs = vec![target_dir.to_path_buf()];
-        let mut symlinks = Vec::new();
-        let mut entry_count = 0usize;
-        let mut total_uncompressed = 0u64;
-
-        for entry_res in archive.entries().map_err(CacheError::Io)? {
-            let mut entry = entry_res.map_err(CacheError::Io)?;
-            let entry_type = entry.header().entry_type();
-            if entry_type == tar::EntryType::XGlobalHeader || entry_type.as_byte() == b'g' {
-                continue;
-            }
-            if entry_type.is_block_special()
-                || entry_type.is_character_special()
-                || entry_type.is_fifo()
-            {
-                let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-                return Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenSpecialEntry {
-                    path: raw_path,
-                }));
-            }
-
-            let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-            let relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
-
-            let clean_path = relative_path.to_string_lossy().replace('\\', "/");
-            let norm_path = clean_path
-                .trim_start_matches("./")
-                .trim_start_matches('/')
-                .to_string();
-            if norm_path.is_empty() {
-                continue;
-            }
-
-            let clean_rel = if cfg!(windows) && norm_path.contains('/') {
-                norm_path.replace('/', "\\")
-            } else {
-                norm_path.clone()
-            };
-            let full_path = target_dir.join(clean_rel);
-            if let Some(parent) = full_path.parent() {
-                if parent != target_dir {
-                    dirs.push(parent.to_path_buf());
-                }
-            }
-
-            if entry_type.is_symlink() {
-                if let Some(target) = entry.link_name().map_err(CacheError::Io)? {
-                    let norm_target = rnpm_fs::strip_package_prefix(&target)
-                        .unwrap_or_else(|| target.to_path_buf());
-                    symlinks.push((full_path, target_dir.join(norm_target)));
-                }
-                continue;
-            }
-
-            if !entry_type.is_file() {
-                continue;
-            }
-
-            entry_count += 1;
-            if entry_count > limits.max_entries {
-                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                    limit_type: "entry count".to_string(),
-                    detail: format!(
-                        "Tarball exceeded maximum allowed entries: {}",
-                        limits.max_entries
-                    ),
-                }));
-            }
-
-            let entry_size = entry.header().size().unwrap_or(0);
-            if entry_size > limits.max_single_entry_size {
-                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                    limit_type: "entry size".to_string(),
-                    detail: format!(
-                        "Entry size {} exceeded single file limit of {} bytes",
-                        entry_size, limits.max_single_entry_size
-                    ),
-                }));
-            }
-
-            let mode = entry
-                .header()
-                .mode()
-                .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE);
-            let mut data = Vec::with_capacity((entry_size as usize).min(1024 * 1024));
-            let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
-            take_reader.read_to_end(&mut data).map_err(CacheError::Io)?;
-            if data.len() as u64 > limits.max_single_entry_size {
-                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                    limit_type: "entry size".to_string(),
-                    detail: format!("Entry '{}' exceeded single file limit", norm_path),
-                }));
-            }
-
-            total_uncompressed = total_uncompressed.saturating_add(data.len() as u64);
-            if total_uncompressed > limits.max_uncompressed_size {
-                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                    limit_type: "uncompressed size".to_string(),
-                    detail: format!(
-                        "Total uncompressed bytes {} exceeded limit {}",
-                        total_uncompressed, limits.max_uncompressed_size
-                    ),
-                }));
-            }
-
-            let mat_file = rnpm_fs::MaterializeFile {
-                path: full_path.clone(),
-                data: std::sync::Arc::new(data),
-                mode,
-                package_id: Some(pkg_key.to_string()),
-            };
-            if let Some(&idx) = file_indices.get(&full_path) {
-                files[idx] = mat_file;
-            } else {
-                file_indices.insert(full_path, files.len());
-                files.push(mat_file);
+        let decoded =
+            rnpm_fs::decode_tar_entries(tarball_bytes, target_dir, None, Some(pkg_key.to_string()))
+                .map_err(CacheError::Fs)?;
+        let mut files = decoded.files;
+        let mut positions: HashMap<PathBuf, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| (file.path.clone(), i))
+            .collect();
+        // Include hardlink payloads in the pack so subsequent warm installs
+        // retain them even on filesystems where linking is unavailable.
+        for (link, target) in decoded.hardlinks {
+            let source = positions.get(&target).copied().ok_or_else(|| {
+                CacheError::InvalidPack(format!("Hardlink target missing: {}", target.display()))
+            })?;
+            let mut file = files[source].clone();
+            file.path = link.clone();
+            positions.insert(link, files.len());
+            files.push(file);
+        }
+        let mut dirs = decoded.directories;
+        dirs.push(rnpm_fs::to_verbatim_path(target_dir));
+        for file in &files {
+            if let Some(parent) = file.path.parent() {
+                dirs.push(parent.to_path_buf());
             }
         }
-
+        let symlinks: Vec<_> = decoded
+            .symlinks
+            .into_iter()
+            .map(|(link, target)| {
+                if let Some(parent) = link.parent() {
+                    dirs.push(parent.to_path_buf());
+                }
+                (link, rnpm_fs::to_verbatim_path(target_dir).join(target))
+            })
+            .collect();
         dirs.sort_unstable();
         dirs.dedup();
-
         Ok(DecodedPackage {
             files,
             dirs,
@@ -3234,5 +3179,67 @@ mod tests {
             "[STARTUP_BENCH] PackStore::new (eager 256 dirs): {:.2} ms",
             eager_dur.as_secs_f64() * 1000.0
         );
+    }
+
+    #[test]
+    fn decoded_pack_preserves_relative_symlinks_and_hardlink_payloads_on_disk() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(7);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/lib/data.js", &b"payload"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        tar.append_link(&mut link, "package/lib/link.js", "data.js")
+            .unwrap();
+        let mut hardlink = tar::Header::new_gnu();
+        hardlink.set_entry_type(tar::EntryType::Link);
+        hardlink.set_size(0);
+        hardlink.set_mode(0o644);
+        tar.append_link(&mut hardlink, "package/hard.js", "package/lib/data.js")
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let target = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let decoded = PackStore::decode_package_tarball(&bytes, target.path(), "links").unwrap();
+        assert_eq!(decoded.files.len(), 2);
+        let store = PackStore::new(store_root.path()).unwrap();
+        store
+            .put_decoded_package("sha512-links", target.path(), &decoded, false)
+            .unwrap();
+        drop(store);
+        let store = PackStore::new(store_root.path()).unwrap();
+        let pack = store.get_package_pack("sha512-links").unwrap().unwrap();
+        assert_eq!(
+            pack.index.symlinks,
+            vec![("lib/link.js".to_string(), "lib/data.js".to_string())]
+        );
+        let warm = tempdir().unwrap();
+        store
+            .materialize_pack("sha512-links", warm.path(), None)
+            .unwrap();
+        assert_eq!(
+            fs::read(warm.path().join("lib/link.js")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(fs::read(warm.path().join("hard.js")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn decoded_pack_rejects_escaping_symlink() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        tar.append_link(&mut link, "package/link", "../../outside")
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let target = tempdir().unwrap();
+        assert!(PackStore::decode_package_tarball(&bytes, target.path(), "escape").is_err());
     }
 }

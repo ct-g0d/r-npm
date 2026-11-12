@@ -14,6 +14,7 @@ let inflight = 0;
 let stdinEnded = false;
 let failed = false;
 const concurrency = parseInt(process.env.RNPM_NODE_WRITER_CONCURRENCY || '96', 10);
+const maxQueue = concurrency * 2;
 
 const timing = !!process.env.RNPM_TIMING_DEBUG;
 const tStart = Date.now();
@@ -25,6 +26,26 @@ let writesCompleted = 0;
 let writtenAtStdinEnd = 0;
 let mkdirCount = 0;
 let mkdirTimeMs = 0;
+let peakQueue = 0;
+let sumQueueDelayMs = 0;
+let sumServiceTimeMs = 0;
+let maxServiceTimeMs = 0;
+
+let reading = false;
+let paused = false;
+
+// Exclusive creation avoids truncating a pre-existing hardlink or following a
+// symlink. Fresh installations pay no additional stat/unlink syscall.
+function writeItem(item, done) {
+  const options = { flag: 'wx', mode: item.m };
+  fs.writeFile(item.p, item.b, options, (err) => {
+    if (!err || err.code !== 'EEXIST') return done(err);
+    fs.unlink(item.p, (unlinkErr) => {
+      if (unlinkErr && unlinkErr.code !== 'ENOENT') return done(unlinkErr);
+      fs.writeFile(item.p, item.b, options, done);
+    });
+  });
+}
 
 function pump() {
   while (inflight < concurrency && head < q.length) {
@@ -32,7 +53,16 @@ function pump() {
     q[head] = null;
     head++;
     inflight++;
+    if (timing) {
+      sumQueueDelayMs += Date.now() - item.t;
+    }
+    const tWriteStart = timing ? Date.now() : 0;
     const onWriteDone = (err) => {
+      if (timing) {
+        const sTime = Date.now() - tWriteStart;
+        sumServiceTimeMs += sTime;
+        if (sTime > maxServiceTimeMs) maxServiceTimeMs = sTime;
+      }
       if (err) {
         if (err.code === 'ENOENT') {
           mkdirCount++;
@@ -51,12 +81,9 @@ function pump() {
             writesCompleted++;
             inflight--;
             pump();
+            checkResume();
           };
-          if (item.m === 0o644) {
-            fs.writeFile(item.p, item.b, onRetryDone);
-          } else {
-            fs.writeFile(item.p, item.b, { mode: item.m }, onRetryDone);
-          }
+          writeItem(item, onRetryDone);
           return;
         }
         console.error('NodeWriter error:', item.p, err);
@@ -65,13 +92,10 @@ function pump() {
       writesCompleted++;
       inflight--;
       pump();
+      checkResume();
     };
 
-    if (item.m === 0o644) {
-      fs.writeFile(item.p, item.b, onWriteDone);
-    } else {
-      fs.writeFile(item.p, item.b, { mode: item.m }, onWriteDone);
-    }
+    writeItem(item, onWriteDone);
   }
   if (head > 1024) {
     q.splice(0, head);
@@ -81,22 +105,40 @@ function pump() {
     if (timing) {
       const tEnd = Date.now();
       const mem = process.memoryUsage();
+      const avgQDelay = writesCompleted ? (sumQueueDelayMs / writesCompleted).toFixed(1) : 0;
+      const avgService = writesCompleted ? (sumServiceTimeMs / writesCompleted).toFixed(1) : 0;
       console.error(`[TIMING_PROFILE] node_writer stats:`);
-      console.error(`  first item received at: ${tFirstItem ? tFirstItem - tStart : 0} ms`);
-      console.error(`  stdin ended at: ${tStdinEnd ? tStdinEnd - tStart : 0} ms (written so far: ${writtenAtStdinEnd}/${totalEnqueued})`);
-      console.error(`  all writes finished at: ${tEnd - tStart} ms (${writesCompleted} files, ${(totalBytes / 1024 / 1024).toFixed(1)} MiB)`);
-      console.error(`  mkdirSync calls: ${mkdirCount}, total mkdir time: ${mkdirTimeMs.toFixed(1)} ms`);
-      console.error(`  node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
+      console.error(`[TIMING_PROFILE]   first item received at: ${tFirstItem ? tFirstItem - tStart : 0} ms`);
+      console.error(`[TIMING_PROFILE]   stdin ended at: ${tStdinEnd ? tStdinEnd - tStart : 0} ms (written so far: ${writtenAtStdinEnd}/${totalEnqueued})`);
+      console.error(`[TIMING_PROFILE]   all writes finished at: ${tEnd - tStart} ms (${writesCompleted} files, ${(totalBytes / 1024 / 1024).toFixed(1)} MiB)`);
+      console.error(`[TIMING_PROFILE]   peak queue depth: ${peakQueue}, avg queue delay: ${avgQDelay} ms`);
+      console.error(`[TIMING_PROFILE]   avg write service time: ${avgService} ms, max service time: ${maxServiceTimeMs} ms`);
+      console.error(`[TIMING_PROFILE]   mkdirSync calls: ${mkdirCount}, total mkdir time: ${mkdirTimeMs.toFixed(1)} ms`);
+      console.error(`[TIMING_PROFILE]   node_writer peak rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MiB, heap: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MiB`);
     }
     process.exit(failed ? 1 : 0);
   }
 }
 
+function checkResume() {
+  if (paused && (q.length - head) < concurrency) {
+    paused = false;
+    readChunks();
+  }
+}
+
 let hdr = null;
 
-process.stdin.on('readable', () => {
-  let count = 0;
+function readChunks() {
+  if (reading) return;
+  reading = true;
   while (true) {
+    const curQueued = q.length - head;
+    if (curQueued > peakQueue) peakQueue = curQueued;
+    if (curQueued >= maxQueue) {
+      paused = true;
+      break;
+    }
     if (!hdr) {
       const h = process.stdin.read(12);
       if (!h) break;
@@ -113,24 +155,96 @@ process.stdin.on('readable', () => {
     const b = body.subarray(hdr.pLen);
     totalEnqueued++;
     totalBytes += hdr.dLen;
-    q.push({ p, b, m: hdr.mode });
+    q.push({ p, b, m: hdr.mode, t: timing ? Date.now() : 0 });
     hdr = null;
-    count++;
-    if (count >= 32) {
-      pump();
-      count = 0;
-    }
   }
+  reading = false;
   pump();
-});
+}
+
+process.stdin.on('readable', readChunks);
 
 process.stdin.on('end', () => {
   stdinEnded = true;
   tStdinEnd = Date.now();
   writtenAtStdinEnd = writesCompleted;
-  pump();
+  if (paused) {
+    paused = false;
+    readChunks();
+  } else {
+    pump();
+  }
 });
 "#;
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_writer_drains_and_replaces_hardlink_without_touching_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let linked = dir.path().join("linked");
+        std::fs::write(&original, b"keep me").unwrap();
+        std::fs::hard_link(&original, &linked).unwrap();
+        let mut writer = NodeWriterWorker::spawn("4", "4").unwrap();
+        for i in 0..700 {
+            let path = if i == 0 {
+                linked.clone()
+            } else {
+                dir.path().join(format!("{i}.txt"))
+            };
+            writer
+                .sender
+                .send(NodeWriterMsg::File {
+                    path: path.to_string_lossy().into_owned(),
+                    data: Arc::new(i.to_string().into_bytes()),
+                    mode: 0o644,
+                })
+                .unwrap();
+        }
+        writer.close_input();
+        writer.wait().unwrap();
+        assert_eq!(std::fs::read(original).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(linked).unwrap(), b"0");
+        for i in 1..700 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("{i}.txt"))).unwrap(),
+                i.to_string().as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn pipe_error_still_waits_for_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let child = Command::new("node")
+            .args([
+                "-e",
+                "setTimeout(() => require('fs').writeFileSync(process.argv[1], 'done'), 40)",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (sender, _receiver) = sync_channel(1);
+        let worker = NodeWriterWorker {
+            child,
+            sender,
+            thread_handle: Some(thread::spawn(|| {
+                Err(std::io::Error::other("injected pipe error"))
+            })),
+        };
+        assert!(worker
+            .wait()
+            .unwrap_err()
+            .to_string()
+            .contains("injected pipe error"));
+        assert_eq!(std::fs::read(marker).unwrap(), b"done");
+    }
+}
 
 pub enum NodeWriterMsg {
     File {
@@ -210,11 +324,14 @@ impl NodeWriterWorker {
     }
 
     fn wait(mut self) -> Result<(), std::io::Error> {
-        if let Some(h) = self.thread_handle.take() {
+        // A pipe failure must not skip reaping the child process.
+        let input_result = self.thread_handle.take().map_or(Ok(()), |h| {
             h.join()
-                .map_err(|_| std::io::Error::other("NodeWriter thread panicked"))??;
-        }
-        let status = self.child.wait()?;
+                .map_err(|_| std::io::Error::other("NodeWriter thread panicked"))?
+        });
+        let status_result = self.child.wait();
+        input_result?;
+        let status = status_result?;
         if !status.success() {
             return Err(std::io::Error::other(format!(
                 "NodeWriter process exited with error status: {status:?}"
@@ -259,6 +376,17 @@ impl NodeWriter {
 
         let concurrency =
             std::env::var("RNPM_NODE_WRITER_CONCURRENCY").unwrap_or_else(|_| "128".to_string());
+        for (name, value) in [
+            ("UV_THREADPOOL_SIZE", &uv_size),
+            ("RNPM_NODE_WRITER_CONCURRENCY", &concurrency),
+        ] {
+            if !matches!(value.parse::<usize>(), Ok(n) if n > 0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer, got {value:?}"),
+                ));
+            }
+        }
 
         let mut workers: Vec<NodeWriterWorker> = Vec::with_capacity(num_workers);
         let mut senders = Vec::with_capacity(num_workers);
@@ -404,6 +532,7 @@ impl RustWriterPool {
                     for task in &batch {
                         match task {
                             WriteTask::File { path, data, mode } => {
+                                crate::tarball::unlink_target_path(path);
                                 crate::writer::write_file_fast(path, data, *mode, 65536)?;
                             }
                             WriteTask::Close => {

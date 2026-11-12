@@ -1,7 +1,7 @@
 use crate::error::FsError;
 use crate::tarball::{
-    ensure_no_symlink_ancestors, normalize_rel_path, strip_package_prefix, unlink_target_path,
-    validate_entry_path, validate_link_target, CountingReader, ExtractionSummary, TarLimits,
+    normalize_rel_path, strip_package_prefix, unlink_target_path, validate_entry_path,
+    validate_link_target, CountingReader, ExtractionSummary, TarLimits,
 };
 use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
@@ -317,11 +317,14 @@ where
                     for chunk in level_dirs.chunks(chunk_size) {
                         scope.spawn(move || {
                             for wide in chunk {
-                                let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                                let ret = unsafe {
+                                    CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut())
+                                };
                                 if ret == 0 {
                                     let err = unsafe { GetLastError() };
                                     if err != ERROR_ALREADY_EXISTS {
-                                        let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
+                                        let dir_path =
+                                            std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
                                         let _ = std::fs::create_dir_all(&dir_path);
                                     }
                                 }
@@ -824,7 +827,14 @@ pub fn materialize_files_parallel_refs<'a>(
                                     );
                                 }
                                 #[cfg(windows)]
-                                let copy_ok = cas_valid && copy_file_fast_buf(src, &file.path, &mut src_buf, &mut dst_buf).is_ok();
+                                let copy_ok = cas_valid
+                                    && copy_file_fast_buf(
+                                        src,
+                                        &file.path,
+                                        &mut src_buf,
+                                        &mut dst_buf,
+                                    )
+                                    .is_ok();
                                 #[cfg(not(windows))]
                                 let copy_ok = cas_valid && copy_file_fast(src, &file.path).is_ok();
 
@@ -1006,8 +1016,16 @@ pub fn decode_tar_entries<R: Read>(
 
     let counting_reader = CountingReader::new(reader);
     let compressed_counter = counting_reader.counter();
-    let gz = GzDecoder::new(counting_reader);
-    let mut archive = Archive::new(gz);
+    let mut buffered = std::io::BufReader::new(counting_reader);
+    let gzipped = std::io::BufRead::fill_buf(&mut buffered)
+        .map_err(FsError::Io)?
+        .starts_with(&[0x1f, 0x8b]);
+    let payload: Box<dyn Read + '_> = if gzipped {
+        Box::new(GzDecoder::new(buffered))
+    } else {
+        Box::new(buffered)
+    };
+    let mut archive = Archive::new(payload);
 
     let mut inflate_nanos = 0u64;
     let mut entry_count = 0usize;
@@ -1021,6 +1039,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
     let mut extracted_regular_files: HashSet<PathBuf> = HashSet::new();
     let mut hardlink_targets: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut safe_ancestors = HashSet::new();
 
     let mut directories = Vec::new();
     let mut files_by_path: HashMap<String, MaterializeFile> = HashMap::new();
@@ -1173,7 +1192,13 @@ pub fn decode_tar_entries<R: Read>(
         }
         let target_path = clean_target;
 
-        ensure_no_symlink_ancestors(&target_path, &verbatim_dest, &symlink_paths, &relative_path)?;
+        crate::tarball::ensure_no_symlink_ancestors_with_cache(
+            &target_path,
+            &verbatim_dest,
+            &symlink_paths,
+            &relative_path,
+            Some(&mut safe_ancestors),
+        )?;
 
         let norm_exact = relative_path
             .components()
@@ -1262,8 +1287,13 @@ pub fn decode_tar_entries<R: Read>(
             }
 
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
-                let normalized_target =
-                    strip_package_prefix(&link_target).unwrap_or_else(|| link_target.to_path_buf());
+                // Symlink targets are relative to the link's parent. Only tar
+                // hardlink targets are relative to the archive root.
+                let normalized_target = if entry_type.is_hard_link() {
+                    strip_package_prefix(&link_target).unwrap_or_else(|| link_target.to_path_buf())
+                } else {
+                    link_target.to_path_buf()
+                };
 
                 if entry_type.is_symlink() {
                     let cleaned_rel =
