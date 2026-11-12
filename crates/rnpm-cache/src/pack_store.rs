@@ -23,12 +23,12 @@ use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
 use rnpm_fs::writer::ParallelWriterConfig;
+#[cfg(windows)]
+use rnpm_fs::RawFileHandle;
 use rnpm_fs::{
     clone_or_write_pack_file, is_block_cloning_supported, is_refs_volume, is_same_volume,
     ExtractionSummary,
 };
-#[cfg(windows)]
-use rnpm_fs::RawFileHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
@@ -332,7 +332,8 @@ impl PackagePack {
                 let slice = &pack_data[start..end];
                 let t_cw = std::time::Instant::now();
                 let _ = rnpm_fs::writer::write_file_fast(&full_path, slice, entry.mode, 65536);
-                TIME_EXTRACT_CAS_WRITE.fetch_add(t_cw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                TIME_EXTRACT_CAS_WRITE
+                    .fetch_add(t_cw.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 rnpm_fs::record_file_created(entry.size);
             }
         }
@@ -599,10 +600,12 @@ pub struct PackStore {
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
     has_cas_files: Arc<std::sync::atomic::AtomicBool>,
+    created_prefixes: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl PackStore {
     /// Initialize a PackStore rooted at `root` directory.
+    /// Uses lazy on-demand creation for pack and CAS prefix directories instead of eager 256-dir loops.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
         let packs_dir = root.join("packs");
@@ -610,26 +613,39 @@ impl PackStore {
         fs::create_dir_all(root.join("tmp"))?;
         let cas_dir = root.join("cas");
         fs::create_dir_all(&cas_dir)?;
-        let mut has_cas = false;
-        for b in 0..=255u8 {
-            let hex_sub = format!("{:02x}", b);
-            let _ = fs::create_dir(packs_dir.join(&hex_sub));
-            let sub = cas_dir.join(&hex_sub);
-            if fs::create_dir(&sub).is_err() && !has_cas {
-                if let Ok(mut it) = fs::read_dir(&sub) {
-                    if it.next().is_some() {
-                        has_cas = true;
-                    }
-                }
-            }
-        }
+
+        let has_cas = if let Ok(mut it) = fs::read_dir(&cas_dir) {
+            it.next().is_some()
+        } else {
+            false
+        };
+
         Ok(Self {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
             has_cas_files: Arc::new(std::sync::atomic::AtomicBool::new(has_cas)),
+            created_prefixes: Arc::new(RwLock::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// Ensures that the prefix directory under `packs/<prefix>` exists, using memoized in-memory check.
+    pub fn ensure_pack_prefix_dir(&self, prefix: &str) -> std::io::Result<PathBuf> {
+        let prefix_dir = self.packs_dir().join(prefix);
+        {
+            if let Ok(guard) = self.created_prefixes.read() {
+                if guard.contains(prefix) {
+                    return Ok(prefix_dir);
+                }
+            }
+        }
+        let mut guard = self.created_prefixes.write().unwrap();
+        if !guard.contains(prefix) {
+            fs::create_dir_all(&prefix_dir)?;
+            guard.insert(prefix.to_string());
+        }
+        Ok(prefix_dir)
     }
 
     /// Returns the cached (size, mtime) stamp for a CAS blob if recorded.
@@ -1339,7 +1355,8 @@ impl PackStore {
         }
 
         // Deduplicate input files by lowercased path, ensuring LAST entry wins
-        let mut deduped_map: HashMap<String, PackInputFile<'_>> = HashMap::with_capacity(files.len());
+        let mut deduped_map: HashMap<String, PackInputFile<'_>> =
+            HashMap::with_capacity(files.len());
         let mut deduped_order: Vec<String> = Vec::with_capacity(files.len());
 
         for file in files {
@@ -1378,7 +1395,10 @@ impl PackStore {
             .collect();
 
         // 1. Pack construction with 4 KiB alignment
-        let total_size: usize = deduped_files.iter().map(|f| f.data.len() + PACK_ALIGNMENT).sum();
+        let total_size: usize = deduped_files
+            .iter()
+            .map(|f| f.data.len() + PACK_ALIGNMENT)
+            .sum();
         let mut pack_bytes = Vec::with_capacity(total_size);
         let mut index_files = Vec::with_capacity(deduped_files.len());
 
@@ -1462,8 +1482,15 @@ impl PackStore {
             index_files,
         );
 
-        let prefix_dir = self.packs_dir().join(&prefix);
-        let _ = fs::create_dir_all(&prefix_dir);
+        let prefix_dir = self.ensure_pack_prefix_dir(&prefix).map_err(|e| {
+            CacheError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to create pack prefix directory '{}': {e}",
+                    self.packs_dir().join(&prefix).display()
+                ),
+            ))
+        })?;
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
@@ -1498,7 +1525,6 @@ impl PackStore {
                 f_idx.flush()?;
             }
 
-            let _ = fs::create_dir_all(&prefix_dir);
             rename_atomic(&tmp_pack, &final_pack)?;
             rename_atomic(&tmp_idx, &final_idx)?;
         }
@@ -1672,7 +1698,8 @@ impl PackStore {
         let limits = rnpm_fs::TarLimits::default();
         let mut file_payloads_map: HashMap<String, (String, u32, Vec<u8>)> = HashMap::new();
         let mut file_payloads_order = Vec::new();
-        let mut saw_npmignores: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut saw_npmignores: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
         let entries = archive.entries().map_err(CacheError::Io)?;
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
@@ -1950,8 +1977,8 @@ impl PackStore {
 
             if entry_type.is_symlink() {
                 if let Some(target) = entry.link_name().map_err(CacheError::Io)? {
-                    let norm_target =
-                        rnpm_fs::strip_package_prefix(&target).unwrap_or_else(|| target.to_path_buf());
+                    let norm_target = rnpm_fs::strip_package_prefix(&target)
+                        .unwrap_or_else(|| target.to_path_buf());
                     symlinks.push((full_path, target_dir.join(norm_target)));
                 }
                 continue;
@@ -2025,7 +2052,11 @@ impl PackStore {
         dirs.sort_unstable();
         dirs.dedup();
 
-        Ok(DecodedPackage { files, dirs, symlinks })
+        Ok(DecodedPackage {
+            files,
+            dirs,
+            symlinks,
+        })
     }
 
     /// Checks whether block cloning from this store into `target_dir` is supported,
@@ -3123,8 +3154,12 @@ mod tests {
             header1.set_size(b"first version of file".len() as u64);
             header1.set_mode(0o644);
             header1.set_cksum();
-            tar.append_data(&mut header1, "package/lib/index.js", &b"first version of file"[..])
-                .unwrap();
+            tar.append_data(
+                &mut header1,
+                "package/lib/index.js",
+                &b"first version of file"[..],
+            )
+            .unwrap();
 
             let mut header2 = tar::Header::new_gnu();
             header2.set_size(b"second version of file (later wins)".len() as u64);
@@ -3141,16 +3176,63 @@ mod tests {
         }
         let tarball_bytes = enc.finish().unwrap();
         let target_dir = tempdir().unwrap();
-        let decoded = PackStore::decode_package_tarball(
-            &tarball_bytes,
-            target_dir.path(),
-            "test-dup-pkg",
-        )
-        .expect("decode_package_tarball must succeed with duplicate entries");
+        let decoded =
+            PackStore::decode_package_tarball(&tarball_bytes, target_dir.path(), "test-dup-pkg")
+                .expect("decode_package_tarball must succeed with duplicate entries");
 
         // Must be deduplicated to exactly 1 file entry, with the later content and mode winning
         assert_eq!(decoded.files.len(), 1);
-        assert_eq!(decoded.files[0].data.as_slice(), b"second version of file (later wins)");
+        assert_eq!(
+            decoded.files[0].data.as_slice(),
+            b"second version of file (later wins)"
+        );
         assert_eq!(decoded.files[0].mode, 0o755);
+    }
+
+    #[test]
+    fn test_pack_store_startup_cost_lazy_vs_eager() {
+        let dir1 = tempdir().unwrap();
+        let t_lazy_start = std::time::Instant::now();
+        let store_lazy = PackStore::new(dir1.path()).unwrap();
+        let lazy_dur = t_lazy_start.elapsed();
+
+        // Verify lazy startup does not create prefix directories up front
+        let packs_dir = store_lazy.packs_dir();
+        assert!(packs_dir.is_dir());
+        let initial_prefix_count = fs::read_dir(&packs_dir).unwrap().count();
+        assert_eq!(
+            initial_prefix_count, 0,
+            "Lazy pack store must not eagerly create prefix dirs"
+        );
+
+        // Verify ensure_pack_prefix_dir creates prefix dir on demand and memoizes
+        let p1 = store_lazy.ensure_pack_prefix_dir("ab").unwrap();
+        assert!(p1.is_dir());
+        assert_eq!(fs::read_dir(&packs_dir).unwrap().count(), 1);
+        let p2 = store_lazy.ensure_pack_prefix_dir("ab").unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(fs::read_dir(&packs_dir).unwrap().count(), 1);
+
+        let dir2 = tempdir().unwrap();
+        let t_eager_start = std::time::Instant::now();
+        let packs = dir2.path().join("packs");
+        let cas = dir2.path().join("cas");
+        fs::create_dir_all(&packs).unwrap();
+        fs::create_dir_all(&cas).unwrap();
+        for b in 0..=255u8 {
+            let hex = format!("{b:02x}");
+            let _ = fs::create_dir(packs.join(&hex));
+            let _ = fs::create_dir(cas.join(&hex));
+        }
+        let eager_dur = t_eager_start.elapsed();
+
+        eprintln!(
+            "[STARTUP_BENCH] PackStore::new (lazy memoized): {:.2} ms",
+            lazy_dur.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[STARTUP_BENCH] PackStore::new (eager 256 dirs): {:.2} ms",
+            eager_dur.as_secs_f64() * 1000.0
+        );
     }
 }

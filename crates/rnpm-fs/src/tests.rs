@@ -3535,3 +3535,49 @@ fn test_symlink_creation_after_writer_target_exists() {
     let content = std::fs::read(&link_file).unwrap();
     assert_eq!(content, b"sample target content");
 }
+
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(ref prev) = self.prev {
+            std::env::set_var(self.key, prev);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[test]
+fn test_node_writer_invalid_worker_config() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+
+    {
+        let _g = EnvVarGuard::set("RNPM_NODE_WRITER_WORKERS", "0");
+        let res = crate::node_writer::NodeWriter::spawn();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    {
+        let _g = EnvVarGuard::set("RNPM_NODE_WRITER_WORKERS", "invalid_number");
+        let res = crate::node_writer::NodeWriter::spawn();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}

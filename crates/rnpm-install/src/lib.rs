@@ -181,7 +181,11 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
     }
 }
 
-type RevalidationItem = (String, Option<String>, Option<(rnpm_cache::IndexEntry, Vec<u8>)>);
+type RevalidationItem = (
+    String,
+    Option<String>,
+    Option<(rnpm_cache::IndexEntry, Vec<u8>)>,
+);
 
 pub struct RegistryPackageProvider {
     client: RegistryClient,
@@ -204,7 +208,9 @@ fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<Package
 
     for (k, pkg) in &lf.packages {
         if k == &target_top || k.ends_with(&target_suffix) {
-            let Some(ref ver_str) = pkg.version else { continue };
+            let Some(ref ver_str) = pkg.version else {
+                continue;
+            };
             if k == &target_top {
                 top_ver = Some(ver_str.clone());
             }
@@ -611,13 +617,17 @@ impl RegistryPackageProvider {
                         &data,
                         cache_meta,
                     );
-                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                    {
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
                         self.merge_lockfile_metadata(name, &mut meta);
                         return Ok(meta);
                     }
                 }
-                Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
+                Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
+                    metadata: abbrev,
+                    etag,
+                }) => {
                     if let Ok(bytes) = serde_json::to_vec(&abbrev) {
                         let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
                         let _ = self.cache.put_packument_with_accept(
@@ -634,7 +644,8 @@ impl RegistryPackageProvider {
                 }
                 Err(err) => {
                     debug!("Failed conditional fetch for {name}: {err}. Falling back to cached packument.");
-                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
+                    if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                    {
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
                         self.merge_lockfile_metadata(name, &mut meta);
                         return Ok(meta);
@@ -667,7 +678,10 @@ impl RegistryPackageProvider {
                 .await
         });
         match res {
-            Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
+            Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
+                metadata: abbrev,
+                etag,
+            }) => {
                 if let Ok(bytes) = serde_json::to_vec(&abbrev) {
                     let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
                     let _ = self.cache.put_packument_with_accept(
@@ -694,7 +708,10 @@ impl RegistryPackageProvider {
                         return Ok(meta);
                     }
                 }
-                Err(SolverError::PackageMetadata(name.to_string(), e.to_string()))
+                Err(SolverError::PackageMetadata(
+                    name.to_string(),
+                    e.to_string(),
+                ))
             }
         }
     }
@@ -829,49 +846,48 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             .min(16);
         let chunk_size = missing.len().div_ceil(num_threads);
         type ThreadBatchResult = (Vec<(String, PackageMetadata)>, Vec<RevalidationItem>);
-        let thread_results: Vec<ThreadBatchResult> =
-            std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for chunk in missing.chunks(chunk_size.max(1)) {
-                    handles.push(s.spawn(move || {
-                        let mut local_fresh = Vec::new();
-                        let mut local_reval = Vec::new();
-                        for name in chunk {
-                            let name = name.as_str();
-                            let is_in_lockfile = self.is_package_locked(name);
+        let thread_results: Vec<ThreadBatchResult> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for chunk in missing.chunks(chunk_size.max(1)) {
+                handles.push(s.spawn(move || {
+                    let mut local_fresh = Vec::new();
+                    let mut local_reval = Vec::new();
+                    for name in chunk {
+                        let name = name.as_str();
+                        let is_in_lockfile = self.is_package_locked(name);
 
-                            if let Some((entry, data)) = self.get_cached_packument(name) {
-                                if let Ok(abbrev) =
-                                    serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                        if let Some((entry, data)) = self.get_cached_packument(name) {
+                            if let Ok(abbrev) =
+                                serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
+                            {
+                                let mut meta = abbreviated_to_package_metadata(&abbrev);
+                                self.merge_lockfile_metadata(name, &mut meta);
+                                if is_in_lockfile
+                                    || is_packument_fresh(&entry, self.prefer_offline, false)
                                 {
-                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
-                                    self.merge_lockfile_metadata(name, &mut meta);
-                                    if is_in_lockfile
-                                        || is_packument_fresh(&entry, self.prefer_offline, false)
-                                    {
-                                        local_fresh.push((name.to_string(), meta));
-                                        continue;
-                                    }
+                                    local_fresh.push((name.to_string(), meta));
+                                    continue;
                                 }
-                                let stored_etag = extract_stored_etag(entry.metadata.as_ref());
-                                local_reval.push((name.to_string(), stored_etag, Some((entry, data))));
-                            } else if is_in_lockfile {
-                                if let Some(ref lf) = self.lockfile {
-                                    if let Some(meta) = package_metadata_from_lockfile(name, lf) {
-                                        local_fresh.push((name.to_string(), meta));
-                                        continue;
-                                    }
-                                }
-                                local_reval.push((name.to_string(), None, None));
-                            } else {
-                                local_reval.push((name.to_string(), None, None));
                             }
+                            let stored_etag = extract_stored_etag(entry.metadata.as_ref());
+                            local_reval.push((name.to_string(), stored_etag, Some((entry, data))));
+                        } else if is_in_lockfile {
+                            if let Some(ref lf) = self.lockfile {
+                                if let Some(meta) = package_metadata_from_lockfile(name, lf) {
+                                    local_fresh.push((name.to_string(), meta));
+                                    continue;
+                                }
+                            }
+                            local_reval.push((name.to_string(), None, None));
+                        } else {
+                            local_reval.push((name.to_string(), None, None));
                         }
-                        (local_fresh, local_reval)
-                    }));
-                }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+                    }
+                    (local_fresh, local_reval)
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         let mut fresh_metas = Vec::new();
         let mut to_revalidate: Vec<RevalidationItem> = Vec::new();
@@ -901,7 +917,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 .iter()
                 .map(|(n, etag, _)| (n.clone(), etag.clone()))
                 .collect();
-            let results = client_c.get_package_metadata_conditional_concurrent(&req_pkgs).await;
+            let results = client_c
+                .get_package_metadata_conditional_concurrent(&req_pkgs)
+                .await;
             for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
                 let reg_url = client_c.registry_for_package(&name).as_str().to_string();
                 match res {
@@ -916,10 +934,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                                 data,
                                 cache_meta,
                             );
-                            if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(data) {
+                            if let Ok(abbrev) =
+                                serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
+                            {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 if let Some(ref lf) = lockfile_c {
-                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
+                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf)
+                                    {
                                         for (v, vm) in lf_meta.versions {
                                             meta.versions.entry(v).or_insert(vm);
                                         }
@@ -931,7 +952,10 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             }
                         }
                     }
-                    Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata: abbrev, etag }) => {
+                    Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
+                        metadata: abbrev,
+                        etag,
+                    }) => {
                         if let Ok(bytes) = serde_json::to_vec(&abbrev) {
                             let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
                             let _ = cache_c.put_packument_with_accept(
@@ -957,10 +981,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     Err(err) => {
                         debug!("Conditional fetch error for {name}: {err}");
                         if let Some((_, ref data)) = cached_info {
-                            if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(data) {
+                            if let Ok(abbrev) =
+                                serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
+                            {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 if let Some(ref lf) = lockfile_c {
-                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
+                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf)
+                                    {
                                         for (v, vm) in lf_meta.versions {
                                             meta.versions.entry(v).or_insert(vm);
                                         }
@@ -1788,7 +1815,11 @@ impl Installer {
                     }
                 }
                 PackageTarget::Url(u) => {
-                    if let Ok(bytes) = self.registry_client.download_tarball_bytes(u.as_str()).await {
+                    if let Ok(bytes) = self
+                        .registry_client
+                        .download_tarball_bytes(u.as_str())
+                        .await
+                    {
                         if let Ok(m) = inspect_manifest_from_tarball(&bytes) {
                             if let Some(ref real_name) = m.name {
                                 spec.name = real_name.clone();
@@ -2928,28 +2959,32 @@ impl Installer {
             let load_success = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(num_workers);
                 for _ in 0..num_workers {
-                    handles.push(scope.spawn(|| -> Result<Vec<(usize, String, PathBuf, rnpm_cache::PackagePack)>, ()> {
-                        let mut local = Vec::new();
-                        while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                            let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if idx >= total_pkgs {
-                                break;
-                            }
-                            let (loc, node) = &packages_to_download[idx];
-                            let integrity_str = node.integrity.as_ref().unwrap();
-                            let pkg_target = loc_base_dir.join(loc);
-                            match pack_store.get_package_pack(integrity_str) {
-                                Ok(Some(pack)) => {
-                                    local.push((idx, loc.clone(), pkg_target, pack));
+                    handles.push(scope.spawn(
+                        || -> Result<Vec<(usize, String, PathBuf, rnpm_cache::PackagePack)>, ()> {
+                            let mut local = Vec::new();
+                            while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                let idx =
+                                    next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if idx >= total_pkgs {
+                                    break;
                                 }
-                                _ => {
-                                    load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return Err(());
+                                let (loc, node) = &packages_to_download[idx];
+                                let integrity_str = node.integrity.as_ref().unwrap();
+                                let pkg_target = loc_base_dir.join(loc);
+                                match pack_store.get_package_pack(integrity_str) {
+                                    Ok(Some(pack)) => {
+                                        local.push((idx, loc.clone(), pkg_target, pack));
+                                    }
+                                    _ => {
+                                        load_failed
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        return Err(());
+                                    }
                                 }
                             }
-                        }
-                        Ok(local)
-                    }));
+                            Ok(local)
+                        },
+                    ));
                 }
 
                 let mut all_results = Vec::with_capacity(total_pkgs);
@@ -3005,7 +3040,8 @@ impl Installer {
                 if files_valid {
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                     if precreate_directories(dir_refs).is_ok()
-                        && rnpm_fs::materialize_files_parallel_refs(all_file_refs, &writer_cfg).is_ok()
+                        && rnpm_fs::materialize_files_parallel_refs(all_file_refs, &writer_cfg)
+                            .is_ok()
                     {
                         for (link_path, target_path) in all_symlinks {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
@@ -3017,16 +3053,21 @@ impl Installer {
                             if let Some(slice) = pack.get_file_slice("package.json") {
                                 if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
                                     in_memory_manifests.insert(loc.clone(), pkg_manifest.clone());
-                                    let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
-                                        || pkg_manifest.scripts.contains_key("install")
-                                        || pkg_manifest.scripts.contains_key("postinstall");
+                                    let has_install_script =
+                                        pkg_manifest.scripts.contains_key("preinstall")
+                                            || pkg_manifest.scripts.contains_key("install")
+                                            || pkg_manifest.scripts.contains_key("postinstall");
                                     if has_install_script {
                                         lifecycle_nodes.push(LifecyclePackageNode {
                                             package_path: loc.clone(),
                                             disk_path: pkg_target.clone(),
                                             manifest: pkg_manifest,
                                             source: PackageSource::Registry,
-                                            dependencies: node.dependencies.keys().cloned().collect(),
+                                            dependencies: node
+                                                .dependencies
+                                                .keys()
+                                                .cloned()
+                                                .collect(),
                                             optional: node.flags.optional,
                                         });
                                     }
@@ -3407,24 +3448,25 @@ impl Installer {
                     lifecycle_node,
                 )))
             });
-        }
+            }
 
-        while let Some(join_res) = join_set.join_next().await {
-            let item_opt = join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
-            if let Some((was_hit, lifecycle_node)) = item_opt {
-                if was_hit {
-                    cache_hits += 1;
-                    collector.record_cache_hit();
-                } else {
-                    cache_misses += 1;
-                    collector.record_cache_miss();
-                }
-                packages_installed += 1;
-                if let Some(l_node) = lifecycle_node {
-                    lifecycle_nodes.push(l_node);
+            while let Some(join_res) = join_set.join_next().await {
+                let item_opt =
+                    join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
+                if let Some((was_hit, lifecycle_node)) = item_opt {
+                    if was_hit {
+                        cache_hits += 1;
+                        collector.record_cache_hit();
+                    } else {
+                        cache_misses += 1;
+                        collector.record_cache_miss();
+                    }
+                    packages_installed += 1;
+                    if let Some(l_node) = lifecycle_node {
+                        lifecycle_nodes.push(l_node);
+                    }
                 }
             }
-        }
         }
 
         // Fill CAS by copying from node_modules on 16 threads for cold installs
@@ -3544,7 +3586,11 @@ impl Installer {
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         if !self.options.no_save && self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
-            crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, &self.options.project_dir, Some(&in_memory_manifests));
+            crate::fast_path::enrich_lockfile_from_installed_manifests(
+                &mut lockfile,
+                &self.options.project_dir,
+                Some(&in_memory_manifests),
+            );
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if !self.options.is_global {
@@ -3933,7 +3979,7 @@ impl Installer {
         std::fs::create_dir_all(&node_modules_dir)?;
         std::fs::create_dir_all(&bin_dir)?;
 
-       // Pre-create all package parent directories and bin directories in one breadth-first pass
+        // Pre-create all package parent directories and bin directories in one breadth-first pass
         {
             let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
             for (pkg_key, pkg_info) in &lockfile.packages {
@@ -3985,7 +4031,7 @@ impl Installer {
                 warn!("precreate_directories warning: {e}");
             }
         }
-       drop(_plan2_span);
+        drop(_plan2_span);
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
 
         if self.options.install_strategy == InstallStrategy::Linked {
@@ -4435,9 +4481,17 @@ impl Installer {
             .filter(|(_, (_, _, integrity_str, _, _, _))| {
                 !integrity_str.is_empty() && !self.pack_store.has_package_pack(integrity_str)
             })
-            .map(|(i, (pkg_key, resolved_url, integrity_str, is_optional, _, _))| {
-                (i, pkg_key.clone(), resolved_url.clone(), integrity_str.clone(), *is_optional)
-            })
+            .map(
+                |(i, (pkg_key, resolved_url, integrity_str, is_optional, _, _))| {
+                    (
+                        i,
+                        pkg_key.clone(),
+                        resolved_url.clone(),
+                        integrity_str.clone(),
+                        *is_optional,
+                    )
+                },
+            )
             .collect();
 
         let mut missing_pack_results: HashMap<usize, bool> = HashMap::new();
@@ -4677,22 +4731,27 @@ impl Installer {
                                 .map_err(|e| anyhow!("{e}"))?;
 
                             for d in &decoded.dirs {
-                                let exists = {
+                                let already_created = {
                                     let guard = seen_dirs.read().unwrap();
                                     guard.contains(d)
                                 };
-                                if !exists {
+                                if !already_created {
+                                    // Safely create directory without holding the global lock during I/O
+                                    std::fs::create_dir_all(d)
+                                        .map_err(|e| anyhow!("Failed to create directory '{}': {e}", d.display()))?;
+
+                                    // Mark as created only after successful create_dir_all
                                     let mut guard = seen_dirs.write().unwrap();
-                                    if guard.insert(d.clone()) {
-                                        let _ = std::fs::create_dir_all(d);
-                                        let mut curr = d.as_path();
-                                        while let Some(parent) = curr.parent() {
-                                            if parent == project_dir || parent.as_os_str().is_empty() {
-                                                break;
-                                            }
-                                            guard.insert(parent.to_path_buf());
-                                            curr = parent;
+                                    guard.insert(d.clone());
+                                    let mut curr = d.as_path();
+                                    while let Some(parent) = curr.parent() {
+                                        if parent == project_dir || parent.as_os_str().is_empty() {
+                                            break;
                                         }
+                                        if !guard.insert(parent.to_path_buf()) {
+                                            break;
+                                        }
+                                        curr = parent;
                                     }
                                 }
                             }
@@ -4712,9 +4771,14 @@ impl Installer {
                                         .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
                                         .map_err(|e| anyhow!("{e}"))?;
                                 }
+                                if timing_debug {
+                                    let now_ms = t_missing_start.elapsed().as_millis() as u64;
+                                    tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                }
                             } else {
                                 for file in &decoded.files {
-                                    let _ = rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536);
+                                    rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536)
+                                        .map_err(|e| anyhow!("Failed to write file '{}': {e}", file.path.display()))?;
                                 }
                             }
 
@@ -4741,16 +4805,20 @@ impl Installer {
                     let pack_task = tokio::task::spawn_blocking(move || {
                         let populate_cas = idx < 5;
                         if !integrity_str.is_empty() {
-                            let _ = pack_store.put_package_pack_from_decoded(
-                                &integrity_str,
-                                &pkg_target,
-                                &decoded.files,
-                                populate_cas,
-                            );
+                            pack_store
+                                .put_package_pack_from_decoded(
+                                    &integrity_str,
+                                    &pkg_target,
+                                    &decoded.files,
+                                    populate_cas,
+                                )
+                                .map_err(|e| anyhow!("Failed to persist pack for {pkg_key} ({integrity_str}): {e}"))?;
                         }
 
                         if let Some((blob_bytes, sha512_hex)) = to_cache {
-                            let _ = cache.put_blob_direct(&blob_bytes, &sha512_hex);
+                            cache
+                                .put_blob_direct(&blob_bytes, &sha512_hex)
+                                .map_err(|e| anyhow!("Failed to write cache blob for {pkg_key} ({sha512_hex}): {e}"))?;
                         }
 
                         Ok::<(), anyhow::Error>(())
@@ -4762,13 +4830,26 @@ impl Installer {
 
             let mut all_pending_symlinks = Vec::new();
             let mut all_pack_tasks = Vec::new();
+            let mut first_producer_err: Option<anyhow::Error> = None;
             while let Some(join_res) = join_set.join_next().await {
-                let item_opt =
-                    join_res.map_err(|e| anyhow!("CI tarball fetch worker panicked: {e}"))??;
-                if let Some((idx, was_hit, symlinks, pack_task)) = item_opt {
-                    missing_pack_results.insert(idx, was_hit);
-                    all_pending_symlinks.extend(symlinks);
-                    all_pack_tasks.push(pack_task);
+                match join_res {
+                    Ok(Ok(Some((idx, was_hit, symlinks, pack_task)))) => {
+                        missing_pack_results.insert(idx, was_hit);
+                        all_pending_symlinks.extend(symlinks);
+                        all_pack_tasks.push(pack_task);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        if first_producer_err.is_none() {
+                            first_producer_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if first_producer_err.is_none() {
+                            first_producer_err =
+                                Some(anyhow!("CI tarball fetch worker panicked: {e}"));
+                        }
+                    }
                 }
             }
             let t_producer_done = t_missing_start.elapsed();
@@ -4777,12 +4858,39 @@ impl Installer {
                 w.close_input();
             }
 
+            let tm_pack_done = std::sync::atomic::AtomicU64::new(0);
             let (pack_res, writer_res) = tokio::join!(
                 async {
+                    let t_p = std::time::Instant::now();
+                    let mut first_pack_err: Option<anyhow::Error> = None;
                     for task in all_pack_tasks {
-                        task.await.map_err(|e| anyhow!("pack worker panicked: {e}"))??;
+                        match task.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                if first_pack_err.is_none() {
+                                    first_pack_err = Some(e);
+                                }
+                            }
+                            Err(e) => {
+                                if first_pack_err.is_none() {
+                                    first_pack_err = Some(anyhow!("pack worker panicked: {e}"));
+                                }
+                            }
+                        }
                     }
-                    Ok::<(), anyhow::Error>(())
+                    let p_done_ms = t_missing_start.elapsed().as_millis() as u64;
+                    tm_pack_done.store(p_done_ms, std::sync::atomic::Ordering::Relaxed);
+                    if timing_debug {
+                        eprintln!(
+                            "[TIMING_PROFILE] pack tasks finish wait: {:.2}s",
+                            t_p.elapsed().as_secs_f64()
+                        );
+                    }
+                    if let Some(err) = first_pack_err {
+                        Err(err)
+                    } else {
+                        Ok(())
+                    }
                 },
                 async {
                     if let Some(w) = async_writer {
@@ -4794,19 +4902,47 @@ impl Installer {
                         .map_err(|e| anyhow!("AsyncFileWriter panicked: {e}"))??;
                         let t_writer_done = t_missing_start.elapsed();
                         if timing_debug {
-                            eprintln!("[TIMING_PROFILE] async_writer finish wait: {:.2}s", t_w.elapsed().as_secs_f64());
+                            eprintln!(
+                                "[TIMING_PROFILE] async_writer finish wait: {:.2}s",
+                                t_w.elapsed().as_secs_f64()
+                            );
                             eprintln!("[TIMING_PROFILE] missing_packs timeline:");
-                            eprintln!("  first enqueue:        {:>7} ms", tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed));
-                            eprintln!("  last enqueue:         {:>7} ms", tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed));
-                            eprintln!("  producer finished:    {:>7.1} ms", t_producer_done.as_secs_f64() * 1000.0);
-                            eprintln!("  writer finished:      {:>7.1} ms", t_writer_done.as_secs_f64() * 1000.0);
+                            eprintln!(
+                                "  first enqueue:        {:>7} ms",
+                                tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed)
+                            );
+                            eprintln!(
+                                "  last enqueue:         {:>7} ms",
+                                tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed)
+                            );
+                            eprintln!(
+                                "  producer finished:    {:>7.1} ms",
+                                t_producer_done.as_secs_f64() * 1000.0
+                            );
+                            eprintln!(
+                                "  writer finished:      {:>7.1} ms",
+                                t_writer_done.as_secs_f64() * 1000.0
+                            );
+                            eprintln!(
+                                "  pack tasks finished:  {:>7} ms",
+                                tm_pack_done.load(std::sync::atomic::Ordering::Relaxed)
+                            );
                             eprintln!("[TIMING_PROFILE] payload counts & bytes:");
-                            eprintln!("  node_modules files:   {:>7} ({:.1} MiB)", tm_nm_count.load(std::sync::atomic::Ordering::Relaxed), tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0 / 1024.0);
+                            eprintln!(
+                                "  node_modules files:   {:>7} ({:.1} MiB)",
+                                tm_nm_count.load(std::sync::atomic::Ordering::Relaxed),
+                                tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
+                                    / 1024.0
+                                    / 1024.0
+                            );
                         }
                     }
                     Ok::<(), anyhow::Error>(())
                 }
             );
+            if let Some(err) = first_producer_err {
+                return Err(err);
+            }
             pack_res?;
             writer_res?;
 
@@ -4821,7 +4957,10 @@ impl Installer {
             }
 
             if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                eprintln!("[TIMING_PROFILE] total missing_packs: {:.2}s", t_missing_start.elapsed().as_secs_f64());
+                eprintln!(
+                    "[TIMING_PROFILE] total missing_packs: {:.2}s",
+                    t_missing_start.elapsed().as_secs_f64()
+                );
             }
 
             if missing_pack_results.len() < missing_packs.len() {
@@ -4908,8 +5047,11 @@ impl Installer {
                 }
             }
 
-            let (loaded_packs, mut load_success) =
-                crate::fast_path::parallel_load_packs(&self.pack_store, &loc_base_dir, &packages_to_process);
+            let (loaded_packs, mut load_success) = crate::fast_path::parallel_load_packs(
+                &self.pack_store,
+                &loc_base_dir,
+                &packages_to_process,
+            );
 
             if load_success {
                 let t_refs = std::time::Instant::now();
@@ -4962,11 +5104,16 @@ impl Installer {
                         } else {
                             target_rel.clone()
                         };
-                        all_symlinks.push((pkg_target.join(clean_link), pkg_target.join(clean_target)));
+                        all_symlinks
+                            .push((pkg_target.join(clean_link), pkg_target.join(clean_target)));
                     }
                 }
                 if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                    eprintln!("[TIMING_PROFILE] all_file_refs: {:.2}s ({} files)", t_refs.elapsed().as_secs_f64(), all_file_refs.len());
+                    eprintln!(
+                        "[TIMING_PROFILE] all_file_refs: {:.2}s ({} files)",
+                        t_refs.elapsed().as_secs_f64(),
+                        all_file_refs.len()
+                    );
                 }
 
                 if load_success {
@@ -4979,69 +5126,76 @@ impl Installer {
                         precreate_directories(dir_refs)
                             .map_err(|e| anyhow!("Failed to precreate directories: {e}"))?;
                         if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                            eprintln!("[TIMING_PROFILE] precreate_directories: {:.2}s", t_dirs.elapsed().as_secs_f64());
+                            eprintln!(
+                                "[TIMING_PROFILE] precreate_directories: {:.2}s",
+                                t_dirs.elapsed().as_secs_f64()
+                            );
                         }
 
-                    // Prepare bin linking and hidden lockfile data to overlap with materialize
-                    let ci_tree_packages: Vec<String> = lockfile
-                        .packages
-                        .keys()
-                        .filter(|k| {
-                            if k.is_empty() {
-                                return false;
-                            }
-                            if platform_skipped_packages.contains(*k) {
-                                return false;
-                            }
-                            if let Some(info) = lockfile.packages.get(*k) {
-                                if info.link == Some(true) {
-                                    return true;
+                        // Prepare bin linking and hidden lockfile data to overlap with materialize
+                        let ci_tree_packages: Vec<String> = lockfile
+                            .packages
+                            .keys()
+                            .filter(|k| {
+                                if k.is_empty() {
+                                    return false;
                                 }
-                            }
-                            k.starts_with("node_modules/")
-                        })
-                        .cloned()
-                        .collect();
+                                if platform_skipped_packages.contains(*k) {
+                                    return false;
+                                }
+                                if let Some(info) = lockfile.packages.get(*k) {
+                                    if info.link == Some(true) {
+                                        return true;
+                                    }
+                                }
+                                k.starts_with("node_modules/")
+                            })
+                            .cloned()
+                            .collect();
 
-                    let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
-                    let save_hidden_needed = self.options.package_lock_enabled() && !self.options.dry_run;
-                    let project_dir_ref = &self.options.project_dir;
-                    let lockfile_ref = &lockfile;
-                    let loc_base_ref = &loc_base_dir;
-                    let bin_dir_ref = &bin_dir;
-                    let nm_dir_ref = &node_modules_dir;
+                        let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
+                        let save_hidden_needed =
+                            self.options.package_lock_enabled() && !self.options.dry_run;
+                        let project_dir_ref = &self.options.project_dir;
+                        let lockfile_ref = &lockfile;
+                        let loc_base_ref = &loc_base_dir;
+                        let bin_dir_ref = &bin_dir;
+                        let nm_dir_ref = &node_modules_dir;
 
-                    // Overlap materialize tail with bin link phase
-                    let (bin_time, mat_res) = std::thread::scope(|s| {
-                        let bin_handle = s.spawn(|| {
-                            let t_start = std::time::Instant::now();
-                            link_tree_bins(
-                                ci_tree_packages,
-                                Some(&known_bins),
-                                loc_base_ref,
-                                bin_dir_ref,
-                                nm_dir_ref,
-                                true,
-                                None,
+                        // Overlap materialize tail with bin link phase
+                        let (bin_time, mat_res) = std::thread::scope(|s| {
+                            let bin_handle = s.spawn(|| {
+                                let t_start = std::time::Instant::now();
+                                link_tree_bins(
+                                    ci_tree_packages,
+                                    Some(&known_bins),
+                                    loc_base_ref,
+                                    bin_dir_ref,
+                                    nm_dir_ref,
+                                    true,
+                                    None,
+                                );
+                                t_start.elapsed()
+                            });
+
+                            let mat_res = rnpm_fs::materialize_files_parallel_refs(
+                                all_file_refs,
+                                &ci_writer_cfg,
                             );
-                            t_start.elapsed()
+                            let bin_time = bin_handle.join().unwrap_or_default();
+
+                            (bin_time, mat_res)
                         });
 
-                        let mat_res = rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg);
-                        let bin_time = bin_handle.join().unwrap_or_default();
+                        mat_res.map_err(|e| anyhow!("{e}"))?;
+                        collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                        collector.record_phase(Phase::Bins, bin_time);
 
-                        (bin_time, mat_res)
-                    });
-
-                    mat_res.map_err(|e| anyhow!("{e}"))?;
-                    collector.record_phase(Phase::Materialize, t_mat.elapsed());
-                    collector.record_phase(Phase::Bins, bin_time);
-
-                    if save_hidden_needed {
-                        let t_lock = std::time::Instant::now();
-                        let _ = lockfile_ref.save_hidden(project_dir_ref);
-                        collector.record_phase(Phase::Lockfile, t_lock.elapsed());
-                    }
+                        if save_hidden_needed {
+                            let t_lock = std::time::Instant::now();
+                            let _ = lockfile_ref.save_hidden(project_dir_ref);
+                            collector.record_phase(Phase::Lockfile, t_lock.elapsed());
+                        }
 
                         // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                         for (link_path, target_path) in all_symlinks {
@@ -5452,7 +5606,7 @@ impl Installer {
             }
         }
 
-       if !used_fast_path {
+        if !used_fast_path {
             // Link all package bins across the tree in shallowest-first order with first-writer-wins
             // per .bin directory in this run, overwriting shims and cleaning up stale ones.
             let ci_tree_packages: Vec<String> = lockfile
@@ -5477,6 +5631,7 @@ impl Installer {
 
             let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
 
+            let t_bin_link = std::time::Instant::now();
             link_tree_bins(
                 ci_tree_packages,
                 Some(&known_bins),
@@ -5486,6 +5641,12 @@ impl Installer {
                 true,
                 Some(&collector),
             );
+            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                eprintln!(
+                    "[TIMING_PROFILE] bin link finished: {:.1} ms",
+                    t_bin_link.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         // Execute lifecycle scripts bottom-up followed by root hooks
         if !self.options.ignore_scripts {
@@ -5509,7 +5670,11 @@ impl Installer {
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
-        if !used_fast_path && self.options.package_lock_enabled() && !self.options.dry_run && has_packages {
+        if !used_fast_path
+            && self.options.package_lock_enabled()
+            && !self.options.dry_run
+            && has_packages
+        {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
@@ -5582,9 +5747,11 @@ impl Installer {
         let mut full_packument_cache: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
-        let npm_cacache_path = std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|l| std::path::PathBuf::from(l).join("npm-cache").join("_cacache"));
+        let npm_cacache_path = std::env::var("LOCALAPPDATA").ok().map(|l| {
+            std::path::PathBuf::from(l)
+                .join("npm-cache")
+                .join("_cacache")
+        });
         let npm_cacache = npm_cacache_path
             .as_ref()
             .filter(|p| p.exists())
@@ -5675,7 +5842,9 @@ impl Installer {
                     if package.license.is_none() {
                         if let Some(lic) = ver_val.get("license").and_then(|l| l.as_str()) {
                             package.license = Some(lic.to_string());
-                        } else if let Some(lic_obj) = ver_val.get("license").and_then(|l| l.as_object()) {
+                        } else if let Some(lic_obj) =
+                            ver_val.get("license").and_then(|l| l.as_object())
+                        {
                             if let Some(t) = lic_obj.get("type").and_then(|t| t.as_str()) {
                                 package.license = Some(t.to_string());
                             }
@@ -5834,9 +6003,7 @@ impl Installer {
                 };
 
                 if meta.is_none() {
-                    if let Ok(reg_abbrev) =
-                        self.registry_client.get_package_metadata(name).await
-                    {
+                    if let Ok(reg_abbrev) = self.registry_client.get_package_metadata(name).await {
                         meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                     }
                 }
@@ -6044,7 +6211,10 @@ impl Installer {
                     }
                 }
                 PackageTarget::Url(ref url) => {
-                    let archive_bytes_res = self.registry_client.download_tarball_bytes(url.as_str()).await;
+                    let archive_bytes_res = self
+                        .registry_client
+                        .download_tarball_bytes(url.as_str())
+                        .await;
                     let (m, integrity) = if let Ok(archive_bytes) = archive_bytes_res {
                         let integrity = Integrity::from_bytes(
                             &archive_bytes,

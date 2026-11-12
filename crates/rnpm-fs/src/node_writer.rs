@@ -234,23 +234,47 @@ pub struct NodeWriter {
 impl NodeWriter {
     /// Spawns background Node.js worker process(es) and begins listening for file write commands.
     pub fn spawn() -> Result<Self, std::io::Error> {
-        let num_workers: usize = std::env::var("RNPM_NODE_WRITER_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+        let num_workers: usize = match std::env::var("RNPM_NODE_WRITER_WORKERS") {
+            Ok(v) => match v.parse::<usize>() {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "RNPM_NODE_WRITER_WORKERS must be greater than 0",
+                    ));
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid RNPM_NODE_WRITER_WORKERS value: {v}"),
+                    ));
+                }
+            },
+            Err(_) => 1,
+        };
 
         let uv_size = std::env::var("UV_THREADPOOL_SIZE")
             .or_else(|_| std::env::var("RNPM_UV_THREADPOOL_SIZE"))
             .unwrap_or_else(|_| "128".to_string());
 
-        let concurrency = std::env::var("RNPM_NODE_WRITER_CONCURRENCY")
-            .unwrap_or_else(|_| "128".to_string());
+        let concurrency =
+            std::env::var("RNPM_NODE_WRITER_CONCURRENCY").unwrap_or_else(|_| "128".to_string());
 
-        let mut workers = Vec::with_capacity(num_workers);
+        let mut workers: Vec<NodeWriterWorker> = Vec::with_capacity(num_workers);
         let mut senders = Vec::with_capacity(num_workers);
 
         for _ in 0..num_workers {
-            let worker = NodeWriterWorker::spawn(&uv_size, &concurrency)?;
+            let worker = match NodeWriterWorker::spawn(&uv_size, &concurrency) {
+                Ok(w) => w,
+                Err(e) => {
+                    // Clean up any already spawned workers before returning
+                    for mut w in workers {
+                        w.close_input();
+                        let _ = w.wait();
+                    }
+                    return Err(e);
+                }
+            };
             senders.push(worker.sender.clone());
             workers.push(worker);
         }
@@ -278,11 +302,21 @@ impl NodeWriter {
     }
 
     /// Waits for Node.js worker(s) to finish writing all files to disk and exit.
+    /// Ensures that all workers are waited/joined even if one fails.
     pub fn wait(self) -> Result<(), std::io::Error> {
+        let mut first_err = None;
         for worker in self.workers {
-            worker.wait()?;
+            if let Err(e) = worker.wait() {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// Flushes all pending writes, waits for Node.js to finish writing all files to disk, and exits.
@@ -301,7 +335,10 @@ pub struct NodeWriterSender {
 
 impl NodeWriterSender {
     pub fn send(&self, msg: NodeWriterMsg) -> Result<(), std::io::Error> {
-        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        let idx = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.senders.len();
         self.senders[idx]
             .send(msg)
             .map_err(|e| std::io::Error::other(format!("NodeWriter disconnected: {e}")))
@@ -338,7 +375,9 @@ impl RustWriterPool {
                 loop {
                     batch.clear();
                     {
-                        let Ok(guard) = rx.lock() else { break; };
+                        let Ok(guard) = rx.lock() else {
+                            break;
+                        };
                         match guard.recv() {
                             Ok(task) => {
                                 let is_close = matches!(task, WriteTask::Close);
@@ -403,11 +442,27 @@ impl RustWriterPool {
 
     /// Waits for all worker threads to finish.
     pub fn wait(mut self) -> Result<(), std::io::Error> {
+        let mut first_err = None;
         for h in self.handles.drain(..) {
-            h.join()
-                .map_err(|_| std::io::Error::other("RustWriterPool worker panicked"))??;
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(std::io::Error::other("RustWriterPool worker panicked"));
+                    }
+                }
+            }
         }
-        Ok(())
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// Sends close sentinels to all worker threads and joins them.
@@ -432,7 +487,12 @@ impl AsyncFileWriterSender {
     }
 
     /// Sends a file write task with pre-shared Arc<Vec<u8>> to avoid buffer copies.
-    pub fn send_arc(&self, path: PathBuf, data: Arc<Vec<u8>>, mode: u32) -> Result<(), std::io::Error> {
+    pub fn send_arc(
+        &self,
+        path: PathBuf,
+        data: Arc<Vec<u8>>,
+        mode: u32,
+    ) -> Result<(), std::io::Error> {
         match self {
             Self::Node(s) => {
                 let path_str = path.to_string_lossy().to_string();
@@ -468,7 +528,8 @@ impl AsyncFileWriter {
         match NodeWriter::spawn() {
             Ok(nw) => Ok(Self::Node(nw)),
             Err(e) => {
-                if pref.eq_ignore_ascii_case("node") {
+                if e.kind() == std::io::ErrorKind::InvalidInput || pref.eq_ignore_ascii_case("node")
+                {
                     return Err(e);
                 }
                 // Fall back to dedicated Rust thread pool
