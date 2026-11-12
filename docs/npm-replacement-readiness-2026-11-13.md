@@ -4,18 +4,26 @@ rnpm is suitable for controlled trials on projects whose workflows have been com
 
 ## Measured lane four result
 
-Implementation: `61a631ae65d8788bdd0ca38140d6c7035a0c1431`. Release binary SHA-256: `1f6c0836de5dd5a47e04c6bcc11660d791ab761dbebc5dd3c65aee6230b02631`. Node v26.13.0, npm 11.20.0, Windows. Source was clean before measurement and the binary hash was unchanged afterwards.
+Implementation: `b29553967fee96df1385dd79ad95d048f84b71f1`. Release binary SHA-256: `cb191ef7b3347256ad8f9f0a9efee52b770ef0ad0871d35b1f9cb22cc4ead1ae`. Node v26.13.0, npm 11.20.0, Windows. Source was clean before measurement and the binary hash was unchanged afterwards.
 
 Three fixed, unfiltered rounds alternate tool order. Every cold invocation has an empty tool cache and rnpm store; warm invocations use separately seeded tarball caches with an empty rnpm store. Process timing excludes setup, parity hashing and cleanup. Both tools use isolated configuration. npm is invoked through Node's npm-cli.js. This is application-cache cold, not an OS page-cache flush.
 
 | Scenario | npm median | rnpm median | Speedup | rnpm spread | Target |
 |---|---:|---:|---:|---:|---|
-| Cold ci | 7.388s | 5.745s | 1.29x | 6.2% | FAIL, requires >=2x |
-| Warm tarballs / empty store | 6.653s | 4.826s | 1.38x | 6.9% | FAIL, requires >=2x |
+| Cold ci | 7.791s | 5.854s | 1.33x | 10.0% | FAIL, requires >=2x |
+| Warm tarballs / empty store | 6.913s | 4.740s | 1.46x | 2.6% | FAIL, requires >=2x |
 
 All four scenario spreads pass the <=25% limit. All twelve measured commands exit zero. Every measured rnpm tree matches npm across 10,298 files after excluding tool-internal metadata, and npm ls --all exits zero on every rnpm tree. Same-size CAS corruption is repaired and the complete installed tree is checked again. This is one larger project fixture; it is not evidence of complete compatibility across arbitrary projects.
 
-Raw samples, exits, configuration, provenance and corruption results: [lane four evidence](../benchmarks/results/lane4-takeover-2026-11-13.json). Per-command stdout/stderr: [raw logs](../benchmarks/results/lane4-takeover-2026-11-13-logs/).
+Raw samples, exits, configuration, provenance and corruption results: [lane four evidence](../benchmarks/results/lane4-after-shutdown-fix-2026-11-13.json). Per-command stdout/stderr: [raw logs](../benchmarks/results/lane4-after-shutdown-fix-2026-11-13-logs/).
+
+## Shutdown stress finding and follow-up
+
+After the first completed acceptance set, an additional fixed writer-throughput comparison exposed a stall after the worker reported all 10,208 payload writes complete. The child stayed alive until the reviewer stopped that verified benchmark child. [All four stress samples](../benchmarks/results/lane4-writer-shutdown-2026-11-13/results.json), including the terminated case, and its [stderr](../benchmarks/results/lane4-writer-shutdown-2026-11-13/stalled-worker.stderr) are retained. The failed case is not discarded as an outlier or used to claim a speed improvement.
+
+The follow-up lets Node's stream callbacks unwind and exit naturally instead of forcing process.exit inside the completion callback. It adds a deadline-based EOF regression at default parallelism, exercised through 32 complete stress cycles without another stall. All 88 filesystem tests, the CLI pack-persistence failure regression, and strict workspace clippy pass on the follow-up. The full workspace suite passed immediately before this follow-up; latest-head CI reruns the complete cross-platform suite. Each benchmark subprocess now has a 120-second process-tree timeout with retained failure evidence.
+
+The acceptance set shown above was then rerun on the rebuilt follow-up binary: no command timed out, parity and corruption recovery passed, and the 2x speed goal still failed. The earlier acceptance set is retained separately in lane4-takeover-2026-11-13.json.
 
 ## Repairs completed in this takeover
 
@@ -29,7 +37,7 @@ Workspace tests and strict workspace clippy pass locally. Isolation checker self
 
 ## Reproduced remaining behavior gaps
 
-The release binary above was compared with npm on these exact fixtures. [Raw smoke evidence](../benchmarks/results/npm-replacement-smoke-2026-11-13.json) includes commands, manifests and file contents. It is a targeted regression probe, not a representative percentage score.
+The release binary above was compared with npm on these exact fixtures. [Raw smoke evidence](../benchmarks/results/npm-replacement-after-shutdown-fix-2026-11-13.json) includes commands, manifests and file contents. It is a targeted regression probe, not a representative percentage score.
 
 | Case | npm | rnpm | Assessment |
 |---|---|---|---|
