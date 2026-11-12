@@ -3330,8 +3330,7 @@ fn rebase_local_spec(spec: &str, base: &std::path::Path) -> String {
             && !path_part.contains("://")
     } || (!path_part.contains(':')
         && !path_part.starts_with('@')
-        && base.join(path_part).is_dir()
-        && (path_part.contains('/') || path_part.contains('\\')));
+        && base.join(path_part).is_dir());
     let path = std::path::Path::new(path_part);
     if !is_local || path_part.is_empty() || path.is_absolute() || path_part.starts_with("//") {
         return spec.to_string();
