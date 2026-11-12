@@ -1,8 +1,8 @@
 # npm-rust (`rnpm`)
 
-High-performance, drop-in Rust implementation of npm 11.x workflows.
+Experimental Rust implementation of npm 11.x workflows.
 
-`rnpm` is designed to install and operate ordinary Node.js projects reliably, with npm 11.x-compatible commands, lockfile v3 output, and a measurable path toward matching npm's tree and performance behavior. Real-project parity is tracked by the differential benchmarks rather than treated as a completed guarantee.
+`rnpm` is designed to install and operate ordinary Node.js projects reliably, with npm 11.x-compatible commands, lockfile v3 output, and a measurable path toward matching npm's tree and performance behavior. Real-project parity is tracked by the differential benchmarks rather than treated as a completed guarantee. See the [current replacement-readiness assessment](docs/npm-replacement-readiness-2026-11-13.md) for reproduced gaps and measured performance.
 
 ---
 

@@ -1,0 +1,132 @@
+{
+  "head": "61a631ae65d8788bdd0ca38140d6c7035a0c1431",
+  "source_dirty": false,
+  "binary_sha256": "1f6c0836de5dd5a47e04c6bcc11660d791ab761dbebc5dd3c65aee6230b02631",
+  "node": "v26.13.0",
+  "npm": "11.20.0",
+  "note": "Four targeted smoke cases; not a complete npm compatibility audit",
+  "results": [
+    {
+      "name": "pack-explicit-file-vs-root-ignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json",
+        "--ignore-scripts"
+      ],
+      "manifest": {
+        "files": [
+          "keep.js"
+        ]
+      },
+      "fixture_files": {
+        "keep.js": "hello",
+        ".npmignore": "keep.js\n"
+      },
+      "npm": {
+        "exit": 0,
+        "public_lock": false,
+        "hidden_lock": false,
+        "files": [
+          "keep.js",
+          "package.json"
+        ]
+      },
+      "rnpm": {
+        "exit": 0,
+        "public_lock": false,
+        "hidden_lock": false,
+        "files": [
+          "package.json"
+        ]
+      },
+      "match": false
+    },
+    {
+      "name": "pack-nested-ignore",
+      "args": [
+        "pack",
+        "--dry-run",
+        "--json",
+        "--ignore-scripts"
+      ],
+      "manifest": {
+        "files": [
+          "lib"
+        ]
+      },
+      "fixture_files": {
+        "lib/keep.js": "hello",
+        "lib/omit.js": "omit",
+        "lib/.npmignore": "omit.js\n"
+      },
+      "npm": {
+        "exit": 0,
+        "public_lock": false,
+        "hidden_lock": false,
+        "files": [
+          "lib/keep.js",
+          "package.json"
+        ]
+      },
+      "rnpm": {
+        "exit": 0,
+        "public_lock": false,
+        "hidden_lock": false,
+        "files": [
+          "lib/keep.js",
+          "lib/omit.js",
+          "package.json"
+        ]
+      },
+      "match": false
+    },
+    {
+      "name": "empty-install-hidden-lock",
+      "args": [
+        "install",
+        "--no-audit",
+        "--no-fund",
+        "--ignore-scripts"
+      ],
+      "manifest": {},
+      "fixture_files": {},
+      "npm": {
+        "exit": 0,
+        "public_lock": true,
+        "hidden_lock": false
+      },
+      "rnpm": {
+        "exit": 0,
+        "public_lock": true,
+        "hidden_lock": false
+      },
+      "match": true
+    },
+    {
+      "name": "failing-lifecycle-public-lock",
+      "args": [
+        "install",
+        "--no-audit",
+        "--no-fund"
+      ],
+      "manifest": {
+        "scripts": {
+          "postinstall": "node -e \"process.exit(7)\""
+        }
+      },
+      "fixture_files": {},
+      "npm": {
+        "exit": 7,
+        "public_lock": true,
+        "hidden_lock": false
+      },
+      "rnpm": {
+        "exit": 7,
+        "public_lock": false,
+        "hidden_lock": false
+      },
+      "match": false
+    }
+  ]
+}
