@@ -341,7 +341,8 @@ impl PackagePack {
         for (link_rel, target_rel) in &self.index.symlinks {
             let link_path = target_dir.join(link_rel);
             let target_path = target_dir.join(target_rel);
-            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
+            rnpm_fs::create_link_or_copy(&link_path, &target_path)
+                .map_err(std::io::Error::other)?;
         }
 
         Ok(())
@@ -569,7 +570,7 @@ impl PackagePack {
         for (link_rel, target_rel) in &self.index.symlinks {
             let link_path = target_dir.join(link_rel);
             let target_path = target_dir.join(target_rel);
-            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
+            rnpm_fs::create_link_or_copy(&link_path, &target_path).map_err(CacheError::Fs)?;
         }
 
         let elapsed = start_time.elapsed();

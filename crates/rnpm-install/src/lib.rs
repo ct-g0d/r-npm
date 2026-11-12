@@ -4959,13 +4959,13 @@ impl Installer {
             writer_res?;
 
             for (link_path, target_path) in all_pending_symlinks {
-                if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
-                    warn!(
-                        "Failed to create link or copy from '{}' to '{}': {e}",
+                rnpm_fs::create_link_or_copy(&link_path, &target_path).with_context(|| {
+                    format!(
+                        "Failed to materialize package link '{}' to '{}'",
                         link_path.display(),
                         target_path.display()
-                    );
-                }
+                    )
+                })?;
             }
 
             if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
@@ -5211,13 +5211,15 @@ impl Installer {
 
                         // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                         for (link_path, target_path) in all_symlinks {
-                            if let Err(e) = rnpm_fs::create_link_or_copy(&link_path, &target_path) {
-                                warn!(
-                                    "Failed to create link or copy from '{}' to '{}': {e}",
-                                    link_path.display(),
-                                    target_path.display()
-                                );
-                            }
+                            rnpm_fs::create_link_or_copy(&link_path, &target_path).with_context(
+                                || {
+                                    format!(
+                                        "Failed to materialize cached package link '{}' to '{}'",
+                                        link_path.display(),
+                                        target_path.display()
+                                    )
+                                },
+                            )?;
                         }
                     }
 
