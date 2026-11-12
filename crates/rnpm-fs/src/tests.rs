@@ -36,6 +36,24 @@ fn create_test_tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
 }
 
 #[test]
+fn test_extraction_replaces_existing_hardlink_without_modifying_its_target() {
+    for content in [b"replacement".as_slice(), b"".as_slice()] {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"preserve outside").unwrap();
+        fs::hard_link(&outside, dest.join("file.txt")).unwrap();
+        let tar_bytes = create_test_tarball(&[("package/file.txt", content, 0o644)]);
+
+        extract_tar_gz(Cursor::new(&tar_bytes), &dest, None).unwrap();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve outside");
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), content);
+    }
+}
+
+#[test]
 fn test_safe_tarball_extraction_and_package_prefix_stripping() {
     let dir = tempdir().unwrap();
     let dest = dir.path().join("extracted");
@@ -3042,7 +3060,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     // File 1: small in pkg-a
     files.push(crate::writer::MaterializeFile {
         path: pkg_a_dir.join("index.js"),
-        data: b"module.exports = 'pkg-a';".to_vec(),
+        data: std::sync::Arc::new(b"module.exports = 'pkg-a';".to_vec()),
         mode: 0o644,
         package_id: Some("pkg-a".to_string()),
     });
@@ -3051,7 +3069,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     let node_binary_data = vec![0xCA; 80 * 1024]; // 80 KiB
     files.push(crate::writer::MaterializeFile {
         path: pkg_a_dir.join("binding.node"),
-        data: node_binary_data.clone(),
+        data: std::sync::Arc::new(node_binary_data.clone()),
         mode: 0o755,
         package_id: Some("pkg-a".to_string()),
     });
@@ -3060,7 +3078,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     let wasm_data = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
     files.push(crate::writer::MaterializeFile {
         path: pkg_b_dir.join("module.wasm"),
-        data: wasm_data.clone(),
+        data: std::sync::Arc::new(wasm_data.clone()),
         mode: 0o644,
         package_id: Some("pkg-b".to_string()),
     });
@@ -3068,7 +3086,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
     // File 4: small in pkg-b
     files.push(crate::writer::MaterializeFile {
         path: pkg_b_dir.join("util.js"),
-        data: b"export const x = 1;".to_vec(),
+        data: std::sync::Arc::new(b"export const x = 1;".to_vec()),
         mode: 0o644,
         package_id: Some("pkg-b".to_string()),
     });
@@ -3108,7 +3126,7 @@ fn test_parallel_file_materialization_ssd_and_hdd_modes() {
         skip_existing_matching: false,
     };
     // Modify one byte to ensure HDD write overwrites correctly
-    files[0].data = b"module.exports = 'pkg-a-hdd';".to_vec();
+    files[0].data = std::sync::Arc::new(b"module.exports = 'pkg-a-hdd';".to_vec());
     crate::writer::materialize_files_parallel(files, &hdd_config).unwrap();
 
     assert_eq!(
@@ -3499,4 +3517,67 @@ fn test_junction_points_to_and_read_target() {
     create_junction(&link, &target2).unwrap();
     assert!(junction_points_to(&link, &target2));
     assert!(!junction_points_to(&link, &target1));
+}
+
+#[test]
+fn test_symlink_creation_after_writer_target_exists() {
+    let dir = tempdir().unwrap();
+    let target_file = dir.path().join("target_file.txt");
+    let link_file = dir.path().join("link_file.txt");
+
+    // Write target file using write_file_fast
+    crate::writer::write_file_fast(&target_file, b"sample target content", 0o644, 65536).unwrap();
+
+    // Create link or copy
+    crate::create_link_or_copy(&link_file, &target_file).unwrap();
+
+    assert!(link_file.exists());
+    let content = std::fs::read(&link_file).unwrap();
+    assert_eq!(content, b"sample target content");
+}
+
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(ref prev) = self.prev {
+            std::env::set_var(self.key, prev);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[test]
+fn test_node_writer_invalid_worker_config() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+
+    {
+        let _g = EnvVarGuard::set("RNPM_NODE_WRITER_WORKERS", "0");
+        let res = crate::node_writer::NodeWriter::spawn();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    {
+        let _g = EnvVarGuard::set("RNPM_NODE_WRITER_WORKERS", "invalid_number");
+        let res = crate::node_writer::NodeWriter::spawn();
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

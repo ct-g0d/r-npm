@@ -1,0 +1,218 @@
+{
+  "timestamp": "2026-11-12T11:34:21.016Z",
+  "git_head": "61a631ae65d8788bdd0ca38140d6c7035a0c1431",
+  "source_dirty": false,
+  "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "binary_sha256": "1f6c0836de5dd5a47e04c6bcc11660d791ab761dbebc5dd3c65aee6230b02631",
+  "fixture_lock_sha256": "50a6f407e801eee927b50c2e2f0d03ec0a402189634fd0159b79c7258797d1ec",
+  "environment": {
+    "os": "win32 10.0.26300",
+    "node": "v26.13.0",
+    "npm": "11.20.0",
+    "cpu_count": 12,
+    "writer": "default",
+    "load_before": [
+      0,
+      0,
+      0
+    ]
+  },
+  "conditions": {
+    "runs": 3,
+    "order": "npm/rnpm on odd rounds, rnpm/npm on even rounds; cold then warm",
+    "cache": "empty per cold invocation; separate tarball caches seeded before warm samples; store empty per rnpm invocation",
+    "logs": "lane4-takeover-2026-11-13-logs"
+  },
+  "samples": [
+    {
+      "round": 1,
+      "scenario": "cold",
+      "tool": "npm",
+      "elapsed_ms": 7353.414800000002,
+      "exit_code": 0,
+      "signal": null,
+      "log": "1-cold-npm"
+    },
+    {
+      "round": 1,
+      "scenario": "cold",
+      "tool": "rnpm",
+      "elapsed_ms": 5436.6914999999935,
+      "exit_code": 0,
+      "signal": null,
+      "log": "1-cold-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    },
+    {
+      "round": 1,
+      "scenario": "warm-tar",
+      "tool": "npm",
+      "elapsed_ms": 6930.421599999994,
+      "exit_code": 0,
+      "signal": null,
+      "log": "1-warm-tar-npm"
+    },
+    {
+      "round": 1,
+      "scenario": "warm-tar",
+      "tool": "rnpm",
+      "elapsed_ms": 4890.1633,
+      "exit_code": 0,
+      "signal": null,
+      "log": "1-warm-tar-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    },
+    {
+      "round": 2,
+      "scenario": "cold",
+      "tool": "rnpm",
+      "elapsed_ms": 5745.0088000000105,
+      "exit_code": 0,
+      "signal": null,
+      "log": "2-cold-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    },
+    {
+      "round": 2,
+      "scenario": "cold",
+      "tool": "npm",
+      "elapsed_ms": 7954.20259999999,
+      "exit_code": 0,
+      "signal": null,
+      "log": "2-cold-npm"
+    },
+    {
+      "round": 2,
+      "scenario": "warm-tar",
+      "tool": "rnpm",
+      "elapsed_ms": 4573.48569999999,
+      "exit_code": 0,
+      "signal": null,
+      "log": "2-warm-tar-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    },
+    {
+      "round": 2,
+      "scenario": "warm-tar",
+      "tool": "npm",
+      "elapsed_ms": 6510.4755000000005,
+      "exit_code": 0,
+      "signal": null,
+      "log": "2-warm-tar-npm"
+    },
+    {
+      "round": 3,
+      "scenario": "cold",
+      "tool": "npm",
+      "elapsed_ms": 7387.673500000004,
+      "exit_code": 0,
+      "signal": null,
+      "log": "3-cold-npm"
+    },
+    {
+      "round": 3,
+      "scenario": "cold",
+      "tool": "rnpm",
+      "elapsed_ms": 5774.5790000000125,
+      "exit_code": 0,
+      "signal": null,
+      "log": "3-cold-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    },
+    {
+      "round": 3,
+      "scenario": "warm-tar",
+      "tool": "npm",
+      "elapsed_ms": 6653.033900000009,
+      "exit_code": 0,
+      "signal": null,
+      "log": "3-warm-tar-npm"
+    },
+    {
+      "round": 3,
+      "scenario": "warm-tar",
+      "tool": "rnpm",
+      "elapsed_ms": 4826.206299999991,
+      "exit_code": 0,
+      "signal": null,
+      "log": "3-warm-tar-rnpm",
+      "parity": {
+        "identical": true,
+        "files": 10298
+      },
+      "npm_ls_exit_code": 0
+    }
+  ],
+  "setup": [
+    {
+      "tool": "npm",
+      "elapsed_ms": 7594.1495,
+      "exit_code": 0,
+      "signal": null,
+      "log": "seed-npm"
+    },
+    {
+      "tool": "rnpm",
+      "elapsed_ms": 6321.3107,
+      "exit_code": 0,
+      "signal": null,
+      "log": "seed-rnpm"
+    }
+  ],
+  "thresholds": {
+    "speedup": 2,
+    "spread_pct": 25
+  },
+  "gate_passed": false,
+  "summary": {
+    "cold": {
+      "npm": {
+        "median_ms": 7387.673500000004,
+        "spread_pct": 8.170187815326114
+      },
+      "rnpm": {
+        "median_ms": 5745.0088000000105,
+        "spread_pct": 6.214947086845361
+      },
+      "speedup": 1.2859290137205692
+    },
+    "warm-tar": {
+      "npm": {
+        "median_ms": 6653.033900000009,
+        "spread_pct": 6.450313805804103
+      },
+      "rnpm": {
+        "median_ms": 4826.206299999991,
+        "spread_pct": 6.924206628655484
+      },
+      "speedup": 1.3785224846273194
+    }
+  },
+  "corruption": {
+    "exit_code": 0,
+    "repaired": true,
+    "installed_tree_identical": true
+  },
+  "finished": "2026-11-12T11:37:32.076Z",
+  "binary_unchanged": true
+}

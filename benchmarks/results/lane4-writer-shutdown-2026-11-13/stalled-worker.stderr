@@ -1,0 +1,12 @@
+[TIMING_PROFILE] node_writer stats:
+[TIMING_PROFILE]   first item received at: 6 ms
+[TIMING_PROFILE]   stdin ended at: 4031 ms (written so far: 10206/10208)
+[TIMING_PROFILE]   all writes finished at: 4031 ms (10208 files, 91.9 MiB)
+[TIMING_PROFILE]   peak queue depth: 256, avg queue delay: 59.0 ms
+[TIMING_PROFILE]   avg write service time: 45.4 ms, max service time: 470 ms
+[TIMING_PROFILE]   mkdirSync calls: 0, total mkdir time: 0.0 ms
+[TIMING_PROFILE]   node_writer peak rss: 78.1 MiB, heap: 6.2 MiB
+[TIMING_PROFILE] pack tasks finish wait: 0.15s
+[RNPM_TIMING_DEBUG] internal: 290.57s, handles_closed: 0.00s, trash_done: 0.00s
+npm error code EUNKNOWN
+npm error AsyncFileWriter failed: NodeWriter process exited with error status: ExitStatus(ExitStatus(4294967295))

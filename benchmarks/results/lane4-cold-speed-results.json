@@ -1,0 +1,57 @@
+{
+  "benchmark": "Lane 4: Cold-Path Install Speed Gate",
+  "timestamp": "2026-11-12T10:48:07.1332494Z",
+  "git_head": "7e458a0026e9e1faa3e716023b5753b910f446a5",
+  "binary_sha256": "3E178A5B0F478D092543DDE11320755AE37E2BA574B939130F461E0A115CAC8C",
+  "environment": {
+    "os": "Microsoft Windows NT 10.0.26300.0",
+    "node_version": "v26.13.0",
+    "npm_version": "11.20.0",
+    "rust_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "processor_count": 12
+  },
+  "samples": {
+    "npm_cold_ms": [
+      7752.8244,
+      7856.6502,
+      8329.0539
+    ],
+    "rnpm_cold_ms": [
+      5716.4165,
+      5662.311500000001,
+      5952.1911
+    ],
+    "npm_warm_ms": [
+      7006.607,
+      7477.3692,
+      7235.1844
+    ],
+    "rnpm_warm_tar_ms": [
+      4883.9562000000005,
+      4822.203100000001,
+      5347.479600000001
+    ]
+  },
+  "medians": {
+    "npm_cold_median_ms": 7856.6502,
+    "rnpm_cold_median_ms": 5716.4165,
+    "cold_speedup": 1.37,
+    "npm_warm_median_ms": 7235.1844,
+    "rnpm_warm_tar_median_ms": 4883.9562000000005,
+    "warm_speedup": 1.48
+  },
+  "spreads": {
+    "npm_cold_spread_pct": 7.4,
+    "rnpm_cold_spread_pct": 5.1,
+    "npm_warm_spread_pct": 6.7,
+    "rnpm_warm_tar_spread_pct": 10.9
+  },
+  "parity": {
+    "identical": true,
+    "file_count": 10298,
+    "npm_ls_exit_code": 0
+  },
+  "gate_passed": false,
+  "source_dirty": true,
+  "provenance_note": "Legacy worker measurements before takeover. git_head names the base commit, not the uncommitted source used to build the binary; retained as historical evidence only."
+}

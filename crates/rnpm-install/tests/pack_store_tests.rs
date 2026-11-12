@@ -154,3 +154,138 @@ async fn test_pack_store_two_files_per_package_and_warm_ci_read() {
     );
     assert_eq!(fs::read(&installed_blob).unwrap(), large_payload);
 }
+
+#[tokio::test]
+async fn test_pack_store_crash_recovery_truncated_or_deleted_pack() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let cache_dir = root.join("cache");
+
+    let tarball_bytes = build_mock_tarball(&[
+        (
+            "package.json",
+            br#"{"name":"omega-core","version":"2.5.0","main":"lib/index.js"}"#,
+        ),
+        ("lib/index.js", b"module.exports = { version: '2.5.0' };"),
+    ]);
+
+    let project_dir = root.join("test-recovery-project");
+    let pkgs_dir = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    let tarball_path = pkgs_dir.join("omega-core-2.5.0.tgz");
+    fs::write(&tarball_path, &tarball_bytes).unwrap();
+
+    let manifest = serde_json::json!({
+        "name": "test-recovery",
+        "version": "1.0.0",
+        "dependencies": {
+            "omega-core": "file:./pkgs/omega-core-2.5.0.tgz"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        cache_dir: Some(cache_dir.clone()),
+        ..Default::default()
+    };
+
+    // 1. Initial install populates store
+    let mut installer = Installer::new(options.clone()).unwrap();
+    let summary = installer.run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+
+    let lockfile = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    let integrity = lockfile
+        .packages
+        .get("node_modules/omega-core")
+        .unwrap()
+        .integrity
+        .as_ref()
+        .unwrap();
+    let pack_store = installer.pack_store();
+    let (pack_path, idx_path) = pack_store.pack_paths(integrity);
+    assert!(pack_path.is_file());
+    assert!(idx_path.is_file());
+
+    // 2. Truncate .pack file to half size (simulating crash during write)
+    let pack_bytes = fs::read(&pack_path).unwrap();
+    assert!(pack_bytes.len() > 10);
+    fs::write(&pack_path, &pack_bytes[..pack_bytes.len() / 2]).unwrap();
+
+    // Remove node_modules
+    fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+    assert!(!project_dir.join("node_modules").exists());
+
+    // Run install: must detect corrupted/truncated pack, recover, and produce correct node_modules
+    let mut installer2 = Installer::new(options.clone()).unwrap();
+    let summary2 = installer2.run_ci().await.unwrap();
+    assert_eq!(summary2.packages_installed, 1);
+    let installed_main = project_dir
+        .join("node_modules")
+        .join("omega-core")
+        .join("lib")
+        .join("index.js");
+    assert_eq!(
+        fs::read_to_string(&installed_main).unwrap(),
+        "module.exports = { version: '2.5.0' };"
+    );
+
+    // 3. Delete .pack entirely leaving only .idx (simulating crash before pack written or pack deleted)
+    fs::remove_file(&pack_path).unwrap();
+    assert!(!pack_path.exists());
+    assert!(idx_path.exists());
+
+    // Remove node_modules
+    fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+    assert!(!project_dir.join("node_modules").exists());
+
+    // Run install: must detect missing pack, recover, and produce correct node_modules
+    let mut installer3 = Installer::new(options.clone()).unwrap();
+    let summary3 = installer3.run_ci().await.unwrap();
+    assert_eq!(summary3.packages_installed, 1);
+    assert_eq!(
+        fs::read_to_string(&installed_main).unwrap(),
+        "module.exports = { version: '2.5.0' };"
+    );
+}
+
+#[tokio::test]
+async fn test_pack_store_atomic_repair_corrupt_cas() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let store_dir = root.join("repair-store");
+    let store = rnpm_cache::PackStore::new(&store_dir).unwrap();
+
+    let files = vec![rnpm_cache::PackInputFile {
+        path: "index.js".to_string(),
+        mode: 0o644,
+        data: b"console.log('hello repair');",
+    }];
+
+    let integrity = "sha512-testrepairintegrity1234567890abcdef";
+    let index = store.put_package_pack(integrity, &files).unwrap();
+    assert_eq!(index.files.len(), 1);
+
+    let pack = store.get_package_pack(integrity).unwrap().unwrap();
+    assert_eq!(pack.index.files.len(), 1);
+    let cas_path = pack.index.files[0].cas_path.as_ref().unwrap();
+    assert!(cas_path.is_file());
+
+    // Corrupt the CAS file by overwriting with invalid content
+    fs::write(cas_path, b"corrupted data").unwrap();
+
+    // Clear mmap cache to force re-reading from disk and re-verifying
+    store.clear_mmap_cache();
+    let recovered_pack = store.get_package_pack(integrity).unwrap().unwrap();
+    assert_eq!(recovered_pack.index.files.len(), 1);
+    assert!(recovered_pack.index.files[0].cas_verified);
+
+    // Verify CAS file was atomically repaired with correct data
+    let repaired_data = fs::read(cas_path).unwrap();
+    assert_eq!(repaired_data, b"console.log('hello repair');");
+}

@@ -15,6 +15,43 @@ use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
+#[tokio::test]
+async fn persistence_failure_waits_for_remaining_jobs() {
+    for panic_first in [false, true] {
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_job = completed.clone();
+        let tasks = vec![
+            tokio::spawn(async move {
+                failed_tx.send(()).unwrap();
+                assert!(!panic_first, "persistence panic");
+                Err(anyhow::anyhow!("first persistence error"))
+            }),
+            tokio::spawn(async move {
+                release_rx.await.unwrap();
+                completed_job.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }),
+        ];
+        let finish = tokio::spawn(crate::finish_pack_tasks(tasks));
+        failed_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !finish.is_finished(),
+            "must not return with a live persistence job"
+        );
+        release_tx.send(()).unwrap();
+        let error = finish.await.unwrap().unwrap_err().to_string();
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(error.contains(if panic_first {
+            "pack worker panicked"
+        } else {
+            "first persistence error"
+        }));
+    }
+}
+
 fn setup_fixture_project(dir: &Path) {
     // 1. Root package.json
     let mut manifest = Manifest::default();
@@ -145,8 +182,13 @@ fn test_link_tree_bins_ansi_html() {
     std::fs::write(
         ansi_html.join("package.json"),
         r#"{"name":"ansi-html","version":"0.0.9","bin":{"ansi-html":"./bin/ansi-html"}}"#,
-    ).unwrap();
-    std::fs::write(ansi_html.join("bin/ansi-html"), "#!/usr/bin/env node\nconsole.log(1);").unwrap();
+    )
+    .unwrap();
+    std::fs::write(
+        ansi_html.join("bin/ansi-html"),
+        "#!/usr/bin/env node\nconsole.log(1);",
+    )
+    .unwrap();
 
     crate::link_tree_bins(
         vec!["node_modules/ansi-html".to_string()],
@@ -159,10 +201,15 @@ fn test_link_tree_bins_ansi_html() {
     );
 
     assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
-    assert!(bin.join("ansi-html.cmd").exists(), "bin/ansi-html.cmd exists");
-    assert!(bin.join("ansi-html.ps1").exists(), "bin/ansi-html.ps1 exists");
+    assert!(
+        bin.join("ansi-html.cmd").exists(),
+        "bin/ansi-html.cmd exists"
+    );
+    assert!(
+        bin.join("ansi-html.ps1").exists(),
+        "bin/ansi-html.ps1 exists"
+    );
 }
-
 
 #[test]
 fn test_uninstall_single_package_and_transitive_pruning() {
@@ -4175,7 +4222,11 @@ fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
             { "type": "MIT", "url": "http://example.com" }
         ]
     });
-    fs::write(nm.join("package.json"), serde_json::to_string(&legacy_json).unwrap()).unwrap();
+    fs::write(
+        nm.join("package.json"),
+        serde_json::to_string(&legacy_json).unwrap(),
+    )
+    .unwrap();
 
     let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
     lockfile.insert_package(
@@ -4284,7 +4335,10 @@ async fn test_enrich_lockfile_from_cacache_packument() {
         .await
         .unwrap();
 
-    let pkg = lockfile.packages.get(&format!("node_modules/{pkg_name}")).unwrap();
+    let pkg = lockfile
+        .packages
+        .get(&format!("node_modules/{pkg_name}"))
+        .unwrap();
     assert_eq!(pkg.license.as_deref(), Some("MIT"));
 }
 
@@ -4300,13 +4354,17 @@ async fn test_enrich_lockfile_with_scoped_package_license_and_libc() {
         },
     );
     let mut installer = Installer::new(InstallOptions::default()).unwrap();
-    installer.enrich_lockfile_from_registry(&mut lockfile).await.unwrap();
+    installer
+        .enrich_lockfile_from_registry(&mut lockfile)
+        .await
+        .unwrap();
 
-    let pkg = lockfile.packages.get("node_modules/@next/swc-linux-x64-musl").unwrap();
+    let pkg = lockfile
+        .packages
+        .get("node_modules/@next/swc-linux-x64-musl")
+        .unwrap();
     if pkg.license.is_some() {
         assert_eq!(pkg.license.as_deref(), Some("MIT"));
         assert_eq!(pkg.libc.as_deref(), Some(&["musl".to_string()][..]));
     }
 }
-
-

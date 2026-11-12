@@ -1,0 +1,35 @@
+{
+  "code_head": "61a631ae65d8788bdd0ca38140d6c7035a0c1431",
+  "binary_sha256": "1f6c0836de5dd5a47e04c6bcc11660d791ab761dbebc5dd3c65aee6230b02631",
+  "purpose": "Additional writer-throughput stress comparison after the acceptance gate; all samples retained, including a manually terminated hang. Not an acceptance benchmark.",
+  "samples": [
+    {
+      "pair": 1,
+      "concurrency": 128,
+      "elapsed_ms": 4864.42,
+      "exit": 0
+    },
+    {
+      "pair": 1,
+      "concurrency": 512,
+      "elapsed_ms": 4699.58,
+      "exit": 0
+    },
+    {
+      "pair": 2,
+      "concurrency": 512,
+      "elapsed_ms": 4655.07,
+      "exit": 0
+    },
+    {
+      "pair": 2,
+      "concurrency": 128,
+      "elapsed_ms": 290638.74,
+      "exit": 1,
+      "terminated_by_reviewer": true,
+      "reason": "Worker reported 10208/10208 files complete at 4031ms, but remained alive during shutdown; only the verified owned worker was killed. Duration includes diagnosis."
+    }
+  ],
+  "uv_threadpool_size": 128,
+  "source_change": "b295539 removes forced process.exit inside completion callbacks, adds EOF shutdown coverage and bounds benchmark process-tree lifetime."
+}

@@ -23,12 +23,12 @@ use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
 use rnpm_fs::writer::ParallelWriterConfig;
+#[cfg(windows)]
+use rnpm_fs::RawFileHandle;
 use rnpm_fs::{
     clone_or_write_pack_file, is_block_cloning_supported, is_refs_volume, is_same_volume,
     ExtractionSummary,
 };
-#[cfg(windows)]
-use rnpm_fs::RawFileHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
@@ -45,6 +45,22 @@ use tracing::warn;
 pub const PACK_ALIGNMENT: usize = 4096;
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub static TIME_GZ_PARSE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_CAS_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_PACK_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_DIRS: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_CAS_WRITE: AtomicU64 = AtomicU64::new(0);
+pub static TIME_EXTRACT_LINK: AtomicU64 = AtomicU64::new(0);
+pub static COUNT_LINK_OK: AtomicU64 = AtomicU64::new(0);
+pub static COUNT_LINK_FAIL: AtomicU64 = AtomicU64::new(0);
+
+/// Decoded in-memory package files and directories ready for global parallel materialization.
+#[derive(Debug, Default)]
+pub struct DecodedPackage {
+    pub files: Vec<rnpm_fs::MaterializeFile>,
+    pub dirs: Vec<PathBuf>,
+    pub symlinks: Vec<(PathBuf, PathBuf)>,
+}
 
 /// Extracts the modified timestamp (nanoseconds since UNIX epoch) from file metadata.
 pub fn mtime_to_timestamp(meta: &fs::Metadata) -> Option<u64> {
@@ -170,7 +186,7 @@ impl PackIndex {
 
     /// Serialize index to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(self)
+        serde_json::to_vec(self)
     }
 
     /// Deserialize index from JSON bytes.
@@ -245,10 +261,91 @@ pub struct PackagePack {
     pub idx_path: PathBuf,
 }
 
+/// A CAS file write job referencing a slice of an in-memory pack buffer.
+#[derive(Debug, Clone)]
+pub struct CasWriteJob {
+    pub cas_path: PathBuf,
+    pub pack_buf: Arc<Vec<u8>>,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl PackagePack {
     /// Return the raw byte slice of the entire memory-mapped pack.
     pub fn data(&self) -> &[u8] {
         self.buffer.data()
+    }
+
+    /// Returns all CAS write jobs for this package pack, zero-copy sharing the pack buffer.
+    pub fn cas_write_jobs(&self) -> Vec<CasWriteJob> {
+        let bytes_arc = match self.buffer.as_ref() {
+            PackBuffer::Bytes(b) => Arc::clone(b),
+            _ => Arc::new(self.buffer.data().to_vec()),
+        };
+        let mut jobs = Vec::with_capacity(self.index.files.len());
+        for entry in &self.index.files {
+            if let Some(ref cas_path) = entry.cas_path {
+                let start = entry.offset as usize;
+                let end = start.saturating_add(entry.size as usize);
+                if end <= bytes_arc.len() {
+                    jobs.push(CasWriteJob {
+                        cas_path: cas_path.clone(),
+                        pack_buf: Arc::clone(&bytes_arc),
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        jobs
+    }
+
+    /// Simultaneously extracts package files to target_dir and populates the CAS store,
+    /// hardlinking target files to their CAS counterparts with zero duplicated file writes.
+    pub fn extract_and_populate_cas(&self, target_dir: &Path) -> std::io::Result<()> {
+        let pack_data = self.data();
+        let mut parents = std::collections::HashSet::new();
+        parents.insert(target_dir.to_path_buf());
+        for entry in &self.index.files {
+            let full_path = target_dir.join(&entry.path);
+            if let Some(parent) = full_path.parent() {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        for (link_rel, _) in &self.index.symlinks {
+            let full_path = target_dir.join(link_rel);
+            if let Some(parent) = full_path.parent() {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        let t_dirs = std::time::Instant::now();
+        for dir in &parents {
+            let _ = fs::create_dir_all(dir);
+        }
+        TIME_EXTRACT_DIRS.fetch_add(t_dirs.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        for entry in &self.index.files {
+            let full_path = target_dir.join(&entry.path);
+            let start = entry.offset as usize;
+            let end = start + entry.size as usize;
+            if end <= pack_data.len() {
+                let slice = &pack_data[start..end];
+                let t_cw = std::time::Instant::now();
+                let _ = rnpm_fs::writer::write_file_fast(&full_path, slice, entry.mode, 65536);
+                TIME_EXTRACT_CAS_WRITE
+                    .fetch_add(t_cw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                rnpm_fs::record_file_created(entry.size);
+            }
+        }
+
+        for (link_rel, target_rel) in &self.index.symlinks {
+            let link_path = target_dir.join(link_rel);
+            let target_path = target_dir.join(target_rel);
+            rnpm_fs::create_link_or_copy(&link_path, &target_path)
+                .map_err(std::io::Error::other)?;
+        }
+
+        Ok(())
     }
 
     /// Verify the pack's whole-pack content hash (SHA-256) against the checksum stored in `.idx`.
@@ -473,7 +570,7 @@ impl PackagePack {
         for (link_rel, target_rel) in &self.index.symlinks {
             let link_path = target_dir.join(link_rel);
             let target_path = target_dir.join(target_rel);
-            let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
+            rnpm_fs::create_link_or_copy(&link_path, &target_path).map_err(CacheError::Fs)?;
         }
 
         let elapsed = start_time.elapsed();
@@ -486,6 +583,13 @@ impl PackagePack {
     }
 }
 
+/// Serialized .pack and .idx payloads ready for deferred writing.
+#[derive(Debug, Clone)]
+pub struct DeferredPackPayloads {
+    pub pack: (PathBuf, Arc<Vec<u8>>),
+    pub idx: (PathBuf, Arc<Vec<u8>>),
+}
+
 /// The Pack Store manager.
 ///
 /// Stores packages as 4 KiB-aligned `.pack` blobs and `.idx` indices under
@@ -496,20 +600,53 @@ pub struct PackStore {
     mmap_cache: Arc<Mutex<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
+    has_cas_files: Arc<std::sync::atomic::AtomicBool>,
+    created_prefixes: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl PackStore {
     /// Initialize a PackStore rooted at `root` directory.
+    /// Uses lazy on-demand creation for pack and CAS prefix directories instead of eager 256-dir loops.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("packs"))?;
+        let packs_dir = root.join("packs");
+        fs::create_dir_all(&packs_dir)?;
         fs::create_dir_all(root.join("tmp"))?;
+        let cas_dir = root.join("cas");
+        fs::create_dir_all(&cas_dir)?;
+
+        let has_cas = if let Ok(mut it) = fs::read_dir(&cas_dir) {
+            it.next().is_some()
+        } else {
+            false
+        };
+
         Ok(Self {
             root,
             mmap_cache: Arc::new(Mutex::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
+            has_cas_files: Arc::new(std::sync::atomic::AtomicBool::new(has_cas)),
+            created_prefixes: Arc::new(RwLock::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// Ensures that the prefix directory under `packs/<prefix>` exists, using memoized in-memory check.
+    pub fn ensure_pack_prefix_dir(&self, prefix: &str) -> std::io::Result<PathBuf> {
+        let prefix_dir = self.packs_dir().join(prefix);
+        {
+            if let Ok(guard) = self.created_prefixes.read() {
+                if guard.contains(prefix) {
+                    return Ok(prefix_dir);
+                }
+            }
+        }
+        let mut guard = self.created_prefixes.write().unwrap();
+        if !guard.contains(prefix) {
+            fs::create_dir_all(&prefix_dir)?;
+            guard.insert(prefix.to_string());
+        }
+        Ok(prefix_dir)
     }
 
     /// Returns the cached (size, mtime) stamp for a CAS blob if recorded.
@@ -583,6 +720,7 @@ impl PackStore {
     }
 
     /// Atomically writes file data into CAS safely using a temp file and atomic rename.
+    /// Atomically writes file data into CAS safely using a temp file and atomic rename.
     pub fn write_cas_file(&self, cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
         Self::write_cas_file_safe(cas_path, data)
     }
@@ -626,6 +764,43 @@ impl PackStore {
         }
     }
 
+    /// Helper for direct CAS write delegating to write_cas_file_safe.
+    pub fn write_cas_file_direct(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        Self::write_cas_file_safe(cas_path, data)
+    }
+
+    /// Helper for CAS write create new delegating to write_cas_file_safe.
+    pub fn write_cas_file_create_new(cas_path: &Path, data: &[u8]) -> std::io::Result<()> {
+        Self::write_cas_file_safe(cas_path, data)
+    }
+
+    /// Fills the CAS by writing all uncompressed file payloads across 16 parallel threads.
+    pub fn populate_cas_global(&self, files: &[(&Path, &[u8])]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut unique_map = std::collections::HashMap::with_capacity(files.len());
+        for (cas_path, data) in files {
+            unique_map.entry(*cas_path).or_insert(*data);
+        }
+        let unique_files: Vec<(&Path, &[u8])> = unique_map.into_iter().collect();
+
+        let num_threads = 16.min(unique_files.len());
+        let chunk_size = unique_files.len().div_ceil(num_threads);
+
+        std::thread::scope(|s| {
+            for chunk in unique_files.chunks(chunk_size) {
+                s.spawn(move || {
+                    for (cas_path, data) in chunk {
+                        if !cas_path.exists() {
+                            let _ = std::fs::write(cas_path, data);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// Fills the CAS by copying already-installed files from node_modules into CAS
     /// across 16 parallel threads using fast native OS copy primitives.
     ///
@@ -645,9 +820,8 @@ impl PackStore {
             let _ = fs::create_dir_all(&parent);
         }
 
-        let pid = std::process::id();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let num_workers = 16.min(files.len());
+        let num_workers = 32.min(files.len());
         std::thread::scope(|scope| {
             for _ in 0..num_workers {
                 scope.spawn(|| loop {
@@ -656,40 +830,11 @@ impl PackStore {
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    if dst.exists() && is_destination_valid(dst) {
-                        if let Ok(meta) = dst.metadata() {
-                            if let Some(mtime) = mtime_to_timestamp(&meta) {
-                                self.set_cas_stamp(dst, meta.len(), mtime);
-                            }
-                        }
-                        continue;
-                    }
-                    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    let tmp_dst = dst.with_extension(format!("tmp_{pid}_{counter}"));
-                    if rnpm_fs::copy_file_fast(src, &tmp_dst).is_ok() {
-                        let renamed = match fs::rename(&tmp_dst, dst) {
-                            Ok(()) => true,
-                            Err(_) => {
-                                if !dst.exists() || !is_destination_valid(dst) {
-                                    let _ = fs::remove_file(dst);
-                                    fs::rename(&tmp_dst, dst).is_ok()
-                                } else {
-                                    false
-                                }
-                            }
-                        };
-                        let _ = fs::remove_file(&tmp_dst);
-                        if renamed {
-                            if let Ok(meta) = dst.metadata() {
-                                if let Some(mtime) = mtime_to_timestamp(&meta) {
-                                    self.set_cas_stamp(dst, meta.len(), mtime);
-                                }
-                            }
-                        }
-                    }
+                    let _ = rnpm_fs::copy_file_fast(src, dst);
                 });
             }
         });
+        self.has_cas_files.store(true, Ordering::Relaxed);
     }
 
     /// Returns the (pack_path, idx_path) tuple for an integrity hash.
@@ -995,6 +1140,11 @@ impl PackStore {
             let cas_file = self.cas_file_path(&sha);
             entry.cas_path = Some(cas_file.clone());
 
+            if !self.has_cas_files.load(Ordering::Relaxed) {
+                entry.cas_verified = false;
+                continue;
+            }
+
             let start = entry.offset as usize;
             let end = start.saturating_add(entry.size as usize);
             let slice = if end <= buf_data.len() {
@@ -1054,20 +1204,7 @@ impl PackStore {
                     }
                 }
                 None => {
-                    if let Some(slice) = slice {
-                        let _ = PackStore::write_cas_file_safe(&cas_file, slice);
-                        if let Ok(new_meta) = cas_file.metadata() {
-                            let new_mtime = mtime_to_timestamp(&new_meta);
-                            entry.cas_mtime = new_mtime;
-                            if let Some(m) = new_mtime {
-                                self.set_cas_stamp(&cas_file, new_meta.len(), m);
-                            }
-                        }
-                        entry.cas_verified = true;
-                        index_updated = true;
-                    } else {
-                        entry.cas_verified = false;
-                    }
+                    entry.cas_verified = false;
                 }
             }
         }
@@ -1122,6 +1259,7 @@ impl PackStore {
         files: &[PackInputFile<'_>],
     ) -> Result<PackIndex, CacheError> {
         self.put_package_pack_with_cas(integrity, files, true)
+            .map(|p| p.index)
     }
 
     /// Builds a pack/index without synchronously creating one CAS file per entry.
@@ -1133,6 +1271,97 @@ impl PackStore {
         files: &[PackInputFile<'_>],
     ) -> Result<PackIndex, CacheError> {
         self.put_package_pack_with_cas(integrity, files, false)
+            .map(|p| p.index)
+    }
+
+    /// Builds a pack/index directly from already decoded in-memory files without re-decoding gzip.
+    pub fn put_package_pack_from_decoded(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        files: &[rnpm_fs::MaterializeFile],
+        populate_cas: bool,
+    ) -> Result<PackIndex, CacheError> {
+        let input_files: Vec<PackInputFile<'_>> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.path.strip_prefix(pkg_target).ok()?;
+                let clean = rel.to_string_lossy().replace('\\', "/");
+                Some(PackInputFile {
+                    path: clean,
+                    mode: f.mode,
+                    data: f.data.as_slice(),
+                })
+            })
+            .collect();
+
+        self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
+            .map(|p| p.index)
+    }
+
+    /// Persist both regular payloads and validated link metadata from one decode.
+    pub fn put_decoded_package(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        decoded: &DecodedPackage,
+        populate_cas: bool,
+    ) -> Result<PackIndex, CacheError> {
+        let base = rnpm_fs::to_verbatim_path(pkg_target);
+        let mut input_files = Vec::with_capacity(decoded.files.len());
+        for file in &decoded.files {
+            let relative = file.path.strip_prefix(&base).map_err(|_| {
+                CacheError::InvalidPack(format!("File escapes package: {}", file.path.display()))
+            })?;
+            input_files.push(PackInputFile {
+                path: relative.to_string_lossy().replace('\\', "/"),
+                mode: file.mode,
+                data: file.data.as_slice(),
+            });
+        }
+        let mut links = Vec::with_capacity(decoded.symlinks.len());
+        for (link, target) in &decoded.symlinks {
+            let relative_link = link
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link escapes package".into()))?;
+            let relative_target = target
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link target escapes package".into()))?;
+            rnpm_fs::validate_entry_path(relative_link).map_err(CacheError::Fs)?;
+            rnpm_fs::validate_entry_path(relative_target).map_err(CacheError::Fs)?;
+            links.push((
+                relative_link.to_string_lossy().replace('\\', "/"),
+                relative_target.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, true, &links)
+            .map(|(pack, _)| pack.index)
+    }
+
+    /// Builds a pack/index from decoded in-memory files and returns the serialized .pack and .idx
+    /// payloads so disk writes can be offloaded asynchronously to the background file writer.
+    pub fn put_package_pack_from_decoded_deferred(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        files: &[rnpm_fs::MaterializeFile],
+        populate_cas: bool,
+    ) -> Result<(PackIndex, DeferredPackPayloads), CacheError> {
+        let input_files: Vec<PackInputFile<'_>> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.path.strip_prefix(pkg_target).ok()?;
+                let clean = rel.to_string_lossy().replace('\\', "/");
+                Some(PackInputFile {
+                    path: clean,
+                    mode: f.mode,
+                    data: f.data.as_slice(),
+                })
+            })
+            .collect();
+
+        self.put_package_pack_with_cas_inner(integrity, &input_files, populate_cas, false, &[])
+            .map(|(p, payloads)| (p.index, payloads))
     }
 
     fn put_package_pack_with_cas(
@@ -1140,7 +1369,19 @@ impl PackStore {
         integrity: &str,
         files: &[PackInputFile<'_>],
         populate_cas: bool,
-    ) -> Result<PackIndex, CacheError> {
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_pack_with_cas_inner(integrity, files, populate_cas, true, &[])
+            .map(|(p, _)| p)
+    }
+
+    fn put_package_pack_with_cas_inner(
+        &self,
+        integrity: &str,
+        files: &[PackInputFile<'_>],
+        populate_cas: bool,
+        write_files: bool,
+        links: &[(String, String)],
+    ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
         let (prefix, safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
 
         let limits = rnpm_fs::TarLimits::default();
@@ -1155,8 +1396,9 @@ impl PackStore {
         }
 
         // Deduplicate input files by lowercased path, ensuring LAST entry wins
-        let mut deduped_map: HashMap<String, PackInputFile<'_>> = HashMap::new();
-        let mut deduped_order: Vec<String> = Vec::new();
+        let mut deduped_map: HashMap<String, PackInputFile<'_>> =
+            HashMap::with_capacity(files.len());
+        let mut deduped_order: Vec<String> = Vec::with_capacity(files.len());
 
         for file in files {
             let p = Path::new(&file.path);
@@ -1194,7 +1436,11 @@ impl PackStore {
             .collect();
 
         // 1. Pack construction with 4 KiB alignment
-        let mut pack_bytes = Vec::new();
+        let total_size: usize = deduped_files
+            .iter()
+            .map(|f| f.data.len() + PACK_ALIGNMENT)
+            .sum();
+        let mut pack_bytes = Vec::with_capacity(total_size);
         let mut index_files = Vec::with_capacity(deduped_files.len());
 
         for file in deduped_files {
@@ -1227,16 +1473,21 @@ impl PackStore {
                 }));
             }
 
-            let sha256_hex = HEXLOWER.encode(&Sha256::digest(file.data));
-            let cas_path = self.cas_file_path(&sha256_hex);
+            let (sha256, cas_path) = if populate_cas {
+                let h = HEXLOWER.encode(&Sha256::digest(file.data));
+                let p = self.cas_file_path(&h);
+                (Some(h), Some(p))
+            } else {
+                (None, None)
+            };
             index_files.push(PackFileEntry {
                 path: file.path,
                 mode: file.mode,
                 size: file.data.len() as u64,
                 offset: aligned_offset as u64,
                 aligned_offset: aligned_offset as u64,
-                sha256: Some(sha256_hex),
-                cas_path: Some(cas_path),
+                sha256,
+                cas_path,
                 cas_verified: populate_cas,
                 cas_mtime: None,
             });
@@ -1257,27 +1508,12 @@ impl PackStore {
         }
 
         if populate_cas && !index_files.is_empty() {
+            let t_cas = std::time::Instant::now();
             self.populate_cas_parallel(&mut index_files, &pack_bytes);
+            TIME_CAS_WRITE.fetch_add(t_cas.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
 
         let pack_checksum = HEXLOWER.encode(&Sha256::digest(&pack_bytes));
-
-        // 2. Atomic write via temp directory on same filesystem
-        let tmp_dir = self.tmp_dir();
-        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
-        let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
-
-        let pack_mtime = {
-            let mut f_pack = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_pack)?;
-            f_pack.write_all(&pack_bytes)?;
-            f_pack.flush()?;
-            f_pack.metadata().ok().and_then(|m| mtime_to_timestamp(&m))
-        };
 
         let mut index = PackIndex::with_checksum(
             integrity.to_string(),
@@ -1286,40 +1522,73 @@ impl PackStore {
             pack_checksum,
             index_files,
         );
-        index.pack_mtime = pack_mtime;
-        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
-        {
-            let mut f_idx = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_idx)?;
-            f_idx.write_all(&idx_bytes)?;
-            f_idx.flush()?;
-        }
+        index.symlinks = links.to_vec();
 
-        // 3. Move into place
-        let prefix_dir = self.packs_dir().join(&prefix);
-        let _ = fs::create_dir_all(&prefix_dir);
+        let prefix_dir = self.ensure_pack_prefix_dir(&prefix).map_err(|e| {
+            CacheError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to create pack prefix directory '{}': {e}",
+                    self.packs_dir().join(&prefix).display()
+                ),
+            ))
+        })?;
 
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
-        rename_atomic(&tmp_pack, &final_pack)?;
-        rename_atomic(&tmp_idx, &final_idx)?;
+        if write_files {
+            // Atomic write via temp directory on same filesystem (Lane 5)
+            let tmp_dir = self.tmp_dir();
+            let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let pid = std::process::id();
+            let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
+            let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
+
+            let pack_mtime = {
+                let mut f_pack = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_pack)?;
+                f_pack.write_all(&pack_bytes)?;
+                f_pack.flush()?;
+                f_pack.metadata().ok().and_then(|m| mtime_to_timestamp(&m))
+            };
+
+            index.pack_mtime = pack_mtime;
+            let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
+
+            {
+                let mut f_idx = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp_idx)?;
+                f_idx.write_all(&idx_bytes)?;
+                f_idx.flush()?;
+            }
+
+            rename_atomic(&tmp_pack, &final_pack)?;
+            rename_atomic(&tmp_idx, &final_idx)?;
+        }
+
+        let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
+
+        let pack_bytes_arc = Arc::new(pack_bytes);
+        let idx_bytes_arc = Arc::new(idx_bytes);
 
         // 4. Update memory-map cache
-        let buffer = if pack_bytes.is_empty() {
+        let buffer = if pack_bytes_arc.is_empty() {
             Arc::new(PackBuffer::Empty)
         } else {
-            Arc::new(PackBuffer::Bytes(Arc::new(pack_bytes)))
+            Arc::new(PackBuffer::Bytes(Arc::clone(&pack_bytes_arc)))
         };
 
         let pack = PackagePack {
             index: index.clone(),
             buffer,
-            pack_path: final_pack,
-            idx_path: final_idx,
+            pack_path: final_pack.clone(),
+            idx_path: final_idx.clone(),
         };
 
         {
@@ -1334,47 +1603,32 @@ impl PackStore {
                     .find(|e| e.algorithm == Algorithm::Sha512)
                 {
                     let canon = format!("sha512-{}", data_encoding::BASE64.encode(&entry.digest));
-                    guard.insert(canon, pack);
+                    guard.insert(canon, pack.clone());
                 }
             }
         }
 
-        Ok(index)
+        Ok((
+            pack,
+            DeferredPackPayloads {
+                pack: (final_pack, pack_bytes_arc),
+                idx: (final_idx, idx_bytes_arc),
+            },
+        ))
     }
 
     fn populate_cas_parallel(&self, entries: &mut [PackFileEntry], pack_bytes: &[u8]) {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let workers = entries.len().min(16);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= entries.len() {
-                        break;
-                    }
-                    let entry = &entries[index];
-                    let start = entry.offset as usize;
-                    let end = start.saturating_add(entry.size as usize);
-                    if end <= pack_bytes.len() {
-                        let _ = self.write_cas_file(
-                            entry.cas_path.as_ref().expect("CAS path is indexed"),
-                            &pack_bytes[start..end],
-                        );
-                    }
-                });
-            }
-        });
         for entry in entries.iter_mut() {
-            if let Some(ref cas_path) = entry.cas_path {
-                if let Ok(meta) = cas_path.metadata() {
-                    let mtime = mtime_to_timestamp(&meta);
-                    entry.cas_mtime = mtime;
-                    if let Some(m) = mtime {
-                        self.set_cas_stamp(cas_path, meta.len(), m);
-                    }
+            let start = entry.offset as usize;
+            let end = start.saturating_add(entry.size as usize);
+            if end <= pack_bytes.len() {
+                if let Some(ref cas_path) = entry.cas_path {
+                    let _ = Self::write_cas_file_create_new(cas_path, &pack_bytes[start..end]);
+                    entry.cas_verified = true;
                 }
             }
         }
+        self.has_cas_files.store(true, Ordering::Relaxed);
     }
 
     /// Extract a tarball into the pack store atomically.
@@ -1383,7 +1637,8 @@ impl PackStore {
         integrity: &str,
         tarball_bytes: &[u8],
     ) -> Result<PackIndex, CacheError> {
-        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, true)
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, true, None)
+            .map(|p| p.index)
     }
 
     /// Cold-install variant that defers per-file CAS writes.
@@ -1392,17 +1647,58 @@ impl PackStore {
         integrity: &str,
         tarball_bytes: &[u8],
     ) -> Result<PackIndex, CacheError> {
-        self.put_package_from_tarball_with_cas(integrity, tarball_bytes, false)
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, true, None)
+            .map(|p| p.index)
     }
 
-    fn put_package_from_tarball_with_cas(
+    /// Cold-install variant: takes already-verified tarball bytes, defers per-file CAS writes,
+    /// skips redundant SHA-512 re-hashing, and returns the constructed `PackagePack`.
+    pub fn put_package_from_verified_tarball_deferred(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, false, None)
+    }
+
+    pub fn put_package_from_verified_tarball_deferred_and_extract(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, false, false, target_dir)
+    }
+
+    /// Takes already-verified tarball bytes, populates per-file CAS writes,
+    /// skips redundant SHA-512 re-hashing, and returns the constructed `PackagePack`.
+    pub fn put_package_from_verified_tarball(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, false, None)
+    }
+
+    pub fn put_package_from_verified_tarball_and_extract(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, false, target_dir)
+    }
+
+    fn put_package_from_tarball_internal(
         &self,
         integrity: &str,
         tarball_bytes: &[u8],
         populate_cas: bool,
-    ) -> Result<PackIndex, CacheError> {
+        verify_integrity: bool,
+        target_dir: Option<&Path>,
+    ) -> Result<PackagePack, CacheError> {
         let trimmed = integrity.trim();
-        if !trimmed.is_empty() {
+        if verify_integrity && !trimmed.is_empty() {
             match trimmed.parse::<Integrity>() {
                 Ok(expected_integ) => {
                     if let Err(e) = expected_integ.verify(tarball_bytes) {
@@ -1434,6 +1730,7 @@ impl PackStore {
             }
         }
 
+        let t_gz = std::time::Instant::now();
         let reader: Box<dyn Read> = if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
             Box::new(GzDecoder::new(tarball_bytes))
         } else {
@@ -1444,10 +1741,19 @@ impl PackStore {
         let limits = rnpm_fs::TarLimits::default();
         let mut file_payloads_map: HashMap<String, (String, u32, Vec<u8>)> = HashMap::new();
         let mut file_payloads_order = Vec::new();
-        let mut saw_npmignores: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut saw_npmignores: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
         let entries = archive.entries().map_err(CacheError::Io)?;
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
+
+        let mut created_dirs = if let Some(target) = target_dir {
+            let mut set = std::collections::HashSet::new();
+            set.insert(target.to_path_buf());
+            Some(set)
+        } else {
+            None
+        };
 
         for entry_res in entries {
             let mut entry = entry_res.map_err(CacheError::Io)?;
@@ -1517,16 +1823,15 @@ impl PackStore {
                 }));
             }
 
-            if let Ok(entry_size) = entry.header().size() {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    }));
-                }
+            let entry_size = entry.header().size().unwrap_or(0);
+            if entry_size > limits.max_single_entry_size {
+                return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                }));
             }
 
             let clean_path = relative_path.to_string_lossy().replace('\\', "/");
@@ -1541,7 +1846,7 @@ impl PackStore {
                 .header()
                 .mode()
                 .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE);
-            let mut data = Vec::new();
+            let mut data = Vec::with_capacity((entry_size as usize).min(1024 * 1024));
             let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
             take_reader.read_to_end(&mut data).map_err(CacheError::Io)?;
             if data.len() as u64 > limits.max_single_entry_size {
@@ -1562,12 +1867,37 @@ impl PackStore {
                 }));
             }
 
-            // Deduplicate by lowercased path, ensuring LAST entry wins
-            let lower_key = norm_path.to_lowercase();
-            if !file_payloads_map.contains_key(&lower_key) {
-                file_payloads_order.push(lower_key.clone());
+            if let (Some(target), Some(ref mut dirs)) = (target_dir, &mut created_dirs) {
+                let clean_p = if cfg!(windows) && norm_path.contains('/') {
+                    norm_path.replace('/', "\\")
+                } else {
+                    norm_path.clone()
+                };
+                let full = target.join(clean_p);
+                if let Some(parent) = full.parent() {
+                    if !dirs.contains(parent) {
+                        let _ = std::fs::create_dir_all(parent);
+                        let mut curr = parent;
+                        while curr != target && dirs.insert(curr.to_path_buf()) {
+                            if let Some(p) = curr.parent() {
+                                curr = p;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = rnpm_fs::write_file_fast(&full, &data, mode, 64 * 1024);
             }
-            file_payloads_map.insert(lower_key, (norm_path, mode, data));
+
+            if populate_cas || target_dir.is_none() {
+                // Deduplicate by lowercased path, ensuring LAST entry wins
+                let lower_key = norm_path.to_lowercase();
+                if !file_payloads_map.contains_key(&lower_key) {
+                    file_payloads_order.push(lower_key.clone());
+                }
+                file_payloads_map.insert(lower_key, (norm_path, mode, data));
+            }
         }
 
         if total_uncompressed > 50_000 && !tarball_bytes.is_empty() {
@@ -1581,6 +1911,28 @@ impl PackStore {
                     ),
                 }));
             }
+        }
+
+        let gz_dur = t_gz.elapsed();
+        TIME_GZ_PARSE.fetch_add(gz_dur.as_nanos() as u64, Ordering::Relaxed);
+
+        if target_dir.is_some() && !populate_cas {
+            let (_prefix, _safe_stem, sha512_hex) = Self::integrity_key_parts(integrity);
+            let dummy_index = PackIndex {
+                integrity: integrity.to_string(),
+                sha512_hex,
+                total_pack_size: 0,
+                pack_checksum: None,
+                pack_mtime: None,
+                files: Vec::new(),
+                symlinks: Vec::new(),
+            };
+            return Ok(PackagePack {
+                index: dummy_index,
+                buffer: Arc::new(PackBuffer::Empty),
+                pack_path: PathBuf::new(),
+                idx_path: PathBuf::new(),
+            });
         }
 
         let file_payloads: Vec<(String, u32, Vec<u8>)> = file_payloads_order
@@ -1598,6 +1950,59 @@ impl PackStore {
             .collect();
 
         self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
+    }
+
+    /// Decodes a package tarball directly in memory without writing to disk,
+    /// returning files, directories, and symlinks ready for parallel materialization.
+    pub fn decode_package_tarball(
+        tarball_bytes: &[u8],
+        target_dir: &Path,
+        pkg_key: &str,
+    ) -> Result<DecodedPackage, CacheError> {
+        let decoded =
+            rnpm_fs::decode_tar_entries(tarball_bytes, target_dir, None, Some(pkg_key.to_string()))
+                .map_err(CacheError::Fs)?;
+        let mut files = decoded.files;
+        let mut positions: HashMap<PathBuf, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| (file.path.clone(), i))
+            .collect();
+        // Include hardlink payloads in the pack so subsequent warm installs
+        // retain them even on filesystems where linking is unavailable.
+        for (link, target) in decoded.hardlinks {
+            let source = positions.get(&target).copied().ok_or_else(|| {
+                CacheError::InvalidPack(format!("Hardlink target missing: {}", target.display()))
+            })?;
+            let mut file = files[source].clone();
+            file.path = link.clone();
+            positions.insert(link, files.len());
+            files.push(file);
+        }
+        let mut dirs = decoded.directories;
+        dirs.push(rnpm_fs::to_verbatim_path(target_dir));
+        for file in &files {
+            if let Some(parent) = file.path.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        let symlinks: Vec<_> = decoded
+            .symlinks
+            .into_iter()
+            .map(|(link, target)| {
+                if let Some(parent) = link.parent() {
+                    dirs.push(parent.to_path_buf());
+                }
+                (link, rnpm_fs::to_verbatim_path(target_dir).join(target))
+            })
+            .collect();
+        dirs.sort_unstable();
+        dirs.dedup();
+        Ok(DecodedPackage {
+            files,
+            dirs,
+            symlinks,
+        })
     }
 
     /// Checks whether block cloning from this store into `target_dir` is supported,
@@ -1820,6 +2225,9 @@ fn is_destination_valid(to: &Path) -> bool {
 /// mapped the file or holds a lock, and the destination files already exist and are valid,
 /// treat it as success rather than failing the install.
 fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
     let mut attempts = 0;
     let mut delay = Duration::from_millis(5);
     loop {
@@ -2680,5 +3088,159 @@ mod tests {
             fs::read(target.path().join("index.js")).unwrap(),
             original_data
         );
+    }
+
+    #[test]
+    fn test_decode_package_tarball_duplicate_entries_differing_content_later_wins() {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut enc);
+
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_size(b"first version of file".len() as u64);
+            header1.set_mode(0o644);
+            header1.set_cksum();
+            tar.append_data(
+                &mut header1,
+                "package/lib/index.js",
+                &b"first version of file"[..],
+            )
+            .unwrap();
+
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_size(b"second version of file (later wins)".len() as u64);
+            header2.set_mode(0o755);
+            header2.set_cksum();
+            tar.append_data(
+                &mut header2,
+                "package/./lib/index.js",
+                &b"second version of file (later wins)"[..],
+            )
+            .unwrap();
+
+            tar.finish().unwrap();
+        }
+        let tarball_bytes = enc.finish().unwrap();
+        let target_dir = tempdir().unwrap();
+        let decoded =
+            PackStore::decode_package_tarball(&tarball_bytes, target_dir.path(), "test-dup-pkg")
+                .expect("decode_package_tarball must succeed with duplicate entries");
+
+        // Must be deduplicated to exactly 1 file entry, with the later content and mode winning
+        assert_eq!(decoded.files.len(), 1);
+        assert_eq!(
+            decoded.files[0].data.as_slice(),
+            b"second version of file (later wins)"
+        );
+        assert_eq!(decoded.files[0].mode, 0o755);
+    }
+
+    #[test]
+    fn test_pack_store_startup_cost_lazy_vs_eager() {
+        let dir1 = tempdir().unwrap();
+        let t_lazy_start = std::time::Instant::now();
+        let store_lazy = PackStore::new(dir1.path()).unwrap();
+        let lazy_dur = t_lazy_start.elapsed();
+
+        // Verify lazy startup does not create prefix directories up front
+        let packs_dir = store_lazy.packs_dir();
+        assert!(packs_dir.is_dir());
+        let initial_prefix_count = fs::read_dir(&packs_dir).unwrap().count();
+        assert_eq!(
+            initial_prefix_count, 0,
+            "Lazy pack store must not eagerly create prefix dirs"
+        );
+
+        // Verify ensure_pack_prefix_dir creates prefix dir on demand and memoizes
+        let p1 = store_lazy.ensure_pack_prefix_dir("ab").unwrap();
+        assert!(p1.is_dir());
+        assert_eq!(fs::read_dir(&packs_dir).unwrap().count(), 1);
+        let p2 = store_lazy.ensure_pack_prefix_dir("ab").unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(fs::read_dir(&packs_dir).unwrap().count(), 1);
+
+        let dir2 = tempdir().unwrap();
+        let t_eager_start = std::time::Instant::now();
+        let packs = dir2.path().join("packs");
+        let cas = dir2.path().join("cas");
+        fs::create_dir_all(&packs).unwrap();
+        fs::create_dir_all(&cas).unwrap();
+        for b in 0..=255u8 {
+            let hex = format!("{b:02x}");
+            let _ = fs::create_dir(packs.join(&hex));
+            let _ = fs::create_dir(cas.join(&hex));
+        }
+        let eager_dur = t_eager_start.elapsed();
+
+        eprintln!(
+            "[STARTUP_BENCH] PackStore::new (lazy memoized): {:.2} ms",
+            lazy_dur.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[STARTUP_BENCH] PackStore::new (eager 256 dirs): {:.2} ms",
+            eager_dur.as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    fn decoded_pack_preserves_relative_symlinks_and_hardlink_payloads_on_disk() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(7);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/lib/data.js", &b"payload"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        tar.append_link(&mut link, "package/lib/link.js", "data.js")
+            .unwrap();
+        let mut hardlink = tar::Header::new_gnu();
+        hardlink.set_entry_type(tar::EntryType::Link);
+        hardlink.set_size(0);
+        hardlink.set_mode(0o644);
+        tar.append_link(&mut hardlink, "package/hard.js", "package/lib/data.js")
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let target = tempdir().unwrap();
+        let store_root = tempdir().unwrap();
+        let decoded = PackStore::decode_package_tarball(&bytes, target.path(), "links").unwrap();
+        assert_eq!(decoded.files.len(), 2);
+        let store = PackStore::new(store_root.path()).unwrap();
+        store
+            .put_decoded_package("sha512-links", target.path(), &decoded, false)
+            .unwrap();
+        drop(store);
+        let store = PackStore::new(store_root.path()).unwrap();
+        let pack = store.get_package_pack("sha512-links").unwrap().unwrap();
+        assert_eq!(
+            pack.index.symlinks,
+            vec![("lib/link.js".to_string(), "lib/data.js".to_string())]
+        );
+        let warm = tempdir().unwrap();
+        store
+            .materialize_pack("sha512-links", warm.path(), None)
+            .unwrap();
+        assert_eq!(
+            fs::read(warm.path().join("lib/link.js")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(fs::read(warm.path().join("hard.js")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn decoded_pack_rejects_escaping_symlink() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        tar.append_link(&mut link, "package/link", "../../outside")
+            .unwrap();
+        let bytes = tar.into_inner().unwrap();
+        let target = tempdir().unwrap();
+        assert!(PackStore::decode_package_tarball(&bytes, target.path(), "escape").is_err());
     }
 }

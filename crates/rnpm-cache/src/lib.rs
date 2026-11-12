@@ -18,7 +18,10 @@ pub use error::{CacheError, PackError};
 pub use index::IndexEntry;
 pub use lock::CacheLock;
 pub use pack_store::{
-    PackFileEntry, PackIndex, PackInputFile, PackStore, PackagePack, PACK_ALIGNMENT,
+    CasWriteJob, DecodedPackage, PackFileEntry, PackIndex, PackInputFile, PackStore, PackagePack,
+    PACK_ALIGNMENT, TIME_CAS_WRITE, TIME_GZ_PARSE, TIME_PACK_WRITE,
+    TIME_EXTRACT_DIRS, TIME_EXTRACT_CAS_WRITE, TIME_EXTRACT_LINK,
+    COUNT_LINK_OK, COUNT_LINK_FAIL,
 };
 pub use storage::{packument_key, Cache, VerifyReport};
 
@@ -1178,6 +1181,22 @@ mod tests {
             .unwrap()
             .expect("Must retrieve final entry");
         assert_eq!(final_data, b"final data");
+    }
+
+    #[test]
+    fn test_direct_blob_write_repairs_corruption_and_reports_io_errors() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let data = b"verified blob payload";
+        let hex = cache.put_blob(data, None).unwrap();
+        let path = cache.blob_path(&hex);
+        std::fs::write(&path, b"corrupt").unwrap();
+        cache.put_blob_direct(data, &hex).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(cache.put_blob_direct(data, &hex).is_err());
     }
 
     #[test]
