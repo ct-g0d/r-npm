@@ -5684,39 +5684,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Fund { package, json } => {
-            let count = audit::count_funding_packages(&current_dir);
-            let manifest_path = current_dir.join("package.json");
-            let (pkg_name, pkg_version) = if manifest_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let n = val.get("name").and_then(|v| v.as_str()).unwrap_or("project").to_string();
-                        let v = val.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
-                        (n, v)
-                    } else {
-                        ("project".to_string(), "1.0.0".to_string())
-                    }
-                } else {
-                    ("project".to_string(), "1.0.0".to_string())
-                }
-            } else {
-                ("project".to_string(), "1.0.0".to_string())
-            };
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "length": count,
-                        "name": pkg_name,
-                        "version": pkg_version,
-                        "dependencies": {}
-                    }))?
-                );
-            } else if let Some(package) = package {
-                println!("{package}: funding metadata is available in package.json");
-            } else {
-                println!("{pkg_name}@{pkg_version}");
-            }
+            commands::fund::run(&current_dir, package, json).await?;
         }
         Commands::Explain { package, json } => {
             explain::run_explain(&current_dir, &package, json)?;

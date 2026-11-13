@@ -41,3 +41,5 @@ pub mod client_helper;
 pub mod edit;
 pub mod explore;
 pub mod help_search;
+
+pub mod fund;
