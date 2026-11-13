@@ -189,11 +189,12 @@ fn test_unsupported_commands_gate_e_diagnostics() {
 
 #[test]
 fn test_unsupported_flags_gate_e_diagnostics() {
-    // npm 11 accepts --production (as --omit=dev); --save-bundle is not implemented.
+    // npm 11 accepts --production (as --omit=dev) and --save-bundle.
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--production"]).is_none());
-    let flags = ["--save-bundle"];
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
+    let flags = ["--legacy-peer-deps", "--strict-peer-deps"];
     for flag in flags {
-        let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+        let res = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
         assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
         let (code, msg) = res.unwrap();
         assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
@@ -1252,10 +1253,11 @@ async fn test_cli_audit_unsupported_command_filtering() {
 
 #[tokio::test]
 async fn test_cli_unsupported_flags_filtering() {
-    let test_flags = ["--save-bundle"];
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
+    let test_flags = ["--legacy-peer-deps", "--strict-peer-deps"];
 
     for flag in test_flags {
-        let check = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+        let check = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
         assert!(
             check.is_some(),
             "Expected unsupported flag check to trigger for '{flag}'"
