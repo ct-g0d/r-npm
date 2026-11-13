@@ -1299,7 +1299,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code_p, 1);
-        assert!(output_p.contains("chalk@2.4.2:chalk@2.4.0:chalk@6.0.1:my-app"));
+        assert!(output_p.contains(&format!(
+            "chalk@2.4.2:chalk@2.4.0:chalk@6.0.1:{}",
+            project_dir.file_name().unwrap().to_str().unwrap()
+        )));
 
         let _ = mock_server.shutdown.send(());
     }
