@@ -498,28 +498,14 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
     })
     .unwrap();
 
-    let summary = installer.run().await.unwrap();
-    assert_eq!(summary.packages_installed, 1);
-
-    // Verify that version 2.0.0 was installed because of override
-    let pkg_json = std::fs::read_to_string(
-        temp_proj
-            .path()
-            .join("node_modules")
-            .join("dep-pkg")
-            .join("package.json"),
-    )
-    .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&pkg_json).unwrap();
-    assert_eq!(parsed["version"], "2.0.0");
-
-    // Verify that overrides field is not emitted into root lockfile descriptor (Arborist alignment)
-    let lockfile = LockfileV3::load_from_file(&temp_proj.path().join("package-lock.json")).unwrap();
-    let root_pkg = lockfile.packages.get("").expect("Root package entry");
+    // Arborist's assertRootOverrides: an override may not change the spec of
+    // one of the root's own dependencies (npm fails with EOVERRIDE).
+    let err = installer.run().await.unwrap_err();
     assert!(
-        !root_pkg.extra.contains_key("overrides"),
-        "Overrides must not be emitted into root lockfile descriptor"
+        err.to_string().contains("npm error code EOVERRIDE"),
+        "unexpected error: {err:#}"
     );
+    assert!(!temp_proj.path().join("node_modules").join("dep-pkg").exists());
 }
 
 #[tokio::test]

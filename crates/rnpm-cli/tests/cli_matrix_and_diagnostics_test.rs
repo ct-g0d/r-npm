@@ -390,8 +390,8 @@ fn test_additional_aliases_and_flag_routing() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Search the registry"));
 
-    // Additional unsupported flags --production on install
-    let flag_args = ["install", "--production"];
+    // --save-bundle is still unsupported (npm 11 accepts --production as --omit=dev).
+    let flag_args = ["install", "--save-bundle"];
     let output = Command::new(rnpm_bin)
         .args(flag_args)
         .output()

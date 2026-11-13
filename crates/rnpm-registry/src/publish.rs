@@ -169,20 +169,18 @@ mod tests {
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
         assert_eq!(version_doc["dist"]["integrity"], "sha512-dummy==");
+        // libnpmpublish rewrites https to http in dist.tarball.
         assert_eq!(
             version_doc["dist"]["tarball"],
-            "https://registry.npmjs.org/my-pkg/-/my-pkg-1.0.0.tgz"
+            "http://registry.npmjs.org/my-pkg/-/my-pkg-1.0.0.tgz"
         );
 
         // Verify attachments
         let attachment = &payload["_attachments"]["my-pkg-1.0.0.tgz"];
         assert_eq!(attachment["content_type"], "application/octet-stream");
         assert_eq!(attachment["length"], tarball_bytes.len());
-        assert_eq!(
-            attachment["shasum"],
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
-        assert_eq!(attachment["integrity"], "sha512-dummy==");
+        assert!(attachment.get("shasum").is_none());
+        assert!(attachment.get("integrity").is_none());
         assert_eq!(attachment["data"], BASE64.encode(tarball_bytes));
     }
 
@@ -218,14 +216,14 @@ mod tests {
 
         assert_eq!(payload["_id"], "@my-org/my-pkg");
         assert_eq!(payload["name"], "@my-org/my-pkg");
-        assert_eq!(payload["description"], "");
+        assert!(payload.get("description").is_none());
         assert_eq!(payload["dist-tags"]["next"], "2.1.0-beta.1");
         assert_eq!(payload["access"], "restricted");
 
         let version_doc = &payload["versions"]["2.1.0-beta.1"];
         assert_eq!(
             version_doc["dist"]["tarball"],
-            "https://registry.npmjs.org/@my-org%2fmy-pkg/-/my-org-my-pkg-2.1.0-beta.1.tgz"
+            "http://registry.npmjs.org/@my-org/my-pkg/-/@my-org/my-pkg-2.1.0-beta.1.tgz"
         );
     }
 }

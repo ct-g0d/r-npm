@@ -386,7 +386,9 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
     );
 
     // Verify PUT request reached mock server
-    let reqs = server.requests.lock().await;
+    // npm reads the packument (version check) before the PUT.
+    let all_reqs = server.requests.lock().await;
+    let reqs: Vec<_> = all_reqs.iter().filter(|r| r.method != "GET").collect();
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].method, "PUT");
     assert_eq!(reqs[0].path, "/lifecycle-test-pkg");
@@ -395,6 +397,7 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
         Some("Bearer secret-lifecycle-token")
     );
     drop(reqs);
+    drop(all_reqs);
 
     server.stop();
 }
@@ -532,7 +535,9 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let reqs = server.requests.lock().await;
+    // npm reads the packument (version check) before the PUT.
+    let all_reqs = server.requests.lock().await;
+    let reqs: Vec<_> = all_reqs.iter().filter(|r| r.method != "GET").collect();
     assert_eq!(reqs.len(), 1);
     let req = &reqs[0];
     assert_eq!(req.method, "PUT");
@@ -559,20 +564,18 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         .as_str()
         .unwrap()
         .starts_with("sha512-"));
+    // libnpmpublish builds these from the raw package name.
     assert_eq!(
         version_entry["dist"]["tarball"],
-        format!("{server_url}@cool%2fawesome-lib/-/cool-awesome-lib-3.5.0.tgz")
+        format!("{server_url}@cool/awesome-lib/-/@cool/awesome-lib-3.5.0.tgz")
     );
 
-    let attachment = &doc["_attachments"]["cool-awesome-lib-3.5.0.tgz"];
+    let attachment = &doc["_attachments"]["@cool/awesome-lib-3.5.0.tgz"];
     assert_eq!(attachment["content_type"], "application/octet-stream");
     assert!(attachment["data"].as_str().unwrap().len() > 10);
-    assert!(attachment["shasum"].is_string());
-    assert!(attachment["integrity"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha512-"));
+    assert!(attachment["length"].is_number());
     drop(reqs);
+    drop(all_reqs);
 
     server.stop();
 }
@@ -623,10 +626,12 @@ async fn test_cli_publish_error_codes_diagnostics() {
     assert!(!out1.status.success());
     let err1 = String::from_utf8_lossy(&out1.stderr);
     assert!(
-        err1.contains("npm error code EPUBLISHCONFLICT"),
-        "Expected EPUBLISHCONFLICT in: {err1}"
+        err1.contains("npm error code E409"),
+        "Expected E409 in: {err1}"
     );
-    assert!(err1.contains("Cannot publish over existing version."));
+    // npm-registry-fetch reports the HTTP status; npm 11 has no producer
+    // of EPUBLISHCONFLICT.
+    assert!(err1.contains("409 Conflict - PUT"));
 
     // 2. Unauthorized 401 -> ENEEDAUTH
     let tmp2 = tempdir().unwrap();
@@ -652,8 +657,8 @@ async fn test_cli_publish_error_codes_diagnostics() {
     assert!(!out2.status.success());
     let err2 = String::from_utf8_lossy(&out2.stderr);
     assert!(
-        err2.contains("npm error code ENEEDAUTH"),
-        "Expected ENEEDAUTH in: {err2}"
+        err2.contains("npm error code E401"),
+        "Expected E401 in: {err2}"
     );
 
     // 3. Forbidden 403 -> E403

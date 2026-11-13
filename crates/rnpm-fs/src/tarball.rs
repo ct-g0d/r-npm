@@ -1728,41 +1728,6 @@ fn match_segment(pattern: &str, text: &str) -> bool {
 /// Sort helper for npm pack files:
 /// Files starting with uppercase letter come first (alphabetical),
 /// followed by others (alphabetical).
-#[cfg(test)]
-mod glob_tests {
-    use super::{match_glob, match_glob_or_parent};
-
-    #[test]
-    fn globstar_matches_any_depth_including_none() {
-        assert!(match_glob("secrets/**/*.pem", "secrets/prod/key.pem"));
-        assert!(match_glob("secrets/**/*.pem", "secrets/key.pem"));
-        assert!(match_glob("dist/**/*.js", "dist/sub/deep/index.js"));
-        assert!(!match_glob("dist/**/*.js", "dist/sub/index.ts"));
-        assert!(!match_glob("dist/*.js", "dist/sub/index.js"));
-    }
-
-    #[test]
-    fn classes_braces_and_question_marks() {
-        assert!(match_glob("lib/*.{js,cjs}", "lib/a.cjs"));
-        assert!(!match_glob("lib/*.{js,cjs}", "lib/a.ts"));
-        assert!(match_glob("file?.txt", "file1.txt"));
-        assert!(match_glob("v[0-9].js", "v7.js"));
-        assert!(!match_glob("v[!0-9].js", "v7.js"));
-    }
-
-    #[test]
-    fn wildcards_skip_dotfiles_like_minimatch() {
-        assert!(!match_glob("*", ".env"));
-        assert!(!match_glob("**/*.js", ".hidden/a.js"));
-    }
-
-    #[test]
-    fn matched_directories_cover_their_contents() {
-        assert!(match_glob_or_parent("secrets/prod", "secrets/prod/key.pem"));
-        assert!(!match_glob_or_parent("secrets/prod", "secrets/production/key.pem"));
-    }
-}
-
 fn sort_pack_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
     let a_first_char = a.chars().next().unwrap_or('\0');
     let b_first_char = b.chars().next().unwrap_or('\0');
@@ -2065,4 +2030,39 @@ fn is_file_executable(path: &Path) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::{match_glob, match_glob_or_parent};
+
+    #[test]
+    fn globstar_matches_any_depth_including_none() {
+        assert!(match_glob("secrets/**/*.pem", "secrets/prod/key.pem"));
+        assert!(match_glob("secrets/**/*.pem", "secrets/key.pem"));
+        assert!(match_glob("dist/**/*.js", "dist/sub/deep/index.js"));
+        assert!(!match_glob("dist/**/*.js", "dist/sub/index.ts"));
+        assert!(!match_glob("dist/*.js", "dist/sub/index.js"));
+    }
+
+    #[test]
+    fn classes_braces_and_question_marks() {
+        assert!(match_glob("lib/*.{js,cjs}", "lib/a.cjs"));
+        assert!(!match_glob("lib/*.{js,cjs}", "lib/a.ts"));
+        assert!(match_glob("file?.txt", "file1.txt"));
+        assert!(match_glob("v[0-9].js", "v7.js"));
+        assert!(!match_glob("v[!0-9].js", "v7.js"));
+    }
+
+    #[test]
+    fn wildcards_skip_dotfiles_like_minimatch() {
+        assert!(!match_glob("*", ".env"));
+        assert!(!match_glob("**/*.js", ".hidden/a.js"));
+    }
+
+    #[test]
+    fn matched_directories_cover_their_contents() {
+        assert!(match_glob_or_parent("secrets/prod", "secrets/prod/key.pem"));
+        assert!(!match_glob_or_parent("secrets/prod", "secrets/production/key.pem"));
+    }
 }

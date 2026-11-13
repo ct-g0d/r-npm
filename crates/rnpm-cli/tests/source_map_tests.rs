@@ -28,8 +28,9 @@ fn test_source_map_01_cli_dispatch() {
     // Test version
     let out = Command::new(rnpm_bin).arg("--version").output().unwrap();
     assert!(out.status.success());
+    // Like npm, --version prints the bare npm release that tools parse.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("rnpm"));
+    assert_eq!(stdout.trim(), "11.20.0");
 
     // Test help
     let out = Command::new(rnpm_bin).arg("--help").output().unwrap();

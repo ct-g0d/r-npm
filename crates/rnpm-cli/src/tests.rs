@@ -189,7 +189,9 @@ fn test_unsupported_commands_gate_e_diagnostics() {
 
 #[test]
 fn test_unsupported_flags_gate_e_diagnostics() {
-    let flags = ["--production", "--save-bundle"];
+    // npm 11 accepts --production (as --omit=dev); --save-bundle is not implemented.
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--production"]).is_none());
+    let flags = ["--save-bundle"];
     for flag in flags {
         let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
         assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
@@ -1250,7 +1252,7 @@ async fn test_cli_audit_unsupported_command_filtering() {
 
 #[tokio::test]
 async fn test_cli_unsupported_flags_filtering() {
-    let test_flags = ["--production"];
+    let test_flags = ["--save-bundle"];
 
     for flag in test_flags {
         let check = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
