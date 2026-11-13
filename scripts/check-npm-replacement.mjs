@@ -211,6 +211,10 @@ add('version-short-flag','version',['-v']);
 add('lockfile-indent-one-line-manifest','install',['install','dep@1.0.0'],dir=>write(dir,'package.json','{"name":"readiness-case","version":"1.0.0"}'));
 add('script-env-contract','run',['run','env'],dir=>manifest(dir,{scripts:{env:"node -e \"for(const k of ['npm_config_user_agent','npm_node_execpath','npm_config_local_prefix','npm_config_prefix','npm_config_global_prefix','npm_config_cache','npm_config_userconfig','npm_config_node_gyp','npm_config_npm_version'])console.log(k+'='+process.env[k])\"",child:'node -p 123',nested:"node -e \"process.exit(require('child_process').spawnSync(process.execPath,[process.env.npm_execpath,'run','child'],{stdio:'inherit'}).status)\""}}));
 add('script-npm-execpath-node','run',['run','nested'],dir=>manifest(dir,{scripts:{child:'node -p 123',nested:"node -e \"process.exit(require('child_process').spawnSync(process.execPath,[process.env.npm_execpath,'run','child'],{stdio:'inherit'}).status)\""}}));
+add('production-flag','install',['install','--production'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},devDependencies:{parent:'1.0.0'}}));
+add('override-conflicts-direct','install',['install'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},overrides:{dep:'2.0.0'}}));
+add('override-reference-ok','install',['install'],dir=>manifest(dir,{dependencies:{dep:'1.0.0',parent:'1.0.0'},overrides:{dep:'$dep'}}));
+add('config-get-several','config',['config','get','fetch-retries','strict-ssl','save-prefix']);
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

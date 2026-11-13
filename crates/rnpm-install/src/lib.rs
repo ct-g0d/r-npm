@@ -1384,6 +1384,45 @@ fn npm_error_lines(message: &str) -> String {
         .join("\n")
 }
 
+/// Arborist's `assertRootOverrides`: an override that changes the spec of
+/// one of the root's own dependencies (other than a `$name` reference) is
+/// an EOVERRIDE error.
+fn assert_root_overrides(manifest: &Manifest) -> Result<()> {
+    let Some(overrides) = manifest.extra.get("overrides").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    let direct = manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.optional_dependencies)
+        .chain(&manifest.dev_dependencies)
+        .chain(&manifest.peer_dependencies);
+    for (name, raw_spec) in direct {
+        for (key, value) in overrides {
+            let key_name = match key.strip_prefix('@') {
+                Some(rest) => rest.split_once('@').map(|(n, _)| format!("@{n}")).unwrap_or_else(|| key.clone()),
+                None => key.split('@').next().unwrap_or(key).to_string(),
+            };
+            if &key_name != name {
+                continue;
+            }
+            let replacement = match value {
+                serde_json::Value::String(s) => Some(s.as_str()),
+                serde_json::Value::Object(o) => o.get(".").and_then(|v| v.as_str()),
+                _ => None,
+            };
+            if let Some(spec) = replacement {
+                if !spec.starts_with('$') && spec != raw_spec {
+                    return Err(anyhow!(
+                        "npm error code EOVERRIDE\nnpm error Override for {name}@{raw_spec} conflicts with direct dependency"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn relative_posix_path(from: &Path, to: &Path) -> String {
     if let Ok(rel) = to.strip_prefix(from) {
         let s = rel.to_string_lossy();
@@ -1611,6 +1650,7 @@ impl Installer {
         manifest: &Manifest,
         workspace_members: &[WorkspaceMember],
     ) -> Result<()> {
+        assert_root_overrides(manifest)?;
         let mut declared: HashSet<String> = HashSet::new();
         let mut collect = |m: &Manifest| {
             declared.extend(m.dependencies.keys().cloned());
@@ -2156,18 +2196,8 @@ impl Installer {
                 .map_err(|e| anyhow!("Invalid package name '{dep_name}': {e}"))?;
         }
 
-        if self.options.omit_dev {
-            manifest.dev_dependencies.clear();
-            for member in &mut workspace_members {
-                member.manifest.dev_dependencies.clear();
-            }
-        }
-        if self.options.omit_optional {
-            manifest.optional_dependencies.clear();
-            for member in &mut workspace_members {
-                member.manifest.optional_dependencies.clear();
-            }
-        }
+        // npm resolves (and locks) the whole tree; --omit only limits what is
+        // reified, so dev/optional dependencies stay in the manifest here.
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             Some(
@@ -2243,7 +2273,7 @@ impl Installer {
 
         let resolver_options = ResolverOptions {
             platform: self.options.platform(),
-            dev: !self.options.omit_dev,
+            dev: true,
             legacy_peer_deps: self.options.legacy_peer_deps,
             strict_peers: !self.options.legacy_peer_deps,
             strict_peer_deps: self.options.strict_peer_deps,
@@ -3838,6 +3868,16 @@ impl Installer {
             let has_packages = graph.nodes.keys().any(|k| !k.is_empty());
             if has_packages {
                 let mut actual_lockfile = lockfile.clone();
+                // The hidden lockfile describes the tree on disk: omitted
+                // dev/optional/peer packages are not part of it.
+                let (omit_dev, omit_optional, omit_peer) =
+                    (self.options.omit_dev, self.options.omit_optional, self.options.omit_peer);
+                actual_lockfile.packages.retain(|location, pkg| {
+                    location.is_empty()
+                        || !((omit_dev && pkg.is_effective_dev())
+                            || (omit_optional && pkg.is_effective_optional())
+                            || (omit_peer && pkg.is_peer()))
+                });
                 if let Some(locations) = &reify_locations {
                     actual_lockfile.packages.retain(|location, _| {
                         locations.contains(location)

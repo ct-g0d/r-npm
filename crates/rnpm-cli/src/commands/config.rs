@@ -10,7 +10,9 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             global,
             location,
         } => run_set(&key, value.as_deref(), global, location.as_deref(), &current_dir)?,
-        ConfigAction::Get { key } => run_get(key.as_deref(), &current_dir)?,
+        ConfigAction::Get { key, extra_keys } => {
+            run_get_keys(key.as_deref(), &extra_keys, &current_dir)?
+        }
         ConfigAction::Delete {
             key,
             global,
@@ -45,13 +47,33 @@ pub(crate) fn run_set(
     Ok(())
 }
 
+/// `npm config get a b c` prints `key=value` lines; one key prints the value.
+pub(crate) fn run_get_keys(key: Option<&str>, extra: &[String], current_dir: &Path) -> Result<()> {
+    if extra.is_empty() {
+        return run_get(key, current_dir);
+    }
+    let config = rnpm_config::Config::load(Some(current_dir))?;
+    for k in key.into_iter().chain(extra.iter().map(String::as_str)) {
+        let value = config
+            .get(k)
+            .map(str::to_string)
+            .or_else(|| rnpm_config::npm_default(k))
+            .unwrap_or_else(|| "undefined".into());
+        println!("{k}={value}");
+    }
+    Ok(())
+}
+
 pub(crate) fn run_get(key: Option<&str>, current_dir: &Path) -> Result<()> {
     if let Some(key_str) = key {
         let config = rnpm_config::Config::load(Some(current_dir))?;
-        if let Some(val) = config.get(key_str) {
-            println!("{val}");
-        } else {
-            println!("undefined");
+        match config
+            .get(key_str)
+            .map(str::to_string)
+            .or_else(|| rnpm_config::npm_default(key_str))
+        {
+            Some(val) => println!("{val}"),
+            None => println!("undefined"),
         }
     } else {
         let opts = rnpm_config::ConfigOptions::new().project_dir(current_dir);

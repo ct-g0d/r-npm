@@ -1432,6 +1432,8 @@ pub(crate) enum Commands {
     Get {
         /// Configuration key to retrieve
         key: Option<String>,
+        /// Further keys (`key=value` lines are printed for several keys)
+        extra_keys: Vec<String>,
     },
 
     /// Set a configuration value (npm set alias)
@@ -1551,6 +1553,8 @@ pub(crate) enum ConfigAction {
     Get {
         /// Configuration key to retrieve
         key: Option<String>,
+        /// Further keys (`key=value` lines are printed for several keys)
+        extra_keys: Vec<String>,
     },
     /// Delete a configuration key
     #[command(alias = "rm", alias = "del")]
@@ -1734,7 +1738,6 @@ where
         "--legacy-peer-deps",
         "--strict-peer-deps",
         "--save-bundle",
-        "--production",
     ];
 
     let mut i = 0;
@@ -2200,6 +2203,13 @@ where
             // npm accepts the lowercase short form as an alias for --version.
             // clap's generated version flag is -V, so normalize it before parsing.
             result.push("--version".to_string());
+        } else if arg == "--production"
+            && args.get(1).is_some_and(|c| c != "prune")
+        {
+            if !args.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent") {
+                eprintln!("npm warn config production Use `--omit=dev` instead.");
+            }
+            result.push("--omit=dev".to_string());
         } else if arg == "--legacy-bundling" {
             result.push("--install-strategy=nested".to_string());
         } else if arg == "--global-style" {
@@ -5870,8 +5880,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 "npm error code ENOTSUP\nnpm error hook is not supported by the active registry"
             ));
         }
-        Commands::Get { key } => {
-            commands::config::run_get(key.as_deref(), &current_dir)?;
+        Commands::Get { key, extra_keys } => {
+            commands::config::run_get_keys(key.as_deref(), &extra_keys, &current_dir)?;
         }
         Commands::Set {
             key,

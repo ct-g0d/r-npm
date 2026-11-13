@@ -19,6 +19,8 @@ pub use npm_keys::{
     is_boolean_npm_config_key, is_known_npm_config_key, normalize_config_key,
     NPM_BOOLEAN_CONFIG_KEYS, NPM_CONFIG_KEYS,
 };
+mod npm_defaults;
+pub use npm_defaults::npm_default;
 pub use error::ConfigError;
 pub use npmrc::{
     encode_package_name, interpolate_env, is_sensitive_credential_key, mask_credential,
