@@ -15,6 +15,26 @@ use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
+#[test]
+fn packument_freshness_honors_http_policy_and_age() {
+    let mut entry = rnpm_cache::IndexEntry::new("test".into(), "".into(), "".into(), 0, None);
+    assert!(!crate::is_packument_fresh(&entry, false, false));
+    for (control, age, expected) in [
+        ("public, max-age=300", "0", true),
+        ("max-age=0", "0", false),
+        ("max-age=300, no-cache", "0", false),
+        ("no-store, max-age=300", "0", false),
+        ("max-age=300", "400", false),
+    ] {
+        entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":control,"age":age}}}));
+        assert_eq!(crate::is_packument_fresh(&entry, false, false), expected, "{control}, age={age}");
+    }
+    entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":"max-age=300","date":"Thu, 01 Jan 1970 00:00:00 GMT"}}}));
+    assert!(!crate::is_packument_fresh(&entry, false, false));
+    assert!(crate::is_packument_fresh(&entry, true, false));
+    assert!(crate::is_packument_fresh(&entry, false, true));
+}
+
 #[tokio::test]
 async fn persistence_failure_waits_for_remaining_jobs() {
     for panic_first in [false, true] {

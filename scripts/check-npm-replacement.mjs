@@ -34,12 +34,12 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const probePackages=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
+const tarballs=new Map(); const probePackages=new Map(); const probeCacheControl=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
   const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{let body=Buffer.concat(chunks);if(req.headers['content-encoding']==='gzip')body=gunzipSync(body);if(body.length){try{request.body=JSON.parse(body.toString());}catch{request.body=body.toString();}}});
-  const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
+  const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':probeCacheControl.get(url.slice(1))||'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
   if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
   if(url===`/-/stage/${STAGE_ID}/tarball`){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get('/dep-1.0.0.tgz'));return;}
   if(url==='/-/ping')return json({});
@@ -233,6 +233,7 @@ for(const [name,versions] of Object.entries({
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
+  'fresh-packument':{'1.0.0':{}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -246,6 +247,8 @@ for(const [name,versions] of Object.entries({
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
+probeCacheControl.set('fresh-packument','public, max-age=300');
+add('cache-fresh-packument-skips-revalidation','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'fresh-packument':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);for(const name of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});},observe:({requests})=>({packumentRequests:requests.filter(r=>r.method==='GET'&&r.url==='/fresh-packument').length})});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
@@ -285,10 +288,12 @@ for(const c of cases){
     files['<userconfig>']=fs.existsSync(path.join(config,'user.npmrc'))?normalize(fs.readFileSync(path.join(config,'user.npmrc'),'utf8'),dir,config):null;
     if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config));
     result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
+    if(c.observe)result[tool].observation=c.observe({dir,env,requests:requests.slice(start)});
   }
   const a=result.npm,b=result.rnpm;
   const mutations=tool=>tool.requests.filter(r=>['PUT','DELETE','POST'].includes(r.method)).map(({method,url,body})=>({method,url,body:body&&typeof body==='object'&&/^org\.couchdb\.user:/.test(body._id)&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(body.date)?{...body,date:'<timestamp>'}:body}));
   result.comparison={execution:!a.execution_error&&!b.execution_error&&a.exit!==null&&b.exit!==null,exit:a.exit===b.exit,stdout:a.stdout===b.stdout,stderr:a.stderr===b.stderr,files:stable(a.files)===stable(b.files),mutations:stable(mutations(a))===stable(mutations(b))};
+  if(c.observe)result.comparison.observation=stable(a.observation)===stable(b.observation);
   result.match=Object.values(result.comparison).every(Boolean);results.push(result);
   // Keep complete comparisons and raw logs without committing multi-megabyte
   // package patches into the report. Hash the full normalized stream first.

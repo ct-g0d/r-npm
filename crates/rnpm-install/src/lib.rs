@@ -535,15 +535,57 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
     graph.edges = new_edges;
 }
 
-/// Use disk packuments without revalidation only when the user requests it.
-/// Our index retains ETags but not HTTP freshness headers, so an arbitrary TTL
-/// would also treat no-cache/max-age=0 responses as fresh.
+/// Respect the registry's HTTP freshness policy, including response Age and
+/// apparent age from Date. Entries without a policy still revalidate.
 pub fn is_packument_fresh(
-    _entry: &rnpm_cache::IndexEntry,
+    entry: &rnpm_cache::IndexEntry,
     prefer_offline: bool,
     offline: bool,
 ) -> bool {
-    offline || prefer_offline
+    if offline || prefer_offline {
+        return true;
+    }
+    let headers = entry.metadata.as_ref().and_then(|m| m.pointer("/response/headers"));
+    let Some(control) = headers.and_then(|h| h.get("cache-control")).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let mut max_age = None;
+    for directive in control.split(',').map(str::trim) {
+        let (name, value) = directive.split_once('=').unwrap_or((directive, ""));
+        if name.eq_ignore_ascii_case("no-cache") || name.eq_ignore_ascii_case("no-store") {
+            return false;
+        }
+        if name.eq_ignore_ascii_case("max-age") {
+            max_age = value.trim().trim_matches('"').parse::<u64>().ok();
+        }
+    }
+    let Some(max_age) = max_age else { return false; };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let headers = headers.unwrap();
+    let age = headers.get("age").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).saturating_mul(1000);
+    let apparent_age = headers.get("date").and_then(|v| v.as_str()).and_then(|v| httpdate::parse_http_date(v).ok())
+        .and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| entry.time.saturating_sub(date.as_millis() as u64)).unwrap_or(0);
+    age.max(apparent_age).saturating_add(now.saturating_sub(entry.time)) < max_age.saturating_mul(1000)
+}
+
+fn merge_packument_cache_metadata(mut response: serde_json::Value, etag: Option<String>, previous: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    if response.pointer("/response/headers/cache-control").is_none() {
+        if let Some(control) = previous.and_then(|m| m.pointer("/response/headers/cache-control")) {
+            response["response"]["headers"]["cache-control"] = control.clone();
+        }
+    }
+    if let Some(etag) = etag { response["etag"] = etag.into(); }
+    Some(response)
+}
+
+fn store_install_packument(cache: &Cache, registry: &str, name: &str, data: &[u8], metadata: Option<serde_json::Value>) {
+    let no_store = metadata.as_ref().and_then(|m| m.pointer("/response/headers/cache-control")).and_then(|v| v.as_str())
+        .is_some_and(|control| control.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-store")));
+    if no_store {
+        let _ = cache.purge_packument(registry, name, Some(INSTALL_PACKUMENT_ACCEPT));
+    } else {
+        let _ = cache.put_packument_with_accept(registry, name, Some(INSTALL_PACKUMENT_ACCEPT), data, metadata);
+    }
 }
 
 /// Extracts an ETag string from cacache metadata JSON.
@@ -627,13 +669,12 @@ impl RegistryPackageProvider {
             });
 
             match res {
-                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
+                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
                     let new_etag = etag.or(stored_etag);
-                    let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
-                    let _ = self.cache.put_packument_with_accept(
+                    let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, entry.metadata.as_ref());
+                    store_install_packument(&self.cache,
                         &registry_url,
                         name,
-                        Some(INSTALL_PACKUMENT_ACCEPT),
                         &data,
                         cache_meta,
                     );
@@ -647,13 +688,13 @@ impl RegistryPackageProvider {
                 Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                     metadata: abbrev,
                     etag,
+                    cache_metadata,
                 }) => {
                     if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                        let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                        let _ = self.cache.put_packument_with_accept(
+                        let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                        store_install_packument(&self.cache,
                             &registry_url,
                             name,
-                            Some(INSTALL_PACKUMENT_ACCEPT),
                             &bytes,
                             cache_meta,
                         );
@@ -701,13 +742,13 @@ impl RegistryPackageProvider {
             Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                 metadata: abbrev,
                 etag,
+                cache_metadata,
             }) => {
                 if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                    let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                    let _ = self.cache.put_packument_with_accept(
+                    let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                    store_install_packument(&self.cache,
                         &registry_url,
                         name,
-                        Some(INSTALL_PACKUMENT_ACCEPT),
                         &bytes,
                         cache_meta,
                     );
@@ -943,14 +984,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
                 let reg_url = client_c.registry_for_package(&name).as_str().to_string();
                 match res {
-                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
+                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
                         let new_etag = etag.or(stored_etag);
-                        let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
+                        let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, cached_info.as_ref().and_then(|(entry, _)| entry.metadata.as_ref()));
                         if let Some((_, ref data)) = cached_info {
-                            let _ = cache_c.put_packument_with_accept(
+                            store_install_packument(&cache_c,
                                 &reg_url,
                                 &name,
-                                Some(INSTALL_PACKUMENT_ACCEPT),
                                 data,
                                 cache_meta,
                             );
@@ -975,13 +1015,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                         metadata: abbrev,
                         etag,
+                        cache_metadata,
                     }) => {
                         if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                            let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                            let _ = cache_c.put_packument_with_accept(
+                            let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                            store_install_packument(&cache_c,
                                 &reg_url,
                                 &name,
-                                Some(INSTALL_PACKUMENT_ACCEPT),
                                 &bytes,
                                 cache_meta,
                             );

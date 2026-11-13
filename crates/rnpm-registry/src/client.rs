@@ -27,6 +27,14 @@ pub fn default_user_agent() -> String {
 /// Abbreviated metadata MIME type for npm registry.
 pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 
+fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
+    let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
+        .into_iter()
+        .filter_map(|key| headers.get(key)?.to_str().ok().map(|value| (key.into(), value.into())))
+        .collect();
+    serde_json::json!({ "response": { "headers": headers } })
+}
+
 /// Maximum number of HTTP redirects to follow before failing.
 pub const MAX_REDIRECTS: usize = 10;
 
@@ -107,9 +115,10 @@ pub enum MetadataFetchResult {
     Fresh {
         metadata: AbbreviatedPackageMetadata,
         etag: Option<String>,
+        cache_metadata: serde_json::Value,
     },
     /// Server returned HTTP 304 Not Modified; cached data is still valid.
-    NotModified { etag: Option<String> },
+    NotModified { etag: Option<String>, cache_metadata: serde_json::Value },
 }
 
 impl MetadataFetchResult {
@@ -1676,6 +1685,7 @@ impl RegistryClient {
                 .await?;
 
             let status = resp.status();
+            let cache_metadata = packument_cache_metadata(resp.headers());
             if status == StatusCode::NOT_MODIFIED {
                 let etag = resp
                     .headers()
@@ -1683,7 +1693,7 @@ impl RegistryClient {
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string())
                     .or_else(|| if_none_match.map(|s| s.to_string()));
-                return Ok(MetadataFetchResult::NotModified { etag });
+                return Ok(MetadataFetchResult::NotModified { etag, cache_metadata });
             }
 
             if status == StatusCode::NOT_FOUND {
@@ -1823,7 +1833,7 @@ impl RegistryClient {
 
             let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
             metadata.validate()?;
-            return Ok(MetadataFetchResult::Fresh { metadata, etag });
+            return Ok(MetadataFetchResult::Fresh { metadata, etag, cache_metadata });
         }
     }
 
