@@ -1,5 +1,6 @@
 // Real-registry resolver evidence. Separate npm/rnpm projects, caches, and stores.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -89,6 +90,17 @@ const revision = () => ({
 });
 if (args.includes('--benchmark')) {
   const results = [];
+  const cpuTotals = () => os.cpus().reduce((sum, cpu) => ({
+    idle: sum.idle + cpu.times.idle,
+    total: sum.total + Object.values(cpu.times).reduce((a, b) => a + b, 0),
+  }), { idle: 0, total: 0 });
+  const sampleCpu = async () => {
+    const start = cpuTotals();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const end = cpuTotals();
+    return Math.round(100 * (1 - (end.idle - start.idle) / (end.total - start.total)));
+  };
+  const host = { logical_cpus: os.cpus().length, cpu_busy_before_pct: await sampleCpu(), cpu_busy_after_pct: null };
   for (const name of ['express-typescript', 'vite-react']) {
     for (const tool of ['npm', 'rnpm']) {
       const warm = path.join(root, 'bench', name, tool, 'warm');
@@ -112,10 +124,12 @@ if (args.includes('--benchmark')) {
           runs.push(result.ms);
         }
         results.push({ name, tool, kind, runs, median_ms: [...runs].sort((a,b) => a-b)[1] });
-        write(path.join(root, 'benchmarks.json'), { ...revision(), flags: ['--ignore-scripts', 'audit=false', 'fund=false'], results });
+        write(path.join(root, 'benchmarks.json'), { ...revision(), flags: ['--ignore-scripts', 'audit=false', 'fund=false'], host, results });
       }
     }
   }
+  host.cpu_busy_after_pct = await sampleCpu();
+  write(path.join(root, 'benchmarks.json'), { ...revision(), flags: ['--ignore-scripts', 'audit=false', 'fund=false'], host, results });
 } else {
   const results = [];
   let failed = false;
