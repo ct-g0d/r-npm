@@ -1560,7 +1560,10 @@ pub fn matches_filter(
         .to_string();
     if let Ok(rel) = member_path.strip_prefix(root_dir) {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str == norm_filter || glob_match(&norm_filter, &rel_str) {
+        if rel_str == norm_filter
+            || glob_match(&norm_filter, &rel_str)
+            || rel_str.starts_with(&format!("{}/", norm_filter.trim_end_matches('/')))
+        {
             return true;
         }
     }
@@ -2054,6 +2057,23 @@ pub async fn execute_topological_with_abort(
     opts: &LifecycleOptions,
     abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
+    execute_dependency_hooks_with_abort(nodes, opts, abort_rx.clone()).await?;
+    execute_root_hooks_with_abort(root_manifest, opts, abort_rx).await
+}
+
+/// Build dependencies before persisting the reified tree's metadata.
+pub async fn execute_dependency_hooks(
+    nodes: &[LifecyclePackageNode],
+    opts: &LifecycleOptions,
+) -> Result<()> {
+    execute_dependency_hooks_with_abort(nodes, opts, None).await
+}
+
+async fn execute_dependency_hooks_with_abort(
+    nodes: &[LifecyclePackageNode],
+    opts: &LifecycleOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
     if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
         return Ok(());
     }
@@ -2222,6 +2242,22 @@ pub async fn execute_topological_with_abort(
         }
     }
 
+    Ok(())
+}
+
+/// Run root install hooks after reification has persisted the public lockfile.
+pub async fn execute_root_hooks(root_manifest: &Manifest, opts: &LifecycleOptions) -> Result<()> {
+    execute_root_hooks_with_abort(root_manifest, opts, None).await
+}
+
+async fn execute_root_hooks_with_abort(
+    root_manifest: &Manifest,
+    opts: &LifecycleOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
+        return Ok(());
+    }
     let root_hooks = [
         "preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
     ];

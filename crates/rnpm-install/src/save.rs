@@ -19,10 +19,12 @@ pub fn resolve_targeted_workspaces(
     if has_workspace_filter {
         for (idx, m) in workspace_members.iter().enumerate() {
             if workspace_filter.iter().any(|target| {
-                target == &m.name
-                    || target == &m.relative_path
-                    || m.relative_path.ends_with(target)
-                    || target.trim_start_matches("./") == m.relative_path
+                let root = m
+                    .path
+                    .ancestors()
+                    .nth(std::path::Path::new(&m.relative_path).components().count())
+                    .unwrap_or(&m.path);
+                rnpm_lifecycle::matches_filter(target, &m.name, &m.path, root)
             }) {
                 targeted_indices.push(idx);
             }
@@ -67,12 +69,19 @@ pub fn compute_save_spec(
         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
         PackageTarget::Url(u) => u.to_string(),
         PackageTarget::Alias {
-            name: real_name, ..
-        } => {
-            if save_exact {
-                format!("npm:{}@{}", real_name, resolved_version)
+            name: real_name,
+            target,
+        } => format!(
+            "npm:{}@{}",
+            real_name,
+            compute_save_spec(target, resolved_version, save_exact, save_prefix)
+        ),
+        PackageTarget::Range(range) if range.raw != "*" && !range.raw.is_empty() => {
+            let proposed = format!("{prefix}{resolved_version}");
+            if range_contains_saved_range(range, &proposed) {
+                proposed
             } else {
-                format!("npm:{}@{}{}", real_name, prefix, resolved_version)
+                range.raw.clone()
             }
         }
         _ => {
@@ -83,6 +92,34 @@ pub fn compute_save_spec(
             }
         }
     }
+}
+
+// Arborist retains a requested range when the save-prefix range would allow
+// versions outside it. Compare the parsed comparator bounds, not string prefixes.
+fn range_contains_saved_range(requested: &rnpm_core::semver::Range, proposed: &str) -> bool {
+    use rnpm_core::semver::comparator::Op;
+    let Ok(candidate) = rnpm_core::semver::Range::parse(proposed) else {
+        return false;
+    };
+    candidate.sets.iter().all(|sub| {
+        requested.sets.iter().any(|sup| {
+            sup.comparators.iter().all(|required| {
+                sub.comparators.iter().any(|bound| {
+                    use Op::*;
+                    match (required.op, bound.op) {
+                        (_, Eq) => required.matches(&bound.version),
+                        (Gte, Gte | Gt) => bound.version >= required.version,
+                        (Gt, Gt) => bound.version >= required.version,
+                        (Gt, Gte) => bound.version > required.version,
+                        (Lte, Lte | Lt) => bound.version <= required.version,
+                        (Lt, Lt) => bound.version <= required.version,
+                        (Lt, Lte) => bound.version < required.version,
+                        _ => false,
+                    }
+                })
+            })
+        })
+    })
 }
 
 /// Re-expresses a root-relative `file:` save spec relative to a workspace
@@ -192,4 +229,45 @@ pub fn save_manifests(
             .with_context(|| format!("Failed to save {}", member_pkg_path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    #[test]
+    fn save_range_stays_within_requested_versions() {
+        for (spec, prefix, exact, expected) in [
+            ("~1.0.0", None, false, "~1.0.0"),
+            (">=1 <2", None, false, "^1.0.3"),
+            ("^1.0.0", Some("~"), false, "~1.0.3"),
+            ("~1.0.0", None, true, "1.0.3"),
+            ("npm:real@~1.0.0", None, false, "npm:real@~1.0.0"),
+            ("npm:real@next", None, false, "npm:real@^1.0.3"),
+        ] {
+            assert_eq!(
+                compute_save_spec(&PackageTarget::parse(spec).unwrap(), "1.0.3", exact, prefix),
+                expected,
+                "{spec}"
+            );
+        }
+    }
+    #[test]
+    fn workspace_parent_directory_selects_children_without_suffix_matching() {
+        let root = std::env::temp_dir().join("workspace-select");
+        let members = ["packages/a", "packages/b", "other/a"].map(|relative| WorkspaceMember {
+            name: format!("pkg-{}", relative.replace('/', "-")),
+            version: Some("1.0.0".into()),
+            path: root.join(relative),
+            relative_path: relative.into(),
+            manifest: Manifest::default(),
+        });
+        assert_eq!(
+            resolve_targeted_workspaces(&members, &["packages".into()], false, false),
+            (vec![0, 1], false)
+        );
+        assert_eq!(
+            resolve_targeted_workspaces(&members, &["a".into()], false, false),
+            (vec![], false)
+        );
+    }
 }

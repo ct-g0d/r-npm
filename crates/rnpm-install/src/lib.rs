@@ -16,7 +16,7 @@ use rnpm_core::spec::{PackageSpec, PackageTarget};
 use rnpm_core::workspace::{discover_workspaces_from_manifest, WorkspaceMember};
 use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
-use rnpm_lifecycle::{execute_topological, LifecycleOptions, LifecyclePackageNode, PackageSource};
+use rnpm_lifecycle::{LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig, NPM_INSTALL_V1_JSON};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
@@ -1743,6 +1743,21 @@ impl Installer {
             discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
                 .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
 
+        for filter in &self.options.workspace {
+            if !workspace_members.iter().any(|member| {
+                rnpm_lifecycle::matches_filter(
+                    filter,
+                    &member.name,
+                    &member.path,
+                    &self.options.project_dir,
+                )
+            }) {
+                return Err(anyhow!(
+                    "npm error No workspaces found:\nnpm error   --workspace={filter}"
+                ));
+            }
+        }
+
         let (targeted_workspace_indices, target_root) = save::resolve_targeted_workspaces(
             &workspace_members,
             &self.options.workspace,
@@ -2239,6 +2254,8 @@ impl Installer {
                 pkg.version = member.manifest.version.clone();
             }
             save::sync_lockfile_package_entry(pkg, &member.manifest);
+            let folder_name = member.relative_path.rsplit('/').next().unwrap_or("");
+            pkg.name = (folder_name != member.name).then(|| member.name.clone());
 
             if !member.name.is_empty() {
                 let m_name = &member.name;
@@ -2309,10 +2326,52 @@ impl Installer {
             });
         }
 
+        // A filtered reify persists the whole ideal tree publicly, but only
+        // materializes the selected workspaces and their dependency closure.
+        let reify_locations = if !self.options.workspace.is_empty() || self.options.workspaces {
+            let mut selected: HashSet<String> = targeted_workspace_indices
+                .iter()
+                .flat_map(|&i| {
+                    let m = &workspace_members[i];
+                    [m.relative_path.clone(), format!("node_modules/{}", m.name)]
+                })
+                .collect();
+            if target_root {
+                selected.insert(String::new());
+            }
+            loop {
+                let before = selected.len();
+                for edge in &graph.edges {
+                    if selected.contains(&edge.from_location) {
+                        selected.insert(edge.to_location.clone());
+                    }
+                }
+                for (loc, node) in &graph.nodes {
+                    if selected.contains(loc) && node.flags.link {
+                        if let Some(target) = &node.resolved {
+                            selected.insert(target.clone());
+                        }
+                    }
+                }
+                if selected.len() == before {
+                    break;
+                }
+            }
+            Some(selected)
+        } else {
+            None
+        };
+
         // 3b. For --dry-run, simulate installation and report what would be installed
         if self.options.dry_run {
             let mut packages_installed = 0;
             for (loc, node) in &graph.nodes {
+                if reify_locations
+                    .as_ref()
+                    .is_some_and(|locations| !locations.contains(loc))
+                {
+                    continue;
+                }
                 if loc.is_empty() {
                     continue;
                 }
@@ -2550,6 +2609,12 @@ impl Installer {
         let mut packages_to_download = Vec::new();
 
         for (loc, node) in &graph.nodes {
+            if reify_locations
+                .as_ref()
+                .is_some_and(|locations| !locations.contains(loc))
+            {
+                continue;
+            }
             if loc.is_empty() {
                 continue;
             }
@@ -2866,6 +2931,12 @@ impl Installer {
 
         // Collect lifecycle nodes for workspace members
         for member in &workspace_members {
+            if reify_locations
+                .as_ref()
+                .is_some_and(|locations| !locations.contains(&member.relative_path))
+            {
+                continue;
+            }
             let has_scripts = member.manifest.scripts.contains_key("preinstall")
                 || member.manifest.scripts.contains_key("install")
                 || member.manifest.scripts.contains_key("postinstall")
@@ -3577,8 +3648,8 @@ impl Installer {
             Some(&collector),
         );
 
-        // 3. Execute lifecycle scripts bottom-up followed by root hooks
-        if !self.options.ignore_scripts {
+        // npm reify builds dependencies before saving, then install runs root hooks.
+        let lifecycle_opts = if !self.options.ignore_scripts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             let sandbox_policy = if self.options.strict_sandbox {
                 rnpm_lifecycle::ScriptSandboxPolicy::restricted()
@@ -3594,8 +3665,11 @@ impl Installer {
                 timeout: None,
                 sandbox_policy,
             };
-            execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
-        }
+            rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
+            Some(lifecycle_opts)
+        } else {
+            None
+        };
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         if !self.options.no_save && self.options.package_lock_enabled() {
@@ -3616,7 +3690,23 @@ impl Installer {
             // 5. Persist hidden lockfile to node_modules/.package-lock.json
             let has_packages = graph.nodes.keys().any(|k| !k.is_empty());
             if has_packages {
-                lockfile
+                let mut actual_lockfile = lockfile.clone();
+                if let Some(locations) = &reify_locations {
+                    actual_lockfile.packages.retain(|location, _| {
+                        locations.contains(location)
+                            || (is_node_modules_package_path(location)
+                                && loc_base_dir.join(location).join("package.json").is_file())
+                            || lockfile.packages.iter().any(|(link_location, package)| {
+                                package.link == Some(true)
+                                    && package.resolved.as_deref() == Some(location)
+                                    && loc_base_dir
+                                        .join(link_location)
+                                        .join("package.json")
+                                        .is_file()
+                            })
+                    });
+                }
+                actual_lockfile
                     .save_hidden(&loc_base_dir)
                     .context("Failed to save hidden package-lock.json")?;
             } else {
@@ -3632,6 +3722,13 @@ impl Installer {
                         }
                     }
                 }
+            }
+        }
+
+        if let Some(opts) = lifecycle_opts {
+            let _life_guard = collector.enter_phase(Phase::Lifecycle);
+            if self.options.packages.is_empty() && !self.options.is_global {
+                rnpm_lifecycle::execute_root_hooks(&manifest, &opts).await?;
             }
         }
 
@@ -5662,8 +5759,9 @@ impl Installer {
                 );
             }
         }
-        // Execute lifecycle scripts bottom-up followed by root hooks
-        if !self.options.ignore_scripts {
+        // As with install, complete dependency builds and save the actual tree
+        // before root hooks can fail.
+        let lifecycle_opts = if !self.options.ignore_scripts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             let sandbox_policy = if self.options.strict_sandbox {
                 rnpm_lifecycle::ScriptSandboxPolicy::restricted()
@@ -5679,8 +5777,11 @@ impl Installer {
                 timeout: None,
                 sandbox_policy,
             };
-            execute_topological(&lifecycle_nodes, &manifest, &lifecycle_opts).await?;
-        }
+            rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
+            Some(lifecycle_opts)
+        } else {
+            None
+        };
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
@@ -5694,6 +5795,11 @@ impl Installer {
             lockfile
                 .save_hidden(&self.options.project_dir)
                 .context("Failed to save hidden package-lock.json")?;
+        }
+
+        if let Some(opts) = lifecycle_opts {
+            let _life_guard = collector.enter_phase(Phase::Lifecycle);
+            rnpm_lifecycle::execute_root_hooks(&manifest, &opts).await?;
         }
 
         if !self.options.dry_run && !self.options.package_lock_only {
@@ -5732,7 +5838,10 @@ impl Installer {
 
         let mut names = std::collections::BTreeSet::new();
         for (location, package) in &lockfile.packages {
-            if location.is_empty() || package.link == Some(true) {
+            if location.is_empty()
+                || package.link == Some(true)
+                || !is_node_modules_package_path(location)
+            {
                 continue;
             }
             let is_linux_package = package
@@ -7171,6 +7280,16 @@ impl Installer {
 
             // Persist hidden lockfile to node_modules/.package-lock.json
             let _ = lockfile.save_hidden(&self.options.project_dir);
+        } else if self.options.package_lock_enabled()
+            && !self.options.no_save
+            && manifest.dependencies.is_empty()
+            && manifest.dev_dependencies.is_empty()
+            && manifest.optional_dependencies.is_empty()
+            && manifest.peer_dependencies.is_empty()
+            && workspace_members.is_empty()
+        {
+            LockfileV3::from_manifest(&manifest)
+                .save_to_file_version(&lockfile_path, self.options.lockfile_version)?;
         }
 
         // Remove deleted package directories from node_modules

@@ -494,6 +494,14 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
 
 /// Normalizes clone URL for git command execution on current platform.
 pub fn normalize_clone_url_for_git(url: &str) -> String {
+    if url.starts_with("file://") {
+        if let Ok(path) = url::Url::parse(url).and_then(|url| {
+            url.to_file_path()
+                .map_err(|_| url::ParseError::RelativeUrlWithoutBase)
+        }) {
+            return path.to_string_lossy().replace('\\', "/");
+        }
+    }
     if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
         return format!("https://github.com/{rest}");
     }
@@ -706,6 +714,9 @@ mod tests {
 
     #[test]
     fn test_normalize_clone_url_for_git() {
+        let local = std::env::temp_dir().join("git space~percent%repo");
+        let encoded = url::Url::from_file_path(&local).unwrap();
+        assert!(encoded.as_str().contains("%20"));
         assert_eq!(
             normalize_clone_url_for_git("https://github.com/user/repo.git"),
             "https://github.com/user/repo.git"
