@@ -634,6 +634,88 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
     Ok(0)
 }
 
+fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
+    let mut replacements = HashMap::new();
+    fn normalize(
+        node: &mut InspectedNode,
+        root: &Path,
+        replacements: &mut HashMap<String, String>,
+    ) {
+        if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
+            if path != realpath {
+                if let Ok(location) = realpath.strip_prefix(root) {
+                    let location = location.to_string_lossy().replace('\\', "/");
+                    replacements.insert(node.location.clone(), location.clone());
+                    node.location = location;
+                    node.path = Some(realpath.clone());
+                    node.from.clear();
+                    node.resolved = None;
+                }
+            }
+        }
+        for child in node.dependencies.values_mut() {
+            normalize(child, root, replacements);
+        }
+    }
+    fn fix_from(node: &mut InspectedNode, replacements: &HashMap<String, String>) {
+        for from in &mut node.from {
+            if let Some(target) = replacements.get(from) {
+                *from = target.clone();
+            }
+        }
+        for child in node.dependencies.values_mut() {
+            fix_from(child, replacements);
+        }
+    }
+    normalize(node, root, &mut replacements);
+    fix_from(node, &replacements);
+}
+
+fn ordered_query_node(node: &InspectedNode) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::OrderedJsonValue;
+    let computed = node.to_query_json();
+    let mut map: rnpm_core::ordered_json::OrderedJsonMap = node
+        .path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p.join("package.json")).ok())
+        .and_then(|s| serde_json::from_str::<OrderedJsonValue>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_else(|| {
+            let mut map = rnpm_core::ordered_json::OrderedJsonMap::new();
+            for key in ["name", "version"] {
+                if let Some(value) = computed.get(key) {
+                    map.insert(key.to_string(), value.clone().into());
+                }
+            }
+            if let Some(Value::Object(raw)) = &node.raw_manifest {
+                for (key, value) in raw {
+                    map.insert(key.clone(), value.clone().into());
+                }
+            }
+            map
+        });
+    for key in [
+        "_id",
+        "pkgid",
+        "location",
+        "path",
+        "realpath",
+        "resolved",
+        "from",
+        "to",
+        "dev",
+        "inBundle",
+        "deduped",
+        "overridden",
+        "queryContext",
+    ] {
+        if let Some(value) = computed.get(key) {
+            map.insert(key.to_string(), value.clone().into());
+        }
+    }
+    OrderedJsonValue::Object(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,73 +806,4 @@ mod tests {
         let q_child = QuerySelector::parse(":root > [name=react]").unwrap();
         assert!(matches_query(&q_child, &child, &map));
     }
-}
-
-fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
-    let mut replacements = HashMap::new();
-    fn normalize(
-        node: &mut InspectedNode,
-        root: &Path,
-        replacements: &mut HashMap<String, String>,
-    ) {
-        if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
-            if path != realpath {
-                if let Ok(location) = realpath.strip_prefix(root) {
-                    let location = location.to_string_lossy().replace('\\', "/");
-                    replacements.insert(node.location.clone(), location.clone());
-                    node.location = location;
-                    node.path = Some(realpath.clone());
-                    node.from.clear();
-                    node.resolved = None;
-                }
-            }
-        }
-        for child in node.dependencies.values_mut() {
-            normalize(child, root, replacements);
-        }
-    }
-    fn fix_from(node: &mut InspectedNode, replacements: &HashMap<String, String>) {
-        for from in &mut node.from {
-            if let Some(target) = replacements.get(from) {
-                *from = target.clone();
-            }
-        }
-        for child in node.dependencies.values_mut() {
-            fix_from(child, replacements);
-        }
-    }
-    normalize(node, root, &mut replacements);
-    fix_from(node, &replacements);
-}
-
-fn ordered_query_node(node: &InspectedNode) -> rnpm_core::ordered_json::OrderedJsonValue {
-    use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
-    let mut map = node
-        .path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p.join("package.json")).ok())
-        .and_then(|s| serde_json::from_str::<OrderedJsonValue>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_else(OrderedJsonMap::new);
-    let computed = node.to_query_json();
-    for key in [
-        "_id",
-        "pkgid",
-        "location",
-        "path",
-        "realpath",
-        "resolved",
-        "from",
-        "to",
-        "dev",
-        "inBundle",
-        "deduped",
-        "overridden",
-        "queryContext",
-    ] {
-        if let Some(value) = computed.get(key) {
-            map.insert(key.to_string(), value.clone().into());
-        }
-    }
-    OrderedJsonValue::Object(map)
 }

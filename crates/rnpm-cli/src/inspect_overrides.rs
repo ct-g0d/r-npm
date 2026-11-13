@@ -106,7 +106,12 @@ pub(super) fn apply(root: &mut InspectedNode) {
         return;
     };
     let mut repaired = Vec::new();
-    walk(root, &[overrides.clone()], &manifest, &mut repaired);
+    walk(
+        root,
+        std::slice::from_ref(overrides),
+        &manifest,
+        &mut repaired,
+    );
     root.problems
         .retain(|p| !p.starts_with("invalid:") || !repaired.iter().any(|path| p.ends_with(path)));
 }

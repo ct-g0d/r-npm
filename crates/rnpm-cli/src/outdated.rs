@@ -903,6 +903,54 @@ fn extract_parent_name_from_path(path: &str) -> Option<String> {
     None
 }
 
+fn ordered_json(
+    packages: &[OutdatedPackage],
+    long: bool,
+) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::{OrderedJsonMap as Map, OrderedJsonValue as Value};
+    let mut result = Map::new();
+    for pkg in packages {
+        let mut item = Map::new();
+        if pkg.current != "MISSING" {
+            item.insert("current".into(), Value::String(pkg.current.clone()));
+        }
+        for (key, value) in [
+            ("wanted", &pkg.wanted),
+            ("latest", &pkg.latest),
+            ("dependent", &pkg.dependent),
+        ] {
+            item.insert(key.into(), Value::String(value.clone()));
+        }
+        if pkg.current != "MISSING" {
+            item.insert(
+                "location".into(),
+                Value::String(pkg.absolute_location.clone()),
+            );
+        }
+        if long {
+            item.insert("type".into(), Value::String(pkg.package_type.clone()));
+            if let Some(homepage) = &pkg.homepage {
+                item.insert("homepage".into(), Value::String(homepage.clone()));
+            }
+            item.insert(
+                "dependedByLocation".into(),
+                Value::String(pkg.dependent_location.clone()),
+            );
+        }
+        let value = Value::Object(item);
+        if let Some(previous) = result.get_mut(&pkg.name) {
+            if let Value::Array(items) = previous {
+                items.push(value);
+            } else {
+                *previous = Value::Array(vec![previous.clone(), value]);
+            }
+        } else {
+            result.insert(pkg.name.clone(), value);
+        }
+    }
+    Value::Object(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1628,52 +1676,4 @@ mod tests {
 
         let _ = mock_server.shutdown.send(());
     }
-}
-
-fn ordered_json(
-    packages: &[OutdatedPackage],
-    long: bool,
-) -> rnpm_core::ordered_json::OrderedJsonValue {
-    use rnpm_core::ordered_json::{OrderedJsonMap as Map, OrderedJsonValue as Value};
-    let mut result = Map::new();
-    for pkg in packages {
-        let mut item = Map::new();
-        if pkg.current != "MISSING" {
-            item.insert("current".into(), Value::String(pkg.current.clone()));
-        }
-        for (key, value) in [
-            ("wanted", &pkg.wanted),
-            ("latest", &pkg.latest),
-            ("dependent", &pkg.dependent),
-        ] {
-            item.insert(key.into(), Value::String(value.clone()));
-        }
-        if pkg.current != "MISSING" {
-            item.insert(
-                "location".into(),
-                Value::String(pkg.absolute_location.clone()),
-            );
-        }
-        if long {
-            item.insert("type".into(), Value::String(pkg.package_type.clone()));
-            if let Some(homepage) = &pkg.homepage {
-                item.insert("homepage".into(), Value::String(homepage.clone()));
-            }
-            item.insert(
-                "dependedByLocation".into(),
-                Value::String(pkg.dependent_location.clone()),
-            );
-        }
-        let value = Value::Object(item);
-        if let Some(previous) = result.get_mut(&pkg.name) {
-            if let Value::Array(items) = previous {
-                items.push(value);
-            } else {
-                *previous = Value::Array(vec![previous.clone(), value]);
-            }
-        } else {
-            result.insert(pkg.name.clone(), value);
-        }
-    }
-    Value::Object(result)
 }
