@@ -34,7 +34,7 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
+const tarballs=new Map(); const probePackages=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
@@ -68,6 +68,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
   if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
   const name=url.slice(1);
+  if(probePackages.has(name))return json(probePackages.get(name));
   if(['dep','parent','changing'].includes(name)){
     const versions={};
     for(const version of (name==='changing'&&generation===1?['1.0.0']:['1.0.0','1.1.0','2.0.0'])){
@@ -220,6 +221,25 @@ add('flags-dev-optional-overlap','install',['install'],dir=>manifest(dir,{option
 add('flags-dev-and-prod-overlap','install',['install'],dir=>manifest(dir,{dependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
 add('flags-omit-dev-keeps-dev-optional','install',['install','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
 add('flags-ci-omit-dev-keeps-dev-optional','ci',['ci','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}),{before:async ctx=>{const p=await ctx.exec(['install']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+// Small registry graphs isolate Arborist's placement order from network state.
+for(const [name,versions] of Object.entries({
+  branch:{'1.0.0':{dependencies:{'alpha-parent':'1.0.0',shared:'2.0.0'}}},
+  'alpha-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
+  shared:{'1.0.0':{},'2.0.0':{}},
+})){
+  const packed={};
+  for(const [version,fields]of Object.entries(versions)){
+    const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
+    packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+  }
+  probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
+add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

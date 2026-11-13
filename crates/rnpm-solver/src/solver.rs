@@ -65,7 +65,6 @@ struct ResolveTask {
     install_name: String,
     raw_spec: String,
     dep_type: DependencyType,
-    dev_path: bool,
     parent_depth: usize,
     ancestors: std::sync::Arc<Vec<String>>,
 }
@@ -171,7 +170,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             install_name,
             raw_spec,
             dep_type,
-            dev_path: dep_type == DependencyType::Dev,
             parent_depth,
             ancestors,
         });
@@ -182,9 +180,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .queue
             .binary_search_by(|queued| {
                 queued
-                    .dev_path
-                    .cmp(&task.dev_path)
-                    .then_with(|| queued.parent_depth.cmp(&task.parent_depth))
+                    .parent_depth
+                    .cmp(&task.parent_depth)
                     .then_with(|| arborist_compare(&queued.parent_location, &task.parent_location))
                     .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
             })
@@ -195,7 +192,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// Processes all queued dependency resolution tasks until completion.
     pub fn resolve_tasks(&mut self) -> Result<(), SolverError> {
         while let Some(task) = self.queue.pop_front() {
-            self.process_task(task)?;
+            // Arborist queues nodes, then places all of a node's problem
+            // edges before visiting another node. A newly hoisted child can
+            // sort ahead of its parent, so freeze this batch before placing
+            // any edges that might enqueue that child's dependencies.
+            let mut siblings = vec![task];
+            while self.queue.front().is_some_and(|queued| {
+                queued.parent_location == siblings[0].parent_location
+            }) {
+                siblings.push(self.queue.pop_front().unwrap());
+            }
+            for task in siblings {
+                self.process_task(task)?;
+            }
         }
         Ok(())
     }
@@ -279,12 +288,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
         self.graph.nodes.insert(String::new(), root_node);
 
-        // Collect root dependencies with npm's precedence order. npm walks
-        // production dependencies before dev-only branches, so a compatible
-        // package first reached through a production dependency gets the
-        // highest hoisting priority. Keep the BTreeMap for deterministic
-        // fallback ordering and duplicate/override semantics, then enqueue
-        // the effective entries by dependency class.
+        // Collect effective root dependency types, then place their edges
+        // in name order. Arborist's node queue uses depth and path rather
+        // than giving production subtrees precedence over dev subtrees.
         let mut root_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
 
         // 1. devDependencies (if enabled)
@@ -339,7 +345,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         install_name: install_name.to_string(),
                         raw_spec,
                         dep_type,
-                        dev_path: dep_type == DependencyType::Dev,
                         parent_depth: 0,
                         ancestors: root_ancestors.clone(),
                     });
@@ -372,9 +377,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.provider.prefetch_packages(&root_names);
 
         // Process resolution queue
-        while let Some(task) = self.queue.pop_front() {
-            self.process_task(task)?;
-        }
+        self.resolve_tasks()?;
 
         self.graph.normalize_dependency_flags();
         Ok(self.graph)
@@ -1055,7 +1058,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         install_name: c_name,
                         raw_spec: c_spec,
                         dep_type: c_type,
-                        dev_path: task.dev_path || c_type == DependencyType::Dev,
                         parent_depth: child_depth,
                         ancestors: child_ancestors.clone(),
                     })
