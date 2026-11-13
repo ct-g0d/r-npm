@@ -198,56 +198,89 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
         }
     };
 
-    let version_doc = packument
-        .get("versions")
-        .and_then(|v| v.get(&resolved_version))
-        .cloned()
-        .unwrap_or_else(|| packument.clone());
-
-    if fields.is_empty() {
-        if json_mode {
-            println!("{}", serde_json::to_string_pretty(&version_doc)?);
-        } else {
-            let summary =
-                format_npm_summary(&pkg_name, &resolved_version, &version_doc, &packument);
-            println!("{summary}");
+    // npm view returns every published match for a range, in semver order.
+    // Dist-tags and exact versions still select one manifest.
+    let mut selected = vec![resolved_version];
+    if let Some(spec) = spec.as_deref() {
+        if spec != "*" && packument["dist-tags"][spec].is_null() {
+            if let Ok(range) = Range::parse(spec) {
+                let mut matches: Vec<_> = packument["versions"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(v, _)| {
+                        Version::parse(v)
+                            .ok()
+                            .filter(|v| range.satisfies(v))
+                            .map(|parsed| (parsed, v.clone()))
+                    })
+                    .collect();
+                matches.sort_by(|a, b| a.0.cmp(&b.0));
+                selected = matches.into_iter().map(|(_, v)| v).collect();
+            }
         }
-    } else if fields.len() == 1 {
-        let field_path = &fields[0];
-        let val = extract_field_value(field_path, &version_doc, &packument);
-        match val {
-            Some(v) => {
-                if json_mode {
-                    println!("{}", serde_json::to_string_pretty(&v)?);
+    }
+    let include_versions = selected.len() > 1;
+    let mut results = Vec::new();
+    for version in &selected {
+        let doc = packument["versions"].get(version).unwrap_or(&packument);
+        if fields.is_empty() {
+            if json_mode {
+                results.push(doc.clone());
+            } else {
+                println!(
+                    "{}",
+                    format_npm_summary(&pkg_name, version, doc, &packument)
+                );
+            }
+            continue;
+        }
+        let entries: Vec<_> = fields
+            .iter()
+            .filter_map(|field| {
+                extract_field_value(field, doc, &packument).map(|value| (field.clone(), value))
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        if json_mode {
+            results.push(if entries.len() == 1 {
+                entries[0].1.clone()
+            } else {
+                Value::Object(entries.into_iter().collect())
+            });
+        } else {
+            let include_fields = entries.len() > 1;
+            for (field, value) in entries {
+                let text = if value.is_string() && (include_versions || include_fields) {
+                    format_primitive_for_list(&value)
                 } else {
-                    println!("{}", format_single_field_text(&v));
-                }
-            }
-            None => {
-                if json_mode {
-                    println!("null");
-                }
-            }
-        }
-    } else {
-        let mut entries = Vec::new();
-        let mut json_map = serde_json::Map::new();
-
-        for field_path in &fields {
-            if let Some(val) = extract_field_value(field_path, &version_doc, &packument) {
-                json_map.insert(field_path.clone(), val.clone());
-                entries.push((field_path.clone(), val));
+                    format_single_field_text(&value)
+                };
+                println!(
+                    "{}{}{text}",
+                    if include_versions {
+                        format!("{pkg_name}@{version} ")
+                    } else {
+                        String::new()
+                    },
+                    if include_fields {
+                        format!("{field} = ")
+                    } else {
+                        String::new()
+                    }
+                );
             }
         }
-
-        if json_mode {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&Value::Object(json_map))?
-            );
+    }
+    if json_mode && !results.is_empty() {
+        let value = if results.len() == 1 {
+            results.remove(0)
         } else {
-            println!("{}", format_multi_fields_text(&entries));
-        }
+            Value::Array(results)
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
     }
 
     Ok(0)

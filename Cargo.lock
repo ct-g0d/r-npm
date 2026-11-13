@@ -1144,6 +1144,7 @@ dependencies = [
 name = "rnpm-config"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "rnpm-core",
  "serde",
  "serde_json",

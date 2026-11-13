@@ -31,6 +31,18 @@ pub struct ListOptions {
 ///
 /// Returns exit code: `0` if no dependency problems exist, `1` if problems (`extraneous`, `invalid`, `missing`) exist.
 pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, false)
+}
+
+pub fn run_workspace_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, true)
+}
+
+fn run_list_inner(
+    project_dir: &Path,
+    options: &ListOptions,
+    workspace: bool,
+) -> anyhow::Result<i32> {
     let (omit_dev, omit_optional, omit_peer) = crate::parse_omit_options(&options.omit);
     let tree_opts = TreeOptions {
         package_lock_only: options.package_lock_only,
@@ -44,13 +56,24 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 
     // Filter by packages if specified
     if !options.packages.is_empty() {
-        filter_tree_by_packages(&mut root_node, &options.packages);
+        if workspace {
+            root_node.dependencies.retain(|name, node| {
+                options
+                    .packages
+                    .iter()
+                    .any(|p| package_matches_filter(name, node, p))
+            });
+        } else {
+            filter_tree_by_packages(&mut root_node, &options.packages);
+        }
     }
 
     let effective_depth = if options.all {
         usize::MAX
     } else if let Some(d) = options.depth {
         d
+    } else if workspace {
+        1
     } else if !options.packages.is_empty() {
         usize::MAX
     } else {
@@ -79,12 +102,17 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
             println!("{p}");
         }
     } else {
-        let output = format_tree_text_with_unicode(
+        let mut output = format_tree_text_with_unicode(
             &root_node,
             effective_depth,
             options.long,
             crate::use_unicode(project_dir),
         );
+        if options.is_global {
+            if let Some((_, rest)) = output.split_once('\n') {
+                output = format!("{}\n{rest}", project_dir.display());
+            }
+        }
         print!("{output}");
     }
 
@@ -335,7 +363,9 @@ fn format_tree_text_with_unicode(
     if dep_keys.is_empty() {
         out.push_str(if unicode {
             "\u{2514}\u{2500}\u{2500} (empty)\n"
-        } else { "`-- (empty)\n" });
+        } else {
+            "`-- (empty)\n"
+        });
     }
     dep_keys.sort_by(|a, b| {
         let child_a = root.dependencies.get(a).unwrap();
@@ -365,11 +395,14 @@ fn format_child_text(
     out: &mut String,
 ) {
     let (long, unicode) = style;
-    let branch = match (unicode, is_last) {
-        (true, true) => "\u{2514}\u{2500}\u{2500} ",
-        (true, false) => "\u{251c}\u{2500}\u{2500} ",
-        (false, true) => "`-- ",
-        (false, false) => "+-- ",
+    let has_children = current_depth < max_depth && !node.dependencies.is_empty() && !node.deduped;
+    let branch = match (unicode, is_last, has_children) {
+        (true, true, false) => "\u{2514}\u{2500}\u{2500} ",
+        (true, true, true) => "\u{2514}\u{2500}\u{252c} ",
+        (true, false, false) => "\u{251c}\u{2500}\u{2500} ",
+        (true, false, true) => "\u{251c}\u{2500}\u{252c} ",
+        (false, true, _) => "`-- ",
+        (false, false, _) => "+-- ",
     };
 
     if node.missing {
@@ -394,6 +427,27 @@ fn format_child_text(
             marker = " extraneous".to_string();
         } else if node.deduped {
             marker = " deduped".to_string();
+        }
+        if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
+            if path != realpath {
+                // Workspace links are displayed relative to the project root.
+                let mut project = path.as_path();
+                while project.file_name().is_some_and(|n| n != "node_modules") {
+                    project = project.parent().unwrap_or(project);
+                }
+                if let Some(project) = project.parent() {
+                    if let Ok(relative) = realpath.strip_prefix(project) {
+                        marker.push_str(&format!(
+                            " -> .{}{}",
+                            std::path::MAIN_SEPARATOR,
+                            relative.display()
+                        ));
+                    }
+                }
+            }
+        }
+        if node.overridden {
+            marker.push_str(" overridden");
         }
         out.push_str(&format!(
             "{prefix}{branch}{}@{}{}\n",
@@ -477,15 +531,27 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     let mut first_missing = None;
     while let Some((parent, depth)) = queue.pop_front() {
         let mut children: Vec<_> = parent.dependencies.values().collect();
-        children.sort_by(|a,b| a.pkgid.as_deref().unwrap_or(&a.name).cmp(b.pkgid.as_deref().unwrap_or(&b.name)));
+        children.sort_by(|a, b| {
+            a.pkgid
+                .as_deref()
+                .unwrap_or(&a.name)
+                .cmp(b.pkgid.as_deref().unwrap_or(&b.name))
+        });
         for child in children {
-            if child.missing && first_missing.is_none() { first_missing = Some(child); }
-            if depth < max_depth && !child.deduped && !child.missing { queue.push_back((child, depth + 1)); }
+            if child.missing && first_missing.is_none() {
+                first_missing = Some(child);
+            }
+            if depth < max_depth && !child.deduped && !child.missing {
+                queue.push_back((child, depth + 1));
+            }
         }
     }
     let mut deps_map = serde_json::Map::new();
     for (name, child) in &root.dependencies {
-        deps_map.insert(name.clone(), format_child_json(child, max_depth, 0, long, first_missing));
+        deps_map.insert(
+            name.clone(),
+            format_child_json(child, max_depth, 0, long, first_missing),
+        );
     }
     map.insert("dependencies".to_string(), Value::Object(deps_map));
 
@@ -543,7 +609,10 @@ fn format_child_json(
             return Value::Object(map);
         }
         if first_missing.is_some_and(|first| std::ptr::eq(first, node)) {
-            map.insert("required".into(), node.required.as_deref().unwrap_or("*").into());
+            map.insert(
+                "required".into(),
+                node.required.as_deref().unwrap_or("*").into(),
+            );
         }
         map.insert("missing".to_string(), Value::Bool(true));
         if !node.problems.is_empty() {

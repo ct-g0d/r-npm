@@ -946,6 +946,14 @@ pub(crate) enum Commands {
         /// Custom npm registry URL
         #[arg(long)]
         registry: Option<String>,
+        #[arg(short = 'g', long)]
+        global: bool,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+        #[arg(long)]
+        workspaces: bool,
+        #[arg(long = "include-workspace-root")]
+        include_workspace_root: bool,
     },
 
     /// View package information from registry
@@ -1574,6 +1582,8 @@ pub(crate) enum ConfigAction {
         /// Output configuration in JSON format
         #[arg(long)]
         json: bool,
+        #[arg(short = 'l', long)]
+        long: bool,
     },
     /// Open the config file in an editor
     Edit,
@@ -4010,6 +4020,8 @@ async fn run_audit_fix(
     registry: Option<String>,
     dry_run: bool,
     force: bool,
+    json: bool,
+    audit_level: &str,
 ) -> anyhow::Result<()> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -4036,9 +4048,8 @@ async fn run_audit_fix(
     let initial_vulns = initial_report.metadata.vulnerabilities.total;
 
     if initial_vulns == 0 {
-        println!("found 0 vulnerabilities");
-        println!("fixed 0 packages");
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     // Parse package.json to identify declared dependency ranges
@@ -4210,12 +4221,8 @@ async fn run_audit_fix(
     }
 
     if targets_to_update.is_empty() {
-        println!("found 0 vulnerabilities to fix");
-        audit::print_concise_audit_summary(&initial_report);
-        if packages_needing_force > 0 {
-            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
-        }
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     if dry_run {
@@ -4309,7 +4316,7 @@ async fn run_audit_fix(
         println!("found 0 vulnerabilities");
     }
 
-    Ok(())
+    audit::check_report_threshold(&post_report, audit_level)
 }
 
 fn should_cleanup_trash(cmd: &Commands) -> bool {
@@ -5212,7 +5219,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ..
         } => {
             if action.as_deref() == Some("fix") {
-                run_audit_fix(&current_dir, registry, dry_run, force).await?;
+                run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
             } else {
                 audit::run_audit(&current_dir, registry, json, &audit_level).await?;
             }
@@ -5337,10 +5344,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 } else {
                     Vec::new()
                 };
-                select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
-                if packages.is_empty() && !ws_filters.is_empty() {
-                    packages.extend(ws_filters);
-                }
+                let members = select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
+                if packages.is_empty() { packages.extend(members.into_iter().map(|m| m.name)); }
             }
 
             let opts = list::ListOptions {
@@ -5354,7 +5359,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit,
                 is_global,
             };
-            let code = list::run_list(&target_dir, &opts)?;
+            let code = if ws_in_overrides { list::run_workspace_list(&target_dir, &opts)? } else { list::run_list(&target_dir, &opts)? };
             if code != 0 {
                 return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
                     exit_code: code,
@@ -5362,15 +5367,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }));
             }
         }
-        Commands::Outdated {
-            packages,
-            all,
-            json,
-            long,
-            parseable,
-            registry,
-        } => {
-            commands::outdated::run(packages, all, json, long, parseable, registry, current_dir).await?;
+        Commands::Outdated { packages, all, json, long, parseable, registry, global, workspace, workspaces, include_workspace_root } => {
+            let target_dir = if global { rnpm_config::find_global_prefix() } else { current_dir };
+            let opts = outdated::OutdatedOptions {packages,all,json,long,parseable,registry,global,workspace,workspaces,include_workspace_root};
+            commands::outdated::run(opts,target_dir).await?;
         }
         Commands::View {
             args,
@@ -5684,39 +5684,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Fund { package, json } => {
-            let count = audit::count_funding_packages(&current_dir);
-            let manifest_path = current_dir.join("package.json");
-            let (pkg_name, pkg_version) = if manifest_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let n = val.get("name").and_then(|v| v.as_str()).unwrap_or("project").to_string();
-                        let v = val.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
-                        (n, v)
-                    } else {
-                        ("project".to_string(), "1.0.0".to_string())
-                    }
-                } else {
-                    ("project".to_string(), "1.0.0".to_string())
-                }
-            } else {
-                ("project".to_string(), "1.0.0".to_string())
-            };
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "length": count,
-                        "name": pkg_name,
-                        "version": pkg_version,
-                        "dependencies": {}
-                    }))?
-                );
-            } else if let Some(package) = package {
-                println!("{package}: funding metadata is available in package.json");
-            } else {
-                println!("{pkg_name}@{pkg_version}");
-            }
+            commands::fund::run(&current_dir, package, json).await?;
         }
         Commands::Explain { package, json } => {
             explain::run_explain(&current_dir, &package, json)?;
@@ -5875,7 +5843,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             dry_run,
         } => {
-            run_audit_fix(&current_dir, registry, dry_run, force).await?;
+            run_audit_fix(&current_dir, registry, dry_run, force, false, "low").await?;
         }
         Commands::Trust {
             action,

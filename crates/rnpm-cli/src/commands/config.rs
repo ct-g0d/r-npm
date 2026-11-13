@@ -1,3 +1,6 @@
+#[path = "config_report.rs"]
+mod report;
+
 use crate::ConfigAction;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -9,7 +12,13 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             value,
             global,
             location,
-        } => run_set(&key, value.as_deref(), global, location.as_deref(), &current_dir)?,
+        } => run_set(
+            &key,
+            value.as_deref(),
+            global,
+            location.as_deref(),
+            &current_dir,
+        )?,
         ConfigAction::Get { key, extra_keys } => {
             run_get_keys(key.as_deref(), &extra_keys, &current_dir)?
         }
@@ -18,7 +27,7 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             global,
             location,
         } => run_delete(&key, global, location.as_deref(), &current_dir)?,
-        ConfigAction::List { json } => run_list(json, &current_dir)?,
+        ConfigAction::List { json, long } => report::run(json, long, &current_dir)?,
         ConfigAction::Edit => run_edit(&current_dir)?,
         ConfigAction::Fix => run_fix(&current_dir)?,
     }
@@ -76,9 +85,7 @@ pub(crate) fn run_get(key: Option<&str>, current_dir: &Path) -> Result<()> {
             None => println!("undefined"),
         }
     } else {
-        let opts = rnpm_config::ConfigOptions::new().project_dir(current_dir);
-        let detailed = rnpm_config::Config::load_detailed(opts)?;
-        print!("{}", detailed.format_text());
+        report::run(false, false, current_dir)?;
     }
     Ok(())
 }
@@ -91,17 +98,6 @@ pub(crate) fn run_delete(
 ) -> Result<()> {
     let target_path = resolve_target_npmrc(global, location, current_dir);
     let _ = rnpm_config::delete_config_value_from_file(&target_path, key)?;
-    Ok(())
-}
-
-pub(crate) fn run_list(json: bool, current_dir: &Path) -> Result<()> {
-    let opts = rnpm_config::ConfigOptions::new().project_dir(current_dir);
-    let detailed = rnpm_config::Config::load_detailed(opts)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&detailed.effective)?);
-    } else {
-        print!("{}", detailed.format_text());
-    }
     Ok(())
 }
 

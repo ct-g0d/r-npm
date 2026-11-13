@@ -34,7 +34,7 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
+const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
@@ -43,7 +43,7 @@ const server=http.createServer((req,res)=>{
   if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
   if(url===`/-/stage/${STAGE_ID}/tarball`){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get('/dep-1.0.0.tgz'));return;}
   if(url==='/-/ping')return json({});
-  if(url.includes('/security/advisories/bulk'))return json({});
+  if(url.includes('/security/advisories/bulk'))return json(securityAdvisories);
   if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
   if(url==='/-/whoami')return json({username:'mock-user'});
   if(url==='/-/v1/login')return authScenario==='web'?json({loginUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}):json({error:'Mock registry does not provide browser login'},400);
@@ -68,6 +68,8 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
   if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
   const name=url.slice(1);
+  if(securityRequireAuth&&['audit-leaf','audit-branch'].includes(name)&&req.headers.authorization!=='Bearer mock-token')return json({error:'Authentication required'},401);
+  if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
   if(['dep','parent','changing'].includes(name)){
     const versions={};
     for(const version of (name==='changing'&&generation===1?['1.0.0']:['1.0.0','1.1.0','2.0.0'])){
@@ -220,6 +222,47 @@ add('flags-dev-optional-overlap','install',['install'],dir=>manifest(dir,{option
 add('flags-dev-and-prod-overlap','install',['install'],dir=>manifest(dir,{dependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
 add('flags-omit-dev-keeps-dev-optional','install',['install','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
 add('flags-ci-omit-dev-keeps-dev-optional','ci',['ci','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}),{before:async ctx=>{const p=await ctx.exec(['install']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+// Read-only CLI lane: advisory propagation and top-level remediation.
+const auditTree=dir=>{
+  manifest(dir,{dependencies:{'audit-branch':'^1.0.0'}});
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-branch':'^1.0.0'}},'node_modules/audit-branch':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'}},'node_modules/audit-leaf':{version:'1.0.0'}}});
+};
+for(const [name,range] of [['breaking','<2.0.0'],['in-range','<1.1.0'],['unfixable','*']])for(const flags of [[],['--json']])add(`cli-audit-${name}${flags.length?'-json':''}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':[{id:101,name:'audit-leaf',url:'https://example.invalid/advisory/101',title:'Fixture advisory',severity:'moderate',vulnerable_versions:range,cwe:['CWE-400'],cvss:{score:5.3,vectorString:null}}]}});
+for(const spec of ['1','>=1'])for(const fields of [['version'],['name','version']])for(const flags of [[],['--json']])add(`cli-view-${spec.replace('>=','gte-')}-${fields.join('-')}${flags.length?'-json':''}`,'view',['view',`dep@${spec}`,...fields,...flags]);
+const fundingTree=dir=>{manifest(dir,{dependencies:{parent:'1.0.0',dep:'1.0.0'}});manifest(path.join(dir,'node_modules/parent'),{name:'parent',funding:[{type:'individual',url:'https://example.invalid/parent'},'https://example.invalid/other'],dependencies:{child:'1.0.0'}});manifest(path.join(dir,'node_modules/parent/node_modules/child'),{name:'child',funding:'https://example.invalid/child'});manifest(path.join(dir,'node_modules/dep'),{name:'dep',funding:'https://example.invalid/parent'});};
+for(const flags of [[],['--json']])add(`cli-fund-tree${flags.length?'-json':''}`,'fund',['fund',...flags],fundingTree);
+add('cli-fund-package','fund',['fund','dep','--browser=false'],fundingTree);
+add('cli-fund-package-missing','fund',['fund','parent','--browser=false'],installed);
+
+for(const [name,flags] of [['json',['--json']],['human',[]]])add(`cli-fund-normalize-${name}`,'fund',['fund',...flags],dir=>{
+  manifest(dir,{funding:'https://example.invalid/root',dependencies:{parent:'1.0.0',dep:'1.0.0'}});
+  manifest(path.join(dir,'node_modules/parent'),{name:'parent',funding:[{url:'ftp://invalid'},'https://example.invalid/partial'],dependencies:{child:'1.0.0'}});
+  manifest(path.join(dir,'node_modules/parent/node_modules/child'),{name:'child',funding:{type:'individual',url:'https://example.invalid/child'}});
+  manifest(path.join(dir,'node_modules/dep'),{name:'dep',funding:[]});
+});
+for(const which of ['1','2','9','0'])add(`cli-fund-which-${which}`,'fund',['fund','parent',`--which=${which}`,'--browser=false'],fundingTree);
+const overrideTree=dir=>{manifest(dir,{dependencies:{parent:'1.0.0'},overrides:{parent:{dep:'2.0.0'}}});manifest(path.join(dir,'node_modules/parent'),{name:'parent',dependencies:{dep:'^1.0.0'}});manifest(path.join(dir,'node_modules/dep'),{name:'dep',version:'2.0.0'});};
+for(const flags of [[],['--json']])add(`cli-ls-nested-override${flags.length?'-json':''}`,'ls',['ls','--all',...flags],overrideTree);
+for(const flags of [[],['--json']])add(`cli-explain-nested-override${flags.length?'-json':''}`,'explain',['explain','dep',...flags],overrideTree);
+
+const cliWorkspaceTree=dir=>{
+  manifest(dir,{workspaces:['modules/*']});
+  manifest(path.join(dir,'modules/a'),{name:'a',dependencies:{dep:'^1.0.0'},private:true});
+  manifest(path.join(dir,'modules/b'),{name:'b',dependencies:{parent:'^1.0.0'}});
+  manifest(path.join(dir,'node_modules/dep'),{name:'dep'});
+  manifest(path.join(dir,'node_modules/parent'),{name:'parent'});
+  for(const name of ['a','b'])fs.symlinkSync(path.join(dir,'modules',name),path.join(dir,'node_modules',name),'junction');
+};
+for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+for(const [name,selector] of [['workspace','.workspace'],['private',':private'],['is',':is(.workspace, #dep)'],['attribute','[name|=readiness]'],['array','[keywords~=tool]']])add(`cli-query-${name}`,'query',['query',selector],dir=>{cliWorkspaceTree(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.keywords=['build','tool'];});});
+for(const [name,flags] of [['list',[]],['json',['--json']],['long',['-l']]])add(`cli-config-${name}`,'config',['config','list',...flags],dir=>{manifest(dir);write(dir,'.npmrc','save-prefix=~\n');});
+
+for(const flags of [[],['--json'],['--silent']])add(`cli-audit-fix-unfixable${flags.join('')}`,'audit',['audit','fix',...flags],dir=>manifest(dir,{dependencies:{dep:'^1.0.0'}}),{before:async ctx=>{securityAdvisories={};const result=await ctx.exec(['install','--ignore-scripts']);if(result.exit!==0)throw new Error(result.stderr);},advisories:{dep:[{id:102,name:'dep',url:'https://example.invalid/advisory/102',title:'No patched release',severity:'high',vulnerable_versions:'*',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+
+for(const flags of [[],['--json']])add(`cli-audit-multiple-severities${flags.join('')}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':['low','high'].map((severity,i)=>({id:103+i,name:'audit-leaf',url: 'https://example.invalid/advisory/'+(103+i),title:severity+' advisory',severity,vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:i?7.5:3,vectorString:null}}))}});
+for(const flags of [[],['--json']])add(`cli-audit-authenticated${flags.join('')}`,'audit',['audit',...flags],auditTree,{auth:true,advisoryAuth:true,advisories:{'audit-leaf':[{id:105,name:'audit-leaf',url:'https://example.invalid/advisory/105',title:'Authenticated advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+add('cli-query-workspace-with-file-link','query',['query','.workspace'],dir=>{cliWorkspaceTree(dir);edit(dir,p=>{p.dependencies={local:'file:./local'};});manifest(path.join(dir,'local'),{name:'local'});fs.symlinkSync(path.join(dir,'local'),path.join(dir,'node_modules/local'),'junction');});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
@@ -252,7 +295,7 @@ for(const c of cases){
     const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
     const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});
-    authScenario=c.authScenario||'';authPolls=0;
+    authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};securityRequireAuth=!!c.advisoryAuth;
     const start=requests.length;const p=await exec(c.args);
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);
