@@ -1070,8 +1070,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let child_names: Vec<&str> =
                     child_tasks.iter().map(|t| t.install_name.as_str()).collect();
                 self.provider.prefetch_packages(&child_names);
+                let mut peer_tasks = Vec::new();
                 for child_task in child_tasks {
-                    self.push_task(child_task);
+                    // PlaceDep places a candidate together with its required
+                    // peer set, before any queued node is expanded. Explicit
+                    // root dependencies still own their reserved slots.
+                    let root_pending = self.graph.nodes.get("").is_some_and(|root| {
+                        [&root.dependencies, &root.dev_dependencies, &root.optional_dependencies]
+                            .iter().any(|deps| deps.contains_key(&child_task.install_name))
+                            && !self.graph.nodes.contains_key(&format!("node_modules/{}", child_task.install_name))
+                    });
+                    if child_task.dep_type == DependencyType::Peer && !root_pending {
+                        peer_tasks.push(child_task);
+                    } else {
+                        self.push_task(child_task);
+                    }
+                }
+                for peer_task in peer_tasks {
+                    self.process_task(peer_task)?;
                 }
             }
         }
