@@ -743,6 +743,20 @@ pub struct LockfileV3 {
     pub packages: BTreeMap<String, LockfilePackage>,
 }
 
+// Shrinkwrap.inferFormattingOptions takes formatting from package.json, even
+// when an existing lockfile uses another newline or indentation style.
+fn project_lockfile_format(project_dir: &Path, fallbacks: &[std::path::PathBuf]) -> rnpm_core::ManifestFormat {
+    let mut format = std::iter::once(project_dir.join("package.json"))
+        .chain(fallbacks.iter().cloned())
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
+        .unwrap_or_default();
+    if format.indent.is_empty() {
+        format.indent = rnpm_core::ManifestFormat::default().indent;
+    }
+    format
+}
+
 impl LockfileV3 {
     /// Create a new LockfileV3 with an empty root package `""`.
     pub fn new(name: impl Into<String>, version: Option<String>) -> Self {
@@ -1503,45 +1517,13 @@ impl LockfileV3 {
     pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
         let this = self.for_writing();
         let content_source: &Self = this.as_ref();
-        let format = if path.exists() {
-            std::fs::read_to_string(path)
-                .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                .unwrap_or_default()
-        } else if let Some(parent) = path.parent() {
-            let root_dir = if parent.ends_with("node_modules") {
-                parent.parent().unwrap_or(parent)
-            } else {
-                parent
-            };
-            let lock_path = root_dir.join("package-lock.json");
-            let sw_path = root_dir.join("npm-shrinkwrap.json");
-            let pkg_json = root_dir.join("package.json");
-            if lock_path.exists() {
-                std::fs::read_to_string(&lock_path)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                    .unwrap_or_default()
-            } else if sw_path.exists() {
-                std::fs::read_to_string(&sw_path)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                    .unwrap_or_default()
-            } else if pkg_json.exists() {
-                // A one-line package.json has no indent to inherit; npm still
-                // writes the lockfile with its default two spaces.
-                std::fs::read_to_string(&pkg_json)
-                    .map(|s| {
-                        let mut format = rnpm_core::ManifestFormat::detect(&s);
-                        if format.indent.is_empty() {
-                            format.indent = rnpm_core::ManifestFormat::default().indent;
-                        }
-                        format
-                    })
-                    .unwrap_or_default()
-            } else {
-                rnpm_core::ManifestFormat::default()
-            }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let root_dir = if parent.ends_with("node_modules") {
+            parent.parent().unwrap_or(parent)
         } else {
-            rnpm_core::ManifestFormat::default()
+            parent
         };
+        let format = project_lockfile_format(root_dir, &[path.to_path_buf()]);
 
         let content = content_source.to_json_string_version_formatted(version, &format)?;
 
@@ -1741,16 +1723,11 @@ impl LockfileV3 {
             true
         });
 
-        let format = [
+        let format = project_lockfile_format(project_dir, &[
             hidden_path.clone(),
             project_dir.join("package-lock.json"),
             project_dir.join("npm-shrinkwrap.json"),
-            project_dir.join("package.json"),
-        ]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
-        .unwrap_or_default();
+        ]);
         let content = hidden.to_npm_json_string_formatted(&format, root_metadata)?;
 
         if let Some(parent) = hidden_path.parent() {
@@ -2058,3 +2035,4 @@ pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
 
     !(os_ok && cpu_ok && libc_ok)
 }
+
