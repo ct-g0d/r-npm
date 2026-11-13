@@ -2,22 +2,9 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 pub(crate) async fn run(
-    packages: Vec<String>,
-    all: bool,
-    json: bool,
-    long: bool,
-    parseable: bool,
-    registry: Option<String>,
+    opts: crate::outdated::OutdatedOptions,
     current_dir: PathBuf,
 ) -> Result<()> {
-    let opts = crate::outdated::OutdatedOptions {
-        packages,
-        all,
-        json,
-        long,
-        parseable,
-        registry,
-    };
     let code = crate::outdated::run_outdated(&current_dir, &opts).await?;
     if code != 0 {
         return Err(crate::outdated::OutdatedStatus.into());

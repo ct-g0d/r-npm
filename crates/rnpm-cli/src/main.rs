@@ -946,6 +946,14 @@ pub(crate) enum Commands {
         /// Custom npm registry URL
         #[arg(long)]
         registry: Option<String>,
+        #[arg(short = 'g', long)]
+        global: bool,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+        #[arg(long)]
+        workspaces: bool,
+        #[arg(long = "include-workspace-root")]
+        include_workspace_root: bool,
     },
 
     /// View package information from registry
@@ -5362,15 +5370,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }));
             }
         }
-        Commands::Outdated {
-            packages,
-            all,
-            json,
-            long,
-            parseable,
-            registry,
-        } => {
-            commands::outdated::run(packages, all, json, long, parseable, registry, current_dir).await?;
+        Commands::Outdated { packages, all, json, long, parseable, registry, global, workspace, workspaces, include_workspace_root } => {
+            let target_dir = if global { rnpm_config::find_global_prefix() } else { current_dir };
+            let opts = outdated::OutdatedOptions {packages,all,json,long,parseable,registry,global,workspace,workspaces,include_workspace_root};
+            commands::outdated::run(opts,target_dir).await?;
         }
         Commands::View {
             args,

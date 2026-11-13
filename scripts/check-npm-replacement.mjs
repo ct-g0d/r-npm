@@ -243,6 +243,16 @@ for(const which of ['1','2','9','0'])add(`cli-fund-which-${which}`,'fund',['fund
 const overrideTree=dir=>{manifest(dir,{dependencies:{parent:'1.0.0'},overrides:{parent:{dep:'2.0.0'}}});manifest(path.join(dir,'node_modules/parent'),{name:'parent',dependencies:{dep:'^1.0.0'}});manifest(path.join(dir,'node_modules/dep'),{name:'dep',version:'2.0.0'});};
 for(const flags of [[],['--json']])add(`cli-ls-nested-override${flags.length?'-json':''}`,'ls',['ls','--all',...flags],overrideTree);
 for(const flags of [[],['--json']])add(`cli-explain-nested-override${flags.length?'-json':''}`,'explain',['explain','dep',...flags],overrideTree);
+
+const cliWorkspaceTree=dir=>{
+  manifest(dir,{workspaces:['modules/*']});
+  manifest(path.join(dir,'modules/a'),{name:'a',dependencies:{dep:'^1.0.0'},private:true});
+  manifest(path.join(dir,'modules/b'),{name:'b',dependencies:{parent:'^1.0.0'}});
+  manifest(path.join(dir,'node_modules/dep'),{name:'dep'});
+  manifest(path.join(dir,'node_modules/parent'),{name:'parent'});
+  for(const name of ['a','b'])fs.symlinkSync(path.join(dir,'modules',name),path.join(dir,'node_modules',name),'junction');
+};
+for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
