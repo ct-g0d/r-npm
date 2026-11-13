@@ -19,19 +19,20 @@ const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !
 const write = (dir, name, value) => { const p=path.join(dir,name); fs.mkdirSync(path.dirname(p),{recursive:true}); fs.writeFileSync(p,typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(value,null,2)+'\n'); };
 const manifest = (dir, fields={}) => write(dir,'package.json',{name:'readiness-case',version:'1.0.0',...fields});
 const edit = (dir, fn) => { const p=JSON.parse(fs.readFileSync(path.join(dir,'package.json'))); fn(p); write(dir,'package.json',p); };
-async function run(exe,args,cwd,env) {
+async function run(exe,args,cwd,env,input=[]) {
   return await new Promise(resolve=>{
-    const p=spawn(exe,args,{cwd,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
+    const p=spawn(exe,args,{cwd,env,windowsHide:true,stdio:[input.length?'pipe':'ignore','pipe','pipe']});
+    let nextInput=0;
     let stdout='',stderr='',error=''; const timer=setTimeout(()=>{
       error=`Timeout after 120 seconds: ${args.join(' ')}`;
       if(process.platform==='win32'&&p.pid)spawn('taskkill.exe',['/pid',String(p.pid),'/t','/f'],{windowsHide:true,stdio:'ignore'});else p.kill('SIGKILL');
     },120000);
-    p.stdout.on('data',b=>stdout+=b); p.stderr.on('data',b=>stderr+=b); p.on('error',e=>{error=String(e);});
+    p.stdout.on('data',b=>{stdout+=b;const item=input[nextInput];if(item&&stdout.includes(item.prompt)){nextInput++;p.stdin.write(item.value+'\n');}}); p.stderr.on('data',b=>stderr+=b); p.on('error',e=>{error=String(e);});
     p.on('close',exit=>{clearTimeout(timer);resolve({exit,stdout,stderr,error});});
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const requests=[]; let generation=1;
+const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
@@ -42,7 +43,9 @@ const server=http.createServer((req,res)=>{
   if(url.includes('/security/advisories/bulk'))return json({});
   if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
   if(url==='/-/whoami')return json({username:'mock-user'});
-  if(url==='/-/v1/login')return json({error:'Mock registry does not provide browser login'},400);
+  if(url==='/-/v1/login')return authScenario==='web'?json({loginUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}):json({error:'Mock registry does not provide browser login'},400);
+  if(url==='/auth/done'){if(authPolls++===0){res.setHeader('retry-after','0.01');return json({},202);}return json({token:'mock-login-token'});}
+  if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
   if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
   if(url==='/-/user/mock-user/package')return json({});
   if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
@@ -130,6 +133,10 @@ for(const [command,args]of [
   ['access',['access','list','packages','mock-user','--json']],['org',['org','ls','mock-org','--json']],['profile',['profile','get','--json']],['team',['team','ls','mock-org','--json']],['token',['token','list','--json']],['owner',['owner','ls','dep']],['dist-tag',['dist-tag','ls','dep']],['view',['view','dep@1.0.0','version','--json']],['whoami',['whoami','--json']],['logout',['logout']],['deprecate',['deprecate','dep@1.0.0','old']],['undeprecate',['undeprecate','dep@1.0.0']],['unpublish',['unpublish','dep@1.0.0','--force']],['star',['star','dep']],['unstar',['unstar','dep']],['stars',['stars','mock-user']],['stage',['stage','list','dep','--json']],['trust',['trust','list','dep','--json']],
 ])add(`registry-${command}`,command,args,dir=>manifest(dir),{auth:true});
 for(const command of ['login','adduser'])add(`registry-${command}`,command,[command,'--auth-type=web']);
+for(const command of ['login','adduser']){
+  add(`registry-${command}-web-success`,command,[command,'--auth-type=web','--browser=false'],undefined,{authScenario:'web'});
+  for(const authType of ['legacy','web'])add(`registry-${command}-${authType}-couch-success`,command,[command,`--auth-type=${authType}`],undefined,{input:[{prompt:'Username:',value:'mock-user'},{prompt:'Password:',value:'mock-password'},...(command==='adduser'?[{prompt:'Email (this will be public):',value:'mock@example.invalid'}]:[])]});
+}
 for(const command of ['approve-scripts','deny-scripts'])add(`command-${command}`,command,[command,'dep'],dir=>{installed(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.scripts={install:'node -p 123'};});});
 add('command-install-scripts','install-scripts',['install-scripts','ls'],installed);
 add('command-set','set',['set','fund','false']);
@@ -178,8 +185,9 @@ for(const c of cases){
   for(const tool of ['npm','rnpm']){
     const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
     const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
-    const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env);return p;};
+    const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});
+    authScenario=c.authScenario||'';authPolls=0;
     const start=requests.length;const p=await exec(c.args);
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);
@@ -188,7 +196,7 @@ for(const c of cases){
     result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
   }
   const a=result.npm,b=result.rnpm;
-  const mutations=tool=>tool.requests.filter(r=>['PUT','DELETE'].includes(r.method)).map(({method,url,body})=>({method,url,body}));
+  const mutations=tool=>tool.requests.filter(r=>['PUT','DELETE','POST'].includes(r.method)).map(({method,url,body})=>({method,url,body:body&&typeof body==='object'&&/^org\.couchdb\.user:/.test(body._id)&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(body.date)?{...body,date:'<timestamp>'}:body}));
   result.comparison={execution:!a.execution_error&&!b.execution_error&&a.exit!==null&&b.exit!==null,exit:a.exit===b.exit,stdout:a.stdout===b.stdout,stderr:a.stderr===b.stderr,files:stable(a.files)===stable(b.files),mutations:stable(mutations(a))===stable(mutations(b))};
   result.match=Object.values(result.comparison).every(Boolean);results.push(result);
   // Keep complete comparisons and raw logs without committing multi-megabyte

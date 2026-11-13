@@ -1039,7 +1039,6 @@ pub(crate) enum Commands {
     },
 
     /// Log in to a registry
-    #[command(alias = "adduser", alias = "add-user")]
     Login {
         /// Custom registry URL
         #[arg(long)]
@@ -1054,6 +1053,19 @@ pub(crate) enum Commands {
         scope: Option<String>,
 
         /// One-time password for legacy/basic authentication
+        #[arg(long)]
+        otp: Option<String>,
+    },
+
+    /// Add a registry user account
+    #[command(alias = "add-user")]
+    Adduser {
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        auth_type: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
         #[arg(long)]
         otp: Option<String>,
     },
@@ -3669,110 +3681,6 @@ pub(crate) async fn execute_publish(
 
 
 
-async fn execute_login(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    auth_type: Option<String>,
-    scope: Option<String>,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else {
-        config.npmrc.registry.clone()
-    };
-
-    let auth_str = auth_type.unwrap_or_else(|| "web".to_string());
-    let token = std::env::var("NPM_TOKEN")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let token = if let Some(token) = token {
-        token
-    } else if auth_str == "legacy" || auth_str == "basic" {
-        let username = std::env::var("NPM_USERNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code ENEEDAUTH\nnpm error set NPM_USERNAME for legacy login"
-                )
-            })?;
-        let password = std::env::var("NPM_PASSWORD")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code ENEEDAUTH\nnpm error set NPM_PASSWORD for legacy login"
-                )
-            })?;
-        let mut client_config = rnpm_registry::RegistryClientConfig {
-            default_registry: registry_url.clone(),
-            ..Default::default()
-        };
-        client_config.scoped_registries = config.npmrc.scoped_registries.clone();
-        let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-        let otp = otp.or_else(|| std::env::var("NPM_OTP").ok());
-        let response = client
-            .login_legacy(Some(&registry_url), &username, &password, otp.as_deref())
-            .await?;
-        response.get("token").and_then(|v| v.as_str()).map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("npm error code EAUTHUNKNOWN\nnpm error registry login response did not contain a token"))?
-    } else {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error Set NPM_TOKEN to a registry token before running rnpm login"
-        ));
-    };
-
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "npm error code ENOENT\nnpm error Cannot determine the user home directory"
-            )
-        })?;
-    let user_npmrc = PathBuf::from(home).join(".npmrc");
-    let key = auth_key_for_registry(&registry_url);
-    rnpm_config::set_config_value_in_file(&user_npmrc, &key, &token)?;
-    if let Some(scope) = scope {
-        let scope = if scope.starts_with('@') {
-            scope
-        } else {
-            format!("@{scope}")
-        };
-        rnpm_config::set_config_value_in_file(
-            &user_npmrc,
-            &format!("{scope}:registry"),
-            registry_url.as_str(),
-        )?;
-    }
-    let _ = current_dir;
-    println!(
-        "Logged in to {} using {} authentication",
-        registry_url, auth_str
-    );
-
-    Ok(())
-}
-
-fn auth_key_for_registry(registry: &Url) -> String {
-    let host = registry.host_str().unwrap_or_default();
-    let port = registry.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = if registry.path().is_empty() {
-        "/".to_string()
-    } else {
-        format!("{}/", registry.path().trim_end_matches('/'))
-    };
-    format!("//{host}{port}{path}:_authToken")
-}
-
-
-
-
 pub(crate) fn make_registry_client(
     current_dir: &Path,
     registry: Option<String>,
@@ -5310,7 +5218,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             scope,
             otp,
         } => {
-            execute_login(&current_dir, registry, auth_type, scope, otp).await?;
+            commands::login::run(&current_dir, registry, auth_type, scope, otp, false).await?;
+        }
+        Commands::Adduser { registry, auth_type, scope, otp } => {
+            commands::login::run(&current_dir, registry, auth_type, scope, otp, true).await?;
         }
         Commands::Logout { registry, scope } => {
             commands::logout::run(&current_dir, registry, scope).await?;
@@ -6360,6 +6271,9 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
 }
 
 fn finish_cli_error(err: &anyhow::Error) -> ! {
+    if err.is::<commands::login::InputClosed>() {
+        std::process::exit(1);
+    }
     if err.is::<outdated::OutdatedStatus>() {
         std::process::exit(1);
     }

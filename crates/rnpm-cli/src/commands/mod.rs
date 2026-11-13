@@ -31,6 +31,7 @@ pub mod star;
 pub mod undeprecate;
 pub mod unpublish;
 pub mod logout;
+pub mod login;
 pub mod allow_scripts;
 pub mod org;
 pub mod team;

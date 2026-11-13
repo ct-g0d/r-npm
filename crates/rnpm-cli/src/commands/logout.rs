@@ -82,7 +82,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn auth_key_for_registry(registry: &Url) -> String {
+pub(super) fn auth_key_for_registry(registry: &Url) -> String {
     let host = registry.host_str().unwrap_or_default();
     let port = registry.port().map(|p| format!(":{p}")).unwrap_or_default();
     let path = if registry.path().is_empty() {
