@@ -86,4 +86,41 @@ binary hash, and tested revision.
 
 ## Final validation and timings
 
-Final results are recorded after the release build and measurements finish.
+- Release build: passed. No performance changes were made.
+- Resolver differential probes: 10/10 match, including all three new probes.
+- Solver tests: 108 passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- Full gate: stopped at the coordinator's wrap-up request after 184 matching
+  comparisons and zero DIFFs. This is a partial run, not a passing full gate.
+- `cargo test --workspace`: not green. Three attempts under load stopped on
+  lifecycle grandchild startup/output-drain time limits or the existing
+  install-ci-test normalizer, which accepts milliseconds/seconds but leaves
+  npm's elapsed `2m` untouched. Both lifecycle tests passed in isolated
+  retries. These unrelated test files and lifecycle code were not modified.
+
+The requested three-run warm no-lockfile and cold `ci` medians were not run
+before the coordinator requested handoff. The benchmark implementation is
+ready in `scripts/check-lane-a2-real-registry.mjs --benchmark`; use a fresh
+`--root` and copy the recorded manifests there to preserve the inputs.
+
+The following are single fresh full-install wall times from lockfile
+verification, in seconds. They ran under heavy, changing host load and are
+not controlled speed comparisons or the requested warm/`ci` benchmarks.
+Both tools used `--ignore-scripts`, with audit and fund disabled.
+
+| Project | npm seconds | rnpm seconds |
+| --- | ---: | ---: |
+| Express + TypeScript + @types/node | 14.083 | 25.460 |
+| Express | 7.504 | 7.133 |
+| Next + dev Sharp | 449.987 | 204.395 |
+| bcrypt + esbuild | 11.427 | 29.581 |
+| Vite React template | 16.902 | 62.516 |
+| create-react-app package.json | 134.776 | 141.240 |
+| Generated CRA app | 437.388 | 500.505 |
+
+Remaining work: complete an uninterrupted full gate, obtain a green full
+workspace test run under lower load, and collect the requested two-project
+three-run warm-install/cold-ci medians. All implementation changes and
+real-project lockfile comparisons are complete. Raw verification evidence
+remains under this worktree's `target/lane-a2-*` paths; the latest incomplete
+gate log is `target/lane-a2-full-gate-final.log`.

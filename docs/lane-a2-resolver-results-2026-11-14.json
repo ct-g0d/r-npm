@@ -374,5 +374,64 @@
       "resolver-peer-set-prefers-parent-dependency",
       "resolver-nested-optional-peer-conflict"
     ]
+  },
+  "handoff": {
+    "full_gate_partial": {
+      "completed": 184,
+      "matches": 184,
+      "diffs": [],
+      "last_case": "MATCH publish-hook-order {\"execution\":true,\"exit\":true,\"stdout\":true,\"stderr\":true,\"files\":true,\"mutations\":true}",
+      "status": "stopped at coordinator request; no full gate result"
+    },
+    "single_fresh_install_wall_ms": [
+      {
+        "name": "express-typescript",
+        "npm": 14083,
+        "rnpm": 25460
+      },
+      {
+        "name": "express",
+        "npm": 7504,
+        "rnpm": 7133
+      },
+      {
+        "name": "next-sharp",
+        "npm": 449987,
+        "rnpm": 204395
+      },
+      {
+        "name": "bcrypt-esbuild",
+        "npm": 11427,
+        "rnpm": 29581
+      },
+      {
+        "name": "vite-react",
+        "npm": 16902,
+        "rnpm": 62516
+      },
+      {
+        "name": "create-react-app",
+        "npm": 134776,
+        "rnpm": 141240
+      },
+      {
+        "name": "cra-generated",
+        "npm": 437388,
+        "rnpm": 500505
+      }
+    ],
+    "requested_warm_and_cold_ci_three_run_medians": "not run",
+    "solver_tests": "108 passed",
+    "clippy": "workspace all-targets -D warnings passed",
+    "workspace_tests": {
+      "status": "failed in three attempts under load",
+      "failures": [
+        "lifecycle grandchild PID startup timeout",
+        "lifecycle async output drain timeout",
+        "install-ci-test parity normalizer does not recognize npm elapsed minutes (2m)"
+      ],
+      "isolated_lifecycle_retries": "both passed"
+    },
+    "evidence_root": "C:\\Users\\charl.CT\\.t3\\worktrees\\npm-rust\\t3-90e403a0\\target\\lane-a2-full-real"
   }
 }
