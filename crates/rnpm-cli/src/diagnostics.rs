@@ -96,10 +96,19 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOTFOUND" => "ENOTFOUND",
                 "ECONNRESET" => "ECONNRESET",
                 "ETIMEDOUT" => "ETIMEDOUT",
+                "128" => "128",
                 _ => "EUNKNOWN",
             };
-            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR") {
-                return Diagnostic::new(code, &err_str[idx..]);
+            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR" | "128") {
+                let mut block = err_str[idx..].to_string();
+                if code == "ECONNREFUSED" && err.chain().any(|cause| {
+                    matches!(cause.downcast_ref::<SolverError>(), Some(SolverError::PackageMetadata(..)))
+                }) {
+                    // Arborist failureNode uses '.' when no parent edge is
+                    // attached to a package metadata failure.
+                    block = block.replace("npm error   type: 'system'\n", "npm error   type: 'system',\nnpm error   requiredBy: '.'\n");
+                }
+                return Diagnostic::new(code, block);
             }
             let remaining: Vec<String> = lines
                 .map(|l| {

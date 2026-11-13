@@ -6392,7 +6392,10 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
     }
     write_error_log(err);
     let missing_manifest = format!("{err:#}").contains("package.json not found");
-    std::process::exit(if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 });
+    let status = diagnostics::classify_error(err).code.parse::<i32>().unwrap_or_else(|_| {
+        if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 }
+    });
+    std::process::exit(status);
 }
 
 fn write_error_log(err: &anyhow::Error) {
