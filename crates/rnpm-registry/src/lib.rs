@@ -8,6 +8,7 @@
 pub mod circuit_breaker;
 pub mod client;
 pub mod error;
+pub mod not_found;
 pub mod metadata;
 pub mod provenance;
 pub mod publish;

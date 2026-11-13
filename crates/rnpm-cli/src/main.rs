@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod init;
 pub mod inspect_tree;
 pub mod json_errors;
+pub(crate) mod http_errors;
 pub mod list;
 pub mod outdated;
 pub mod query;
@@ -1129,14 +1130,16 @@ pub(crate) enum Commands {
     /// Manage package distribution tags.
     #[command(alias = "dist-tags")]
     DistTag {
-        #[command(subcommand)]
-        action: DistTagAction,
+        /// `add <spec> [<tag>]`, `rm <spec> <tag>` or `ls [<spec>]`.
+        args: Vec<String>,
         #[arg(long)]
         registry: Option<String>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
         otp: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Manage package owners/collaborators.
     #[command(alias = "author")]
@@ -1515,20 +1518,6 @@ pub(crate) enum TokenAction {
     /// Revoke an authentication token
     #[command(alias = "delete")]
     Revoke { token_id: String },
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub(crate) enum DistTagAction {
-    /// List tags for a package.
-    Ls { package: Option<String> },
-    /// Add or replace a tag.
-    Add {
-        package: String,
-        tag: Option<String>,
-    },
-    /// Remove a tag.
-    #[command(alias = "remove")]
-    Rm { package: String, tag: String },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -3833,28 +3822,47 @@ pub(crate) async fn execute_publish(
         let put_url = registry_url
             .join(&rnpm_config::encode_package_name(&pkg_name))
             .unwrap_or_else(|_| registry_url.clone());
-        client
-            .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
-            .await
-            .map_err(|err| {
-                use rnpm_registry::RegistryError as E;
-                let status_error = |status: u16, body: &str| {
-                    commands::client_helper::format_http_error(
-                        "PUT",
-                        &put_url,
-                        reqwest::StatusCode::from_u16(status)
-                            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                        body,
-                    )
-                };
-                match err {
-                    E::Forbidden { status, message, .. }
-                    | E::Unauthorized { status, message, .. }
-                    | E::PublishConflict { status, message, .. } => status_error(status, &message),
-                    E::ServerError { status, body } => status_error(status, &body),
-                    other => anyhow::anyhow!(other),
+        let mut otp = otp;
+        let mut may_prompt = true;
+        loop {
+            let result = client
+                .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
+                .await
+                .map_err(|err| {
+                    use rnpm_registry::RegistryError as E;
+                    let status_error = |status: u16, www: Option<&str>, body: &str| {
+                        commands::client_helper::format_http_error_with_auth(
+                            "PUT",
+                            &put_url,
+                            reqwest::StatusCode::from_u16(status)
+                                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                            www,
+                            body,
+                        )
+                    };
+                    match err {
+                        E::Forbidden { status, message, .. }
+                        | E::Unauthorized { status, message, .. }
+                        | E::PublishConflict { status, message, .. } => status_error(status, None, &message),
+                        E::AuthChallenge { www_authenticate, body, .. } => {
+                            status_error(401, Some(&www_authenticate), &body)
+                        }
+                        E::ServerError { status, body } => status_error(status, None, &body),
+                        other => anyhow::anyhow!(other),
+                    }
+                });
+            match result {
+                // npm's otplease: on a terminal, prompt for the code and retry once.
+                Err(err) if may_prompt && http_errors::is_otp_error(&err) => {
+                    may_prompt = false;
+                    match http_errors::prompt_otp() {
+                        Some(code) => otp = Some(code),
+                        None => return Err(err),
+                    }
                 }
-            })?;
+                other => break other?,
+            }
+        }
     }
 
     // JSON is only printed once the publish has completed.
@@ -3926,17 +3934,6 @@ pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> 
         ));
     }
     Ok((name, version))
-}
-
-pub(crate) fn package_name_from_spec(spec: &str) -> &str {
-    if let Some(stripped) = spec.strip_prefix('@') {
-        stripped
-            .rfind('@')
-            .map(|idx| &spec[..idx + 1])
-            .unwrap_or(spec)
-    } else {
-        spec.split_once('@').map(|(name, _)| name).unwrap_or(spec)
-    }
 }
 
 pub(crate) fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
@@ -5484,11 +5481,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::DistTag {
-            action,
+            args,
             registry,
-            json,
+            json: _,
             otp,
-        } => commands::dist_tag::run(current_dir, action, registry, json, otp).await?,
+            tag,
+        } => commands::dist_tag::run(current_dir, args, registry, otp, tag).await?,
         Commands::Owner {
             action,
             registry,
@@ -6327,6 +6325,10 @@ fn npm_json_error(block: &str) -> String {
         "notarget In most cases",
         "need auth You need to authorize",
         "404 \u{0027}",
+        "You can provide a one-time password",
+        "Open this URL in your browser",
+        "To correct this please try logging in again",
+        "If you were trying to login",
     ];
     let lines: Vec<String> = lines
         .into_iter()
@@ -6350,8 +6352,9 @@ fn npm_json_error(block: &str) -> String {
         }
         l.clone()
     };
-    let summary = lines[..split].iter().map(strip).collect::<Vec<_>>().join("\n");
-    let detail = lines[split..].iter().map(strip).collect::<Vec<_>>().join("\n");
+    // npm's jsonError trims both joined strings.
+    let summary = lines[..split].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
+    let detail = lines[split..].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
     let mut error = serde_json::Map::new();
     if let Some(code) = code {
         error.insert("code".into(), serde_json::Value::String(code));
@@ -6382,7 +6385,7 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         };
         println!("{}", npm_json_error(&block));
     }
-    if rendered.starts_with("npm error code ") {
+    if rendered.starts_with("npm error ") {
         // Already a complete npm error block: keep its code and blank lines.
         eprintln!("{}", rendered.trim_end());
     } else {

@@ -1710,6 +1710,8 @@ impl RegistryClient {
             }
 
             if status == StatusCode::NOT_FOUND {
+                let body = resp.text().await.unwrap_or_default();
+                crate::not_found::record(package_name, url.as_str(), &body);
                 return Err(RegistryError::PackageNotFound {
                     package: package_name.to_string(),
                     status: 404,
@@ -2584,7 +2586,22 @@ impl RegistryClient {
             return Ok(());
         }
 
+        let www_authenticate = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body_text = resp.text().await.unwrap_or_default();
+
+        if status == StatusCode::UNAUTHORIZED {
+            if let Some(www_authenticate) = www_authenticate {
+                return Err(RegistryError::AuthChallenge {
+                    url: target_url.to_string(),
+                    www_authenticate,
+                    body: body_text,
+                });
+            }
+        }
 
         if status == StatusCode::CONFLICT {
             return Err(RegistryError::PublishConflict {

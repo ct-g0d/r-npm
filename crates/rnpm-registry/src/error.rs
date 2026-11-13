@@ -24,6 +24,14 @@ pub enum RegistryError {
         message: String,
     },
 
+    /// A 401 that carried a `www-authenticate` challenge (OTP, IP, Bearer, ...).
+    #[error("Authentication failed for {url} (HTTP 401): {www_authenticate}")]
+    AuthChallenge {
+        url: String,
+        www_authenticate: String,
+        body: String,
+    },
+
     #[error("Access forbidden for {url} (HTTP {status}): {message}")]
     Forbidden {
         url: String,
@@ -98,6 +106,7 @@ impl RegistryError {
         match self {
             Self::PackageNotFound { status, .. } => Some(*status),
             Self::Unauthorized { status, .. } => Some(*status),
+            Self::AuthChallenge { .. } => Some(401),
             Self::Forbidden { status, .. } => Some(*status),
             Self::PublishConflict { status, .. } => Some(*status),
             Self::RateLimited { .. } => Some(429),
@@ -109,7 +118,7 @@ impl RegistryError {
 
     /// Returns true if this error is an authentication error (HTTP 401).
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Unauthorized { .. })
+        matches!(self, Self::Unauthorized { .. } | Self::AuthChallenge { .. })
     }
 
     /// Returns true if this error is an access forbidden error (HTTP 403).
@@ -239,6 +248,7 @@ impl RegistryError {
             Self::PackageNotFound { .. } => false,
             Self::VersionNotFound { .. } => false,
             Self::Unauthorized { .. } => false,
+            Self::AuthChallenge { .. } => false,
             Self::Forbidden { .. } => false,
             Self::PublishConflict { .. } => false,
             Self::CircuitBreakerOpen { .. } => false,

@@ -141,6 +141,7 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
     let client = RegistryClient::with_config(client_config)
         .map_err(|e| anyhow::anyhow!("Failed to initialize registry client: {e}"))?;
 
+    let view_pkgid = format!("{pkg_name}@{}", spec.as_deref().unwrap_or("*"));
     let encoded_name = encode_package_name(&pkg_name);
     let base_str = registry_url.as_str().trim_end_matches('/');
     let packument_url = Url::parse(&format!("{base_str}/{encoded_name}"))?;
@@ -164,10 +165,9 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
 
     let status = resp.status();
     if status == StatusCode::NOT_FOUND {
-        eprintln!("npm error code E404");
-        eprintln!("npm error 404 Not Found - GET {packument_url} - Not found");
-        eprintln!("npm error '{pkg_name}' is not in this registry.");
-        return Ok(1);
+        let body = resp.text().await.unwrap_or_default();
+        let message = crate::http_errors::general_message("GET", packument_url.as_str(), status, &body);
+        return Err(anyhow::anyhow!(crate::http_errors::e404_block(&message, Some(&view_pkgid))));
     }
 
     if !status.is_success() {

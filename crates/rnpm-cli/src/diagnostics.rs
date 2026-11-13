@@ -42,6 +42,26 @@ impl Diagnostic {
     }
 }
 
+/// npm's E404 block for a registry package that does not exist, using the
+/// 404 response the registry client recorded for it.
+fn missing_package_diagnostic(name: &str, spec: &str) -> Diagnostic {
+    let (url, body) = rnpm_registry::not_found::lookup(name).unwrap_or_else(|| {
+        let config = rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
+        let registry = config.npmrc.registry_for_package(name).clone();
+        let url = format!(
+            "{}/{}",
+            registry.as_str().trim_end_matches('/'),
+            rnpm_config::encode_package_name(name)
+        );
+        (url, String::new())
+    });
+    let status = reqwest::StatusCode::NOT_FOUND;
+    let message = crate::http_errors::general_message("GET", &url, status, &body);
+    // npm-package-arg reports an empty spec as `*`; rnpm's default is `latest`.
+    let raw_spec = if spec.is_empty() || spec == "latest" { "*" } else { spec };
+    Diagnostic::new("E404", crate::http_errors::e404_block(&message, Some(&format!("{name}@{raw_spec}"))))
+}
+
 /// npm's EJSONPARSE block for the current project's package.json.
 fn npm_package_json_error() -> Option<String> {
     let text = std::fs::read_to_string(std::env::current_dir().ok()?.join("package.json")).ok()?;
@@ -128,9 +148,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
-                SolverError::UnresolvedDependency { message, .. }
+                SolverError::UnresolvedDependency { name, spec, message }
                     if message == "Package not found in metadata provider" => {
-                    return Diagnostic::new("E404", solver_err.to_string());
+                    return missing_package_diagnostic(name, spec);
                 }
                 SolverError::PeerConflict { .. } => {
                     return Diagnostic::new("ERESOLVE", solver_err.to_string());
@@ -389,7 +409,14 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
                 "Package not found in metadata provider" => {
-                    return Diagnostic::new("E404", err_str);
+                    let at = package_spec
+                        .char_indices()
+                        .skip(1)
+                        .find(|(_, c)| *c == '@')
+                        .map(|(i, _)| i)
+                        .unwrap_or(package_spec.len());
+                    let (name, spec) = package_spec.split_at(at);
+                    return missing_package_diagnostic(name, spec.strip_prefix('@').unwrap_or(spec));
                 }
                 _ => {}
             }

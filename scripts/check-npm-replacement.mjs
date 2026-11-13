@@ -51,6 +51,10 @@ const server=http.createServer((req,res)=>{
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
   if(url.endsWith('/trust')&&req.method==='POST'){req.on('end',()=>json(request.body.map((item,i)=>({id:`created-${i+1}`,...item}))));return;}
   if(url.startsWith('/-/stage/package/')&&req.method==='POST')return json({stageId:STAGE_ID});
+  if((req.method==='PUT'&&url==='/otp-pkg')||(url==='/-/package/otp-pkg/dist-tags/beta'))if(req.headers['npm-otp']!=='123456'){res.writeHead(401,{'content-type':'application/json','www-authenticate':'OTP'});res.end(JSON.stringify({error:'one-time pass required'}));return;}
+  if(req.method==='PUT'&&url==='/denied-pkg'){res.writeHead(401,{'content-type':'application/json'});res.end(JSON.stringify({error:'invalid token'}));return;}
+  if(url==='/-/package/bearer-pkg/dist-tags/beta'){res.writeHead(401,{'content-type':'application/json','www-authenticate':'Bearer realm="mock"'});res.end(JSON.stringify({error:'bad token'}));return;}
+  if(url==='/-/package/heuristic-pkg/dist-tags/beta'){res.writeHead(401,{'content-type':'application/json'});res.end(JSON.stringify({error:'one-time pass required'}));return;}
   if(req.method==='PUT'&&url==='/rejected-pkg')return json({error:'You do not have permission to publish "rejected-pkg"'},403);
   if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
   if(url==='/-/user/mock-user/package')return json({});
@@ -66,6 +70,9 @@ const server=http.createServer((req,res)=>{
   if(url.endsWith('/trust'))return json([]);
   if(url.includes('/stages')||url.includes('/trusted-publishers'))return json([]);
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
+  if(url==='/-/package/tags-pkg/dist-tags')return json({latest:'1.0.0',beta:'2.0.0-beta.1',alpha:'0.1.0',_etag:'W/"x"'});
+  if(url==='/-/package/missing-tags/dist-tags')return json({error:'Not found'},404);
+  if(url==='/-/package/empty-tags/dist-tags')return json({});
   if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
   const name=url.slice(1);
   if(securityRequireAuth&&['audit-leaf','audit-branch'].includes(name)&&req.headers.authorization!=='Bearer mock-token')return json({error:'Authentication required'},401);
@@ -322,6 +329,34 @@ probeCacheControl.set('fresh-packument','public, max-age=300');
 add('cache-fresh-packument-skips-revalidation','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'fresh-packument':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);for(const name of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});},observe:({requests})=>({packumentRequests:requests.filter(r=>r.method==='GET'&&r.url==='/fresh-packument').length})});
 add('cache-clean-removes-install-store','cache',['cache','clean','--force'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);},observe:({env})=>({storeExists:fs.existsSync(env.RNPM_STORE_DIR)})});
 for(const [name,args]of [['install',['install','dep@1.0.0','--ignore-scripts']],['alias',['i','dep@1.0.0','--ignore-scripts']],['view',['view','dep@1.0.0','version']],['ping',['ping','--json']],['custom-agent',['install','dep@1.0.0','--ignore-scripts','--user-agent=parity-probe/1.0']]])add(`registry-request-headers-${name}`,args[0],args,undefined,{observe:({requests})=>requests.filter(r=>r.method==='GET').map(({url,headers})=>({url,headers})).sort((a,b)=>a.url.localeCompare(b.url))});
+add('publish-otp-required','publish',['publish','--ignore-scripts'],dir=>{manifest(dir,{name:'otp-pkg'});write(dir,'index.js','1\n');},{auth:true});
+add('publish-otp-supplied','publish',['publish','--ignore-scripts','--otp','123456'],dir=>{manifest(dir,{name:'otp-pkg'});write(dir,'index.js','1\n');},{auth:true});
+add('publish-otp-required-json','publish',['publish','--ignore-scripts','--json'],dir=>{manifest(dir,{name:'otp-pkg'});write(dir,'index.js','1\n');},{auth:true});
+add('publish-401-invalid-token','publish',['publish','--ignore-scripts'],dir=>{manifest(dir,{name:'denied-pkg'});write(dir,'index.js','1\n');},{auth:true});
+add('dist-tag-otp-required','dist-tag',['dist-tag','add','otp-pkg@1.0.0','beta'],dir=>manifest(dir,{name:'root'}),{auth:true});
+add('dist-tag-otp-supplied','dist-tag',['dist-tag','add','otp-pkg@1.0.0','beta','--otp=123456'],dir=>manifest(dir,{name:'root'}),{auth:true});
+add('dist-tag-ls-sorted','dist-tag',['dist-tag','ls','tags-pkg'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-bare-name-lists','dist-tag',['dist-tag','tags-pkg'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-ls-from-manifest','dist-tag',['dist-tag','ls'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-ls-json','dist-tag',['dist-tag','ls','tags-pkg','--json'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-ls-missing','dist-tag',['dist-tag','ls','missing-tags'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-ls-empty','dist-tag',['dist-tag','ls','empty-tags'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-add-already-set','dist-tag',['dist-tag','add','tags-pkg@1.0.0','latest'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-add-range-tag','dist-tag',['dist-tag','add','tags-pkg@1.0.0','^1'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-add-no-version','dist-tag',['dist-tag','add','tags-pkg'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-add-default-tag','dist-tag',['dist-tag','add','tags-pkg@1.1.0','--tag','next'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-set-alias','dist-tag',['dist-tag','set','tags-pkg@1.1.0','next'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-rm','dist-tag',['dist-tag','rm','tags-pkg','beta'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-rm-missing-tag','dist-tag',['dist-tag','rm','tags-pkg','nope'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-unknown-subcommand','dist-tag',['dist-tag','frob','tags-pkg'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-401-bearer','dist-tag',['dist-tag','add','bearer-pkg@1.0.0','beta'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('dist-tag-401-otp-heuristic','dist-tag',['dist-tag','add','heuristic-pkg@1.0.0','beta'],dir=>manifest(dir,{name:'tags-pkg'}),{auth:true});
+add('install-missing-package','install',['install','nope-missing']);
+add('install-missing-package-range','install',['install','nope-missing@^1.2.0']);
+add('install-missing-package-invalid-name','install',['install','BadName']);
+add('install-missing-transitive','install',['install'],dir=>manifest(dir,{dependencies:{'nope-missing':'^1.0.0'}}));
+add('view-missing-package','view',['view','nope-missing']);
+add('view-missing-package-json','view',['view','nope-missing','--json']);
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
