@@ -1,3 +1,6 @@
+#[path = "query/attributes.rs"]
+mod attributes;
+
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -36,6 +39,7 @@ pub enum SimpleSelector {
         name: String,
         op: Option<AttrOp>,
         val: Option<String>,
+        insensitive: bool,
     },
 }
 
@@ -335,7 +339,13 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
     for (op_str, op_enum) in ops {
         if let Some((name_part, val_part)) = s.split_once(op_str) {
             let name = name_part.trim().to_string();
-            let mut val = val_part.trim().to_string();
+            let value = val_part.trim();
+            let (value, insensitive) = match value.rsplit_once(char::is_whitespace) {
+                Some((value, flag)) if flag.eq_ignore_ascii_case("i") => (value.trim_end(), true),
+                Some((value, flag)) if flag.eq_ignore_ascii_case("s") => (value.trim_end(), false),
+                _ => (value, false),
+            };
+            let mut val = value.to_string();
             if (val.starts_with('"') && val.ends_with('"'))
                 || (val.starts_with('\'') && val.ends_with('\''))
             {
@@ -345,6 +355,7 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
                 name,
                 op: Some(op_enum),
                 val: Some(val),
+                insensitive,
             });
         }
     }
@@ -353,20 +364,8 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
         name: s.trim().to_string(),
         op: None,
         val: None,
+        insensitive: false,
     })
-}
-
-fn get_nested_json_val<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut curr = root;
-    for part in path.split('.') {
-        match curr {
-            Value::Object(map) => {
-                curr = map.get(part)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(curr)
 }
 
 fn matches_simple(
@@ -406,6 +405,8 @@ fn matches_simple(
                 node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
             }
             "link" => node.is_link,
+            "attr" => arg.as_deref().zip(node.raw_manifest.as_ref())
+                .is_some_and(|(arg, package)| attributes::pseudo(arg, package)),
             "private" => node
                 .raw_manifest
                 .as_ref()
@@ -460,50 +461,18 @@ fn matches_simple(
             }
             _ => false,
         },
-        SimpleSelector::Attribute { name, op, val } => {
+        SimpleSelector::Attribute { name, op, val, insensitive } => {
             let actual = node
                 .raw_manifest
                 .as_ref()
-                .and_then(|m| get_nested_json_val(m, name));
+                .and_then(|m| m.get(name));
             let fallback = match name.as_str() {
                 "name" => Some(Value::String(node.name.clone())),
                 "version" => node.version.clone().map(Value::String),
                 _ => None,
             };
             let actual = actual.or(fallback.as_ref());
-            if op.is_none() {
-                return actual.is_some_and(|v| match v {
-                    Value::Null | Value::Bool(false) => false,
-                    Value::String(s) => !s.is_empty(),
-                    Value::Number(n) => n.as_f64() != Some(0.0),
-                    _ => true,
-                });
-            }
-            let Some(expected) = val else {
-                return false;
-            };
-            let candidates: Vec<_> = match actual {
-                Some(Value::Array(items)) => items.iter().collect(),
-                Some(value) => vec![value],
-                None => Vec::new(),
-            };
-            candidates.iter().any(|value| {
-                let text = value
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| value.to_string());
-                match op {
-                    Some(AttrOp::Exact) => text == *expected,
-                    Some(AttrOp::Prefix) => text.starts_with(expected),
-                    Some(AttrOp::Suffix) => text.ends_with(expected),
-                    Some(AttrOp::Substring) => text.contains(expected),
-                    Some(AttrOp::Tilde) => text
-                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                        .any(|part| part == expected),
-                    Some(AttrOp::Dash) => text.starts_with(&format!("{expected}-")),
-                    None => false,
-                }
-            })
+            attributes::matches(actual, op.as_ref(), val.as_deref(), *insensitive)
         }
     }
 }
@@ -752,6 +721,7 @@ mod tests {
                 name: "name".to_string(),
                 op: Some(AttrOp::Exact),
                 val: Some("react".to_string()),
+                insensitive: false,
             }
         );
 
@@ -762,6 +732,7 @@ mod tests {
                 name: "version".to_string(),
                 op: Some(AttrOp::Prefix),
                 val: Some("18".to_string()),
+                insensitive: false,
             }
         );
     }
