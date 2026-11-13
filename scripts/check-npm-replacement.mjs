@@ -254,6 +254,7 @@ const cliWorkspaceTree=dir=>{
 };
 for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
 for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+for(const [name,selector] of [['workspace','.workspace'],['private',':private'],['is',':is(.workspace, #dep)'],['attribute','[name|=readiness]'],['array','[keywords~=tool]']])add(`cli-query-${name}`,'query',['query',selector],dir=>{cliWorkspaceTree(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.keywords=['build','tool'];});});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
