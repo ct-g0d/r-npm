@@ -33,6 +33,10 @@ pub struct InspectedNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pkgid: Option<String>,
 
+    #[serde(skip)]
+    pub is_workspace: bool,
+    #[serde(skip)]
+    pub is_link: bool,
     pub location: String, // "" for root, "node_modules/foo"
     pub path: Option<PathBuf>,
     pub realpath: Option<PathBuf>,
@@ -97,6 +101,8 @@ impl InspectedNode {
             homepage: None,
             repository: None,
             engines: None,
+            is_workspace: false,
+            is_link: false,
             location: String::new(),
             path: Some(project_dir.to_path_buf()),
             realpath: Some(project_dir.to_path_buf()),
@@ -955,6 +961,8 @@ fn create_node_from_disk(
         engines,
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: realpath != disk_pkg.dir_path,
         location: disk_pkg.location.clone(),
         path: Some(disk_pkg.dir_path.clone()),
         realpath: Some(realpath),
@@ -996,6 +1004,8 @@ fn create_missing_node(
         engines: None,
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: false,
         location: location.to_string(),
         path: None,
         realpath: None,
@@ -1116,6 +1126,8 @@ fn create_node_from_lock(
         engines: pkg.engines_map(),
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: false,
         location: location.to_string(),
         path: Some(path.clone()),
         realpath: Some(path),

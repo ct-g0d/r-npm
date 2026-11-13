@@ -382,7 +382,7 @@ fn matches_simple(
             "optional" => node.optional,
             "peer" => node.peer,
             "prod" => !node.dev && !node.optional && !node.peer,
-            "workspace" => !node.location.is_empty() && !node.location.starts_with("node_modules/"),
+            "workspace" => node.is_workspace,
             _ => false,
         },
         SimpleSelector::PseudoClass { name, arg } => match name.as_str() {
@@ -405,10 +405,7 @@ fn matches_simple(
             "workspace" => {
                 node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
             }
-            "link" => {
-                node.path != node.realpath
-                    || (!node.location.is_empty() && !node.location.starts_with("node_modules/"))
-            }
+            "link" => node.is_link,
             "private" => node
                 .raw_manifest
                 .as_ref()
@@ -636,11 +633,27 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
 
 fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
     let mut replacements = HashMap::new();
+    let workspaces: HashSet<_> = rnpm_core::workspace::discover_workspaces(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            m.path
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
     fn normalize(
         node: &mut InspectedNode,
         root: &Path,
         replacements: &mut HashMap<String, String>,
+        workspaces: &HashSet<String>,
     ) {
+        node.is_workspace = node
+            .realpath
+            .as_ref()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .is_some_and(|p| workspaces.contains(&p.to_string_lossy().replace('\\', "/")));
         if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
             if path != realpath {
                 if let Ok(location) = realpath.strip_prefix(root) {
@@ -654,7 +667,7 @@ fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
             }
         }
         for child in node.dependencies.values_mut() {
-            normalize(child, root, replacements);
+            normalize(child, root, replacements, workspaces);
         }
     }
     fn fix_from(node: &mut InspectedNode, replacements: &HashMap<String, String>) {
@@ -667,7 +680,7 @@ fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
             fix_from(child, replacements);
         }
     }
-    normalize(node, root, &mut replacements);
+    normalize(node, root, &mut replacements, &workspaces);
     fix_from(node, &replacements);
 }
 
