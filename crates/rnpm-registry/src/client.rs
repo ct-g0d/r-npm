@@ -27,6 +27,14 @@ pub fn default_user_agent() -> String {
 /// Abbreviated metadata MIME type for npm registry.
 pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 
+static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Install the CLI's canonical command and expanded npm user agent once per
+/// invocation. Library callers retain their configured request identity.
+pub fn set_cli_request_context(command: String, user_agent: String) {
+    let _ = CLI_REQUEST_CONTEXT.set((command, user_agent));
+}
+
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
     let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
         .into_iter()
@@ -605,11 +613,16 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
         let mut headers = HeaderMap::new();
+        let cli_context = CLI_REQUEST_CONTEXT.get();
+        let agent = cli_context.filter(|_| config.user_agent == default_user_agent()).map(|(_, agent)| agent.as_str()).unwrap_or(&config.user_agent);
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&config.user_agent)
+            HeaderValue::from_str(agent)
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
+        if let Some((command, _)) = cli_context {
+            headers.insert("npm-command", HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?);
+        }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         let max_idle = if config.pool_max_idle_per_host == 0 {

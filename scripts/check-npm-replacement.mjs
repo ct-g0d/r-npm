@@ -37,7 +37,7 @@ const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
 const tarballs=new Map(); const probePackages=new Map(); const probeCacheControl=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
-  const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
+  const request={method:req.method,url,etag:req.headers['if-none-match'],headers:{'npm-command':req.headers['npm-command']??null,'npm-session':req.headers['npm-session']??null,'user-agent':req.headers['user-agent']??null}};requests.push(request);
   const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{let body=Buffer.concat(chunks);if(req.headers['content-encoding']==='gzip')body=gunzipSync(body);if(body.length){try{request.body=JSON.parse(body.toString());}catch{request.body=body.toString();}}});
   const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':probeCacheControl.get(url.slice(1))||'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
   if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
@@ -235,10 +235,15 @@ for(const [name,versions] of Object.entries({
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
   'fresh-packument':{'1.0.0':{}},
   'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
+  'bundle-owner':{'1.0.0':{dependencies:{'bundled-leaf':'1.0.0'},bundleDependencies:['bundled-leaf']}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
     const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    if(name==='bundle-owner'){
+      manifest(path.join(dir,'node_modules/bundled-leaf'),{name:'bundled-leaf',license:'MIT',dependencies:{'bundled-transitive':'1.0.0'}});
+      manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC'});
+    }
     const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
     const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
@@ -252,6 +257,7 @@ add('install-normalizes-historical-full-metadata','install',['install','--ignore
 probeCacheControl.set('fresh-packument','public, max-age=300');
 add('cache-fresh-packument-skips-revalidation','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'fresh-packument':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);for(const name of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});},observe:({requests})=>({packumentRequests:requests.filter(r=>r.method==='GET'&&r.url==='/fresh-packument').length})});
 add('cache-clean-removes-install-store','cache',['cache','clean','--force'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);},observe:({env})=>({storeExists:fs.existsSync(env.RNPM_STORE_DIR)})});
+for(const [name,args]of [['install',['install','dep@1.0.0','--ignore-scripts']],['alias',['i','dep@1.0.0','--ignore-scripts']],['view',['view','dep@1.0.0','version']],['ping',['ping','--json']],['custom-agent',['install','dep@1.0.0','--ignore-scripts','--user-agent=parity-probe/1.0']]])add(`registry-request-headers-${name}`,args[0],args,undefined,{observe:({requests})=>requests.filter(r=>r.method==='GET').map(({url,headers})=>({url,headers})).sort((a,b)=>a.url.localeCompare(b.url))});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
