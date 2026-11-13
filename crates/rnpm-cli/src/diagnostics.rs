@@ -70,6 +70,13 @@ fn npm_package_json_error() -> Option<String> {
 
 /// Classify an arbitrary error into a structured npm diagnostic with stable error code.
 pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
+    for cause in err.chain() {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some((code, message)) = rnpm_registry::network_errors::diagnostic(http) {
+                return Diagnostic::new(code, message);
+            }
+        }
+    }
     let err_str = format!("{:#}", err);
 
     // If the error string already contains an npm error block, preserve its code and message
@@ -105,8 +112,24 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOMATCH" => "ENOMATCH",
                 "FETCH_ERROR" => "FETCH_ERROR",
                 "EINVALIDURL" => "EINVALIDURL",
+                "ECONNREFUSED" => "ECONNREFUSED",
+                "ENOTFOUND" => "ENOTFOUND",
+                "ECONNRESET" => "ECONNRESET",
+                "ETIMEDOUT" => "ETIMEDOUT",
+                "128" => "128",
                 _ => "EUNKNOWN",
             };
+            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR" | "128") {
+                let mut block = err_str[idx..].to_string();
+                if code == "ECONNREFUSED" && err.chain().any(|cause| {
+                    matches!(cause.downcast_ref::<SolverError>(), Some(SolverError::PackageMetadata(..)))
+                }) {
+                    // Arborist failureNode uses '.' when no parent edge is
+                    // attached to a package metadata failure.
+                    block = block.replace("npm error   type: 'system'\n", "npm error   type: 'system',\nnpm error   requiredBy: '.'\n");
+                }
+                return Diagnostic::new(code, block);
+            }
             let remaining: Vec<String> = lines
                 .map(|l| {
                     let trimmed = l.trim();

@@ -673,6 +673,13 @@ impl Manifest {
             sync_deps(map, "devDependencies", &self.dev_dependencies);
             sync_deps(map, "peerDependencies", &self.peer_dependencies);
             sync_deps(map, "optionalDependencies", &self.optional_dependencies);
+            if let Some(ref bundled) = self.bundled_dependencies {
+                map.shift_remove("bundledDependencies");
+                map.insert(
+                    "bundleDependencies".to_string(),
+                    OrderedJsonValue::from(serde_json::to_value(bundled).unwrap_or_default()),
+                );
+            }
 
             if !self.peer_dependencies_meta.is_empty() {
                 let val = serde_json::to_value(&self.peer_dependencies_meta).unwrap_or_default();

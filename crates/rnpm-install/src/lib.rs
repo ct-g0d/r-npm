@@ -1252,6 +1252,7 @@ pub struct InstallOptions {
     pub save_prod: bool,
     pub save_optional: bool,
     pub save_peer: bool,
+    pub save_bundle: bool,
     pub no_save: bool,
     pub package_lock_only: bool,
     pub packages: Vec<String>,
@@ -1332,6 +1333,7 @@ impl Default for InstallOptions {
             save_prod: false,
             save_optional: false,
             save_peer: false,
+            save_bundle: false,
             no_save: false,
             package_lock_only: false,
             packages: Vec::new(),
@@ -1408,6 +1410,11 @@ pub struct ResolvedNode {
 }
 
 /// Helper to compute normalized POSIX relative path from one directory to another.
+fn is_directory_dependency(path: &Path) -> bool {
+    let spec = path.to_string_lossy();
+    !path.is_file() && ![".tgz", ".tar.gz", ".tar"].iter().any(|suffix| spec.ends_with(suffix))
+}
+
 /// Lockfile entry for the target of a `file:` directory link, shaped like
 /// Arborist's: `name` only when it differs from the folder name, and
 /// `hasInstallScript` when the package declares install-time scripts.
@@ -1418,6 +1425,9 @@ fn directory_target_entry(
 ) -> LockfilePackage {
     let folder = location.rsplit('/').next().unwrap_or(location);
     let manifest = Manifest::from_file(dir.join("package.json")).ok();
+    if manifest.is_none() {
+        return LockfilePackage::default();
+    }
     let has_install_script = manifest.as_ref().is_some_and(|m| {
         ["preinstall", "install", "postinstall"]
             .iter()
@@ -1570,6 +1580,7 @@ impl Installer {
             let _ = std::fs::create_dir_all(&global_bin);
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
+        options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
 
         if options.install_strategy == InstallStrategy::Hoisted {
             if let Some(strat_str) = config
@@ -2199,6 +2210,9 @@ impl Installer {
             };
 
             let insert_dep = |m: &mut Manifest| {
+                if self.options.save_bundle && !self.options.save_peer {
+                    save::bundle_manifest_dep(m, &spec.name);
+                }
                 if self.options.save_dev {
                     m.dev_dependencies
                         .insert(spec.name.clone(), solver_spec.clone());
@@ -2355,20 +2369,24 @@ impl Installer {
 
         let mut graph = if !workspace_members.is_empty() {
             let members = workspace_members.clone();
-            let root_m = manifest.clone();
+            let mut root_m = manifest.clone();
+            // A root bundle is installed normally; only dependency-owned
+            // bundles are supplied by their owner's tarball.
+            root_m.bundled_dependencies = None;
             tokio::task::spawn_blocking(move || {
                 resolve_workspace_graph(&root_m, &members, &provider, &resolver_options)
-                    .map_err(|e| anyhow!("Workspace dependency error: {e}"))
+                    .map_err(|e| anyhow::Error::from(e).context("Workspace dependency error"))
             })
             .await
             .map_err(|e| anyhow!("Solver task panicked: {e}"))??
         } else {
-            let root_m = manifest.clone();
+            let mut root_m = manifest.clone();
+            root_m.bundled_dependencies = None;
             tokio::task::spawn_blocking(move || {
                 let overrides = Overrides::from_manifest(&root_m)
                     .map_err(|e| anyhow!("Failed to parse overrides: {e}"))?;
                 let solver = Solver::new(&provider, resolver_options, overrides);
-                solver.resolve(&root_m).map_err(|e| anyhow!("{e}"))
+                solver.resolve(&root_m).map_err(anyhow::Error::from)
             })
             .await
             .map_err(|e| anyhow!("Solver task panicked: {e}"))??
@@ -2491,11 +2509,20 @@ impl Installer {
         if let Some(root_pkg) = lockfile.root_package_mut() {
             if target_root {
                 save::sync_lockfile_package_entry(root_pkg, &manifest);
+                if self.options.save_optional {
+                    for added in &added_pkgs {
+                        root_pkg.dependencies.get_or_insert_default().insert(
+                            added.name.clone(), added.user_spec.clone().unwrap_or_else(|| "*".into())
+                        );
+                    }
+                }
             }
             if !manifest.workspace_patterns().is_empty() {
                 root_pkg.workspaces = Some(manifest.workspace_patterns());
             }
         }
+
+        save::mark_root_bundles(&mut lockfile, &graph, &manifest);
 
         for member in &workspace_members {
             let pkg = lockfile
@@ -2536,7 +2563,7 @@ impl Installer {
                 if let Some(ref res) = node.resolved {
                     if let Some(rel_file) = res.strip_prefix("file:") {
                         let abs_file = self.options.project_dir.join(rel_file);
-                        if abs_file.is_dir() {
+                        if is_directory_dependency(&abs_file) {
                             let clean_rel = rel_file.strip_prefix("./").unwrap_or(rel_file);
                             let link_entry = LockfilePackage {
                                 resolved: Some(clean_rel.to_string()),
@@ -3120,7 +3147,7 @@ impl Installer {
                             }
                         }
                         continue;
-                    } else if abs_file.is_dir() {
+                    } else if is_directory_dependency(&abs_file) {
                         if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                             let _ = rnpm_fs::remove_junction(&dest_dir);
                             if dest_dir.exists()
@@ -3132,7 +3159,7 @@ impl Installer {
                         if let Some(parent) = dest_dir.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        rnpm_fs::create_junction(&dest_dir, &abs_file)
+                        rnpm_fs::junction::create_directory_link(&dest_dir, &abs_file)
                             .map_err(|e| anyhow!("Failed to link file dir {}: {e}", loc))?;
                         packages_installed += 1;
                         let pkg_manifest_path = abs_file.join("package.json");
@@ -3922,7 +3949,7 @@ impl Installer {
         };
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
-        if !self.options.no_save && self.options.package_lock_enabled() {
+        if self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             crate::fast_path::enrich_lockfile_from_installed_manifests(
                 &mut lockfile,
@@ -3931,7 +3958,7 @@ impl Installer {
             );
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
-            if !self.options.is_global {
+            if !self.options.is_global && !self.options.no_save {
                 lockfile
                     .save_to_file_version(&lockfile_path, self.options.lockfile_version)
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
@@ -3969,7 +3996,7 @@ impl Installer {
                     });
                 }
                 actual_lockfile
-                    .save_hidden(&loc_base_dir)
+                    .save_hidden_with_root_metadata(&loc_base_dir, !self.options.no_save || lockfile_path.exists())
                     .context("Failed to save hidden package-lock.json")?;
             } else {
                 let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");
@@ -6559,7 +6586,7 @@ impl Installer {
 
                             Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
                         }
-                    } else if abs_path.exists() && abs_path.is_dir() {
+                    } else if !is_archive {
                         let manifest_path = abs_path.join("package.json");
                         let m = if manifest_path.exists() {
                             Manifest::from_file(&manifest_path).unwrap_or_default()

@@ -181,10 +181,49 @@ pub fn insert_manifest_dep(
     }
 }
 
+/// npm's add-rm-pkg-deps keeps the bundle list sorted and unique.
+pub fn bundle_manifest_dep(manifest: &mut Manifest, name: &str) {
+    let mut names = manifest.bundled_package_names();
+    names.push(name.to_string());
+    // npm uses an English collator. These are the punctuation characters
+    // permitted in npm names, in their English collation order.
+    names.sort_by_cached_key(|name| name.bytes().map(|byte| match byte {
+        b'_' => 0,
+        b'-' => 1,
+        b'.' => 2,
+        b'@' => 3,
+        b'/' => 4,
+        other => other.to_ascii_lowercase(),
+    }).collect::<Vec<_>>());
+    names.dedup();
+    manifest.bundled_dependencies = Some(rnpm_core::BundledDependencies::List(names));
+}
+
+/// Root bundles are still installed normally, but carry inBundle in lockfiles.
+pub fn mark_root_bundles(
+    lockfile: &mut rnpm_lockfile::LockfileV3,
+    graph: &rnpm_solver::DependencyGraph,
+    manifest: &Manifest,
+) {
+    let names = manifest.bundled_package_names();
+    let mut queue: Vec<_> = graph.get_outgoing_edges("").iter()
+        .filter(|edge| names.contains(&edge.install_name))
+        .map(|edge| edge.to_location.clone()).collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(location) = queue.pop() {
+        if !seen.insert(location.clone()) { continue; }
+        if let Some(package) = lockfile.packages.get_mut(&location) {
+            package.in_bundle = Some(true);
+        }
+        queue.extend(graph.get_outgoing_edges(&location).iter().map(|edge| edge.to_location.clone()));
+    }
+}
+
 /// Syncs a lockfile package entry's dependencies with a Manifest, clearing `raw_value`
 /// so serialization faithfully reflects the updated fields.
 pub fn sync_lockfile_package_entry(pkg_entry: &mut LockfilePackage, manifest: &Manifest) {
     pkg_entry.raw_value = None;
+    pkg_entry.bundle_dependencies = manifest.bundled_dependencies.clone();
     if manifest.dependencies.is_empty() {
         pkg_entry.dependencies = None;
     } else {

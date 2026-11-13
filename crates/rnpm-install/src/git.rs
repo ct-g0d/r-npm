@@ -181,6 +181,32 @@ impl GitFetcher {
             ));
         }
 
+        // pacote resolves the remote refs before attempting a clone. Preserve
+        // that command's stderr and status rather than reporting clone errors.
+        let args = ["--no-replace-objects", "ls-remote", clone_url];
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .env("SSH_ASKPASS", "")
+            .output()
+            .await?;
+        if !output.status.success() {
+            let mut block = format!(
+                "npm error code {}\nnpm error An unknown git error occurred\nnpm error command git {}",
+                output.status.code().unwrap_or(128), args.join(" ")
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.trim().lines() {
+                block.push_str("\nnpm error");
+                if !line.is_empty() {
+                    block.push(' ');
+                    block.push_str(line);
+                }
+            }
+            return Err(anyhow!(block));
+        }
+
         if let Some(parent) = remote_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }

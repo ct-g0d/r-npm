@@ -157,9 +157,9 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("npm error code EREGISTRY");
-            eprintln!("npm error Failed to fetch package metadata: {e}");
-            return Ok(1);
+            // The registry display preserves npm's transport error block.
+            // Do not append reqwest's Rust source chain to that block.
+            return Err(anyhow::anyhow!(e.to_string()));
         }
     };
 

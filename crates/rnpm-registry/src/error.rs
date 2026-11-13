@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    #[error("HTTP error: {0}")]
+    #[error("{}", crate::network_errors::format_http(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("URL parse error: {0}")]

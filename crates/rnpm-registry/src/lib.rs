@@ -10,6 +10,7 @@ pub mod client;
 pub mod error;
 pub mod not_found;
 pub mod metadata;
+pub mod network_errors;
 pub mod provenance;
 pub mod publish;
 

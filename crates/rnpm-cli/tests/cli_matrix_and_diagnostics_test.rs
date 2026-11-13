@@ -390,8 +390,8 @@ fn test_additional_aliases_and_flag_routing() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Search the registry"));
 
-    // --save-bundle is still unsupported (npm 11 accepts --production as --omit=dev).
-    let flag_args = ["install", "--save-bundle"];
+    // Peer-resolution flags are still unsupported for pack.
+    let flag_args = ["pack", "--legacy-peer-deps"];
     let output = Command::new(rnpm_bin)
         .args(flag_args)
         .output()
@@ -407,6 +407,14 @@ fn test_additional_aliases_and_flag_routing() {
         "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}",
         flag_args
     );
+
+    let project = tempdir().unwrap();
+    fs::write(project.path().join("package.json"), r#"{"name":"bundle-routing","version":"1.0.0"}"#).unwrap();
+    let output = Command::new(rnpm_bin)
+        .args(["install", "--save-bundle", "--ignore-scripts", "--no-audit", "--no-fund"])
+        .current_dir(project.path())
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
 
 #[test]
