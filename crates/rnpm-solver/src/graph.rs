@@ -630,7 +630,9 @@ impl DependencyGraph {
                     libc,
                     bin: normalize_bin_paths(node.bin.clone(), &node.name),
                     license,
-                    engines: if node.engines.is_empty() {
+                    engines: if let Some(raw) = node.extra.get("engines") {
+                        serde_json::from_value(raw.clone()).ok()
+                    } else if node.engines.is_empty() {
                         None
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))

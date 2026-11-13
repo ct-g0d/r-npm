@@ -191,6 +191,9 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                 deprecated: ver_info.deprecated.clone(),
                 extra: {
                     let mut extra = ver_info.extra.clone();
+                    if let Some(engines) = &ver_info.engines_raw {
+                        extra.insert("engines".into(), engines.clone());
+                    }
                     if let Some(url) = extra.get("funding").and_then(|value| value.as_str()) {
                         extra.insert("funding".into(), serde_json::json!({ "url": url }));
                     }

@@ -61,7 +61,9 @@ where
                         }
                     }
                 }
-                let version = serde_json::from_value(value).map_err(de::Error::custom)?;
+                let engines_raw = value.get("engines").filter(|v| v.is_array() || v.is_string()).cloned();
+                let mut version: AbbreviatedVersion = serde_json::from_value(value).map_err(de::Error::custom)?;
+                if engines_raw.is_some() { version.engines_raw = engines_raw; }
                 map.insert(key, version);
             }
             Ok(map)
@@ -264,6 +266,9 @@ pub struct AbbreviatedVersion {
     pub license: Option<String>,
     #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: HashMap<String, String>,
+    /// Retain legacy engine shapes across the typed packument disk cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines_raw: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub os: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
