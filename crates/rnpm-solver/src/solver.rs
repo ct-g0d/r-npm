@@ -736,6 +736,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &chosen_version.dependencies,
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
+            Some(&chosen_version.version),
         );
 
         let is_unlocked = self
@@ -838,6 +839,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &chosen_version.dependencies,
                 &chosen_version.peer_dependencies,
                 &chosen_version.peer_dependencies_meta,
+                Some(&chosen_version.version),
             );
         }
         let parent_skipped = self
