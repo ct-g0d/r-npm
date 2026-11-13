@@ -42,6 +42,12 @@ impl Diagnostic {
     }
 }
 
+/// npm's EJSONPARSE block for the current project's package.json.
+fn npm_package_json_error() -> Option<String> {
+    let text = std::fs::read_to_string(std::env::current_dir().ok()?.join("package.json")).ok()?;
+    crate::json_errors::package_json_error(&text)
+}
+
 /// Classify an arbitrary error into a structured npm diagnostic with stable error code.
 pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     let err_str = format!("{:#}", err);
@@ -316,6 +322,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
             column,
         }) = cause.downcast_ref::<ManifestError>()
         {
+            if let Some(block) = npm_package_json_error() {
+                return Diagnostic::new("EJSONPARSE", block);
+            }
             return Diagnostic::new(
                 "EJSONPARSE",
                 format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
@@ -355,6 +364,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     line,
                     column,
                 }) => {
+                    if let Some(block) = npm_package_json_error() {
+                        return Diagnostic::new("EJSONPARSE", block);
+                    }
                     return Diagnostic::new(
                         "EJSONPARSE",
                         format!(

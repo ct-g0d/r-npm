@@ -1767,14 +1767,91 @@ fn sort_pack_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
     let a_first_char = a.chars().next().unwrap_or('\0');
     let b_first_char = b.chars().next().unwrap_or('\0');
 
-    let a_is_upper = a_first_char.is_ascii_uppercase();
-    let b_is_upper = b_first_char.is_ascii_uppercase();
+    // npm's tar.js: `ch === ch.toUpperCase()`, so digits and punctuation
+    // sort with the uppercase group.
+    let a_is_upper = !a_first_char.is_lowercase();
+    let b_is_upper = !b_first_char.is_lowercase();
 
     match (a_is_upper, b_is_upper) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.cmp(b),
     }
+}
+
+/// Summarize an existing .tgz the way npm's `getContents` does, returning
+/// the summary and the parsed `package/package.json`.
+pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value), FsError> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let mut files = Vec::new();
+    let mut bundled: Vec<String> = Vec::new();
+    let mut unpacked_size = 0u64;
+    let mut entry_count = 0usize;
+    let mut manifest: Option<serde_json::Value> = None;
+    for entry in archive.entries().map_err(FsError::Io)? {
+        let mut entry = entry.map_err(FsError::Io)?;
+        let raw = entry.path().map_err(FsError::Io)?.to_string_lossy().replace('\\', "/");
+        let size = entry.header().size().map_err(FsError::Io)?;
+        let mode = entry.header().mode().map_err(FsError::Io)?;
+        entry_count += 1;
+        unpacked_size += size;
+        if let Some(rest) = raw.strip_prefix("package/node_modules/").filter(|r| !r.is_empty()) {
+            let mut parts = rest.split('/');
+            let first = parts.next().unwrap_or("");
+            let name = if first.starts_with('@') {
+                format!("{first}/{}", parts.next().unwrap_or(""))
+            } else {
+                first.to_string()
+            };
+            if !bundled.contains(&name) {
+                bundled.push(name);
+            }
+        }
+        let path = raw.strip_prefix("package/").unwrap_or(&raw).to_string();
+        if path == "package.json" {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).map_err(FsError::Io)?;
+            manifest = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok();
+        }
+        files.push(PackedFileEntry { path, size, mode });
+    }
+    let manifest = manifest.ok_or_else(|| {
+        FsError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "package.json not found in tarball",
+        ))
+    })?;
+    files.sort_by(|a, b| sort_pack_file_paths(&a.path, &b.path));
+    let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let summary = PackSummary {
+        filename: compute_tarball_filename(&name, &version),
+        name,
+        version,
+        package_size: bytes.len() as u64,
+        unpacked_size,
+        shasum: data_encoding::HEXLOWER.encode(&Algorithm::Sha1.compute_digest(bytes)),
+        integrity: Integrity::from_bytes(bytes, Algorithm::Sha512).to_string(),
+        files,
+        entry_count,
+        bundled,
+    };
+    Ok((summary, manifest))
+}
+
+/// Text of one `package/<path>` entry in a .tgz, if present.
+pub fn read_tarball_text(bytes: &[u8], inner_path: &str) -> Option<String> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let raw = entry.path().ok()?.to_string_lossy().replace('\\', "/");
+        if raw.strip_prefix("package/").unwrap_or(&raw) == inner_path {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).ok()?;
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Create a tar.gz package archive for the project directory.

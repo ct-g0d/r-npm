@@ -51,6 +51,7 @@ const server=http.createServer((req,res)=>{
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
   if(url.endsWith('/trust')&&req.method==='POST'){req.on('end',()=>json(request.body.map((item,i)=>({id:`created-${i+1}`,...item}))));return;}
   if(url.startsWith('/-/stage/package/')&&req.method==='POST')return json({stageId:STAGE_ID});
+  if(req.method==='PUT'&&url==='/rejected-pkg')return json({error:'You do not have permission to publish "rejected-pkg"'},403);
   if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
   if(url==='/-/user/mock-user/package')return json({});
   if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
@@ -186,6 +187,19 @@ for(const [name,args,fields] of [
 add('policy-allow-file-none','install',['install','--allow-file=none'],dir=>{manifest(dir,{dependencies:{dep:'file:./dep.tgz'}});write(dir,'dep.tgz',tarballs.get('/dep-1.0.0.tgz'));});
 add('policy-allow-registry-none','install',['install','--allow-registry=none'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}));
 add('repeat-install-runs-prepare','install',['install'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},scripts:{prepare:'node -e "require(\'fs\').appendFileSync(\'hooks.txt\',\'prepare\\n\')"'}}),{before:async ctx=>{const p=await ctx.exec(['install']);if(p.exit!==0)throw new Error(p.stderr);}});
+const hookPkg=(name)=>dir=>{const hooks=['prepublishOnly','prepack','prepare','postpack','publish','postpublish'];manifest(dir,{name,version:'1.0.0',scripts:Object.fromEntries(hooks.map(h=>[h,`node -e "require('fs').appendFileSync('events.txt','${h}\\n')"`]))});write(dir,'index.js','module.exports=1\n');};
+add('publish-hook-order','publish',['publish'],hookPkg('hooked-pkg'),{auth:true});
+add('publish-rejected-skips-publish-hook','publish',['publish'],hookPkg('rejected-pkg'),{auth:true});
+add('publish-provenance-unsupported-provider','publish',['publish','--provenance','--access','public','--ignore-scripts'],dir=>{manifest(dir,{name:'prov-pkg'});write(dir,'index.js','1\n');},{auth:true});
+add('publish-basic-auth','publish',['publish','--ignore-scripts'],dir=>{manifest(dir,{name:'basic-pkg'});write(dir,'index.js','1\n');},{auth:'basic'});
+add('publish-no-auth','publish',['publish','--ignore-scripts'],dir=>{manifest(dir,{name:'noauth-pkg'});write(dir,'index.js','1\n');});
+add('publish-tarball','publish',['publish','./dep.tgz'],dir=>{manifest(dir,{name:'wrapper'});write(dir,'dep.tgz',tarballs.get('/dep-1.0.0.tgz'));},{auth:true});
+add('publish-tarball-json','publish',['publish','./dep.tgz','--json'],dir=>{manifest(dir,{name:'wrapper'});write(dir,'dep.tgz',tarballs.get('/dep-1.0.0.tgz'));},{auth:true});
+for(const [name,args] of [['registry-version',['pack','dep@1.0.0']],['registry-range-json',['pack','dep@^1','--json']],['registry-dry-run',['pack','dep@1.1.0','--dry-run']],['tarball-file',['pack','./dep.tgz']]])add(`pack-spec-${name}`,'pack',args,dir=>{manifest(dir);write(dir,'dep.tgz',tarballs.get('/dep-2.0.0.tgz'));});
+add('json-error-ci-no-lock','ci',['ci','--json']);
+add('json-error-invalid-manifest','install',['install','--json'],dir=>write(dir,'package.json','{"name":'));
+add('json-error-missing-script','run',['run','nope','--json']);
+add('ci-no-lock','ci',['ci']);
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
@@ -214,7 +228,7 @@ for(const c of cases){
   if(option('--case','')&&!c.name.includes(option('--case','')))continue;
   const result={name:c.name,command:c.command,args:c.args};
   for(const tool of ['npm','rnpm']){
-    const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
+    const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth==='basic'?`//127.0.0.1:${server.address().port}/:_auth=${Buffer.from('mock-user:mock-pass').toString('base64')}\n`:c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
     const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
     const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});

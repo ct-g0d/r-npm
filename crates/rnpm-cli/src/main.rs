@@ -9,6 +9,7 @@ pub mod diff;
 pub mod doctor;
 pub mod init;
 pub mod inspect_tree;
+pub mod json_errors;
 pub mod list;
 pub mod outdated;
 pub mod query;
@@ -3402,6 +3403,122 @@ pub(crate) fn run_lifecycle_hook(
     Ok(())
 }
 
+/// Fields @npmcli/package-json's `prepare` and libnpmpublish's
+/// `patchManifest` add to the published manifest: `readme` and
+/// `readmeFilename`, `_nodeVersion` and `_npmVersion`. `readme_source`
+/// lists candidate file names and reads one.
+pub(crate) fn prepare_publish_manifest(
+    manifest: &mut serde_json::Value,
+    file_names: &[String],
+    read: impl Fn(&str) -> Option<String>,
+) {
+    let Some(obj) = manifest.as_object_mut() else {
+        return;
+    };
+    if obj.get("readme").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+        let mut names: Vec<&String> = file_names
+            .iter()
+            .filter(|f| !f.contains('/'))
+            .filter(|f| {
+                let lower = f.to_ascii_lowercase();
+                lower == "readme" || lower.starts_with("readme.")
+            })
+            .collect();
+        names.sort();
+        // `/\.m?a?r?k?d?o?w?n?$/i` wins; a bare README is the fallback.
+        let markdown = |f: &str| {
+            f.rfind('.').is_some_and(|i| {
+                let ext = f[i + 1..].to_ascii_lowercase();
+                let mut want = "markdown".chars().peekable();
+                ext.chars().all(|c| {
+                    while let Some(&w) = want.peek() {
+                        want.next();
+                        if w == c {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+        };
+        let chosen = names
+            .iter()
+            .find(|f| markdown(f))
+            .or_else(|| names.iter().find(|f| f.eq_ignore_ascii_case("readme")));
+        let mut readme = None;
+        if let Some(file) = chosen {
+            if let Some(text) = read(file) {
+                readme = Some(text);
+                obj.insert("readmeFilename".into(), serde_json::Value::String((*file).clone()));
+            }
+        }
+        obj.insert(
+            "readme".into(),
+            serde_json::Value::String(
+                readme
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "ERROR: No README data found!".into()),
+            ),
+        );
+    }
+    if let Ok(out) = std::process::Command::new("node").arg("--version").output() {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
+            obj.insert("_nodeVersion".into(), serde_json::Value::String(v));
+        }
+    }
+    obj.insert(
+        "_npmVersion".into(),
+        serde_json::Value::String(crate::version::NPM_VERSION.into()),
+    );
+}
+
+/// npm's ci-info name for the CI provider, or `null` outside a known one.
+fn ci_provider_name() -> &'static str {
+    let set = |k: &str| std::env::var_os(k).is_some();
+    if set("GITHUB_ACTIONS") {
+        "GitHub Actions"
+    } else if set("GITLAB_CI") {
+        "GitLab CI"
+    } else if set("CIRCLECI") {
+        "CircleCI"
+    } else if set("TRAVIS") {
+        "Travis CI"
+    } else if set("BUILDKITE") {
+        "Buildkite"
+    } else if set("TF_BUILD") {
+        "Azure Pipelines"
+    } else if set("JENKINS_URL") && set("BUILD_ID") {
+        "Jenkins"
+    } else if set("BITBUCKET_COMMIT") {
+        "Bitbucket Pipelines"
+    } else {
+        "null"
+    }
+}
+
+/// libnpmpublish's provenance prerequisites. rnpm cannot sign a Sigstore
+/// bundle, so where npm would generate one rnpm refuses instead of
+/// publishing without the attestation it was asked for.
+fn ensure_provenance_generation() -> anyhow::Result<()> {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        if std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_none() {
+            anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitHub Actions requires \"write\" access to the \"id-token\" permission");
+        }
+    } else if std::env::var_os("GITLAB_CI").is_some() {
+        if std::env::var_os("SIGSTORE_ID_TOKEN").is_none() {
+            anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitLab CI requires \"SIGSTORE_ID_TOKEN\" with \"sigstore\" audience to be present in \"id_tokens\". For more info see:\nnpm error https://docs.gitlab.com/ee/ci/secrets/id_token_authentication.html");
+        }
+    } else {
+        anyhow::bail!(
+            "npm error code EUSAGE\nnpm error Automatic provenance generation not supported for provider: {}",
+            ci_provider_name()
+        );
+    }
+    anyhow::bail!("npm error code EUSAGE\nnpm error rnpm cannot generate Sigstore provenance attestations; publish this version with npm or without --provenance")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_publish(
     current_dir: PathBuf,
     target: PathBuf,
@@ -3414,49 +3531,69 @@ pub(crate) async fn execute_publish(
     ignore_scripts: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let package_dir = if target.is_absolute() {
+    let target_path = if target.is_absolute() {
         target
     } else {
         current_dir.join(target)
     };
+    // `npm publish <tarball>` publishes the archive as-is and runs no scripts.
+    let tarball_spec = target_path.is_file();
+    let package_dir = if tarball_spec {
+        current_dir.clone()
+    } else {
+        target_path.clone()
+    };
 
-    let manifest_path = package_dir.join("package.json");
-    if !manifest_path.exists() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENOENT\nnpm error package.json not found in {}",
-            package_dir.display()
-        ));
-    }
+    let script_config = rnpm_config::Config::load(Some(&package_dir))?;
+    let is_silent = script_config.get("loglevel") == Some("silent");
+    let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
-    let manifest_content = std::fs::read_to_string(&manifest_path)?;
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest_content).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}"
-            )
+    let (summary, tarball_bytes, manifest_json) = if tarball_spec {
+        let bytes = std::fs::read(&target_path)?;
+        let (summary, manifest_json) = rnpm_fs::summarize_tarball(&bytes).map_err(|e| {
+            anyhow::anyhow!("npm error code ENOENT\nnpm error Could not read {}: {e}", target_path.display())
         })?;
-
-    if manifest_json
-        .get("private")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(anyhow::anyhow!(
-            "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
-        ));
-    }
-
-    let manifest = Manifest::from_file(&manifest_path)?;
-    let pkg_name = manifest.name.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field"
-        )
-    })?;
-    let pkg_version = manifest.version.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field"
-        )
-    })?;
+        (summary, bytes, manifest_json)
+    } else {
+        let manifest_path = package_dir.join("package.json");
+        if !manifest_path.exists() {
+            return Err(anyhow::anyhow!(
+                "npm error code ENOENT\nnpm error package.json not found in {}",
+                package_dir.display()
+            ));
+        }
+        let manifest_content = std::fs::read_to_string(&manifest_path)?;
+        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).map_err(|e| {
+            anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}")
+        })?;
+        if manifest_json.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(anyhow::anyhow!(
+                "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
+            ));
+        }
+        let manifest = Manifest::from_file(&manifest_path)?;
+        if manifest.name.is_none() {
+            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field");
+        }
+        if manifest.version.is_none() {
+            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field");
+        }
+        run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
+        let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
+            .map_err(|e| anyhow::anyhow!("npm error pack failed: {e}"))?;
+        let updated = Manifest::from_file(&manifest_path).unwrap_or(manifest);
+        run_lifecycle_hook(&package_dir, &updated, "postpack", ignore_scripts, foreground, is_silent, json)?;
+        // Re-read: hooks may have changed package.json (including publishConfig).
+        let manifest_json = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(manifest_json);
+        (summary, bytes, manifest_json)
+    };
+    let pkg_name = summary.name.clone();
+    let pkg_version = summary.version.clone();
 
     if let Some(ref acc) = access {
         if acc != "public" && acc != "restricted" {
@@ -3467,175 +3604,8 @@ pub(crate) async fn execute_publish(
         }
     }
 
-    if provenance {
-        let is_ci = std::env::var("CI").is_ok()
-            || std::env::var("GITHUB_ACTIONS").is_ok()
-            || std::env::var("GITLAB_CI").is_ok()
-            || std::env::var("CIRCLECI").is_ok()
-            || std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").is_ok();
-        if !is_ci && !dry_run {
-            return Err(anyhow::anyhow!(
-                "npm error code EUSAGE\nnpm error --provenance can only be used from a supported CI/CD environment (such as GitHub Actions or GitLab CI)"
-            ));
-        }
-    }
-
-    let script_config = rnpm_config::Config::load(Some(&package_dir))?;
-    let is_silent = script_config.get("loglevel") == Some("silent");
-    let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
-
-    // 1. prepublishOnly
-    run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
-
-    // 2. prepack
-    run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
-
-    run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
-
-    let updated_manifest = Manifest::from_file(&manifest_path).unwrap_or_else(|_| manifest.clone());
-    let updated_manifest_content =
-        std::fs::read_to_string(&manifest_path).unwrap_or_else(|_| manifest_content.clone());
-    let updated_manifest_json: serde_json::Value =
-        serde_json::from_str(&updated_manifest_content).unwrap_or_else(|_| manifest_json.clone());
-
-    // 3. Packaging into memory using canonical rnpm-fs tarball pack logic
-    let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
-        Ok(res) => res,
-        Err(e) => {
-            return Err(anyhow::anyhow!("npm error pack failed: {e}"));
-        }
-    };
-
-    // 4. postpack
-    run_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts, foreground, is_silent, json)?;
-
-    if dry_run {
-        if json {
-            let id = format!("{}@{}", summary.name, summary.version);
-            let files_json = summary.files.iter().map(|f| serde_json::json!({
-                "path": f.path,
-                "size": f.size,
-                "mode": f.mode,
-            })).collect::<Vec<_>>();
-            let pkg_details = serde_json::json!({
-                "id": id,
-                "name": summary.name,
-                "version": summary.version,
-                "size": summary.package_size,
-                "unpackedSize": summary.unpacked_size,
-                "shasum": summary.shasum,
-                "integrity": summary.integrity,
-                "filename": summary.filename,
-                "files": files_json,
-                "entryCount": summary.entry_count,
-                "bundled": summary.bundled,
-            });
-            let json_output = serde_json::json!({ summary.name.clone(): pkg_details });
-            println!("{}", serde_json::to_string_pretty(&json_output)?);
-        } else {
-            if !is_silent {
-                print_pack_notices(&summary);
-            }
-            if provenance {
-                eprintln!(
-                    "npm notice provenance would be generated and verified in CI environment"
-                );
-            }
-            if !is_silent { println!("+ {}@{}", summary.name, summary.version); }
-        }
-        let config = rnpm_config::Config::load(Some(&package_dir))?;
-        if config.get("loglevel") != Some("silent") {
-            let registry = registry.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
-                .and_then(|c| c.get("registry")).and_then(|v| v.as_str()))
-                .unwrap_or(config.npmrc.registry.as_str());
-            let registry_url = Url::parse(registry)?;
-            if config.npmrc.get_auth_token(&registry_url).is_none() {
-                eprintln!("npm warn publish This command requires you to be logged in to {registry_url} (dry-run)");
-            }
-            eprintln!("npm notice Publishing to {registry_url} with tag {tag} and {} access (dry-run)",
-                access.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
-                    .and_then(|c| c.get("access")).and_then(|v| v.as_str())).unwrap_or("default"));
-        }
-        return Ok(());
-    }
-
-    // 5. publish
-    run_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
-
-    let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else if let Some(pub_reg) = updated_manifest_json
-        .get("publishConfig")
-        .and_then(|c| c.get("registry"))
-        .and_then(|r| r.as_str())
-    {
-        Url::parse(pub_reg).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid publishConfig registry URL '{pub_reg}': {e}"))?
-    } else {
-        config.npmrc.registry_for_package(&pkg_name).clone()
-    };
-
-    let effective_access = access.as_deref().or_else(|| {
-        updated_manifest_json
-            .get("publishConfig")
-            .and_then(|c| c.get("access"))
-            .and_then(|a| a.as_str())
-    });
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    let token = config.npmrc.get_auth_token(&registry_url);
-    if token.is_none() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to <{registry_url}>\nnpm error You need a valid auth token to publish."
-        ));
-    }
-    if let Some(token) = token {
-        client_config.auth_token = Some(token.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-
-    let tarball_data = rnpm_registry::PublishTarballData {
-        filename: &summary.filename,
-        bytes: &tarball_bytes,
-        shasum: &summary.shasum,
-        integrity: &summary.integrity,
-    };
-
-    let desc = updated_manifest_json
-        .get("description")
-        .and_then(|d| d.as_str());
-
-    let payload_opts = rnpm_registry::PublishPayloadOptions {
-        name: &pkg_name,
-        version: &pkg_version,
-        description: desc,
-        tag: &tag,
-        access: effective_access,
-        manifest: &updated_manifest_json,
-        tarball: tarball_data,
-        registry_url: &registry_url,
-        provenance_attestation: None,
-    };
-
-    let payload = rnpm_registry::create_publish_payload(&payload_opts);
-
-    // Send HTTP PUT request to registry
-    client
-        .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
-        .await?;
-
-    if json {
-        let json_output = serde_json::json!({
+    let pack_json = || {
+        serde_json::json!({
             summary.name.clone(): {
                 "id": format!("{}@{}", summary.name, summary.version),
                 "name": summary.name,
@@ -3653,29 +3623,190 @@ pub(crate) async fn execute_publish(
                 "entryCount": summary.entry_count,
                 "bundled": summary.bundled,
             }
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else {
-        if !is_silent {
-            print_pack_notices(&summary);
-        }
-        if provenance {
-            eprintln!("npm notice published with provenance attestations");
-        }
-        println!("+ {}@{}", summary.name, summary.version);
+        })
+    };
+
+    let force = script_config.get_bool("force").unwrap_or(false);
+    let is_default_tag = !std::env::args().any(|a| a == "--tag" || a.starts_with("--tag="))
+        && manifest_json
+            .get("publishConfig")
+            .and_then(|c| c.get("tag"))
+            .is_none();
+    let parsed_version = rnpm_core::semver::Version::parse(&pkg_version).ok();
+    if !force
+        && is_default_tag
+        && parsed_version.as_ref().is_some_and(|v| !v.prerelease.is_empty())
+    {
+        anyhow::bail!("npm error You must specify a tag using --tag when publishing a prerelease version.");
     }
 
-    // 6. postpublish
-    run_lifecycle_hook(
-        &package_dir,
-        &updated_manifest,
-        "postpublish",
-        ignore_scripts,
-        foreground,
-        is_silent,
-        json,
-    )?;
+    // npm shows the contents before authenticating so they are visible while
+    // an OTP is pending.
+    if !json && !is_silent {
+        print_pack_notices(&summary);
+    }
 
+    let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
+    let registry_url = if let Some(ref reg_str) = registry {
+        Url::parse(reg_str).map_err(|e| {
+            anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}")
+        })?
+    } else if let Some(pub_reg) = manifest_json
+        .get("publishConfig")
+        .and_then(|c| c.get("registry"))
+        .and_then(|r| r.as_str())
+    {
+        Url::parse(pub_reg).map_err(|e| {
+            anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid publishConfig registry URL '{pub_reg}': {e}")
+        })?
+    } else {
+        config.npmrc.registry_for_package(&pkg_name).clone()
+    };
+
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
+        ..Default::default()
+    };
+    if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+        client_config.auth_token = Some(token.to_string());
+    }
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+    let has_creds = client.auth_header_for_url(&registry_url).is_some();
+    if !has_creds {
+        let msg = format!("This command requires you to be logged in to {registry_url}");
+        if dry_run {
+            if !is_silent {
+                eprintln!("npm warn publish {msg} (dry-run)");
+            }
+        } else {
+            anyhow::bail!("npm error code ENEEDAUTH\nnpm error need auth {msg}\nnpm error need auth You need to authorize this machine using `npm adduser`");
+        }
+    }
+
+    if !force {
+        // npm refuses to overwrite a version or to move `latest` backwards.
+        if let Ok(existing) = client.get_package_metadata(&pkg_name).await {
+            if existing.versions.contains_key(&pkg_version) {
+                anyhow::bail!(
+                    "npm error You cannot publish over the previously published versions: {pkg_version}."
+                );
+            }
+            let highest = existing
+                .versions
+                .keys()
+                .filter_map(|v| rnpm_core::semver::Version::parse(v).ok())
+                .max();
+            if let (Some(highest), Some(current)) = (highest, parsed_version.as_ref()) {
+                if is_default_tag && &highest >= current {
+                    anyhow::bail!(
+                        "npm error Cannot implicitly apply the \"latest\" tag because previously published version {highest} is higher than the new version {pkg_version}. You must specify a tag using --tag."
+                    );
+                }
+            }
+        }
+    }
+
+    let effective_access = access.as_deref().or_else(|| {
+        manifest_json
+            .get("publishConfig")
+            .and_then(|c| c.get("access"))
+            .and_then(|a| a.as_str())
+    });
+    if !is_silent {
+        eprintln!(
+            "npm notice Publishing to {registry_url} with tag {tag} and {} access{}",
+            effective_access.unwrap_or("default"),
+            if dry_run { " (dry-run)" } else { "" }
+        );
+    }
+
+    if !dry_run {
+        if provenance {
+            ensure_provenance_generation()?;
+        }
+        let mut publish_manifest = manifest_json.clone();
+        if tarball_spec {
+            let names: Vec<String> = summary.files.iter().map(|f| f.path.clone()).collect();
+            prepare_publish_manifest(&mut publish_manifest, &names, |f| {
+                rnpm_fs::read_tarball_text(&tarball_bytes, f)
+            });
+        } else {
+            let names: Vec<String> = std::fs::read_dir(&package_dir)
+                .map(|it| {
+                    it.flatten()
+                        .filter(|e| e.path().is_file())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            prepare_publish_manifest(&mut publish_manifest, &names, |f| {
+                std::fs::read_to_string(package_dir.join(f)).ok()
+            });
+        }
+        let tarball_data = rnpm_registry::PublishTarballData {
+            filename: &summary.filename,
+            bytes: &tarball_bytes,
+            shasum: &summary.shasum,
+            integrity: &summary.integrity,
+        };
+        let payload_opts = rnpm_registry::PublishPayloadOptions {
+            name: &pkg_name,
+            version: &pkg_version,
+            description: manifest_json.get("description").and_then(|d| d.as_str()),
+            tag: &tag,
+            access: effective_access,
+            manifest: &publish_manifest,
+            tarball: tarball_data,
+            registry_url: &registry_url,
+            provenance_attestation: None,
+        };
+        let payload = rnpm_registry::create_publish_payload(&payload_opts);
+        let put_url = registry_url
+            .join(&rnpm_config::encode_package_name(&pkg_name))
+            .unwrap_or_else(|_| registry_url.clone());
+        client
+            .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
+            .await
+            .map_err(|err| {
+                use rnpm_registry::RegistryError as E;
+                let status_error = |status: u16, body: &str| {
+                    commands::client_helper::format_http_error(
+                        "PUT",
+                        &put_url,
+                        reqwest::StatusCode::from_u16(status)
+                            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                        body,
+                    )
+                };
+                match err {
+                    E::Forbidden { status, message, .. }
+                    | E::Unauthorized { status, message, .. }
+                    | E::PublishConflict { status, message, .. } => status_error(status, &message),
+                    E::ServerError { status, body } => status_error(status, &body),
+                    other => anyhow::anyhow!(other),
+                }
+            })?;
+    }
+
+    // JSON is only printed once the publish has completed.
+    if json {
+        println!("{}", serde_json::to_string_pretty(&pack_json())?);
+    }
+
+    // `publish` and `postpublish` run only after a successful upload, and
+    // only for directory specs.
+    if !tarball_spec {
+        let manifest = Manifest::from_file(package_dir.join("package.json"))?;
+        run_lifecycle_hook(&package_dir, &manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "postpublish", ignore_scripts, foreground, is_silent, json)?;
+    }
+
+    if !json && !is_silent {
+        println!("+ {pkg_name}@{pkg_version}");
+    }
     Ok(())
 }
 
@@ -3698,6 +3829,7 @@ pub(crate) fn make_registry_client(
         default_registry: registry_url.clone(),
         scoped_registries: config.npmrc.scoped_registries.clone(),
         auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
         ..Default::default()
     };
     if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
@@ -5950,6 +6082,19 @@ pub(crate) fn use_unicode(dir: &Path) -> bool {
         })
 }
 
+/// True when npm's loglevel resolves to `silent` for this directory.
+pub(crate) fn is_loglevel_silent(dir: &Path) -> bool {
+    let overrides = rnpm_config::get_process_cli_overrides();
+    overrides
+        .as_ref()
+        .and_then(|o| o.get("loglevel"))
+        .map(|s| s == "silent")
+        .unwrap_or(false)
+        || rnpm_config::Config::load(Some(dir))
+            .ok()
+            .is_some_and(|c| c.get("loglevel") == Some("silent"))
+}
+
 pub(crate) fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
     eprintln!("npm notice");
     let unicode = use_unicode(&std::env::current_dir().unwrap_or_default());
@@ -6098,6 +6243,81 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
     env
 }
 
+/// `--json` (or `json=true` config) is in effect for this invocation.
+fn json_error_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == "--json" || a == "--json=true")
+        || std::env::current_dir()
+            .ok()
+            .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+            .and_then(|c| c.get_bool("json"))
+            .unwrap_or(false)
+}
+
+/// npm's `jsonError`: `{ error: { code?, summary, detail } }` built from a
+/// rendered `npm error` block. Summary is the message; detail starts at the
+/// explanatory lines npm keeps separate.
+fn npm_json_error(block: &str) -> String {
+    let mut code = None;
+    let mut lines: Vec<String> = Vec::new();
+    for line in block.lines() {
+        let Some(rest) = line.strip_prefix("npm error").map(|r| r.strip_prefix(' ').unwrap_or(r)) else {
+            continue;
+        };
+        if let Some(c) = rest.strip_prefix("code ").filter(|_| code.is_none() && lines.is_empty()) {
+            code = Some(c.trim().to_string());
+            continue;
+        }
+        if rest.starts_with("A complete log of this run") || rest.starts_with("Log files were not written") {
+            continue;
+        }
+        lines.push(rest.to_string());
+    }
+    while lines.first().is_some_and(|l| l.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    const DETAIL_STARTS: &[&str] = &[
+        "403 In most cases",
+        "Failed to parse JSON data.",
+        "notarget In most cases",
+        "need auth You need to authorize",
+        "404 \u{0027}",
+    ];
+    let lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| l.strip_prefix("JSON.parse ").map(str::to_string).unwrap_or(l))
+        .collect();
+    let split = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, l)| DETAIL_STARTS.iter().any(|p| l.starts_with(p)) || l.as_str() == "404")
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    let strip = |l: &String| {
+        for prefix in ["403 ", "404 ", "notarget ", "need auth ", "notsup ", "engine "] {
+            if let Some(rest) = l.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+        if l == "404" {
+            return String::new();
+        }
+        l.clone()
+    };
+    let summary = lines[..split].iter().map(strip).collect::<Vec<_>>().join("\n");
+    let detail = lines[split..].iter().map(strip).collect::<Vec<_>>().join("\n");
+    let mut error = serde_json::Map::new();
+    if let Some(code) = code {
+        error.insert("code".into(), serde_json::Value::String(code));
+    }
+    error.insert("summary".into(), serde_json::Value::String(summary));
+    error.insert("detail".into(), serde_json::Value::String(detail));
+    serde_json::to_string_pretty(&serde_json::json!({ "error": error })).unwrap_or_default()
+}
+
 fn finish_cli_error(err: &anyhow::Error) -> ! {
     if err.is::<commands::login::InputClosed>() {
         std::process::exit(1);
@@ -6111,6 +6331,14 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         std::process::exit(exit.exit_code);
     }
     let rendered = format!("{err:#}");
+    if json_error_requested() {
+        let block = if rendered.starts_with("npm error ") {
+            rendered.clone()
+        } else {
+            diagnostics::classify_error(err).format_npm()
+        };
+        println!("{}", npm_json_error(&block));
+    }
     if rendered.starts_with("npm error code ") {
         // Already a complete npm error block: keep its code and blank lines.
         eprintln!("{}", rendered.trim_end());

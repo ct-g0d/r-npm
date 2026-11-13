@@ -22,6 +22,7 @@ pub(crate) async fn run(
         default_registry: registry_url.clone(),
         scoped_registries: config.npmrc.scoped_registries.clone(),
         auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
         ..Default::default()
     };
     if let Some(tok) = config.npmrc.get_auth_token(&registry_url) {

@@ -291,6 +291,8 @@ pub struct RegistryClientConfig {
     pub retry_on_status: HashSet<u16>,
     pub scoped_registries: std::collections::BTreeMap<String, Url>,
     pub auth_tokens: std::collections::BTreeMap<String, String>,
+    /// URI-scoped Basic credentials (base64 `user:password`).
+    pub basic_auths: std::collections::BTreeMap<String, String>,
     pub circuit_breaker_enabled: bool,
     pub circuit_breaker_failure_threshold: usize,
     pub circuit_breaker_reset_timeout: Duration,
@@ -339,6 +341,7 @@ impl Default for RegistryClientConfig {
             retry_on_status,
             scoped_registries: std::collections::BTreeMap::new(),
             auth_tokens: std::collections::BTreeMap::new(),
+            basic_auths: std::collections::BTreeMap::new(),
             circuit_breaker_enabled: false,
             circuit_breaker_failure_threshold: 5,
             circuit_breaker_reset_timeout: Duration::from_secs(30),
@@ -869,6 +872,31 @@ impl RegistryClient {
         false
     }
 
+    /// The `Authorization` value npm would send: a Bearer token when one is
+    /// configured, otherwise URI-scoped Basic credentials.
+    pub fn auth_header_for_url(&self, url: &Url) -> Option<String> {
+        if let Some(token) = self.auth_token_for_url(url) {
+            return Some(format!("Bearer {token}"));
+        }
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let mut path = url.path().to_string();
+        loop {
+            let key = format!("//{host}{port}{}", if path.ends_with('/') { path.clone() } else { format!("{path}/") });
+            if let Some(basic) = self.config.basic_auths.get(&key) {
+                return Some(format!("Basic {basic}"));
+            }
+            if path == "/" || path.is_empty() {
+                return None;
+            }
+            let trimmed = path.trim_end_matches('/');
+            path = match trimmed.rfind('/') {
+                Some(i) => trimmed[..=i].to_string(),
+                None => "/".to_string(),
+            };
+        }
+    }
+
     /// Retrieve the auth token for a target URL if configured in `auth_tokens` or fallback to `auth_token`.
     /// Never returns the fallback registry auth token to untrusted hosts.
     pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
@@ -1086,8 +1114,8 @@ impl RegistryClient {
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
 
                 if should_send_auth {
-                    if let Some(token) = self.auth_token_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    if let Some(auth) = self.auth_header_for_url(&current_url) {
+                        req = req.header(AUTHORIZATION, auth);
                     }
                 } else {
                     debug!(
@@ -1326,8 +1354,8 @@ impl RegistryClient {
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
 
                 if should_send_auth {
-                    if let Some(token) = self.auth_token_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    if let Some(auth) = self.auth_header_for_url(&current_url) {
+                        req = req.header(AUTHORIZATION, auth);
                     }
                 } else {
                     debug!(

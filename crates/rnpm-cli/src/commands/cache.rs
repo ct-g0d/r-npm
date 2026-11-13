@@ -172,11 +172,53 @@ async fn cache_registry_package(
     } else {
         (spec.name.as_str(), &spec.target)
     };
+    let (bytes, version, metadata, tarball_url) =
+        download_registry_package(&client, package, name, target).await?;
+    cache.put(
+        &format!(
+            "make-fetch-happen:request-cache:{}",
+            client.package_metadata_url(name)?
+        ),
+        &serde_json::to_vec(&metadata)?,
+        None,
+    )?;
+    cache.put(
+        &format!("make-fetch-happen:request-cache:{tarball_url}"),
+        &bytes,
+        None,
+    )?;
+    cache.put(&format!("pacote:tarball:{name}@{version}"), &bytes, None)?;
+    Ok(())
+}
+
+/// Resolve a registry spec like pacote (a range prefers the `latest` tag
+/// when it satisfies) and download its verified tarball.
+pub(crate) async fn download_registry_package(
+    client: &rnpm_registry::RegistryClient,
+    package: &str,
+    name: &str,
+    target: &rnpm_core::spec::PackageTarget,
+) -> Result<(Vec<u8>, String, rnpm_registry::metadata::AbbreviatedPackageMetadata, String)> {
+    use rnpm_core::spec::PackageTarget;
     let metadata = client.get_package_metadata(name).await?;
     let version = match target {
         PackageTarget::Version(version) => version.to_string(),
         PackageTarget::Tag(tag) => metadata.dist_tags.get(tag).cloned().ok_or_else(|| anyhow::anyhow!("npm error code ETARGET\nnpm error No matching tag found for {name}@{tag}"))?,
-        PackageTarget::Range(range) => metadata.versions.keys().filter_map(|v| rnpm_core::semver::Version::parse(v).ok()).filter(|v| range.satisfies(v)).max().map(|v| v.to_string()).ok_or_else(|| anyhow::anyhow!("npm error code ETARGET\nnpm error No matching version found for {package}"))?,
+        PackageTarget::Range(range) => metadata
+            .dist_tags
+            .get("latest")
+            .filter(|l| rnpm_core::semver::Version::parse(l).is_ok_and(|v| range.satisfies(&v)))
+            .cloned()
+            .or_else(|| {
+                metadata
+                    .versions
+                    .keys()
+                    .filter_map(|v| rnpm_core::semver::Version::parse(v).ok())
+                    .filter(|v| range.satisfies(v))
+                    .max()
+                    .map(|v| v.to_string())
+            })
+            .ok_or_else(|| anyhow::anyhow!("npm error code ETARGET\nnpm error No matching version found for {package}"))?,
         _ => anyhow::bail!("npm error code EUNSUPPORTEDPROTOCOL\nnpm error Unsupported cache package spec: {package}"),
     };
     let resolved = metadata.versions.get(&version).ok_or_else(|| {
@@ -194,19 +236,6 @@ async fn cache_registry_package(
             "npm error code EINTEGRITY\nnpm error Tarball checksum mismatch"
         );
     }
-    cache.put(
-        &format!(
-            "make-fetch-happen:request-cache:{}",
-            client.package_metadata_url(name)?
-        ),
-        &serde_json::to_vec(&metadata)?,
-        None,
-    )?;
-    cache.put(
-        &format!("make-fetch-happen:request-cache:{}", resolved.dist.tarball),
-        &bytes,
-        None,
-    )?;
-    cache.put(&format!("pacote:tarball:{name}@{version}"), &bytes, None)?;
-    Ok(())
+    let tarball_url = resolved.dist.tarball.clone();
+    Ok((bytes, version, metadata, tarball_url))
 }

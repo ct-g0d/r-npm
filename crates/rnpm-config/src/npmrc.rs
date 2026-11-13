@@ -60,6 +60,40 @@ impl Default for Npmrc {
 }
 
 impl Npmrc {
+    /// URI-scoped Basic credentials (base64 `user:password`), keyed like
+    /// `auth_tokens`: from `//host/:_auth`, or `//host/:username` with
+    /// base64 `//host/:_password`.
+    pub fn basic_auths(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (key, value) in &self.settings {
+            if let Some(prefix) = key.strip_suffix(":_auth") {
+                if prefix.starts_with("//") || prefix.contains("://") {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        out.insert(normalize_uri_prefix(prefix), v.to_string());
+                    }
+                }
+            } else if let Some(prefix) = key.strip_suffix(":username") {
+                let password = self
+                    .settings
+                    .get(&format!("{prefix}:_password"))
+                    .map(|p| {
+                        data_encoding::BASE64
+                            .decode(p.trim().as_bytes())
+                            .ok()
+                            .and_then(|b| String::from_utf8(b).ok())
+                            .unwrap_or_else(|| p.trim().to_string())
+                    });
+                if let Some(password) = password {
+                    let encoded =
+                        data_encoding::BASE64.encode(format!("{}:{password}", value.trim()).as_bytes());
+                    out.entry(normalize_uri_prefix(prefix)).or_insert(encoded);
+                }
+            }
+        }
+        out
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

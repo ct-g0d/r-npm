@@ -1372,6 +1372,18 @@ fn directory_target_entry(
     }
 }
 
+/// npm 11.20 usage error for `npm ci` without a lockfile (from npm itself).
+pub const CI_NO_LOCKFILE_USAGE: &str = "\nThe `npm ci` command can only install with an existing package-lock.json or\nnpm-shrinkwrap.json with lockfileVersion >= 1. Run an install with npm@5 or\nlater to generate a package-lock.json file, then try again.\n\nClean install a project\n\nUsage:\nnpm ci\n\nOptions:\n[--install-strategy <hoisted|nested|shallow|linked>] [--legacy-bundling]\n[--global-style] [--omit <dev|optional|peer> [--omit <dev|optional|peer> ...]]\n[--include <prod|dev|optional|peer> [--include <prod|dev|optional|peer> ...]]\n[--strict-peer-deps] [--foreground-scripts] [--ignore-scripts]\n[--allow-directory <all|none|root>] [--allow-file <all|none|root>]\n[--allow-git <all|none|root>] [--allow-remote <all|none|root>]\n[--allow-scripts <package-list> [--allow-scripts <package-list> ...]]\n[--strict-allow-scripts] [--dangerously-allow-all-scripts] [--no-audit]\n[--no-bin-links] [--no-fund] [--dry-run]\n[-w|--workspace <workspace-name> [-w|--workspace <workspace-name> ...]]\n[--workspaces] [--include-workspace-root] [--install-links]\n\n  --install-strategy\n    Sets the strategy for installing packages in node_modules.\n\n  --legacy-bundling\n    Instead of hoisting package installs in `node_modules`, install packages\n\n  --global-style\n    Only install direct dependencies in the top level `node_modules`,\n\n  --omit\n    Dependency types to omit from the installation tree on disk.\n\n  --include\n    Option that allows for defining which types of dependencies to install.\n\n  --strict-peer-deps\n    If set to `true`, and `--legacy-peer-deps` is not set, then _any_\n\n  --foreground-scripts\n    Run all build scripts (ie, `preinstall`, `install`, and\n\n  --ignore-scripts\n    If true, npm does not run scripts specified in package.json files.\n\n  --allow-directory\n    Limits the ability for npm to install dependencies from directories.\n\n  --allow-file\n    Limits the ability for npm to install dependencies from tarball files.\n\n  --allow-git\n    Limits the ability for npm to fetch dependencies from git references.\n\n  --allow-remote\n    Limits the ability for npm to fetch dependencies from urls.\n\n  --allow-scripts\n    Comma-separated list of packages whose install-time lifecycle scripts\n\n  --strict-allow-scripts\n    If `true`, turn the install-script policy from a warning into a hard\n\n  --dangerously-allow-all-scripts\n    If `true`, bypass the `allowScripts` policy entirely and run every\n\n  --audit\n    When \"true\" submit audit reports alongside the current npm command to the\n\n  --bin-links\n    Tells npm to create symlinks (or `.cmd` shims on Windows) for package\n\n  --fund\n    When \"true\" displays the message at the end of each `npm install`\n\n  --dry-run\n    Indicates that you don't want npm to make any changes and that it should\n\n  -w|--workspace\n    Enable running a command in the context of the configured workspaces of the\n\n  --workspaces\n    Set to true to run the command in the context of **all** configured\n\n  --include-workspace-root\n    Include the workspace root when workspaces are enabled for a command.\n\n  --install-links\n    When set file: protocol dependencies will be packed and installed as\n\n\naliases: clean-install, ic, install-clean, isntall-clean\n\nRun \"npm help ci\" for more info";
+
+/// Render a multi-line message as npm error lines (blank lines stay bare).
+fn npm_error_lines(message: &str) -> String {
+    message
+        .lines()
+        .map(|l| if l.is_empty() { "npm error".to_string() } else { format!("npm error {l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn relative_posix_path(from: &Path, to: &Path) -> String {
     if let Ok(rel) = to.strip_prefix(from) {
         let s = rel.to_string_lossy();
@@ -1519,6 +1531,7 @@ impl Installer {
         let mut client_config = RegistryClientConfig {
             default_registry: registry_url.clone(),
             auth_tokens: config.npmrc.auth_tokens.clone(),
+            basic_auths: config.npmrc.basic_auths(),
             scoped_registries: config.npmrc.scoped_registries.clone(),
             ..Default::default()
         };
@@ -3929,8 +3942,10 @@ impl Installer {
             ));
         }
         if !lockfile_path.exists() {
+            let _ = lockfile_name;
             return Err(anyhow!(
-                "{lockfile_name} not found: rnpm ci requires a committed lockfile"
+                "npm error code EUSAGE\n{}",
+                npm_error_lines(CI_NO_LOCKFILE_USAGE)
             ));
         }
 
