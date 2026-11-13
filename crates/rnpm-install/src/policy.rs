@@ -672,7 +672,9 @@ fn describe(scripts: &[(String, String)]) -> String {
         .join("; ")
 }
 
-fn strict_error(mut unreviewed: Vec<(String, String, Vec<(String, String)>)>) -> anyhow::Error {
+type UnreviewedPackageScripts = (String, String, Vec<(String, String)>);
+
+fn strict_error(mut unreviewed: Vec<UnreviewedPackageScripts>) -> anyhow::Error {
     unreviewed.sort_by(|a, b| a.0.cmp(&b.0));
     let lines = unreviewed
         .iter()

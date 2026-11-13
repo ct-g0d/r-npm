@@ -45,6 +45,7 @@ pub struct PublishAttachment {
 /// - `versions`: `{ [version]: manifest_with_dist }`
 /// - `_attachments`: containing base64-encoded tarball with shasum and integrity
 /// - `access`: public or restricted (optional)
+///
 /// Build the publish document like libnpmpublish's `buildMetadata`: the
 /// manifest is stored as-is plus `_id` and `dist`, `access` is always
 /// present (null when unset), and the tarball URL and attachment key use the
