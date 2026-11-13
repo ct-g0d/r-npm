@@ -227,6 +227,7 @@ const auditTree=dir=>{
   write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-branch':'^1.0.0'}},'node_modules/audit-branch':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'}},'node_modules/audit-leaf':{version:'1.0.0'}}});
 };
 for(const [name,range] of [['breaking','<2.0.0'],['in-range','<1.1.0'],['unfixable','*']])for(const flags of [[],['--json']])add(`cli-audit-${name}${flags.length?'-json':''}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':[{id:101,name:'audit-leaf',url:'https://example.invalid/advisory/101',title:'Fixture advisory',severity:'moderate',vulnerable_versions:range,cwe:['CWE-400'],cvss:{score:5.3,vectorString:null}}]}});
+for(const spec of ['1','>=1'])for(const fields of [['version'],['name','version']])for(const flags of [[],['--json']])add(`cli-view-${spec.replace('>=','gte-')}-${fields.join('-')}${flags.length?'-json':''}`,'view',['view',`dep@${spec}`,...fields,...flags]);
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
