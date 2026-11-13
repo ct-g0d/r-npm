@@ -236,6 +236,8 @@ for(const [name,versions] of Object.entries({
   'fresh-packument':{'1.0.0':{}},
   'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
   'bundle-owner':{'1.0.0':{dependencies:{'bundled-leaf':'1.0.0'},bundleDependencies:['bundled-leaf']}},
+  'peer-entry':{'1.0.0':{peerDependencies:{'peer-parent':'1.0.0'}}},
+  'peer-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -252,6 +254,7 @@ for(const [name,versions] of Object.entries({
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
+add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
