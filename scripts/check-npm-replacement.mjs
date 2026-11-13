@@ -12,7 +12,9 @@ const cli = process.argv.slice(2);
 const option = (name, fallback) => cli.includes(name) ? cli[cli.indexOf(name) + 1] : fallback;
 const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
 const output = path.resolve(option('--output', path.join(repo, 'target/npm-replacement-smoke.json')));
-const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rnpm-replacement-'));
+// Long real path: npm compares realpaths, so an 8.3 short temp path would
+// make npm's own path-keyed policies miss.
+const root = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'rnpm-replacement-'));
 console.log(`Fixtures and raw logs: ${root}`);
 const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
 const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_|npm_token$|node_auth_token$)/i.test(k)));
@@ -92,6 +94,10 @@ for(const [name,fields,files] of [
   ['pack-nested-ignore',{files:['lib']},{'lib/keep.js':'hello','lib/omit.js':'omit','lib/.npmignore':'omit.js\n'}],
   ['pack-explicit-nested-file',{files:['lib/keep.js']},{'lib/keep.js':'hello','lib/.npmignore':'keep.js\n'}],
   ['pack-nested-gitignore',{files:['lib']},{'lib/keep.js':'hello','lib/omit.js':'omit','lib/.gitignore':'omit.js\n'}],
+  ['pack-ignore-globstar',{},{'index.js':'1','.npmignore':'secrets/**/*.pem\n','secrets/prod/key.pem':'FAKE-KEY','secrets/top.pem':'FAKE-KEY'}],
+  ['pack-ignore-anchored-dir',{},{'index.js':'1','.npmignore':'config/private\n','config/private/a.json':'{}','config/public.json':'{}'}],
+  ['pack-files-globstar',{files:['dist/**/*.js']},{'dist/sub/index.js':'1','dist/sub/index.ts':'1','dist/top.js':'1'}],
+  ['pack-files-brace-class',{files:['lib/*.{js,cjs}','bin/v[0-9].js']},{'lib/a.js':'1','lib/b.cjs':'1','lib/c.ts':'1','bin/v1.js':'1','bin/vx.js':'1'}],
   ['pack-nested-ignore-negation',{}, {'lib/keep.js':'hello','lib/omit.js':'omit','.npmignore':'*.js\n','lib/.npmignore':'!keep.js\n'}],
 ])add(name,'pack',packArgs,dir=>{manifest(dir,fields);for(const [p,v]of Object.entries(files))write(dir,p,v);});
 add('empty-install-hidden-lock','install',['install','--ignore-scripts']);
@@ -165,6 +171,21 @@ for(const [name,args] of [
   ['list',['trust','list','dep']],['list-json',['trust','list','dep','--json']],['list-empty',['trust','list','parent']],['list-from-manifest',['trust','list']],
   ['revoke',['trust','revoke','dep','--id=trust-1']],['revoke-dry-run',['trust','revoke','dep','--id=trust-1','--dry-run']],['revoke-missing-id',['trust','revoke','dep']],['bare',['trust']],
 ])add(`trust-${name}`,'trust',args,dir=>manifest(dir,{name:'dep'}),{auth:true});
+const scriptDep=(dir,fields={})=>{manifest(dir,{dependencies:{'script-dep':'file:./script-dep'},...fields});manifest(path.join(dir,'script-dep'),{name:'script-dep',version:'1.0.0',scripts:{postinstall:'node -e "require(\'fs\').writeFileSync(\'RAN.txt\',\'yes\')"'}});};
+for(const [name,args,fields] of [
+  ['allow-directory-none',['install','--allow-directory=none'],{}],
+  ['allow-directory-root',['install','--allow-directory=root'],{}],
+  ['strict-allow-scripts',['install','--strict-allow-scripts'],{}],
+  ['strict-allow-scripts-approved',['install','--strict-allow-scripts'],{allowScripts:{'file:./script-dep':true}}],
+  ['deny-by-name',['install'],{allowScripts:{'script-dep':false}}],
+  ['allow-by-path',['install'],{allowScripts:{'file:./script-dep':true}}],
+  ['advisory',['install'],{}],
+  ['range-key-dropped',['install'],{allowScripts:{'script-dep@^1.0.0':true}}],
+  ['dangerously-allow-all',['install','--strict-allow-scripts','--dangerously-allow-all-scripts'],{}],
+])add(`policy-${name}`,'install',args,dir=>scriptDep(dir,fields));
+add('policy-allow-file-none','install',['install','--allow-file=none'],dir=>{manifest(dir,{dependencies:{dep:'file:./dep.tgz'}});write(dir,'dep.tgz',tarballs.get('/dep-1.0.0.tgz'));});
+add('policy-allow-registry-none','install',['install','--allow-registry=none'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}));
+add('repeat-install-runs-prepare','install',['install'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},scripts:{prepare:'node -e "require(\'fs\').appendFileSync(\'hooks.txt\',\'prepare\\n\')"'}}),{before:async ctx=>{const p=await ctx.exec(['install']);if(p.exit!==0)throw new Error(p.stderr);}});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

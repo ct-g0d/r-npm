@@ -63,6 +63,7 @@ pub mod save;
 pub use save::*;
 
 pub mod linked;
+pub mod policy;
 pub use linked::*;
 
 /// Wait for every persistence job even when an earlier job fails.
@@ -1347,6 +1348,30 @@ pub struct ResolvedNode {
 }
 
 /// Helper to compute normalized POSIX relative path from one directory to another.
+/// Lockfile entry for the target of a `file:` directory link, shaped like
+/// Arborist's: `name` only when it differs from the folder name, and
+/// `hasInstallScript` when the package declares install-time scripts.
+fn directory_target_entry(
+    dir: &Path,
+    location: &str,
+    node: &rnpm_solver::graph::Node,
+) -> LockfilePackage {
+    let folder = location.rsplit('/').next().unwrap_or(location);
+    let manifest = Manifest::from_file(dir.join("package.json")).ok();
+    let has_install_script = manifest.as_ref().is_some_and(|m| {
+        ["preinstall", "install", "postinstall"]
+            .iter()
+            .any(|s| m.scripts.contains_key(*s))
+    }) || dir.join("binding.gyp").is_file();
+    LockfilePackage {
+        name: (node.name != folder).then(|| node.name.clone()),
+        version: Some(node.version.clone()),
+        has_install_script: has_install_script.then_some(true),
+        dependencies: (!node.dependencies.is_empty()).then(|| node.dependencies.clone()),
+        ..Default::default()
+    }
+}
+
 pub fn relative_posix_path(from: &Path, to: &Path) -> String {
     if let Ok(rel) = to.strip_prefix(from) {
         let s = rel.to_string_lossy();
@@ -1416,6 +1441,8 @@ pub struct Installer {
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
     writer_cfg: Arc<rnpm_fs::ParallelWriterConfig>,
     io_semaphore: Arc<tokio::sync::Semaphore>,
+    source_policy: policy::SourcePolicy,
+    script_policy: policy::ScriptPolicy,
 }
 
 impl Installer {
@@ -1540,6 +1567,15 @@ impl Installer {
         let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
 
+        let source_policy = policy::SourcePolicy::from_config(&config);
+        let script_policy =
+            policy::ScriptPolicy::load(&options.project_dir, &config, options.is_global);
+        if !options.silent {
+            for warning in &script_policy.warnings {
+                eprintln!("npm warn install-scripts {warning}");
+            }
+        }
+
         Ok(Self {
             options,
             cache,
@@ -1548,7 +1584,94 @@ impl Installer {
             metadata_cache: HashMap::new(),
             writer_cfg,
             io_semaphore,
+            source_policy,
+            script_policy,
         })
+    }
+
+    /// Enforce `allow-git`/`allow-file`/... before anything is fetched.
+    fn check_source_policy(
+        &self,
+        lockfile: &LockfileV3,
+        manifest: &Manifest,
+        workspace_members: &[WorkspaceMember],
+    ) -> Result<()> {
+        let mut declared: HashSet<String> = HashSet::new();
+        let mut collect = |m: &Manifest| {
+            declared.extend(m.dependencies.keys().cloned());
+            declared.extend(m.dev_dependencies.keys().cloned());
+            declared.extend(m.optional_dependencies.keys().cloned());
+            declared.extend(m.peer_dependencies.keys().cloned());
+        };
+        collect(manifest);
+        for member in workspace_members {
+            collect(&member.manifest);
+        }
+        declared.extend(self.options.packages.iter().filter_map(|spec| {
+            rnpm_core::spec::PackageSpec::parse(spec).ok().map(|s| s.name.clone())
+        }));
+        let workspace_paths: HashSet<String> = workspace_members
+            .iter()
+            .map(|m| m.relative_path.clone())
+            .collect();
+        policy::check_sources(lockfile, &declared, &workspace_paths, &self.source_policy)?;
+        let base_dir = if self.options.is_global {
+            rnpm_config::find_global_node_modules(&self.options.project_dir)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.options.project_dir.clone())
+        } else {
+            self.options.project_dir.clone()
+        };
+        policy::strict_preflight(
+            lockfile,
+            &base_dir,
+            &workspace_paths,
+            &self.script_policy,
+            self.options.ignore_scripts,
+        )
+    }
+
+    /// Lifecycle options shared by dependency and root hooks.
+    fn lifecycle_options(&self) -> LifecycleOptions {
+        let sandbox_policy = if self.options.strict_sandbox {
+            rnpm_lifecycle::ScriptSandboxPolicy::restricted()
+        } else {
+            rnpm_lifecycle::ScriptSandboxPolicy::permissive()
+        };
+        LifecycleOptions {
+            root_dir: self.options.project_dir.clone(),
+            init_cwd: self.options.project_dir.clone(),
+            ignore_scripts: false,
+            capture_output: !self.options.foreground_scripts,
+            foreground_scripts: self.options.foreground_scripts,
+            timeout: None,
+            sandbox_policy,
+        }
+    }
+
+    /// npm's post-reify advisory about install scripts the allowScripts
+    /// policy does not cover.
+    fn warn_unreviewed_scripts(&self, lockfile: &LockfileV3, base_dir: &Path) {
+        if self.options.ignore_scripts || self.options.silent {
+            return;
+        }
+        let workspace_paths: HashSet<String> = Manifest::from_file(base_dir.join("package.json"))
+            .ok()
+            .and_then(|m| discover_workspaces_from_manifest(base_dir, &m).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.relative_path)
+            .collect();
+        if let Some(message) = policy::unreviewed_scripts_warning(
+            lockfile,
+            base_dir,
+            &workspace_paths,
+            &self.script_policy,
+            self.options.is_global,
+        ) {
+            eprintln!("{message}");
+        }
     }
 
     /// Access the underlying PackStore.
@@ -1655,6 +1778,21 @@ impl Installer {
                         let lockfile_path = project_lockfile_path(&self.options.project_dir);
                         drop(_plan_span);
                         collector.record_phase(Phase::Plan, plan_start.elapsed());
+                        if !self.options.ignore_scripts && !self.options.is_global {
+                            let hidden = self
+                                .options
+                                .project_dir
+                                .join("node_modules")
+                                .join(".package-lock.json");
+                            if let Ok(actual) = LockfileV3::load_from_file(&hidden) {
+                                self.warn_unreviewed_scripts(&actual, &self.options.project_dir);
+                            }
+                            let root_manifest = Manifest::from_file(&manifest_path)
+                                .context("Failed to parse project package.json")?;
+                            let opts = self.lifecycle_options();
+                            let _life_guard = collector.enter_phase(Phase::Lifecycle);
+                            rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts).await?;
+                        }
                         return Ok(InstallSummary {
                             packages_installed: 0,
                             cache_hits: 0,
@@ -2205,6 +2343,7 @@ impl Installer {
         }
 
         let mut lockfile = graph.to_lockfile_v3(&project_name, project_version.as_deref());
+        self.check_source_policy(&lockfile, &manifest, &workspace_members)?;
         if let Some(ref existing) = existing_lockfile_for_merge {
             for (loc, pkg) in &mut lockfile.packages {
                 if loc.is_empty() {
@@ -2283,15 +2422,10 @@ impl Installer {
                             };
                             lockfile.insert_package(loc, link_entry);
 
-                            let mut target_entry = LockfilePackage {
-                                name: Some(node.name.clone()),
-                                version: Some(node.version.clone()),
-                                ..Default::default()
-                            };
-                            if !node.dependencies.is_empty() {
-                                target_entry.dependencies = Some(node.dependencies.clone());
-                            }
-                            lockfile.insert_package(clean_rel, target_entry);
+                            lockfile.insert_package(
+                                clean_rel,
+                                directory_target_entry(&abs_file, clean_rel, node),
+                            );
                         }
                     }
                 }
@@ -2904,15 +3038,10 @@ impl Installer {
                         };
                         lockfile.insert_package(loc, link_entry);
 
-                        let mut target_entry = LockfilePackage {
-                            name: Some(node.name.clone()),
-                            version: Some(node.version.clone()),
-                            ..Default::default()
-                        };
-                        if !node.dependencies.is_empty() {
-                            target_entry.dependencies = Some(node.dependencies.clone());
-                        }
-                        lockfile.insert_package(clean_rel, target_entry);
+                        lockfile.insert_package(
+                            clean_rel,
+                            directory_target_entry(&abs_file, clean_rel, node),
+                        );
                         continue;
                     }
                 }
@@ -3657,6 +3786,12 @@ impl Installer {
                 timeout: None,
                 sandbox_policy,
             };
+            let lifecycle_nodes = policy::apply_script_policy(
+                lifecycle_nodes,
+                &lockfile,
+                &loc_base_dir,
+                &self.script_policy,
+            )?;
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
             Some(lifecycle_opts)
         } else {
@@ -3717,6 +3852,7 @@ impl Installer {
             }
         }
 
+        self.warn_unreviewed_scripts(&lockfile, &loc_base_dir);
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             if self.options.packages.is_empty() && !self.options.is_global {
@@ -3815,6 +3951,7 @@ impl Installer {
         let workspace_members =
             discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
                 .unwrap_or_default();
+        self.check_source_policy(&lockfile, &manifest, &workspace_members)?;
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             WorkspaceDependencyGraph::construct(&workspace_members).ok()
@@ -5769,6 +5906,12 @@ impl Installer {
                 timeout: None,
                 sandbox_policy,
             };
+            let lifecycle_nodes = policy::apply_script_policy(
+                lifecycle_nodes,
+                &lockfile,
+                &self.options.project_dir,
+                &self.script_policy,
+            )?;
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
             Some(lifecycle_opts)
         } else {
@@ -5789,6 +5932,7 @@ impl Installer {
                 .context("Failed to save hidden package-lock.json")?;
         }
 
+        self.warn_unreviewed_scripts(&lockfile, &self.options.project_dir);
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             rnpm_lifecycle::execute_root_hooks(&manifest, &opts).await?;

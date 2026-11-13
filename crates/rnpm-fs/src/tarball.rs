@@ -1476,8 +1476,8 @@ fn should_include_file(
             if rel_path.starts_with(&format!("{clean_no_slash}/")) {
                 return true;
             }
-            // Wildcard match
-            match_glob(clean, rel_path)
+            // Glob match against the file or a directory containing it
+            match_glob_or_parent(clean_no_slash, rel_path)
         });
 
         if !matched {
@@ -1582,8 +1582,8 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
         }
     }
 
-    if clean_pat.contains('/') {
-        if match_glob(clean_pat, target_path) {
+    if clean_pat.trim_end_matches('/').contains('/') {
+        if match_glob_or_parent(clean_pat.trim_end_matches('/'), target_path) {
             return true;
         }
     } else {
@@ -1602,29 +1602,167 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
     false
 }
 
+/// minimatch-style path glob: `*` and `?` stay within a segment, `**`
+/// spans any number of segments (including none), `[...]` is a class and
+/// `{a,b}` alternatives are expanded.
 fn match_glob(pattern: &str, text: &str) -> bool {
-    if pattern == "*" || pattern == "**" {
-        return true;
-    }
+    expand_braces(pattern).iter().any(|p| {
+        let pat: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let txt: Vec<&str> = text.split('/').filter(|s| !s.is_empty()).collect();
+        match_segments(&pat, &txt)
+    })
+}
 
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if text.starts_with(prefix) {
-            return true;
+/// True when the glob matches `text` or any directory containing it, which is
+/// how ignore-walk treats a matched directory.
+fn match_glob_or_parent(pattern: &str, text: &str) -> bool {
+    let segments: Vec<&str> = text.split('/').filter(|s| !s.is_empty()).collect();
+    (1..=segments.len()).any(|n| match_glob(pattern, &segments[..n].join("/")))
+}
+
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let mut depth = 0;
+    let mut close = None;
+    for (i, c) in pattern[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
         }
     }
-
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if text.ends_with(suffix) {
-            return true;
+    let Some(close) = close else {
+        return vec![pattern.to_string()];
+    };
+    let inner = &pattern[open + 1..close];
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
+    parts.push(&inner[start..]);
+    if parts.len() < 2 {
+        return vec![pattern.to_string()];
+    }
+    let (head, tail) = (&pattern[..open], &pattern[close + 1..]);
+    parts
+        .into_iter()
+        .flat_map(|part| expand_braces(&format!("{head}{part}{tail}")))
+        .collect()
+}
 
-    pattern == text
+fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
+    match pat.first() {
+        None => txt.is_empty(),
+        Some(&"**") => {
+            // `**` never matches dot-entries, mirroring minimatch's default.
+            match_segments(&pat[1..], txt)
+                || (!txt.is_empty()
+                    && !txt[0].starts_with('.')
+                    && match_segments(pat, &txt[1..]))
+        }
+        Some(seg) => {
+            !txt.is_empty() && match_segment(seg, txt[0]) && match_segments(&pat[1..], &txt[1..])
+        }
+    }
+}
+
+fn match_segment(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // A leading wildcard does not match a leading dot (minimatch `dot: false`).
+    if t.first() == Some(&'.') && matches!(p.first(), Some('*') | Some('?') | Some('[')) {
+        return false;
+    }
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some('[') => {
+                let Some(end) = p.iter().skip(1).position(|c| *c == ']').map(|i| i + 1) else {
+                    return !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..]);
+                };
+                let Some(&c) = t.first() else { return false };
+                let mut class = &p[1..end];
+                let negate = matches!(class.first(), Some('!') | Some('^'));
+                if negate {
+                    class = &class[1..];
+                }
+                let mut hit = false;
+                let mut i = 0;
+                while i < class.len() {
+                    if i + 2 < class.len() && class[i + 1] == '-' {
+                        hit |= class[i] <= c && c <= class[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= class[i] == c;
+                        i += 1;
+                    }
+                }
+                hit != negate && go(&p[end + 1..], &t[1..])
+            }
+            Some('\\') if p.len() > 1 => !t.is_empty() && t[0] == p[1] && go(&p[2..], &t[1..]),
+            Some(&c) => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        }
+    }
+    go(&p, &t)
 }
 
 /// Sort helper for npm pack files:
 /// Files starting with uppercase letter come first (alphabetical),
 /// followed by others (alphabetical).
+#[cfg(test)]
+mod glob_tests {
+    use super::{match_glob, match_glob_or_parent};
+
+    #[test]
+    fn globstar_matches_any_depth_including_none() {
+        assert!(match_glob("secrets/**/*.pem", "secrets/prod/key.pem"));
+        assert!(match_glob("secrets/**/*.pem", "secrets/key.pem"));
+        assert!(match_glob("dist/**/*.js", "dist/sub/deep/index.js"));
+        assert!(!match_glob("dist/**/*.js", "dist/sub/index.ts"));
+        assert!(!match_glob("dist/*.js", "dist/sub/index.js"));
+    }
+
+    #[test]
+    fn classes_braces_and_question_marks() {
+        assert!(match_glob("lib/*.{js,cjs}", "lib/a.cjs"));
+        assert!(!match_glob("lib/*.{js,cjs}", "lib/a.ts"));
+        assert!(match_glob("file?.txt", "file1.txt"));
+        assert!(match_glob("v[0-9].js", "v7.js"));
+        assert!(!match_glob("v[!0-9].js", "v7.js"));
+    }
+
+    #[test]
+    fn wildcards_skip_dotfiles_like_minimatch() {
+        assert!(!match_glob("*", ".env"));
+        assert!(!match_glob("**/*.js", ".hidden/a.js"));
+    }
+
+    #[test]
+    fn matched_directories_cover_their_contents() {
+        assert!(match_glob_or_parent("secrets/prod", "secrets/prod/key.pem"));
+        assert!(!match_glob_or_parent("secrets/prod", "secrets/production/key.pem"));
+    }
+}
+
 fn sort_pack_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
     let a_first_char = a.chars().next().unwrap_or('\0');
     let b_first_char = b.chars().next().unwrap_or('\0');
