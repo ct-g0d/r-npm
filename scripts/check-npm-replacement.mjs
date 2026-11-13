@@ -30,6 +30,7 @@ async function run(exe,args,cwd,env) {
     p.on('close',exit=>{clearTimeout(timer);resolve({exit,stdout,stderr,error});});
   });
 }
+const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
 const tarballs=new Map(); const requests=[]; let generation=1;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
@@ -49,7 +50,10 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/npm/v1/user')return json({name:'mock-user',email:'mock@example.invalid',tfa:false});
   if(url==='/-/npm/v1/tokens')return json({objects:[],total:0,urls:{}});
   if(url==='/-/_view/starredByUser')return json({rows:[]});
-  if(url==='/-/stage')return json({items:[],total:0});
+  const stageItem={id:STAGE_ID,packageName:'dep',version:'1.2.0',status:'pending',tag:'latest',createdAt:'2026-11-13T00:00:00.000Z',actor:'mock-user',actorType:'user',shasum:'0123456789abcdef',extra:'kept'};
+  if(url==='/-/stage'){const pkg=new URL(req.url,'http://x').searchParams.get('package');return json(pkg==='empty-pkg'?{items:[],total:0}:{items:[stageItem],total:1});}
+  if(url===`/-/stage/${STAGE_ID}`)return json(stageItem);
+  if(url==='/-/package/dep/trust')return json([{id:'trust-1',type:'github',claims:{repository:'mock/repo',workflow_ref:{file:'publish.yml'},environment:'prod'},permissions:['createPackage','createStagedPackage']},{id:'trust-2',type:'gitlab',claims:{project_path:'group/proj',ci_config_ref_uri:{file:'.gitlab-ci.yml'}},permissions:['createPackage']}]);
   if(url.endsWith('/trust'))return json([]);
   if(url.includes('/stages')||url.includes('/trusted-publishers'))return json([]);
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
@@ -140,6 +144,15 @@ for(const [name,args] of [['spdx',['--sbom-format=spdx']],['cyclonedx',['--sbom-
 add('sbom-missing-format','sbom',['sbom']);
 add('sbom-lock-only-without-lock','sbom',['sbom','--sbom-format=spdx','--package-lock-only']);
 add('sbom-missing-dependency','sbom',['sbom','--sbom-format=spdx'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}));
+for(const [name,args] of [
+  ['list',['stage','list']],['list-json',['stage','list','--json']],['list-filter-empty',['stage','list','empty-pkg']],['list-version-spec',['stage','list','dep@1']],
+  ['bare',['stage']],['view',['stage','view',STAGE_ID]],['view-json',['stage','view',STAGE_ID,'--json']],['view-missing-id',['stage','view']],['view-invalid-id',['stage','view','nope']],
+  ['approve',['stage','approve',STAGE_ID]],['reject',['stage','reject',STAGE_ID]],['approve-missing-id',['stage','approve']],
+])add(`stage-${name}`,'stage',args,dir=>manifest(dir),{auth:true});
+for(const [name,args] of [
+  ['list',['trust','list','dep']],['list-json',['trust','list','dep','--json']],['list-empty',['trust','list','parent']],['list-from-manifest',['trust','list']],
+  ['revoke',['trust','revoke','dep','--id=trust-1']],['revoke-dry-run',['trust','revoke','dep','--id=trust-1','--dry-run']],['revoke-missing-id',['trust','revoke','dep']],['bare',['trust']],
+])add(`trust-${name}`,'trust',args,dir=>manifest(dir,{name:'dep'}),{auth:true});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);

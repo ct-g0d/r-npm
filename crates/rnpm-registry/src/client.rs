@@ -3491,6 +3491,32 @@ impl RegistryClient {
             .await
     }
 
+    /// One page of `GET /-/stage`, optionally filtered to one package.
+    pub async fn stage_list_page(
+        &self,
+        registry: Option<&Url>,
+        page: u64,
+        per_page: u64,
+        package: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let mut target = Url::parse(&format!(
+            "{}/-/stage",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        {
+            let mut query = target.query_pairs_mut();
+            query.append_pair("page", &page.to_string());
+            query.append_pair("perPage", &per_page.to_string());
+            if let Some(package) = package {
+                query.append_pair("package", package);
+            }
+        }
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
+    }
+
     pub async fn stage_view(
         &self,
         registry: Option<&Url>,

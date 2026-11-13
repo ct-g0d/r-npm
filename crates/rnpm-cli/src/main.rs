@@ -1411,6 +1411,8 @@ pub(crate) enum Commands {
         json: bool,
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Retrieve a configuration value (npm get alias)
@@ -5712,6 +5714,23 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             args,
             registry,
             otp,
+            json,
+        } if action.as_deref() != Some("publish") && action.as_deref() != Some("download") => {
+            commands::stage::run_stage(
+                action.as_deref(),
+                &args,
+                registry,
+                otp.as_deref(),
+                json,
+                &current_dir,
+            )
+            .await?;
+        }
+        Commands::Stage {
+            action,
+            args,
+            registry,
+            otp,
             json: _,
         } => {
             let (registry_url, client) = make_registry_client(&current_dir, registry)?;
@@ -5817,8 +5836,26 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             allow_publish,
             allow_stage_publish,
             json,
+            dry_run,
         } => {
-            let action = action.unwrap_or_else(|| "list".into());
+            let Some(action) = action else {
+                return Err(commands::stage::usage_error(None, commands::stage::TRUST_USAGE));
+            };
+            if action == "list" {
+                return commands::stage::run_trust_list(&args, registry, json, &current_dir).await;
+            }
+            if action == "revoke" {
+                return commands::stage::run_trust_revoke(
+                    &args,
+                    id,
+                    registry,
+                    otp.as_deref(),
+                    dry_run,
+                    json,
+                    &current_dir,
+                )
+                .await;
+            }
             let package = args
                 .first()
                 .cloned()
