@@ -1089,12 +1089,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     // PlaceDep places a candidate together with its required
                     // peer set, before any queued node is expanded. Explicit
                     // root dependencies still own their reserved slots.
-                    let root_pending = self.graph.nodes.get("").is_some_and(|root| {
-                        [&root.dependencies, &root.dev_dependencies, &root.optional_dependencies]
+                    let peer_scope = target_loc.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("");
+                    let provider_pending = self.graph.nodes.get(peer_scope).is_some_and(|parent| {
+                        [&parent.dependencies, &parent.dev_dependencies, &parent.optional_dependencies]
                             .iter().any(|deps| deps.contains_key(&child_task.install_name))
-                            && !self.graph.nodes.contains_key(&format!("node_modules/{}", child_task.install_name))
+                            && !self.graph.nodes.contains_key(&if peer_scope.is_empty() { format!("node_modules/{}", child_task.install_name) } else { format!("{peer_scope}/node_modules/{}", child_task.install_name) })
                     });
-                    if child_task.dep_type == DependencyType::Peer && !root_pending {
+                    if child_task.dep_type == DependencyType::Peer && !provider_pending {
                         peer_tasks.push(child_task);
                     } else {
                         self.push_task(child_task);
