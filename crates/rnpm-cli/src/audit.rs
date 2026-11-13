@@ -278,6 +278,10 @@ async fn fetch_advisories(
     project_dir: &Path,
     config: &rnpm_config::Config,
 ) -> anyhow::Result<BTreeMap<String, Vec<AdvisoryPayload>>> {
+    // Arborist does not contact the advisory endpoint for an empty inventory.
+    if bulk_request.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     // 1. If local mock fixture advisories.json exists in project_dir and test mocking is enabled, load it
     let allow_mock_fixture = cfg!(test) || std::env::var("RNPM_TEST_MOCK_ADVISORIES").is_ok();
     if allow_mock_fixture {

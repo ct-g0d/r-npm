@@ -521,23 +521,15 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
     graph.edges = new_edges;
 }
 
-/// Determines if a disk-cached packument is fresh according to npm's 300s TTL rule.
+/// Use disk packuments without revalidation only when the user requests it.
+/// Our index retains ETags but not HTTP freshness headers, so an arbitrary TTL
+/// would also treat no-cache/max-age=0 responses as fresh.
 pub fn is_packument_fresh(
-    entry: &rnpm_cache::IndexEntry,
+    _entry: &rnpm_cache::IndexEntry,
     prefer_offline: bool,
     offline: bool,
 ) -> bool {
-    if offline || prefer_offline {
-        return true;
-    }
-    if entry.time == 0 {
-        return false;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    now_ms.saturating_sub(entry.time) < 300_000
+    offline || prefer_offline
 }
 
 /// Extracts an ETag string from cacache metadata JSON.
