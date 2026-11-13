@@ -335,7 +335,9 @@ fn format_tree_text_with_unicode(
     if dep_keys.is_empty() {
         out.push_str(if unicode {
             "\u{2514}\u{2500}\u{2500} (empty)\n"
-        } else { "`-- (empty)\n" });
+        } else {
+            "`-- (empty)\n"
+        });
     }
     dep_keys.sort_by(|a, b| {
         let child_a = root.dependencies.get(a).unwrap();
@@ -365,11 +367,14 @@ fn format_child_text(
     out: &mut String,
 ) {
     let (long, unicode) = style;
-    let branch = match (unicode, is_last) {
-        (true, true) => "\u{2514}\u{2500}\u{2500} ",
-        (true, false) => "\u{251c}\u{2500}\u{2500} ",
-        (false, true) => "`-- ",
-        (false, false) => "+-- ",
+    let has_children = current_depth < max_depth && !node.dependencies.is_empty() && !node.deduped;
+    let branch = match (unicode, is_last, has_children) {
+        (true, true, false) => "\u{2514}\u{2500}\u{2500} ",
+        (true, true, true) => "\u{2514}\u{2500}\u{252c} ",
+        (true, false, false) => "\u{251c}\u{2500}\u{2500} ",
+        (true, false, true) => "\u{251c}\u{2500}\u{252c} ",
+        (false, true, _) => "`-- ",
+        (false, false, _) => "+-- ",
     };
 
     if node.missing {
@@ -394,6 +399,9 @@ fn format_child_text(
             marker = " extraneous".to_string();
         } else if node.deduped {
             marker = " deduped".to_string();
+        }
+        if node.overridden {
+            marker.push_str(" overridden");
         }
         out.push_str(&format!(
             "{prefix}{branch}{}@{}{}\n",
@@ -477,15 +485,27 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     let mut first_missing = None;
     while let Some((parent, depth)) = queue.pop_front() {
         let mut children: Vec<_> = parent.dependencies.values().collect();
-        children.sort_by(|a,b| a.pkgid.as_deref().unwrap_or(&a.name).cmp(b.pkgid.as_deref().unwrap_or(&b.name)));
+        children.sort_by(|a, b| {
+            a.pkgid
+                .as_deref()
+                .unwrap_or(&a.name)
+                .cmp(b.pkgid.as_deref().unwrap_or(&b.name))
+        });
         for child in children {
-            if child.missing && first_missing.is_none() { first_missing = Some(child); }
-            if depth < max_depth && !child.deduped && !child.missing { queue.push_back((child, depth + 1)); }
+            if child.missing && first_missing.is_none() {
+                first_missing = Some(child);
+            }
+            if depth < max_depth && !child.deduped && !child.missing {
+                queue.push_back((child, depth + 1));
+            }
         }
     }
     let mut deps_map = serde_json::Map::new();
     for (name, child) in &root.dependencies {
-        deps_map.insert(name.clone(), format_child_json(child, max_depth, 0, long, first_missing));
+        deps_map.insert(
+            name.clone(),
+            format_child_json(child, max_depth, 0, long, first_missing),
+        );
     }
     map.insert("dependencies".to_string(), Value::Object(deps_map));
 
@@ -543,7 +563,10 @@ fn format_child_json(
             return Value::Object(map);
         }
         if first_missing.is_some_and(|first| std::ptr::eq(first, node)) {
-            map.insert("required".into(), node.required.as_deref().unwrap_or("*").into());
+            map.insert(
+                "required".into(),
+                node.required.as_deref().unwrap_or("*").into(),
+            );
         }
         map.insert("missing".to_string(), Value::Bool(true));
         if !node.problems.is_empty() {

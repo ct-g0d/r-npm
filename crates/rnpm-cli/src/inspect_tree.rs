@@ -1,3 +1,6 @@
+#[path = "inspect_overrides.rs"]
+mod overrides;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -502,6 +505,7 @@ pub fn build_dependency_tree(
         if let Some(lock) = lockfile {
             build_tree_from_lockfile(&mut root, project_dir, &lock, options)?;
         }
+        overrides::apply(&mut root);
         return Ok(root);
     }
 
@@ -543,7 +547,8 @@ pub fn build_dependency_tree(
                     .or_insert((req.clone(), "peer", is_opt));
             }
         }
-        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m) {
+        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m)
+        {
             for member in members {
                 let expected_loc = format!("node_modules/{}", member.name);
                 if disk_packages.contains_key(&expected_loc) {
@@ -799,6 +804,8 @@ pub fn build_dependency_tree(
         &all_resolved_nodes,
         &mut ancestors,
     );
+
+    overrides::apply(&mut root);
 
     Ok(root)
 }
