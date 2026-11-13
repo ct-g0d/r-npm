@@ -2510,7 +2510,7 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "get", "foo"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::Get { key, extra_keys: Vec::new() },
+            action: ConfigAction::Get { key, .. },
         } => {
             assert_eq!(key, Some("foo".to_string()));
         }
@@ -2542,7 +2542,7 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "list", "--json"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::List { json },
+            action: ConfigAction::List { json, .. },
         } => {
             assert!(json);
         }

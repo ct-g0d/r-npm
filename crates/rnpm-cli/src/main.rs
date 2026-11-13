@@ -1582,6 +1582,8 @@ pub(crate) enum ConfigAction {
         /// Output configuration in JSON format
         #[arg(long)]
         json: bool,
+        #[arg(short = 'l', long)]
+        long: bool,
     },
     /// Open the config file in an editor
     Edit,
