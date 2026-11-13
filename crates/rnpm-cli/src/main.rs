@@ -3062,6 +3062,51 @@ fn parse_package_spec(spec: &str) -> (String, String) {
     }
 }
 
+/// Install `specs` into a cached npx environment and return its directory.
+pub(crate) async fn ensure_npx_environment(
+    specs: &[String],
+    registry: Option<String>,
+    cache: Option<PathBuf>,
+    offline: bool,
+) -> anyhow::Result<PathBuf> {
+    let cache_path = cache.unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
+    });
+    let safe: String = specs
+        .join("+")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') { c } else { '_' })
+        .collect();
+    let env_dir = cache_path.join("_npx").join(safe);
+    let mut deps = serde_json::Map::new();
+    for spec in specs {
+        let (name, req) = parse_package_spec(spec);
+        deps.insert(name, serde_json::Value::String(req));
+    }
+    let manifest = serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
+    let manifest_text = serde_json::to_string_pretty(&manifest)?;
+    let installed = env_dir.join("node_modules").is_dir()
+        && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
+    if !installed {
+        if offline {
+            anyhow::bail!("npm error code ENOTCACHED\nnpm error request to install {} failed: cache mode is 'only-if-cached'", specs.join(" "));
+        }
+        std::fs::create_dir_all(&env_dir)?;
+        std::fs::write(env_dir.join("package.json"), &manifest_text)?;
+        let mut installer = Installer::new(InstallOptions {
+            project_dir: env_dir.clone(),
+            registry_url: registry,
+            cache_dir: Some(cache_path),
+            silent: true,
+            ..Default::default()
+        })?;
+        installer.run().await?;
+    }
+    Ok(env_dir)
+}
+
 pub(crate) async fn execute_exec(
     current_dir: &std::path::Path,
     command: &str,
@@ -4909,6 +4954,25 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     );
                     ctx.package_version = manifest.version;
                     ctx.extra_env = lifecycle_config_env(&target_dir);
+                    // `exec --package=x -c cmd`: install the packages into an
+                    // npx environment and put its bins first on PATH.
+                    if !packages.is_empty() {
+                        let env_dir = ensure_npx_environment(
+                            &packages,
+                            registry.clone(),
+                            cache.clone(),
+                            offline,
+                        )
+                        .await?;
+                        let bin = env_dir.join("node_modules").join(".bin");
+                        let mut paths = vec![bin];
+                        if let Some(existing) = std::env::var_os("PATH") {
+                            paths.extend(std::env::split_paths(&existing));
+                        }
+                        if let Ok(joined) = std::env::join_paths(paths) {
+                            std::env::set_var("PATH", joined);
+                        }
+                    }
                     let status = execute_lifecycle_script(&ctx)?;
                     if !status.success() {
                         let code = rnpm_lifecycle::extract_exit_status_code(&status);

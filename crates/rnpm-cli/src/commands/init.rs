@@ -14,11 +14,17 @@ pub(crate) struct InitCommandArgs {
 pub(crate) async fn run(args: InitCommandArgs, current_dir: PathBuf) -> Result<()> {
     if let Some(init_pkg) = args.initializer {
         let transformed = crate::init::transform_initializer(&init_pkg);
+        // `npm init vite app -- --template x`: the separator belongs to npm,
+        // the initializer only sees `app --template x`.
+        let mut forwarded = args.args.clone();
+        if let Some(pos) = forwarded.iter().position(|a| a == "--") {
+            forwarded.remove(pos);
+        }
         crate::execute_exec(
             &current_dir,
             &transformed,
             &[],
-            &args.args,
+            &forwarded,
             args.registry,
             args.cache,
             args.offline,
