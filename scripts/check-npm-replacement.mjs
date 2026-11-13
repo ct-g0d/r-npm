@@ -295,6 +295,8 @@ for(const [name,versions] of Object.entries({
   'a-peer-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'z-normal-peer-owner':{'1.0.0':{dependencies:{'a-broad-peer-plugin':'1.0.0',shared:'1.0.0'}}},
   'a-broad-peer-plugin':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'nested-optional-owner':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'}}},
+  'nested-optional-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -327,6 +329,7 @@ add('cache-clean-removes-install-store','cache',['cache','clean','--force'],dir=
 for(const [name,args]of [['install',['install','dep@1.0.0','--ignore-scripts']],['alias',['i','dep@1.0.0','--ignore-scripts']],['view',['view','dep@1.0.0','version']],['ping',['ping','--json']],['custom-agent',['install','dep@1.0.0','--ignore-scripts','--user-agent=parity-probe/1.0']]])add(`registry-request-headers-${name}`,args[0],args,undefined,{observe:({requests})=>requests.filter(r=>r.method==='GET').map(({url,headers})=>({url,headers})).sort((a,b)=>a.url.localeCompare(b.url))});
 add('resolver-nesting-preserves-pending-descendant-edges','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'2.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0','z-passive':'1.0.0'}}));
 add('resolver-peer-set-prefers-parent-dependency','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-normal-peer-owner':'1.0.0'}}));
+add('resolver-nested-optional-peer-conflict','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'nested-optional-owner':'1.0.0',shared:'1.0.0'}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

@@ -584,11 +584,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             );
                         }
                     } else if task.dep_type == DependencyType::PeerOptional {
-                        debug!(
-                            "Optional peer dependency '{}' for '{}' conflicts with installed {}@{} at '{}'; omitting optional peer",
-                            dep_spec.package_name, task.parent_package_name, existing.name, existing.version, existing.location
-                        );
-                        return Ok(());
+                        // loadPeerSet resolves an incompatible optional peer
+                        // when its owner can nest with a new sibling provider.
+                        // A missing optional peer still never triggers a fetch.
+                        let sibling = task.parent_location.rsplit_once("/node_modules/")
+                            .map(|(scope, _)| format!("{scope}/node_modules/{}", task.install_name));
+                        if sibling.as_ref().is_none_or(|location| self.graph.nodes.contains_key(location)) {
+                            return Ok(());
+                        }
                     }
                 }
             } else if task.dep_type == DependencyType::PeerOptional {
@@ -1108,7 +1111,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             .iter().any(|deps| deps.contains_key(&child_task.install_name))
                             && !self.graph.nodes.contains_key(&if peer_scope.is_empty() { format!("node_modules/{}", child_task.install_name) } else { format!("{peer_scope}/node_modules/{}", child_task.install_name) })
                     });
-                    if child_task.dep_type == DependencyType::Peer && !provider_pending {
+                    if matches!(child_task.dep_type, DependencyType::Peer | DependencyType::PeerOptional) && !provider_pending {
                         peer_tasks.push(child_task);
                     } else {
                         self.push_task(child_task);
