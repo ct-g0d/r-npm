@@ -1408,6 +1408,11 @@ pub struct ResolvedNode {
 }
 
 /// Helper to compute normalized POSIX relative path from one directory to another.
+fn is_directory_dependency(path: &Path) -> bool {
+    let spec = path.to_string_lossy();
+    !path.is_file() && ![".tgz", ".tar.gz", ".tar"].iter().any(|suffix| spec.ends_with(suffix))
+}
+
 /// Lockfile entry for the target of a `file:` directory link, shaped like
 /// Arborist's: `name` only when it differs from the folder name, and
 /// `hasInstallScript` when the package declares install-time scripts.
@@ -1418,6 +1423,9 @@ fn directory_target_entry(
 ) -> LockfilePackage {
     let folder = location.rsplit('/').next().unwrap_or(location);
     let manifest = Manifest::from_file(dir.join("package.json")).ok();
+    if manifest.is_none() {
+        return LockfilePackage::default();
+    }
     let has_install_script = manifest.as_ref().is_some_and(|m| {
         ["preinstall", "install", "postinstall"]
             .iter()
@@ -2536,7 +2544,7 @@ impl Installer {
                 if let Some(ref res) = node.resolved {
                     if let Some(rel_file) = res.strip_prefix("file:") {
                         let abs_file = self.options.project_dir.join(rel_file);
-                        if abs_file.is_dir() {
+                        if is_directory_dependency(&abs_file) {
                             let clean_rel = rel_file.strip_prefix("./").unwrap_or(rel_file);
                             let link_entry = LockfilePackage {
                                 resolved: Some(clean_rel.to_string()),
@@ -3120,7 +3128,7 @@ impl Installer {
                             }
                         }
                         continue;
-                    } else if abs_file.is_dir() {
+                    } else if is_directory_dependency(&abs_file) {
                         if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                             let _ = rnpm_fs::remove_junction(&dest_dir);
                             if dest_dir.exists()
@@ -3132,7 +3140,7 @@ impl Installer {
                         if let Some(parent) = dest_dir.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        rnpm_fs::create_junction(&dest_dir, &abs_file)
+                        rnpm_fs::junction::create_directory_link(&dest_dir, &abs_file)
                             .map_err(|e| anyhow!("Failed to link file dir {}: {e}", loc))?;
                         packages_installed += 1;
                         let pkg_manifest_path = abs_file.join("package.json");
@@ -6559,7 +6567,7 @@ impl Installer {
 
                             Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
                         }
-                    } else if abs_path.exists() && abs_path.is_dir() {
+                    } else if !is_archive {
                         let manifest_path = abs_path.join("package.json");
                         let m = if manifest_path.exists() {
                             Manifest::from_file(&manifest_path).unwrap_or_default()
