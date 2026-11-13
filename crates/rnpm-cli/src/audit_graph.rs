@@ -95,14 +95,15 @@ struct Cause {
 
 async fn load_packument(
     client: &rnpm_registry::RegistryClient,
-    registry: &reqwest::Url,
     name: &str,
     cache: &mut BTreeMap<String, Value>,
 ) -> anyhow::Result<Value> {
     if let Some(value) = cache.get(name) {
         return Ok(value.clone());
     }
-    let url = registry.join(&rnpm_registry::client::encode_package_name(name))?;
+    let url = client
+        .registry_for_package(name)
+        .join(&rnpm_registry::client::encode_package_name(name))?;
     let (response, _permit) = client
         .execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None)
         .await?;
@@ -123,8 +124,23 @@ pub(super) async fn complete_graph(
     let registry = reqwest::Url::parse(registry)?;
     let mut client_config = rnpm_registry::RegistryClientConfig {
         default_registry: registry.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
         ..Default::default()
     };
+    if let Some(token) = config.npmrc.get_auth_token(&registry) {
+        client_config.auth_token = Some(token.to_string());
+    }
+    for url in std::iter::once(&registry).chain(config.npmrc.scoped_registries.values()) {
+        if let Some(host) = url.host_str() {
+            client_config
+                .trusted_hosts
+                .insert(host.to_ascii_lowercase());
+            if let Some(port) = url.port_or_known_default() {
+                client_config.trusted_hosts.insert(format!("{host}:{port}"));
+            }
+        }
+    }
     rnpm_install::apply_npmrc_to_client_config(&mut client_config, &config.npmrc);
     let client = rnpm_registry::RegistryClient::with_config(client_config)?;
     let packages = serde_json::to_value(&lockfile.packages)?;
@@ -152,7 +168,7 @@ pub(super) async fn complete_graph(
         if !seen.insert((cause.name.clone(), cause.range.clone())) {
             continue;
         }
-        let source = load_packument(&client, &registry, &cause.name, &mut packuments).await?;
+        let source = load_packument(&client, &cause.name, &mut packuments).await?;
         let source_versions = versions(&source);
         // Incoming edges from installed nodes determine which metavulns matter.
         let source_nodes: BTreeSet<_> = packages
@@ -192,7 +208,7 @@ pub(super) async fn complete_graph(
             if name == cause.name {
                 continue;
             }
-            let packument = load_packument(&client, &registry, &name, &mut packuments).await?;
+            let packument = load_packument(&client, &name, &mut packuments).await?;
             let published = versions(&packument);
             let test_spec = |spec: &str| {
                 // A dependency is a metavulnerability only when every available
@@ -268,7 +284,7 @@ pub(super) async fn complete_graph(
         }
     }
     for (name, vuln) in vulnerabilities.iter_mut() {
-        let packument = load_packument(&client, &registry, name, &mut packuments).await?;
+        let packument = load_packument(&client, name, &mut packuments).await?;
         let published = versions(&packument);
         let range = ranges[name].join(" || ");
         let affected = published

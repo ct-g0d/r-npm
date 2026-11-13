@@ -34,7 +34,7 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={};
+const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
@@ -68,6 +68,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
   if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
   const name=url.slice(1);
+  if(securityRequireAuth&&['audit-leaf','audit-branch'].includes(name)&&req.headers.authorization!=='Bearer mock-token')return json({error:'Authentication required'},401);
   if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
   if(['dep','parent','changing'].includes(name)){
     const versions={};
@@ -260,6 +261,7 @@ for(const [name,flags] of [['list',[]],['json',['--json']],['long',['-l']]])add(
 for(const flags of [[],['--json'],['--silent']])add(`cli-audit-fix-unfixable${flags.join('')}`,'audit',['audit','fix',...flags],dir=>manifest(dir,{dependencies:{dep:'^1.0.0'}}),{before:async ctx=>{securityAdvisories={};const result=await ctx.exec(['install','--ignore-scripts']);if(result.exit!==0)throw new Error(result.stderr);},advisories:{dep:[{id:102,name:'dep',url:'https://example.invalid/advisory/102',title:'No patched release',severity:'high',vulnerable_versions:'*',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 
 for(const flags of [[],['--json']])add(`cli-audit-multiple-severities${flags.join('')}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':['low','high'].map((severity,i)=>({id:103+i,name:'audit-leaf',url: 'https://example.invalid/advisory/'+(103+i),title:severity+' advisory',severity,vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:i?7.5:3,vectorString:null}}))}});
+for(const flags of [[],['--json']])add(`cli-audit-authenticated${flags.join('')}`,'audit',['audit',...flags],auditTree,{auth:true,advisoryAuth:true,advisories:{'audit-leaf':[{id:105,name:'audit-leaf',url:'https://example.invalid/advisory/105',title:'Authenticated advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
@@ -292,7 +294,7 @@ for(const c of cases){
     const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
     const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});
-    authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};
+    authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};securityRequireAuth=!!c.advisoryAuth;
     const start=requests.length;const p=await exec(c.args);
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);
