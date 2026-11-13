@@ -1,44 +1,187 @@
+// Differential behavioral gate. All registry traffic stays on a loopback mock.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import { gunzipSync } from 'node:zlib';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const args = process.argv.slice(2);
-const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
+const cli = process.argv.slice(2);
+const option = (name, fallback) => cli.includes(name) ? cli[cli.indexOf(name) + 1] : fallback;
 const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
 const output = path.resolve(option('--output', path.join(repo, 'target/npm-replacement-smoke.json')));
-const root = fs.mkdtempSync(path.join(repo, 'target/readiness-smoke-'));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rnpm-replacement-'));
+console.log(`Fixtures and raw logs: ${root}`);
 const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
-const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_)/i.test(k)));
-fs.writeFileSync(path.join(root, 'empty.npmrc'), '');
-fs.writeFileSync(path.join(root, 'global.npmrc'), '');
-Object.assign(env, { NPM_CONFIG_USERCONFIG:path.join(root,'empty.npmrc'), NPM_CONFIG_GLOBALCONFIG:path.join(root,'global.npmrc'), NPM_CONFIG_PREFIX:path.join(root,'prefix'), NPM_CONFIG_CACHE:path.join(root,'cache'), RNPM_STORE_DIR:path.join(root,'store') });
-const cases = [
-  { name:'pack-explicit-file-vs-root-ignore', args:['pack','--dry-run','--json','--ignore-scripts'], manifest:{files:['keep.js']}, files:{'keep.js':'hello','.npmignore':'keep.js\n'} },
-  { name:'pack-nested-ignore', args:['pack','--dry-run','--json','--ignore-scripts'], manifest:{files:['lib']}, files:{'lib/keep.js':'hello','lib/omit.js':'omit','lib/.npmignore':'omit.js\n'} },
-  { name:'empty-install-hidden-lock', args:['install','--no-audit','--no-fund','--ignore-scripts'], manifest:{}, files:{} },
-  { name:'failing-lifecycle-public-lock', args:['install','--no-audit','--no-fund'], manifest:{scripts:{postinstall:'node -e "process.exit(7)"'}}, files:{} },
-];
-const results=[];
-for(const c of cases){
-  const result={name:c.name,args:c.args,manifest:c.manifest,fixture_files:c.files};
-  for(const tool of ['npm','rnpm']){
-    const dir=path.join(root,c.name+'-'+tool);fs.mkdirSync(dir);
-    fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify({name:'readiness-case',version:'1.0.0',...c.manifest}));
-    for(const [name,content] of Object.entries(c.files)){fs.mkdirSync(path.dirname(path.join(dir,name)),{recursive:true});fs.writeFileSync(path.join(dir,name),content);}
-    const exe=tool==='npm'?process.execPath:binary;
-    const args=tool==='npm'?[npmCli,...c.args]:c.args;
-    const p=spawnSync(exe,args,{cwd:dir,env,encoding:'utf8',windowsHide:true});
-    result[tool]={exit:p.status,public_lock:fs.existsSync(path.join(dir,'package-lock.json')),hidden_lock:fs.existsSync(path.join(dir,'node_modules/.package-lock.json'))};
-    if(c.args[0]==='pack')try{result[tool].files=JSON.parse(p.stdout)[0].files.map(f=>f.path).sort();}catch{result[tool].parse_error=p.stdout.slice(0,300);}
-    fs.writeFileSync(path.join(root,c.name+'-'+tool+'.log'),p.stdout+p.stderr);
-  }
-  result.match=JSON.stringify(result.npm)===JSON.stringify(result.rnpm);results.push(result);
+const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_|npm_token$|node_auth_token$)/i.test(k)));
+const write = (dir, name, value) => { const p=path.join(dir,name); fs.mkdirSync(path.dirname(p),{recursive:true}); fs.writeFileSync(p,typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(value,null,2)+'\n'); };
+const manifest = (dir, fields={}) => write(dir,'package.json',{name:'readiness-case',version:'1.0.0',...fields});
+const edit = (dir, fn) => { const p=JSON.parse(fs.readFileSync(path.join(dir,'package.json'))); fn(p); write(dir,'package.json',p); };
+async function run(exe,args,cwd,env) {
+  return await new Promise(resolve=>{
+    const p=spawn(exe,args,{cwd,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
+    let stdout='',stderr='',error=''; const timer=setTimeout(()=>{
+      error=`Timeout after 120 seconds: ${args.join(' ')}`;
+      if(process.platform==='win32'&&p.pid)spawn('taskkill.exe',['/pid',String(p.pid),'/t','/f'],{windowsHide:true,stdio:'ignore'});else p.kill('SIGKILL');
+    },120000);
+    p.stdout.on('data',b=>stdout+=b); p.stderr.on('data',b=>stderr+=b); p.on('error',e=>{error=String(e);});
+    p.on('close',exit=>{clearTimeout(timer);resolve({exit,stdout,stderr,error});});
+  });
 }
-const git = (...args) => execFileSync('git',args,{cwd:repo,encoding:'utf8'}).trim();
-fs.mkdirSync(path.dirname(output),{recursive:true});
-fs.writeFileSync(output,JSON.stringify({head:git('rev-parse','HEAD'),source_dirty:git('status','--porcelain','--untracked-files=no')!=='',binary_sha256:createHash('sha256').update(fs.readFileSync(binary)).digest('hex'),node:process.version,npm:execFileSync(process.execPath,[npmCli,'--version'],{env,encoding:'utf8'}).trim(),note:'Four targeted smoke cases; not a complete npm compatibility audit',results},null,2)+'\n');
-console.log(JSON.stringify(results,null,2));
-console.log('Evidence: '+output);
-process.exitCode=results.every(r=>r.match)?0:1;
+const tarballs=new Map(); const requests=[]; let generation=1;
+const server=http.createServer((req,res)=>{
+  const url=decodeURIComponent(req.url.split('?')[0]);
+  const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
+  const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{let body=Buffer.concat(chunks);if(req.headers['content-encoding']==='gzip')body=gunzipSync(body);if(body.length){try{request.body=JSON.parse(body.toString());}catch{request.body=body.toString();}}});
+  const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
+  if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
+  if(url==='/-/ping')return json({});
+  if(url.includes('/security/advisories/bulk'))return json({});
+  if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
+  if(url==='/-/whoami')return json({username:'mock-user'});
+  if(url==='/-/v1/login')return json({error:'Mock registry does not provide browser login'},400);
+  if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
+  if(url==='/-/user/mock-user/package')return json({});
+  if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
+  if(url==='/-/org/mock-org/team')return json([]);
+  if(url==='/-/npm/v1/user')return json({name:'mock-user',email:'mock@example.invalid',tfa:false});
+  if(url==='/-/npm/v1/tokens')return json({objects:[],total:0,urls:{}});
+  if(url==='/-/_view/starredByUser')return json({rows:[]});
+  if(url==='/-/stage')return json({items:[],total:0});
+  if(url.endsWith('/trust'))return json([]);
+  if(url.includes('/stages')||url.includes('/trusted-publishers'))return json([]);
+  if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
+  if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
+  const name=url.slice(1);
+  if(['dep','parent','changing'].includes(name)){
+    const versions={};
+    for(const version of (name==='changing'&&generation===1?['1.0.0']:['1.0.0','1.1.0','2.0.0'])){
+      const bytes=tarballs.get(`/${name}-${version}.tgz`);
+      versions[version]={name,version,...(name==='parent'?{dependencies:{dep:'^1.0.0'}}:{}),dist:{tarball:`${registry}${name}-${version}.tgz`,shasum:createHash('sha1').update(bytes).digest('hex'),integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+    }
+    return json({name,_id:name,_rev:'1-mock',maintainers:[{name:'mock-user',email:'mock@example.invalid'}],users:{},'dist-tags':{latest:name==='changing'&&generation===1?'1.0.0':'2.0.0',next:'1.1.0'},versions});
+  }
+  return json({error:'not found'},404);
+});
+await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+const registry=`http://127.0.0.1:${server.address().port}/`;
+const oracleEnv={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(root,'empty.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(root,'global.npmrc'),NPM_CONFIG_CACHE:path.join(root,'oracle-cache'),NPM_CONFIG_PREFIX:path.join(root,'oracle-prefix'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false'};
+write(root,'empty.npmrc','');write(root,'global.npmrc','');
+for(const name of ['dep','parent','changing'])for(const version of ['1.0.0','1.1.0','2.0.0']){
+  const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...(name==='parent'?{dependencies:{dep:'^1.0.0'}}:{})});write(dir,'index.js','module.exports = 1;\n');
+  const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+  tarballs.set(`/${name}-${version}.tgz`,fs.readFileSync(path.join(dir,`${name}-${version}.tgz`)));
+}
+const cases=[];
+const add=(name,command,args,setup=dir=>manifest(dir),extra={})=>cases.push({name,command,args,setup,...extra});
+const packArgs=['pack','--dry-run','--json','--ignore-scripts'];
+for(const [name,fields,files] of [
+  ['pack-explicit-file-vs-root-ignore',{files:['keep.js']},{'keep.js':'hello','.npmignore':'keep.js\n'}],
+  ['pack-nested-ignore',{files:['lib']},{'lib/keep.js':'hello','lib/omit.js':'omit','lib/.npmignore':'omit.js\n'}],
+  ['pack-explicit-nested-file',{files:['lib/keep.js']},{'lib/keep.js':'hello','lib/.npmignore':'keep.js\n'}],
+  ['pack-nested-gitignore',{files:['lib']},{'lib/keep.js':'hello','lib/omit.js':'omit','lib/.gitignore':'omit.js\n'}],
+  ['pack-nested-ignore-negation',{}, {'lib/keep.js':'hello','lib/omit.js':'omit','.npmignore':'*.js\n','lib/.npmignore':'!keep.js\n'}],
+])add(name,'pack',packArgs,dir=>{manifest(dir,fields);for(const [p,v]of Object.entries(files))write(dir,p,v);});
+add('empty-install-hidden-lock','install',['install','--ignore-scripts']);
+add('failing-lifecycle-public-lock','install',['install'],dir=>manifest(dir,{scripts:{postinstall:'node -e "process.exit(7)"'}}));
+add('explicit-install-skips-root-hooks','install',['install','dep@1.0.0'],dir=>manifest(dir,{scripts:{postinstall:'node -e "process.exit(7)"'}}));
+add('failing-ci-preserves-hidden-lock','ci',['ci'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},scripts:{postinstall:'node -e "process.exit(7)"'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true});}});
+const workspace=dir=>{manifest(dir,{workspaces:['packages/*']});for(const name of ['a','b'])manifest(path.join(dir,'packages',name),{name,scripts:{probe:'node -p process.env.npm_package_name'}});};
+for(const [name,flags]of [['name',['-w','a']],['long-equals',['--workspace=a']],['short-attached',['-wa']],['path',['-w','./packages/a']],['bare-directory',['-w','packages/a']],['parent-directory',['-w','packages']],['multiple',['-w','a','--workspace','b']]]){
+  add(`workspace-run-${name}`,'run',['run','probe',...flags],workspace);
+  add(`workspace-install-${name}`,'install',['install','dep@1.0.0','--ignore-scripts',...flags],workspace);
+}
+for(const [name,spec,flags] of [['default','dep@1.0.0',[]],['prefix','dep@1.0.0',['--save-prefix=~']],['exact','dep@1.0.0',['--save-exact']],['range','dep@~1.0.0',[]],['tag','dep@next',[]],['alias','aliased@npm:dep@1.0.0',[]],['url',()=>`${registry}dep-1.0.0.tgz`,[]],['file','./dep.tgz',[]]]){
+  add(`save-${name}`,'install',['install',typeof spec==='function'?spec():spec,'--ignore-scripts',...flags],dir=>{manifest(dir);if(name==='file')write(dir,'dep.tgz',tarballs.get('/dep-1.0.0.tgz'));});
+}
+add('shadow-url-registry','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{dep:`${registry}dep-2.0.0.tgz`,parent:'1.0.0'}}));
+add('shadow-file-registry','install',['install','--ignore-scripts'],dir=>{manifest(dir,{dependencies:{dep:'file:dep.tgz',parent:'1.0.0'}});write(dir,'dep.tgz',tarballs.get('/dep-2.0.0.tgz'));});
+const gitDir=path.join(root,'git-dependency');manifest(gitDir,{name:'dep',version:'2.0.0'});write(gitDir,'index.js','module.exports = 2;\n');
+const gitEnv={...baseEnv,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:path.join(root,'empty.npmrc'),GIT_AUTHOR_DATE:'2026-11-13T00:00:00Z',GIT_COMMITTER_DATE:'2026-11-13T00:00:00Z'};
+for(const args of [['init','--initial-branch=main'],['add','.'],['-c','user.name=Mock Author','-c','user.email=mock@example.invalid','-c','commit.gpgsign=false','-c',`core.hooksPath=${root}/empty-hooks`,'commit','-m','Fixture']])execFileSync('git',args,{cwd:gitDir,env:gitEnv,stdio:'pipe'});
+const gitSpec='git+'+pathToFileURL(gitDir).href;
+add('shadow-git-registry','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{dep:gitSpec,parent:'1.0.0'}}));
+add('save-git','install',['install',gitSpec,'--ignore-scripts']);
+add('save-alias-range','install',['install','aliased@npm:dep@~1.0.0','--ignore-scripts']);
+for(const [key,value]of [['save-prefix','~'],['save-exact','true']])add(`save-config-${key}`,'install',['install','dep@1.0.0','--ignore-scripts'],dir=>{manifest(dir);write(dir,'.npmrc',`${key}=${value}\n`);});
+add('cache-revalidate-changed-packument','install',['install','changing','--ignore-scripts'],dir=>manifest(dir),{before:async ctx=>{generation=1;await ctx.exec(['install','changing','--ignore-scripts']);edit(ctx.dir,p=>{delete p.dependencies;});for(const p of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,p),{recursive:true,force:true});generation=2;}});
+const lsFixture=(kind)=>(dir)=>{
+  manifest(dir,{dependencies:{required:'^1.0.0'},optionalDependencies:{optional:'1.0.0'},peerDependencies:{peer:'^1.0.0',optionalPeer:'1.0.0'},peerDependenciesMeta:{optionalPeer:{optional:true}}});
+  if(kind!=='missing')manifest(path.join(dir,'node_modules/required'),{name:'required',version:kind==='invalid'?'2.0.0':'1.0.0'});
+  if(kind==='extraneous')manifest(path.join(dir,'node_modules/extra'),{name:'extra'});
+  if(kind==='complete')manifest(path.join(dir,'node_modules/peer'),{name:'peer'});
+};
+for(const kind of ['missing','invalid','extraneous','complete'])for(const flags of [[],['--json'],['--all'],['--all','--json']])add(`ls-${kind}${flags.join('-')}`,'ls',['ls',...flags],lsFixture(kind));
+for(const flags of [[],['--json'],['--all','--json']])add(`ls-only-extraneous${flags.join('-')}`,'ls',['ls',...flags],dir=>{manifest(dir);manifest(path.join(dir,'node_modules/extra'),{name:'extra'});});
+const simple=[['ci',['ci']],['uninstall',['uninstall','dep']],['update',['update']],['outdated',['outdated','--json']],['audit',['audit','--json']],['fund',['fund','--json']],['exec',['exec','--call=node -p 123']],['npx',['exec','--call=node -p 123']],['init',['init','-y','--silent']],['version',['version','patch','--no-git-tag-version']],['publish',['publish','--dry-run','--json','--ignore-scripts']],['config',['config','get','registry']],['cache',['cache','ls']],['link',['link','--ignore-scripts']],['pkg',['pkg','get','name']],['prefix',['prefix']],['root',['root']],['get',['get','registry']],['ping',['ping','--json']],['search',['search','--json','mock']],['whoami',['whoami','--json']],['rebuild',['rebuild']],['prune',['prune']],['dedupe',['dedupe']],['find-dupes',['find-dupes']],['shrinkwrap',['shrinkwrap']],['query',['query',':root']],['sbom',['sbom','--sbom-format=cyclonedx']]];
+for(const [command,args]of simple)add(`command-${command}`,command,args,dir=>manifest(dir),{before:async ctx=>{if(['ci','audit','shrinkwrap'].includes(command))await ctx.exec(['install','--ignore-scripts']);}});
+const installed=dir=>{manifest(dir,{dependencies:{dep:'^1.0.0'}});manifest(path.join(dir,'node_modules/dep'),{name:'dep'});};
+for(const command of ['start','stop','restart','test','run'])add(`command-${command}`,command,command==='run'?['run','probe']:[command],dir=>manifest(dir,{scripts:{[command==='run'?'probe':command]:'node -p process.env.npm_lifecycle_event'}}));
+for(const command of ['install-test','install-ci-test'])add(`command-${command}`,command,[command],dir=>manifest(dir,{scripts:{test:'node -p 123'}}),{before:async ctx=>{if(command==='install-ci-test')await ctx.exec(['install','--ignore-scripts']);}});
+for(const [command,args]of [['ll',['ll','--json']],['explain',['explain','dep','--json']],['explore',['explore','dep','--','node','-p','123']],['edit',['edit','dep','--editor=node editor.cjs']]])add(`command-${command}`,command,args,dir=>{installed(dir);if(command==='edit')write(dir,'editor.cjs','require("fs").writeFileSync("edited.txt","edited");\n');});
+for(const [command,field,url]of [['bugs','bugs','https://example.invalid/issues'],['docs','homepage','https://example.invalid/docs'],['repo','repository','https://example.invalid/repo.git']])add(`command-${command}`,command,[command,'--browser=false'],dir=>manifest(dir,{[field]:url}));
+for(const [command,args]of [
+  ['access',['access','list','packages','mock-user','--json']],['org',['org','ls','mock-org','--json']],['profile',['profile','get','--json']],['team',['team','ls','mock-org','--json']],['token',['token','list','--json']],['owner',['owner','ls','dep']],['dist-tag',['dist-tag','ls','dep']],['view',['view','dep@1.0.0','version','--json']],['whoami',['whoami','--json']],['logout',['logout']],['deprecate',['deprecate','dep@1.0.0','old']],['undeprecate',['undeprecate','dep@1.0.0']],['unpublish',['unpublish','dep@1.0.0','--force']],['star',['star','dep']],['unstar',['unstar','dep']],['stars',['stars','mock-user']],['stage',['stage','list','dep','--json']],['trust',['trust','list','dep','--json']],
+])add(`registry-${command}`,command,args,dir=>manifest(dir),{auth:true});
+for(const command of ['login','adduser'])add(`registry-${command}`,command,[command,'--auth-type=web']);
+for(const command of ['approve-scripts','deny-scripts'])add(`command-${command}`,command,[command,'dep'],dir=>{installed(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.scripts={install:'node -p 123'};});});
+add('command-install-scripts','install-scripts',['install-scripts','ls'],installed);
+add('command-set','set',['set','fund','false']);
+add('command-set-script','set-script',['set-script','probe','node -p 123']);
+add('command-completion','completion',['completion']);
+add('command-help','help',['help']);
+add('command-help-search','help-search',['help-search','install']);
+add('command-doctor','doctor',['doctor','connection']);
+add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
+for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
+add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
+add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});
+const normalize=(str,dir,config)=>str.replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\r\n/g,'\n');
+function snapshot(dir,config){
+  if(!fs.existsSync(dir))return {};
+  const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){
+    const p=path.join(current,e.name),rel=path.relative(dir,p).replaceAll('\\','/');
+    if(e.isSymbolicLink())result[rel]={link:normalize(fs.readlinkSync(p),dir,config)};
+    else if(e.isDirectory())walk(p);
+    else if(rel.endsWith('.json')){try{result[rel]=JSON.parse(normalize(fs.readFileSync(p,'utf8'),dir,config));}catch{result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');}}
+    else result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+  }};walk(dir);return result;
+}
+const stable=v=>JSON.stringify(v,(_,value)=>value&&typeof value==='object'&&!Array.isArray(value)?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b))):value);
+const results=[];
+try{
+for(const c of cases){
+  if(option('--case','')&&!c.name.includes(option('--case','')))continue;
+  const result={name:c.name,command:c.command,args:c.args};
+  for(const tool of ['npm','rnpm']){
+    const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
+    const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
+    const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env);return p;};
+    if(c.before)await c.before({dir,env,exec});
+    const start=requests.length;const p=await exec(c.args);
+    write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
+    const files=snapshot(dir,config);
+    files['<userconfig>']=fs.existsSync(path.join(config,'user.npmrc'))?normalize(fs.readFileSync(path.join(config,'user.npmrc'),'utf8'),dir,config):null;
+    if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config));
+    result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
+  }
+  const a=result.npm,b=result.rnpm;
+  const mutations=tool=>tool.requests.filter(r=>['PUT','DELETE'].includes(r.method)).map(({method,url,body})=>({method,url,body}));
+  result.comparison={execution:!a.execution_error&&!b.execution_error&&a.exit!==null&&b.exit!==null,exit:a.exit===b.exit,stdout:a.stdout===b.stdout,stderr:a.stderr===b.stderr,files:stable(a.files)===stable(b.files),mutations:stable(mutations(a))===stable(mutations(b))};
+  result.match=Object.values(result.comparison).every(Boolean);results.push(result);
+  // Keep complete comparisons and raw logs without committing multi-megabyte
+  // package patches into the report. Hash the full normalized stream first.
+  for(const tool of ['npm','rnpm'])for(const stream of ['stdout','stderr']){
+    const value=result[tool][stream];result[tool][`${stream}_sha256`]=createHash('sha256').update(value).digest('hex');
+    if(value.length>16000){result[tool][`${stream}_truncated`]=true;result[tool][stream]=value.slice(0,16000);}
+  }
+  console.log(`${result.match?'MATCH':'DIFF'} ${c.name} ${JSON.stringify(result.comparison)}`);
+}
+}catch(error){results.push({name:'harness-error',match:false,error:String(error.stack||error)});console.error(error);}finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+const git=(...args)=>execFileSync('git',args,{cwd:repo,encoding:'utf8'}).trim();
+const expectedCases=cases.filter(c=>!option('--case','')||c.name.includes(option('--case',''))).length;
+write(path.dirname(output),path.basename(output),{head:git('rev-parse','HEAD'),binary_revision:option('--binary-revision',null),source_dirty:git('status','--porcelain','--untracked-files=no')!=='',binary_sha256:createHash('sha256').update(fs.readFileSync(binary)).digest('hex'),node:process.version,npm:execFileSync(process.execPath,[npmCli,'--version'],{env:oracleEnv,encoding:'utf8'}).trim(),platform:process.platform,root,expected_cases:expectedCases,normalization:'Fixture/config paths (including JSON escaping), loopback registry origin, CRLF, elapsed summary/ping times, and diagnostic log timestamps. JSON file key order ignored; all fields retained. Full normalized stream hashes retained; streams over 16KB truncated in this report, with complete raw streams in root/logs. No stderr suppression.',results});
+console.log(`Evidence: ${output}; ${results.filter(r=>r.match).length}/${results.length} match`);
+process.exitCode=results.length>0&&results.length===expectedCases&&results.every(r=>r.match)?0:1;
