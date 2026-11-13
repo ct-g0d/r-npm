@@ -15,7 +15,7 @@ impl std::fmt::Display for InputClosed {
 }
 impl std::error::Error for InputClosed {}
 
-fn prompt(label: &str, default: Option<&str>, password: bool) -> Result<String> {
+pub(super) fn prompt(label: &str, default: Option<&str>, password: bool) -> Result<String> {
     loop {
         print!("{label} ");
         if let Some(value) = default.filter(|v| !v.is_empty()) {

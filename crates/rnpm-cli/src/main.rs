@@ -5732,7 +5732,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Trust {
             action,
             args,
-            yes: _,
+            yes,
             registry,
             id,
             otp,
@@ -5768,125 +5768,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 )
                 .await;
             }
-            let package = args
-                .first()
-                .cloned()
-                .or_else(|| package_name_from_manifest(&current_dir).ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "npm error code ENEEDPACKAGE\nnpm error package name must be specified"
-                    )
-                })?;
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            match action.as_str() {
-                "list" => {
-                    let value = client.trust_list(Some(&registry_url), &package).await?;
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                }
-                "revoke" => {
-                    let id = id.or_else(|| args.get(1).cloned()).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust revoke requires --id=<trust-id>"))?;
-                    client
-                        .trust_revoke(Some(&registry_url), &package, &id, otp.as_deref())
-                        .await?;
-                    println!("revoked trusted configuration {id} for {package}");
-                }
-                "github" | "gitlab" | "circleci" => {
-                    if !allow_publish && !allow_stage_publish {
-                        return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error trust {action} requires --allow-publish or --allow-stage-publish"));
-                    }
-                    let claims = match action.as_str() {
-                        "github" => {
-                            let file = workflow_file.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error trust github requires --file"
-                                )
-                            })?;
-                            if !file.ends_with(".yml") && !file.ends_with(".yaml") {
-                                return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error workflow file must end in .yml or .yaml"));
-                            }
-                            let mut claims = serde_json::Map::new();
-                            if let Some(repo) = repository {
-                                claims.insert("repository".into(), serde_json::Value::String(repo));
-                            }
-                            let mut workflow = serde_json::Map::new();
-                            workflow.insert("file".into(), serde_json::Value::String(file));
-                            claims
-                                .insert("workflow_ref".into(), serde_json::Value::Object(workflow));
-                            if let Some(env) = environment {
-                                claims.insert("environment".into(), serde_json::Value::String(env));
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                        "gitlab" => {
-                            let file = workflow_file.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error trust gitlab requires --file"
-                                )
-                            })?;
-                            let mut claims = serde_json::Map::new();
-                            if let Some(project) = project.or(repository) {
-                                claims.insert(
-                                    "project_path".into(),
-                                    serde_json::Value::String(project),
-                                );
-                            }
-                            claims.insert("ref_path".into(), serde_json::Value::String(file));
-                            if let Some(env) = environment {
-                                claims.insert("environment".into(), serde_json::Value::String(env));
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                        _ => {
-                            let org = org_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --org-id"))?;
-                            let project_id = project_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --project-id"))?;
-                            let pipeline = pipeline_definition_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --pipeline-definition-id"))?;
-                            let origin = vcs_origin.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --vcs-origin"))?;
-                            let mut claims = serde_json::Map::new();
-                            for (key, value) in [
-                                ("organization_id", org),
-                                ("project_id", project_id),
-                                ("pipeline_definition_id", pipeline),
-                                ("vcs_origin", origin),
-                            ] {
-                                claims.insert(key.into(), serde_json::Value::String(value));
-                            }
-                            if !context_id.is_empty() {
-                                claims.insert(
-                                    "context_id".into(),
-                                    serde_json::Value::Array(
-                                        context_id
-                                            .into_iter()
-                                            .map(serde_json::Value::String)
-                                            .collect(),
-                                    ),
-                                );
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                    };
-                    let mut permissions = Vec::new();
-                    if allow_publish {
-                        permissions.push(serde_json::Value::String("createPackage".into()));
-                    }
-                    if allow_stage_publish {
-                        permissions.push(serde_json::Value::String("createStagedPackage".into()));
-                    }
-                    let config = serde_json::json!([{"type": action, "claims": claims, "permissions": permissions}]);
-                    let value = client
-                        .trust_create(Some(&registry_url), &package, config, otp.as_deref())
-                        .await?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("trusted {package} with {action}");
-                    }
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error Unknown trust command: {other}"
-                    ))
-                }
-            }
+            commands::trust::run(commands::trust::CreateArgs {
+                provider: action, package: args.first().cloned(), registry, otp,
+                file: workflow_file, repository, environment, project, org_id,
+                project_id, pipeline_definition_id, vcs_origin, context_ids: context_id,
+                allow_publish, allow_stage_publish, yes, json, dry_run,
+            }, &current_dir).await?;
         }
         Commands::Hook { registry, .. } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();

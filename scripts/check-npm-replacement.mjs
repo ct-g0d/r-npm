@@ -46,6 +46,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/v1/login')return authScenario==='web'?json({loginUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}):json({error:'Mock registry does not provide browser login'},400);
   if(url==='/auth/done'){if(authPolls++===0){res.setHeader('retry-after','0.01');return json({},202);}return json({token:'mock-login-token'});}
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
+  if(url.endsWith('/trust')&&req.method==='POST'){req.on('end',()=>json(request.body.map((item,i)=>({id:`created-${i+1}`,...item}))));return;}
   if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
   if(url==='/-/user/mock-user/package')return json({});
   if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
@@ -162,6 +163,10 @@ for(const [name,args] of [
   ['revoke',['trust','revoke','dep','--id=trust-1']],['revoke-dry-run',['trust','revoke','dep','--id=trust-1','--dry-run']],['revoke-missing-id',['trust','revoke','dep']],['bare',['trust']],
 ])add(`trust-${name}`,'trust',args,dir=>manifest(dir,{name:'dep'}),{auth:true});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
+for(const provider of ['github','gitlab','circleci']){
+  const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
+  for(const [name,extra] of [['create',['--yes']],['create-json',['--yes','--json']],['dry-run',['--dry-run']]])add(`trust-create-${provider}-${name}`,'trust',['trust',provider,'dep',...flags,'--allow-publish','--allow-stage-publish',...extra],undefined,{auth:true});
+}
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
 add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});

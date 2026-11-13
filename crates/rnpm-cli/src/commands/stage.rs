@@ -137,7 +137,7 @@ fn otp_usage(description: &str, name: &str) -> String {
     format!("{description}\n\nUsage:\nnpm stage {name} <stage-id>\n\n{STAGE_OTP_OPTIONS}")
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(super) fn is_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups
@@ -327,7 +327,7 @@ fn split_spec(spec: &str) -> (String, String) {
 }
 
 /// `bodyToOptions` of the provider that created the trust configuration.
-fn trust_body_to_options(body: &Value) -> Vec<(String, Value)> {
+pub(super) fn trust_body_to_options(body: &Value) -> Vec<(String, Value)> {
     let mut out: Vec<(String, Value)> = Vec::new();
     let mut put = |k: &str, v: Option<&Value>| {
         if let Some(v) = v.filter(|v| is_truthy(v)) {
@@ -371,7 +371,7 @@ fn is_truthy(v: &Value) -> bool {
     }
 }
 
-fn format_permissions(permissions: Option<&Value>) -> Option<String> {
+pub(super) fn format_permissions(permissions: Option<&Value>) -> Option<String> {
     let list = permissions?.as_array().filter(|l| !l.is_empty())?;
     Some(
         list.iter()

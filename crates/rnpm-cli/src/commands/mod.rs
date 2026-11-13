@@ -17,6 +17,7 @@ pub mod install_test;
 pub mod shrinkwrap;
 pub mod sbom;
 pub mod stage;
+pub mod trust;
 pub mod view;
 pub mod search;
 pub mod dist_tag;
