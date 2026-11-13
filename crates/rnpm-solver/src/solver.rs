@@ -642,12 +642,24 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             });
         };
 
+        // Optional peers do not trigger installation, but still constrain a
+        // peer set once another member requires that package. Match the
+        // advisory parent edge used by Arborist's loadPeerSet/nodeFromEdge.
+        let peer_scope = task.parent_location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("");
+        let peer_advisories: Vec<PackageTarget> = if is_peer {
+            self.graph.nodes.values().filter(|node| {
+                node.location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("") == peer_scope
+                    && node.peer_dependencies_meta.get(&task.install_name).is_some_and(|meta| meta.optional)
+            }).filter_map(|node| node.peer_dependencies.get(&task.install_name))
+                .filter_map(|spec| PackageTarget::parse(spec).ok()).collect()
+        } else { Vec::new() };
         let matched_version_opt = self.select_version(
             &task.parent_location,
             &dep_spec.package_name,
             &pkg_meta,
             &dep_spec.target,
-        );
+            &peer_advisories,
+        ).or_else(|| self.select_version(&task.parent_location, &dep_spec.package_name, &pkg_meta, &dep_spec.target, &[]));
         let Some(chosen_version) = matched_version_opt else {
             if task.dep_type == DependencyType::Optional
                 || task.dep_type == DependencyType::PeerOptional
@@ -1207,6 +1219,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         pkg_name: &str,
         meta: &'b PackageMetadata,
         target: &PackageTarget,
+        advisories: &[PackageTarget],
     ) -> Option<&'b PackageVersionMetadata> {
         let is_unlocked = self.options.unlocked_packages.contains(pkg_name)
             || self
@@ -1286,7 +1299,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
                         if let Ok(v) = Version::parse(&latest.version) {
-                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none() {
+                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none()
+                                && advisories.iter().all(|target| crate::hoisting::version_satisfies_target(&latest.version, target)) {
                                 return Some(latest);
                             }
                         }
@@ -1299,7 +1313,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {
-                        if range.satisfies(&parsed) {
+                        if range.satisfies(&parsed) && advisories.iter().all(|target| crate::hoisting::version_satisfies_target(ver_str, target)) {
                             let safe = is_safe(&parsed);
                             if safe {
                                 if v_meta.deprecated.is_none() {
@@ -1348,7 +1362,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
             }
             PackageTarget::Alias { target, .. } => {
-                self.select_version(parent_location, pkg_name, meta, target)
+                self.select_version(parent_location, pkg_name, meta, target, advisories)
             }
             PackageTarget::Url(u) => {
                 let u_str = u.as_str();

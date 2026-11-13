@@ -244,6 +244,8 @@ for(const [name,versions] of Object.entries({
   'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}}},
   'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
   'd-new':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^2.0.0'}}},
+  'optional-peer-owner':{'1.0.0':{dependencies:{'peer-consumer':'1.0.0'},peerDependencies:{shared:'^1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -263,6 +265,7 @@ add('resolver-depth-path-before-dev-class','install',['install','--ignore-script
 add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
 add('resolver-places-peer-set-before-expansion','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-regular':'1.0.0','z-peer-entry':'1.0.0'}}));
 add('resolver-nesting-preserves-descendant-resolution','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'1.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0'}}));
+add('resolver-peer-set-uses-parent-advisory','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'optional-peer-owner':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
