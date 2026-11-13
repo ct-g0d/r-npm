@@ -1,3 +1,6 @@
+#[path = "audit_graph.rs"]
+mod graph;
+
 use reqwest::Url;
 use rnpm_core::semver::{Op, Range, Version};
 use serde::{Deserialize, Serialize};
@@ -205,11 +208,13 @@ pub struct PackageVulnerability {
     pub name: String,
     pub severity: String,
     pub is_direct: bool,
-    pub via: Vec<ViaItem>,
+    #[serde(serialize_with = "serialize_via")]
+    pub via: Vec<serde_json::Value>,
     pub effects: Vec<String>,
     pub range: String,
     pub nodes: Vec<String>,
-    pub fix_available: bool,
+    #[serde(serialize_with = "serialize_fix")]
+    pub fix_available: serde_json::Value,
 }
 
 /// Vulnerabilities count summary breakdown.
@@ -628,7 +633,7 @@ pub async fn build_audit_report_with_advisories(
                             effects: Vec::new(),
                             range: range_str.to_string(),
                             nodes: Vec::new(),
-                            fix_available: true,
+                            fix_available: serde_json::json!(true),
                         }
                     });
 
@@ -641,47 +646,15 @@ pub async fn build_audit_report_with_advisories(
                     if !entry.nodes.contains(node_path) {
                         entry.nodes.push(node_path.clone());
                     }
-                    if !entry.via.iter().any(|v| v.source == via_item.source) {
-                        entry.via.push(via_item);
+                    if !entry.via.iter().any(|v| v["source"] == via_item.source) {
+                        entry.via.push(serde_json::to_value(via_item)?);
                     }
                 }
             }
         }
     }
 
-    // Propagate severity from dependencies to dependents (matching npm's rule:
-    // a package's severity is the highest of its own advisories and the vulnerable dependencies it pulls in)
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (_node_path, pkg_name, _ver_str, _is_direct) in &installed_packages {
-            let node_key = format!("node_modules/{pkg_name}");
-            let empty_deps = BTreeMap::new();
-            let deps = lockfile
-                .packages
-                .get(&node_key)
-                .and_then(|p| p.dependencies.as_ref())
-                .unwrap_or(&empty_deps);
-
-            for dep_name in deps.keys() {
-                let dep_sev_opt = vulnerabilities.get(dep_name).map(|v| {
-                    (
-                        Severity::from_str(&v.severity).unwrap_or(Severity::Low),
-                        v.severity.clone(),
-                    )
-                });
-                if let Some((dep_sev, dep_sev_str)) = dep_sev_opt {
-                    if let Some(entry) = vulnerabilities.get_mut(pkg_name) {
-                        let cur_sev = Severity::from_str(&entry.severity).unwrap_or(Severity::Low);
-                        if dep_sev > cur_sev {
-                            entry.severity = dep_sev_str;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    graph::complete_graph(&mut vulnerabilities, &lockfile, &registry, &config).await?;
 
     // npm 11 counts vulnerable packages using each package's highest severity
     let mut pkg_vuln_counts = VulnerabilitiesCount::default();
@@ -794,59 +767,151 @@ pub fn print_concise_audit_summary(report: &AuditReport) {
     println!("  run `npm audit fix` to fix them, or `npm audit` for details");
 }
 
-fn print_human_audit_report(report: &AuditReport) {
+pub fn print_human_audit_report(report: &AuditReport) {
     if report.vulnerabilities.is_empty() {
         println!("found 0 vulnerabilities");
         return;
     }
-
     println!("# npm audit report\n");
-
+    let mut printed = BTreeSet::new();
     for (name, vuln) in &report.vulnerabilities {
-        println!("{name}  {}", vuln.range);
-        println!("Severity: {}", vuln.severity);
-        for via in &vuln.via {
-            println!("{} - {}", via.title, via.url);
+        if vuln.via.iter().any(serde_json::Value::is_object) {
+            if let Some(text) = format_vulnerability(name, report, &mut printed, "") {
+                println!("{text}");
+            }
         }
-        println!("fix available via `npm audit fix`");
-        for node in &vuln.nodes {
-            println!("{node}");
-        }
-        println!();
     }
+    let counts = &report.metadata.vulnerabilities;
+    let severities: Vec<_> = [
+        ("low", counts.low),
+        ("moderate", counts.moderate),
+        ("high", counts.high),
+        ("critical", counts.critical),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .collect();
+    if severities.len() == 1 {
+        let (severity, count) = severities[0];
+        println!(
+            "{count} {severity} severity vulnerabilit{}",
+            if count == 1 { "y" } else { "ies" }
+        );
+    } else {
+        println!(
+            "{} vulnerabilities ({})",
+            counts.total,
+            severities
+                .iter()
+                .map(|(s, c)| format!("{c} {s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let some_fixable = report
+        .vulnerabilities
+        .values()
+        .any(|v| v.fix_available == serde_json::json!(true));
+    let some_force = report
+        .vulnerabilities
+        .values()
+        .any(|v| v.fix_available.is_object());
+    let some_unfixable = report
+        .vulnerabilities
+        .values()
+        .any(|v| v.fix_available == serde_json::json!(false));
+    let breaking = report
+        .vulnerabilities
+        .values()
+        .any(|v| v.fix_available["isSemVerMajor"] == serde_json::json!(true));
+    if some_fixable {
+        println!(
+            "\nTo address {}, run:\n  npm audit fix",
+            if some_force || some_unfixable {
+                "issues that do not require attention"
+            } else {
+                "all issues"
+            }
+        );
+    }
+    if some_force {
+        println!(
+            "\nTo address all issues{}{}, run:\n  npm audit fix --force",
+            if some_unfixable { " possible" } else { "" },
+            if breaking {
+                " (including breaking changes)"
+            } else {
+                ""
+            }
+        );
+    }
+    if some_unfixable {
+        println!("\nSome issues need review, and may require choosing\na different dependency.");
+    }
+}
 
-    let mut summary_parts = Vec::new();
-    if report.metadata.vulnerabilities.critical > 0 {
-        summary_parts.push(format!(
-            "{} critical",
-            report.metadata.vulnerabilities.critical
-        ));
+fn format_vulnerability(
+    name: &str,
+    report: &AuditReport,
+    printed: &mut BTreeSet<String>,
+    indent: &str,
+) -> Option<String> {
+    if !printed.insert(name.to_string()) {
+        return None;
     }
-    if report.metadata.vulnerabilities.high > 0 {
-        summary_parts.push(format!("{} high", report.metadata.vulnerabilities.high));
+    let vuln = &report.vulnerabilities[name];
+    let mut lines = vec![format!("{name}  {}", vuln.range)];
+    if indent.is_empty() && vuln.severity != "low" {
+        lines.push(format!("Severity: {}", vuln.severity));
     }
-    if report.metadata.vulnerabilities.moderate > 0 {
-        summary_parts.push(format!(
-            "{} moderate",
-            report.metadata.vulnerabilities.moderate
-        ));
-    }
-    if report.metadata.vulnerabilities.low > 0 {
-        summary_parts.push(format!("{} low", report.metadata.vulnerabilities.low));
-    }
-    if report.metadata.vulnerabilities.info > 0 {
-        summary_parts.push(format!("{} info", report.metadata.vulnerabilities.info));
-    }
-
-    println!(
-        "{} severity {}\n\nTo address issues, run:\n  npm audit fix",
-        summary_parts.join(", "),
-        if report.metadata.vulnerabilities.total == 1 {
-            "vulnerability"
-        } else {
-            "vulnerabilities"
+    for via in &vuln.via {
+        if let Some(dep) = via.as_str() {
+            lines.push(format!("Depends on vulnerable versions of {dep}"));
+        } else if indent.is_empty() {
+            lines.push(format!(
+                "{} - {}",
+                via["title"].as_str().unwrap_or(""),
+                via["url"].as_str().unwrap_or("")
+            ));
         }
-    );
+    }
+    if indent.is_empty() {
+        match &vuln.fix_available {
+            serde_json::Value::Bool(false) => lines.push("No fix available".to_string()),
+            serde_json::Value::Bool(true) => {
+                lines.push("fix available via `npm audit fix`".to_string())
+            }
+            fix => {
+                lines.push("fix available via `npm audit fix --force`".to_string());
+                lines.push(format!(
+                    "Will install {}@{}, which is {}",
+                    fix["name"].as_str().unwrap_or(""),
+                    fix["version"].as_str().unwrap_or(""),
+                    if fix["isSemVerMajor"] == serde_json::json!(true) {
+                        "a breaking change"
+                    } else {
+                        "outside the stated dependency range"
+                    }
+                ));
+            }
+        }
+    }
+    lines.extend(vuln.nodes.iter().cloned());
+    for effect in &vuln.effects {
+        if let Some(text) = format_vulnerability(effect, report, printed, "  ") {
+            lines.push(text);
+        }
+    }
+    if indent.is_empty() {
+        lines.push(String::new());
+    }
+    Some(
+        lines
+            .iter()
+            .map(|line| format!("{indent}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Runs a post-install vulnerability audit check emitting only a concise summary.
@@ -923,4 +988,38 @@ pub fn count_funding_packages(project_dir: &Path) -> usize {
         }
     }
     count
+}
+
+fn serialize_via<S: serde::Serializer>(
+    via: &[serde_json::Value],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::{Error, SerializeSeq};
+    let mut seq = serializer.serialize_seq(Some(via.len()))?;
+    for item in via {
+        if item.is_object() {
+            let advisory: ViaItem =
+                serde_json::from_value(item.clone()).map_err(S::Error::custom)?;
+            seq.serialize_element(&advisory)?;
+        } else {
+            seq.serialize_element(item)?;
+        }
+    }
+    seq.end()
+}
+
+fn serialize_fix<S: serde::Serializer>(
+    fix: &serde_json::Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    if fix.is_object() {
+        let mut map = serializer.serialize_map(Some(3))?;
+        for key in ["name", "version", "isSemVerMajor"] {
+            map.serialize_entry(key, &fix[key])?;
+        }
+        map.end()
+    } else {
+        fix.serialize(serializer)
+    }
 }
