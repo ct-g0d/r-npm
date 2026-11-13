@@ -3894,8 +3894,10 @@ impl Installer {
                     (self.options.omit_dev, self.options.omit_optional, self.options.omit_peer);
                 actual_lockfile.packages.retain(|location, pkg| {
                     location.is_empty()
-                        || !((omit_dev && pkg.is_effective_dev())
-                            || (omit_optional && pkg.is_effective_optional())
+                        || !((omit_dev && pkg.is_dev())
+                            || (omit_optional && pkg.is_optional())
+                            // devOptional packages go only when both are omitted.
+                            || (omit_dev && omit_optional && pkg.is_dev_optional())
                             || (omit_peer && pkg.is_peer()))
                 });
                 if let Some(locations) = &reify_locations {
@@ -4236,10 +4238,15 @@ impl Installer {
                 let is_peer =
                     pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
 
-                if self.options.omit_dev && (is_dev || is_dev_optional) {
+                // npm: devOptional packages are omitted only when both dev and
+                // optional are omitted.
+                if self.options.omit_dev && is_dev {
                     continue;
                 }
-                if self.options.omit_optional && (is_optional || is_dev_optional) {
+                if self.options.omit_optional && is_optional && !is_dev_optional {
+                    continue;
+                }
+                if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
                     continue;
                 }
                 if self.options.omit_peer && is_peer {
@@ -4316,10 +4323,15 @@ impl Installer {
                     || pkg_info.is_effective_optional()
                     || pkg_info.is_peer_optional();
                 let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-                if self.options.omit_dev && (is_dev || is_dev_optional) {
+                // npm: devOptional packages are omitted only when both dev and
+                // optional are omitted.
+                if self.options.omit_dev && is_dev {
                     continue;
                 }
-                if self.options.omit_optional && (is_optional || is_dev_optional) {
+                if self.options.omit_optional && is_optional && !is_dev_optional {
+                    continue;
+                }
+                if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
                     continue;
                 }
                 if is_optional {
@@ -4430,12 +4442,17 @@ impl Installer {
             let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
             let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
 
+            // devOptional packages are omitted only when dev and optional both are.
+            if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
+                continue;
+            }
             if self.options.omit_dev {
-                if is_dev || is_dev_optional {
+                if is_dev {
                     continue;
                 }
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/')
+                    if !is_dev_optional
+                        && !clean_name.contains('/')
                         && manifest.dev_dependencies.contains_key(clean_name)
                         && !manifest.dependencies.contains_key(clean_name)
                     {
@@ -4444,11 +4461,12 @@ impl Installer {
                 }
             }
             if self.options.omit_optional {
-                if is_optional || is_dev_optional {
+                if is_optional && !is_dev_optional {
                     continue;
                 }
                 if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/')
+                    if !is_dev_optional
+                        && !clean_name.contains('/')
                         && manifest.optional_dependencies.contains_key(clean_name)
                         && !manifest.dependencies.contains_key(clean_name)
                     {

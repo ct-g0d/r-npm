@@ -216,6 +216,10 @@ add('override-conflicts-direct','install',['install'],dir=>manifest(dir,{depende
 add('override-reference-ok','install',['install'],dir=>manifest(dir,{dependencies:{dep:'1.0.0',parent:'1.0.0'},overrides:{dep:'$dep'}}));
 add('config-get-several','config',['config','get','fetch-retries','strict-ssl','save-prefix']);
 for(const command of ['ci','install'])add(`lockfile-without-resolved-${command}`,command,[command],dir=>manifest(dir,{dependencies:{parent:'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--omit-lockfile-registry-resolved']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+add('flags-dev-optional-overlap','install',['install'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
+add('flags-dev-and-prod-overlap','install',['install'],dir=>manifest(dir,{dependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
+add('flags-omit-dev-keeps-dev-optional','install',['install','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}));
+add('flags-ci-omit-dev-keeps-dev-optional','ci',['ci','--omit=dev'],dir=>manifest(dir,{optionalDependencies:{parent:'1.0.0'},devDependencies:{dep:'1.1.0'}}),{before:async ctx=>{const p=await ctx.exec(['install']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
