@@ -1070,6 +1070,381 @@ pub async fn run_doctor_standard(project_path: &Path, json: bool) -> anyhow::Res
     Ok(())
 }
 
+// -------------------------------------------------------------------------
+// `npm doctor` (port of npm's lib/commands/doctor.js)
+// -------------------------------------------------------------------------
+
+const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
+
+struct DoctorCheck {
+    groups: &'static [&'static str],
+    title: &'static str,
+    kind: DoctorCheckKind,
+    windows: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DoctorCheckKind {
+    Ping,
+    NpmVersion,
+    NodeVersion,
+    Registry,
+    Git,
+    BinPath,
+    CachePermission,
+    LocalModulesPermission,
+    GlobalModulesPermission,
+    LocalBinPermission,
+    GlobalBinPermission,
+    VerifyCache,
+}
+
+const DOCTOR_CHECKS: &[DoctorCheck] = &[
+    DoctorCheck { groups: &["connection", "ping", "registry"], title: "Connecting to the registry", kind: DoctorCheckKind::Ping, windows: true },
+    DoctorCheck { groups: &["versions"], title: "Checking npm version", kind: DoctorCheckKind::NpmVersion, windows: true },
+    DoctorCheck { groups: &["versions"], title: "Checking node version", kind: DoctorCheckKind::NodeVersion, windows: true },
+    DoctorCheck { groups: &["registry"], title: "Checking configured npm registry", kind: DoctorCheckKind::Registry, windows: true },
+    DoctorCheck { groups: &["environment"], title: "Checking for git executable in PATH", kind: DoctorCheckKind::Git, windows: true },
+    DoctorCheck { groups: &["environment"], title: "Checking for global bin folder in PATH", kind: DoctorCheckKind::BinPath, windows: true },
+    DoctorCheck { groups: &["permissions", "cache"], title: "Checking permissions on cached files (this may take awhile)", kind: DoctorCheckKind::CachePermission, windows: false },
+    DoctorCheck { groups: &["permissions"], title: "Checking permissions on local node_modules (this may take awhile)", kind: DoctorCheckKind::LocalModulesPermission, windows: false },
+    DoctorCheck { groups: &["permissions"], title: "Checking permissions on global node_modules (this may take awhile)", kind: DoctorCheckKind::GlobalModulesPermission, windows: false },
+    DoctorCheck { groups: &["permissions"], title: "Checking permissions on local bin folder", kind: DoctorCheckKind::LocalBinPermission, windows: false },
+    DoctorCheck { groups: &["permissions"], title: "Checking permissions on global bin folder", kind: DoctorCheckKind::GlobalBinPermission, windows: false },
+    DoctorCheck { groups: &["cache"], title: "Verifying cache contents (this may take awhile)", kind: DoctorCheckKind::VerifyCache, windows: false },
+];
+
+/// A failed check: `Error` instances print as `Error: msg`, thrown strings as-is.
+enum CheckFailure {
+    Error(String),
+    Text(String),
+}
+
+impl std::fmt::Display for CheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckFailure::Error(m) => write!(f, "Error: {m}"),
+            CheckFailure::Text(m) => f.write_str(m),
+        }
+    }
+}
+
+struct DoctorEnv {
+    config: rnpm_config::Config,
+    registry: reqwest::Url,
+    project_dir: PathBuf,
+}
+
+impl DoctorEnv {
+    fn prefix(&self) -> PathBuf {
+        self.config
+            .get("prefix")
+            .map(PathBuf::from)
+            .unwrap_or_else(rnpm_config::find_global_prefix)
+    }
+
+    fn global_bin(&self) -> PathBuf {
+        rnpm_config::find_global_bin_dir(&self.prefix())
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("npm-cache")
+        })
+    }
+}
+
+fn doctor_client(env: &DoctorEnv) -> Result<rnpm_registry::RegistryClient, CheckFailure> {
+    let config = rnpm_registry::RegistryClientConfig {
+        default_registry: env.registry.clone(),
+        max_retries: 0,
+        ..Default::default()
+    };
+    rnpm_registry::RegistryClient::with_config(config).map_err(|e| CheckFailure::Text(e.to_string()))
+}
+
+fn registry_failure(err: rnpm_registry::RegistryError) -> CheckFailure {
+    match err {
+        rnpm_registry::RegistryError::ServerError { status, body } => {
+            CheckFailure::Text(format!("{status} {}", body.trim()))
+        }
+        other => CheckFailure::Text(other.to_string()),
+    }
+}
+
+/// `which` as used by npm: search cwd then PATH with PATHEXT on Windows.
+fn which_executable(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        dirs.push(cwd.to_path_buf());
+    }
+    dirs.extend(std::env::split_paths(&path));
+    let exts: Vec<String> = if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into());
+        let mut exts: Vec<String> = pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .flat_map(|e| [e.to_string(), e.to_lowercase()])
+            .collect();
+        if cmd.contains('.') {
+            exts.insert(0, String::new());
+        }
+        exts
+    } else {
+        vec![String::new()]
+    };
+    for dir in dirs {
+        for ext in &exts {
+            let candidate = dir.join(format!("{cmd}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+async fn run_check(kind: DoctorCheckKind, env: &DoctorEnv) -> Result<String, CheckFailure> {
+    match kind {
+        DoctorCheckKind::Ping => {
+            let client = doctor_client(env)?;
+            client
+                .ping(Some(&env.registry))
+                .await
+                .map(|_| String::new())
+                .map_err(registry_failure)
+        }
+        DoctorCheckKind::NpmVersion => {
+            let client = doctor_client(env)?;
+            let meta = client
+                .get_package_metadata("npm")
+                .await
+                .map_err(registry_failure)?;
+            let latest = meta
+                .dist_tags
+                .get("latest")
+                .cloned()
+                .ok_or_else(|| CheckFailure::Text("No matching version found for npm@latest.".into()))?;
+            let current = rnpm_core::semver::Version::parse(crate::version::NPM_VERSION);
+            let newest = rnpm_core::semver::Version::parse(&latest);
+            match (current, newest) {
+                (Ok(c), Ok(l)) if c >= l => Ok(format!(
+                    "current: v{}, latest: v{latest}",
+                    crate::version::NPM_VERSION
+                )),
+                _ => Err(CheckFailure::Text(format!("Use npm v{latest}"))),
+            }
+        }
+        DoctorCheckKind::NodeVersion => node_version_check().await,
+        DoctorCheckKind::Registry => {
+            if env.registry.as_str() != DEFAULT_REGISTRY {
+                Err(CheckFailure::Text(format!(
+                    "Try `npm config set registry={DEFAULT_REGISTRY}`"
+                )))
+            } else {
+                Ok(format!("using default registry ({DEFAULT_REGISTRY})"))
+            }
+        }
+        DoctorCheckKind::Git => which_executable("git", &env.project_dir)
+            .map(|p| p.display().to_string())
+            .ok_or_else(|| CheckFailure::Error("Install git and ensure it's in your PATH.".into())),
+        DoctorCheckKind::BinPath => {
+            let bin = env.global_bin().display().to_string();
+            let path = std::env::var("PATH").unwrap_or_default();
+            if path.contains(&bin) {
+                Ok(bin)
+            } else {
+                Err(CheckFailure::Error(format!("Add {bin} to your $PATH")))
+            }
+        }
+        DoctorCheckKind::CachePermission => check_files_permission(&env.cache_dir(), true, false),
+        DoctorCheckKind::LocalModulesPermission => {
+            check_files_permission(&env.project_dir.join("node_modules"), true, true)
+        }
+        DoctorCheckKind::GlobalModulesPermission => check_files_permission(
+            &rnpm_config::find_global_node_modules(&env.prefix()),
+            false,
+            false,
+        ),
+        DoctorCheckKind::LocalBinPermission => {
+            check_files_permission(&env.project_dir.join("node_modules/.bin"), false, true)
+        }
+        DoctorCheckKind::GlobalBinPermission => {
+            check_files_permission(&env.global_bin(), false, false)
+        }
+        DoctorCheckKind::VerifyCache => {
+            let cache = env.cache_dir().join("_cacache").join("content-v2");
+            let mut count = 0usize;
+            let mut stack = vec![cache];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(format!("verified {count} tarballs"))
+        }
+    }
+}
+
+async fn node_version_check() -> Result<String, CheckFailure> {
+    let current = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .ok_or_else(|| CheckFailure::Text("node executable not found".into()))?;
+    let releases: serde_json::Value = reqwest::get("https://nodejs.org/dist/index.json")
+        .await
+        .map_err(|e| CheckFailure::Text(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| CheckFailure::Text(e.to_string()))?;
+    use rnpm_core::semver::{Range, Version};
+    let parse = |v: &str| Version::parse(v.trim_start_matches('v')).ok();
+    let current_v = parse(&current).ok_or_else(|| CheckFailure::Text(format!("Invalid Version: {current}")))?;
+    let current_range = Range::parse(&format!("^{}", current.trim_start_matches('v'))).ok();
+    let zero = Version::parse("0.0.0").expect("valid");
+    let (mut max_current, mut max_lts) = ((zero.clone(), String::from("0.0.0")), (zero, String::from("0.0.0")));
+    for release in releases.as_array().into_iter().flatten() {
+        let Some(raw) = release.get("version").and_then(|v| v.as_str()) else { continue };
+        let Some(v) = parse(raw) else { continue };
+        let lts = release.get("lts").is_some_and(|l| !l.is_null() && l != &serde_json::Value::Bool(false));
+        if lts && v > max_lts.0 {
+            max_lts = (v.clone(), raw.to_string());
+        }
+        if current_range.as_ref().is_some_and(|r| r.satisfies(&v)) && v > max_current.0 {
+            max_current = (v, raw.to_string());
+        }
+    }
+    let recommended = if max_current.0 > max_lts.0 { max_current } else { max_lts };
+    if current_v >= recommended.0 {
+        Ok(format!("current: {current}, recommended: {}", recommended.1))
+    } else {
+        Err(CheckFailure::Text(format!(
+            "Use node {} (current: {current})",
+            recommended.1
+        )))
+    }
+}
+
+/// Permission walk used by the POSIX-only checks.
+fn check_files_permission(
+    root: &Path,
+    should_own: bool,
+    missing_ok: bool,
+) -> Result<String, CheckFailure> {
+    let mut ok = true;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                if !missing_ok || e.kind() != std::io::ErrorKind::NotFound {
+                    ok = false;
+                    eprintln!("npm warn doctor checkFilesPermission error getting info for {}", path.display());
+                }
+                continue;
+            }
+        };
+        #[cfg(unix)]
+        if should_own {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: getuid/getgid have no preconditions.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            if meta.uid() != uid || meta.gid() != gid {
+                eprintln!("npm warn doctor checkFilesPermission should be owner of {}", path.display());
+                ok = false;
+            }
+        }
+        if meta.is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => stack.extend(entries.flatten().map(|e| e.path())),
+                Err(_) => {
+                    ok = false;
+                    eprintln!("npm warn doctor checkFilesPermission error reading directory {}", path.display());
+                }
+            }
+        }
+    }
+    if ok {
+        Ok(String::new())
+    } else {
+        Err(CheckFailure::Text(format!(
+            "Check the permissions of files in {}{}",
+            root.display(),
+            if should_own { " (should be owned by current user)" } else { "" }
+        )))
+    }
+}
+
+fn doctor_is_silent(config: &rnpm_config::Config) -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().enumerate().any(|(i, a)| {
+        a == "-s"
+            || a == "--silent"
+            || a == "--loglevel=silent"
+            || (a == "--loglevel" && args.get(i + 1).is_some_and(|n| n == "silent"))
+    }) || config.get("loglevel") == Some("silent")
+}
+
+/// Run npm's doctor checks for the given groups (all checks when empty).
+pub async fn run_npm_doctor(project_dir: &Path, groups: &[String]) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    let registry = config.npmrc.registry.clone();
+    let silent = doctor_is_silent(&config);
+    let env = DoctorEnv {
+        config,
+        registry,
+        project_dir: project_dir.to_path_buf(),
+    };
+    let mut all_ok = true;
+    for check in DOCTOR_CHECKS {
+        if cfg!(windows) && !check.windows {
+            continue;
+        }
+        if !groups.is_empty() && !groups.iter().any(|g| check.groups.contains(&g.as_str())) {
+            continue;
+        }
+        if !silent {
+            println!("{}", check.title);
+        }
+        match run_check(check.kind, &env).await {
+            Ok(result) => {
+                if !silent {
+                    if result.is_empty() {
+                        println!("Ok\n");
+                    } else {
+                        println!("Ok\n{result}\n");
+                    }
+                }
+            }
+            Err(err) => {
+                all_ok = false;
+                if !silent {
+                    println!("Not ok\n{err}\n");
+                }
+            }
+        }
+    }
+    if !all_ok {
+        if silent {
+            anyhow::bail!("npm error Some problems found. Check logs or disable silent mode for recommendations.");
+        }
+        anyhow::bail!("npm error Some problems found. See above for recommendations.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

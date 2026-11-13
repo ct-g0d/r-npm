@@ -5561,7 +5561,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if is_perf {
                 doctor::run_doctor_perf(&current_dir, json).await?;
             } else {
-                doctor::run_doctor_standard(&current_dir, json).await?;
+                let groups: Vec<String> = action.into_iter().chain(args).collect();
+                doctor::run_npm_doctor(&current_dir, &groups).await?;
             }
         }
         Commands::Fund { package, json } => {
