@@ -138,6 +138,7 @@ add('command-completion','completion',['completion']);
 add('command-help','help',['help']);
 add('command-help-search','help-search',['help-search','install']);
 add('command-doctor','doctor',['doctor','connection']);
+for(const group of ['registry','environment','unknown'])add(`doctor-${group}`,'doctor',['doctor',group]);
 const sbomTree=dir=>manifest(dir,{license:'MIT',dependencies:{parent:'1.0.0'},devDependencies:{dep:'2.0.0'},optionalDependencies:{changing:'1.0.0'}});
 const sbomInstall={before:async ctx=>{generation=1;const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`sbom seed failed: ${p.stderr}`);}};
 for(const [name,args] of [['spdx',['--sbom-format=spdx']],['cyclonedx',['--sbom-format=cyclonedx']],['cyclonedx-application',['--sbom-format=cyclonedx','--sbom-type=application']],['omit-dev',['--sbom-format=spdx','--omit=dev']],['lock-only',['--sbom-format=cyclonedx','--package-lock-only']]])add(`sbom-populated-${name}`,'sbom',['sbom',...args],sbomTree,sbomInstall);

@@ -954,122 +954,6 @@ pub async fn run_doctor_perf(project_path: &Path, json: bool) -> anyhow::Result<
     Ok(())
 }
 
-/// Standard doctor health check report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StandardDoctorReport {
-    pub rnpm_version: String,
-    pub os: String,
-    pub arch: String,
-    pub registry: String,
-    pub package_json: bool,
-    pub package_lock: bool,
-    pub node_modules: bool,
-    pub cache_dir: String,
-    pub cache_writable: bool,
-    pub dev_drive: bool,
-    pub seek_penalty: Option<bool>,
-}
-
-/// Run `rnpm doctor` standard diagnostic check.
-pub async fn run_doctor_standard(project_path: &Path, json: bool) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(project_path)).unwrap_or_default();
-    let registry = config.npmrc.registry.clone();
-
-    let package_json = project_path.join("package.json").exists();
-    let package_lock = project_path.join("package-lock.json").exists();
-    let node_modules = project_path.join("node_modules").exists();
-
-    let cache_dir = rnpm_cache::PackStore::default_location(None);
-    let cache_writable = std::fs::create_dir_all(&cache_dir).is_ok();
-
-    let vol = query_volume_info(project_path);
-    let dev_drive = vol.as_ref().map(|v| v.is_dev_drive).unwrap_or(false);
-    let is_refs = vol
-        .as_ref()
-        .map(|v| v.file_system.eq_ignore_ascii_case("ReFS"))
-        .unwrap_or(false);
-    let seek_penalty = rnpm_fs::detect_seek_penalty(project_path);
-
-    let report = StandardDoctorReport {
-        rnpm_version: env!("CARGO_PKG_VERSION").to_string(),
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        registry: registry.to_string(),
-        package_json,
-        package_lock,
-        node_modules,
-        cache_dir: cache_dir.to_string_lossy().to_string(),
-        cache_writable,
-        dev_drive,
-        seek_penalty,
-    };
-
-    if json {
-        let json_str = serde_json::to_string_pretty(&report)?;
-        println!("{}", json_str);
-    } else {
-        println!("rnpm doctor - Environment & Project Health Check");
-        println!("================================================");
-        println!("  rnpm version : v{}", report.rnpm_version);
-        println!("  Platform     : {} ({})", report.os, report.arch);
-        println!("  Registry     : {}", report.registry);
-        println!(
-            "  package.json : {}",
-            if package_json {
-                "[OK] Found"
-            } else {
-                "[!] Not found"
-            }
-        );
-        println!(
-            "  package-lock : {}",
-            if package_lock {
-                "[OK] Found"
-            } else {
-                "[!] Not found"
-            }
-        );
-        println!(
-            "  node_modules : {}",
-            if node_modules {
-                "[OK] Present"
-            } else {
-                "Not present"
-            }
-        );
-        println!(
-            "  Cache dir    : {} {}",
-            report.cache_dir,
-            if cache_writable {
-                "[OK] Writable"
-            } else {
-                "[!] Not writable"
-            }
-        );
-        println!(
-            "  Dev Drive    : {}",
-            if dev_drive {
-                "[OK] Dev Drive (ReFS)"
-            } else if is_refs {
-                "No (Plain ReFS volume, not a Dev Drive)"
-            } else {
-                "No (NTFS / other)"
-            }
-        );
-        println!(
-            "  Seek Penalty : {}",
-            match seek_penalty {
-                Some(true) => "Yes (Rotational HDD)",
-                Some(false) => "No (SSD / NVMe)",
-                None => "Unknown",
-            }
-        );
-        println!("\nTip: Run 'rnpm doctor perf' for in-depth Dev Drive, disk speed, and Windows Defender diagnostics.");
-    }
-
-    Ok(())
-}
-
 // -------------------------------------------------------------------------
 // `npm doctor` (port of npm's lib/commands/doctor.js)
 // -------------------------------------------------------------------------
@@ -1100,18 +984,78 @@ enum DoctorCheckKind {
 }
 
 const DOCTOR_CHECKS: &[DoctorCheck] = &[
-    DoctorCheck { groups: &["connection", "ping", "registry"], title: "Connecting to the registry", kind: DoctorCheckKind::Ping, windows: true },
-    DoctorCheck { groups: &["versions"], title: "Checking npm version", kind: DoctorCheckKind::NpmVersion, windows: true },
-    DoctorCheck { groups: &["versions"], title: "Checking node version", kind: DoctorCheckKind::NodeVersion, windows: true },
-    DoctorCheck { groups: &["registry"], title: "Checking configured npm registry", kind: DoctorCheckKind::Registry, windows: true },
-    DoctorCheck { groups: &["environment"], title: "Checking for git executable in PATH", kind: DoctorCheckKind::Git, windows: true },
-    DoctorCheck { groups: &["environment"], title: "Checking for global bin folder in PATH", kind: DoctorCheckKind::BinPath, windows: true },
-    DoctorCheck { groups: &["permissions", "cache"], title: "Checking permissions on cached files (this may take awhile)", kind: DoctorCheckKind::CachePermission, windows: false },
-    DoctorCheck { groups: &["permissions"], title: "Checking permissions on local node_modules (this may take awhile)", kind: DoctorCheckKind::LocalModulesPermission, windows: false },
-    DoctorCheck { groups: &["permissions"], title: "Checking permissions on global node_modules (this may take awhile)", kind: DoctorCheckKind::GlobalModulesPermission, windows: false },
-    DoctorCheck { groups: &["permissions"], title: "Checking permissions on local bin folder", kind: DoctorCheckKind::LocalBinPermission, windows: false },
-    DoctorCheck { groups: &["permissions"], title: "Checking permissions on global bin folder", kind: DoctorCheckKind::GlobalBinPermission, windows: false },
-    DoctorCheck { groups: &["cache"], title: "Verifying cache contents (this may take awhile)", kind: DoctorCheckKind::VerifyCache, windows: false },
+    DoctorCheck {
+        groups: &["connection", "ping", "registry"],
+        title: "Connecting to the registry",
+        kind: DoctorCheckKind::Ping,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["versions"],
+        title: "Checking npm version",
+        kind: DoctorCheckKind::NpmVersion,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["versions"],
+        title: "Checking node version",
+        kind: DoctorCheckKind::NodeVersion,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["registry"],
+        title: "Checking configured npm registry",
+        kind: DoctorCheckKind::Registry,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["environment"],
+        title: "Checking for git executable in PATH",
+        kind: DoctorCheckKind::Git,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["environment"],
+        title: "Checking for global bin folder in PATH",
+        kind: DoctorCheckKind::BinPath,
+        windows: true,
+    },
+    DoctorCheck {
+        groups: &["permissions", "cache"],
+        title: "Checking permissions on cached files (this may take awhile)",
+        kind: DoctorCheckKind::CachePermission,
+        windows: false,
+    },
+    DoctorCheck {
+        groups: &["permissions"],
+        title: "Checking permissions on local node_modules (this may take awhile)",
+        kind: DoctorCheckKind::LocalModulesPermission,
+        windows: false,
+    },
+    DoctorCheck {
+        groups: &["permissions"],
+        title: "Checking permissions on global node_modules (this may take awhile)",
+        kind: DoctorCheckKind::GlobalModulesPermission,
+        windows: false,
+    },
+    DoctorCheck {
+        groups: &["permissions"],
+        title: "Checking permissions on local bin folder",
+        kind: DoctorCheckKind::LocalBinPermission,
+        windows: false,
+    },
+    DoctorCheck {
+        groups: &["permissions"],
+        title: "Checking permissions on global bin folder",
+        kind: DoctorCheckKind::GlobalBinPermission,
+        windows: false,
+    },
+    DoctorCheck {
+        groups: &["cache"],
+        title: "Verifying cache contents (this may take awhile)",
+        kind: DoctorCheckKind::VerifyCache,
+        windows: false,
+    },
 ];
 
 /// A failed check: `Error` instances print as `Error: msg`, thrown strings as-is.
@@ -1148,12 +1092,15 @@ impl DoctorEnv {
     }
 
     fn cache_dir(&self) -> PathBuf {
-        self.config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("npm-cache")
-        })
+        self.config
+            .get("cache")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("npm-cache")
+            })
     }
 }
 
@@ -1163,7 +1110,8 @@ fn doctor_client(env: &DoctorEnv) -> Result<rnpm_registry::RegistryClient, Check
         max_retries: 0,
         ..Default::default()
     };
-    rnpm_registry::RegistryClient::with_config(config).map_err(|e| CheckFailure::Text(e.to_string()))
+    rnpm_registry::RegistryClient::with_config(config)
+        .map_err(|e| CheckFailure::Text(e.to_string()))
 }
 
 fn registry_failure(err: rnpm_registry::RegistryError) -> CheckFailure {
@@ -1224,11 +1172,9 @@ async fn run_check(kind: DoctorCheckKind, env: &DoctorEnv) -> Result<String, Che
                 .get_package_metadata("npm")
                 .await
                 .map_err(registry_failure)?;
-            let latest = meta
-                .dist_tags
-                .get("latest")
-                .cloned()
-                .ok_or_else(|| CheckFailure::Text("No matching version found for npm@latest.".into()))?;
+            let latest = meta.dist_tags.get("latest").cloned().ok_or_else(|| {
+                CheckFailure::Text("No matching version found for npm@latest.".into())
+            })?;
             let current = rnpm_core::semver::Version::parse(crate::version::NPM_VERSION);
             let newest = rnpm_core::semver::Version::parse(&latest);
             match (current, newest) {
@@ -1311,14 +1257,22 @@ async fn node_version_check() -> Result<String, CheckFailure> {
         .map_err(|e| CheckFailure::Text(e.to_string()))?;
     use rnpm_core::semver::{Range, Version};
     let parse = |v: &str| Version::parse(v.trim_start_matches('v')).ok();
-    let current_v = parse(&current).ok_or_else(|| CheckFailure::Text(format!("Invalid Version: {current}")))?;
+    let current_v =
+        parse(&current).ok_or_else(|| CheckFailure::Text(format!("Invalid Version: {current}")))?;
     let current_range = Range::parse(&format!("^{}", current.trim_start_matches('v'))).ok();
     let zero = Version::parse("0.0.0").expect("valid");
-    let (mut max_current, mut max_lts) = ((zero.clone(), String::from("0.0.0")), (zero, String::from("0.0.0")));
+    let (mut max_current, mut max_lts) = (
+        (zero.clone(), String::from("0.0.0")),
+        (zero, String::from("0.0.0")),
+    );
     for release in releases.as_array().into_iter().flatten() {
-        let Some(raw) = release.get("version").and_then(|v| v.as_str()) else { continue };
+        let Some(raw) = release.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let Some(v) = parse(raw) else { continue };
-        let lts = release.get("lts").is_some_and(|l| !l.is_null() && l != &serde_json::Value::Bool(false));
+        let lts = release
+            .get("lts")
+            .is_some_and(|l| !l.is_null() && l != &serde_json::Value::Bool(false));
         if lts && v > max_lts.0 {
             max_lts = (v.clone(), raw.to_string());
         }
@@ -1326,9 +1280,16 @@ async fn node_version_check() -> Result<String, CheckFailure> {
             max_current = (v, raw.to_string());
         }
     }
-    let recommended = if max_current.0 > max_lts.0 { max_current } else { max_lts };
+    let recommended = if max_current.0 > max_lts.0 {
+        max_current
+    } else {
+        max_lts
+    };
     if current_v >= recommended.0 {
-        Ok(format!("current: {current}, recommended: {}", recommended.1))
+        Ok(format!(
+            "current: {current}, recommended: {}",
+            recommended.1
+        ))
     } else {
         Err(CheckFailure::Text(format!(
             "Use node {} (current: {current})",
@@ -1351,7 +1312,10 @@ fn check_files_permission(
             Err(e) => {
                 if !missing_ok || e.kind() != std::io::ErrorKind::NotFound {
                     ok = false;
-                    eprintln!("npm warn doctor checkFilesPermission error getting info for {}", path.display());
+                    eprintln!(
+                        "npm warn doctor checkFilesPermission error getting info for {}",
+                        path.display()
+                    );
                 }
                 continue;
             }
@@ -1362,7 +1326,10 @@ fn check_files_permission(
             // SAFETY: getuid/getgid have no preconditions.
             let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
             if meta.uid() != uid || meta.gid() != gid {
-                eprintln!("npm warn doctor checkFilesPermission should be owner of {}", path.display());
+                eprintln!(
+                    "npm warn doctor checkFilesPermission should be owner of {}",
+                    path.display()
+                );
                 ok = false;
             }
         }
@@ -1371,7 +1338,10 @@ fn check_files_permission(
                 Ok(entries) => stack.extend(entries.flatten().map(|e| e.path())),
                 Err(_) => {
                     ok = false;
-                    eprintln!("npm warn doctor checkFilesPermission error reading directory {}", path.display());
+                    eprintln!(
+                        "npm warn doctor checkFilesPermission error reading directory {}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -1382,7 +1352,11 @@ fn check_files_permission(
         Err(CheckFailure::Text(format!(
             "Check the permissions of files in {}{}",
             root.display(),
-            if should_own { " (should be owned by current user)" } else { "" }
+            if should_own {
+                " (should be owned by current user)"
+            } else {
+                ""
+            }
         )))
     }
 }
