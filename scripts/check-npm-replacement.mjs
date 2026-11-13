@@ -241,14 +241,17 @@ for(const [name,versions] of Object.entries({
   'z-peer-entry':{'1.0.0':{peerDependencies:{'a-peer-parent':'1.0.0'}}},
   'a-peer-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'b-regular':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
-  'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}}},
-  'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
+  'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}},'2.0.0':{dependencies:{'c-old':'3.0.0','d-new':'2.0.0'}}},
+  'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}},'3.0.0':{dependencies:{'z-passive':'2.0.0'}}},
   'd-new':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^2.0.0'}}},
+  'z-passive':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
   'optional-peer-owner':{'1.0.0':{dependencies:{'peer-consumer':'1.0.0'},peerDependencies:{shared:'^1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
   'legacy-engines':{'1.0.0':{engines:['node >= 0.8.0']}},
   'z-peer-source':{'1.0.0':{dependencies:{'a-peer-plugin':'1.0.0',shared:'2.0.0'}}},
   'a-peer-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'z-normal-peer-owner':{'1.0.0':{dependencies:{'a-broad-peer-plugin':'1.0.0',shared:'1.0.0'}}},
+  'a-broad-peer-plugin':{'1.0.0':{peerDependencies:{shared:'*'}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -268,8 +271,10 @@ add('resolver-depth-path-before-dev-class','install',['install','--ignore-script
 add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
 add('resolver-places-peer-set-before-expansion','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-regular':'1.0.0','z-peer-entry':'1.0.0'}}));
 add('resolver-nesting-preserves-descendant-resolution','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'1.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0'}}));
+add('resolver-nesting-preserves-pending-descendant-edges','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'2.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0','z-passive':'1.0.0'}}));
 add('resolver-peer-set-uses-parent-advisory','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'optional-peer-owner':'1.0.0'}}));
 add('resolver-peer-set-waits-for-sibling-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'1.0.0','z-peer-source':'1.0.0'}}));
+add('resolver-peer-set-prefers-parent-dependency','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-normal-peer-owner':'1.0.0'}}));
 add('install-preserves-legacy-engines-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'legacy-engines':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));

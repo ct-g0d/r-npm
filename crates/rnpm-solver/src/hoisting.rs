@@ -453,6 +453,18 @@ fn candidate_shadows_descendant_dep(
 ) -> bool {
     let Some(version) = resolved_version else { return false; };
     let prefix = format!("{scope}/node_modules/");
+    // Arborist links a node's edgesOut as soon as it enters the tree, even
+    // before its turn in depsQueue. Include those not-yet-processed edges.
+    if graph.nodes.values().filter(|node| node.location.starts_with(&prefix)).any(|node| {
+        let Some(spec) = node.optional_dependencies.get(install_name)
+            .or_else(|| node.dependencies.get(install_name))
+            .or_else(|| node.peer_dependencies.get(install_name)) else { return false; };
+        let Ok(target) = PackageTarget::parse(spec) else { return false; };
+        find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
+            !current.location.starts_with(&prefix) && node_satisfies_target(current, &target)
+                && !version_satisfies_target(version, &target)
+        })
+    }) { return true; }
     graph.edges.iter().any(|edge| {
         if edge.install_name != install_name || !edge.from_location.starts_with(&prefix)
             || edge.to_location.starts_with(&prefix) {

@@ -646,13 +646,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // peer set once another member requires that package. Match the
         // advisory parent edge used by Arborist's loadPeerSet/nodeFromEdge.
         let peer_scope = task.parent_location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("");
-        let peer_advisories: Vec<PackageTarget> = if is_peer {
+        let mut peer_advisories: Vec<PackageTarget> = if is_peer {
             self.graph.nodes.values().filter(|node| {
                 node.location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("") == peer_scope
                     && node.peer_dependencies_meta.get(&task.install_name).is_some_and(|meta| meta.optional)
             }).filter_map(|node| node.peer_dependencies.get(&task.install_name))
                 .filter_map(|spec| PackageTarget::parse(spec).ok()).collect()
         } else { Vec::new() };
+        if is_peer {
+            for incoming in self.graph.edges.iter().filter(|edge| edge.to_location == task.parent_location) {
+                if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
+                    if let Some(spec) = source.dependencies.get(&task.install_name)
+                        .or_else(|| source.optional_dependencies.get(&task.install_name)) {
+                        if let Ok(target) = PackageTarget::parse(spec) { peer_advisories.push(target); }
+                    }
+                }
+            }
+        }
         let matched_version_opt = self.select_version(
             &task.parent_location,
             &dep_spec.package_name,
