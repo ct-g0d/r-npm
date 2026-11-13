@@ -62,7 +62,9 @@ fn run_hook_failure_preserves_exit_code_and_stops_later_hooks() {
     let out = run(temp.path(), &["run", "x"]);
     assert_eq!(out.status.code(), Some(7));
     assert_eq!(events(temp.path()), "prex\n");
-    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let log = stderr.trim().strip_prefix("npm error A complete log of this run can be found in: ").expect("npm's failed root script writes a diagnostic log footer");
+    assert!(Path::new(log).is_file());
 }
 
 #[test]

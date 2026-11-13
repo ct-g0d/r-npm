@@ -261,8 +261,20 @@ fn test_cli_publish_dry_run() {
     assert!(package["integrity"].is_string());
 }
 
-#[test]
-fn test_cli_login_persists_registry_token_without_echoing_secret() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cli_login_persists_registry_token_without_echoing_secret() {
+    let server = TestMockRegistry::start(|req| {
+        let body = if req.method == "POST" && req.path == "/-/v1/login" {
+            assert_eq!(req.json(), serde_json::json!({}));
+            let origin = format!("http://{}", req.header("host").unwrap());
+            serde_json::json!({"loginUrl":format!("{origin}/auth/login"),"doneUrl":format!("{origin}/auth/done")})
+        } else {
+            assert_eq!(req.path, "/auth/done");
+            serde_json::json!({"token":"mock-login-token"})
+        };
+        (200, vec![("Content-Type", "application/json".into())], serde_json::to_vec(&body).unwrap())
+    }).await;
+    let registry = server.url();
     let tmp = tempdir().unwrap();
     let home = tmp.path().join("home");
     let project = tmp.path().join("project");
@@ -273,14 +285,14 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
         .args([
             "login",
             "--registry",
-            "https://registry.example.test/",
+            &registry,
             "--scope",
             "@acme",
         ])
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
-        .env("NPM_TOKEN", "secret-login-token")
+        .env_remove("NPM_TOKEN")
         .output()
         .expect("failed to run rnpm login");
 
@@ -290,10 +302,11 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
         String::from_utf8_lossy(&output.stderr)
     );
     let npmrc = std::fs::read_to_string(home.join(".npmrc")).unwrap();
-    assert!(npmrc.contains("//registry.example.test/:_authToken=secret-login-token"));
-    assert!(npmrc.contains("@acme:registry=https://registry.example.test/"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-login-token"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-login-token"));
+    assert!(npmrc.contains(&format!("//{}/:_authToken=mock-login-token",server.addr)));
+    assert!(npmrc.contains(&format!("@acme:registry={registry}")));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("mock-login-token"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("mock-login-token"));
+    server.stop();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -793,9 +806,9 @@ async fn test_cli_auth_helpers_login_and_logout() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&project).unwrap();
 
-    let server = TestMockRegistry::start(|_req| {
+    let server = TestMockRegistry::start(|req| {
         (
-            200,
+            if req.path == "/-/v1/login" { 400 } else { 200 },
             vec![("Content-Type", "application/json".to_string())],
             b"{\"ok\":true}".to_vec(),
         )
@@ -803,9 +816,9 @@ async fn test_cli_auth_helpers_login_and_logout() {
     .await;
     let reg_url = server.url();
 
-    // 1. Non-interactive login requires an explicit credential source.
+    // 1. Unsupported web auth falls back to a legacy prompt; EOF exits 1.
     let login_out = isolated_rnpm(&project)
-        .arg("login")
+        .args(["login", "--registry", &reg_url])
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
@@ -814,7 +827,8 @@ async fn test_cli_auth_helpers_login_and_logout() {
 
     assert!(!login_out.status.success());
     let login_err = String::from_utf8_lossy(&login_out.stderr);
-    assert!(login_err.contains("npm error code ENEEDAUTH"));
+    assert_eq!(login_out.stdout, b"Username: ");
+    assert_eq!(login_err, format!("npm notice Log in on {reg_url}\n"));
 
     // 2. logout with existing token removes token from .npmrc and contacts mock registry
     let local_npmrc = project.join(".npmrc");

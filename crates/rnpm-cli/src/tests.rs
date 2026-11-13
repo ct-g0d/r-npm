@@ -2382,7 +2382,7 @@ fn test_cli_parse_whoami_ping_login_logout_token() {
         _ => panic!("Expected Commands::Ping"),
     }
 
-    // login / adduser alias
+    // login and adduser retain distinct authentication request bodies.
     let parsed_login = Cli::try_parse_from([
         "rnpm",
         "login",
@@ -2405,8 +2405,8 @@ fn test_cli_parse_whoami_ping_login_logout_token() {
     }
     let parsed_adduser = Cli::try_parse_from(["rnpm", "adduser"]).unwrap();
     match parsed_adduser.command {
-        Commands::Login { .. } => {}
-        _ => panic!("Expected Commands::Login via adduser"),
+        Commands::Adduser { .. } => {}
+        _ => panic!("Expected Commands::Adduser"),
     }
 
     // logout
