@@ -1,7 +1,5 @@
 use crate::error::FsError;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use path_clean::clean;
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::Manifest;
@@ -1205,7 +1203,10 @@ pub fn collect_pack_files(
     let npmignore_path = package_dir.join(".npmignore");
     let gitignore_path = package_dir.join(".gitignore");
 
-    let ignore_patterns = if npmignore_path.is_file() {
+    let ignore_patterns = if manifest.files.is_some() {
+        // npm-packlist's package.json rules disable both root ignore files.
+        Vec::new()
+    } else if npmignore_path.is_file() {
         parse_ignore_patterns(&npmignore_path)?
     } else if gitignore_path.is_file() {
         parse_ignore_patterns(&gitignore_path)?
@@ -1220,7 +1221,7 @@ pub fn collect_pack_files(
         package_dir,
         package_dir,
         &files_filter,
-        &ignore_patterns,
+        &[(String::new(), ignore_patterns)],
         manifest,
         &mut files_to_pack,
     )?;
@@ -1321,6 +1322,21 @@ fn collect_strictly_required_files(package_dir: &Path, manifest: &Manifest) -> V
         required.push(clean_bin.to_string());
     }
 
+    // npm-packlist promotes literal files entries to strict requirements. These
+    // survive even an ignore file in their parent directory; directory/glob
+    // entries remain subject to nested ignore rules.
+    if let Some(files) = &manifest.files {
+        for file in files {
+            let clean = file
+                .strip_prefix("./")
+                .unwrap_or(file)
+                .trim_start_matches('/');
+            if package_dir.join(clean).is_file() && !is_strictly_excluded(clean, false) {
+                required.push(clean.to_string());
+            }
+        }
+    }
+
     // Look for README*, LICENSE*, LICENCE*, COPYING* in root
     if let Ok(entries) = fs::read_dir(package_dir) {
         for entry in entries.flatten() {
@@ -1344,10 +1360,24 @@ fn walk_dir_collect(
     current_dir: &Path,
     root_dir: &Path,
     files_filter: &Option<Vec<String>>,
-    ignore_patterns: &[String],
+    inherited_ignores: &[(String, Vec<String>)],
     manifest: &Manifest,
     out: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), FsError> {
+    let mut ignore_scopes = inherited_ignores.to_vec();
+    if current_dir != root_dir {
+        let local = if current_dir.join(".npmignore").is_file() {
+            current_dir.join(".npmignore")
+        } else {
+            current_dir.join(".gitignore")
+        };
+        let prefix = current_dir
+            .strip_prefix(root_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        ignore_scopes.push((format!("{prefix}/"), parse_ignore_patterns(&local)?));
+    }
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -1377,20 +1407,13 @@ fn walk_dir_collect(
 
         if file_type.is_dir() {
             // Check if directory itself is ignored
-            if is_path_ignored(&format!("{rel_path}/"), ignore_patterns) {
+            if is_path_ignored(&rel_path, &ignore_scopes) {
                 continue;
             }
-            walk_dir_collect(
-                &path,
-                root_dir,
-                files_filter,
-                ignore_patterns,
-                manifest,
-                out,
-            )?;
+            walk_dir_collect(&path, root_dir, files_filter, &ignore_scopes, manifest, out)?;
         } else if file_type.is_file() {
             // Check if file is included
-            if should_include_file(&rel_path, files_filter, ignore_patterns, manifest) {
+            if should_include_file(&rel_path, files_filter, &ignore_scopes, manifest) {
                 out.push((rel_path, path));
             }
         }
@@ -1431,7 +1454,7 @@ fn is_strictly_excluded(rel_path: &str, is_dir: bool) -> bool {
 fn should_include_file(
     rel_path: &str,
     files_filter: &Option<Vec<String>>,
-    ignore_patterns: &[String],
+    ignore_patterns: &[(String, Vec<String>)],
     manifest: &Manifest,
 ) -> bool {
     // 1. If it's an always-included root file
@@ -1461,7 +1484,7 @@ fn should_include_file(
             return false;
         }
 
-        // Within files list, check if explicitly ignored by .npmignore
+        // Only directory-local ignore rules remain when files is present.
         if is_path_ignored(rel_path, ignore_patterns) {
             return false;
         }
@@ -1525,20 +1548,21 @@ fn parse_ignore_patterns(path: &Path) -> Result<Vec<String>, FsError> {
     Ok(patterns)
 }
 
-fn is_path_ignored(rel_path: &str, patterns: &[String]) -> bool {
+fn is_path_ignored(rel_path: &str, scopes: &[(String, Vec<String>)]) -> bool {
     let mut ignored = false;
-
-    for pat in patterns {
-        let mut is_negated = false;
-        let p = if let Some(stripped) = pat.strip_prefix('!') {
-            is_negated = true;
-            stripped.trim()
-        } else {
-            pat.as_str()
+    for (prefix, patterns) in scopes {
+        let Some(local_path) = rel_path.strip_prefix(prefix) else {
+            continue;
         };
-
-        if match_ignore_rule(p, rel_path) {
-            ignored = !is_negated;
+        for pattern in patterns {
+            let (rule, is_negated) = if let Some(rule) = pattern.strip_prefix('!') {
+                (rule.trim(), true)
+            } else {
+                (pattern.as_str(), false)
+            };
+            if match_ignore_rule(rule, local_path) {
+                ignored = !is_negated;
+            }
         }
     }
 
@@ -1644,15 +1668,32 @@ pub fn pack_directory(
     let filename = compute_tarball_filename(&name, &version);
 
     let files_to_pack = collect_pack_files(package_dir, &manifest)?;
+    // npm-packlist sorts archive entries by extension, basename, then path for
+    // compressibility. The public file list keeps its separate display order.
+    let mut archive_files: Vec<_> = files_to_pack.iter().collect();
+    archive_files.sort_by_key(|(path, _)| {
+        let file = Path::new(path);
+        (
+            file.extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            file.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            path.to_lowercase(),
+        )
+    });
 
     // Build tar archive in memory
     let mut tar_bytes = Vec::new();
     {
         let mut builder = Builder::new(&mut tar_bytes);
 
-        for (rel_path, full_path) in &files_to_pack {
+        for (rel_path, full_path) in archive_files {
             let file_data = fs::read(full_path)?;
-            let mut header = Header::new_gnu();
+            let mut header = Header::new_ustar();
             header.set_size(file_data.len() as u64);
 
             // Normalized mtime
@@ -1668,11 +1709,28 @@ pub fn pack_directory(
                 NPM_DEFAULT_FILE_MODE
             };
             header.set_mode(mode);
-            header.set_cksum();
-
             let entry_path = format!("package/{rel_path}");
+            header.set_path(entry_path).map_err(FsError::Io)?;
+            header.set_entry_type(tar::EntryType::Regular);
+            // node-tar's portable USTAR encoder leaves uid/gid unset, and uses
+            // octal digits followed by space + NUL (including checksum).
+            let bytes = header.as_mut_bytes();
+            bytes[108..124].fill(0);
+            for (start, end, value) in [
+                (100, 108, mode as u64),
+                (124, 136, file_data.len() as u64),
+                (136, 148, NPM_PACK_EPOCH_MTIME),
+                (329, 337, 0),
+                (337, 345, 0),
+            ] {
+                let encoded = format!("{:0width$o} \0", value, width = end - start - 2);
+                bytes[start..end].copy_from_slice(encoded.as_bytes());
+            }
+            bytes[148..156].fill(b' ');
+            let sum: u64 = bytes.iter().map(|b| *b as u64).sum();
+            bytes[148..156].copy_from_slice(format!("{sum:06o} \0").as_bytes());
             builder
-                .append_data(&mut header, entry_path, &file_data[..])
+                .append(&header, &file_data[..])
                 .map_err(FsError::Io)?;
         }
 
@@ -1680,9 +1738,7 @@ pub fn pack_directory(
     }
 
     // Compress with gzip level 9
-    let mut gz_encoder = GzEncoder::new(Vec::new(), Compression::best());
-    gz_encoder.write_all(&tar_bytes).map_err(FsError::Io)?;
-    let compressed_bytes = gz_encoder.finish().map_err(FsError::Io)?;
+    let compressed_bytes = npm_gzip(&tar_bytes)?;
 
     // Compute SHA-1 and SHA-512 hashes
     let sha1_digest = Algorithm::Sha1.compute_digest(&compressed_bytes);
@@ -1732,6 +1788,45 @@ pub fn pack_directory(
     }
 
     Ok((summary, compressed_bytes))
+}
+
+/// npm's digests depend on the Node runtime's zlib byte stream. Different
+/// compliant DEFLATE implementations produce different digests. Use only the
+/// built-in zlib module, without requiring an npm installation.
+fn npm_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use std::process::{Command, Stdio};
+    const SCRIPT: &str = "const {pipeline,Transform}=require('node:stream');let first=true;pipeline(process.stdin,require('node:zlib').createGzip({level:9}),new Transform({transform(b,e,cb){if(first){b[9]=255;first=false;}cb(null,b);}}),process.stdout,e=>{if(e){console.error(e.message);process.exitCode=1;}});";
+    let mut command = Command::new("node");
+    command
+        .args(["-e", SCRIPT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().map_err(FsError::Io)?;
+    let mut stdin = child.stdin.take().expect("piped child stdin");
+    let (output, written) = std::thread::scope(|scope| {
+        // Drain stdout while feeding stdin so large archives cannot deadlock
+        // when both OS pipes fill. Always reap the child, including EPIPE.
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        (output, writer.join())
+    });
+    let output = output.map_err(FsError::Io)?;
+    if !output.status.success() {
+        return Err(FsError::Io(std::io::Error::other(format!(
+            "Node gzip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    written
+        .map_err(|_| FsError::Io(std::io::Error::other("gzip input writer panicked")))?
+        .map_err(FsError::Io)?;
+    Ok(output.stdout)
 }
 
 fn is_file_executable(path: &Path) -> bool {

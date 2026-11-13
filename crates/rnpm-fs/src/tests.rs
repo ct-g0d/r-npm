@@ -654,7 +654,7 @@ fn test_pack_files_array_and_ignore_rules() {
     fs::write(pkg_dir.join("README.txt"), "readme text").unwrap();
 
     // .npmignore inside src
-    fs::write(pkg_dir.join(".npmignore"), "src/utils.js\n").unwrap();
+    fs::write(pkg_dir.join("src/.npmignore"), "utils.js\n").unwrap();
 
     let (_summary, compressed_bytes) = crate::tarball::pack_directory(&pkg_dir, None).unwrap();
 
@@ -3580,4 +3580,48 @@ fn test_node_writer_invalid_worker_config() {
         let err = res.err().unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
+}
+
+#[test]
+fn pack_files_precedence_and_scoped_ignores() {
+    for ignore_name in [".npmignore", ".gitignore"] {
+        for explicit_file in [false, true] {
+            let dir = tempdir().unwrap();
+            fs::create_dir_all(dir.path().join("lib")).unwrap();
+            let json = serde_json::json!({"name":"precedence", "version":"1.0.0", "files": if explicit_file { vec!["lib/keep.js"] } else { vec!["lib"] }});
+            fs::write(dir.path().join("package.json"), json.to_string()).unwrap();
+            fs::write(dir.path().join(ignore_name), "lib\n").unwrap();
+            fs::write(
+                dir.path().join("lib").join(ignore_name),
+                "keep.js\nomit.js\n",
+            )
+            .unwrap();
+            fs::write(dir.path().join("lib/keep.js"), "keep").unwrap();
+            fs::write(dir.path().join("lib/omit.js"), "omit").unwrap();
+            let manifest =
+                rnpm_core::manifest::Manifest::from_file(dir.path().join("package.json")).unwrap();
+            let files: Vec<_> = crate::collect_pack_files(dir.path(), &manifest)
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            assert_eq!(
+                files.contains(&"lib/keep.js".to_string()),
+                explicit_file,
+                "{ignore_name}, explicit={explicit_file}"
+            );
+            assert!(!files.contains(&"lib/omit.js".to_string()));
+            assert!(files.contains(&"package.json".to_string()));
+        }
+    }
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("package.json"), r#"{"files":["keep.js"]}"#).unwrap();
+    fs::write(dir.path().join("keep.js"), "keep").unwrap();
+    fs::write(dir.path().join(".npmignore"), "keep.js\n").unwrap();
+    let manifest =
+        rnpm_core::manifest::Manifest::from_file(dir.path().join("package.json")).unwrap();
+    assert!(crate::collect_pack_files(dir.path(), &manifest)
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p == "keep.js"));
 }
