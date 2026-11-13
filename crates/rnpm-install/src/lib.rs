@@ -183,7 +183,10 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                has_install_script: ver_info.has_install_script,
+                has_install_script: ver_info.has_install_script
+                    || ver_info.extra.get("scripts").is_some_and(|scripts| {
+                        ["preinstall", "install", "postinstall"].iter().any(|name| scripts.get(*name).is_some_and(|v| v.is_string()))
+                    }),
                 deprecated: ver_info.deprecated.clone(),
                 extra: {
                     let mut extra = ver_info.extra.clone();

@@ -33,13 +33,36 @@ where
             M: MapAccess<'de>,
         {
             let mut map = BTreeMap::new();
-            while let Some((key, value)) = access.next_entry::<String, AbbreviatedVersion>()? {
+            while let Some((key, mut value)) = access.next_entry::<String, serde_json::Value>()? {
                 if map.contains_key(&key) {
                     return Err(de::Error::custom(format!(
                         "duplicate version key '{key}' found in packument metadata"
                     )));
                 }
-                map.insert(key, value);
+                // Full packuments retain historical manifest spellings and
+                // types. Apply pacote's package-json normalization before
+                // deserializing the resolver's typed manifest representation.
+                if let Some(object) = value.as_object_mut() {
+                    if object.get("deprecated") == Some(&serde_json::Value::Bool(false)) {
+                        object.remove("deprecated");
+                    }
+                    if let Some(legacy) = object.remove("bundledDependencies") {
+                        object.entry("bundleDependencies").or_insert(legacy);
+                    }
+                    if let Some(bundled) = object.get("bundleDependencies") {
+                        let names = match bundled {
+                            serde_json::Value::Bool(true) => object.get("dependencies").and_then(|v| v.as_object()).map(|deps| deps.keys().cloned().collect::<Vec<_>>()),
+                            serde_json::Value::Object(deps) => Some(deps.keys().cloned().collect()),
+                            serde_json::Value::Array(_) => None,
+                            _ => Some(Vec::new()),
+                        };
+                        if let Some(names) = names {
+                            object.insert("bundleDependencies".into(), serde_json::json!(names));
+                        }
+                    }
+                }
+                let version = serde_json::from_value(value).map_err(de::Error::custom)?;
+                map.insert(key, version);
             }
             Ok(map)
         }

@@ -234,6 +234,7 @@ for(const [name,versions] of Object.entries({
   shared:{'1.0.0':{},'2.0.0':{}},
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
   'fresh-packument':{'1.0.0':{}},
+  'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -247,6 +248,7 @@ for(const [name,versions] of Object.entries({
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
+add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 probeCacheControl.set('fresh-packument','public, max-age=300');
 add('cache-fresh-packument-skips-revalidation','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'fresh-packument':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);for(const name of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});},observe:({requests})=>({packumentRequests:requests.filter(r=>r.method==='GET'&&r.url==='/fresh-packument').length})});
 add('cache-clean-removes-install-store','cache',['cache','clean','--force'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);},observe:({env})=>({storeExists:fs.existsSync(env.RNPM_STORE_DIR)})});
