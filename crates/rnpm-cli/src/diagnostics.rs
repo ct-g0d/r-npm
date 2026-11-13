@@ -50,6 +50,13 @@ fn npm_package_json_error() -> Option<String> {
 
 /// Classify an arbitrary error into a structured npm diagnostic with stable error code.
 pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
+    for cause in err.chain() {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some((code, message)) = rnpm_registry::network_errors::diagnostic(http) {
+                return Diagnostic::new(code, message);
+            }
+        }
+    }
     let err_str = format!("{:#}", err);
 
     // If the error string already contains an npm error block, preserve its code and message
@@ -85,8 +92,15 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOMATCH" => "ENOMATCH",
                 "FETCH_ERROR" => "FETCH_ERROR",
                 "EINVALIDURL" => "EINVALIDURL",
+                "ECONNREFUSED" => "ECONNREFUSED",
+                "ENOTFOUND" => "ENOTFOUND",
+                "ECONNRESET" => "ECONNRESET",
+                "ETIMEDOUT" => "ETIMEDOUT",
                 _ => "EUNKNOWN",
             };
+            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR") {
+                return Diagnostic::new(code, &err_str[idx..]);
+            }
             let remaining: Vec<String> = lines
                 .map(|l| {
                     let trimmed = l.trim();
