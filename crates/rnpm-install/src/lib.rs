@@ -184,7 +184,16 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                     .collect(),
                 has_install_script: ver_info.has_install_script,
                 deprecated: ver_info.deprecated.clone(),
-                extra: ver_info.extra.clone(),
+                extra: {
+                    let mut extra = ver_info.extra.clone();
+                    if !ver_info.bundle_dependencies.is_empty() {
+                        extra.insert(
+                            "bundleDependencies".to_string(),
+                            serde_json::json!(ver_info.bundle_dependencies),
+                        );
+                    }
+                    extra
+                },
             },
         );
     }

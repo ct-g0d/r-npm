@@ -1017,6 +1017,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                 }
 
+                // Bundled dependencies ship inside the package tarball; npm
+                // never resolves them from the registry.
+                let bundled = chosen_version
+                    .extra
+                    .get("bundleDependencies")
+                    .or_else(|| chosen_version.extra.get("bundledDependencies"));
+                match bundled {
+                    Some(serde_json::Value::Array(names)) => {
+                        for name in names.iter().filter_map(|n| n.as_str()) {
+                            child_deps.remove(name);
+                        }
+                    }
+                    // `true` bundles every dependency.
+                    Some(serde_json::Value::Bool(true)) => {
+                        let names: Vec<String> =
+                            chosen_version.dependencies.keys().cloned().collect();
+                        for name in names {
+                            child_deps.remove(&name);
+                        }
+                    }
+                    _ => {}
+                }
+
                 // npm's Arborist walks package dependency names in sorted
                 // order.  Registry packuments preserve insertion order, but
                 // using that order here changes which compatible version wins
