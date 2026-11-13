@@ -470,9 +470,22 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
         );
     }
 
+    // npm's seenNodes map keys missing nodes by their undefined path. Only the
+    // first such node retains _required; subsequent clones omit that symbol.
+    // Discovery follows the breadth-first, pkgid-sorted traversal in ls.js.
+    let mut queue = std::collections::VecDeque::from([(root, 0usize)]);
+    let mut first_missing = None;
+    while let Some((parent, depth)) = queue.pop_front() {
+        let mut children: Vec<_> = parent.dependencies.values().collect();
+        children.sort_by(|a,b| a.pkgid.as_deref().unwrap_or(&a.name).cmp(b.pkgid.as_deref().unwrap_or(&b.name)));
+        for child in children {
+            if child.missing && first_missing.is_none() { first_missing = Some(child); }
+            if depth < max_depth && !child.deduped && !child.missing { queue.push_back((child, depth + 1)); }
+        }
+    }
     let mut deps_map = serde_json::Map::new();
     for (name, child) in &root.dependencies {
-        deps_map.insert(name.clone(), format_child_json(child, max_depth, 0, long));
+        deps_map.insert(name.clone(), format_child_json(child, max_depth, 0, long, first_missing));
     }
     map.insert("dependencies".to_string(), Value::Object(deps_map));
 
@@ -521,12 +534,16 @@ fn format_child_json(
     max_depth: usize,
     current_depth: usize,
     long: bool,
+    first_missing: Option<&InspectedNode>,
 ) -> Value {
     let mut map = serde_json::Map::new();
 
     if node.missing {
         if node.optional {
             return Value::Object(map);
+        }
+        if first_missing.is_some_and(|first| std::ptr::eq(first, node)) {
+            map.insert("required".into(), node.required.as_deref().unwrap_or("*").into());
         }
         map.insert("missing".to_string(), Value::Bool(true));
         if !node.problems.is_empty() {
@@ -578,7 +595,7 @@ fn format_child_json(
         for (name, child) in &node.dependencies {
             child_map.insert(
                 name.clone(),
-                format_child_json(child, max_depth, current_depth + 1, long),
+                format_child_json(child, max_depth, current_depth + 1, long, first_missing),
             );
         }
         map.insert("dependencies".to_string(), Value::Object(child_map));
@@ -864,10 +881,7 @@ mod tests {
         assert!(json["problems"].is_array());
         assert_eq!(json["error"]["code"], "ELSPROBLEMS");
         assert_eq!(json["dependencies"]["uninstalled"]["missing"], true);
-        // npm 11 reports the range in problems, without a required field.
-        assert!(json["dependencies"]["uninstalled"]
-            .get("required")
-            .is_none());
+        assert_eq!(json["dependencies"]["uninstalled"]["required"], "^1.0.0");
         assert_eq!(
             json["dependencies"]["uninstalled"]["problems"][0],
             "missing: uninstalled@^1.0.0, required by app@1.0.0"
