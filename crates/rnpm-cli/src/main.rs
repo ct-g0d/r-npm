@@ -4020,6 +4020,8 @@ async fn run_audit_fix(
     registry: Option<String>,
     dry_run: bool,
     force: bool,
+    json: bool,
+    audit_level: &str,
 ) -> anyhow::Result<()> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -4046,9 +4048,8 @@ async fn run_audit_fix(
     let initial_vulns = initial_report.metadata.vulnerabilities.total;
 
     if initial_vulns == 0 {
-        println!("found 0 vulnerabilities");
-        println!("fixed 0 packages");
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     // Parse package.json to identify declared dependency ranges
@@ -4220,12 +4221,8 @@ async fn run_audit_fix(
     }
 
     if targets_to_update.is_empty() {
-        println!("found 0 vulnerabilities to fix");
-        audit::print_concise_audit_summary(&initial_report);
-        if packages_needing_force > 0 {
-            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
-        }
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     if dry_run {
@@ -4319,7 +4316,7 @@ async fn run_audit_fix(
         println!("found 0 vulnerabilities");
     }
 
-    Ok(())
+    audit::check_report_threshold(&post_report, audit_level)
 }
 
 fn should_cleanup_trash(cmd: &Commands) -> bool {
@@ -5222,7 +5219,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ..
         } => {
             if action.as_deref() == Some("fix") {
-                run_audit_fix(&current_dir, registry, dry_run, force).await?;
+                run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
             } else {
                 audit::run_audit(&current_dir, registry, json, &audit_level).await?;
             }
@@ -5846,7 +5843,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             dry_run,
         } => {
-            run_audit_fix(&current_dir, registry, dry_run, force).await?;
+            run_audit_fix(&current_dir, registry, dry_run, force, false, "low").await?;
         }
         Commands::Trust {
             action,

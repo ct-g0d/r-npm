@@ -1023,3 +1023,74 @@ fn serialize_fix<S: serde::Serializer>(
         fix.serialize(serializer)
     }
 }
+
+pub fn check_report_threshold(report: &AuditReport, level: &str) -> anyhow::Result<()> {
+    if let Some(threshold) = parse_audit_level(level)? {
+        let highest = report
+            .vulnerabilities
+            .values()
+            .filter_map(|v| Severity::from_str(&v.severity).ok())
+            .max();
+        if let Some(highest) = highest.filter(|v| *v >= threshold) {
+            return Err(AuditThresholdError { highest, threshold }.into());
+        }
+    }
+    Ok(())
+}
+
+pub fn finish_unchanged_fix(
+    project_dir: &Path,
+    report: &AuditReport,
+    json: bool,
+    level: &str,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(project_dir))?;
+    if config.get("loglevel") != Some("silent") {
+        let audited = report.metadata.dependencies.total + 1;
+        let funding = if config.get_bool("fund").unwrap_or(true) {
+            count_funding_packages(project_dir)
+        } else {
+            0
+        };
+        if json {
+            #[derive(Serialize)]
+            struct Summary<'a> {
+                add: Vec<String>,
+                added: usize,
+                audited: usize,
+                change: Vec<String>,
+                changed: usize,
+                funding: usize,
+                remove: Vec<String>,
+                removed: usize,
+                audit: &'a AuditReport,
+            }
+            let summary = Summary {
+                add: Vec::new(),
+                added: 0,
+                audited,
+                change: Vec::new(),
+                changed: 0,
+                funding,
+                remove: Vec::new(),
+                removed: 0,
+                audit: report,
+            };
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            println!(
+                "\nup to date, audited {audited} package{} in 0ms",
+                if audited == 1 { "" } else { "s" }
+            );
+            if funding > 0 {
+                println!(
+                    "\n{funding} package{} looking for funding\n  run `npm fund` for details",
+                    if funding == 1 { " is" } else { "s are" }
+                );
+            }
+            println!();
+            print_human_audit_report(report);
+        }
+    }
+    check_report_threshold(report, level)
+}

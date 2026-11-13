@@ -187,8 +187,33 @@ fn test_audit_missing_lockfile_emits_enolock() {
     assert!(stderr.contains("This command requires an existing lockfile."));
 }
 
+// Audits calculate affected published versions as well as reading advisories.
+fn audit_packument_registry(requests: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(requests) {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = r#"{"name":"vuln-pkg","dist-tags":{"latest":"1.1.0"},"versions":{"1.0.0":{"name":"vuln-pkg","version":"1.0.0"},"1.1.0":{"name":"vuln-pkg","version":"1.1.0"}}}"#;
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        }
+    });
+    url
+}
+
 #[test]
 fn test_audit_threshold_exit_codes() {
+    let registry = audit_packument_registry(3);
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
@@ -251,6 +276,8 @@ fn test_audit_threshold_exit_codes() {
     // 1. Audit level moderate: high severity >= moderate threshold -> must exit 1
     let out_fail = Command::new(rnpm_bin)
         .arg("audit")
+        .arg("--registry")
+        .arg(&registry)
         .arg("--audit-level")
         .arg("moderate")
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
@@ -266,6 +293,8 @@ fn test_audit_threshold_exit_codes() {
     // 2. Audit level critical: high severity < critical threshold -> must exit 0
     let out_pass = Command::new(rnpm_bin)
         .arg("audit")
+        .arg("--registry")
+        .arg(&registry)
         .arg("--audit-level")
         .arg("critical")
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
@@ -280,6 +309,8 @@ fn test_audit_threshold_exit_codes() {
     // 3. Audit level none: always exits 0 even with vulnerabilities present
     let out_none = Command::new(rnpm_bin)
         .arg("audit")
+        .arg("--registry")
+        .arg(&registry)
         .arg("--audit-level")
         .arg("none")
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
@@ -625,6 +656,7 @@ fn test_ci_timing_wireup() {
 
 #[test]
 fn test_post_install_concise_audit_summary_no_full_table() {
+    let registry = audit_packument_registry(1);
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
@@ -689,6 +721,8 @@ fn test_post_install_concise_audit_summary_no_full_table() {
 
     let output = Command::new(rnpm_bin)
         .arg("install")
+        .arg("--registry")
+        .arg(&registry)
         .env("RNPM_TEST_MOCK_ADVISORIES", "1")
         .env_remove("NPM_CONFIG_AUDIT")
         .current_dir(project_dir)

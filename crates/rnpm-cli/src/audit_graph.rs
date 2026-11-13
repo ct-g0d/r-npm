@@ -147,6 +147,7 @@ pub(super) async fn complete_graph(
         }
     }
     let mut seen = BTreeSet::new();
+    let mut traversed_nodes = BTreeSet::new();
     while let Some(cause) = causes.pop_front() {
         if !seen.insert((cause.name.clone(), cause.range.clone())) {
             continue;
@@ -164,6 +165,9 @@ pub(super) async fn complete_graph(
                     .is_some_and(|v| satisfies(v, &cause.range))
             })
             .filter(|(loc, _)| loc.ends_with(&format!("node_modules/{}", cause.name)))
+            // Arborist visits incoming edges once per affected installed node,
+            // even when later advisories also affect that node.
+            .filter(|(loc, _)| traversed_nodes.insert((cause.name.clone(), (*loc).clone())))
             .map(|(loc, _)| loc.clone())
             .collect();
         let mut dependents = BTreeMap::<String, Vec<String>>::new();
@@ -302,11 +306,11 @@ pub(super) async fn complete_graph(
                         current
                             .as_ref()
                             .zip(Version::parse(v).ok())
-                            .is_some_and(|(c, t)| c.major == t.major)
+                            .is_some_and(|(c, t)| satisfies(&t.to_string(), &format!("^{c}")))
                     })
                     .copied()
                     .or_else(|| safe.last().copied());
-                vuln.fix_available = target.map_or(json!(false), |v| json!({"name":name,"version":v,"isSemVerMajor":current.as_ref().zip(Version::parse(v).ok()).is_none_or(|(c,t)| c.major != t.major)}));
+                vuln.fix_available = target.map_or(json!(false), |v| json!({"name":name,"version":v,"isSemVerMajor":current.as_ref().zip(Version::parse(v).ok()).is_none_or(|(c,t)| !satisfies(&t.to_string(), &format!("^{c}")))}));
             }
         }
     }
