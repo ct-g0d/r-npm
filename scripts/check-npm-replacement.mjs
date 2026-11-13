@@ -200,6 +200,17 @@ add('json-error-ci-no-lock','ci',['ci','--json']);
 add('json-error-invalid-manifest','install',['install','--json'],dir=>write(dir,'package.json','{"name":'));
 add('json-error-missing-script','run',['run','nope','--json']);
 add('ci-no-lock','ci',['ci']);
+const engineDep=dir=>{manifest(dir,{dependencies:{'engine-dep':'file:./engine-dep'}});manifest(path.join(dir,'engine-dep'),{name:'engine-dep',version:'1.0.0',engines:{node:'>=99.0.0'}});};
+add('engines-warn','install',['install'],engineDep);
+add('engines-strict','install',['install','--engine-strict'],engineDep);
+add('engines-strict-force','install',['install','--engine-strict','--force'],engineDep);
+const failingDep=dir=>{manifest(dir,{dependencies:{'failing-dep':'file:./failing-dep'}});manifest(path.join(dir,'failing-dep'),{name:'failing-dep',version:'1.0.0',scripts:{install:'node -e "console.log(\x27building\x27);process.exit(42)"'}});};
+add('dependency-script-exit-code','install',['install'],failingDep);
+add('version-flag','version',['--version']);
+add('version-short-flag','version',['-v']);
+add('lockfile-indent-one-line-manifest','install',['install','dep@1.0.0'],dir=>write(dir,'package.json','{"name":"readiness-case","version":"1.0.0"}'));
+add('script-env-contract','run',['run','env'],dir=>manifest(dir,{scripts:{env:"node -e \"for(const k of ['npm_config_user_agent','npm_node_execpath','npm_config_local_prefix','npm_config_prefix','npm_config_global_prefix','npm_config_cache','npm_config_userconfig','npm_config_node_gyp','npm_config_npm_version'])console.log(k+'='+process.env[k])\"",child:'node -p 123',nested:"node -e \"process.exit(require('child_process').spawnSync(process.execPath,[process.env.npm_execpath,'run','child'],{stdio:'inherit'}).status)\""}}));
+add('script-npm-execpath-node','run',['run','nested'],dir=>manifest(dir,{scripts:{child:'node -p 123',nested:"node -e \"process.exit(require('child_process').spawnSync(process.execPath,[process.env.npm_execpath,'run','child'],{stdio:'inherit'}).status)\""}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

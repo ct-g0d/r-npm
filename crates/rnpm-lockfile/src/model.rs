@@ -1503,8 +1503,16 @@ impl LockfileV3 {
                     .map(|s| rnpm_core::ManifestFormat::detect(&s))
                     .unwrap_or_default()
             } else if pkg_json.exists() {
+                // A one-line package.json has no indent to inherit; npm still
+                // writes the lockfile with its default two spaces.
                 std::fs::read_to_string(&pkg_json)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
+                    .map(|s| {
+                        let mut format = rnpm_core::ManifestFormat::detect(&s);
+                        if format.indent.is_empty() {
+                            format.indent = rnpm_core::ManifestFormat::default().indent;
+                        }
+                        format
+                    })
                     .unwrap_or_default()
             } else {
                 rnpm_core::ManifestFormat::default()

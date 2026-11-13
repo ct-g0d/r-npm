@@ -1455,6 +1455,7 @@ pub struct Installer {
     io_semaphore: Arc<tokio::sync::Semaphore>,
     source_policy: policy::SourcePolicy,
     script_policy: policy::ScriptPolicy,
+    engine_strict: bool,
 }
 
 impl Installer {
@@ -1599,6 +1600,7 @@ impl Installer {
             io_semaphore,
             source_policy,
             script_policy,
+            engine_strict: config.get_bool("engine-strict").unwrap_or(false),
         })
     }
 
@@ -1642,7 +1644,12 @@ impl Installer {
             &workspace_paths,
             &self.script_policy,
             self.options.ignore_scripts,
-        )
+        )?;
+        // --force skips the engine check entirely, as Arborist does.
+        if self.options.force {
+            return Ok(());
+        }
+        policy::check_engines(lockfile, &base_dir, self.engine_strict, self.options.silent)
     }
 
     /// Lifecycle options shared by dependency and root hooks.

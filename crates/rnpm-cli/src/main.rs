@@ -2872,7 +2872,8 @@ where
         };
 
         if !is_forwarded {
-            println!("rnpm {}", env!("CARGO_PKG_VERSION"));
+            // Tools parse `npm -v` as a bare semver of the npm release.
+            println!("{}", crate::version::NPM_VERSION);
             std::process::exit(0);
         }
     }
@@ -6569,6 +6570,21 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // npm warns whenever force is in effect, whatever the command.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
+        let silent = raw.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent");
+        let forced = raw.iter().any(|a| a == "--force" || a == "-f" || a == "--force=true")
+            || std::env::current_dir()
+                .ok()
+                .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+                .and_then(|c| c.get_bool("force"))
+                .unwrap_or(false);
+        if forced && !silent {
+            eprintln!("npm warn using --force Recommended protections disabled.");
+        }
+    }
 
     if filtered_args.get(1).is_some_and(|s| s == "la" || s == "ll") {
         if let Commands::List { ref mut long, .. } = cli.command {

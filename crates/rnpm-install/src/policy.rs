@@ -189,6 +189,134 @@ pub fn check_sources(
 }
 
 // -------------------------------------------------------------------------
+// engines (npm-install-checks checkEngine)
+// -------------------------------------------------------------------------
+
+fn js_inspect_str(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{s}\"")
+    } else {
+        format!("'{}'", s.replace('\'', "\\'"))
+    }
+}
+
+fn js_inspect_map(map: &[(String, String)]) -> String {
+    let body = map
+        .iter()
+        .map(|(k, v)| {
+            let key = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                k.clone()
+            } else {
+                js_inspect_str(k)
+            };
+            format!("{key}: {}", js_inspect_str(v))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{ {body} }}")
+}
+
+/// Check every resolved package's `engines` against the running node/npm.
+/// Mismatches warn like npm; with `engine-strict` (and no `--force`) the
+/// first one fails with EBADENGINE before anything is installed.
+pub fn check_engines(
+    lockfile: &LockfileV3,
+    base_dir: &Path,
+    strict: bool,
+    silent: bool,
+) -> Result<()> {
+    let node_version = rnpm_lifecycle::node_version();
+    let npm_version = rnpm_lifecycle::NPM_VERSION;
+    let node_semver = rnpm_core::semver::Version::parse(node_version.trim_start_matches('v')).ok();
+    let npm_semver = rnpm_core::semver::Version::parse(npm_version).ok();
+    let fails = |range: Option<&String>, version: Option<&rnpm_core::semver::Version>| {
+        match (range, version) {
+            (Some(range), Some(version)) => rnpm_core::semver::Range::parse(range)
+                .map(|r| !r.satisfies(version))
+                .unwrap_or(false),
+            _ => false,
+        }
+    };
+    for (location, pkg) in &lockfile.packages {
+        if location.is_empty() {
+            continue;
+        }
+        // Links and directory targets carry their engines on disk.
+        let disk_dir = if pkg.link == Some(true) {
+            pkg.resolved.as_deref().map(|t| base_dir.join(t))
+        } else if !location.contains("node_modules/") {
+            Some(base_dir.join(location))
+        } else {
+            None
+        };
+        let disk = disk_dir.and_then(|d| Manifest::from_file(d.join("package.json")).ok());
+        let engines: Vec<(String, String)> = match &disk {
+            Some(m) => m.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None => pkg
+                .engines
+                .as_ref()
+                .and_then(|e| e.as_map())
+                .map(|m| m.into_iter().collect())
+                .unwrap_or_default(),
+        };
+        if engines.is_empty() {
+            continue;
+        }
+        let get = |k: &str| engines.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+        if !fails(get("node"), node_semver.as_ref()) && !fails(get("npm"), npm_semver.as_ref()) {
+            continue;
+        }
+        let name = disk
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .or_else(|| pkg.name.clone())
+            .or_else(|| top_level_or_nested_name(location))
+            .unwrap_or_default();
+        let version = disk
+            .as_ref()
+            .and_then(|m| m.version.clone())
+            .or_else(|| pkg.version.clone())
+            .unwrap_or_default();
+        let pkgid = format!("{name}@{version}");
+        let current = vec![
+            ("node".to_string(), node_version.clone()),
+            ("npm".to_string(), npm_version.to_string()),
+        ];
+        if strict {
+            let json_map = |m: &[(String, String)]| {
+                let obj: serde_json::Map<String, serde_json::Value> = m
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                serde_json::Value::Object(obj).to_string()
+            };
+            return Err(anyhow!(
+                "npm error code EBADENGINE\nnpm error engine Unsupported engine\nnpm error engine Not compatible with your version of node/npm: {pkgid}\nnpm error notsup Not compatible with your version of node/npm: {pkgid}\nnpm error notsup Required: {}\nnpm error notsup Actual:   {}",
+                json_map(&engines),
+                json_map(&current)
+            ));
+        }
+        // Arborist checks each inventory node: a directory dependency is both
+        // a link and its target, so npm reports it twice.
+        let is_directory_dep = pkg.link == Some(true)
+            || pkg.resolved.as_deref().is_some_and(|r| {
+                r.strip_prefix("file:").is_some_and(|p| base_dir.join(p).is_dir())
+            });
+        for _ in 0..if is_directory_dep { 2 } else { 1 } {
+        if !silent {
+            eprintln!(
+                "npm warn EBADENGINE Unsupported engine {{\nnpm warn EBADENGINE   package: {},\nnpm warn EBADENGINE   required: {},\nnpm warn EBADENGINE   current: {}\nnpm warn EBADENGINE }}",
+                js_inspect_str(&pkgid),
+                js_inspect_map(&engines),
+                js_inspect_map(&current)
+            );
+        }
+        }
+    }
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
 // allowScripts
 // -------------------------------------------------------------------------
 

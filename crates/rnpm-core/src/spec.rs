@@ -27,7 +27,8 @@ pub enum PackageTarget {
 
 impl PackageTarget {
     pub fn parse(spec: &str) -> Result<Self, SpecError> {
-        let s = spec.trim();
+        let expanded = expand_github_shorthand(spec.trim());
+        let s = expanded.as_str();
         if s.is_empty() || s == "*" {
             return Ok(PackageTarget::Range(
                 Range::parse("*").map_err(|e| SpecError::Semver(e.to_string()))?,
@@ -260,7 +261,8 @@ impl PackageSpec {
     /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar", "foo@workspace:*",
     /// "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0", "https://cdn.example.com/packages/pkg-1.0.0.tgz"
     pub fn parse(input: &str) -> Result<Self, SpecError> {
-        let trimmed = input.trim();
+        let expanded = expand_github_shorthand(input.trim());
+        let trimmed = expanded.as_str();
         if trimmed.is_empty() {
             return Err(SpecError::Empty);
         }
@@ -528,5 +530,30 @@ pub fn parse_file_path(spec: &str) -> std::path::PathBuf {
         stripped.to_path_buf()
     } else {
         cleaned
+    }
+}
+
+/// npm-package-arg treats `user/repo[#committish]` as a GitHub dependency
+/// (hosted-git-info shorthand: no protocol, scope, path prefix or spaces).
+fn expand_github_shorthand(spec: &str) -> String {
+    let (body, committish) = spec.split_once('#').unwrap_or((spec, ""));
+    let Some((user, repo)) = body.split_once('/') else {
+        return spec.to_string();
+    };
+    let user_ok = user
+        .chars()
+        .next()
+        .is_some_and(|c| !matches!(c, '@' | '%' | '/' | '.' | '-') && !c.is_whitespace())
+        && !user.chars().any(|c| matches!(c, ':' | '@' | '%' | '/') || c.is_whitespace());
+    let repo_ok = !repo.is_empty()
+        && !repo.chars().any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
+    if user_ok && repo_ok {
+        if committish.is_empty() && !spec.contains('#') {
+            format!("github:{body}")
+        } else {
+            format!("github:{body}#{committish}")
+        }
+    } else {
+        spec.to_string()
     }
 }
