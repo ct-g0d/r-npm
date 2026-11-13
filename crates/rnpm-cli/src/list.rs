@@ -63,11 +63,14 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
     collect_problems(&root_node, &mut problems, &mut seen_problems);
     root_node.problems = problems.clone();
 
-    let has_problems = !problems.is_empty();
+    let has_problems = problems.iter().any(|p| !p.starts_with("extraneous:"));
 
     if options.json {
         let json_val = format_tree_json(&root_node, effective_depth, options.long);
-        println!("{}", serde_json::to_string_pretty(&ordered_node_json(&json_val))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ordered_node_json(&json_val, &root_node))?
+        );
     } else if options.parseable {
         let mut paths = Vec::new();
         let mut seen_paths = HashSet::new();
@@ -76,7 +79,12 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
             println!("{p}");
         }
     } else {
-        let output = format_tree_text(&root_node, effective_depth, options.long);
+        let output = format_tree_text_with_unicode(
+            &root_node,
+            effective_depth,
+            options.long,
+            crate::use_unicode(project_dir),
+        );
         print!("{output}");
     }
 
@@ -92,28 +100,103 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 }
 
 /// Preserve npm's field order without changing serde_json's workspace-wide map type.
-fn ordered_node_json(value: &Value) -> rnpm_core::ordered_json::OrderedJsonValue {
+fn ordered_node_json(
+    value: &Value,
+    node: &InspectedNode,
+) -> rnpm_core::ordered_json::OrderedJsonValue {
     use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
     let Some(map) = value.as_object() else {
         return value.clone().into();
     };
     let mut ordered = OrderedJsonMap::new();
-    for key in ["version", "name", "resolved", "overridden", "required", "missing", "extraneous", "invalid", "deduped", "description", "license", "problems", "dependencies", "error"] {
-        if let Some(value) = map.get(key) {
+    let mut keys: Vec<String> = ["version", "resolved", "overridden", "name"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if value.get("path").is_some() {
+        if let Some(raw) = &node.raw_manifest {
+            keys.extend(
+                raw.as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| key.as_str() != "dependencies")
+                    .map(|(key, _)| key.clone()),
+            );
+        }
+        keys.extend(
+            [
+                "_id",
+                "extraneous",
+                "path",
+                "_dependencies",
+                "devDependencies",
+                "peerDependencies",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    keys.extend(
+        [
+            "required",
+            "missing",
+            "extraneous",
+            "invalid",
+            "deduped",
+            "description",
+            "license",
+            "problems",
+            "dependencies",
+            "error",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    for key in keys {
+        if ordered.contains_key(&key) {
+            continue;
+        }
+        if let Some(value) = map.get(&key) {
             let value = if key == "dependencies" {
-                OrderedJsonValue::Object(value.as_object().into_iter().flatten().map(|(name, child)| (name.clone(), ordered_node_json(child))).collect())
+                OrderedJsonValue::Object(
+                    sorted_dependencies(node)
+                        .into_iter()
+                        .filter_map(|(name, child_node)| {
+                            value
+                                .get(name)
+                                .map(|child| (name.clone(), ordered_node_json(child, child_node)))
+                        })
+                        .collect(),
+                )
             } else {
                 value.clone().into()
             };
-            ordered.insert(key.to_string(), value);
+            ordered.insert(key, value);
         }
     }
     OrderedJsonValue::Object(ordered)
 }
 
+fn sorted_dependencies(node: &InspectedNode) -> Vec<(&String, &InspectedNode)> {
+    let mut children: Vec<_> = node.dependencies.iter().collect();
+    children.sort_by(|(name_a, a), (name_b, b)| {
+        a.pkgid
+            .as_ref()
+            .unwrap_or(name_a)
+            .cmp(b.pkgid.as_ref().unwrap_or(name_b))
+    });
+    children
+}
+
 /// Recursively collects unique problem lines from a node and its descendants.
 fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-    for p in &node.problems {
+    // npm walks nodes in display order; the root's accumulated insertion-order
+    // list would otherwise put missing peers ahead of earlier extraneous nodes.
+    for p in node
+        .problems
+        .iter()
+        .filter(|_| !node.location.is_empty() || node.dependencies.is_empty())
+    {
         if seen.insert(p.clone()) {
             out.push(p.clone());
         }
@@ -154,7 +237,7 @@ fn collect_problems(node: &InspectedNode, out: &mut Vec<String>, seen: &mut Hash
         }
     }
 
-    for child in node.dependencies.values() {
+    for (_, child) in sorted_dependencies(node) {
         collect_problems(child, out, seen);
     }
 }
@@ -221,6 +304,15 @@ pub fn filter_tree_by_packages(node: &mut InspectedNode, filter_pkgs: &[String])
 
 /// Formats the dependency tree as text matching npm standard output format.
 pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> String {
+    format_tree_text_with_unicode(root, max_depth, long, false)
+}
+
+fn format_tree_text_with_unicode(
+    root: &InspectedNode,
+    max_depth: usize,
+    long: bool,
+    unicode: bool,
+) -> String {
     let mut out = String::new();
     let version_str = root.version.as_deref().unwrap_or("0.0.0");
     let path_display = root
@@ -241,7 +333,7 @@ pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> S
 
     let mut dep_keys: Vec<String> = root.dependencies.keys().cloned().collect();
     if dep_keys.is_empty() {
-        out.push_str(if crate::use_unicode(root.path.as_deref().unwrap_or(Path::new("."))) {
+        out.push_str(if unicode {
             "\u{2514}\u{2500}\u{2500} (empty)\n"
         } else { "`-- (empty)\n" });
     }
@@ -256,7 +348,7 @@ pub fn format_tree_text(root: &InspectedNode, max_depth: usize, long: bool) -> S
     for (idx, name) in dep_keys.iter().enumerate() {
         let is_last = idx == dep_keys.len() - 1;
         let child = root.dependencies.get(name).unwrap();
-        format_child_text(child, max_depth, 0, "", is_last, long, &mut out);
+        format_child_text(child, max_depth, 0, "", is_last, (long, unicode), &mut out);
     }
 
     out.push('\n');
@@ -269,10 +361,16 @@ fn format_child_text(
     current_depth: usize,
     prefix: &str,
     is_last: bool,
-    long: bool,
+    style: (bool, bool),
     out: &mut String,
 ) {
-    let branch = if is_last { "`-- " } else { "+-- " };
+    let (long, unicode) = style;
+    let branch = match (unicode, is_last) {
+        (true, true) => "\u{2514}\u{2500}\u{2500} ",
+        (true, false) => "\u{251c}\u{2500}\u{2500} ",
+        (false, true) => "`-- ",
+        (false, false) => "+-- ",
+    };
 
     if node.missing {
         let req = node.required.as_deref().unwrap_or("*");
@@ -303,7 +401,13 @@ fn format_child_text(
         ));
     }
 
-    let continuation = if is_last { "  " } else { "| " };
+    let continuation = if is_last {
+        "  "
+    } else if unicode {
+        "\u{2502} "
+    } else {
+        "| "
+    };
     let child_prefix = format!("{prefix}{continuation}");
 
     if long {
@@ -334,7 +438,7 @@ fn format_child_text(
                 current_depth + 1,
                 &child_prefix,
                 child_is_last,
-                long,
+                style,
                 out,
             );
         }
@@ -350,6 +454,7 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     map.insert("name".to_string(), Value::String(root.name.clone()));
 
     if long {
+        augment_long_json(&mut map, root);
         if let Some(desc) = &root.description {
             map.insert("description".to_string(), Value::String(desc.clone()));
         }
@@ -371,7 +476,7 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     }
     map.insert("dependencies".to_string(), Value::Object(deps_map));
 
-    if !root.problems.is_empty() {
+    if root.problems.iter().any(|p| !p.starts_with("extraneous:")) {
         let summary = root.problems.join("\n");
         let error_obj = serde_json::json!({
             "code": "ELSPROBLEMS",
@@ -382,6 +487,33 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
     }
 
     Value::Object(map)
+}
+
+fn augment_long_json(map: &mut serde_json::Map<String, Value>, node: &InspectedNode) {
+    if let Some(raw) = node.raw_manifest.as_ref().and_then(Value::as_object) {
+        for (key, value) in raw.iter().filter(|(key, _)| key.as_str() != "dependencies") {
+            map.insert(key.clone(), value.clone());
+        }
+        let mut deps = raw
+            .get("dependencies")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(optional) = raw.get("optionalDependencies").and_then(Value::as_object) {
+            deps.extend(optional.clone());
+        }
+        map.insert("_dependencies".into(), Value::Object(deps));
+        for key in ["devDependencies", "peerDependencies"] {
+            map.entry(key).or_insert_with(|| serde_json::json!({}));
+        }
+    }
+    if let Some(id) = &node.id {
+        map.insert("_id".into(), Value::String(id.clone()));
+    }
+    map.insert("extraneous".into(), Value::Bool(node.extraneous));
+    if let Some(path) = &node.path {
+        map.insert("path".into(), Value::String(path.display().to_string()));
+    }
 }
 
 fn format_child_json(
@@ -395,9 +527,6 @@ fn format_child_json(
     if node.missing {
         if node.optional {
             return Value::Object(map);
-        }
-        if let Some(req) = &node.required {
-            map.insert("required".to_string(), Value::String(req.clone()));
         }
         map.insert("missing".to_string(), Value::Bool(true));
         if !node.problems.is_empty() {
@@ -428,6 +557,7 @@ fn format_child_json(
     }
 
     if long {
+        augment_long_json(&mut map, node);
         if let Some(desc) = &node.description {
             map.insert("description".to_string(), Value::String(desc.clone()));
         }
@@ -734,7 +864,14 @@ mod tests {
         assert!(json["problems"].is_array());
         assert_eq!(json["error"]["code"], "ELSPROBLEMS");
         assert_eq!(json["dependencies"]["uninstalled"]["missing"], true);
-        assert_eq!(json["dependencies"]["uninstalled"]["required"], "^1.0.0");
+        // npm 11 reports the range in problems, without a required field.
+        assert!(json["dependencies"]["uninstalled"]
+            .get("required")
+            .is_none());
+        assert_eq!(
+            json["dependencies"]["uninstalled"]["problems"][0],
+            "missing: uninstalled@^1.0.0, required by app@1.0.0"
+        );
     }
 
     #[test]

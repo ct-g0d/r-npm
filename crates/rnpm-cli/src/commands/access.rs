@@ -9,6 +9,18 @@ pub(crate) struct AccessArgs {
 }
 
 pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
+    if args.args.first().is_some_and(|v| v == "list") && args.args.get(1).is_some_and(|v| v == "packages") {
+        let client = super::client_helper::CommandClient::new(&current_dir, args.registry.as_deref())?;
+        let user = args.args.get(2).cloned().ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error access list packages requires a user or organization"))?;
+        let encoded = super::client_helper::url_encode(&user);
+        let target = reqwest::Url::parse(&format!("{}/-/user/{encoded}/package", client.registry_url.as_str().trim_end_matches('/')))?;
+        let response = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref()).send().await?;
+        let status = response.status(); let body = response.text().await?;
+        if !status.is_success() { return Err(super::client_helper::format_http_error("GET", &target, status, &body)); }
+        let value = super::client_helper::parse_json_response(&body, &target)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
     let action = args.args.first().map(String::as_str).unwrap_or("get");
     let package = args
         .args

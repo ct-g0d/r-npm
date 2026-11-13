@@ -29,7 +29,9 @@ pub(crate) async fn run(
     }
 
     let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+    eprintln!("npm notice PING {registry_url}");
     let duration = client.ping(Some(&registry_url)).await?;
+    eprintln!("npm notice PONG {}ms", duration.as_millis());
 
     if json {
         let json_out = serde_json::json!({
@@ -38,9 +40,6 @@ pub(crate) async fn run(
             "details": {}
         });
         println!("{}", serde_json::to_string_pretty(&json_out)?);
-    } else {
-        eprintln!("npm notice PING {registry_url}");
-        eprintln!("npm notice PONG {}ms", duration.as_millis());
     }
 
     Ok(())

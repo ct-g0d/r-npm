@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+#[derive(Debug)]
+pub struct OutdatedStatus;
+impl std::fmt::Display for OutdatedStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("outdated dependencies found")
+    }
+}
+impl std::error::Error for OutdatedStatus {}
+
 /// Options for outdated command.
 #[derive(Debug, Clone, Default)]
 pub struct OutdatedOptions {
@@ -106,14 +115,9 @@ pub async fn run_outdated_inner(
     let manifest: Manifest = serde_json::from_str(&manifest_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse package.json: {e}"))?;
 
-    let root_name = manifest
-        .name
-        .clone()
-        .or_else(|| {
-            project_dir
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-        })
+    let root_name = project_dir
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
     let abs_project_dir = if project_dir.is_absolute() {
@@ -1280,7 +1284,10 @@ mod tests {
         assert_eq!(parsed["chalk"]["current"], "2.4.0");
         assert_eq!(parsed["chalk"]["wanted"], "2.4.2");
         assert_eq!(parsed["chalk"]["latest"], "6.0.1");
-        assert_eq!(parsed["chalk"]["dependent"], "my-app");
+        assert_eq!(
+            parsed["chalk"]["dependent"],
+            project_dir.file_name().unwrap().to_str().unwrap()
+        );
 
         // Parseable mode returns colon-delimited output with exit code 1
         let parseable_options = OutdatedOptions {

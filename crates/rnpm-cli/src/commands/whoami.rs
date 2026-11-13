@@ -20,8 +20,30 @@ pub(crate) async fn run(
 
     let token = config.npmrc.get_auth_token(&registry_url);
     if token.is_none() {
+        if json {
+            #[derive(serde::Serialize)]
+            struct AuthError<'a> {
+                code: &'a str,
+                summary: &'a str,
+                detail: &'a str,
+            }
+            #[derive(serde::Serialize)]
+            struct ErrorOutput<'a> {
+                error: AuthError<'a>,
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ErrorOutput {
+                    error: AuthError {
+                        code: "ENEEDAUTH",
+                        summary: "This command requires you to be logged in.",
+                        detail: "You need to authorize this machine using `npm adduser`",
+                    }
+                })?
+            );
+        }
         return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
+            "npm error code ENEEDAUTH\nnpm error need auth This command requires you to be logged in.\nnpm error need auth You need to authorize this machine using `npm adduser`"
         ));
     }
 

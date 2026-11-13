@@ -20,10 +20,7 @@ pub(crate) async fn run(
     };
     let code = crate::outdated::run_outdated(&current_dir, &opts).await?;
     if code != 0 {
-        return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-            exit_code: code,
-            message: "outdated dependencies found".to_string(),
-        }));
+        return Err(crate::outdated::OutdatedStatus.into());
     }
     Ok(())
 }

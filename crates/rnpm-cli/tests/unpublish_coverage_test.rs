@@ -367,7 +367,11 @@ async fn test_cli_unpublish_mock_registry() {
     );
 
     let reqs = recorded.lock().await;
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].method, "DELETE");
-    assert_eq!(reqs[0].path, "/sample-pkg/1.0.0");
+    // npm first reads the revision, then removes the whole document when it
+    // has no versions. A direct DELETE /package/version is not npm's API.
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].method, "GET");
+    assert_eq!(reqs[0].path, "/sample-pkg?write=true");
+    assert_eq!(reqs[1].method, "DELETE");
+    assert_eq!(reqs[1].path, "/sample-pkg/-rev/undefined");
 }

@@ -2191,6 +2191,10 @@ where
             result.push("--install-strategy=shallow".to_string());
         } else if arg == "-ws" {
             result.push("--workspaces".to_string());
+        } else if arg == "-wa" {
+            // npm's nopt expands the short cluster to -w --all, consuming
+            // --all as the workspace value rather than selecting workspace a.
+            result.push("--workspace=--all".to_string());
         } else if let Some(rest) = arg.strip_prefix("-ws=") {
             result.push(format!("--workspaces={rest}"));
         } else if arg == "--git-tag-version=false" || arg == "--git-tag-version=0" {
@@ -4423,7 +4427,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 legacy_peer_deps,
                 strict_peer_deps,
                 save_dev,
-                save_exact,
+                save_exact: save_exact || config.get_bool("save-exact").unwrap_or(false),
                 save_prefix: effective_save_prefix,
                 save_prod,
                 save_optional,
@@ -5097,7 +5101,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Cache { action, cache } => {
-            commands::cache::run(action, cache, current_dir)?;
+            commands::cache::run(action, cache, current_dir).await?;
         }
         Commands::Diff {
             specs,
@@ -5597,6 +5601,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             explain::run_explain(&current_dir, &package, json)?;
         }
         Commands::Bugs { packages, .. } => {
+            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
@@ -5607,21 +5612,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .or_else(|| value.get("bugs").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 if url.is_empty() {
-                    println!("https://www.npmjs.com/package/{package}?activeTab=issues");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", &format!("https://www.npmjs.com/package/{package}?activeTab=issues"));
                 } else {
-                    println!("{url}");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", url);
                 }
             }
         }
         Commands::Docs { packages, .. } => {
+            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
                 let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
                 if url.is_empty() {
-                    println!("https://www.npmjs.com/package/{package}?activeTab=readme");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", &format!("https://www.npmjs.com/package/{package}?activeTab=readme"));
                 } else {
-                    println!("{url}");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", url);
                 }
             }
         }
@@ -5637,7 +5643,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .and_then(|v| v.get("url").or(Some(v)))
                     .and_then(|v| v.as_str());
                 if let Some(r) = repo {
-                    println!("{r}");
+                    let name = value.as_ref().and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    print_package_url(&current_dir, name, "repo", r.trim_end_matches(".git"));
                     return Ok(());
                 } else {
                     return Err(anyhow::anyhow!("npm error no repository"));
@@ -5660,7 +5667,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         .and_then(|v| v.as_str())
                         .or_else(|| value.get("repository").and_then(|v| v.as_str()))
                     {
-                        println!("{repo}");
+                        print_package_url(&current_dir, &package, "repo", repo.trim_end_matches(".git"));
                         continue;
                     }
                 }
@@ -5678,7 +5685,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                             .and_then(|v| v.extra.get("repository"))
                             .and_then(|v| v.as_str())
                     });
-                println!("{}", repo.unwrap_or("https://www.npmjs.com/package/"));
+                print_package_url(&current_dir, &package, "repo", repo.unwrap_or("https://www.npmjs.com/package/").trim_end_matches(".git"));
                 let _ = registry_url;
             }
         }
@@ -6106,6 +6113,12 @@ CONFIGURATION
     );
 }
 
+fn print_package_url(dir: &Path, name: &str, command: &str, url: &str) {
+    if rnpm_config::Config::load(Some(dir)).ok().is_some_and(|config| config.get("browser") == Some("false")) {
+        println!("{name} {command} available at the following URL:\n{url}");
+    } else { println!("{url}"); }
+}
+
 pub(crate) fn use_unicode(dir: &Path) -> bool {
     rnpm_config::Config::load(Some(dir)).ok().and_then(|config| config.get_bool("unicode"))
         .unwrap_or_else(|| {
@@ -6265,15 +6278,72 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
 }
 
 fn finish_cli_error(err: &anyhow::Error) -> ! {
+    if err.is::<outdated::OutdatedStatus>() {
+        std::process::exit(1);
+    }
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
         if exit.message.starts_with("npm error ") { eprintln!("{}", exit.message); }
+        write_error_log(err);
         std::process::exit(exit.exit_code);
     }
     let diagnostic = diagnostics::classify_error(err);
     if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
     else { print_structured_error(err); }
+    write_error_log(err);
     let missing_manifest = format!("{err:#}").contains("package.json not found");
     std::process::exit(if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 });
+}
+
+fn write_error_log(err: &anyhow::Error) {
+    use std::io::Write;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = rnpm_config::Config::load(Some(&cwd)).unwrap_or_default();
+    if config.get("logs-max") == Some("0") {
+        return;
+    }
+    let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("npm-cache")
+    });
+    let log_dir = config
+        .get("logs-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cache.join("_logs"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp = format!(
+        "{}_{:03}Z",
+        sbom::current_rfc3339_time()
+            .trim_end_matches('Z')
+            .replace(':', "_"),
+        now.subsec_millis()
+    );
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    for index in 0..10 {
+        let log = log_dir.join(format!("{timestamp}-debug-{index}.log"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log)
+        {
+            Ok(mut file) => {
+                if writeln!(file, "0 verbose cwd {}\n1 error {err:#}", cwd.display()).is_ok() {
+                    eprintln!(
+                        "npm error A complete log of this run can be found in: {}",
+                        log.display()
+                    );
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn main() {

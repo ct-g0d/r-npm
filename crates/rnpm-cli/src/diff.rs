@@ -623,6 +623,19 @@ pub fn generate_diff(
             output.push_str(&format!(
                 "diff --git {src_prefix}{path} {dst_prefix}{path}\n"
             ));
+            let version = |files: &BTreeMap<String, Vec<u8>>| {
+                files
+                    .get("package.json")
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .and_then(|json| {
+                        json.get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+            };
+            if let (Some(from), Some(to)) = (version(files_a), version(files_b)) {
+                output.push_str(&format!("index v{from}..v{to} 100644\n"));
+            }
             output.push_str(&format!("--- {src_hdr}\n"));
             output.push_str(&format!("+++ {dst_hdr}\n"));
 
@@ -646,6 +659,11 @@ pub async fn run_diff(
     options: DiffOptions,
     registry_url: Option<String>,
 ) -> anyhow::Result<()> {
+    let registry_url = registry_url.or_else(|| {
+        rnpm_config::Config::load(Some(current_dir))
+            .ok()
+            .map(|config| config.npmrc.registry.to_string())
+    });
     let mut all_specs = diff_specs;
     all_specs.extend(specs);
 

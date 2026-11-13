@@ -75,6 +75,8 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOWORKSPACES" => "ENOWORKSPACES",
                 "ENOWORKSPACE" => "ENOWORKSPACE",
                 "ENOTCACHED" => "ENOTCACHED",
+                "ENOTSUP" => "ENOTSUP",
+                "ENOMATCH" => "ENOMATCH",
                 "FETCH_ERROR" => "FETCH_ERROR",
                 "EINVALIDURL" => "EINVALIDURL",
                 _ => "EUNKNOWN",

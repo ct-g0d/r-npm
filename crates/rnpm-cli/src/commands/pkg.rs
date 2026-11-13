@@ -87,7 +87,7 @@ pub(crate) fn run(
                     .map(|m| (m.name.as_str(), m.path.as_path()))
                     .collect();
                 let output = rnpm_core::pkg::pkg_get_workspaces(&member_refs, &fields)?;
-                println!("{output}");
+                println!("{}", output.trim_end_matches(['\r', '\n']));
             }
             PkgAction::Set { assignments } => {
                 for m in &matched_members {
@@ -109,7 +109,7 @@ pub(crate) fn run(
         match action {
             PkgAction::Get { fields } => {
                 let output = rnpm_core::pkg::pkg_get(&root_manifest_path, &fields, json)?;
-                println!("{output}");
+                println!("{}", output.trim_end_matches(['\r', '\n']));
             }
             PkgAction::Set { assignments } => {
                 rnpm_core::pkg::pkg_set(&root_manifest_path, &assignments)?;

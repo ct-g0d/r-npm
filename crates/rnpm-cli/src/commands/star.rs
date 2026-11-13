@@ -77,6 +77,9 @@ pub(crate) async fn run_stars(
         Vec::new()
     };
 
+    if packages.is_empty() {
+        eprintln!("npm warn stars user has not starred any packages");
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&packages)?);
     } else {

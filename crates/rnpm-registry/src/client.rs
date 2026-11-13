@@ -2923,18 +2923,95 @@ impl RegistryClient {
     ) -> Result<(), RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let suffix = version.map(|v| format!("/{}", v)).unwrap_or_default();
         if let Some(v) = version {
             validate_admin_token(v)?;
         }
-        let target = Url::parse(&format!(
-            "{}/{encoded}{suffix}",
-            reg_url.as_str().trim_end_matches('/')
-        ))
-        .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp)
-            .await?;
-        Ok(())
+        let base = format!("{}/{encoded}", reg_url.as_str().trim_end_matches('/'));
+        let read_url = Url::parse(&format!("{base}?write=true"))?;
+        let result: Result<(), RegistryError> = async {
+            let mut document = self
+                .admin_json_request(Method::GET, read_url.clone(), None, None)
+                .await?;
+            let versions = document.get("versions").and_then(|v| v.as_object());
+            let count = versions.map_or(0, |v| v.len());
+            let specific = version.filter(|v| *v != "*");
+            let version_doc = specific.and_then(|version| versions?.get(version)).cloned();
+            if specific.is_some() && version_doc.is_none() && count > 0 {
+                return Ok(());
+            }
+            let revision = document
+                .get("_rev")
+                .and_then(|v| v.as_str())
+                .unwrap_or("undefined");
+            let write_url = Url::parse(&format!("{base}/-rev/{revision}"))?;
+            if specific.is_none() || count <= 1 {
+                self.admin_json_request(Method::DELETE, write_url, None, otp)
+                    .await?;
+                return Ok(());
+            }
+            let version = specific.unwrap();
+            let tarball = version_doc
+                .as_ref()
+                .and_then(|v| v.get("dist"))
+                .and_then(|v| v.get("tarball"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(versions) = document.get_mut("versions").and_then(|v| v.as_object_mut()) {
+                versions.remove(version);
+            }
+            let remaining_latest = document
+                .get("versions")
+                .and_then(|v| v.as_object())
+                .into_iter()
+                .flat_map(|v| v.keys())
+                .filter_map(|v| rnpm_core::semver::Version::parse(v).ok())
+                .max()
+                .map(|v| v.to_string());
+            if let Some(tags) = document
+                .get_mut("dist-tags")
+                .and_then(|v| v.as_object_mut())
+            {
+                let removed_latest = tags.get("latest").and_then(|v| v.as_str()) == Some(version);
+                tags.retain(|_, value| value.as_str() != Some(version));
+                if removed_latest {
+                    if let Some(latest) = remaining_latest {
+                        tags.insert("latest".into(), latest.into());
+                    }
+                }
+            }
+            if let Some(object) = document.as_object_mut() {
+                object.remove("_revisions");
+                object.remove("_attachments");
+            }
+            self.admin_json_request(Method::PUT, write_url, Some(document), otp)
+                .await?;
+            let refreshed = self
+                .admin_json_request(Method::GET, read_url, None, None)
+                .await?;
+            let revision = refreshed
+                .get("_rev")
+                .and_then(|v| v.as_str())
+                .unwrap_or("undefined");
+            if let Some(tarball) = tarball {
+                let url = Url::parse(&tarball)?;
+                let relative_path = url
+                    .path()
+                    .strip_prefix(reg_url.path())
+                    .unwrap_or(url.path().trim_start_matches('/'));
+                let target = Url::parse(&format!(
+                    "{}/{relative_path}/-rev/{revision}",
+                    reg_url.as_str().trim_end_matches('/')
+                ))?;
+                self.admin_json_request(Method::DELETE, target, None, otp)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Err(error) if error.status_code() == Some(404) => Ok(()),
+            result => result,
+        }
     }
 
     /// Set or clear a deprecation message on one version.
@@ -3074,6 +3151,10 @@ impl RegistryClient {
             users.insert(username, serde_json::Value::Bool(true));
         } else {
             users.remove(&username);
+        }
+        // npm sends only the identity, revision, and users map for this update.
+        if let Some(object) = document.as_object_mut() {
+            object.retain(|key, _| matches!(key.as_str(), "_id" | "_rev" | "users"));
         }
         self.admin_json_request(Method::PUT, package_url, Some(document), otp)
             .await?;

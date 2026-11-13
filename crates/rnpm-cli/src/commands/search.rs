@@ -35,7 +35,7 @@ pub(crate) async fn run(args: SearchArgs, current_dir: PathBuf) -> Result<()> {
         .collect();
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&packages)?);
+        println!("\n{}\n", serde_json::to_string_pretty(&packages)?);
     } else if args.parseable {
         for p in &packages {
             let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");

@@ -444,7 +444,12 @@ pub async fn build_audit_report_with_advisories(
     let mut bulk_request: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut installed_packages: Vec<(String, String, String, bool)> = Vec::new(); // (key, name, version, is_direct)
 
-    let mut dep_counts = DependenciesCount::default();
+    // Arborist's inventory includes the project root in prod, while total
+    // excludes it. This also applies to an otherwise empty project.
+    let mut dep_counts = DependenciesCount {
+        prod: 1,
+        ..Default::default()
+    };
 
     for (key, pkg) in &lockfile.packages {
         if key.is_empty() {
