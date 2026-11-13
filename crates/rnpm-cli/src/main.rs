@@ -5345,10 +5345,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 } else {
                     Vec::new()
                 };
-                select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
-                if packages.is_empty() && !ws_filters.is_empty() {
-                    packages.extend(ws_filters);
-                }
+                let members = select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
+                if packages.is_empty() { packages.extend(members.into_iter().map(|m| m.name)); }
             }
 
             let opts = list::ListOptions {
@@ -5362,7 +5360,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit,
                 is_global,
             };
-            let code = list::run_list(&target_dir, &opts)?;
+            let code = if ws_in_overrides { list::run_workspace_list(&target_dir, &opts)? } else { list::run_list(&target_dir, &opts)? };
             if code != 0 {
                 return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
                     exit_code: code,

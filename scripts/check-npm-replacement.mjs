@@ -252,6 +252,7 @@ const cliWorkspaceTree=dir=>{
   manifest(path.join(dir,'node_modules/parent'),{name:'parent'});
   for(const name of ['a','b'])fs.symlinkSync(path.join(dir,'modules',name),path.join(dir,'node_modules',name),'junction');
 };
+for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
 for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){

@@ -31,6 +31,18 @@ pub struct ListOptions {
 ///
 /// Returns exit code: `0` if no dependency problems exist, `1` if problems (`extraneous`, `invalid`, `missing`) exist.
 pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, false)
+}
+
+pub fn run_workspace_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, true)
+}
+
+fn run_list_inner(
+    project_dir: &Path,
+    options: &ListOptions,
+    workspace: bool,
+) -> anyhow::Result<i32> {
     let (omit_dev, omit_optional, omit_peer) = crate::parse_omit_options(&options.omit);
     let tree_opts = TreeOptions {
         package_lock_only: options.package_lock_only,
@@ -44,13 +56,24 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
 
     // Filter by packages if specified
     if !options.packages.is_empty() {
-        filter_tree_by_packages(&mut root_node, &options.packages);
+        if workspace {
+            root_node.dependencies.retain(|name, node| {
+                options
+                    .packages
+                    .iter()
+                    .any(|p| package_matches_filter(name, node, p))
+            });
+        } else {
+            filter_tree_by_packages(&mut root_node, &options.packages);
+        }
     }
 
     let effective_depth = if options.all {
         usize::MAX
     } else if let Some(d) = options.depth {
         d
+    } else if workspace {
+        1
     } else if !options.packages.is_empty() {
         usize::MAX
     } else {
@@ -79,12 +102,17 @@ pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32
             println!("{p}");
         }
     } else {
-        let output = format_tree_text_with_unicode(
+        let mut output = format_tree_text_with_unicode(
             &root_node,
             effective_depth,
             options.long,
             crate::use_unicode(project_dir),
         );
+        if options.is_global {
+            if let Some((_, rest)) = output.split_once('\n') {
+                output = format!("{}\n{rest}", project_dir.display());
+            }
+        }
         print!("{output}");
     }
 
@@ -399,6 +427,24 @@ fn format_child_text(
             marker = " extraneous".to_string();
         } else if node.deduped {
             marker = " deduped".to_string();
+        }
+        if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
+            if path != realpath {
+                // Workspace links are displayed relative to the project root.
+                let mut project = path.as_path();
+                while project.file_name().is_some_and(|n| n != "node_modules") {
+                    project = project.parent().unwrap_or(project);
+                }
+                if let Some(project) = project.parent() {
+                    if let Ok(relative) = realpath.strip_prefix(project) {
+                        marker.push_str(&format!(
+                            " -> .{}{}",
+                            std::path::MAIN_SEPARATOR,
+                            relative.display()
+                        ));
+                    }
+                }
+            }
         }
         if node.overridden {
             marker.push_str(" overridden");

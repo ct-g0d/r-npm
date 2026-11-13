@@ -931,6 +931,20 @@ fn create_node_from_disk(
         }
     });
 
+    let realpath = std::fs::canonicalize(&disk_pkg.dir_path)
+        .ok()
+        .map(|p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")))
+        .unwrap_or_else(|| disk_pkg.dir_path.clone());
+    let resolved = if realpath != disk_pkg.dir_path {
+        realpath
+            .strip_prefix(_project_dir)
+            .ok()
+            .map(|p| format!("file:../{}", p.display().to_string().replace('\\', "/")))
+            .or(resolved)
+    } else {
+        resolved
+    };
+
     InspectedNode {
         name: disk_pkg.name.clone(),
         version: disk_pkg.version.clone(),
@@ -943,7 +957,7 @@ fn create_node_from_disk(
         pkgid: Some(pkgid),
         location: disk_pkg.location.clone(),
         path: Some(disk_pkg.dir_path.clone()),
-        realpath: Some(disk_pkg.dir_path.clone()),
+        realpath: Some(realpath),
         resolved,
         integrity,
         from: Vec::new(),
