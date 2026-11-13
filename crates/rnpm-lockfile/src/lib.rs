@@ -20,7 +20,7 @@ pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrit
 pub use migration::{
     load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
 };
-pub use model::{LockfilePackage, LockfileV3, PackageBin, PackageEngines};
+pub use model::{set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines};
 pub use rnpm_core::manifest::BundledDependencies;
 
 #[cfg(test)]

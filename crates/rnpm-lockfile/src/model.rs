@@ -1480,7 +1480,29 @@ impl LockfileV3 {
     }
 
     /// Save using npm lockfile-version semantics (1, 2, or 3).
+    /// Copy without `resolved` on registry tarballs when
+    /// `omit-lockfile-registry-resolved` is set.
+    fn for_writing(&self) -> std::borrow::Cow<'_, Self> {
+        let registries = OMIT_REGISTRY_RESOLVED.read().ok().and_then(|g| g.clone());
+        let Some(registries) = registries else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        let is_registry = |r: &str| registries.iter().any(|base| r.starts_with(base.as_str()));
+        let mut copy = self.clone();
+        for pkg in copy.packages.values_mut() {
+            if pkg.resolved.as_deref().is_some_and(is_registry) {
+                pkg.resolved = None;
+                if let Some(obj) = pkg.raw_value.as_mut().and_then(|v| v.as_object_mut()) {
+                    obj.remove("resolved");
+                }
+            }
+        }
+        std::borrow::Cow::Owned(copy)
+    }
+
     pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
+        let this = self.for_writing();
+        let content_source: &Self = this.as_ref();
         let format = if path.exists() {
             std::fs::read_to_string(path)
                 .map(|s| rnpm_core::ManifestFormat::detect(&s))
@@ -1521,7 +1543,7 @@ impl LockfileV3 {
             rnpm_core::ManifestFormat::default()
         };
 
-        let content = self.to_json_string_version_formatted(version, &format)?;
+        let content = content_source.to_json_string_version_formatted(version, &format)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1683,7 +1705,7 @@ impl LockfileV3 {
     /// - Fields are ordered in npm's `json-stringify-nice` order so diffs against npm are minimal.
     pub fn save_hidden(&self, project_dir: &Path) -> Result<(), LockfileError> {
         let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
-        let mut hidden = self.clone();
+        let mut hidden = self.for_writing().into_owned();
         hidden.lockfile_version = 3;
         hidden.packages.remove("");
         for pkg in hidden.packages.values_mut() {
@@ -1827,6 +1849,19 @@ const NPM_CHAR_RANK: [u8; 256] = [
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
 ];
+
+static OMIT_REGISTRY_RESOLVED: std::sync::RwLock<Option<Vec<String>>> =
+    std::sync::RwLock::new(None);
+
+/// npm's `omit-lockfile-registry-resolved`: write registry packages without
+/// `resolved`, so installs fetch them from whichever registry is configured.
+/// `registries` lists the configured registry URLs whose tarballs count as
+/// registry dependencies; `None` keeps `resolved`.
+pub fn set_omit_registry_resolved(registries: Option<Vec<String>>) {
+    if let Ok(mut guard) = OMIT_REGISTRY_RESOLVED.write() {
+        *guard = registries;
+    }
+}
 
 pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let a_bytes = a.as_bytes();

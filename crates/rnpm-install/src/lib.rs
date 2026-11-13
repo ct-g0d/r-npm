@@ -1620,6 +1620,17 @@ impl Installer {
         let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
 
+        rnpm_lockfile::set_omit_registry_resolved(
+            config
+                .get_bool("omit-lockfile-registry-resolved")
+                .unwrap_or(false)
+                .then(|| {
+                    std::iter::once(&config.npmrc.registry)
+                        .chain(config.npmrc.scoped_registries.values())
+                        .map(|u| u.as_str().to_string())
+                        .collect()
+                }),
+        );
         let source_policy = policy::SourcePolicy::from_config(&config);
         let script_policy =
             policy::ScriptPolicy::load(&options.project_dir, &config, options.is_global);
@@ -4600,7 +4611,22 @@ impl Installer {
                 }
             }
 
-            let resolved_url = match pkg_info.resolved.as_ref() {
+            // Lockfiles written with omit-lockfile-registry-resolved omit
+            // `resolved` for registry packages; npm then fetches them from the
+            // configured registry by name and version.
+            let derived_resolved = if pkg_info.resolved.is_none() && pkg_info.link != Some(true) {
+                pkg_info.version.as_ref().map(|version| {
+                    let name = pkg_info.name.clone().unwrap_or_else(|| {
+                        pkg_key.rsplit_once("node_modules/").map(|(_, n)| n.to_string()).unwrap_or_default()
+                    });
+                    let unscoped = name.rsplit('/').next().unwrap_or(&name).to_string();
+                    let base = self.registry_client.registry_for_package(&name).as_str().trim_end_matches('/').to_string();
+                    format!("{base}/{name}/-/{unscoped}-{version}.tgz")
+                })
+            } else {
+                None
+            };
+            let resolved_url = match pkg_info.resolved.as_ref().or(derived_resolved.as_ref()) {
                 Some(url) => url,
                 None => {
                     if is_optional {
