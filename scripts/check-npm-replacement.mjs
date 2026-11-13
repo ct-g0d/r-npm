@@ -134,11 +134,17 @@ add('command-completion','completion',['completion']);
 add('command-help','help',['help']);
 add('command-help-search','help-search',['help-search','install']);
 add('command-doctor','doctor',['doctor','connection']);
+const sbomTree=dir=>manifest(dir,{license:'MIT',dependencies:{parent:'1.0.0'},devDependencies:{dep:'2.0.0'},optionalDependencies:{changing:'1.0.0'}});
+const sbomInstall={before:async ctx=>{generation=1;const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`sbom seed failed: ${p.stderr}`);}};
+for(const [name,args] of [['spdx',['--sbom-format=spdx']],['cyclonedx',['--sbom-format=cyclonedx']],['cyclonedx-application',['--sbom-format=cyclonedx','--sbom-type=application']],['omit-dev',['--sbom-format=spdx','--omit=dev']],['lock-only',['--sbom-format=cyclonedx','--package-lock-only']]])add(`sbom-populated-${name}`,'sbom',['sbom',...args],sbomTree,sbomInstall);
+add('sbom-missing-format','sbom',['sbom']);
+add('sbom-lock-only-without-lock','sbom',['sbom','--sbom-format=spdx','--package-lock-only']);
+add('sbom-missing-dependency','sbom',['sbom','--sbom-format=spdx'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
 add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});
-const normalize=(str,dir,config)=>str.replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\r\n/g,'\n');
+const normalize=(str,dir,config)=>str.replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
 function snapshot(dir,config){
   if(!fs.existsSync(dir))return {};
   const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){

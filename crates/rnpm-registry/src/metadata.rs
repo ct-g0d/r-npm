@@ -300,12 +300,8 @@ impl AbbreviatedPackageMetadata {
                     "dist-tag version target for '{tag_name}' contains forbidden CR/LF characters: {tag_ver:?}"
                 )));
             }
-            if !self.versions.is_empty() && !self.versions.contains_key(tag_ver) {
-                return Err(RegistryError::MalformedMetadata(format!(
-                    "dist-tag '{tag_name}' points to non-existent version '{tag_ver}' in package '{}'",
-                    self.name
-                )));
-            }
+            // A dist-tag may dangle after an unpublish. npm keeps such
+            // packuments usable and only fails when that tag is requested.
         }
 
         // Validate versions
@@ -516,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_spoofed_dist_tags() {
+    fn test_dangling_dist_tags_are_tolerated_like_npm() {
         let json = r#"{
             "name": "example",
             "dist-tags": { "latest": "9.9.9" },
@@ -529,11 +525,8 @@ mod tests {
             }
         }"#;
         let meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
-        let err = meta.validate().unwrap_err();
-        assert!(err.is_malformed_metadata());
-        assert!(err
-            .to_string()
-            .contains("points to non-existent version '9.9.9'"));
+        meta.validate()
+            .expect("npm accepts packuments whose dist-tag names a missing version");
     }
 
     #[test]

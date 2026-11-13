@@ -259,7 +259,7 @@ pub struct TreeOptions {
 
 /// Discovered package on disk.
 #[derive(Debug, Clone)]
-struct DiskPackage {
+pub(crate) struct DiskPackage {
     pub location: String, // e.g. "node_modules/foo"
     pub dir_path: PathBuf,
     pub name: String,
@@ -275,7 +275,7 @@ struct RawDiskEntry {
 }
 
 /// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
-fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
+pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
     let root_nm = project_dir.join("node_modules");
     if !root_nm.is_dir() {
         return HashMap::new();

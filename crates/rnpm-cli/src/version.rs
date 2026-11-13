@@ -1,3 +1,6 @@
+/// npm release whose behavior rnpm emulates.
+pub(crate) const NPM_VERSION: &str = "11.20.0";
+
 use anyhow::{Context, Result};
 use rnpm_core::semver::Version;
 use rnpm_lifecycle::{execute_lifecycle_script, LifecycleContext};
@@ -47,7 +50,7 @@ fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
 
     results.insert(
         "npm".to_string(),
-        serde_json::Value::String("11.20.0".to_string()),
+        serde_json::Value::String(NPM_VERSION.to_string()),
     );
 
     let mut node_versions_found = false;

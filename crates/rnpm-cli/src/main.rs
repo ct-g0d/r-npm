@@ -805,11 +805,11 @@ pub(crate) enum Commands {
     /// Generate Software Bill of Materials (SBOM)
     Sbom {
         /// SBOM specification format (spdx, cyclonedx)
-        #[arg(long = "sbom-format", default_value = "spdx")]
+        #[arg(long = "sbom-format", default_value = "")]
         sbom_format: String,
 
         /// CycloneDX component type (library, application, framework)
-        #[arg(long = "sbom-type", default_value = "application")]
+        #[arg(long = "sbom-type", default_value = "library")]
         sbom_type: String,
 
         /// Inspect only package-lock.json without requiring node_modules
@@ -6012,33 +6012,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if topic_str == "install-strategy" || topic_str == "install_strategy" {
                 print_help_install_strategy();
             } else if topic.is_empty() {
-                println!(
-r#"npm <command>
-
-Usage:
-
-npm install        install all the dependencies in your project
-npm install <foo>  add the <foo> dependency to your project
-npm test           run this project's tests
-npm run <foo>      run the script named <foo>
-npm <command> -h   quick help on <command>
-npm -l             display usage info for all commands
-npm help <term>    search for help on <term> (in a browser)
-npm help npm       more involved overview (in a browser)
-
-All commands:
-
-    access, adduser, audit, bugs, cache, ci, completion,
-    config, dedupe, deprecate, diff, dist-tag, docs, doctor,
-    edit, exec, explain, explore, find-dupes, fund, get, help,
-    help-search, hook, init, install, install-ci-test,
-    install-test, link, ll, login, logout, ls, org, outdated,
-    owner, pack, ping, pkg, prefix, profile, prune, publish,
-    query, rebuild, repo, restart, root, run-script, sbom,
-    search, set, shrinkwrap, star, stars, start, stop, team,
-    test, token, uninstall, unpublish, unstar, update, version,
-    view, whoami"#
-                );
+                print!("{}", npm_usage());
             } else {
                 let cmd = Cli::command();
                 if let Some(sub) = cmd.find_subcommand(&topic[0]) {
@@ -6055,6 +6029,76 @@ All commands:
     }
 
     Ok(())
+}
+
+/// Command list printed by `npm help` (npm's lib/utils/cmd-list.js).
+const NPM_COMMANDS: &[&str] = &[
+    "access", "adduser", "approve-scripts", "audit", "bugs", "cache", "ci", "completion",
+    "config", "dedupe", "deny-scripts", "deprecate", "diff", "dist-tag", "docs", "doctor",
+    "edit", "exec", "explain", "explore", "find-dupes", "fund", "get", "help", "help-search",
+    "init", "install", "install-ci-test", "install-scripts", "install-test", "link", "ll",
+    "login", "logout", "ls", "org", "outdated", "owner", "pack", "ping", "pkg", "prefix",
+    "profile", "prune", "publish", "query", "rebuild", "repo", "restart", "root", "run",
+    "sbom", "search", "set", "shrinkwrap", "stage", "star", "stars", "start", "stop", "team",
+    "test", "token", "trust", "undeprecate", "uninstall", "unpublish", "unstar", "update",
+    "version", "view", "whoami",
+];
+
+/// Wraps the command list like npm's utils/npm-usage.js for a non-TTY stdout.
+fn npm_command_names() -> String {
+    const LINE: usize = 60;
+    let mut out = vec![String::new()];
+    for c in NPM_COMMANDS {
+        let last = out.last_mut().expect("non-empty");
+        if last.len() + c.len() + 2 < LINE {
+            last.push_str(", ");
+            last.push_str(c);
+        } else {
+            last.push(',');
+            out.push((*c).to_string());
+        }
+    }
+    let joined = out.join("\n    ");
+    format!("\n    {}", &joined[2..])
+}
+
+fn npm_usage() -> String {
+    let userconfig = rnpm_config::find_user_npmrc()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let root = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.display().to_string()))
+        .unwrap_or_default();
+    format!(
+        "npm <command>
+
+Usage:
+
+npm install        install all the dependencies in your project
+npm install <foo>  add the <foo> dependency to your project
+npm test           run this project's tests
+npm run <foo>      run the script named <foo>
+npm <command> -h   quick help on <command>
+npm -l             display usage info for all commands
+npm help <term>    search for help on <term> (in a browser)
+npm help npm       more involved overview (in a browser)
+
+All commands:
+{}
+
+Specify configs in the ini-formatted file:
+    {userconfig}
+or on the command line via: npm <command> --key=value
+
+More configuration info: npm help config
+Configuration fields: npm help 7 config
+
+npm@{} {root}
+",
+        npm_command_names(),
+        crate::version::NPM_VERSION,
+    )
 }
 
 fn print_help_install_strategy() {
@@ -6286,9 +6330,15 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         write_error_log(err);
         std::process::exit(exit.exit_code);
     }
-    let diagnostic = diagnostics::classify_error(err);
-    if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
-    else { print_structured_error(err); }
+    let rendered = format!("{err:#}");
+    if rendered.starts_with("npm error code ") {
+        // Already a complete npm error block: keep its code and blank lines.
+        eprintln!("{}", rendered.trim_end());
+    } else {
+        let diagnostic = diagnostics::classify_error(err);
+        if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
+        else { print_structured_error(err); }
+    }
     write_error_log(err);
     let missing_manifest = format!("{err:#}").contains("package.json not found");
     std::process::exit(if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 });
@@ -6298,7 +6348,11 @@ fn write_error_log(err: &anyhow::Error) {
     use std::io::Write;
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = rnpm_config::Config::load(Some(&cwd)).unwrap_or_default();
-    if config.get("logs-max") == Some("0") {
+    if let Some(max) = config
+        .get("logs-max")
+        .filter(|v| v.parse::<i64>().is_ok_and(|n| n <= 0))
+    {
+        eprintln!("npm error Log files were not written due to the config logs-max={max}");
         return;
     }
     let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
@@ -6321,7 +6375,18 @@ fn write_error_log(err: &anyhow::Error) {
             .replace(':', "_"),
         now.subsec_millis()
     );
-    if std::fs::create_dir_all(&log_dir).is_err() {
+    let dir_created = std::fs::create_dir_all(&log_dir).is_ok();
+    // npm never opens a log file for `completion` (utils/log-file.js), so it
+    // reports that the logs directory could not be written.
+    let is_completion = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|c| c == "completion");
+    if !dir_created || is_completion {
+        eprintln!(
+            "npm error Log files were not written due to an error writing to the directory: {}\nnpm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal",
+            log_dir.display()
+        );
         return;
     }
     for index in 0..10 {
