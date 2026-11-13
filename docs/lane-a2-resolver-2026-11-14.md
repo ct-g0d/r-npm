@@ -65,6 +65,25 @@ The first two fixes remove eleven of the generated CRA differences. The
 remaining entry is the nested optional YAML provider handled by the third
 fix. Complete baseline differences are in `target/lane-a2-real/identity-rnpm.json`.
 
+Final full installs match npm's parsed lockfile JSON exactly for all seven
+projects. npm's full-install oracle is itself exactly equal to its earlier
+lockfile-only oracle for every project, so the before/after oracle is stable.
+
+| Project | Differences before | Differences after | Final packages (each tool) |
+| --- | ---: | ---: | ---: |
+| Express + TypeScript + @types/node | 0 | 0 | 91 |
+| Express | 0 | 0 | 68 |
+| Next + dev Sharp | 0 | 0 | 80 |
+| bcrypt + esbuild | 0 | 0 | 30 |
+| Vite React template | 0 | 0 | 74 |
+| create-react-app package.json | 0 | 0 | 371 |
+| Generated CRA app | 12 | 0 | 1307 |
+
+Final raw process logs and lockfiles are under `target/lane-a2-full-real`;
+the complete comparisons are in `identity-rnpm.json`. The committed JSON
+summary records the manifests, every baseline difference, final counts,
+binary hash, and tested revision.
+
 ## Final validation and timings
 
 Final results are recorded after the release build and measurements finish.

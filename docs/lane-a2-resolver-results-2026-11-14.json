@@ -1,0 +1,378 @@
+{
+  "baseline_head": "30a0808",
+  "implementation_head": "ea6b1f5",
+  "tested_head": "0539244cecdd3890ce69e9edbc3b8757f958f9a2",
+  "binary_sha256": "6e27e0f5ebdc2b1334665ce4bfb5f9d9e2f0c3659aefae5752a6835d7ef8de71",
+  "node": "v26.13.0",
+  "npm": "11.20.0",
+  "manifest_sources": {
+    "vite": "https://raw.githubusercontent.com/vitejs/vite/main/packages/create-vite/template-react/package.json",
+    "cra": "https://raw.githubusercontent.com/facebook/create-react-app/main/packages/create-react-app/package.json",
+    "craTemplate": "https://raw.githubusercontent.com/facebook/create-react-app/main/packages/cra-template/template.json"
+  },
+  "manifests": {
+    "express-typescript": {
+      "name": "lane-a2-project",
+      "version": "1.0.0",
+      "dependencies": {
+        "express": "5.1.0",
+        "typescript": "latest",
+        "@types/node": "latest"
+      }
+    },
+    "express": {
+      "name": "lane-a2-project",
+      "version": "1.0.0",
+      "dependencies": {
+        "express": "5.1.0"
+      }
+    },
+    "next-sharp": {
+      "name": "lane-a2-project",
+      "version": "1.0.0",
+      "dependencies": {
+        "next": "15"
+      },
+      "devDependencies": {
+        "sharp": "0.33"
+      }
+    },
+    "bcrypt-esbuild": {
+      "name": "lane-a2-project",
+      "version": "1.0.0",
+      "dependencies": {
+        "bcrypt": "latest",
+        "esbuild": "latest"
+      }
+    },
+    "vite-react": {
+      "name": "vite-react-starter",
+      "private": true,
+      "version": "0.0.0",
+      "type": "module",
+      "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "lint": "oxlint",
+        "preview": "vite preview"
+      },
+      "dependencies": {
+        "react": "^19.3.1",
+        "react-dom": "^19.3.1"
+      },
+      "devDependencies": {
+        "@types/react": "^19.3.0",
+        "@types/react-dom": "^19.3.0",
+        "@vitejs/plugin-react": "^6.2.1",
+        "oxlint": "^1.92.0",
+        "vite": "^8.3.6"
+      }
+    },
+    "create-react-app": {
+      "name": "create-react-app",
+      "version": "5.1.0",
+      "keywords": [
+        "react"
+      ],
+      "description": "Create React apps with no build configuration.",
+      "repository": {
+        "type": "git",
+        "url": "https://github.com/facebook/create-react-app.git",
+        "directory": "packages/create-react-app"
+      },
+      "license": "MIT",
+      "engines": {
+        "node": ">=14"
+      },
+      "bugs": {
+        "url": "https://github.com/facebook/create-react-app/issues"
+      },
+      "files": [
+        "index.js",
+        "createReactApp.js"
+      ],
+      "bin": {
+        "create-react-app": "./index.js"
+      },
+      "scripts": {
+        "test": "cross-env FORCE_COLOR=true jest"
+      },
+      "dependencies": {
+        "chalk": "^4.1.2",
+        "commander": "^4.1.1",
+        "cross-spawn": "^7.0.3",
+        "envinfo": "^7.8.1",
+        "fs-extra": "^10.0.0",
+        "hyperquest": "^2.1.3",
+        "prompts": "^2.4.2",
+        "semver": "^7.3.5",
+        "tar-pack": "^3.4.1",
+        "tmp": "^0.2.1",
+        "validate-npm-package-name": "^3.0.0"
+      },
+      "devDependencies": {
+        "cross-env": "^7.0.3",
+        "jest": "^27.4.3"
+      }
+    },
+    "cra-generated": {
+      "name": "lane-a2-project",
+      "version": "1.0.0",
+      "dependencies": {
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0",
+        "react-scripts": "5.0.1",
+        "@testing-library/dom": "^10.4.0",
+        "@testing-library/jest-dom": "^6.6.3",
+        "@testing-library/react": "^16.1.0",
+        "@testing-library/user-event": "^13.2.1",
+        "web-vitals": "^2.1.0"
+      },
+      "private": true
+    }
+  },
+  "baseline": {
+    "flags": [
+      "install",
+      "--package-lock-only",
+      "--ignore-scripts",
+      "audit=false",
+      "fund=false"
+    ],
+    "results": [
+      {
+        "name": "express-typescript",
+        "npm_packages": 91,
+        "rnpm_packages": 91,
+        "differences": []
+      },
+      {
+        "name": "express",
+        "npm_packages": 68,
+        "rnpm_packages": 68,
+        "differences": []
+      },
+      {
+        "name": "next-sharp",
+        "npm_packages": 80,
+        "rnpm_packages": 80,
+        "differences": []
+      },
+      {
+        "name": "bcrypt-esbuild",
+        "npm_packages": 30,
+        "rnpm_packages": 30,
+        "differences": []
+      },
+      {
+        "name": "vite-react",
+        "npm_packages": 74,
+        "rnpm_packages": 74,
+        "differences": []
+      },
+      {
+        "name": "create-react-app",
+        "npm_packages": 371,
+        "rnpm_packages": 371,
+        "differences": []
+      },
+      {
+        "name": "cra-generated",
+        "npm_packages": 1307,
+        "rnpm_packages": 1309,
+        "differences": [
+          {
+            "path": "/packages/node_modules/jest-watch-typeahead/node_modules/char-regex",
+            "rnpm": {
+              "version": "2.0.2",
+              "resolved": "https://registry.npmjs.org/char-regex/-/char-regex-2.0.2.tgz",
+              "integrity": "sha512-cbGOjAptfM2LVmWhwRFHEKTPkLwNddVmuqYZQt895yXwAsWsXObCG+YN4DGQ/JBtT4GP1a1lPPdio2z413LmTg==",
+              "license": "MIT",
+              "engines": {
+                "node": ">=12.20"
+              }
+            }
+          },
+          {
+            "path": "/packages/node_modules/jest-watch-typeahead/node_modules/jest-watcher/node_modules/char-regex",
+            "rnpm": {
+              "version": "1.0.2",
+              "resolved": "https://registry.npmjs.org/char-regex/-/char-regex-1.0.2.tgz",
+              "integrity": "sha512-kWWXztvZ5SBQV+eRgKFeh8q5sLuZY2+8WUIzlxWVTg+oGwY14qylx1KbKzHd8P6ZYkAg0xyIDU9JMHhyJMZ1jw==",
+              "license": "MIT",
+              "engines": {
+                "node": ">=10"
+              }
+            }
+          },
+          {
+            "path": "/packages/node_modules/jest-watch-typeahead/node_modules/string-length/node_modules/char-regex",
+            "npm": {
+              "version": "2.0.2",
+              "resolved": "https://registry.npmjs.org/char-regex/-/char-regex-2.0.2.tgz",
+              "integrity": "sha512-cbGOjAptfM2LVmWhwRFHEKTPkLwNddVmuqYZQt895yXwAsWsXObCG+YN4DGQ/JBtT4GP1a1lPPdio2z413LmTg==",
+              "license": "MIT",
+              "engines": {
+                "node": ">=12.20"
+              }
+            }
+          },
+          {
+            "path": "/packages/node_modules/react-refresh/integrity",
+            "npm": "sha512-F27qZr8uUqwhWZboondsPx8tnC3Ct3SxZA3V5WyEvujRyyNv0VYPhoBg1gZ8/MV5tubQp76Trw8lTv9hzRBa+A==",
+            "rnpm": "sha512-5HdstYgoJBbBofjapO5qCPcovECJCBfvjLb+iTcsmqDFVMRdqy0qs7iiInBJTUXmIFc2bjoc5b2HVLp2zRtYhQ=="
+          },
+          {
+            "path": "/packages/node_modules/react-refresh/peer",
+            "rnpm": true
+          },
+          {
+            "path": "/packages/node_modules/react-refresh/resolved",
+            "npm": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.11.0.tgz",
+            "rnpm": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.19.0.tgz"
+          },
+          {
+            "path": "/packages/node_modules/react-refresh/version",
+            "npm": "0.11.0",
+            "rnpm": "0.19.0"
+          },
+          {
+            "path": "/packages/node_modules/react-scripts/node_modules/react-refresh",
+            "rnpm": {
+              "version": "0.11.0",
+              "resolved": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.11.0.tgz",
+              "integrity": "sha512-F27qZr8uUqwhWZboondsPx8tnC3Ct3SxZA3V5WyEvujRyyNv0VYPhoBg1gZ8/MV5tubQp76Trw8lTv9hzRBa+A==",
+              "license": "MIT",
+              "engines": {
+                "node": ">=0.10.0"
+              }
+            }
+          },
+          {
+            "path": "/packages/node_modules/svgo/node_modules/dom-serializer/node_modules/domelementtype",
+            "rnpm": {
+              "version": "2.3.0",
+              "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-2.3.0.tgz",
+              "integrity": "sha512-OLETBj6w0OsagBwdXnPdN0cnMfF9opN69co+7ZrbfPGrdpPVNBUj02spi6B1N7wChLQiPn4CSH/zJvXw56gmHw==",
+              "funding": [
+                {
+                  "type": "github",
+                  "url": "https://github.com/sponsors/fb55"
+                }
+              ],
+              "license": "BSD-2-Clause"
+            }
+          },
+          {
+            "path": "/packages/node_modules/svgo/node_modules/domelementtype",
+            "rnpm": {
+              "version": "1.3.1",
+              "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-1.3.1.tgz",
+              "integrity": "sha512-BSKB+TSpMpFI/HOxCNr1O8aMOTZ8hT3pM3GQ0w/mWRmkhEDSFJkkyzz4XQsBV44BChwGkrDfMyjVD0eA2aFV3w==",
+              "license": "BSD-2-Clause"
+            }
+          },
+          {
+            "path": "/packages/node_modules/svgo/node_modules/domutils/node_modules/domelementtype",
+            "npm": {
+              "version": "1.3.1",
+              "resolved": "https://registry.npmjs.org/domelementtype/-/domelementtype-1.3.1.tgz",
+              "integrity": "sha512-BSKB+TSpMpFI/HOxCNr1O8aMOTZ8hT3pM3GQ0w/mWRmkhEDSFJkkyzz4XQsBV44BChwGkrDfMyjVD0eA2aFV3w==",
+              "license": "BSD-2-Clause"
+            }
+          },
+          {
+            "path": "/packages/node_modules/tailwindcss/node_modules/yaml",
+            "npm": {
+              "version": "2.9.1",
+              "resolved": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
+              "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
+              "extraneous": true,
+              "license": "ISC",
+              "bin": {
+                "yaml": "bin.mjs"
+              },
+              "engines": {
+                "node": ">= 14.6"
+              },
+              "funding": {
+                "url": "https://github.com/sponsors/eemeli"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "after": {
+    "flags": [
+      "install",
+      "--ignore-scripts",
+      "audit=false",
+      "fund=false"
+    ],
+    "results": [
+      {
+        "name": "express-typescript",
+        "npm_packages": 91,
+        "rnpm_packages": 91,
+        "differences": []
+      },
+      {
+        "name": "express",
+        "npm_packages": 68,
+        "rnpm_packages": 68,
+        "differences": []
+      },
+      {
+        "name": "next-sharp",
+        "npm_packages": 80,
+        "rnpm_packages": 80,
+        "differences": []
+      },
+      {
+        "name": "bcrypt-esbuild",
+        "npm_packages": 30,
+        "rnpm_packages": 30,
+        "differences": []
+      },
+      {
+        "name": "vite-react",
+        "npm_packages": 74,
+        "rnpm_packages": 74,
+        "differences": []
+      },
+      {
+        "name": "create-react-app",
+        "npm_packages": 371,
+        "rnpm_packages": 371,
+        "differences": []
+      },
+      {
+        "name": "cra-generated",
+        "npm_packages": 1307,
+        "rnpm_packages": 1307,
+        "differences": []
+      }
+    ]
+  },
+  "oracle_lock_only_equals_full_install": [
+    "express-typescript",
+    "express",
+    "next-sharp",
+    "bcrypt-esbuild",
+    "vite-react",
+    "create-react-app",
+    "cra-generated"
+  ],
+  "probes": {
+    "baseline_resolver_matches": "7/9",
+    "fixed_resolver_matches": "10/10",
+    "optional_peer_before": "0/1",
+    "names": [
+      "resolver-nesting-preserves-pending-descendant-edges",
+      "resolver-peer-set-prefers-parent-dependency",
+      "resolver-nested-optional-peer-conflict"
+    ]
+  }
+}
