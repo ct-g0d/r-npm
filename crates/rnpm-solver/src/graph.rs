@@ -285,6 +285,30 @@ impl DependencyGraph {
             }
         }
 
+        // Arborist calc-dep-flags keeps nodes reached only through optional
+        // peers extraneous. Their ordinary dependencies inherit that state.
+        let mut non_extraneous = HashSet::from([self.root_location.clone()]);
+        let mut required_queue = VecDeque::from([self.root_location.clone()]);
+        while let Some(location) = required_queue.pop_front() {
+            if let Some(edges) = outgoing.get(&location) {
+                for edge in edges {
+                    if edge.dep_type != DependencyType::PeerOptional
+                        && non_extraneous.insert(edge.to_location.clone())
+                    {
+                        required_queue.push_back(edge.to_location.clone());
+                    }
+                }
+            }
+        }
+        // Required nested children also keep their physical parents alive.
+        for location in non_extraneous.clone() {
+            let mut scope = location.as_str();
+            while let Some((parent, _)) = scope.rsplit_once("/node_modules/") {
+                non_extraneous.insert(parent.to_string());
+                scope = parent;
+            }
+        }
+
         for (location, node) in &mut self.nodes {
             if location == &self.root_location {
                 continue;
@@ -292,6 +316,11 @@ impl DependencyGraph {
             let dev_state = dev_states.get(location).copied().unwrap_or(0);
             let optional_state = optional_states.get(location).copied().unwrap_or(0);
             let skipped_state = skipped_states.get(location).copied().unwrap_or(0);
+            if dev_state != 0 && !non_extraneous.contains(location) {
+                node.extra.insert("extraneous".to_string(), serde_json::Value::Bool(true));
+            } else {
+                node.extra.remove("extraneous");
+            }
 
             let is_dev = dev_state == DEV_ONLY;
             let is_optional = optional_state == OPTIONAL_ONLY;
@@ -504,7 +533,10 @@ impl DependencyGraph {
                 //   but is neither exclusively dev nor exclusively optional (`dev_optional && !dev && !optional`),
                 //   emit `devOptional: true`.
                 // - When neither applies, omit `devOptional`.
-                let (dev, optional, dev_optional) = if node.flags.dev && node.flags.optional {
+                let extraneous = node.extra.get("extraneous") == Some(&serde_json::Value::Bool(true));
+                let (dev, optional, dev_optional) = if extraneous {
+                    (None, None, None)
+                } else if node.flags.dev && node.flags.optional {
                     (Some(true), Some(true), None)
                 } else if node.flags.dev_optional && !node.flags.dev && !node.flags.optional {
                     (None, None, Some(true))
@@ -561,7 +593,7 @@ impl DependencyGraph {
                 let cpu = node.cpu.as_ref().filter(|v| !v.is_empty()).cloned();
 
                 let mut extra = BTreeMap::new();
-                for key in ["funding", "deprecated"] {
+                for key in ["funding", "deprecated", "extraneous"] {
                     if let Some(v) = node.extra.get(key) {
                         if key == "deprecated"
                             && (v == &serde_json::Value::Bool(false) || v.is_null() || v == "")
@@ -591,7 +623,7 @@ impl DependencyGraph {
                     dev,
                     optional,
                     dev_optional,
-                    peer: if node.flags.peer { Some(true) } else { None },
+                    peer: if node.flags.peer && !extraneous { Some(true) } else { None },
                     in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
                         Some(true)

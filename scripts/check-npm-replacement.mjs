@@ -293,14 +293,19 @@ for(const [name,versions] of Object.entries({
   'z-peer-entry':{'1.0.0':{peerDependencies:{'a-peer-parent':'1.0.0'}}},
   'a-peer-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'b-regular':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
-  'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}}},
-  'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
+  'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}},'2.0.0':{dependencies:{'c-old':'3.0.0','d-new':'2.0.0'}}},
+  'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}},'3.0.0':{dependencies:{'z-passive':'2.0.0'}}},
   'd-new':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^2.0.0'}}},
+  'z-passive':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
   'optional-peer-owner':{'1.0.0':{dependencies:{'peer-consumer':'1.0.0'},peerDependencies:{shared:'^1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
   'legacy-engines':{'1.0.0':{engines:['node >= 0.8.0']}},
   'z-peer-source':{'1.0.0':{dependencies:{'a-peer-plugin':'1.0.0',shared:'2.0.0'}}},
   'a-peer-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'z-normal-peer-owner':{'1.0.0':{dependencies:{'a-broad-peer-plugin':'1.0.0',shared:'1.0.0'}}},
+  'a-broad-peer-plugin':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'nested-optional-owner':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'}}},
+  'nested-optional-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -369,6 +374,9 @@ for(const [name,manifestEol,lockEol] of [['manifest-lf-lock-crlf','\n','\r\n'],[
 
 const queryMetadataTree=dir=>{installed(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.funding=[{type:'individual',url:'https://example.invalid/support'}];p.engines={node:'>=18'};p.private=true;});};
 for(const [name,selector] of [['insensitive','[name=DEP i]'],['attr-object',':attr(engines,[node])'],['attr-object-match',':attr(engines,[node^=">="])'],['attr-array',':attr(funding,[url*="example.invalid"])'],['attr-nested',':attr(funding,:attr([type=individual]))'],['boolean-attribute','[private=true]']])add(`cli-query-${name}`,'query',['query',selector],queryMetadataTree);
+add('resolver-nesting-preserves-pending-descendant-edges','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'2.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0','z-passive':'1.0.0'}}));
+add('resolver-peer-set-prefers-parent-dependency','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-normal-peer-owner':'1.0.0'}}));
+add('resolver-nested-optional-peer-conflict','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'nested-optional-owner':'1.0.0',shared:'1.0.0'}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
