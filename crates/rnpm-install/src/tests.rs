@@ -4268,12 +4268,8 @@ fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
 
 #[tokio::test]
 async fn test_enrich_lockfile_never_makes_network_requests() {
-    use rnpm_registry::{http_request_count, reset_http_request_count};
-
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
-
-    reset_http_request_count();
 
     let mut lockfile = LockfileV3::new("no-net-app", Some("1.0.0".to_string()));
     lockfile.insert_package(
@@ -4291,12 +4287,12 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
     };
     let mut installer = Installer::new(options).unwrap();
 
-    let before_requests = http_request_count();
+    let before_requests = installer.registry_client.http_requests();
     installer
         .enrich_lockfile_from_registry(&mut lockfile)
         .await
         .unwrap();
-    let after_requests = http_request_count();
+    let after_requests = installer.registry_client.http_requests();
 
     assert_eq!(
         before_requests, after_requests,
