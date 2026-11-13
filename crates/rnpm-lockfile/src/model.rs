@@ -1704,6 +1704,11 @@ impl LockfileV3 {
     ///   npm's hidden lockfile lists only what is physically on disk.
     /// - Fields are ordered in npm's `json-stringify-nice` order so diffs against npm are minimal.
     pub fn save_hidden(&self, project_dir: &Path) -> Result<(), LockfileError> {
+        self.save_hidden_with_root_metadata(project_dir, true)
+    }
+
+    /// A new --no-save install has no persisted root metadata in its hidden lock.
+    pub fn save_hidden_with_root_metadata(&self, project_dir: &Path, root_metadata: bool) -> Result<(), LockfileError> {
         let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
         let mut hidden = self.for_writing().into_owned();
         hidden.lockfile_version = 3;
@@ -1746,7 +1751,7 @@ impl LockfileV3 {
         .find_map(|path| std::fs::read_to_string(path).ok())
         .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
         .unwrap_or_default();
-        let content = hidden.to_npm_json_string_formatted(&format)?;
+        let content = hidden.to_npm_json_string_formatted(&format, root_metadata)?;
 
         if let Some(parent) = hidden_path.parent() {
             fs::create_dir_all(parent)?;
@@ -1757,15 +1762,16 @@ impl LockfileV3 {
 
     /// Serializes with npm's `json-stringify-nice` key ordering so diffs against npm are minimal.
     pub fn to_npm_json_string(&self) -> Result<String, LockfileError> {
-        self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default())
+        self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default(), true)
     }
 
     fn to_npm_json_string_formatted(
         &self,
         format: &rnpm_core::ManifestFormat,
+        root_metadata: bool,
     ) -> Result<String, LockfileError> {
         let has_any_raw = self.packages.values().any(|p| p.raw_value.is_some());
-        let value = if has_any_raw {
+        let mut value = if has_any_raw {
             let mut root = serde_json::Map::new();
             root.insert("name".into(), serde_json::Value::String(self.name.clone()));
             if let Some(v) = &self.version {
@@ -1802,6 +1808,12 @@ impl LockfileV3 {
             copy.packages = normalized_packages;
             serde_json::to_value(&copy)?
         };
+        if !root_metadata {
+            if let Some(root) = value.as_object_mut() {
+                root.remove("name");
+                root.remove("version");
+            }
+        }
         let mut out = String::new();
         stringify_npm_nice_indent(&value, &format.indent, 0, &mut out);
         if !out.ends_with('\n') {

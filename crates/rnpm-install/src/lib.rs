@@ -1252,6 +1252,7 @@ pub struct InstallOptions {
     pub save_prod: bool,
     pub save_optional: bool,
     pub save_peer: bool,
+    pub save_bundle: bool,
     pub no_save: bool,
     pub package_lock_only: bool,
     pub packages: Vec<String>,
@@ -1332,6 +1333,7 @@ impl Default for InstallOptions {
             save_prod: false,
             save_optional: false,
             save_peer: false,
+            save_bundle: false,
             no_save: false,
             package_lock_only: false,
             packages: Vec::new(),
@@ -1578,6 +1580,7 @@ impl Installer {
             let _ = std::fs::create_dir_all(&global_bin);
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
+        options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
 
         if options.install_strategy == InstallStrategy::Hoisted {
             if let Some(strat_str) = config
@@ -2207,6 +2210,9 @@ impl Installer {
             };
 
             let insert_dep = |m: &mut Manifest| {
+                if self.options.save_bundle && !self.options.save_peer {
+                    save::bundle_manifest_dep(m, &spec.name);
+                }
                 if self.options.save_dev {
                     m.dev_dependencies
                         .insert(spec.name.clone(), solver_spec.clone());
@@ -2363,20 +2369,24 @@ impl Installer {
 
         let mut graph = if !workspace_members.is_empty() {
             let members = workspace_members.clone();
-            let root_m = manifest.clone();
+            let mut root_m = manifest.clone();
+            // A root bundle is installed normally; only dependency-owned
+            // bundles are supplied by their owner's tarball.
+            root_m.bundled_dependencies = None;
             tokio::task::spawn_blocking(move || {
                 resolve_workspace_graph(&root_m, &members, &provider, &resolver_options)
-                    .map_err(|e| anyhow!("Workspace dependency error: {e}"))
+                    .map_err(|e| anyhow::Error::from(e).context("Workspace dependency error"))
             })
             .await
             .map_err(|e| anyhow!("Solver task panicked: {e}"))??
         } else {
-            let root_m = manifest.clone();
+            let mut root_m = manifest.clone();
+            root_m.bundled_dependencies = None;
             tokio::task::spawn_blocking(move || {
                 let overrides = Overrides::from_manifest(&root_m)
                     .map_err(|e| anyhow!("Failed to parse overrides: {e}"))?;
                 let solver = Solver::new(&provider, resolver_options, overrides);
-                solver.resolve(&root_m).map_err(|e| anyhow!("{e}"))
+                solver.resolve(&root_m).map_err(anyhow::Error::from)
             })
             .await
             .map_err(|e| anyhow!("Solver task panicked: {e}"))??
@@ -2499,11 +2509,20 @@ impl Installer {
         if let Some(root_pkg) = lockfile.root_package_mut() {
             if target_root {
                 save::sync_lockfile_package_entry(root_pkg, &manifest);
+                if self.options.save_optional {
+                    for added in &added_pkgs {
+                        root_pkg.dependencies.get_or_insert_default().insert(
+                            added.name.clone(), added.user_spec.clone().unwrap_or_else(|| "*".into())
+                        );
+                    }
+                }
             }
             if !manifest.workspace_patterns().is_empty() {
                 root_pkg.workspaces = Some(manifest.workspace_patterns());
             }
         }
+
+        save::mark_root_bundles(&mut lockfile, &graph, &manifest);
 
         for member in &workspace_members {
             let pkg = lockfile
@@ -3930,7 +3949,7 @@ impl Installer {
         };
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
-        if !self.options.no_save && self.options.package_lock_enabled() {
+        if self.options.package_lock_enabled() {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             crate::fast_path::enrich_lockfile_from_installed_manifests(
                 &mut lockfile,
@@ -3939,7 +3958,7 @@ impl Installer {
             );
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
-            if !self.options.is_global {
+            if !self.options.is_global && !self.options.no_save {
                 lockfile
                     .save_to_file_version(&lockfile_path, self.options.lockfile_version)
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
@@ -3977,7 +3996,7 @@ impl Installer {
                     });
                 }
                 actual_lockfile
-                    .save_hidden(&loc_base_dir)
+                    .save_hidden_with_root_metadata(&loc_base_dir, !self.options.no_save || lockfile_path.exists())
                     .context("Failed to save hidden package-lock.json")?;
             } else {
                 let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");
