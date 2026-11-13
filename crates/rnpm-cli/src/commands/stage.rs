@@ -54,7 +54,8 @@ const STAGE_OTP_OPTIONS: &str = "Options:
 
 Run \"npm help stage\" for more info";
 
-const STAGE_USAGE: &str = "Stage packages for publishing, deferring proof-of-presence (2FA) to a later point in time
+const STAGE_USAGE: &str =
+    "Stage packages for publishing, deferring proof-of-presence (2FA) to a later point in time
 
 Usage:
 npm stage
@@ -176,7 +177,10 @@ fn stage_item_lines(item: &Value) -> Vec<String> {
     let staged_by = match (get("actor"), get("actorType")) {
         (actor, Some(kind)) if !js_string(&kind).is_empty() => Some(Value::String(format!(
             "{} ({})",
-            actor.as_ref().map(js_string).unwrap_or_else(|| "undefined".into()),
+            actor
+                .as_ref()
+                .map(js_string)
+                .unwrap_or_else(|| "undefined".into()),
             js_string(&kind)
         ))),
         (actor, _) => actor,
@@ -192,7 +196,14 @@ fn stage_item_lines(item: &Value) -> Vec<String> {
         ("shasum".into(), get("shasum")),
     ];
     const KNOWN: &[&str] = &[
-        "id", "packageName", "version", "tag", "createdAt", "actor", "actorType", "shasum",
+        "id",
+        "packageName",
+        "version",
+        "tag",
+        "createdAt",
+        "actor",
+        "actorType",
+        "shasum",
         "status",
     ];
     if let Some(obj) = item.as_object() {
@@ -287,25 +298,310 @@ pub(crate) async fn run_stage(
             }
         }
         "approve" => {
-            let usage = otp_usage("Approve a staged package, publishing it to the npm registry", "approve");
+            let usage = otp_usage(
+                "Approve a staged package, publishing it to the npm registry",
+                "approve",
+            );
             let id = require_stage_id(args, &usage)?;
             eprintln!("npm notice Approving staged package {id}");
             client.stage_approve(Some(&registry_url), id, otp).await?;
             println!("Staged package {id} approved and published successfully.");
         }
         "reject" => {
-            let usage = otp_usage("Reject a staged package, removing it from the registry", "reject");
+            let usage = otp_usage(
+                "Reject a staged package, removing it from the registry",
+                "reject",
+            );
             let id = require_stage_id(args, &usage)?;
             eprintln!("npm notice Rejecting staged package {id}");
             eprintln!("npm warn Rejecting will permanently delete this staged publish record and tarball from the registry.");
             client.stage_reject(Some(&registry_url), id, otp).await?;
             println!("Staged package {id} has been rejected.");
         }
+        "download" => {
+            let usage = STAGE_VIEW_USAGE
+                .replace(
+                    "View details of a specific staged package",
+                    "Download the tarball of a staged package for inspection",
+                )
+                .replace("npm stage view", "npm stage download")
+                .replace("\n\naliases: info, show, v", "");
+            let id = require_stage_id(args, &usage)?;
+            let client =
+                super::client_helper::CommandClient::new(current_dir, Some(registry_url.as_str()))?;
+            if !client.silent {
+                eprintln!("npm notice Downloading staged package {id}");
+            }
+            let target = registry_url.join(&format!("-/stage/{id}/tarball"))?;
+            let response = client
+                .request(reqwest::Method::GET, target, None)
+                .send()
+                .await?
+                .error_for_status()?;
+            let bytes = response.bytes().await?;
+            let summary = archive_summary(&bytes)?;
+            if !json && !client.silent {
+                crate::print_pack_notices(&summary);
+            }
+            let filename = format!("{}-{id}.tgz", summary.filename.trim_end_matches(".tgz"));
+            std::fs::write(current_dir.join(&filename), &bytes)?;
+            if json {
+                println!(
+                    "{}",
+                    pretty(&serde_json::json!({summary.name.clone(): summary_json(&summary)}))?
+                );
+            } else {
+                println!("{filename}");
+            }
+        }
+        "publish" => publish(args, registry_url.as_str(), json, current_dir).await?,
         other => {
             return Err(anyhow::anyhow!(
                 "npm error code EUSAGE\nnpm error Unknown subcommand: {other}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn summary_json(summary: &rnpm_fs::PackSummary) -> Value {
+    serde_json::json!({
+        "id":format!("{}@{}",summary.name,summary.version),"name":summary.name,"version":summary.version,
+        "size":summary.package_size,"unpackedSize":summary.unpacked_size,"shasum":summary.shasum,
+        "integrity":summary.integrity,"filename":summary.filename,
+        "files":summary.files.iter().map(|f|serde_json::json!({"path":f.path,"size":f.size,"mode":f.mode})).collect::<Vec<_>>(),
+        "entryCount":summary.entry_count,"bundled":summary.bundled
+    })
+}
+
+fn archive_summary(bytes: &[u8]) -> Result<rnpm_fs::PackSummary> {
+    use rnpm_core::integrity::{Algorithm, Integrity};
+    use std::io::Read;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    let mut files = Vec::new();
+    let mut bundled = Vec::new();
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let raw_path = entry.path()?.to_string_lossy().to_string();
+        let path = raw_path
+            .strip_prefix("package/")
+            .unwrap_or(&raw_path)
+            .to_string();
+        let size = entry.size();
+        let mode = entry.header().mode()?;
+        if path == "package.json" {
+            let mut content = String::new();
+            entry.read_to_string(&mut content)?;
+            manifest = Some(serde_json::from_str::<Value>(&content)?);
+        }
+        if let Some(rest) = path.strip_prefix("node_modules/").filter(|r| !r.is_empty()) {
+            let parts: Vec<_> = rest.split('/').collect();
+            let name = if rest.starts_with('@') && parts.len() > 1 {
+                format!("{}/{}", parts[0], parts[1])
+            } else {
+                parts[0].to_string()
+            };
+            if !bundled.contains(&name) {
+                bundled.push(name);
+            }
+        }
+        files.push(rnpm_fs::PackedFileEntry { path, size, mode });
+    }
+    let manifest = manifest
+        .ok_or_else(|| anyhow::anyhow!("npm error Could not read package.json from tarball"))?;
+    let name = manifest["name"].as_str().unwrap_or_default().to_string();
+    let version = manifest["version"].as_str().unwrap_or_default().to_string();
+    files.sort_by(|a, b| {
+        let upper = |s: &str| s.chars().next().is_some_and(|c| !c.is_lowercase());
+        upper(&b.path)
+            .cmp(&upper(&a.path))
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let shasum = Algorithm::Sha1
+        .compute_digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok(rnpm_fs::PackSummary {
+        filename: rnpm_fs::compute_tarball_filename(&name, &version),
+        name,
+        version,
+        package_size: bytes.len() as u64,
+        unpacked_size: files.iter().map(|f| f.size).sum(),
+        shasum,
+        integrity: Integrity::from_bytes(bytes, Algorithm::Sha512).to_string(),
+        entry_count: files.len(),
+        files,
+        bundled,
+    })
+}
+
+async fn publish(args: &[String], registry: &str, json: bool, current_dir: &Path) -> Result<()> {
+    use rnpm_core::manifest::Manifest;
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let package_dir = current_dir.join(args.first().map(String::as_str).unwrap_or("."));
+    let manifest = Manifest::from_file(package_dir.join("package.json"))?;
+    let ignore = config.get_bool("ignore-scripts").unwrap_or(false);
+    let foreground = config.get_bool("foreground-scripts").unwrap_or(true);
+    let silent = config.get("loglevel") == Some("silent");
+    let dry_run = config.get_bool("dry-run").unwrap_or(false);
+    for event in ["prepublishOnly", "prepack", "prepare"] {
+        crate::run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            event,
+            ignore,
+            foreground,
+            silent,
+            json,
+        )?;
+    }
+    let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)?;
+    crate::run_lifecycle_hook(
+        &package_dir,
+        &manifest,
+        "postpack",
+        ignore,
+        foreground,
+        silent,
+        json,
+    )?;
+    let mut manifest = crate::package_manifest_value(&package_dir)?;
+    let client = super::client_helper::CommandClient::new(current_dir, Some(registry))?;
+    let registry = &client.registry_url;
+    let tag = config
+        .get("tag")
+        .or_else(|| manifest.get("publishConfig")?.get("tag")?.as_str())
+        .unwrap_or("latest")
+        .to_string();
+    let access_value = config
+        .get("access")
+        .or_else(|| manifest.get("publishConfig")?.get("access")?.as_str())
+        .map(str::to_string);
+    let access = access_value.as_deref();
+    if !json && !silent {
+        crate::print_pack_notices(&summary);
+    }
+    if client.auth.is_none() {
+        if !dry_run {
+            anyhow::bail!("npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry}");
+        }
+        if !silent {
+            eprintln!(
+                "npm warn stage This command requires you to be logged in to {registry} (dry-run)"
+            );
+        }
+    }
+    if !silent {
+        eprintln!(
+            "npm notice Staging to {registry} with tag {tag} and {} access{}",
+            access.unwrap_or("default"),
+            if dry_run { " (dry-run)" } else { "" }
+        );
+    }
+    let mut details = summary_json(&summary);
+    let mut stage_id = None;
+    if !dry_run {
+        if manifest.get("readme").is_none() {
+            let readme = std::fs::read_dir(&package_dir)?
+                .flatten()
+                .find(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case("readme.md")
+                })
+                .and_then(|e| std::fs::read_to_string(e.path()).ok())
+                .unwrap_or_else(|| "ERROR: No README data found!".into());
+            manifest["readme"] = readme.into();
+        }
+        let node = std::process::Command::new("node")
+            .arg("--version")
+            .output()?;
+        manifest["_nodeVersion"] = String::from_utf8_lossy(&node.stdout)
+            .trim()
+            .trim_start_matches('v')
+            .into();
+        manifest["_npmVersion"] = crate::version::NPM_VERSION.into();
+        let options = rnpm_registry::PublishPayloadOptions {
+            name: &summary.name,
+            version: &summary.version,
+            description: manifest.get("description").and_then(Value::as_str),
+            tag: &tag,
+            access,
+            manifest: &manifest,
+            tarball: rnpm_registry::PublishTarballData {
+                filename: &summary.filename,
+                bytes: &bytes,
+                shasum: &summary.shasum,
+                integrity: &summary.integrity,
+            },
+            registry_url: registry,
+            provenance_attestation: None,
+        };
+        let mut payload = rnpm_registry::create_publish_payload(&options);
+        if manifest.get("description").is_none() {
+            payload.as_object_mut().unwrap().remove("description");
+        }
+        payload["access"] = access.map(Value::from).unwrap_or(Value::Null);
+        if let Some(attachments) = payload["_attachments"].as_object_mut() {
+            for attachment in attachments.values_mut() {
+                attachment.as_object_mut().unwrap().remove("shasum");
+                attachment.as_object_mut().unwrap().remove("integrity");
+            }
+        }
+        let target = registry.join(&format!(
+            "-/stage/package/{}",
+            rnpm_config::encode_package_name(&summary.name)
+        ))?;
+        let response = client
+            .request(reqwest::Method::POST, target, None)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        stage_id = response
+            .get("stageId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(id) = &stage_id {
+            details["stageId"] = id.clone().into();
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            pretty(&serde_json::json!({summary.name.clone():details}))?
+        );
+    }
+    let updated = Manifest::from_file(package_dir.join("package.json"))?;
+    for event in ["publish", "postpublish"] {
+        crate::run_lifecycle_hook(
+            &package_dir,
+            &updated,
+            event,
+            ignore,
+            foreground,
+            silent,
+            json,
+        )?;
+    }
+    if !json && !silent {
+        println!(
+            "+ {}@{} (staged{})",
+            summary.name,
+            summary.version,
+            stage_id
+                .map(|id| format!(" with id {id}"))
+                .unwrap_or_default()
+        );
+        eprintln!(
+            "npm notice stage package {}@{} has been staged with tag {tag}",
+            summary.name, summary.version
+        );
     }
     Ok(())
 }
@@ -320,7 +616,14 @@ fn split_spec(spec: &str) -> (String, String) {
     match at {
         Some(i) => {
             let raw = &spec[i + 1..];
-            (spec[..i].to_string(), if raw.is_empty() { "*".into() } else { raw.into() })
+            (
+                spec[..i].to_string(),
+                if raw.is_empty() {
+                    "*".into()
+                } else {
+                    raw.into()
+                },
+            )
         }
         None => (spec.to_string(), "*".into()),
     }
@@ -345,14 +648,20 @@ pub(super) fn trust_body_to_options(body: &Value) -> Vec<(String, Value)> {
             put("environment", claim("environment"));
         }
         Some("gitlab") => {
-            put("file", claim("ci_config_ref_uri").and_then(|w| w.get("file")));
+            put(
+                "file",
+                claim("ci_config_ref_uri").and_then(|w| w.get("file")),
+            );
             put("project", claim("project_path"));
             put("environment", claim("environment"));
         }
         Some("circleci") => {
             put("orgId", claim("oidc.circleci.com/org-id"));
             put("projectId", claim("oidc.circleci.com/project-id"));
-            put("pipelineDefinitionId", claim("oidc.circleci.com/pipeline-definition-id"));
+            put(
+                "pipelineDefinitionId",
+                claim("oidc.circleci.com/pipeline-definition-id"),
+            );
             put("vcsOrigin", claim("oidc.circleci.com/vcs-origin"));
             put("contextIds", claim("oidc.circleci.com/context-ids"));
         }
@@ -529,7 +838,10 @@ mod tests {
             "claims": {"repository": "o/r", "workflow_ref": {"file": "ci.yml"}},
             "permissions": ["createPackage", "createStagedPackage"]
         });
-        let keys: Vec<String> = trust_body_to_options(&body).into_iter().map(|(k, _)| k).collect();
+        let keys: Vec<String> = trust_body_to_options(&body)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(keys, ["id", "type", "file", "repository"]);
         assert_eq!(
             format_permissions(body.get("permissions")).as_deref(),

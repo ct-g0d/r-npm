@@ -39,6 +39,7 @@ const server=http.createServer((req,res)=>{
   const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{let body=Buffer.concat(chunks);if(req.headers['content-encoding']==='gzip')body=gunzipSync(body);if(body.length){try{request.body=JSON.parse(body.toString());}catch{request.body=body.toString();}}});
   const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
   if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
+  if(url===`/-/stage/${STAGE_ID}/tarball`){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get('/dep-1.0.0.tgz'));return;}
   if(url==='/-/ping')return json({});
   if(url.includes('/security/advisories/bulk'))return json({});
   if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
@@ -47,6 +48,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/auth/done'){if(authPolls++===0){res.setHeader('retry-after','0.01');return json({},202);}return json({token:'mock-login-token'});}
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
   if(url.endsWith('/trust')&&req.method==='POST'){req.on('end',()=>json(request.body.map((item,i)=>({id:`created-${i+1}`,...item}))));return;}
+  if(url.startsWith('/-/stage/package/')&&req.method==='POST')return json({stageId:STAGE_ID});
   if(req.method==='PUT'||req.method==='DELETE'||req.method==='POST')return json({ok:true});
   if(url==='/-/user/mock-user/package')return json({});
   if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
@@ -167,6 +169,8 @@ for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
   for(const [name,extra] of [['create',['--yes']],['create-json',['--yes','--json']],['dry-run',['--dry-run']]])add(`trust-create-${provider}-${name}`,'trust',['trust',provider,'dep',...flags,'--allow-publish','--allow-stage-publish',...extra],undefined,{auth:true});
 }
+for(const [name,args] of [['download',['download',STAGE_ID]],['download-json',['download',STAGE_ID,'--json']],['download-missing',['download']],['download-invalid',['download','nope']]])add(`stage-${name}`,'stage',['stage',...args],undefined,{auth:true});
+for(const [name,flags] of [['publish',['--ignore-scripts']],['publish-json',['--ignore-scripts','--json']],['publish-dry-run',['--dry-run','--ignore-scripts']],['publish-dry-run-json',['--dry-run','--ignore-scripts','--json']]])add(`stage-${name}`,'stage',['stage','publish',...flags],undefined,{auth:true});
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
 add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});

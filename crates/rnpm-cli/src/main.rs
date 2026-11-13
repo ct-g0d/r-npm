@@ -5627,7 +5627,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             otp,
             json,
-        } if action.as_deref() != Some("publish") && action.as_deref() != Some("download") => {
+        } => {
             commands::stage::run_stage(
                 action.as_deref(),
                 &args,
@@ -5637,65 +5637,6 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 &current_dir,
             )
             .await?;
-        }
-        Commands::Stage {
-            action,
-            args,
-            registry,
-            otp,
-            json: _,
-        } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = match action.as_deref().unwrap_or("list") {
-                "list" | "ls" => client.stage_list(Some(&registry_url)).await?,
-                "view" | "show" => {
-                    client
-                        .stage_view(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage view <stage-id>"
-                                )
-                            })?,
-                        )
-                        .await?
-                }
-                "approve" => {
-                    client
-                        .stage_approve(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage approve <stage-id>"
-                                )
-                            })?,
-                            otp.as_deref(),
-                        )
-                        .await?
-                }
-                "reject" | "delete" => {
-                    client
-                        .stage_reject(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage reject <stage-id>"
-                                )
-                            })?,
-                            otp.as_deref(),
-                        )
-                        .await?;
-                    serde_json::Value::Null
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error unknown stage command: {other}"
-                    ))
-                }
-            };
-            if !value.is_null() {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
         }
         Commands::InstallCiTest { args } => {
             commands::install_test::run_install_ci_test(args, current_dir).await?;
