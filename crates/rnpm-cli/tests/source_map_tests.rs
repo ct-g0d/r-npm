@@ -49,7 +49,7 @@ fn test_source_map_01_cli_dispatch() {
 
     // Test unsupported flag
     let out = Command::new(rnpm_bin)
-        .args(["install", "--save-bundle"])
+        .args(["pack", "--legacy-peer-deps"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
