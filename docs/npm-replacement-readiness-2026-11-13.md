@@ -1,27 +1,29 @@
 # npm replacement readiness, 2026-11-13
 
-Verdict: the measured everyday workflows are substantially closer to npm, but rnpm is not a verified universal npm replacement. The final Windows sweep has 131/139 exact normalized matches. Keep npm available for the remaining differences and unverified workflows.
+Verdict: the final Windows release gate has **194/194 exact normalized matches**. This establishes parity for the registered probes; rnpm is not a verified universal npm replacement. Keep npm available for the incomplete and unverified workflows listed below.
 
 ## Provenance and reproduction
 
-Base: `4f2735de15fb66b09d0136cc5b91959acc07d4e8`. Implementation source for the measured candidate: `fda973c9c7b671b03efaecf3fd19b5eb6a16235b`; subsequent source changes only correct test expectations. Oracle: npm 11.20.0, Node v26.13.0, Windows. Candidate uses the debug build produced by Cargo tests; the original baseline is a release build compiled before implementation edits. These are correctness comparisons, not timings.
+Implementation head: `cdbf51a626389ab62f9af780c64a4049e66eaa01`. The final report was generated after a successful `cargo build --release`, from a clean tracked source tree (report source_dirty: false). Documentation and generated evidence are committed afterward. Oracle: npm 11.20.0, Node v26.13.0, Windows. These are correctness comparisons, not performance measurements.
 
-- Baseline executable SHA-256: `acf9a4a040161e8bc6284f614093cd391323667944a0f441956e65ad5ea1ce9f`.
-- Candidate executable SHA-256: `d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1`.
+- Release executable SHA-256: `eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d`.
+- Raw fixture and log root: `C:\Users\CHARL_~1\AppData\Local\Temp\rnpm-replacement-xfbEJn` (local temporary evidence).
+- [Final behavioral evidence](npm-replacement-results-2026-11-13.json).
+- [Historical baseline](npm-replacement-baseline-2026-11-13.json): 63/139; the final suite adds 55 probes and is larger than that baseline.
 
 ```powershell
-cargo test --workspace -j 4 -- --test-threads=1
-cargo clippy --workspace --all-targets -j 4 -- -D warnings
-node scripts/check-npm-replacement.mjs --binary target/debug/rnpm.exe --output docs/npm-replacement-results-2026-11-13.json
-Write-Output "success=$? exit=$LASTEXITCODE"
+cargo build --release
+node scripts/check-npm-replacement.mjs --output docs/npm-replacement-results-2026-11-13.json
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 node scripts/generate-npm-command-coverage.mjs
 ```
 
-Both comparison runs returned `$? = False`, `$LASTEXITCODE = 1`. The gate rejects any failed execution, exit mismatch, normalized stream mismatch, project/configuration file mismatch, or PUT/DELETE mutation mismatch. It also rejects an empty or incomplete run. No mismatch was skipped or converted into a pass.
+The final gate exits 0. It rejects execution failures, exit mismatches, any normalized stdout/stderr mismatch, project/userconfig file mismatches, and POST/PUT/DELETE request-body differences. It also rejects an empty or incomplete run. No case is skipped or converted into a pass.
 
-Every command runs in sibling isolated projects with separate user/global configuration, prefix, cache and store. Registry fixtures use loopback HTTP and a synthetic token. Publishing is dry-run only; administrative mutations target only the mock. Full raw streams remain in each report's `root/logs` directory. The checked-in reports retain normalized stream hashes, output excerpts, JSON file contents, non-JSON file hashes, request bodies and comparison dimensions. Outputs over 16KB are excerpted only after comparing and hashing the complete streams.
+Each command runs in sibling isolated projects with separate user/global configuration, prefix, cache and store. Registry probes use loopback HTTP with synthetic credentials. Stage upload and trusted-publisher creation mutate only the mock. The gate retains normalized streams, hashes, file snapshots, registry requests and comparisons; raw streams remain under the printed temporary root. Long streams are excerpted only after comparing and hashing the complete output.
 
-Normalization covers fixture/configuration paths, JSON escaping of those paths, loopback origins, CRLF, elapsed summary/ping times, and diagnostic-log timestamps. JSON file key order is ignored; fields are retained. stderr is compared without suppressing npm diagnostic footers. Cache/store contents and empty-directory presence are not compared.
+Normalization covers fixture/configuration paths and JSON escaping, loopback origins, CRLF, elapsed summary/ping times, generated diagnostic-log timestamps, generated UUIDs and millisecond UTC timestamps, and the npm installation root. Couch authentication request dates are normalized after checking the ISO timestamp shape. JSON file key order is ignored; fields remain present. stderr is compared without suppressing diagnostic footers. Cache/store contents and empty-directory presence are not compared.
 
 ## Fixed behavior
 
@@ -34,18 +36,28 @@ Normalization covers fixture/configuration paths, JSON escaping of those paths, 
 
 Rust regressions include [replacement_gaps_test.rs](../crates/rnpm-cli/tests/replacement_gaps_test.rs), existing pack/cache/script-policy/star/unpublish tests, filesystem tests, and installer save/workspace/lifecycle tests. Existing ASCII tree assertions now select Unicode=false explicitly; Unicode output is independently compared with npm. Outdated assertions retain the same version checks while expecting npm's directory-based dependent name.
 
+
+Additional completed work in this continuation:
+
+- [Doctor](../crates/rnpm-cli/src/doctor.rs): verified the WIP release build, retained doctor perf, removed the dead custom standard report, and compared connection, registry, environment and unknown groups with npm.
+- [Authentication](../crates/rnpm-cli/src/commands/login.rs), [dispatch](../crates/rnpm-cli/src/main.rs): distinct login/adduser web payloads, login URL output, pending doneUrl polling, canonical npmjs done-host rebasing, HTTP 4xx/500 legacy fallback, stdin username/password/email prompts, couch conflict retry, token cleanup and configured userconfig persistence. Eight login/adduser probes changed from DIFF to MATCH. No real credentials were used.
+- [Trust creation](../crates/rnpm-cli/src/commands/trust.rs): GitHub/GitLab/CircleCI claim bodies, permission selection, text/JSON output, dry-run, repository inference and confirmation. Nine create/JSON/dry-run probes changed from DIFF to MATCH.
+- [Stage](../crates/rnpm-cli/src/commands/stage.rs): download summaries and archive bytes, missing/invalid IDs, directory stage publish uploads, JSON stage IDs and dry-run output. Eight probes changed from DIFF to MATCH.
+- [Registry cache](../crates/rnpm-install/src/lib.rs): removed the invented 300-second freshness assumption when HTTP freshness headers have not been stored. Unlocked packuments revalidate by ETag unless offline/prefer-offline is requested. This can increase metadata requests; performance was not remeasured.
+- [Audit](../crates/rnpm-cli/src/audit.rs): empty inventories make no advisory POST, matching npm. POST comparison exposed this difference.
+- [List](../crates/rnpm-cli/src/list.rs): retain required on the first missing dependency, matching npm's breadth-first seenNodes behavior. The new single-missing probe failed before the fix; all 20 listing probes now match.
+- [Tests](../crates/rnpm-cli/tests): outdated uses loopback metadata and compares npm's actual dependent name. Doctor/auth/script-log expectations follow npm. SBOM tests require explicit formats and lock-only mode for lockfile fixtures, compare complete oracle documents, and retain actual-tree missing-dependency errors. Only generated document UUIDs/timestamps and diagnostic-log filenames vary.
+
 ## Probe and command coverage results
 
-| Measurement | Baseline | Candidate |
+| Measurement | Historical baseline | Final release |
 |---|---:|---:|
-| Matching behavioral probes | 63/139 | 131/139 |
-| Mismatches closed | - | 68 |
+| Matching behavioral probes | 63/139 | 194/194 |
+| Remaining DIFFs | 76 | 0 |
 
-Command classifications from the same behavioral report: **64 matching, 9 partial, 0 missing**, out of 73 tracked canonical/legacy entries. [Coverage matrix](npm-command-coverage.md) and [raw coverage](npm-command-coverage-raw.json) are generated together. Matching classifies the registered probes; it does not establish complete command semantics or a completion percentage.
+Generated command classifications: **71 matching, 2 partial, 0 missing**, out of 73 tracked canonical/legacy entries. [Coverage matrix](npm-command-coverage.md) and [raw coverage](npm-command-coverage-raw.json) use this final report. Matching is a probe classification, not a completion percentage; negative-only commands remain partial even when their observed errors match.
 
-[Baseline evidence](npm-replacement-baseline-2026-11-13.json), [candidate evidence](npm-replacement-results-2026-11-13.json). The changed-packument cache probe and URL/file source-shadowing probes already matched the baseline; they are verified existing behavior, not new fixes. Git source shadowing now matches.
-
-| Probe | npm exit | rnpm exit | Result | Remaining differing observations | Baseline |
+| Probe | npm exit | rnpm exit | Result | Differing observations | Historical baseline |
 |---|---:|---:|---|---|---|
 | pack-explicit-file-vs-root-ignore | 0 | 0 | match |  | mismatch |
 | pack-nested-ignore | 0 | 0 | match |  | mismatch |
@@ -102,6 +114,7 @@ Command classifications from the same behavioral report: **64 matching, 9 partia
 | ls-complete--json | 0 | 0 | match |  | match |
 | ls-complete--all | 0 | 0 | match |  | mismatch |
 | ls-complete--all---json | 0 | 0 | match |  | match |
+| ls-single-missing-json | 1 | 1 | match |  | not probed |
 | ls-only-extraneous | 0 | 0 | match |  | mismatch |
 | ls-only-extraneous--json | 0 | 0 | match |  | mismatch |
 | ls-only-extraneous--all---json | 0 | 0 | match |  | mismatch |
@@ -132,7 +145,7 @@ Command classifications from the same behavioral report: **64 matching, 9 partia
 | command-find-dupes | 0 | 0 | match |  | mismatch |
 | command-shrinkwrap | 0 | 0 | match |  | match |
 | command-query | 0 | 0 | match |  | match |
-| command-sbom | 0 | 1 | partial | exit, stdout, stderr | mismatch |
+| command-sbom | 0 | 0 | match |  | mismatch |
 | command-start | 0 | 0 | match |  | match |
 | command-stop | 0 | 0 | match |  | match |
 | command-restart | 0 | 0 | match |  | match |
@@ -163,20 +176,74 @@ Command classifications from the same behavioral report: **64 matching, 9 partia
 | registry-star | 0 | 0 | match |  | mismatch |
 | registry-unstar | 0 | 0 | match |  | mismatch |
 | registry-stars | 0 | 0 | match |  | mismatch |
-| registry-stage | 0 | 0 | partial | stdout | mismatch |
-| registry-trust | 0 | 0 | partial | stdout | mismatch |
-| registry-login | 1 | 1 | partial | stdout, stderr | mismatch |
-| registry-adduser | 1 | 1 | partial | stdout, stderr | mismatch |
+| registry-stage | 0 | 0 | match |  | mismatch |
+| registry-trust | 0 | 0 | match |  | mismatch |
+| registry-login | 1 | 1 | match |  | mismatch |
+| registry-adduser | 1 | 1 | match |  | mismatch |
+| registry-login-web-success | 0 | 0 | match |  | not probed |
+| registry-login-legacy-couch-success | 0 | 0 | match |  | not probed |
+| registry-login-web-couch-success | 0 | 0 | match |  | not probed |
+| registry-adduser-web-success | 0 | 0 | match |  | not probed |
+| registry-adduser-legacy-couch-success | 0 | 0 | match |  | not probed |
+| registry-adduser-web-couch-success | 0 | 0 | match |  | not probed |
 | command-approve-scripts | 0 | 0 | match |  | mismatch |
 | command-deny-scripts | 0 | 0 | match |  | match |
 | command-install-scripts | 0 | 0 | match |  | mismatch |
 | command-set | 0 | 0 | match |  | match |
 | command-set-script | 1 | 1 | match |  | match |
-| command-completion | 1 | 1 | partial | stderr | mismatch |
-| command-help | 0 | 0 | partial | stdout | mismatch |
+| command-completion | 1 | 1 | match |  | mismatch |
+| command-help | 0 | 0 | match |  | mismatch |
 | command-help-search | 0 | 0 | match |  | match |
-| command-doctor | 0 | 0 | partial | stdout | mismatch |
+| command-doctor | 0 | 0 | match |  | mismatch |
+| doctor-registry | 1 | 1 | match |  | not probed |
+| doctor-environment | 1 | 1 | match |  | not probed |
+| doctor-unknown | 0 | 0 | match |  | not probed |
+| sbom-populated-spdx | 0 | 0 | match |  | not probed |
+| sbom-populated-cyclonedx | 0 | 0 | match |  | not probed |
+| sbom-populated-cyclonedx-application | 0 | 0 | match |  | not probed |
+| sbom-populated-omit-dev | 0 | 0 | match |  | not probed |
+| sbom-populated-lock-only | 0 | 0 | match |  | not probed |
+| sbom-missing-format | 1 | 1 | match |  | not probed |
+| sbom-lock-only-without-lock | 1 | 1 | match |  | not probed |
+| sbom-missing-dependency | 1 | 1 | match |  | not probed |
+| stage-list | 0 | 0 | match |  | not probed |
+| stage-list-json | 0 | 0 | match |  | not probed |
+| stage-list-filter-empty | 0 | 0 | match |  | not probed |
+| stage-list-version-spec | 1 | 1 | match |  | not probed |
+| stage-bare | 1 | 1 | match |  | not probed |
+| stage-view | 0 | 0 | match |  | not probed |
+| stage-view-json | 0 | 0 | match |  | not probed |
+| stage-view-missing-id | 1 | 1 | match |  | not probed |
+| stage-view-invalid-id | 1 | 1 | match |  | not probed |
+| stage-approve | 0 | 0 | match |  | not probed |
+| stage-reject | 0 | 0 | match |  | not probed |
+| stage-approve-missing-id | 1 | 1 | match |  | not probed |
+| trust-list | 0 | 0 | match |  | not probed |
+| trust-list-json | 0 | 0 | match |  | not probed |
+| trust-list-empty | 0 | 0 | match |  | not probed |
+| trust-list-from-manifest | 0 | 0 | match |  | not probed |
+| trust-revoke | 0 | 0 | match |  | not probed |
+| trust-revoke-dry-run | 0 | 0 | match |  | not probed |
+| trust-revoke-missing-id | 1 | 1 | match |  | not probed |
+| trust-bare | 1 | 1 | match |  | not probed |
 | command-diff | 0 | 0 | match |  | mismatch |
+| trust-create-github-create | 0 | 0 | match |  | not probed |
+| trust-create-github-create-json | 0 | 0 | match |  | not probed |
+| trust-create-github-dry-run | 0 | 0 | match |  | not probed |
+| trust-create-gitlab-create | 0 | 0 | match |  | not probed |
+| trust-create-gitlab-create-json | 0 | 0 | match |  | not probed |
+| trust-create-gitlab-dry-run | 0 | 0 | match |  | not probed |
+| trust-create-circleci-create | 0 | 0 | match |  | not probed |
+| trust-create-circleci-create-json | 0 | 0 | match |  | not probed |
+| trust-create-circleci-dry-run | 0 | 0 | match |  | not probed |
+| stage-download | 0 | 0 | match |  | not probed |
+| stage-download-json | 0 | 0 | match |  | not probed |
+| stage-download-missing | 1 | 1 | match |  | not probed |
+| stage-download-invalid | 1 | 1 | match |  | not probed |
+| stage-publish | 0 | 0 | match |  | not probed |
+| stage-publish-json | 0 | 0 | match |  | not probed |
+| stage-publish-dry-run | 0 | 0 | match |  | not probed |
+| stage-publish-dry-run-json | 0 | 0 | match |  | not probed |
 | populated-install | 0 | 0 | match |  | match |
 | populated-ci | 0 | 0 | match |  | match |
 | populated-uninstall | 0 | 0 | match |  | match |
@@ -189,26 +256,20 @@ Command classifications from the same behavioral report: **64 matching, 9 partia
 
 ## Remaining measured differences
 
-- `command-sbom`: npm emits an SBOM without a public lockfile; rnpm requires one.
-- `registry-stage`: npm emits the collected items array; rnpm emits the pagination envelope.
-- `registry-trust`: empty trust-list output differs in JSON mode.
-- `registry-login`: npm falls back to a username prompt on this mock; rnpm requires an environment token.
-- `registry-adduser`: same interactive/authentication limitation as login.
-- `command-completion`: Windows unsupported-command diagnostic/log-footer behavior differs.
-- `command-help`: command listing and configuration/version footer differ.
-- `command-doctor`: npm runs the requested connection check; rnpm prints its broader environment diagnostic.
+None in the final 194-probe Windows suite.
 
-## Validation and limits
+The first full release sweep in this continuation was 174/176 (exit 1): stale changing-packument metadata and an unnecessary empty-audit POST. Both causes were fixed, then verified in focused probes and the final expanded suite.
 
-- `cargo test --workspace -j 4 -- --test-threads=1`: exit 101. It stops at `crates/rnpm-cli/tests/npm_parity_outdated_test.rs::test_outdated_column_layout_and_json_parity` (line 34). The table golden still expects dependent `test-pkg`; actual npm-compatible output uses the temporary project directory name. This failure is retained, not skipped. Later workspace test binaries were not run after this failure.
-- `cargo clippy --workspace --all-targets -j 4 -- -D warnings`: exit 0, zero warnings.
-- Focused replacement regressions: 6 passed; filesystem crate tests: 89 passed. Earlier focused cache, script-policy, star and unpublish tests also passed. These focused results do not substitute for the failed complete workspace run.
-- The baseline and final behavioral gates both exit 1: 63/139 and 131/139 matches respectively. The remaining failures are retained above.
-- The repository isolation checker could not run because this host disables PowerShell script execution. Its self-test and scan are not reported as passed.
-- All implementation targets compiled through Cargo test/check. A final release rebuild and lane4 rerun were not performed during wrap-up. The PR is a draft and is not ready to merge.
+## Validation and unfinished work
 
-No performance optimization or lane4 benchmark was attempted. The historical [lane4 evidence](../benchmarks/results/lane4-after-shutdown-fix-2026-11-13.json) reported 1.33x cold CI; it does not measure this candidate, and the 2x target remains unproven.
+- `cargo build --release`: exit 0; final gate uses that executable.
+- `cargo test --workspace`: exit 0; **1,037 passed, 0 failed, 1 existing ignored benchmark** (`bench_fetch_matrix`). All workspace test binaries and doc-tests completed. Earlier failures were investigated and fixed, not skipped; the final invocation has no filters.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0, zero warnings.
+- Final differential gate: **194/194**, exit 0.
+- Interactive terminal/browser launching and OTP exchanges are not fully ported or verified. Reusing saved username/password prompt defaults is incomplete. Web and legacy non-TTY exchanges are verified only against the mock.
+- Stage publish coverage is directory-based. Remote package/tarball specs, provenance and complete publish-time validation still need work; these probes do not establish full npm publish semantics.
+- Doctor version checks and POSIX permissions/cache verification need broader coverage; this host verifies the requested Windows groups only.
+- Real private registries, real trusted-publisher/OIDC exchanges, real publication and cross-platform behavior remain unverified. The draft PR has no approving review; GitHub checks were pending at wrap-up.
+- The 100-project replacement corpus and performance gates were not run. The historical lane4 1.33x cold result is not a measurement of this candidate; the 2x target remains unproven.
 
-Real private-registry authentication, browser/TTY/OTP login, OIDC/trusted publishing, actual publication, the 100-project corpus, all archive-pattern edge cases, and non-Windows behavior remain unverified. The npx-style probe exercises exec semantics; it does not establish a separately installed drop-in npx launcher. Cross-platform CI and review are pending on the draft PR.
-
-The user stopped implementation at this point. No further compatibility or performance work is running.
+Implementation stopped at the user's time limit. No additional compatibility work was started during wrap-up.

@@ -29,14 +29,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "adduser",
     "aliases": "add-user",
-    "status": "partial",
-    "diffs": "registry-adduser: stdout, stderr; No successful operation demonstrated (negative/unsupported/interactive probe only)",
-    "checkMethod": "adduser --auth-type=web",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "adduser --auth-type=web; adduser --auth-type=web --browser=false; adduser --auth-type=legacy; adduser --auth-type=web",
     "probes": [
       {
         "name": "registry-adduser",
@@ -46,19 +46,74 @@
         ],
         "npmExit": 1,
         "rnpmExit": 1,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
-          "stderr": false,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-web-success",
+        "args": [
+          "adduser",
+          "--auth-type=web",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-legacy-couch-success",
+        "args": [
+          "adduser",
+          "--auth-type=legacy"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-web-couch-success",
+        "args": [
+          "adduser",
+          "--auth-type=web"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
           "files": true,
           "mutations": true
         }
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "approve-scripts",
@@ -87,7 +142,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "audit",
@@ -134,7 +189,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "bugs",
@@ -163,7 +218,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "cache",
@@ -229,7 +284,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ci",
@@ -292,13 +347,13 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "completion",
     "aliases": "",
     "status": "partial",
-    "diffs": "command-completion: stderr; No successful operation demonstrated (negative/unsupported/interactive probe only)",
+    "diffs": "No successful operation demonstrated (negative/unsupported/interactive probe only)",
     "checkMethod": "completion",
     "probes": [
       {
@@ -308,19 +363,19 @@
         ],
         "npmExit": 1,
         "rnpmExit": 1,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
           "stdout": true,
-          "stderr": false,
+          "stderr": true,
           "files": true,
           "mutations": true
         }
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "config",
@@ -350,7 +405,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "dedupe",
@@ -378,7 +433,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "deny-scripts",
@@ -407,7 +462,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "deprecate",
@@ -437,7 +492,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "diff",
@@ -467,7 +522,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "dist-tag",
@@ -497,7 +552,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "docs",
@@ -526,14 +581,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "doctor",
     "aliases": "",
-    "status": "partial",
-    "diffs": "command-doctor: stdout",
-    "checkMethod": "doctor connection",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "doctor connection; doctor registry; doctor environment; doctor unknown",
     "probes": [
       {
         "name": "command-doctor",
@@ -543,11 +598,65 @@
         ],
         "npmExit": 0,
         "rnpmExit": 0,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-registry",
+        "args": [
+          "doctor",
+          "registry"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-environment",
+        "args": [
+          "doctor",
+          "environment"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-unknown",
+        "args": [
+          "doctor",
+          "unknown"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
           "stderr": true,
           "files": true,
           "mutations": true
@@ -555,7 +664,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "edit",
@@ -585,7 +694,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "exec",
@@ -614,7 +723,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "explain",
@@ -644,7 +753,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "explore",
@@ -677,7 +786,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "find-dupes",
@@ -705,7 +814,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "fund",
@@ -752,7 +861,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "get",
@@ -781,13 +890,13 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "help",
     "aliases": "hlep",
-    "status": "partial",
-    "diffs": "command-help: stdout",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
     "checkMethod": "help",
     "probes": [
       {
@@ -797,11 +906,11 @@
         ],
         "npmExit": 0,
         "rnpmExit": 0,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
+          "stdout": true,
           "stderr": true,
           "files": true,
           "mutations": true
@@ -809,7 +918,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "help-search",
@@ -838,7 +947,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "init",
@@ -868,14 +977,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install",
     "aliases": "add, i, in, ins, inst, insta, instal, isnt, isnta, isntal, isntall",
     "status": "matching",
     "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
-    "checkMethod": "install --ignore-scripts; install; install dep@1.0.0; install dep@1.0.0 --ignore-scripts -w a; install dep@1.0.0 --ignore-scripts --workspace=a; install dep@1.0.0 --ignore-scripts -wa; install dep@1.0.0 --ignore-scripts -w ./packages/a; install dep@1.0.0 --ignore-scripts -w packages/a; install dep@1.0.0 --ignore-scripts -w packages; install dep@1.0.0 --ignore-scripts -w a --workspace b; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts --save-prefix=~; install dep@1.0.0 --ignore-scripts --save-exact; install dep@~1.0.0 --ignore-scripts; install dep@next --ignore-scripts; install aliased@npm:dep@1.0.0 --ignore-scripts; install http://127.0.0.1:52402/dep-1.0.0.tgz --ignore-scripts; install ./dep.tgz --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-Iw5PNn/git-dependency --ignore-scripts; install aliased@npm:dep@~1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install changing --ignore-scripts; install --ignore-scripts",
+    "checkMethod": "install --ignore-scripts; install; install dep@1.0.0; install dep@1.0.0 --ignore-scripts -w a; install dep@1.0.0 --ignore-scripts --workspace=a; install dep@1.0.0 --ignore-scripts -wa; install dep@1.0.0 --ignore-scripts -w ./packages/a; install dep@1.0.0 --ignore-scripts -w packages/a; install dep@1.0.0 --ignore-scripts -w packages; install dep@1.0.0 --ignore-scripts -w a --workspace b; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts --save-prefix=~; install dep@1.0.0 --ignore-scripts --save-exact; install dep@~1.0.0 --ignore-scripts; install dep@next --ignore-scripts; install aliased@npm:dep@1.0.0 --ignore-scripts; install http://127.0.0.1:53724/dep-1.0.0.tgz --ignore-scripts; install ./dep.tgz --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-xfbEJn/git-dependency --ignore-scripts; install aliased@npm:dep@~1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install changing --ignore-scripts; install --ignore-scripts",
     "probes": [
       {
         "name": "empty-install-hidden-lock",
@@ -1197,7 +1306,7 @@
         "name": "save-url",
         "args": [
           "install",
-          "http://127.0.0.1:52402/dep-1.0.0.tgz",
+          "http://127.0.0.1:53724/dep-1.0.0.tgz",
           "--ignore-scripts"
         ],
         "npmExit": 0,
@@ -1289,7 +1398,7 @@
         "name": "save-git",
         "args": [
           "install",
-          "git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-Iw5PNn/git-dependency",
+          "git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-xfbEJn/git-dependency",
           "--ignore-scripts"
         ],
         "npmExit": 0,
@@ -1400,7 +1509,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-ci-test",
@@ -1428,7 +1537,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-scripts",
@@ -1457,7 +1566,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-test",
@@ -1485,7 +1594,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "link",
@@ -1514,7 +1623,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ll",
@@ -1543,14 +1652,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "login",
     "aliases": "",
-    "status": "partial",
-    "diffs": "registry-login: stdout, stderr; No successful operation demonstrated (negative/unsupported/interactive probe only)",
-    "checkMethod": "login --auth-type=web",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "login --auth-type=web; login --auth-type=web --browser=false; login --auth-type=legacy; login --auth-type=web",
     "probes": [
       {
         "name": "registry-login",
@@ -1560,19 +1669,74 @@
         ],
         "npmExit": 1,
         "rnpmExit": 1,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
-          "stderr": false,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-web-success",
+        "args": [
+          "login",
+          "--auth-type=web",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-legacy-couch-success",
+        "args": [
+          "login",
+          "--auth-type=legacy"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-web-couch-success",
+        "args": [
+          "login",
+          "--auth-type=web"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
           "files": true,
           "mutations": true
         }
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "logout",
@@ -1600,14 +1764,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ls",
     "aliases": "list",
     "status": "matching",
     "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
-    "checkMethod": "ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all --json",
+    "checkMethod": "ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls --json; ls; ls --json; ls --all --json",
     "probes": [
       {
         "name": "ls-missing",
@@ -1898,6 +2062,24 @@
         }
       },
       {
+        "name": "ls-single-missing-json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
         "name": "ls-only-extraneous",
         "args": [
           "ls"
@@ -1953,7 +2135,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "org",
@@ -1984,7 +2166,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "outdated",
@@ -2031,7 +2213,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "owner",
@@ -2061,7 +2243,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "pack",
@@ -2172,7 +2354,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ping",
@@ -2201,7 +2383,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "pkg",
@@ -2231,7 +2413,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "prefix",
@@ -2259,7 +2441,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "profile",
@@ -2289,7 +2471,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "prune",
@@ -2317,7 +2499,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "publish",
@@ -2348,7 +2530,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "query",
@@ -2377,7 +2559,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "rebuild",
@@ -2405,7 +2587,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "repo",
@@ -2434,7 +2616,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "restart",
@@ -2462,7 +2644,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "root",
@@ -2490,7 +2672,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "run",
@@ -2659,14 +2841,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "sbom",
     "aliases": "",
-    "status": "partial",
-    "diffs": "command-sbom: exit, stdout, stderr; No successful operation demonstrated (negative/unsupported/interactive probe only)",
-    "checkMethod": "sbom --sbom-format=cyclonedx",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "sbom --sbom-format=cyclonedx; sbom --sbom-format=spdx; sbom --sbom-format=cyclonedx; sbom --sbom-format=cyclonedx --sbom-type=application; sbom --sbom-format=spdx --omit=dev; sbom --sbom-format=cyclonedx --package-lock-only; sbom; sbom --sbom-format=spdx --package-lock-only; sbom --sbom-format=spdx",
     "probes": [
       {
         "name": "command-sbom",
@@ -2675,20 +2857,167 @@
           "--sbom-format=cyclonedx"
         ],
         "npmExit": 0,
-        "rnpmExit": 1,
-        "match": false,
+        "rnpmExit": 0,
+        "match": true,
         "comparison": {
           "execution": true,
-          "exit": false,
-          "stdout": false,
-          "stderr": false,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-spdx",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-cyclonedx",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-cyclonedx-application",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx",
+          "--sbom-type=application"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-omit-dev",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx",
+          "--omit=dev"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-lock-only",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx",
+          "--package-lock-only"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-missing-format",
+        "args": [
+          "sbom"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-lock-only-without-lock",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx",
+          "--package-lock-only"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-missing-dependency",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
           "files": true,
           "mutations": true
         }
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "search",
@@ -2718,7 +3047,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "set",
@@ -2748,7 +3077,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "shrinkwrap",
@@ -2776,14 +3105,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stage",
     "aliases": "",
-    "status": "partial",
-    "diffs": "registry-stage: stdout",
-    "checkMethod": "stage list dep --json",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "stage list dep --json; stage list; stage list --json; stage list empty-pkg; stage list dep@1; stage; stage view 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage view 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --json; stage view; stage view nope; stage approve 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage reject 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage approve; stage download 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage download 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --json; stage download; stage download nope; stage publish --ignore-scripts; stage publish --ignore-scripts --json; stage publish --dry-run --ignore-scripts; stage publish --dry-run --ignore-scripts --json",
     "probes": [
       {
         "name": "registry-stage",
@@ -2795,11 +3124,391 @@
         ],
         "npmExit": 0,
         "rnpmExit": 0,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list",
+        "args": [
+          "stage",
+          "list"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-json",
+        "args": [
+          "stage",
+          "list",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-filter-empty",
+        "args": [
+          "stage",
+          "list",
+          "empty-pkg"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-version-spec",
+        "args": [
+          "stage",
+          "list",
+          "dep@1"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-bare",
+        "args": [
+          "stage"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view",
+        "args": [
+          "stage",
+          "view",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-json",
+        "args": [
+          "stage",
+          "view",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-missing-id",
+        "args": [
+          "stage",
+          "view"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-invalid-id",
+        "args": [
+          "stage",
+          "view",
+          "nope"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-approve",
+        "args": [
+          "stage",
+          "approve",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-reject",
+        "args": [
+          "stage",
+          "reject",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-approve-missing-id",
+        "args": [
+          "stage",
+          "approve"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download",
+        "args": [
+          "stage",
+          "download",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-json",
+        "args": [
+          "stage",
+          "download",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-missing",
+        "args": [
+          "stage",
+          "download"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-invalid",
+        "args": [
+          "stage",
+          "download",
+          "nope"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish",
+        "args": [
+          "stage",
+          "publish",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-json",
+        "args": [
+          "stage",
+          "publish",
+          "--ignore-scripts",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-dry-run",
+        "args": [
+          "stage",
+          "publish",
+          "--dry-run",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-dry-run-json",
+        "args": [
+          "stage",
+          "publish",
+          "--dry-run",
+          "--ignore-scripts",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
           "stderr": true,
           "files": true,
           "mutations": true
@@ -2807,7 +3516,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "star",
@@ -2836,7 +3545,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stars",
@@ -2865,7 +3574,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "start",
@@ -2893,7 +3602,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stop",
@@ -2921,7 +3630,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "team",
@@ -2952,7 +3661,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "test",
@@ -2980,7 +3689,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "token",
@@ -3010,14 +3719,14 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "trust",
     "aliases": "",
-    "status": "partial",
-    "diffs": "registry-trust: stdout",
-    "checkMethod": "trust list dep --json",
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "trust list dep --json; trust list dep; trust list dep --json; trust list parent; trust list; trust revoke dep --id=trust-1; trust revoke dep --id=trust-1 --dry-run; trust revoke dep; trust; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --yes; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --yes --json; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --dry-run; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --yes; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --yes --json; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --dry-run; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --yes; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --yes --json; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --dry-run",
     "probes": [
       {
         "name": "registry-trust",
@@ -3029,11 +3738,431 @@
         ],
         "npmExit": 0,
         "rnpmExit": 0,
-        "match": false,
+        "match": true,
         "comparison": {
           "execution": true,
           "exit": true,
-          "stdout": false,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list",
+        "args": [
+          "trust",
+          "list",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-json",
+        "args": [
+          "trust",
+          "list",
+          "dep",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-empty",
+        "args": [
+          "trust",
+          "list",
+          "parent"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-from-manifest",
+        "args": [
+          "trust",
+          "list"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke",
+        "args": [
+          "trust",
+          "revoke",
+          "dep",
+          "--id=trust-1"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke-dry-run",
+        "args": [
+          "trust",
+          "revoke",
+          "dep",
+          "--id=trust-1",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke-missing-id",
+        "args": [
+          "trust",
+          "revoke",
+          "dep"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-bare",
+        "args": [
+          "trust"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-create",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-create-json",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-dry-run",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-create",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-create-json",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-dry-run",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-create",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-create-json",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-dry-run",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
           "stderr": true,
           "files": true,
           "mutations": true
@@ -3041,7 +4170,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "undeprecate",
@@ -3070,7 +4199,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "uninstall",
@@ -3117,7 +4246,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "unpublish",
@@ -3147,7 +4276,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "unstar",
@@ -3176,7 +4305,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "update",
@@ -3222,7 +4351,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "version",
@@ -3252,7 +4381,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "view",
@@ -3283,7 +4412,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "whoami",
@@ -3330,7 +4459,7 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "set-script",
@@ -3360,6 +4489,6 @@
       }
     ],
     "evidence": "docs/npm-replacement-results-2026-11-13.json",
-    "binary_sha256": "d809380b9a20dc219d6b2fef7c3d75fd11b86e0e27851a33c14de4b868a5d2c1"
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   }
 ]
