@@ -377,6 +377,10 @@ for(const [name,selector] of [['insensitive','[name=DEP i]'],['attr-object',':at
 add('resolver-nesting-preserves-pending-descendant-edges','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'2.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0','z-passive':'1.0.0'}}));
 add('resolver-peer-set-prefers-parent-dependency','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-normal-peer-owner':'1.0.0'}}));
 add('resolver-nested-optional-peer-conflict','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'nested-optional-owner':'1.0.0',shared:'1.0.0'}}));
+add('unknown-command','frobnicate-xyz',['frobnicate-xyz']);
+add('unknown-command-with-args','frobnicate-xyz',['frobnicate-xyz','a','--json']);
+add('install-no-package-lock-writes-hidden','install',['install','--no-package-lock','--ignore-scripts'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}));
+add('install-no-package-lock-rewrites-stale-hidden','install',['install','--no-package-lock','--ignore-scripts'],dir=>{manifest(dir,{dependencies:{dep:'1.0.0'}});write(dir,'node_modules/.package-lock.json',JSON.stringify({name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{}},null,4)+'\n');});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

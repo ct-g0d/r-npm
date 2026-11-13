@@ -3949,7 +3949,10 @@ impl Installer {
         };
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
-        if self.options.package_lock_enabled() {
+        // npm writes node_modules/.package-lock.json even with package-lock=false
+        // (without root metadata); only package-lock.json depends on the flag.
+        let package_lock_enabled = self.options.package_lock_enabled();
+        {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
             crate::fast_path::enrich_lockfile_from_installed_manifests(
                 &mut lockfile,
@@ -3958,7 +3961,7 @@ impl Installer {
             );
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
-            if !self.options.is_global && !self.options.no_save {
+            if package_lock_enabled && !self.options.is_global && !self.options.no_save {
                 lockfile
                     .save_to_file_version(&lockfile_path, self.options.lockfile_version)
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
@@ -3996,7 +3999,10 @@ impl Installer {
                     });
                 }
                 actual_lockfile
-                    .save_hidden_with_root_metadata(&loc_base_dir, !self.options.no_save || lockfile_path.exists())
+                    .save_hidden_with_root_metadata(
+                        &loc_base_dir,
+                        package_lock_enabled && (!self.options.no_save || lockfile_path.exists()),
+                    )
                     .context("Failed to save hidden package-lock.json")?;
             } else {
                 let hidden_path = loc_base_dir.join("node_modules").join(".package-lock.json");

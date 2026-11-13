@@ -1660,20 +1660,6 @@ where
 
     let first = &args[1];
 
-    let unsupported_commands: [&str; 1] = ["definitely-unknown-command"];
-
-    if unsupported_commands.contains(&first.as_str()) {
-        return Some((
-            "ERR_UNSUPPORTED_COMMAND".to_string(),
-            format!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command '{}' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface.",
-                first
-            ),
-        ));
-    }
-
     // Determine the slice of arguments to check for unsupported flags.
     // 1. Any arguments after "--" are forwarded payloads and never scanned.
     let pre_dash_dash = if let Some(dash_dash_idx) = args.iter().position(|a| a == "--") {
@@ -6611,6 +6597,15 @@ fn main() {
             if rendered.contains("unrecognized subcommand") {
                 let first_arg = filtered_args.get(1).cloned().unwrap_or_default();
                 println!("Unknown command: \"{first_arg}\"\n\nTo see a list of supported npm commands, run:\n  npm help");
+                if json_error_requested() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": { "code": "EUNKNOWNCOMMAND", "summary": "", "detail": "" }
+                        }))
+                        .unwrap_or_default()
+                    );
+                }
             } else {
                 eprintln!("{rendered}");
             }

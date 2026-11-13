@@ -1111,8 +1111,9 @@ mod tests {
             json: false,
             registry: Some(server.url()),
         };
-        let code = run_view(temp_dir.path(), &opts).await.unwrap();
-        assert_eq!(code, 1);
+        let err = run_view(temp_dir.path(), &opts).await.unwrap_err().to_string();
+        assert!(err.starts_with("npm error code E404\nnpm error 404 Not Found - GET "), "{err}");
+        assert!(err.contains("The requested resource 'missing-pkg@*' could not be found"), "{err}");
     }
 
     #[tokio::test]

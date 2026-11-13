@@ -427,11 +427,11 @@ mod tests {
         let text = std::fs::read_to_string(&hidden).unwrap();
         assert!(text.starts_with("{\r\n\t\"name\""), "{text:?}");
         assert!(!text.starts_with('\u{feff}'));
-        // Existing lockfile formatting wins over the manifest on subsequent saves.
+        // npm takes the format from package.json, not from an existing lockfile.
         std::fs::write(&hidden, "{\n    \"name\": \"app\"\n}\n").unwrap();
         lock.save_hidden(project).unwrap();
         let text = std::fs::read_to_string(hidden).unwrap();
-        assert!(text.starts_with("{\n    \"name\""), "{text:?}");
+        assert!(text.starts_with("{\r\n\t\"name\""), "{text:?}");
     }
 
     #[test]
