@@ -47,6 +47,7 @@ pub use dedupe::{
 };
 
 pub mod fast_path;
+mod bundled;
 pub use fast_path::{
     compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
 };
@@ -2523,6 +2524,8 @@ impl Installer {
             }
         }
 
+        bundled::inflate(&mut lockfile, &self.cache, &self.registry_client, self.options.offline, &self.options.project_dir).await?;
+
         // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
         if self.options.package_lock_only {
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
@@ -2858,7 +2861,7 @@ impl Installer {
             {
                 continue;
             }
-            if loc.is_empty() {
+            if loc.is_empty() || node.flags.bundled {
                 continue;
             }
 
@@ -4635,8 +4638,8 @@ impl Installer {
                 continue;
             }
 
-            // Skip workspace member physical directories
-            if !pkg_key.starts_with("node_modules/") {
+            // Bundled packages are materialized with their owner's tarball.
+            if pkg_info.in_bundle == Some(true) || !pkg_key.starts_with("node_modules/") {
                 continue;
             }
 
