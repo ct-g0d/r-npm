@@ -59,23 +59,6 @@ pub fn create_directory_link(link: &Path, target: &Path) -> Result<(), FsError> 
     create_junction(link, target)
 }
 
-#[cfg(test)]
-mod directory_link_tests {
-    #[test]
-    fn dangling_link_becomes_usable_when_target_is_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        let link = dir.path().join("link");
-        super::create_directory_link(&link, &target).unwrap();
-        assert!(!target.exists());
-        assert!(std::fs::symlink_metadata(&link).is_ok());
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("value"), "kept").unwrap();
-        assert_eq!(std::fs::read_to_string(link.join("value")).unwrap(), "kept");
-        super::remove_junction(&link).unwrap();
-        assert_eq!(std::fs::read_to_string(target.join("value")).unwrap(), "kept");
-    }
-}
 
 /// Create a directory junction (if target is a directory) or a file symlink/copy (if target is a file).
 pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
@@ -611,4 +594,22 @@ pub fn junction_points_to(link: &Path, expected_target: &Path) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod directory_link_tests {
+    #[test]
+    fn dangling_link_becomes_usable_when_target_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        super::create_directory_link(&link, &target).unwrap();
+        assert!(!target.exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("value"), "kept").unwrap();
+        assert_eq!(std::fs::read_to_string(link.join("value")).unwrap(), "kept");
+        super::remove_junction(&link).unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("value")).unwrap(), "kept");
+    }
 }

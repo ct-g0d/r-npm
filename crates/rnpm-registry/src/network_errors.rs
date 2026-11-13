@@ -16,17 +16,34 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
         source = cause.source();
     }
     let (code, syscall, reason) = if dns {
-        ("ENOTFOUND", Some("getaddrinfo"), format!("getaddrinfo ENOTFOUND {host}"))
+        (
+            "ENOTFOUND",
+            Some("getaddrinfo"),
+            format!("getaddrinfo ENOTFOUND {host}"),
+        )
     } else if kind == Some(ErrorKind::ConnectionRefused) {
         let port = url.port_or_known_default()?;
-        ("ECONNREFUSED", Some("connect"), format!("connect ECONNREFUSED {host}:{port}"))
+        (
+            "ECONNREFUSED",
+            Some("connect"),
+            format!("connect ECONNREFUSED {host}:{port}"),
+        )
+    } else if kind == Some(ErrorKind::TimedOut) || (error.is_timeout() && error.is_connect()) {
+        (
+            "ETIMEDOUT",
+            Some("connect"),
+            format!("connect ETIMEDOUT {host}:{}", url.port_or_known_default()?),
+        )
     } else if error.is_timeout() {
         // minipass-fetch's request timer has no system syscall/errno.
-        return Some(("FETCH_ERROR", format!("errno FETCH_ERROR\nnpm error network timeout at: {url}")));
-    } else if kind == Some(ErrorKind::TimedOut) {
-        ("ETIMEDOUT", Some("connect"), format!("connect ETIMEDOUT {host}:{}", url.port_or_known_default()?))
-    } else if matches!(kind, Some(ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::UnexpectedEof))
-        || format!("{error:?}").contains("IncompleteMessage")
+        return Some((
+            "FETCH_ERROR",
+            format!("errno FETCH_ERROR\nnpm error network timeout at: {url}"),
+        ));
+    } else if matches!(
+        kind,
+        Some(ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::UnexpectedEof)
+    ) || format!("{error:?}").contains("IncompleteMessage")
     {
         ("ECONNRESET", None, "socket hang up".into())
     } else {
@@ -61,7 +78,12 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
             "network If you are behind a proxy, please make sure that the 'proxy' config is set properly.  See: 'npm help config'".into(),
         ]);
     }
-    Some((code, lines.join("\nnpm error ").replace("npm error \n", "npm error\n")))
+    Some((
+        code,
+        lines
+            .join("\nnpm error ")
+            .replace("npm error \n", "npm error\n"),
+    ))
 }
 
 /// Retain the npm error contract through string-based metadata-provider errors.
