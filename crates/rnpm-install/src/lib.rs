@@ -18,8 +18,9 @@ use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
 use rnpm_lifecycle::{LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use rnpm_registry::client::{RegistryClient, RegistryClientConfig, NPM_INSTALL_V1_JSON};
+use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
+const INSTALL_PACKUMENT_ACCEPT: &str = "application/json";
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
 use std::sync::Arc;
@@ -186,6 +187,9 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                 deprecated: ver_info.deprecated.clone(),
                 extra: {
                     let mut extra = ver_info.extra.clone();
+                    if let Some(url) = extra.get("funding").and_then(|value| value.as_str()) {
+                        extra.insert("funding".into(), serde_json::json!({ "url": url }));
+                    }
                     if !ver_info.bundle_dependencies.is_empty() {
                         extra.insert(
                             "bundleDependencies".to_string(),
@@ -585,7 +589,7 @@ impl RegistryPackageProvider {
     fn get_cached_packument(&self, name: &str) -> Option<(rnpm_cache::IndexEntry, Vec<u8>)> {
         let registry_url = self.client.registry_for_package(name).as_str().to_string();
         self.cache
-            .get_packument_with_accept(&registry_url, name, Some(NPM_INSTALL_V1_JSON))
+            .get_packument_with_accept(&registry_url, name, Some(INSTALL_PACKUMENT_ACCEPT))
             .ok()
             .flatten()
             .or_else(|| {
@@ -618,7 +622,7 @@ impl RegistryPackageProvider {
             let if_none_match = stored_etag.clone();
             let res = self.handle.block_on(async move {
                 client
-                    .get_package_metadata_conditional(&pkg_name, if_none_match.as_deref())
+                    .get_package_metadata_full_conditional(&pkg_name, if_none_match.as_deref())
                     .await
             });
 
@@ -629,7 +633,7 @@ impl RegistryPackageProvider {
                     let _ = self.cache.put_packument_with_accept(
                         &registry_url,
                         name,
-                        Some(NPM_INSTALL_V1_JSON),
+                        Some(INSTALL_PACKUMENT_ACCEPT),
                         &data,
                         cache_meta,
                     );
@@ -649,7 +653,7 @@ impl RegistryPackageProvider {
                         let _ = self.cache.put_packument_with_accept(
                             &registry_url,
                             name,
-                            Some(NPM_INSTALL_V1_JSON),
+                            Some(INSTALL_PACKUMENT_ACCEPT),
                             &bytes,
                             cache_meta,
                         );
@@ -690,7 +694,7 @@ impl RegistryPackageProvider {
         let pkg_name = name.to_string();
         let res = self.handle.block_on(async move {
             client
-                .get_package_metadata_conditional(&pkg_name, None)
+                .get_package_metadata_full_conditional(&pkg_name, None)
                 .await
         });
         match res {
@@ -703,7 +707,7 @@ impl RegistryPackageProvider {
                     let _ = self.cache.put_packument_with_accept(
                         &registry_url,
                         name,
-                        Some(NPM_INSTALL_V1_JSON),
+                        Some(INSTALL_PACKUMENT_ACCEPT),
                         &bytes,
                         cache_meta,
                     );
@@ -934,7 +938,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 .map(|(n, etag, _)| (n.clone(), etag.clone()))
                 .collect();
             let results = client_c
-                .get_package_metadata_conditional_concurrent(&req_pkgs)
+                .get_package_metadata_full_conditional_concurrent(&req_pkgs)
                 .await;
             for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
                 let reg_url = client_c.registry_for_package(&name).as_str().to_string();
@@ -946,7 +950,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             let _ = cache_c.put_packument_with_accept(
                                 &reg_url,
                                 &name,
-                                Some(NPM_INSTALL_V1_JSON),
+                                Some(INSTALL_PACKUMENT_ACCEPT),
                                 data,
                                 cache_meta,
                             );
@@ -977,7 +981,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             let _ = cache_c.put_packument_with_accept(
                                 &reg_url,
                                 &name,
-                                Some(NPM_INSTALL_V1_JSON),
+                                Some(INSTALL_PACKUMENT_ACCEPT),
                                 &bytes,
                                 cache_meta,
                             );
@@ -6159,7 +6163,7 @@ impl Installer {
                 })
                 .or_else(|| {
                     self.cache
-                        .get_packument_with_accept(registry_url, name, Some(NPM_INSTALL_V1_JSON))
+                        .get_packument_with_accept(registry_url, name, Some(INSTALL_PACKUMENT_ACCEPT))
                         .ok()
                         .flatten()
                         .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
@@ -6279,7 +6283,12 @@ impl Installer {
                     {
                         continue;
                     }
-                    package.extra.insert(key.to_string(), value.clone());
+                    let value = if key == "funding" && value.is_string() {
+                        serde_json::json!({ "url": value })
+                    } else {
+                        value.clone()
+                    };
+                    package.extra.insert(key.to_string(), value);
                 }
             }
         }

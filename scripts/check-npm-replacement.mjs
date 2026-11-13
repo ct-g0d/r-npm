@@ -68,7 +68,11 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/v1/search')return json({objects:[],total:0,time:'2026-11-13T00:00:00.000Z'});
   if(url.startsWith('/-/package/')&&url.endsWith('/dist-tags'))return json({latest:'1.0.0'});
   const name=url.slice(1);
-  if(probePackages.has(name))return json(probePackages.get(name));
+  if(probePackages.has(name)){
+    const metadata=probePackages.get(name);
+    if(name==='metadata-probe'&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,...abbreviated}=m;return [v,abbreviated];}))});
+    return json(metadata);
+  }
   if(['dep','parent','changing'].includes(name)){
     const versions={};
     for(const version of (name==='changing'&&generation===1?['1.0.0']:['1.0.0','1.1.0','2.0.0'])){
@@ -228,6 +232,7 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
+  'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -240,6 +245,7 @@ for(const [name,versions] of Object.entries({
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
+add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];

@@ -1628,14 +1628,8 @@ impl RegistryClient {
         &self,
         package_name: &str,
     ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-        let url = self.package_metadata_url(package_name)?;
         match self
-            .get_package_metadata_from_url_conditional_with_accept(
-                package_name,
-                url,
-                None,
-                "application/json",
-            )
+            .get_package_metadata_full_conditional(package_name, None)
             .await?
         {
             MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
@@ -1643,6 +1637,23 @@ impl RegistryClient {
                 "Unexpected 304 Not Modified response for full metadata request".into(),
             )),
         }
+    }
+
+    /// Arborist resolves manifests from full packuments, including lockfile
+    /// fields absent from the abbreviated install representation.
+    pub async fn get_package_metadata_full_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_from_url_conditional_with_accept(
+            package_name,
+            url,
+            if_none_match,
+            "application/json",
+        )
+        .await
     }
 
     async fn get_package_metadata_from_url_conditional_with_accept(
@@ -1851,15 +1862,37 @@ impl RegistryClient {
         &self,
         packages: &[(S, Option<String>)],
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, NPM_INSTALL_V1_JSON)
+            .await
+    }
+
+    pub async fn get_package_metadata_full_conditional_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, "application/json")
+            .await
+    }
+
+    async fn get_package_metadata_conditional_concurrent_with_accept<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+        accept: &'static str,
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
             let client = self.clone();
             let name = pkg.as_ref().to_string();
             let etag = if_none_match.clone();
             join_set.spawn(async move {
-                let res = client
-                    .get_package_metadata_conditional(&name, etag.as_deref())
-                    .await;
+                let res = match client.package_metadata_url(&name) {
+                    Ok(url) => client
+                        .get_package_metadata_from_url_conditional_with_accept(
+                            &name, url, etag.as_deref(), accept,
+                        )
+                        .await,
+                    Err(error) => Err(error),
+                };
                 (idx, res)
             });
         }

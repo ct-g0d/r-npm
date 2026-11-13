@@ -7,6 +7,12 @@ use serde::{
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
 
+fn deserialize_license<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // Arborist's shrinkwrap stores the type from legacy license objects.
+    Ok(value.as_str().or_else(|| value.get("type").and_then(|v| v.as_str())).map(str::to_owned))
+}
+
 pub fn deserialize_unique_versions<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
@@ -231,7 +237,7 @@ pub struct AbbreviatedVersion {
     pub bundle_dependencies: Vec<String>,
     #[serde(default)]
     pub bin: Option<PackageBin>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_license")]
     pub license: Option<String>,
     #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: HashMap<String, String>,
