@@ -981,6 +981,7 @@ mod tests {
             bin: None,
             license: None,
             engines: HashMap::new(),
+            engines_raw: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),

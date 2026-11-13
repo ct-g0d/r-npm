@@ -18,8 +18,9 @@ use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
 use rnpm_lifecycle::{LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use rnpm_registry::client::{RegistryClient, RegistryClientConfig, NPM_INSTALL_V1_JSON};
+use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
+const INSTALL_PACKUMENT_ACCEPT: &str = "application/json";
 use rnpm_shim::{create_shims, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
 use std::sync::Arc;
@@ -46,6 +47,7 @@ pub use dedupe::{
 };
 
 pub mod fast_path;
+mod bundled;
 pub use fast_path::{
     compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
 };
@@ -182,10 +184,19 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                has_install_script: ver_info.has_install_script,
+                has_install_script: ver_info.has_install_script
+                    || ver_info.extra.get("scripts").is_some_and(|scripts| {
+                        ["preinstall", "install", "postinstall"].iter().any(|name| scripts.get(*name).is_some_and(|v| v.is_string()))
+                    }),
                 deprecated: ver_info.deprecated.clone(),
                 extra: {
                     let mut extra = ver_info.extra.clone();
+                    if let Some(engines) = &ver_info.engines_raw {
+                        extra.insert("engines".into(), engines.clone());
+                    }
+                    if let Some(url) = extra.get("funding").and_then(|value| value.as_str()) {
+                        extra.insert("funding".into(), serde_json::json!({ "url": url }));
+                    }
                     if !ver_info.bundle_dependencies.is_empty() {
                         extra.insert(
                             "bundleDependencies".to_string(),
@@ -531,15 +542,57 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
     graph.edges = new_edges;
 }
 
-/// Use disk packuments without revalidation only when the user requests it.
-/// Our index retains ETags but not HTTP freshness headers, so an arbitrary TTL
-/// would also treat no-cache/max-age=0 responses as fresh.
+/// Respect the registry's HTTP freshness policy, including response Age and
+/// apparent age from Date. Entries without a policy still revalidate.
 pub fn is_packument_fresh(
-    _entry: &rnpm_cache::IndexEntry,
+    entry: &rnpm_cache::IndexEntry,
     prefer_offline: bool,
     offline: bool,
 ) -> bool {
-    offline || prefer_offline
+    if offline || prefer_offline {
+        return true;
+    }
+    let headers = entry.metadata.as_ref().and_then(|m| m.pointer("/response/headers"));
+    let Some(control) = headers.and_then(|h| h.get("cache-control")).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let mut max_age = None;
+    for directive in control.split(',').map(str::trim) {
+        let (name, value) = directive.split_once('=').unwrap_or((directive, ""));
+        if name.eq_ignore_ascii_case("no-cache") || name.eq_ignore_ascii_case("no-store") {
+            return false;
+        }
+        if name.eq_ignore_ascii_case("max-age") {
+            max_age = value.trim().trim_matches('"').parse::<u64>().ok();
+        }
+    }
+    let Some(max_age) = max_age else { return false; };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let headers = headers.unwrap();
+    let age = headers.get("age").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).saturating_mul(1000);
+    let apparent_age = headers.get("date").and_then(|v| v.as_str()).and_then(|v| httpdate::parse_http_date(v).ok())
+        .and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| entry.time.saturating_sub(date.as_millis() as u64)).unwrap_or(0);
+    age.max(apparent_age).saturating_add(now.saturating_sub(entry.time)) < max_age.saturating_mul(1000)
+}
+
+fn merge_packument_cache_metadata(mut response: serde_json::Value, etag: Option<String>, previous: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    if response.pointer("/response/headers/cache-control").is_none() {
+        if let Some(control) = previous.and_then(|m| m.pointer("/response/headers/cache-control")) {
+            response["response"]["headers"]["cache-control"] = control.clone();
+        }
+    }
+    if let Some(etag) = etag { response["etag"] = etag.into(); }
+    Some(response)
+}
+
+fn store_install_packument(cache: &Cache, registry: &str, name: &str, data: &[u8], metadata: Option<serde_json::Value>) {
+    let no_store = metadata.as_ref().and_then(|m| m.pointer("/response/headers/cache-control")).and_then(|v| v.as_str())
+        .is_some_and(|control| control.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-store")));
+    if no_store {
+        let _ = cache.purge_packument(registry, name, Some(INSTALL_PACKUMENT_ACCEPT));
+    } else {
+        let _ = cache.put_packument_with_accept(registry, name, Some(INSTALL_PACKUMENT_ACCEPT), data, metadata);
+    }
 }
 
 /// Extracts an ETag string from cacache metadata JSON.
@@ -585,7 +638,7 @@ impl RegistryPackageProvider {
     fn get_cached_packument(&self, name: &str) -> Option<(rnpm_cache::IndexEntry, Vec<u8>)> {
         let registry_url = self.client.registry_for_package(name).as_str().to_string();
         self.cache
-            .get_packument_with_accept(&registry_url, name, Some(NPM_INSTALL_V1_JSON))
+            .get_packument_with_accept(&registry_url, name, Some(INSTALL_PACKUMENT_ACCEPT))
             .ok()
             .flatten()
             .or_else(|| {
@@ -618,18 +671,17 @@ impl RegistryPackageProvider {
             let if_none_match = stored_etag.clone();
             let res = self.handle.block_on(async move {
                 client
-                    .get_package_metadata_conditional(&pkg_name, if_none_match.as_deref())
+                    .get_package_metadata_full_conditional(&pkg_name, if_none_match.as_deref())
                     .await
             });
 
             match res {
-                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
+                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
                     let new_etag = etag.or(stored_etag);
-                    let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
-                    let _ = self.cache.put_packument_with_accept(
+                    let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, entry.metadata.as_ref());
+                    store_install_packument(&self.cache,
                         &registry_url,
                         name,
-                        Some(NPM_INSTALL_V1_JSON),
                         &data,
                         cache_meta,
                     );
@@ -643,13 +695,13 @@ impl RegistryPackageProvider {
                 Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                     metadata: abbrev,
                     etag,
+                    cache_metadata,
                 }) => {
                     if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                        let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                        let _ = self.cache.put_packument_with_accept(
+                        let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                        store_install_packument(&self.cache,
                             &registry_url,
                             name,
-                            Some(NPM_INSTALL_V1_JSON),
                             &bytes,
                             cache_meta,
                         );
@@ -690,20 +742,20 @@ impl RegistryPackageProvider {
         let pkg_name = name.to_string();
         let res = self.handle.block_on(async move {
             client
-                .get_package_metadata_conditional(&pkg_name, None)
+                .get_package_metadata_full_conditional(&pkg_name, None)
                 .await
         });
         match res {
             Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                 metadata: abbrev,
                 etag,
+                cache_metadata,
             }) => {
                 if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                    let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                    let _ = self.cache.put_packument_with_accept(
+                    let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                    store_install_packument(&self.cache,
                         &registry_url,
                         name,
-                        Some(NPM_INSTALL_V1_JSON),
                         &bytes,
                         cache_meta,
                     );
@@ -934,19 +986,18 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 .map(|(n, etag, _)| (n.clone(), etag.clone()))
                 .collect();
             let results = client_c
-                .get_package_metadata_conditional_concurrent(&req_pkgs)
+                .get_package_metadata_full_conditional_concurrent(&req_pkgs)
                 .await;
             for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
                 let reg_url = client_c.registry_for_package(&name).as_str().to_string();
                 match res {
-                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag }) => {
+                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
                         let new_etag = etag.or(stored_etag);
-                        let cache_meta = new_etag.map(|e| serde_json::json!({ "etag": e }));
+                        let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, cached_info.as_ref().and_then(|(entry, _)| entry.metadata.as_ref()));
                         if let Some((_, ref data)) = cached_info {
-                            let _ = cache_c.put_packument_with_accept(
+                            store_install_packument(&cache_c,
                                 &reg_url,
                                 &name,
-                                Some(NPM_INSTALL_V1_JSON),
                                 data,
                                 cache_meta,
                             );
@@ -971,13 +1022,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
                         metadata: abbrev,
                         etag,
+                        cache_metadata,
                     }) => {
                         if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                            let cache_meta = etag.map(|e| serde_json::json!({ "etag": e }));
-                            let _ = cache_c.put_packument_with_accept(
+                            let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
+                            store_install_packument(&cache_c,
                                 &reg_url,
                                 &name,
-                                Some(NPM_INSTALL_V1_JSON),
                                 &bytes,
                                 cache_meta,
                             );
@@ -2476,6 +2527,8 @@ impl Installer {
             }
         }
 
+        bundled::inflate(&mut lockfile, &self.cache, &self.registry_client, self.options.offline, &self.options.project_dir).await?;
+
         // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
         if self.options.package_lock_only {
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
@@ -2811,7 +2864,7 @@ impl Installer {
             {
                 continue;
             }
-            if loc.is_empty() {
+            if loc.is_empty() || node.flags.bundled {
                 continue;
             }
 
@@ -4588,8 +4641,8 @@ impl Installer {
                 continue;
             }
 
-            // Skip workspace member physical directories
-            if !pkg_key.starts_with("node_modules/") {
+            // Bundled packages are materialized with their owner's tarball.
+            if pkg_info.in_bundle == Some(true) || !pkg_key.starts_with("node_modules/") {
                 continue;
             }
 
@@ -6159,7 +6212,7 @@ impl Installer {
                 })
                 .or_else(|| {
                     self.cache
-                        .get_packument_with_accept(registry_url, name, Some(NPM_INSTALL_V1_JSON))
+                        .get_packument_with_accept(registry_url, name, Some(INSTALL_PACKUMENT_ACCEPT))
                         .ok()
                         .flatten()
                         .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
@@ -6279,7 +6332,12 @@ impl Installer {
                     {
                         continue;
                     }
-                    package.extra.insert(key.to_string(), value.clone());
+                    let value = if key == "funding" && value.is_string() {
+                        serde_json::json!({ "url": value })
+                    } else {
+                        value.clone()
+                    };
+                    package.extra.insert(key.to_string(), value);
                 }
             }
         }

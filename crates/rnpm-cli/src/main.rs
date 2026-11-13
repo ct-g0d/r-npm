@@ -6613,6 +6613,16 @@ fn main() {
         }
     };
 
+    if let Some(command) = Cli::command().try_get_matches_from(&filtered_args).ok()
+        .and_then(|matches| matches.subcommand_name().map(str::to_owned)) {
+        let config = std::env::current_dir().ok().and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok()).unwrap_or_default();
+        let mut agent = config.npmrc.settings.get("user-agent").cloned().unwrap_or_else(rnpm_lifecycle::npm_user_agent);
+        if config.get_bool("workspaces") == Some(true) || config.get("workspace").is_some_and(|v| !v.is_empty()) {
+            agent = agent.replace("workspaces/false", "workspaces/true");
+        }
+        rnpm_registry::client::set_cli_request_context(command, agent);
+    }
+
     // npm warns whenever force is in effect, whatever the command.
     {
         let raw: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();

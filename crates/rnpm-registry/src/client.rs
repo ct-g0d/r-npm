@@ -27,6 +27,22 @@ pub fn default_user_agent() -> String {
 /// Abbreviated metadata MIME type for npm registry.
 pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 
+static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Install the CLI's canonical command and expanded npm user agent once per
+/// invocation. Library callers retain their configured request identity.
+pub fn set_cli_request_context(command: String, user_agent: String) {
+    let _ = CLI_REQUEST_CONTEXT.set((command, user_agent));
+}
+
+fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
+    let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
+        .into_iter()
+        .filter_map(|key| headers.get(key)?.to_str().ok().map(|value| (key.into(), value.into())))
+        .collect();
+    serde_json::json!({ "response": { "headers": headers } })
+}
+
 /// Maximum number of HTTP redirects to follow before failing.
 pub const MAX_REDIRECTS: usize = 10;
 
@@ -107,9 +123,10 @@ pub enum MetadataFetchResult {
     Fresh {
         metadata: AbbreviatedPackageMetadata,
         etag: Option<String>,
+        cache_metadata: serde_json::Value,
     },
     /// Server returned HTTP 304 Not Modified; cached data is still valid.
-    NotModified { etag: Option<String> },
+    NotModified { etag: Option<String>, cache_metadata: serde_json::Value },
 }
 
 impl MetadataFetchResult {
@@ -596,11 +613,16 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
         let mut headers = HeaderMap::new();
+        let cli_context = CLI_REQUEST_CONTEXT.get();
+        let agent = cli_context.filter(|_| config.user_agent == default_user_agent()).map(|(_, agent)| agent.as_str()).unwrap_or(&config.user_agent);
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&config.user_agent)
+            HeaderValue::from_str(agent)
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
+        if let Some((command, _)) = cli_context {
+            headers.insert("npm-command", HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?);
+        }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         let max_idle = if config.pool_max_idle_per_host == 0 {
@@ -1628,14 +1650,8 @@ impl RegistryClient {
         &self,
         package_name: &str,
     ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-        let url = self.package_metadata_url(package_name)?;
         match self
-            .get_package_metadata_from_url_conditional_with_accept(
-                package_name,
-                url,
-                None,
-                "application/json",
-            )
+            .get_package_metadata_full_conditional(package_name, None)
             .await?
         {
             MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
@@ -1643,6 +1659,23 @@ impl RegistryClient {
                 "Unexpected 304 Not Modified response for full metadata request".into(),
             )),
         }
+    }
+
+    /// Arborist resolves manifests from full packuments, including lockfile
+    /// fields absent from the abbreviated install representation.
+    pub async fn get_package_metadata_full_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_from_url_conditional_with_accept(
+            package_name,
+            url,
+            if_none_match,
+            "application/json",
+        )
+        .await
     }
 
     async fn get_package_metadata_from_url_conditional_with_accept(
@@ -1665,6 +1698,7 @@ impl RegistryClient {
                 .await?;
 
             let status = resp.status();
+            let cache_metadata = packument_cache_metadata(resp.headers());
             if status == StatusCode::NOT_MODIFIED {
                 let etag = resp
                     .headers()
@@ -1672,7 +1706,7 @@ impl RegistryClient {
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string())
                     .or_else(|| if_none_match.map(|s| s.to_string()));
-                return Ok(MetadataFetchResult::NotModified { etag });
+                return Ok(MetadataFetchResult::NotModified { etag, cache_metadata });
             }
 
             if status == StatusCode::NOT_FOUND {
@@ -1812,7 +1846,7 @@ impl RegistryClient {
 
             let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
             metadata.validate()?;
-            return Ok(MetadataFetchResult::Fresh { metadata, etag });
+            return Ok(MetadataFetchResult::Fresh { metadata, etag, cache_metadata });
         }
     }
 
@@ -1851,15 +1885,37 @@ impl RegistryClient {
         &self,
         packages: &[(S, Option<String>)],
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, NPM_INSTALL_V1_JSON)
+            .await
+    }
+
+    pub async fn get_package_metadata_full_conditional_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, "application/json")
+            .await
+    }
+
+    async fn get_package_metadata_conditional_concurrent_with_accept<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+        accept: &'static str,
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
             let client = self.clone();
             let name = pkg.as_ref().to_string();
             let etag = if_none_match.clone();
             join_set.spawn(async move {
-                let res = client
-                    .get_package_metadata_conditional(&name, etag.as_deref())
-                    .await;
+                let res = match client.package_metadata_url(&name) {
+                    Ok(url) => client
+                        .get_package_metadata_from_url_conditional_with_accept(
+                            &name, url, etag.as_deref(), accept,
+                        )
+                        .await,
+                    Err(error) => Err(error),
+                };
                 (idx, res)
             });
         }

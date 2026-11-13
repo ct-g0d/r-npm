@@ -34,12 +34,12 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false;
+const tarballs=new Map(); const probePackages=new Map(); const probeCacheControl=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false;
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
-  const request={method:req.method,url,etag:req.headers['if-none-match']};requests.push(request);
+  const request={method:req.method,url,etag:req.headers['if-none-match'],headers:{'npm-command':req.headers['npm-command']??null,'npm-session':req.headers['npm-session']??null,'user-agent':req.headers['user-agent']??null}};requests.push(request);
   const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{let body=Buffer.concat(chunks);if(req.headers['content-encoding']==='gzip')body=gunzipSync(body);if(body.length){try{request.body=JSON.parse(body.toString());}catch{request.body=body.toString();}}});
-  const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
+  const json=(data,status=200)=>{res.writeHead(status,{'content-type':'application/json','cache-control':probeCacheControl.get(url.slice(1))||'max-age=0','etag':`"generation-${generation}"`});res.end(JSON.stringify(data));};
   if(tarballs.has(url)){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get(url));return;}
   if(url===`/-/stage/${STAGE_ID}/tarball`){res.writeHead(200,{'content-type':'application/octet-stream'});res.end(tarballs.get('/dep-1.0.0.tgz'));return;}
   if(url==='/-/ping')return json({});
@@ -70,6 +70,11 @@ const server=http.createServer((req,res)=>{
   const name=url.slice(1);
   if(securityRequireAuth&&['audit-leaf','audit-branch'].includes(name)&&req.headers.authorization!=='Bearer mock-token')return json({error:'Authentication required'},401);
   if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
+  if(probePackages.has(name)){
+    const metadata=probePackages.get(name);
+    if(name==='metadata-probe'&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,...abbreviated}=m;return [v,abbreviated];}))});
+    return json(metadata);
+  }
   if(['dep','parent','changing'].includes(name)){
     const versions={};
     for(const version of (name==='changing'&&generation===1?['1.0.0']:['1.0.0','1.1.0','2.0.0'])){
@@ -263,6 +268,60 @@ for(const flags of [[],['--json'],['--silent']])add(`cli-audit-fix-unfixable${fl
 for(const flags of [[],['--json']])add(`cli-audit-multiple-severities${flags.join('')}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':['low','high'].map((severity,i)=>({id:103+i,name:'audit-leaf',url: 'https://example.invalid/advisory/'+(103+i),title:severity+' advisory',severity,vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:i?7.5:3,vectorString:null}}))}});
 for(const flags of [[],['--json']])add(`cli-audit-authenticated${flags.join('')}`,'audit',['audit',...flags],auditTree,{auth:true,advisoryAuth:true,advisories:{'audit-leaf':[{id:105,name:'audit-leaf',url:'https://example.invalid/advisory/105',title:'Authenticated advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 add('cli-query-workspace-with-file-link','query',['query','.workspace'],dir=>{cliWorkspaceTree(dir);edit(dir,p=>{p.dependencies={local:'file:./local'};});manifest(path.join(dir,'local'),{name:'local'});fs.symlinkSync(path.join(dir,'local'),path.join(dir,'node_modules/local'),'junction');});
+// Small registry graphs isolate Arborist's placement order from network state.
+for(const [name,versions] of Object.entries({
+  branch:{'1.0.0':{dependencies:{'alpha-parent':'1.0.0',shared:'2.0.0'}}},
+  'alpha-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
+  shared:{'1.0.0':{},'2.0.0':{}},
+  'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
+  'fresh-packument':{'1.0.0':{}},
+  'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
+  'bundle-owner':{'1.0.0':{dependencies:{'bundled-leaf':'1.0.0'},bundleDependencies:['bundled-leaf']}},
+  'peer-entry':{'1.0.0':{peerDependencies:{'peer-parent':'1.0.0'}}},
+  'peer-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'z-peer-entry':{'1.0.0':{peerDependencies:{'a-peer-parent':'1.0.0'}}},
+  'a-peer-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'b-regular':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
+  'b-mid':{'1.0.0':{dependencies:{'c-old':'2.0.0','d-new':'2.0.0'}}},
+  'c-old':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^1.0.0'}}},
+  'd-new':{'1.0.0':{},'2.0.0':{dependencies:{shared:'^2.0.0'}}},
+  'optional-peer-owner':{'1.0.0':{dependencies:{'peer-consumer':'1.0.0'},peerDependencies:{shared:'^1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'legacy-engines':{'1.0.0':{engines:['node >= 0.8.0']}},
+  'z-peer-source':{'1.0.0':{dependencies:{'a-peer-plugin':'1.0.0',shared:'2.0.0'}}},
+  'a-peer-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+})){
+  const packed={};
+  for(const [version,fields]of Object.entries(versions)){
+    const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    if(name==='bundle-owner'){
+      manifest(path.join(dir,'node_modules/bundled-leaf'),{name:'bundled-leaf',license:'MIT',dependencies:{'bundled-transitive':'1.0.0'}});
+      manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC'});
+    }
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
+    packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+  }
+  probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
+add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
+add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
+add('resolver-places-peer-set-before-expansion','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-regular':'1.0.0','z-peer-entry':'1.0.0'}}));
+add('resolver-nesting-preserves-descendant-resolution','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-mid':'1.0.0','c-old':'1.0.0','d-new':'1.0.0',shared:'1.0.0'}}));
+add('resolver-peer-set-uses-parent-advisory','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'optional-peer-owner':'1.0.0'}}));
+add('resolver-peer-set-waits-for-sibling-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'1.0.0','z-peer-source':'1.0.0'}}));
+add('install-preserves-legacy-engines-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'legacy-engines':'1.0.0'}}));
+add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
+add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
+for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
+add('ci-bundled-lock-entries','ci',['ci','--ignore-scripts'],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+probeCacheControl.set('fresh-packument','public, max-age=300');
+add('cache-fresh-packument-skips-revalidation','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'fresh-packument':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);for(const name of ['package-lock.json','node_modules'])fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});},observe:({requests})=>({packumentRequests:requests.filter(r=>r.method==='GET'&&r.url==='/fresh-packument').length})});
+add('cache-clean-removes-install-store','cache',['cache','clean','--force'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);},observe:({env})=>({storeExists:fs.existsSync(env.RNPM_STORE_DIR)})});
+for(const [name,args]of [['install',['install','dep@1.0.0','--ignore-scripts']],['alias',['i','dep@1.0.0','--ignore-scripts']],['view',['view','dep@1.0.0','version']],['ping',['ping','--json']],['custom-agent',['install','dep@1.0.0','--ignore-scripts','--user-agent=parity-probe/1.0']]])add(`registry-request-headers-${name}`,args[0],args,undefined,{observe:({requests})=>requests.filter(r=>r.method==='GET').map(({url,headers})=>({url,headers})).sort((a,b)=>a.url.localeCompare(b.url))});
 add('command-diff','diff',['diff','--diff=dep@1.0.0','--diff=dep@1.1.0']);
 for(const provider of ['github','gitlab','circleci']){
   const flags=provider==='circleci'?['--org-id',STAGE_ID,'--project-id',STAGE_ID,'--pipeline-definition-id',STAGE_ID,'--vcs-origin','github.com/mock/repo','--context-id',STAGE_ID]:['--file',provider==='github'?'publish.yml':'.gitlab-ci.yml',provider==='github'?'--repository':'--project','mock/repo','--environment','prod'];
@@ -302,10 +361,12 @@ for(const c of cases){
     files['<userconfig>']=fs.existsSync(path.join(config,'user.npmrc'))?normalize(fs.readFileSync(path.join(config,'user.npmrc'),'utf8'),dir,config):null;
     if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config));
     result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
+    if(c.observe)result[tool].observation=c.observe({dir,env,requests:requests.slice(start)});
   }
   const a=result.npm,b=result.rnpm;
   const mutations=tool=>tool.requests.filter(r=>['PUT','DELETE','POST'].includes(r.method)).map(({method,url,body})=>({method,url,body:body&&typeof body==='object'&&/^org\.couchdb\.user:/.test(body._id)&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(body.date)?{...body,date:'<timestamp>'}:body}));
   result.comparison={execution:!a.execution_error&&!b.execution_error&&a.exit!==null&&b.exit!==null,exit:a.exit===b.exit,stdout:a.stdout===b.stdout,stderr:a.stderr===b.stderr,files:stable(a.files)===stable(b.files),mutations:stable(mutations(a))===stable(mutations(b))};
+  if(c.observe)result.comparison.observation=stable(a.observation)===stable(b.observation);
   result.match=Object.values(result.comparison).every(Boolean);results.push(result);
   // Keep complete comparisons and raw logs without committing multi-megabyte
   // package patches into the report. Hash the full normalized stream first.

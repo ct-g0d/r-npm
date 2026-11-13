@@ -7,6 +7,12 @@ use serde::{
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
 
+fn deserialize_license<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // Arborist's shrinkwrap stores the type from legacy license objects.
+    Ok(value.as_str().or_else(|| value.get("type").and_then(|v| v.as_str())).map(str::to_owned))
+}
+
 pub fn deserialize_unique_versions<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
@@ -27,13 +33,38 @@ where
             M: MapAccess<'de>,
         {
             let mut map = BTreeMap::new();
-            while let Some((key, value)) = access.next_entry::<String, AbbreviatedVersion>()? {
+            while let Some((key, mut value)) = access.next_entry::<String, serde_json::Value>()? {
                 if map.contains_key(&key) {
                     return Err(de::Error::custom(format!(
                         "duplicate version key '{key}' found in packument metadata"
                     )));
                 }
-                map.insert(key, value);
+                // Full packuments retain historical manifest spellings and
+                // types. Apply pacote's package-json normalization before
+                // deserializing the resolver's typed manifest representation.
+                if let Some(object) = value.as_object_mut() {
+                    if object.get("deprecated") == Some(&serde_json::Value::Bool(false)) {
+                        object.remove("deprecated");
+                    }
+                    if let Some(legacy) = object.remove("bundledDependencies") {
+                        object.entry("bundleDependencies").or_insert(legacy);
+                    }
+                    if let Some(bundled) = object.get("bundleDependencies") {
+                        let names = match bundled {
+                            serde_json::Value::Bool(true) => object.get("dependencies").and_then(|v| v.as_object()).map(|deps| deps.keys().cloned().collect::<Vec<_>>()),
+                            serde_json::Value::Object(deps) => Some(deps.keys().cloned().collect()),
+                            serde_json::Value::Array(_) => None,
+                            _ => Some(Vec::new()),
+                        };
+                        if let Some(names) = names {
+                            object.insert("bundleDependencies".into(), serde_json::json!(names));
+                        }
+                    }
+                }
+                let engines_raw = value.get("engines").filter(|v| v.is_array() || v.is_string()).cloned();
+                let mut version: AbbreviatedVersion = serde_json::from_value(value).map_err(de::Error::custom)?;
+                if engines_raw.is_some() { version.engines_raw = engines_raw; }
+                map.insert(key, version);
             }
             Ok(map)
         }
@@ -231,10 +262,13 @@ pub struct AbbreviatedVersion {
     pub bundle_dependencies: Vec<String>,
     #[serde(default)]
     pub bin: Option<PackageBin>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_license")]
     pub license: Option<String>,
     #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: HashMap<String, String>,
+    /// Retain legacy engine shapes across the typed packument disk cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines_raw: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub os: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]

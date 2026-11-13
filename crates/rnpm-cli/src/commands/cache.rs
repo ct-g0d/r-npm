@@ -42,7 +42,13 @@ pub(crate) async fn run(
                 std::process::exit(1);
             }
             cache.clean()?;
-            println!("rnpm: cache cleared successfully ({})", cache_path.display());
+            let stores = std::collections::BTreeSet::from([
+                rnpm_cache::PackStore::default_location(Some(&cache_path)),
+                rnpm_cache::PackStore::default_location(None),
+            ]);
+            for store in stores {
+                rnpm_cache::PackStore::clean_at(&store)?;
+            }
         }
         CacheAction::Verify { .. } => {
             let start = std::time::Instant::now();

@@ -225,6 +225,7 @@ pub fn determine_placement(
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
+        None,
     )
 }
 
@@ -243,6 +244,7 @@ pub fn determine_placement_with_peers(
         String,
         rnpm_core::manifest::PeerDependencyMeta,
     >,
+    resolved_version: Option<&str>,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
@@ -365,6 +367,9 @@ pub fn determine_placement_with_peers(
             install_name,
             package_name,
             target,
+            resolved_version,
+        ) && !candidate_shadows_descendant_dep(
+            graph, ancestor, install_name, resolved_version,
         ) {
             return PlacementDecision::PlaceNew(candidate);
         }
@@ -391,6 +396,7 @@ fn candidate_shadows_ancestor_dep(
     install_name: &str,
     package_name: &str,
     target: &PackageTarget,
+    resolved_version: Option<&str>,
 ) -> bool {
     let Some(ancestor_node) = graph.nodes.get(ancestor) else {
         return false;
@@ -407,6 +413,9 @@ fn candidate_shadows_ancestor_dep(
     };
 
     if let Ok(req_target) = PackageTarget::parse(spec) {
+        if let Some(version) = resolved_version {
+            return !version_satisfies_target(version, &req_target);
+        }
         if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
             if node_satisfies_target(visible, &req_target)
                 && !node_satisfies_target(visible, target)
@@ -431,6 +440,28 @@ fn candidate_shadows_ancestor_dep(
         }
     }
     false
+}
+
+// CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
+// must not intercept a valid descendant edge that currently resolves above
+// this scope. Otherwise a later sibling silently breaks an earlier branch.
+fn candidate_shadows_descendant_dep(
+    graph: &DependencyGraph,
+    scope: &str,
+    install_name: &str,
+    resolved_version: Option<&str>,
+) -> bool {
+    let Some(version) = resolved_version else { return false; };
+    let prefix = format!("{scope}/node_modules/");
+    graph.edges.iter().any(|edge| {
+        if edge.install_name != install_name || !edge.from_location.starts_with(&prefix)
+            || edge.to_location.starts_with(&prefix) {
+            return false;
+        }
+        let Ok(target) = PackageTarget::parse(&edge.spec) else { return false; };
+        graph.nodes.get(&edge.to_location).is_some_and(|current| node_satisfies_target(current, &target))
+            && !version_satisfies_target(version, &target)
+    })
 }
 
 fn candidate_has_incompatible_peer(

@@ -180,6 +180,7 @@ impl DependencyGraph {
 
         let mut dev_states: HashMap<String, u8> = HashMap::new();
         let mut optional_states: HashMap<String, u8> = HashMap::new();
+        let mut peer_states: HashMap<String, u8> = HashMap::new();
         let mut skipped_states: HashMap<String, u8> = HashMap::new();
         let initially_skipped: HashSet<String> = self
             .nodes
@@ -188,6 +189,7 @@ impl DependencyGraph {
             .collect();
         dev_states.insert(self.root_location.clone(), NON_DEV);
         optional_states.insert(self.root_location.clone(), NON_OPTIONAL);
+        peer_states.insert(self.root_location.clone(), NON_DEV);
         skipped_states.insert(self.root_location.clone(), NON_DEV);
 
         let mut queue = VecDeque::from([self.root_location.clone()]);
@@ -201,6 +203,7 @@ impl DependencyGraph {
         while let Some(location) = queue.pop_front() {
             let dev_state = dev_states.get(&location).copied().unwrap_or(0);
             let optional_state = optional_states.get(&location).copied().unwrap_or(0);
+            let peer_state = peer_states.get(&location).copied().unwrap_or(0);
             let skipped_state = skipped_states.get(&location).copied().unwrap_or(0);
             let Some(edges) = outgoing.get(&location) else {
                 continue;
@@ -224,11 +227,16 @@ impl DependencyGraph {
                     next_optional |= OPTIONAL_ONLY;
                 }
                 if optional_state & NON_OPTIONAL != 0 {
-                    next_optional |= if matches!(edge.dep_type, DependencyType::Optional) {
+                    next_optional |= if matches!(edge.dep_type, DependencyType::Optional | DependencyType::PeerOptional) {
                         OPTIONAL_ONLY
                     } else {
                         NON_OPTIONAL
                     };
+                }
+
+                let mut next_peer = peer_state & DEV_ONLY;
+                if peer_state & NON_DEV != 0 {
+                    next_peer |= if matches!(edge.dep_type, DependencyType::Peer | DependencyType::PeerOptional) { DEV_ONLY } else { NON_DEV };
                 }
 
                 let next_skipped = if skipped_state & DEV_ONLY != 0
@@ -242,12 +250,15 @@ impl DependencyGraph {
 
                 let dev_entry = dev_states.entry(edge.to_location.clone()).or_default();
                 let optional_entry = optional_states.entry(edge.to_location.clone()).or_default();
+                let peer_entry = peer_states.entry(edge.to_location.clone()).or_default();
                 let skipped_entry = skipped_states.entry(edge.to_location.clone()).or_default();
                 let changed = (*dev_entry | next_dev) != *dev_entry
                     || (*optional_entry | next_optional) != *optional_entry
+                    || (*peer_entry | next_peer) != *peer_entry
                     || (*skipped_entry | next_skipped) != *skipped_entry;
                 *dev_entry |= next_dev;
                 *optional_entry |= next_optional;
+                *peer_entry |= next_peer;
                 *skipped_entry |= next_skipped;
                 if changed {
                     queue.push_back(edge.to_location.clone());
@@ -290,6 +301,7 @@ impl DependencyGraph {
 
             node.flags.dev = is_dev;
             node.flags.optional = is_optional;
+            node.flags.peer = peer_states.get(location).copied().unwrap_or(0) == DEV_ONLY;
             node.flags.dev_optional = !is_pure_prod
                 && reachable_from_dev
                 && reachable_from_optional
@@ -618,7 +630,9 @@ impl DependencyGraph {
                     libc,
                     bin: normalize_bin_paths(node.bin.clone(), &node.name),
                     license,
-                    engines: if node.engines.is_empty() {
+                    engines: if let Some(raw) = node.extra.get("engines") {
+                        serde_json::from_value(raw.clone()).ok()
+                    } else if node.engines.is_empty() {
                         None
                     } else {
                         Some(rnpm_lockfile::PackageEngines::Map(node.engines.clone()))
@@ -729,6 +743,11 @@ impl DependencyGraph {
                     node.optional_dependencies
                         .iter()
                         .map(|(n, s)| (n, s, DependencyType::Optional)),
+                )
+                .chain(
+                    node.peer_dependencies.iter()
+                        .filter(|(name, _)| !node.dependencies.contains_key(*name) && !node.optional_dependencies.contains_key(*name) && !node.dev_dependencies.contains_key(*name))
+                        .map(|(name, spec)| (name, spec, if node.peer_dependencies_meta.get(name).is_some_and(|meta| meta.optional) { DependencyType::PeerOptional } else { DependencyType::Peer })),
                 );
 
             for (dep_name, dep_spec, dep_type) in all_deps {
