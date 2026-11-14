@@ -1945,6 +1945,8 @@ impl Installer {
             && !self.options.force
             && !self.options.dry_run
             && !self.options.package_lock_only
+            && self.options.unlocked_packages.is_empty()
+            && self.options.vulnerability_constraints.is_empty()
         {
             if let Ok(current_fingerprint) =
                 compute_project_fingerprint(&self.options.project_dir, &self.options)

@@ -3997,43 +3997,13 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 
-fn print_fixed_summary(
-    fixed_vulns: usize,
-    fixed_counts: &audit::VulnerabilitiesCount,
-    pkg_count: usize,
-) {
-    let mut parts = Vec::new();
-    if fixed_counts.critical > 0 {
-        parts.push(format!("{} critical", fixed_counts.critical));
+/// The package name an `audit fix` target names (`a@1`, `node_modules/x/node_modules/a@1`).
+fn audit_fix_target_name(target: &str) -> String {
+    let spec = target.rsplit("node_modules/").next().unwrap_or(target);
+    match spec.get(1..).and_then(|rest| rest.find('@')) {
+        Some(at) => spec[..at + 1].to_string(),
+        None => spec.to_string(),
     }
-    if fixed_counts.high > 0 {
-        parts.push(format!("{} high", fixed_counts.high));
-    }
-    if fixed_counts.moderate > 0 {
-        parts.push(format!("{} moderate", fixed_counts.moderate));
-    }
-    if fixed_counts.low > 0 {
-        parts.push(format!("{} low", fixed_counts.low));
-    }
-    if fixed_counts.info > 0 {
-        parts.push(format!("{} info", fixed_counts.info));
-    }
-    let details = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(", "))
-    };
-    let vuln_word = if fixed_vulns == 1 {
-        "vulnerability"
-    } else {
-        "vulnerabilities"
-    };
-    let pkg_word = if pkg_count == 1 {
-        "package"
-    } else {
-        "packages"
-    };
-    println!("fixed {fixed_vulns} {vuln_word}{details} in {pkg_count} {pkg_word}");
 }
 
 async fn run_audit_fix(
@@ -4059,14 +4029,27 @@ async fn run_audit_fix(
         ));
     }
 
-    if force {
-        eprintln!("npm warn audit --force installing breaking changes if necessary");
-    }
-
     // Run initial audit scan to retrieve list of vulnerability advisories
     let (initial_report, _, advisories) =
         audit::build_audit_report_with_advisories(project_dir, registry.clone()).await?;
     let initial_vulns = initial_report.metadata.vulnerabilities.total;
+    if force {
+        // arborist's fixVulnerabilities, for each fix outside the declared range.
+        let mut warned = std::collections::BTreeSet::new();
+        for vuln in initial_report.vulnerabilities.values() {
+            let fix = &vuln.fix_available;
+            if let (Some(name), Some(version)) = (fix["name"].as_str(), fix["version"].as_str()) {
+                if warned.insert(name.to_string()) {
+                    let breaking = if fix["isSemVerMajor"] == serde_json::Value::Bool(true) {
+                        "a SemVer major change"
+                    } else {
+                        "outside your stated dependency range"
+                    };
+                    eprintln!("npm warn audit Updating {name} to {version}, which is {breaking}.");
+                }
+            }
+        }
+    }
 
     if initial_vulns == 0 {
         let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
@@ -4211,51 +4194,8 @@ async fn run_audit_fix(
         }
     }
 
-    let mut fixed_counts = audit::VulnerabilitiesCount::default();
-    for (pkg_name, (target_ver, _old_ver)) in &packages_to_upgrade {
-        let mut highest_sev: Option<audit::Severity> = None;
-        if let Some(advs) = advs_by_pkg.get(pkg_name) {
-            for adv in advs {
-                let is_still_vuln = match rnpm_core::semver::Range::parse(&adv.vulnerable_versions)
-                {
-                    Ok(r) => r.satisfies(target_ver),
-                    Err(_) => false,
-                };
-                if !is_still_vuln {
-                    highest_sev = match highest_sev {
-                        Some(cur) => Some(cur.max(adv.severity)),
-                        None => Some(adv.severity),
-                    };
-                }
-            }
-        }
-        if let Some(sev) = highest_sev {
-            match sev {
-                audit::Severity::Info => fixed_counts.info += 1,
-                audit::Severity::Low => fixed_counts.low += 1,
-                audit::Severity::Moderate => fixed_counts.moderate += 1,
-                audit::Severity::High => fixed_counts.high += 1,
-                audit::Severity::Critical => fixed_counts.critical += 1,
-            }
-            fixed_counts.total += 1;
-        }
-    }
-
-    if targets_to_update.is_empty() {
-        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
-    }
-
-    if dry_run {
-        for (pkg_name, (target_ver, old_ver)) in &packages_to_upgrade {
-            println!("would update {pkg_name} from {old_ver} to {target_ver}");
-        }
-        print_fixed_summary(fixed_counts.total, &fixed_counts, packages_to_upgrade.len());
-        return Ok(());
-    }
-
     // 1. If --force updated declared ranges, update package.json PRESERVING key order and formatting!
-    if !manifest_updates.is_empty() {
+    if !manifest_updates.is_empty() && !dry_run {
         let content = std::fs::read_to_string(&manifest_path)?;
         let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
         for (pkg_name, new_range) in &manifest_updates {
@@ -4294,6 +4234,7 @@ async fn run_audit_fix(
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
         strict_sandbox: config.get_bool("strict-sandbox").unwrap_or(false),
+        dry_run,
         ..Default::default()
     };
 
@@ -4312,31 +4253,58 @@ async fn run_audit_fix(
         }
     }
 
+    let started = std::time::Instant::now();
+    let mut options = options;
+    options.unlocked_packages = targets_to_update
+        .iter()
+        .map(|t| audit_fix_target_name(t))
+        .chain(vulnerability_constraints.keys().cloned())
+        // arborist re-resolves every vulnerable node, including the
+        // dependents that are vulnerable only through a dependency.
+        .chain(initial_report.vulnerabilities.keys().cloned())
+        .collect();
+    options.vulnerability_constraints = vulnerability_constraints;
     let mut installer = Installer::new(options)?;
-    let _update_summary = installer
-        .update_with_constraints(&targets_to_update, &vulnerability_constraints)
-        .await?;
+    let summary = installer.install().await?;
+    let _ = packages_needing_force;
 
-    // 3. Re-run audit to count actual remaining vs fixed vulnerabilities
-    let (post_report, _, _) = audit::build_audit_report_with_advisories(project_dir, registry)
-        .await
-        .unwrap_or((initial_report.clone(), None, Vec::new()));
-    let remaining_vulns = post_report.metadata.vulnerabilities.total;
-    let actual_fixed = initial_vulns.saturating_sub(remaining_vulns);
-
-    if actual_fixed > 0 {
-        print_fixed_summary(actual_fixed, &fixed_counts, packages_to_upgrade.len());
-    }
-
-    if remaining_vulns > 0 {
-        audit::print_concise_audit_summary(&post_report);
-        if !force && packages_needing_force > 0 {
-            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
+    // npm reifies, then prints the detailed audit report of the new tree.
+    let report = summary.reify.unwrap_or_default();
+    let post_report = if dry_run {
+        // A dry run audits the old tree; nodes the plan replaces are detached
+        // from it, so npm prints them with an empty location.
+        let mut post = initial_report;
+        let replaced: std::collections::HashSet<&str> = report
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                rnpm_install::ReifyChange::Change { from, .. } | rnpm_install::ReifyChange::Remove(from) => {
+                    Some(from.location.as_str())
+                }
+                rnpm_install::ReifyChange::Add(_) => None,
+            })
+            .collect();
+        for vuln in post.vulnerabilities.values_mut() {
+            for node in &mut vuln.nodes {
+                if replaced.contains(node.as_str()) {
+                    node.clear();
+                }
+            }
         }
+        post
     } else {
-        println!("found 0 vulnerabilities");
+        audit::build_audit_report(project_dir, registry)
+            .await
+            .map(|(r, _)| r)
+            .unwrap_or(initial_report)
+    };
+    let fund = config.get_bool("fund").unwrap_or(true);
+    let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+    opts.audit_command = true;
+    let funding = if fund && !dry_run { audit::count_funding_packages(project_dir) } else { 0 };
+    if !opts.silent {
+        reify_output::print(project_dir, &report, Some(&post_report), funding, &opts, started.elapsed())?;
     }
-
     audit::check_report_threshold(&post_report, audit_level)
 }
 

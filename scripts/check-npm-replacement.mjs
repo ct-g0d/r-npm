@@ -321,6 +321,28 @@ for(const [name,args]of [['json',['audit','--json']],['text',['audit']],['fix-dr
     ['prune-default',['prune','--ignore-scripts'],installed],
   ])add(`reify-${name}`,args[0],args,tree,{env:defaults,...(before?{before}:{}),...(extra||{})});
 }
+// audit fix on an installed tree: an in-range transitive fix, and a direct
+// semver-major fix that needs --force.
+{
+  const defaults={NPM_CONFIG_AUDIT:'true',NPM_CONFIG_FUND:'true'};
+  const locked=deps=>dir=>{
+    const entry=(name,version,extra={})=>{const bytes=tarballs.get(`/${name}-${version}.tgz`);return {version,resolved:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64'),...extra};};
+    const packages={'':{name:'readiness-case',version:'1.0.0',dependencies:deps}};
+    if(deps.parent)packages['node_modules/parent']=entry('parent','1.0.0',{dependencies:{dep:'^1.0.0'}});
+    packages['node_modules/dep']=entry('dep','1.0.0');
+    manifest(dir,{dependencies:deps});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages});
+  };
+  const ci=async ctx=>{const p=await ctx.exec(['ci','--ignore-scripts','--no-audit']);if(p.exit!==0)throw new Error(p.stderr);};
+  const advisory=range=>({dep:[{id:401,name:'dep',url:'https://example.invalid/advisory/401',title:'Fix advisory',severity:'high',vulnerable_versions:range,cwe:[],cvss:{score:7.5,vectorString:null}}]});
+  for(const [name,deps,range,flags] of [
+    ['transitive',{parent:'^1.0.0'},'<1.1.0',[]],
+    ['transitive-json',{parent:'^1.0.0'},'<1.1.0',['--json']],
+    ['transitive-dry',{parent:'^1.0.0'},'<1.1.0',['--dry-run']],
+    ['direct-major',{dep:'^1.0.0'},'<2.0.0',[]],
+    ['direct-major-force',{dep:'^1.0.0'},'<2.0.0',['--force']],
+    ['direct-major-force-json',{dep:'^1.0.0'},'<2.0.0',['--force','--json']],
+  ])add(`audit-fix-${name}`,'audit',['audit','fix','--ignore-scripts',...flags],locked(deps),{env:defaults,before:ci,advisories:advisory(range)});
+}
 probePackages.set('audit-bundler',{name:'audit-bundler','dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name:'audit-bundler',version,dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'},bundleDependencies:['audit-leaf']}]))});
 for(const flags of [[],['--json']])add(`f1-audit-bundled${flags.length?'-json':''}`,'audit',['audit',...flags],dir=>{
   manifest(dir,{dependencies:{'audit-bundler':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-bundler':'^1.0.0'}},'node_modules/audit-bundler':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'},bundleDependencies:['audit-leaf']},'node_modules/audit-bundler/node_modules/audit-leaf':{version:'1.0.0',inBundle:true}}});
