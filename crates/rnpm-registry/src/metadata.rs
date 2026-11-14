@@ -125,9 +125,14 @@ where
         where
             S: SeqAccess<'de>,
         {
+            // Published packuments contain entries such as `"libc": [null]`
+            // (@oxc-parser bindings); npm keeps reading the document, so
+            // non-string entries are dropped instead of failing the parse.
             let mut list = Vec::new();
-            while let Some(item) = seq.next_element::<String>()? {
-                list.push(item);
+            while let Some(item) = seq.next_element::<serde_json::Value>()? {
+                if let serde_json::Value::String(s) = item {
+                    list.push(s);
+                }
             }
             Ok(list)
         }
@@ -417,6 +422,19 @@ impl AbbreviatedPackageMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_platform_lists_tolerate_null_entries() {
+        // Shape published by @oxc-parser/binding-win32-arm64-msvc.
+        let json = r#"{
+            "name": "binding", "version": "1.0.0",
+            "dist": { "tarball": "https://r/b.tgz" },
+            "os": ["win32"], "cpu": ["arm64"], "libc": [null]
+        }"#;
+        let version: AbbreviatedVersion = serde_json::from_str(json).unwrap();
+        assert_eq!(version.os, ["win32"]);
+        assert!(version.libc.is_empty());
+    }
 
     #[test]
     fn test_deserialize_abbreviated_metadata() {
