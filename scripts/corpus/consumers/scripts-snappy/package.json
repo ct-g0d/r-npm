@@ -1,0 +1,8 @@
+{
+  "name": "scripts-snappy",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "snappy": "7.4.4"
+  }
+}
