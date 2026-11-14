@@ -68,9 +68,11 @@ impl Overrides {
             &manifest.optional_dependencies,
             &manifest.dev_dependencies,
         ] {
+            // An empty spec is falsy in arborist, so it never resolves.
             for (name, spec) in section {
-                let effective = if spec.is_empty() { "*" } else { spec.as_str() };
-                specs.insert(name.clone(), effective.to_string());
+                if !spec.is_empty() {
+                    specs.insert(name.clone(), spec.clone());
+                }
             }
         }
         specs
