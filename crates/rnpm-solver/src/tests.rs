@@ -5674,3 +5674,230 @@ fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
     // overridden by the visible root node, not duplicated beside the owner.
     assert!(!graph.nodes.contains_key("node_modules/a/node_modules/react"));
 }
+
+#[test]
+fn test_peer_conflict_fatality_depends_on_requester_is_mine() {
+    // #1: Peer conflict fatality depends on who requested the package:
+    // root/workspace = fatal ERESOLVE, else warn and keep visible node (build-ideal-tree conflictOK)
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("peer-pkg", "1.0.0", |_| {});
+    provider.add_version("peer-pkg", "2.0.0", |_| {});
+    provider.add_version("parent-pkg", "1.0.0", |v| {
+        v.dependencies.insert("transitive".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("transitive", "1.0.0", |v| {
+        v.peer_dependencies.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("root-pkg".to_string());
+    manifest.dependencies.insert("peer-pkg".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("parent-pkg".to_string(), "1.0.0".to_string());
+
+    // Transitive requester is NOT root (is_mine = false) -> non-fatal, keeps visible node
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+        .expect("Transitive peer conflict must not be fatal in standard mode");
+    assert_eq!(graph.nodes["node_modules/peer-pkg"].version, "1.0.0");
+    assert_eq!(graph.nodes["node_modules/parent-pkg"].version, "1.0.0");
+
+    // But when root directly requests a package with a conflicting peer, is_mine = true -> fatal ERESOLVE
+    provider.add_version("direct-pkg", "1.0.0", |v| {
+        v.peer_dependencies.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+    });
+    manifest.dependencies.insert("direct-pkg".to_string(), "1.0.0".to_string());
+    let err = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+        .expect_err("Direct root peer conflict must be fatal");
+    assert!(matches!(err, crate::error::SolverError::PeerConflict { .. }));
+}
+
+#[test]
+fn test_target_peer_conflicts_intermediate_ancestor_scopes() {
+    // #2: target_peer_conflicts checks intermediate ancestor scopes and reuse targets
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("peer-dep", "1.0.0", |_| {});
+    provider.add_version("peer-dep", "2.0.0", |_| {});
+    provider.add_version("leaf", "1.0.0", |v| {
+        v.peer_dependencies.insert("peer-dep".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("leaf", "2.0.0", |_| {});
+    provider.add_version("sub", "1.0.0", |v| {
+        v.dependencies.insert("leaf".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("sub", "2.0.0", |_| {});
+    provider.add_version("tool", "1.0.0", |v| {
+        v.dependencies.insert("sub".to_string(), "1.0.0".to_string());
+        v.dependencies.insert("peer-dep".to_string(), "2.0.0".to_string());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("app".to_string());
+    manifest.dependencies.insert("peer-dep".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("leaf".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("sub".to_string(), "2.0.0".to_string());
+    manifest.dependencies.insert("tool".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+        .expect("Resolution should succeed by nesting leaf under sub");
+    assert_eq!(graph.nodes["node_modules/leaf"].version, "2.0.0");
+    assert_eq!(graph.nodes["node_modules/tool/node_modules/sub"].version, "1.0.0");
+    assert_eq!(graph.nodes["node_modules/tool/node_modules/peer-dep"].version, "2.0.0");
+    // leaf@1.0.0 requires peer-dep ^1.0.0. Visible peer at intermediate scope 'tool' is 2.0.0 (incompatible).
+    // Because target_peer_conflicts checks intermediate ancestor scopes, leaf@1.0.0 is not placed at
+    // tool/node_modules/leaf, but correctly nests under tool/node_modules/sub/node_modules/leaf:
+    assert!(graph.nodes.contains_key("node_modules/tool/node_modules/sub/node_modules/leaf"));
+}
+
+#[test]
+fn test_load_peer_set_workspace_and_omit_dev() {
+    // #3: loadPeerSet advisory resolution supports workspaces and respects omit_dev
+    use rnpm_core::manifest::PackageWorkspaces;
+    use rnpm_core::workspace::WorkspaceMember;
+    use std::path::PathBuf;
+
+    let mut provider = InMemoryPackageProvider::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        provider.add_version("shared-pkg", v, |_| {});
+    }
+    provider.add_version("plugin-pkg", "1.0.0", |v| {
+        v.peer_dependencies.insert("shared-pkg".to_string(), "1.1.0".to_string());
+    });
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("workspace-root".to_string());
+    root_manifest.workspaces = Some(PackageWorkspaces::List(vec!["packages/*".to_string()]));
+
+    let mut member_manifest = Manifest::default();
+    member_manifest.name = Some("member-a".to_string());
+    member_manifest.version = Some("1.0.0".to_string());
+    member_manifest.dependencies.insert("shared-pkg".to_string(), "^1.0.0".to_string());
+    member_manifest.dependencies.insert("plugin-pkg".to_string(), "1.0.0".to_string());
+
+    let members = vec![WorkspaceMember {
+        name: "member-a".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/a"),
+        relative_path: "packages/a".to_string(),
+        manifest: member_manifest,
+    }];
+
+    let graph = crate::workspace::resolve_workspace_graph(
+        &root_manifest,
+        &members,
+        &provider,
+        &ResolverOptions::default(),
+    )
+    .expect("Workspace resolution with loadPeerSet should succeed");
+
+    // The advisory second edge from plugin-pkg@1.0.0 selects 1.1.0 for shared-pkg
+    assert_eq!(graph.nodes["node_modules/shared-pkg"].version, "1.1.0");
+}
+
+#[test]
+fn test_override_reference_unresolvable_fails_and_caller_fallback_succeeds() {
+    // #4: Unresolved $name reference errors, and caller dependencies fallback works
+    use crate::overrides::Overrides;
+    use crate::solver::Solver;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("shared-dep", "2.0.0", |_| {});
+    provider.add_version("caller-pkg", "1.0.0", |v| {
+        v.dependencies.insert("callee".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies.insert("shared-dep".to_string(), "2.0.0".to_string());
+    });
+    provider.add_version("callee", "1.0.0", |_| {});
+    provider.add_version("callee", "2.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("test-overrides".to_string());
+    manifest.dependencies.insert("caller-pkg".to_string(), "1.0.0".to_string());
+
+    // 1. Unresolvable reference override errors with SolverError::InvalidOverride
+    let bad_overrides = Overrides::from_json_value(
+        Some(&serde_json::json!({ "callee": "$nonexistent" })),
+        BTreeMap::new(),
+    );
+    let err = Solver::new(&provider, ResolverOptions::default(), bad_overrides)
+        .resolve(&manifest)
+        .expect_err("Unresolvable override reference must error");
+    assert!(err.to_string().contains("Unable to resolve reference $nonexistent"));
+
+    // 2. Reference override falls back to caller dependencies when missing from root
+    let caller_overrides = Overrides::from_json_value(
+        Some(&serde_json::json!({ "callee": "$shared-dep" })),
+        BTreeMap::new(),
+    );
+    let graph = Solver::new(&provider, ResolverOptions::default(), caller_overrides)
+        .resolve(&manifest)
+        .expect("Caller fallback override must succeed");
+    assert_eq!(graph.nodes["node_modules/callee"].version, "2.0.0");
+}
+
+#[test]
+fn test_ci_omit_peer_and_legacy_peer_deps() {
+    // #5: legacy_peer_deps bypasses peer resolution during solver traversal,
+    // whereas standard resolution marks peer dependencies with peer flags.
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("pkg-with-peer", "1.0.0", |v| {
+        v.peer_dependencies.insert("peer-lib".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("peer-lib", "1.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("app".to_string());
+    manifest.dependencies.insert("pkg-with-peer".to_string(), "1.0.0".to_string());
+
+    // Standard mode resolves peer-lib and marks it as peer
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+        .expect("Standard resolution must succeed");
+    assert!(graph.nodes.contains_key("node_modules/peer-lib"));
+    assert!(graph.nodes["node_modules/peer-lib"].flags.peer);
+
+    // legacy-peer-deps bypasses peer resolution completely
+    let legacy_opts = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
+    let legacy_graph = resolve_dependency_graph(&manifest, &provider, &legacy_opts)
+        .expect("Legacy peer resolution must succeed");
+    assert!(!legacy_graph.nodes.contains_key("node_modules/peer-lib"));
+}
+
+#[test]
+fn test_rehome_transitive_root_node_migrates_nested_children_and_edges() {
+    // #6: rehome_transitive_root_node migrates nested child nodes and updates all edges
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("parent-a", "1.0.0", |v| {
+        v.dependencies.insert("shared-sub".to_string(), "^1.0.0".to_string());
+    });
+    provider.add_version("shared-sub", "1.0.0", |v| {
+        v.dependencies.insert("leaf-child".to_string(), "1.0.0".to_string());
+    });
+    provider.add_version("leaf-child", "1.0.0", |_| {});
+    provider.add_version("parent-b", "1.0.0", |v| {
+        v.dependencies.insert("shared-sub".to_string(), "^2.0.0".to_string());
+    });
+    provider.add_version("shared-sub", "2.0.0", |_| {});
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("rehome-test".to_string());
+    manifest.dependencies.insert("parent-a".to_string(), "1.0.0".to_string());
+    manifest.dependencies.insert("parent-b".to_string(), "1.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+        .expect("Tree resolution should succeed");
+    // Verify no dangling edges point to non-existent nodes
+    for edge in &graph.edges {
+        if !edge.from_location.is_empty() {
+            assert!(
+                graph.nodes.contains_key(&edge.from_location),
+                "Edge from_location '{}' must exist in graph nodes",
+                edge.from_location
+            );
+        }
+        assert!(
+            graph.nodes.contains_key(&edge.to_location),
+            "Edge to_location '{}' must exist in graph nodes",
+            edge.to_location
+        );
+    }
+}

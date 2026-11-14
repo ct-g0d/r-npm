@@ -1580,7 +1580,7 @@ fn test_sync_reaps_descendants_before_waiting_for_pipe_eof() {
     std::fs::write(&script_file, script).unwrap();
     let ctx = LifecycleContext::new(
         temp.path(), temp.path(), "inherited-pipes", "install",
-        &format!("node \"{}\"", script_file.display()),
+        format!("node \"{}\"", script_file.display()),
     ).with_capture_output(true).with_timeout(std::time::Duration::from_secs(180));
     let status = execute_lifecycle_script(&ctx).unwrap();
     assert!(status.success());
