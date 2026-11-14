@@ -510,9 +510,8 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                 continue;
             }
         }
-        if package.license.is_some() && package.engines.is_some() {
-            continue;
-        }
+        // Registry metadata never carries `workspaces`, so even entries with
+        // license and engines need their package.json read.
         missing_locations.push(location.clone());
     }
 

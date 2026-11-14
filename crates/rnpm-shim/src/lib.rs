@@ -237,18 +237,95 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// cmd-shim runs a target with no `#!` line directly instead of through node.
-fn target_has_shebang(target: &Path) -> bool {
-    let Ok(data) = fs::read(target) else {
-        return false;
-    };
+/// The shebang of `target` as cmd-shim parses it: `None` when the file has
+/// no `#!` line (run directly), else `(env vars, program, trimmed args)`.
+fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
+    let data = fs::read(target).ok()?;
     let text = String::from_utf8_lossy(&data);
-    let line = text.trim().lines().next().unwrap_or("");
-    line.strip_prefix("#!").is_some_and(|rest| {
-        let rest = rest.trim_start();
-        let rest = rest.strip_prefix("/usr/bin/env").map_or(rest, str::trim_start);
-        !rest.is_empty()
-    })
+    let line = text.trim().split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let mut rest = line.strip_prefix("#!")?.trim_start();
+    let mut vars = String::new();
+    // /^#!\s*(?:\/usr\/bin\/env\s+(?:-S\s+)?((?:[^ \t=]+=[^ \t=]+\s+)*))?([^ \t]+)(.*)$/
+    if let Some(after) = rest.strip_prefix("/usr/bin/env") {
+        if after.starts_with(char::is_whitespace) {
+            let mut after = after.trim_start();
+            if let Some(s) = after.strip_prefix("-S") {
+                if s.starts_with(char::is_whitespace) {
+                    after = s.trim_start();
+                }
+            }
+            loop {
+                let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                let token = &after[..end];
+                let is_var = token.split_once('=').is_some_and(|(k, v)| {
+                    !k.is_empty() && !v.is_empty() && !v.contains('=')
+                });
+                if !is_var || end == after.len() {
+                    break;
+                }
+                let next = after[end..].trim_start();
+                vars.push_str(&after[..after.len() - next.len()]);
+                after = next;
+            }
+            rest = after;
+        }
+    }
+    let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((vars, rest[..end].to_string(), rest[end..].trim().to_string()))
+}
+
+const SH_HEAD: &str = concat!(
+    "#!/bin/sh\n",
+    r#"basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")"#,
+    "\n\ncase `uname` in\n",
+    "    *CYGWIN*|*MINGW*|*MSYS*)\n",
+    "        if command -v cygpath > /dev/null 2>&1; then\n",
+    "            basedir=`cygpath -w \"$basedir\"`\n",
+    "        fi\n",
+    "    ;;\n",
+    "esac\n\n",
+);
+
+const CMD_HEAD: &str =
+    "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n";
+
+const PS1_HEAD: &str = concat!(
+    "#!/usr/bin/env pwsh\n",
+    "$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n\n",
+    "$exe=\"\"\n",
+    "if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {\n",
+    "  # Fix case when both the Windows and Linux builds of Node\n",
+    "  # are installed in the same directory\n",
+    "  $exe=\".exe\"\n",
+    "}\n",
+);
+
+/// Shim trio for a target whose shebang names `prog` (other than plain node),
+/// as cmd-shim writes it: the program and its args are copied verbatim.
+pub fn generate_program_shims(
+    target_rel_from_node_modules: &str,
+    prog: &str,
+    args: &str,
+) -> (String, String, String) {
+    let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
+    let ps1_target = format!("\"$basedir/../{}\"", escape_ps1_path(target_rel_from_node_modules));
+    let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
+    let sh_prog = prog.replace('\\', "/");
+    let sh = format!(
+        "{SH_HEAD}if [ -x \"$basedir/{prog}\" ]; then\n  exec \"$basedir/{prog}\" {args} {sh_target} \"$@\"\nelse \n  exec {sh_prog} {args} {sh_target} \"$@\"\nfi\n"
+    );
+    let cmd = format!(
+        "{CMD_HEAD}\r\nIF EXIST \"%dp0%\\{prog}.exe\" (\r\n  SET \"_prog=%dp0%\\{prog}.exe\"\r\n) ELSE (\r\n  SET \"_prog={prog}\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" {args} \"%dp0%\\..\\{win_target}\" %*\r\n"
+    );
+    let long = format!("\"$basedir/{prog}$exe\"");
+    let short = format!("\"{sh_prog}$exe\"");
+    let ps1 = format!(
+        "{PS1_HEAD}$ret=0\nif (Test-Path {long}) {{\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {{\n    $input | & {long} {args} {ps1_target} $args\n  }} else {{\n    & {long} {args} {ps1_target} $args\n  }}\n  $ret=$LASTEXITCODE\n}} else {{\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {{\n    $input | & {short} {args} {ps1_target} $args\n  }} else {{\n    & {short} {args} {ps1_target} $args\n  }}\n  $ret=$LASTEXITCODE\n}}\nexit $ret\n"
+    );
+    (sh, cmd, ps1)
 }
 
 /// Shim trio (sh, cmd, ps1) for a target without a shebang, as cmd-shim writes it.
@@ -256,31 +333,10 @@ pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, Str
     let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
     let ps1_target = format!("\"$basedir/../{}\"", escape_ps1_path(target_rel_from_node_modules));
     let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
-    let sh = [
-        "#!/bin/sh\n",
-        r#"basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")"#,
-        "\n\ncase `uname` in\n",
-        "    *CYGWIN*|*MINGW*|*MSYS*)\n",
-        "        if command -v cygpath > /dev/null 2>&1; then\n",
-        "            basedir=`cygpath -w \"$basedir\"`\n",
-        "        fi\n",
-        "    ;;\n",
-        "esac\n\n",
-        &format!("exec {sh_target}   \"$@\"\n"),
-    ]
-    .concat();
-    let cmd = format!(
-        "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\..\\{win_target}\"   %*\r\n"
-    );
+    let sh = format!("{SH_HEAD}exec {sh_target}   \"$@\"\n");
+    let cmd = format!("{CMD_HEAD}\"%dp0%\\..\\{win_target}\"   %*\r\n");
     let ps1 = [
-        "#!/usr/bin/env pwsh\n",
-        "$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n\n",
-        "$exe=\"\"\n",
-        "if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {\n",
-        "  # Fix case when both the Windows and Linux builds of Node\n",
-        "  # are installed in the same directory\n",
-        "  $exe=\".exe\"\n",
-        "}\n",
+        PS1_HEAD,
         "# Support pipeline input\n",
         "if ($MyInvocation.ExpectingInput) {\n",
         &format!("  $input | & {ps1_target}   $args\n"),
@@ -306,9 +362,19 @@ pub fn create_shims(
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
     let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
-    let target = bin_dir.parent().map(|nm| nm.join(target_rel_from_node_modules));
-    if is_dot_bin && target.is_some_and(|t| t.is_file() && !target_has_shebang(&t)) {
-        let (sh, cmd, ps1) = generate_direct_shims(target_rel_from_node_modules);
+    let target = bin_dir
+        .parent()
+        .map(|nm| nm.join(target_rel_from_node_modules))
+        .filter(|t| is_dot_bin && t.is_file());
+    // Plain `node` (and env-var shebangs, not modelled here) keep the node shim.
+    let custom = target.map(|t| cmd_shim_shebang(&t)).and_then(|shebang| match shebang {
+        None => Some(generate_direct_shims(target_rel_from_node_modules)),
+        Some((vars, prog, args)) if vars.is_empty() && (prog != "node" || !args.is_empty()) => {
+            Some(generate_program_shims(target_rel_from_node_modules, &prog, &args))
+        }
+        Some(_) => None,
+    });
+    if let Some((sh, cmd, ps1)) = custom {
         let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, sh)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;

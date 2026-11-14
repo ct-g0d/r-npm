@@ -237,6 +237,17 @@ pub struct RegistryPackageProvider {
     unlocked_packages: std::collections::HashSet<String>,
 }
 
+/// npm never creates node_modules when nothing is reified, so drop one that
+/// holds nothing but the hidden lockfile.
+fn remove_node_modules_if_empty(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+    if names.iter().all(|n| n == ".package-lock.json") {
+        let _ = std::fs::remove_file(dir.join(".package-lock.json"));
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<PackageMetadata> {
     let mut versions = BTreeMap::new();
     let mut top_ver = None;
@@ -1421,9 +1432,28 @@ fn reify_report_for(
 }
 
 /// Node.shouldOmit from arborist, over lockfile flags.
-fn lockfile_entry_omitted(options: &InstallOptions, info: &LockfilePackage) -> bool {
+fn lockfile_entry_omitted(
+    options: &InstallOptions,
+    lockfile: &LockfileV3,
+    key: &str,
+    info: &LockfilePackage,
+) -> bool {
     let dev_optional = info.dev_optional.unwrap_or(false);
-    let is_dev = info.dev.unwrap_or(false);
+    // A package's link to itself (`"name": "."`) targets the root, so the
+    // lockfile has no flags for it; npm derives them from the root's edge.
+    let self_link_dev = info.link == Some(true)
+        && info.resolved.as_deref() == Some("")
+        && key.strip_prefix("node_modules/").is_some_and(|name| {
+            lockfile.packages.get("").is_some_and(|root| {
+                let has = |deps: &Option<BTreeMap<String, String>>| {
+                    deps.as_ref().is_some_and(|d| d.contains_key(name))
+                };
+                has(&root.dev_dependencies)
+                    && !has(&root.dependencies)
+                    && !has(&root.optional_dependencies)
+            })
+        });
+    let is_dev = info.dev.unwrap_or(false) || self_link_dev;
     let is_optional = info.is_effective_optional() || info.is_peer_optional();
     let is_peer = info.peer.unwrap_or(false) || info.peer_optional.unwrap_or(false);
 
@@ -1468,6 +1498,13 @@ pub struct ResolvedNode {
 fn is_directory_dependency(path: &Path) -> bool {
     let spec = path.to_string_lossy();
     !path.is_file() && ![".tgz", ".tar.gz", ".tar"].iter().any(|suffix| spec.ends_with(suffix))
+}
+
+/// The lockfile location a `file:` directory link points at, as npm writes it:
+/// relative, forward slashes, and `""` for the project root itself.
+fn link_target_rel(rel_file: &str) -> String {
+    let cleaned = path_clean::clean(rel_file).to_string_lossy().replace('\\', "/");
+    if cleaned == "." { String::new() } else { cleaned }
 }
 
 /// Lockfile entry for the target of a `file:` directory link, shaped like
@@ -2625,7 +2662,8 @@ impl Installer {
                     if let Some(rel_file) = res.strip_prefix("file:") {
                         let abs_file = self.options.project_dir.join(rel_file);
                         if is_directory_dependency(&abs_file) {
-                            let clean_rel = rel_file.strip_prefix("./").unwrap_or(rel_file);
+                            let clean_rel = link_target_rel(rel_file);
+                            let clean_rel = clean_rel.as_str();
                             let link_entry = LockfilePackage {
                                 resolved: Some(clean_rel.to_string()),
                                 link: Some(true),
@@ -2633,10 +2671,13 @@ impl Installer {
                             };
                             lockfile.insert_package(loc, link_entry);
 
-                            lockfile.insert_package(
-                                clean_rel,
-                                directory_target_entry(&abs_file, clean_rel, node),
-                            );
+                            // A self link (`"."`) targets the root, which already has an entry.
+
+                            if !clean_rel.is_empty() {
+
+                                lockfile.insert_package(clean_rel, directory_target_entry(&abs_file, clean_rel, node));
+
+                            }
                         }
                     }
                 }
@@ -3126,7 +3167,7 @@ impl Installer {
                 if res.starts_with("file:") {
                     let rel_file = res.strip_prefix("file:").unwrap();
                     let clean_rel = rel_file.trim_start_matches("./").trim_start_matches(".\\");
-                    let abs_file = self.options.project_dir.join(clean_rel);
+                    let abs_file = path_clean::clean(self.options.project_dir.join(clean_rel));
                     if abs_file.is_file() {
                         let archive_bytes = std::fs::read(&abs_file)?;
                         let computed_integrity = if let Some(ref integ) = node.integrity {
@@ -3267,7 +3308,8 @@ impl Installer {
                             }
                         }
 
-                        let clean_rel = rel_file.strip_prefix("./").unwrap_or(rel_file);
+                        let clean_rel = link_target_rel(rel_file);
+                            let clean_rel = clean_rel.as_str();
                         let link_entry = LockfilePackage {
                             resolved: Some(clean_rel.to_string()),
                             link: Some(true),
@@ -3275,10 +3317,13 @@ impl Installer {
                         };
                         lockfile.insert_package(loc, link_entry);
 
-                        lockfile.insert_package(
-                            clean_rel,
-                            directory_target_entry(&abs_file, clean_rel, node),
-                        );
+                        // A self link (`"."`) targets the root, which already has an entry.
+
+                        if !clean_rel.is_empty() {
+
+                            lockfile.insert_package(clean_rel, directory_target_entry(&abs_file, clean_rel, node));
+
+                        }
                         continue;
                     }
                 }
@@ -4097,13 +4142,7 @@ impl Installer {
                     let _ = std::fs::remove_file(&hidden_path);
                 }
                 let nm_dir = loc_base_dir.join("node_modules");
-                if nm_dir.exists() {
-                    if let Ok(mut entries) = std::fs::read_dir(&nm_dir) {
-                        if entries.next().is_none() {
-                            let _ = std::fs::remove_dir(&nm_dir);
-                        }
-                    }
-                }
+                remove_node_modules_if_empty(&nm_dir);
             }
         }
 
@@ -4126,13 +4165,7 @@ impl Installer {
         }
 
         clean_empty_bin_dirs(&node_modules_dir);
-        if node_modules_dir.exists() {
-            if let Ok(mut entries) = std::fs::read_dir(&node_modules_dir) {
-                if entries.next().is_none() {
-                    let _ = std::fs::remove_dir(&node_modules_dir);
-                }
-            }
-        }
+        remove_node_modules_if_empty(&node_modules_dir);
 
         Ok(InstallSummary {
             reify: reify_report,
@@ -4425,7 +4458,7 @@ impl Installer {
                 if pkg_key.is_empty() || pkg_info.is_extraneous() {
                     continue;
                 }
-                if lockfile_entry_omitted(&self.options, pkg_info) {
+                if lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info) {
                     continue;
                 }
                 let is_optional = pkg_info.optional.unwrap_or(false)
@@ -4614,7 +4647,7 @@ impl Installer {
             }
 
             // Omit filtering: match Arborist node.js shouldOmit
-            if lockfile_entry_omitted(&self.options, pkg_info) {
+            if lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info) {
                 continue;
             }
 
@@ -6106,7 +6139,7 @@ impl Installer {
                     }
                     if let Some(info) = lockfile.packages.get(*k) {
                         // Omitted packages are not on disk; npm links no bins for them.
-                        if lockfile_entry_omitted(&self.options, info) {
+                        if lockfile_entry_omitted(&self.options, &lockfile, k, info) {
                             return false;
                         }
                         if info.link == Some(true) {
@@ -6204,13 +6237,7 @@ impl Installer {
             }
         }
         clean_empty_bin_dirs(&node_modules_dir);
-        if node_modules_dir.exists() {
-            if let Ok(mut entries) = std::fs::read_dir(&node_modules_dir) {
-                if entries.next().is_none() {
-                    let _ = std::fs::remove_dir(&node_modules_dir);
-                }
-            }
-        }
+        remove_node_modules_if_empty(&node_modules_dir);
 
         Ok(InstallSummary {
             reify: reify_report,

@@ -2718,6 +2718,10 @@ mod tests {
         let mut pack_bytes = fs::read(&pack_path).unwrap();
         pack_bytes[0] ^= 0xFF; // Bit flip
         fs::write(&pack_path, &pack_bytes).unwrap();
+        // Same-tick writes keep the mtime, which would hit the verified-mtime
+        // shortcut; real corruption is detected once the mtime differs.
+        fs::File::options().write(true).open(&pack_path).unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
 
         // Attempting to materialize should detect hash mismatch, return CorruptedPack, and purge files
         let target = tempdir().unwrap();
@@ -2756,6 +2760,10 @@ mod tests {
         store.clear_mmap_cache();
         let zero_bytes = vec![0u8; index.total_pack_size as usize];
         fs::write(&pack_path, &zero_bytes).unwrap();
+        // Same-tick writes keep the mtime, which would hit the verified-mtime
+        // shortcut; real corruption is detected once the mtime differs.
+        fs::File::options().write(true).open(&pack_path).unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
 
         // Materialize should detect zero-filled corruption and purge
         let target = tempdir().unwrap();
