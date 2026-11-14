@@ -151,6 +151,9 @@ pub struct DependencyGraph {
     pub nodes: BTreeMap<String, Node>,
     pub edges: Vec<DependencyEdge>,
     pub skipped: HashSet<String>,
+    /// `legacy-peer-deps`: arborist creates no peer edges at all.
+    #[serde(skip)]
+    pub legacy_peer_deps: bool,
 }
 
 impl DependencyGraph {
@@ -160,6 +163,7 @@ impl DependencyGraph {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             skipped: HashSet::new(),
+            legacy_peer_deps: false,
         }
     }
 
@@ -198,6 +202,9 @@ impl DependencyGraph {
     /// provider lands in the tree, even if that happens after its owner was
     /// placed. Those late edges keep the provider alive in calc-dep-flags.
     fn link_late_optional_peers(&mut self) {
+        if self.legacy_peer_deps {
+            return;
+        }
         let existing: HashSet<(String, String)> = self
             .edges
             .iter()
