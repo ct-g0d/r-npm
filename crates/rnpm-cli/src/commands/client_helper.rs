@@ -16,7 +16,13 @@ pub(crate) struct CommandClient {
 }
 
 impl CommandClient {
-    pub async fn send_json(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, mut otp: Option<String>) -> Result<serde_json::Value> {
+    pub async fn send_json(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, otp: Option<String>) -> Result<serde_json::Value> {
+        let text = self.send_text(current_dir, method, url.clone(), body, otp).await?;
+        if text.trim().is_empty() { Ok(serde_json::Value::Null) } else { parse_json_response(&text, &url) }
+    }
+
+    /// One registry request wrapped in npm's otplease retry; returns the raw body.
+    pub async fn send_text(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, mut otp: Option<String>) -> Result<String> {
         for attempt in 0..2 {
             let mut request = self.request(method.clone(), url.clone(), otp.as_deref());
             if let Some(body) = &body { request = request.json(body); }
@@ -24,9 +30,7 @@ impl CommandClient {
             let status = response.status();
             let www = response.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
             let text = response.text().await?;
-            if status.is_success() {
-                return if text.trim().is_empty() { Ok(serde_json::Value::Null) } else { parse_json_response(&text, &url) };
-            }
+            if status.is_success() { return Ok(text); }
             let err = format_http_error_with_auth(method.as_str(), &url, status, www.as_deref(), &text);
             if attempt == 0 {
                 if let Some(code) = crate::http_errors::retry_otp(current_dir, &err).await? { otp = Some(code); continue; }

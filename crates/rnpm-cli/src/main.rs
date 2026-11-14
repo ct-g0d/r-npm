@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
+mod reify_output;
 mod explain;
 pub mod commands;
 pub mod diagnostics;
@@ -1523,12 +1524,12 @@ pub(crate) enum TokenAction {
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum OwnerAction {
     /// List package owners.
-    Ls { package: String },
+    Ls { package: Option<String> },
     /// Add an owner.
-    Add { user: String, package: String },
+    Add { user: String, package: Option<String> },
     /// Remove an owner.
     #[command(alias = "remove")]
-    Rm { user: String, package: String },
+    Rm { user: String, package: Option<String> },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -4364,18 +4365,16 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
     }
 }
 
+/// npm's elapsed format: the `ms` package's short form (rounded units).
 pub(crate) fn format_duration(d: std::time::Duration) -> String {
-    let millis = d.as_millis();
-    if millis < 1000 {
-        format!("{millis}ms")
-    } else {
-        let secs = d.as_secs_f64();
-        if (secs * 10.0).round() % 10.0 == 0.0 {
-            format!("{:.0}s", secs)
-        } else {
-            format!("{:.1}s", secs)
+    let ms = d.as_millis() as f64;
+    let units = [(86_400_000.0, "d"), (3_600_000.0, "h"), (60_000.0, "m"), (1_000.0, "s")];
+    for (size, suffix) in units {
+        if ms >= size {
+            return format!("{}{suffix}", (ms / size).round());
         }
     }
+    format!("{ms}ms")
 }
 
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
@@ -4591,7 +4590,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let summary = installer.run().await?;
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(report) = summary.reify.as_ref() {
+                let audit_report = if audit_val && !dry_run {
+                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                } else {
+                    None
+                };
+                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
+                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                out.silent |= silent;
+                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": summary.packages_installed,
@@ -4621,7 +4630,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         let count = audit::count_funding_packages(&current_dir);
                         if count > 0 {
                             println!(
-                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                "\n{} packages are looking for funding\n  run `npm fund` for details",
                                 count
                             );
                         }
@@ -4764,7 +4773,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let summary = installer.run_ci().await?;
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(report) = summary.reify.as_ref() {
+                let audit_report = if audit_val && !dry_run {
+                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                } else {
+                    None
+                };
+                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
+                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                out.silent |= silent;
+                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": summary.packages_installed,
@@ -4794,7 +4813,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         let count = audit::count_funding_packages(&current_dir);
                         if count > 0 {
                             println!(
-                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                "\n{} packages are looking for funding\n  run `npm fund` for details",
                                 count
                             );
                         }

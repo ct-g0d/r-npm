@@ -126,7 +126,9 @@ pub(crate) async fn run(
                 })
                 .ok_or_else(|| anyhow::anyhow!("npm error Unknown token id or value \"{token_id}\"."))?;
 
-            client.token_revoke(Some(&registry_url), &key_to_remove).await?;
+            let command_client = super::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
+            let url = registry_url.join(&format!("-/npm/v1/tokens/token/{key_to_remove}"))?;
+            command_client.send_text(&current_dir, reqwest::Method::DELETE, url, None, None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&vec![key_to_remove])?);
             } else {

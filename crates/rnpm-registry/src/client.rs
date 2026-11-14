@@ -1635,13 +1635,28 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
-        self.get_package_metadata_from_url_conditional_with_accept(
-            package_name,
-            url,
-            if_none_match,
-            NPM_INSTALL_V1_JSON,
-        )
-        .await
+        match self
+            .get_package_metadata_from_url_conditional_with_accept(
+                package_name,
+                url.clone(),
+                if_none_match,
+                NPM_INSTALL_V1_JSON,
+            )
+            .await
+        {
+            // pacote treats a corgi 404 as "abbreviated documents unsupported"
+            // and asks once more for the full packument before failing.
+            Err(RegistryError::PackageNotFound { .. }) => {
+                self.get_package_metadata_from_url_conditional_with_accept(
+                    package_name,
+                    url,
+                    if_none_match,
+                    "application/json",
+                )
+                .await
+            }
+            other => other,
+        }
     }
 
     /// Fetch the full npm packument when lockfile metadata omitted by the
