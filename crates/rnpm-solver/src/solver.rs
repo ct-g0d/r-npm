@@ -1506,7 +1506,7 @@ pub fn resolve_fast_path(
 
     let overrides = Overrides::from_json_value(
         manifest.extra.get("overrides"),
-        manifest.dependencies.clone(),
+        Overrides::reference_specs(manifest),
     );
 
     let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
@@ -1738,7 +1738,7 @@ pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
     }
     let overrides = Overrides::from_json_value(
         manifest.extra.get("overrides"),
-        manifest.dependencies.clone(),
+        Overrides::reference_specs(manifest),
     );
     let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)
