@@ -502,14 +502,16 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
         if location.is_empty() || package.link == Some(true) {
             continue;
         }
-        if package.license.is_some() && package.engines.is_some() {
-            continue;
-        }
+        // A cached manifest costs no IO, so always use it: npm also records
+        // fields such as `workspaces` that the registry metadata lacks.
         if let Some(cache) = manifest_cache {
             if let Some(m) = cache.get(location) {
                 manifests_by_loc.insert(location.clone(), m.clone());
                 continue;
             }
+        }
+        if package.license.is_some() && package.engines.is_some() {
+            continue;
         }
         missing_locations.push(location.clone());
     }
@@ -564,6 +566,23 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                         None
                     }
                 });
+        }
+
+        // arborist pkgMetaKeys: the abbreviated packument has no `workspaces`,
+        // so npm records it from the installed package.json.
+        if !location.is_empty() && !package.extra.contains_key("workspaces") {
+            let workspaces = match &manifest.workspaces {
+                Some(rnpm_core::manifest::PackageWorkspaces::List(list)) if !list.is_empty() => {
+                    serde_json::to_value(list).ok()
+                }
+                Some(config @ rnpm_core::manifest::PackageWorkspaces::Config { .. }) => {
+                    serde_json::to_value(config).ok()
+                }
+                _ => None,
+            };
+            if let Some(value) = workspaces {
+                package.extra.insert("workspaces".to_string(), value);
+            }
         }
 
         if package.engines.is_none() {

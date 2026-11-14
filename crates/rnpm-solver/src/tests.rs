@@ -5901,3 +5901,20 @@ fn test_rehome_transitive_root_node_migrates_nested_children_and_edges() {
         );
     }
 }
+
+#[test]
+fn test_reference_specs_follow_arborist_lookup_order() {
+    // edge.js #calculateReferentialOverrideSpec: dev, optional, dependencies,
+    // peer; an empty spec is falsy and never resolves.
+    let mut node = crate::graph::Node::default();
+    node.peer_dependencies.insert("a".into(), "peer".into());
+    node.dependencies.insert("a".into(), "prod".into());
+    node.dev_dependencies.insert("a".into(), "dev".into());
+    node.dependencies.insert("b".into(), "prod".into());
+    node.peer_dependencies.insert("b".into(), "peer".into());
+    node.dev_dependencies.insert("c".into(), String::new());
+    let specs = node.all_dependency_specs();
+    assert_eq!(specs.get("a").map(String::as_str), Some("dev"));
+    assert_eq!(specs.get("b").map(String::as_str), Some("prod"));
+    assert_eq!(specs.get("c"), None);
+}

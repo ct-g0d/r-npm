@@ -6273,6 +6273,14 @@ impl Installer {
             // 1. Try filling license and libc from cached full packument
             if let Some(val) = full_packument_cache.get(&name) {
                 if let Some(ver_val) = val.get("versions").and_then(|v| v.get(version)) {
+                    // arborist pkgMetaKeys records a non-empty `workspaces`.
+                    if !package.extra.contains_key("workspaces") {
+                        if let Some(ws) = ver_val.get("workspaces").filter(|ws| {
+                            ws.as_array().map_or(ws.is_object() && ws.as_object().is_some_and(|o| !o.is_empty()), |a| !a.is_empty())
+                        }) {
+                            package.extra.insert("workspaces".to_string(), ws.clone());
+                        }
+                    }
                     if package.license.is_none() {
                         if let Some(lic) = ver_val.get("license").and_then(|l| l.as_str()) {
                             package.license = Some(lic.to_string());
