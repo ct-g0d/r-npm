@@ -1378,6 +1378,15 @@ pub struct InstallSummary {
     pub timing: Option<TimingMetrics>,
 }
 
+/// Node.shouldOmit from arborist, over lockfile flags.
+fn lockfile_entry_omitted(options: &InstallOptions, info: &LockfilePackage) -> bool {
+    let dev_optional = info.dev_optional == Some(true);
+    (options.omit_dev && info.dev == Some(true))
+        || (options.omit_optional && !dev_optional && (info.is_effective_optional() || info.is_peer_optional()))
+        || (options.omit_dev && options.omit_optional && dev_optional)
+        || (options.omit_peer && (info.peer == Some(true) || info.peer_optional == Some(true)))
+}
+
 /// Result of an update run.
 #[derive(Debug, Clone)]
 pub struct UpdateSummary {
@@ -4550,33 +4559,13 @@ impl Installer {
             if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
                 continue;
             }
-            if self.options.omit_dev {
-                if is_dev {
-                    continue;
-                }
-                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !is_dev_optional
-                        && !clean_name.contains('/')
-                        && manifest.dev_dependencies.contains_key(clean_name)
-                        && !manifest.dependencies.contains_key(clean_name)
-                    {
-                        continue;
-                    }
-                }
+            // Like arborist, omission follows the lockfile flags only: a root
+            // devDependency that production also reaches is not dev.
+            if self.options.omit_dev && is_dev {
+                continue;
             }
-            if self.options.omit_optional {
-                if is_optional && !is_dev_optional {
-                    continue;
-                }
-                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !is_dev_optional
-                        && !clean_name.contains('/')
-                        && manifest.optional_dependencies.contains_key(clean_name)
-                        && !manifest.dependencies.contains_key(clean_name)
-                    {
-                        continue;
-                    }
-                }
+            if self.options.omit_optional && is_optional && !is_dev_optional {
+                continue;
             }
             if self.options.omit_peer || self.options.legacy_peer_deps {
                 if is_peer {
@@ -6079,6 +6068,10 @@ impl Installer {
                         return false;
                     }
                     if let Some(info) = lockfile.packages.get(*k) {
+                        // Omitted packages are not on disk; npm links no bins for them.
+                        if lockfile_entry_omitted(&self.options, info) {
+                            return false;
+                        }
                         if info.link == Some(true) {
                             return true;
                         }
