@@ -5,6 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { cleanPhase } from './corpus/clean-artifacts.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -172,6 +173,7 @@ async function checkProject(project) {
       result.phases.push(stage);
       write(path.join(location, 'result.json'), result);
       console.log(`${project.id} ${phase}: ${stage.differences.length} differences`);
+      if (!args.includes('--keep-artifacts')) cleanPhase(root, location, phase);
     }
   } catch (error) { result.failures.push(String(error.stack || error)); }
   result.match = result.failures.length === 0 && result.phases.length >= 3 && result.phases.every(phase => phase.differences.length === 0);
