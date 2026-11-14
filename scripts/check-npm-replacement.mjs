@@ -48,6 +48,9 @@ const server=http.createServer((req,res)=>{
   if(url.includes('/security/advisories/bulk'))return json(securityAdvisories);
   if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
   if(url==='/-/whoami')return json({username:'mock-user'});
+  if(url==='/oidc/id-token')return json({value:'mock-id-token'});
+  if(url.startsWith('/-/npm/v1/oidc/token/exchange/package/'))return json({token:'mock-exchanged-token'});
+  if(authScenario==='mutation-otp'&&['PUT','POST','DELETE'].includes(req.method)&&!url.includes('/security/')){res.writeHead(401,{'content-type':'application/json','www-authenticate':'OTP'});res.end(JSON.stringify({error:'one-time pass required',authUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}));return;}
   if(url==='/-/v1/login')return authScenario==='web'?json({loginUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}):json({error:'Mock registry does not provide browser login'},400);
   if(url==='/auth/done'){if(authPolls++===0){res.setHeader('retry-after','0.01');return json({},202);}return json({token:'mock-login-token'});}
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
@@ -105,6 +108,39 @@ for(const name of ['dep','parent','changing'])for(const version of ['1.0.0','1.1
 }
 const cases=[];
 const add=(name,command,args,setup=dir=>manifest(dir),extra={})=>cases.push({name,command,args,setup,...extra});
+// CLI/auth lane fixtures: real registry tarballs, with observable executable output.
+for(const [name,bin] of [['create-argv','create-argv'],['@argv/create','scoped-create'],['argv-tool','argv-tool'],['second-tool','second-tool']]){
+  const dir=path.join(root,'bin-tarballs',name.replaceAll('/','-'));
+  manifest(dir,{name,version:'1.0.0',bin:{[bin]:'bin.cjs'}});
+  write(dir,'bin.cjs',`#!/usr/bin/env node\nrequire('fs').writeFileSync('${bin}.json',JSON.stringify(process.argv.slice(2)));\n`);
+  const packed=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);
+  if(packed.exit!==0)throw new Error(packed.stderr);
+  const filename=packed.stdout.trim();tarballs.set('/'+filename,fs.readFileSync(path.join(dir,filename)));
+  probePackages.set(name,{name,'dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name,version:'1.0.0',bin:{[bin]:'bin.cjs'},dist:{tarball:registry+filename}}}});
+}
+for(const [name,args]of [
+  ['init-forward',['init','-y','argv','--','hello','--flag','two words']],
+  ['create-forward',['create','-y','argv','--','hello','--flag']],
+  ['init-version',['init','-y','argv@1.0.0','--','versioned']],
+  ['init-scope',['init','-y','@argv','--','scoped']],
+  ['init-yes-after',['init','argv','-y','--','hello']],
+  ['exec-yes',['exec','--yes','argv-tool','--','hello','two words']],
+  ['exec-call-package',['exec','--yes','-c','argv-tool hello','--package','argv-tool']],
+  ['exec-call-multiple',['exec','--yes','--package','argv-tool','--package','second-tool','-c','argv-tool first && second-tool second']],
+  ['exec-call-env',['exec','--yes','-c','node env.cjs','--package','argv-tool','--save-exact']],
+])add(`f1-${name}`,args[0],args,dir=>{manifest(dir);if(name==='exec-call-env')write(dir,'env.cjs',`require('fs').writeFileSync('env.json',JSON.stringify(Object.fromEntries(['npm_command','npm_lifecycle_event','npm_config_registry','npm_config_save_exact','npm_config_yes'].map(k=>[k,process.env[k]??null]))));\n`);});
+for(const [name,fields]of [['missing-name',{name:undefined}],['missing-version',{version:undefined}],['invalid-version',{version:'banana'}],['private',{private:true}],['publish-config',{publishConfig:{tag:'next',access:'public'}}]])add(`f1-publish-${name}`,'publish',['publish','--ignore-scripts'],dir=>manifest(dir,{name:'validation-pkg',...fields}),{auth:true});
+add('f1-publish-range-tag','publish',['publish','--tag','^1','--ignore-scripts'],dir=>manifest(dir,{name:'tag-pkg'}),{auth:true});
+add('f1-publish-provenance-config','publish',['publish','--access','public','--ignore-scripts'],dir=>{manifest(dir,{name:'prov-config-pkg'});write(dir,'.npmrc','provenance=true\n');},{auth:true});
+for(const command of ['publish','stage'])for(const [name,spec]of [['registry','dep@1.0.0'],['url',`${registry}dep-1.0.0.tgz`]])add(`f1-${command}-remote-${name}`,command,[command,...(command==='stage'?['publish']:[]),spec,'--force','--ignore-scripts'],undefined,{auth:true});
+for(const provider of ['github','gitlab'])add(`f1-publish-oidc-${provider}`,'publish',['publish','--provenance=false','--ignore-scripts'],dir=>manifest(dir,{name:'oidc-pkg'}),{env:provider==='github'?{GITHUB_ACTIONS:'true',ACTIONS_ID_TOKEN_REQUEST_URL:`${registry}oidc/id-token`,ACTIONS_ID_TOKEN_REQUEST_TOKEN:'mock-request-token'}:{GITLAB_CI:'true',NPM_ID_TOKEN:'mock-id-token'},observe:ctx=>ctx.requests.filter(r=>r.url.includes('oidc')).map(r=>({method:r.method,url:r.url,body:r.body}))});
+for(const [name,args]of [['publish',['publish','--ignore-scripts']],['dist-tag',['dist-tag','add','dep@1.0.0','beta']],['access',['access','set','status=public','dep']],['owner',['owner','add','other-user','dep']],['deprecate',['deprecate','dep@1.0.0','old']],['unpublish',['unpublish','dep@1.0.0','--force']],['token',['token','revoke','mock-id']],['profile',['profile','set','fullname','Mock User']]])add(`f1-otp-nontty-${name}`,args[0],args,dir=>manifest(dir,{name:'challenge-pkg'}),{auth:true,authScenario:'mutation-otp'});
+for(const command of ['login','adduser'])add(`f1-${command}-saved-defaults`,command,[command,'--auth-type=legacy'],undefined,{userconfig:`//127.0.0.1:${server.address().port}/:username=mock-user\n//127.0.0.1:${server.address().port}/:_password=${Buffer.from('mock-password').toString('base64')}\n//127.0.0.1:${server.address().port}/:email=mock@example.invalid\n`,input:[{prompt:'Username:',value:''},{prompt:'Password:',value:''},...(command==='adduser'?[{prompt:'Email (this will be public):',value:''}]:[])]});
+for(const [name,flags]of [['global',['-g']],['workspace',['-w','a']],['workspaces',['--workspaces']]])for(const [format,flags2]of [['long',['--long']],['json-long',['--json','--long']],['parseable',['--parseable']],['parseable-long',['--parseable','--long']]])add(`f1-outdated-${name}-${format}`,'outdated',['outdated',...flags,...flags2],dir=>{
+  manifest(dir,{workspaces:['modules/*']});
+  for(const [member,dep]of [['a','dep'],['b','parent']])manifest(path.join(dir,'modules',member),{name:member,dependencies:{[dep]:'^1.0.0'}});
+  for(const dep of ['dep','parent'])manifest(path.join(dir,'node_modules',dep),{name:dep});
+},{before:async ctx=>{if(name==='global')manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
 const packArgs=['pack','--dry-run','--json','--ignore-scripts'];
 for(const [name,fields,files] of [
   ['pack-explicit-file-vs-root-ignore',{files:['keep.js']},{'keep.js':'hello','.npmignore':'keep.js\n'}],
@@ -241,6 +277,16 @@ const auditTree=dir=>{
   manifest(dir,{dependencies:{'audit-branch':'^1.0.0'}});
   write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-branch':'^1.0.0'}},'node_modules/audit-branch':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'}},'node_modules/audit-leaf':{version:'1.0.0'}}});
 };
+for(const name of ['audit-top','audit-middle'])probePackages.set(name,{name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,dependencies:{[name==='audit-top'?'audit-middle':'audit-branch']:version==='2.0.0'?'^2.0.0':'^1.0.0'}}]))});
+for(const [name,args]of [['json',['audit','--json']],['text',['audit']],['fix-dry-json',['audit','fix','--dry-run','--json']],['fix-dry-text',['audit','fix','--dry-run']]])add(`f1-audit-chain-${name}`,'audit',args,dir=>{
+  const packages={'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-top':'^1.0.0'}}};
+  for(const [name,child]of [['audit-top','audit-middle'],['audit-middle','audit-branch'],['audit-branch','audit-leaf'],['audit-leaf',null]])packages['node_modules/'+name]={version:'1.0.0',...(child?{dependencies:{[child]:'^1.0.0'}}:{})};
+  manifest(dir,{dependencies:{'audit-top':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages});
+},{advisories:{'audit-leaf':[{id:106,name:'audit-leaf',url:'https://example.invalid/advisory/106',title:'Deep chain advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+probePackages.set('audit-bundler',{name:'audit-bundler','dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name:'audit-bundler',version,dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'},bundleDependencies:['audit-leaf']}]))});
+for(const flags of [[],['--json']])add(`f1-audit-bundled${flags.length?'-json':''}`,'audit',['audit',...flags],dir=>{
+  manifest(dir,{dependencies:{'audit-bundler':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-bundler':'^1.0.0'}},'node_modules/audit-bundler':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'},bundleDependencies:['audit-leaf']},'node_modules/audit-bundler/node_modules/audit-leaf':{version:'1.0.0',inBundle:true}}});
+},{advisories:{'audit-leaf':[{id:107,name:'audit-leaf',url:'https://example.invalid/advisory/107',title:'Bundled advisory',severity:'high',vulnerable_versions:'<1.1.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 for(const [name,range] of [['breaking','<2.0.0'],['in-range','<1.1.0'],['unfixable','*']])for(const flags of [[],['--json']])add(`cli-audit-${name}${flags.length?'-json':''}`,'audit',['audit',...flags],auditTree,{advisories:{'audit-leaf':[{id:101,name:'audit-leaf',url:'https://example.invalid/advisory/101',title:'Fixture advisory',severity:'moderate',vulnerable_versions:range,cwe:['CWE-400'],cvss:{score:5.3,vectorString:null}}]}});
 for(const spec of ['1','>=1'])for(const fields of [['version'],['name','version']])for(const flags of [[],['--json']])add(`cli-view-${spec.replace('>=','gte-')}-${fields.join('-')}${flags.length?'-json':''}`,'view',['view',`dep@${spec}`,...fields,...flags]);
 const fundingTree=dir=>{manifest(dir,{dependencies:{parent:'1.0.0',dep:'1.0.0'}});manifest(path.join(dir,'node_modules/parent'),{name:'parent',funding:[{type:'individual',url:'https://example.invalid/parent'},'https://example.invalid/other'],dependencies:{child:'1.0.0'}});manifest(path.join(dir,'node_modules/parent/node_modules/child'),{name:'child',funding:'https://example.invalid/child'});manifest(path.join(dir,'node_modules/dep'),{name:'dep',funding:'https://example.invalid/parent'});};
@@ -414,6 +460,8 @@ for(const c of cases){
   for(const tool of ['npm','rnpm']){
     const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth==='basic'?`//127.0.0.1:${server.address().port}/:_auth=${Buffer.from('mock-user:mock-pass').toString('base64')}\n`:c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
     const env={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(config,'user.npmrc'),NPM_CONFIG_GLOBALCONFIG:path.join(config,'global.npmrc'),NPM_CONFIG_PREFIX:path.join(config,'prefix'),NPM_CONFIG_CACHE:path.join(config,'cache'),RNPM_STORE_DIR:path.join(config,'store'),NPM_CONFIG_REGISTRY:registry,NPM_CONFIG_UPDATE_NOTIFIER:'false',NPM_CONFIG_AUDIT:'false',NPM_CONFIG_FUND:'false',NO_COLOR:'1',NPM_CONFIG_UNICODE:'true'};
+    Object.assign(env,c.env||{});
+    if(c.userconfig)write(config,'user.npmrc',c.userconfig);
     const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});
     authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};securityRequireAuth=!!c.advisoryAuth;
