@@ -125,12 +125,16 @@ pub fn arborist_compare(a: &str, b: &str) -> std::cmp::Ordering {
 
 impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     pub fn new(provider: &'a P, options: ResolverOptions, overrides: Overrides) -> Self {
+        let graph = DependencyGraph {
+            legacy_peer_deps: options.legacy_peer_deps,
+            ..DependencyGraph::new()
+        };
         Self {
             provider,
             options,
             overrides,
             peer_ctx: PeerContext::new(),
-            graph: DependencyGraph::new(),
+            graph,
             queue: VecDeque::new(),
             preplaced: std::collections::HashSet::new(),
         }
@@ -143,7 +147,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     /// Attaches an existing base graph to the solver (e.g. pre-populated workspace graph).
-    pub fn with_graph(mut self, graph: DependencyGraph) -> Self {
+    pub fn with_graph(mut self, mut graph: DependencyGraph) -> Self {
+        graph.legacy_peer_deps = self.options.legacy_peer_deps;
         self.graph = graph;
         self
     }
@@ -1660,6 +1665,7 @@ pub fn resolve_fast_path(
     );
 
     let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
+    graph.legacy_peer_deps = options.legacy_peer_deps;
 
     // Apply platform filters for optional dependencies
     for node in graph.nodes.values_mut() {

@@ -5992,3 +5992,26 @@ fn test_audit_fix_reresolves_vulnerable_chain_in_range() {
         assert_eq!(graph.nodes[&format!("node_modules/{name}")].version, "1.1.0", "{name}");
     }
 }
+
+#[test]
+fn test_legacy_peer_deps_adds_no_late_optional_peer_edges() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("owner", "1.0.0", |v| {
+        v.peer_dependencies.insert("provider".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies_meta
+            .insert("provider".to_string(), PeerDependencyMeta { optional: true });
+    });
+    provider.add_version("provider", "1.0.0", |_| {});
+    let mut manifest = Manifest::default();
+    manifest.name = Some("app".to_string());
+    manifest.dependencies.insert("owner".into(), "^1.0.0".into());
+    manifest.dev_dependencies.insert("provider".into(), "^1.0.0".into());
+
+    let options = ResolverOptions { legacy_peer_deps: true, ..Default::default() };
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+    assert!(graph
+        .get_outgoing_edges("node_modules/owner")
+        .iter()
+        .all(|e| e.install_name != "provider"));
+    assert!(graph.nodes["node_modules/provider"].flags.dev);
+}

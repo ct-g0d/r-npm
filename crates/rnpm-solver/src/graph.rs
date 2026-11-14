@@ -151,6 +151,9 @@ pub struct DependencyGraph {
     pub nodes: BTreeMap<String, Node>,
     pub edges: Vec<DependencyEdge>,
     pub skipped: HashSet<String>,
+    /// `legacy-peer-deps`: arborist creates no peer edges at all.
+    #[serde(skip)]
+    pub legacy_peer_deps: bool,
 }
 
 impl DependencyGraph {
@@ -160,6 +163,7 @@ impl DependencyGraph {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             skipped: HashSet::new(),
+            legacy_peer_deps: false,
         }
     }
 
@@ -194,7 +198,48 @@ impl DependencyGraph {
     /// when a production branch also reaches the same node. The same rule is
     /// applied to optional reachability so dependencies below an optional
     /// platform package remain optional in the lockfile.
+    /// Arborist keeps an edge for every optional peer and resolves it once a
+    /// provider lands in the tree, even if that happens after its owner was
+    /// placed. Those late edges keep the provider alive in calc-dep-flags.
+    fn link_late_optional_peers(&mut self) {
+        if self.legacy_peer_deps {
+            return;
+        }
+        let existing: HashSet<(String, String)> = self
+            .edges
+            .iter()
+            .map(|e| (e.from_location.clone(), e.install_name.clone()))
+            .collect();
+        let mut late = Vec::new();
+        for (location, node) in &self.nodes {
+            for (name, spec) in &node.peer_dependencies {
+                let optional = node.peer_dependencies_meta.get(name).is_some_and(|m| m.optional);
+                if !optional || existing.contains(&(location.clone(), name.clone())) {
+                    continue;
+                }
+                if let Some(target) = crate::hoisting::find_visible_node(self, location, name) {
+                    let satisfies = rnpm_core::semver::Range::parse(spec).is_ok_and(|range| {
+                        rnpm_core::semver::Version::parse(&target.version)
+                            .is_ok_and(|v| range.satisfies(&v))
+                    });
+                    if satisfies && target.location != *location {
+                        late.push(DependencyEdge {
+                            from_location: location.clone(),
+                            to_location: target.location.clone(),
+                            install_name: name.clone(),
+                            package_name: target.name.clone(),
+                            spec: spec.clone(),
+                            dep_type: DependencyType::PeerOptional,
+                        });
+                    }
+                }
+            }
+        }
+        self.edges.extend(late);
+    }
+
     pub fn normalize_dependency_flags(&mut self) {
+        self.link_late_optional_peers();
         const NON_DEV: u8 = 0b01;
         const DEV_ONLY: u8 = 0b10;
         const NON_OPTIONAL: u8 = 0b01;
