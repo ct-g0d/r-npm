@@ -103,23 +103,22 @@ pub struct Node {
 }
 
 impl Node {
+    /// `$name` override references of this package, in arborist's edge.js
+    /// lookup order: dev, optional, dependencies, peer. The first non-empty
+    /// spec wins (an empty string is falsy in arborist).
     pub fn all_dependency_specs(&self) -> BTreeMap<String, String> {
         let mut specs = BTreeMap::new();
-        for (k, v) in &self.dev_dependencies {
-            let spec = if v.is_empty() { "*" } else { v.as_str() };
-            specs.insert(k.clone(), spec.to_string());
-        }
-        for (k, v) in &self.optional_dependencies {
-            let spec = if v.is_empty() { "*" } else { v.as_str() };
-            specs.insert(k.clone(), spec.to_string());
-        }
-        for (k, v) in &self.dependencies {
-            let spec = if v.is_empty() { "*" } else { v.as_str() };
-            specs.insert(k.clone(), spec.to_string());
-        }
-        for (k, v) in &self.peer_dependencies {
-            let spec = if v.is_empty() { "*" } else { v.as_str() };
-            specs.insert(k.clone(), spec.to_string());
+        for section in [
+            &self.peer_dependencies,
+            &self.dependencies,
+            &self.optional_dependencies,
+            &self.dev_dependencies,
+        ] {
+            for (name, spec) in section {
+                if !spec.is_empty() {
+                    specs.insert(name.clone(), spec.clone());
+                }
+            }
         }
         specs
     }
