@@ -34,6 +34,25 @@ fn is_none_or_empty_engines(v: &Option<PackageEngines>) -> bool {
 }
 
 /// Helper function to omit empty vectors or None during serialization.
+/// npm copies `os`/`cpu`/`libc` from the manifest as written, so a lockfile
+/// may hold a single string (`"libc": "glibc"`) as well as a list.
+fn string_or_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(vec![s])),
+        Some(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| D::Error::custom("expected a string")))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(D::Error::custom("expected a string or an array of strings")),
+    }
+}
+
 fn is_none_or_empty_vec<T>(v: &Option<Vec<T>>) -> bool {
     v.as_ref().map(|l| l.is_empty()).unwrap_or(true)
 }
@@ -347,13 +366,13 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub license: Option<String>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
     pub os: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
     pub cpu: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
     pub libc: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
@@ -2043,5 +2062,19 @@ fn bin_is_empty(bin: &Option<PackageBin>) -> bool {
         None => true,
         Some(PackageBin::Map(map)) => map.is_empty(),
         Some(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod platform_field_tests {
+    use super::LockfilePackage;
+
+    #[test]
+    fn libc_accepts_npm_string_form() {
+        let pkg: LockfilePackage =
+            serde_json::from_str(r#"{"version":"1.0.0","os":"linux","cpu":["arm"],"libc":"glibc"}"#).unwrap();
+        assert_eq!(pkg.libc, Some(vec!["glibc".to_string()]));
+        assert_eq!(pkg.os, Some(vec!["linux".to_string()]));
+        assert_eq!(pkg.cpu, Some(vec!["arm".to_string()]));
     }
 }

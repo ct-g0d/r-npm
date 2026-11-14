@@ -654,6 +654,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         // A missing optional peer still never triggers a fetch.
                         let sibling = task.parent_location.rsplit_once("/node_modules/")
                             .map(|(scope, _)| format!("{scope}/node_modules/{}", task.install_name));
+                        // A top-level owner's provider slot is the root's own
+                        // dependency: npm cannot replace it, so it is ERESOLVE.
+                        let root_pins_provider = sibling.is_none()
+                            && existing.location == format!("node_modules/{}", task.install_name)
+                            && self.graph.nodes.get(&self.graph.root_location).is_some_and(|root| {
+                                root.dependencies.contains_key(&task.install_name)
+                                    || root.dev_dependencies.contains_key(&task.install_name)
+                                    || root.optional_dependencies.contains_key(&task.install_name)
+                            });
+                        if root_pins_provider && self.peer_conflict_is_fatal(task.is_mine) {
+                            return Err(SolverError::peer_conflict(
+                                &task.parent_package_name,
+                                &dep_spec.package_name,
+                                &effective_spec,
+                                Some(existing.version.clone()),
+                                Some(existing.location.clone()),
+                                (*task.ancestors).clone(),
+                                format!(
+                                    "Installed {}@{} at '{}' does not satisfy optional peer constraint '{}'",
+                                    existing.name, existing.version, existing.location, effective_spec
+                                ),
+                            ));
+                        }
                         if sibling.as_ref().is_none_or(|location| self.graph.nodes.contains_key(location)) {
                             return Ok(());
                         }
