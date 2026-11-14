@@ -26,8 +26,10 @@ const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
 function envFor(isolation) {
   const env = { ...baseEnv };
   for (const name of ['user.npmrc', 'global.npmrc']) write(path.join(isolation, name), '');
-  for (const name of ['home', 'cache', 'store', 'prefix']) fs.mkdirSync(path.join(isolation, name), { recursive: true });
+  for (const name of ['home', 'cache', 'store', 'prefix', 'appdata', 'localappdata', 'xdg-config', 'xdg-cache', 'xdg-data']) fs.mkdirSync(path.join(isolation, name), { recursive: true });
   return { ...env, HOME: path.join(isolation, 'home'), USERPROFILE: path.join(isolation, 'home'),
+    APPDATA: path.join(isolation, 'appdata'), LOCALAPPDATA: path.join(isolation, 'localappdata'),
+    XDG_CONFIG_HOME: path.join(isolation, 'xdg-config'), XDG_CACHE_HOME: path.join(isolation, 'xdg-cache'), XDG_DATA_HOME: path.join(isolation, 'xdg-data'),
     NPM_CONFIG_USERCONFIG: path.join(isolation, 'user.npmrc'), NPM_CONFIG_GLOBALCONFIG: path.join(isolation, 'global.npmrc'),
     NPM_CONFIG_PREFIX: path.join(isolation, 'prefix'), NPM_CONFIG_CACHE: path.join(isolation, 'cache'),
     RNPM_STORE_DIR: path.join(isolation, 'store'), NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
@@ -40,7 +42,7 @@ async function run(tool, command, cwd, isolation, log) {
   const stdout = fs.createWriteStream(log + '.stdout.log');
   const stderr = fs.createWriteStream(log + '.stderr.log');
   const result = await new Promise(resolve => {
-    const child = spawn(executable, argv, { cwd, env: envFor(isolation), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, argv, { cwd, env: envFor(isolation), windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     let error = null, timedOut = false;
     // This is a deadlock bound, not a performance gate. Kill the entire process tree.
     const timer = setTimeout(() => {
@@ -48,7 +50,7 @@ async function run(tool, command, cwd, isolation, log) {
       if (process.platform === 'win32' && child.pid) {
         spawn('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
       } else if (child.pid) {
-        child.kill('SIGKILL');
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
       }
     }, 20 * 60 * 1000);
     child.stdout.pipe(stdout); child.stderr.pipe(stderr);
@@ -71,7 +73,7 @@ function differences(a, b, key = '') {
 }
 function tree(dir) {
   const files = {};
-  const walk = (absolute, relative) => {
+  const walk = (absolute, relative, installed = false) => {
     if (!fs.existsSync(absolute)) return;
     for (const entry of fs.readdirSync(absolute, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const key = relative ? `${relative}/${entry.name}` : entry.name;
@@ -80,16 +82,18 @@ function tree(dir) {
       // Only the project-root cache is excluded, never package-owned lockfiles.
       if (key === 'node_modules/.package-lock.json') continue;
       const file = path.join(absolute, entry.name);
+      const inTree = installed || entry.name === 'node_modules';
       if (entry.isSymbolicLink()) {
+        if (!inTree) continue;
         const target = fs.readlinkSync(file);
         files[key] = { link: path.relative(dir, path.resolve(path.dirname(file), target)).replaceAll('\\', '/') };
       } else if (entry.isDirectory()) {
-        files[key + '/'] = { directory: true };
-        walk(file, key);
-      } else files[key] = { sha256: hash(fs.readFileSync(file)) };
+        if (inTree) files[key + '/'] = { directory: true };
+        walk(file, key, inTree);
+      } else if (inTree) files[key] = { sha256: hash(fs.readFileSync(file)) };
     }
   };
-  walk(path.join(dir, 'node_modules'), 'node_modules');
+  walk(dir, '');
   return files;
 }
 const isolation = path.join(root, 'identity');
@@ -126,15 +130,22 @@ async function checkProject(project) {
   const result = { id: project.id, kind: project.kind, phases: [], failures: [] };
   try {
     let oracleLock;
-    const phases = ['install', 'ci', 'ci-omit-dev', ...(project.smoke ? ['scripts'] : [])];
+    const phases = ['install', 'ci', 'ci-omit-dev', ...Object.keys(project.locks || {}).map(version => `upgrade-v${version}`), ...(project.smoke ? ['scripts'] : [])];
     for (const phase of phases) {
-      const commands = phase === 'install' ? ['install', '--ignore-scripts'] : phase === 'scripts' ? ['install'] : ['ci', '--ignore-scripts', ...(phase === 'ci-omit-dev' ? ['--omit=dev'] : [])];
+      const commands = phase === 'install' || phase.startsWith('upgrade-') ? ['install', '--ignore-scripts'] : phase === 'scripts' ? ['install'] : ['ci', '--ignore-scripts', ...(phase === 'ci-omit-dev' ? ['--omit=dev'] : [])];
       const stage = { phase, commands, processes: {}, ls: {}, smoke: {}, differences: [] };
       const dirs = {};
       for (const tool of ['npm', 'rnpm']) {
         const dir = path.join(location, phase, tool, 'project'); dirs[tool] = dir;
         const iso = path.join(location, phase, tool, 'isolation');
-        prepare(project, dir, phase.startsWith('ci') ? oracleLock : undefined);
+        let lock = phase.startsWith('ci') ? oracleLock : undefined;
+        if (phase.startsWith('upgrade-')) {
+          const input = project.locks[phase.slice(-1)];
+          const bytes = fs.readFileSync(path.join(corpus, input.path));
+          if (hash(bytes) !== input.sha256) throw new Error(`Lockfile hash mismatch: ${input.path}`);
+          lock = bytes.toString('utf8');
+        }
+        prepare(project, dir, lock);
         const log = path.join(location, `${phase}-${tool}`);
         if (phase.startsWith('ci') && !oracleLock) {
           stage.processes[tool] = { exit: null, error: 'npm install did not produce a usable lockfile; ci input unavailable' };
@@ -167,7 +178,9 @@ async function checkProject(project) {
   results.push(result); results.sort((a, b) => a.id.localeCompare(b.id)); persist();
 }
 let cursor = 0;
-await Promise.all(Array.from({ length: Math.min(Number(option('--jobs', '2')), selected.length) }, async () => {
+const jobs = Number(option('--jobs', '4'));
+if (!Number.isInteger(jobs) || jobs < 1) throw new Error('--jobs must be a positive integer');
+await Promise.all(Array.from({ length: Math.min(jobs, selected.length) }, async () => {
   while (cursor < selected.length) await checkProject(selected[cursor++]);
 }));
 if (results.length !== selected.length || results.some(result => !result.match)) process.exitCode = 1;

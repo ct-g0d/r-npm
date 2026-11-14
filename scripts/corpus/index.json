@@ -2411,6 +2411,26 @@
           "path": "consumers/scripts-sharp/package.json",
           "sha256": "db07f1072e954c69843969ebaddc89405383e8ce06de64b80e326b4d74003c79"
         }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-sharp-v1.json",
+          "sha256": "1136e1fec0f0bd2ab205744fabbdbd644258743a514494d4b65909786c729039",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-sharp-v2.json",
+          "sha256": "477c1769eedef6da0e6bc6e93edf07051b6cf92d27a20bf8201b8c7e366ee662",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-sharp-v3.json",
+          "sha256": "73ac9c5e4291f0390da25c801045d91f326b6f2e8855bd5be9a29c84ba3a6920",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        }
       }
     },
     {
@@ -2431,6 +2451,26 @@
         "package.json": {
           "path": "consumers/scripts-bcrypt/package.json",
           "sha256": "8ccad4eaef3295715ba80a0c7222931dd45120ece7ee425f96388d2e369542ba"
+        }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-bcrypt-v1.json",
+          "sha256": "dfce38399a752c0099d31e8b8ce563f118ff808c28457cf3d81fe9c56cecd4f6",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-bcrypt-v2.json",
+          "sha256": "c5b0b4db0050c5a1705be16a72d01d02afd2d184feac4dbfa8e3933d353bcc66",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-bcrypt-v3.json",
+          "sha256": "a9977bf40bb9578d2189d5c0c50a555afaac1915a01dc0367efc27a28eb90814",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
         }
       }
     },
@@ -2683,6 +2723,26 @@
         "package.json": {
           "path": "consumers/scripts-esbuild/package.json",
           "sha256": "c88c757ad28fc6290cea4afdde6381152002d847d0d93b95a6352579e687b62e"
+        }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-esbuild-v1.json",
+          "sha256": "9c858371a09dec7ebc47537cf94402a2c535736416ecfb80b50b37eaaa3e3ab8",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-esbuild-v2.json",
+          "sha256": "69f7a3e494c414f4a0d0f3b4181395987e03d24b2ca377ed11ce410e07064a9c",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-esbuild-v3.json",
+          "sha256": "eb089e73318f02e457a0b39cfda80074a3af451ed8f0fad6298be087afded34a",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
         }
       }
     },

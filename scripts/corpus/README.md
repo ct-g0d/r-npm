@@ -8,6 +8,10 @@ Consumers deliberately install the pinned published package itself so its
 installation scripts and entry point are exercised. They are identified as
 generated consumers, not upstream application manifests.
 
+Three consumers additionally pin npm-generated lockfileVersion 1, 2 and 3
+inputs. The gate compares upgrades using the same complete JSON and tree
+checks; it does not generate expected lockfiles with rnpm.
+
 Run `cargo build --release`, then `node scripts/check-real-corpus.mjs`.
 The default run checks every case. `--case substring`, `--jobs N`, `--root path`,
 `--binary path`, and `--npm-cli path` support diagnosis; a filtered run is not
@@ -46,3 +50,4 @@ oracle lockfiles are needed for reproducibility across registry changes.
 `import-published.mjs` and `import-templates.mjs` are explicit maintenance
 commands for refreshing sources. Review and commit their resulting changes;
 they are not part of validation.
+`pin-lockfiles.mjs` explicitly regenerates the versioned npm lockfile inputs.
