@@ -2737,9 +2737,12 @@ fn test_stress_npm_aliases_with_peers_and_overrides() {
     // react-router is placed at node_modules/react-router
     assert!(graph.nodes.contains_key("node_modules/react-router"));
     let rr_edges = graph.get_outgoing_edges("node_modules/react-router");
+    // npm resolves the "react" peer by folder name, so a real react is
+    // installed beside the "my-react" alias.
     let rr_peer_edge = rr_edges.iter().find(|e| e.package_name == "react").unwrap();
-    assert_eq!(rr_peer_edge.to_location, "node_modules/my-react");
+    assert_eq!(rr_peer_edge.to_location, "node_modules/react");
     assert_eq!(rr_peer_edge.dep_type, DependencyType::Peer);
+    assert_eq!(graph.nodes["node_modules/react"].version, "18.3.1");
 
     // custom-ui is placed at node_modules/custom-ui
     assert!(graph.nodes.contains_key("node_modules/custom-ui"));
@@ -5917,4 +5920,25 @@ fn test_reference_specs_follow_arborist_lookup_order() {
     assert_eq!(specs.get("a").map(String::as_str), Some("dev"));
     assert_eq!(specs.get("b").map(String::as_str), Some("prod"));
     assert_eq!(specs.get("c"), None);
+}
+
+#[test]
+fn test_alias_folder_is_not_a_peer_of_the_real_name() {
+    // sveltejs-kit: "@typescript/native": "npm:typescript@^7" beside
+    // "typescript": "~6" and a root peer typescript ^6. Arborist resolves
+    // edges by folder name, so the alias never conflicts with the peer.
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("typescript", "6.0.3", |_| {});
+    provider.add_version("typescript", "7.0.2", |_| {});
+    let mut manifest = Manifest::default();
+    manifest.name = Some("kit".to_string());
+    manifest
+        .dev_dependencies
+        .insert("@typescript/native".to_string(), "npm:typescript@^7.0.2".to_string());
+    manifest.dev_dependencies.insert("typescript".to_string(), "~6.0.3".to_string());
+    manifest.peer_dependencies.insert("typescript".to_string(), "^6.0.0".to_string());
+
+    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert_eq!(graph.nodes["node_modules/typescript"].version, "6.0.3");
+    assert_eq!(graph.nodes["node_modules/@typescript/native"].version, "7.0.2");
 }

@@ -367,7 +367,7 @@ fn test_init_initializer_delegation_to_create_pkg() {
     std::fs::write(
         tool_dir.join("index.js"),
         format!(
-            "const fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
+            "#!/usr/bin/env node\nconst fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
         ),
     ).unwrap();
 
@@ -417,7 +417,7 @@ fn test_create_initializer_delegation() {
     std::fs::write(
         tool_dir.join("index.js"),
         format!(
-            "const fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
+            "#!/usr/bin/env node\nconst fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
         ),
     ).unwrap();
 
@@ -466,7 +466,7 @@ fn test_init_scoped_initializer_delegation() {
     std::fs::write(
         tool_dir.join("index.js"),
         format!(
-            "const fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
+            "#!/usr/bin/env node\nconst fs = require('fs'); fs.writeFileSync('{escaped_marker}', process.argv.slice(2).join(' '));\n"
         ),
     ).unwrap();
 

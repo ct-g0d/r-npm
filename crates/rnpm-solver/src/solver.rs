@@ -1183,7 +1183,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     let provider_pending = self.graph.nodes.get(peer_scope).is_some_and(|parent| {
                         let mut declared = parent.dependencies.contains_key(&child_task.install_name)
                             || parent.optional_dependencies.contains_key(&child_task.install_name)
-                            || parent.peer_dependencies.contains_key(&child_task.install_name);
+                            || (parent.peer_dependencies.contains_key(&child_task.install_name)
+                                && !parent.peer_dependencies_meta.get(&child_task.install_name).is_some_and(|m| m.optional));
                         if self.options.dev {
                             declared = declared || parent.dev_dependencies.contains_key(&child_task.install_name);
                         }
@@ -1203,12 +1204,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         // with the peer range as the advisory second edge.
                         let parent = &self.graph.nodes[peer_scope];
                         let name = child_task.install_name.clone();
-                        let mut parent_edge = parent.optional_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Optional))
+                        // arborist loads peer, prod, optional, then dev edges, a
+                        // later type replacing an earlier one for the same name.
+                        let dev_edge = self.options.dev.then(|| parent.dev_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Dev))).flatten();
+                        let parent_edge = dev_edge
+                            .or_else(|| parent.optional_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Optional)))
                             .or_else(|| parent.dependencies.get(&name).map(|s| (s.clone(), DependencyType::Prod)))
-                            .or_else(|| parent.peer_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Peer)));
-                        if parent_edge.is_none() && self.options.dev {
-                            parent_edge = parent.dev_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Dev));
-                        }
+                            .or_else(|| parent.peer_dependencies.get(&name).filter(|_| !parent.peer_dependencies_meta.get(&name).is_some_and(|m| m.optional)).map(|s| (s.clone(), DependencyType::Peer)));
                         if let Some((raw_spec, dep_type)) = parent_edge {
                             let root_task = ResolveTask {
                                 parent_location: peer_scope.to_string(),
