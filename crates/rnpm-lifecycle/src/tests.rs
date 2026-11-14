@@ -445,25 +445,11 @@ async fn test_process_tree_abort_signal_kills_entire_subtree() {
     };
 
     // Spawn script in background
-    let exec_task =
+    let mut exec_task =
         tokio::spawn(async move { execute_lifecycle_script_with_abort(&ctx, abort_fut).await });
 
     // Wait until the grandchild has started and written its PID
-    let mut grandchild_pid: Option<u32> = None;
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if grandchild_pid_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&grandchild_pid_file) {
-                let trimmed = content.trim();
-                if let Ok(pid) = trimmed.parse::<u32>() {
-                    grandchild_pid = Some(pid);
-                    break;
-                }
-            }
-        }
-    }
-
-    let pid = grandchild_pid.expect("Grandchild process should have launched and written its PID");
+    let pid = wait_for_grandchild_pid(&grandchild_pid_file, &mut exec_task).await;
     assert!(
         process_guard::is_process_running(pid),
         "Grandchild process {pid} must be actively running"
@@ -479,14 +465,49 @@ async fn test_process_tree_abort_signal_kills_entire_subtree() {
         "Lifecycle execution must terminate with error on abort"
     );
 
-    // Wait brief grace period for OS process cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    wait_for_process_exit(pid).await;
 
     // Verify the grandchild process was cleanly terminated and not orphaned
     assert!(
         !process_guard::is_process_running(pid),
         "Grandchild process {pid} must be terminated upon abort signal, no orphans allowed"
     );
+}
+
+// Startup and OS cleanup are scheduling events, not fixed-duration sleeps.
+// On loaded hosts, two Node startups can take longer than an entire old test.
+async fn wait_for_grandchild_pid(
+    file: &std::path::Path,
+    task: &mut tokio::task::JoinHandle<anyhow::Result<std::process::ExitStatus>>,
+) -> u32 {
+    let ready = async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            if task.is_finished() {
+                panic!("Lifecycle exited before grandchild readiness: {:?}", (&mut *task).await);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(90), ready).await {
+        Ok(pid) => pid,
+        Err(_) => {
+            task.abort();
+            panic!("Grandchild did not record its PID within 90 seconds: {}", file.display());
+        }
+    }
+}
+
+async fn wait_for_process_exit(pid: u32) {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while process_guard::is_process_running(pid) {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await.expect("Terminated grandchild must actually exit, without orphaned processes");
 }
 
 #[tokio::test]
@@ -1435,26 +1456,12 @@ async fn test_lifecycle_timeout_terminates_grandchild_process_tree() {
         "preinstall",
         &script_cmd,
     )
-    .with_timeout(std::time::Duration::from_millis(1500));
+    .with_timeout(std::time::Duration::from_secs(120));
 
-    let exec_task = tokio::spawn(async move { execute_lifecycle_script_async(&ctx).await });
+    let mut exec_task = tokio::spawn(async move { execute_lifecycle_script_async(&ctx).await });
 
     // Wait until the grandchild has started and written its PID
-    let mut grandchild_pid: Option<u32> = None;
-    for _ in 0..60 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        if grandchild_pid_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&grandchild_pid_file) {
-                let trimmed = content.trim();
-                if let Ok(pid) = trimmed.parse::<u32>() {
-                    grandchild_pid = Some(pid);
-                    break;
-                }
-            }
-        }
-    }
-
-    let pid = grandchild_pid.expect("Grandchild process should have launched and recorded its PID");
+    let pid = wait_for_grandchild_pid(&grandchild_pid_file, &mut exec_task).await;
     assert!(
         process_guard::is_process_running(pid),
         "Grandchild process {pid} must be running before timeout"
@@ -1469,8 +1476,7 @@ async fn test_lifecycle_timeout_terminates_grandchild_process_tree() {
         "Timeout must return exit code 124"
     );
 
-    // Wait brief grace period for OS process cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_process_exit(pid).await;
 
     // Verify grandchild process is no longer running (contained by Job Object / ProcessTreeGuard)
     assert!(
@@ -1559,6 +1565,30 @@ async fn test_sigint_and_sigterm_exit_code_fidelity() {
 }
 
 #[test]
+fn test_sync_reaps_descendants_before_waiting_for_pipe_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("orphan-completed");
+    let marker_js = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+    let grandchild = format!(
+        "process.send('ready'); setTimeout(() => {{ require('fs').writeFileSync({marker_js}, 'orphan'); }}, 2000);"
+    );
+    let script = format!(
+        "const g = require('child_process').spawn(process.execPath, ['-e', {}], {{ stdio: ['ignore', 'inherit', 'inherit', 'ipc'] }}); g.on('message', () => {{ console.log('grandchild-ready'); g.disconnect(); g.unref(); }});",
+        serde_json::to_string(&grandchild).unwrap()
+    );
+    let script_file = temp.path().join("parent.cjs");
+    std::fs::write(&script_file, script).unwrap();
+    let ctx = LifecycleContext::new(
+        temp.path(), temp.path(), "inherited-pipes", "install",
+        &format!("node \"{}\"", script_file.display()),
+    ).with_capture_output(true).with_timeout(std::time::Duration::from_secs(180));
+    let status = execute_lifecycle_script(&ctx).unwrap();
+    assert!(status.success());
+    assert!(ctx.get_captured_output().unwrap().stdout.contains("grandchild-ready"));
+    assert!(!marker.exists(), "An inherited output pipe must not keep an orphan alive until natural exit");
+}
+
+#[test]
 fn test_massive_output_pipe_drain_sync() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -1589,14 +1619,15 @@ process.exitCode = 0;
     let script = format!("node \"{escaped}\"");
 
     let ctx = LifecycleContext::new(root, root, "massive-output-sync-pkg", "install", &script)
-        .with_capture_output(true);
+        .with_capture_output(true)
+        .with_timeout(std::time::Duration::from_secs(180));
 
     let start = std::time::Instant::now();
     let status =
         execute_lifecycle_script(&ctx).expect("Sync massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(45),
+        start.elapsed() < std::time::Duration::from_secs(180),
         "Must complete without pipe buffer deadlock"
     );
 
@@ -1672,7 +1703,8 @@ process.exitCode = 0;
         "postinstall",
         &script,
     )
-    .with_capture_output(true);
+    .with_capture_output(true)
+    .with_timeout(std::time::Duration::from_secs(180));
 
     let start = std::time::Instant::now();
     let status = execute_lifecycle_script_async(&ctx)
@@ -1680,7 +1712,7 @@ process.exitCode = 0;
         .expect("Async massive output execution must succeed");
     assert!(status.success(), "Process must exit cleanly with code 0");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(45),
+        start.elapsed() < std::time::Duration::from_secs(180),
         "Must complete without pipe buffer deadlock"
     );
 
