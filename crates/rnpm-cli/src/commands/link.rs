@@ -8,13 +8,13 @@ pub(crate) fn run_link(package: Option<String>, current_dir: PathBuf) -> Result<
         None => {
             let _target_link = rnpm_install::link_package(&current_dir, &global_prefix)?;
             let elapsed_str = crate::format_duration(start_time.elapsed());
-            println!("added 1 package in {elapsed_str}");
+            println!("\nadded 1 package in {elapsed_str}");
         }
         Some(pkg) => {
             let _target_link =
                 rnpm_install::link_package_from_global(&current_dir, &pkg, &global_prefix)?;
             let elapsed_str = crate::format_duration(start_time.elapsed());
-            println!("added 1 package in {elapsed_str}");
+            println!("\nadded 1 package in {elapsed_str}");
         }
     }
     Ok(())

@@ -1,3 +1,6 @@
+#[path = "query/attributes.rs"]
+mod attributes;
+
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -20,6 +23,7 @@ pub enum AttrOp {
     Suffix,    // $=
     Substring, // *=
     Tilde,     // ~=
+    Dash,      // |=
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +39,7 @@ pub enum SimpleSelector {
         name: String,
         op: Option<AttrOp>,
         val: Option<String>,
+        insensitive: bool,
     },
 }
 
@@ -312,7 +317,9 @@ fn parse_compound_selector(tokens: &[String]) -> Result<CompoundSelector, String
             simple.push(parse_attribute_selector(inner)?);
         } else {
             // Type name
-            simple.push(SimpleSelector::Type(tok.clone()));
+            simple.push(SimpleSelector::Type(
+                tok.strip_prefix('#').unwrap_or(tok).to_string(),
+            ));
         }
     }
 
@@ -321,6 +328,7 @@ fn parse_compound_selector(tokens: &[String]) -> Result<CompoundSelector, String
 
 fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
     let ops = [
+        ("|=", AttrOp::Dash),
         ("^=", AttrOp::Prefix),
         ("$=", AttrOp::Suffix),
         ("*=", AttrOp::Substring),
@@ -331,7 +339,13 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
     for (op_str, op_enum) in ops {
         if let Some((name_part, val_part)) = s.split_once(op_str) {
             let name = name_part.trim().to_string();
-            let mut val = val_part.trim().to_string();
+            let value = val_part.trim();
+            let (value, insensitive) = match value.rsplit_once(char::is_whitespace) {
+                Some((value, flag)) if flag.eq_ignore_ascii_case("i") => (value.trim_end(), true),
+                Some((value, flag)) if flag.eq_ignore_ascii_case("s") => (value.trim_end(), false),
+                _ => (value, false),
+            };
+            let mut val = value.to_string();
             if (val.starts_with('"') && val.ends_with('"'))
                 || (val.starts_with('\'') && val.ends_with('\''))
             {
@@ -341,6 +355,7 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
                 name,
                 op: Some(op_enum),
                 val: Some(val),
+                insensitive,
             });
         }
     }
@@ -349,20 +364,8 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
         name: s.trim().to_string(),
         op: None,
         val: None,
+        insensitive: false,
     })
-}
-
-fn get_nested_json_val<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    let mut curr = root;
-    for part in path.split('.') {
-        match curr {
-            Value::Object(map) => {
-                curr = map.get(part)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(curr)
 }
 
 fn matches_simple(
@@ -378,9 +381,7 @@ fn matches_simple(
             "optional" => node.optional,
             "peer" => node.peer,
             "prod" => !node.dev && !node.optional && !node.peer,
-            "workspace" => {
-                node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
-            }
+            "workspace" => node.is_workspace,
             _ => false,
         },
         SimpleSelector::PseudoClass { name, arg } => match name.as_str() {
@@ -403,6 +404,18 @@ fn matches_simple(
             "workspace" => {
                 node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
             }
+            "link" => node.is_link,
+            "attr" => arg.as_deref().zip(node.raw_manifest.as_ref())
+                .is_some_and(|(arg, package)| attributes::pseudo(arg, package)),
+            "private" => node
+                .raw_manifest
+                .as_ref()
+                .and_then(|m| m.get("private"))
+                .is_some_and(|v| v == &Value::Bool(true)),
+            "is" => arg
+                .as_deref()
+                .and_then(|s| QuerySelector::parse(s).ok())
+                .is_some_and(|q| matches_query(&q, node, all_nodes_map)),
             "project" => node.location.is_empty(),
             "semver" => {
                 if let (Some(range_str), Some(ver_str)) = (arg, &node.version) {
@@ -448,94 +461,18 @@ fn matches_simple(
             }
             _ => false,
         },
-        SimpleSelector::Attribute { name, op, val } => {
-            let actual_str: Option<String> = match name.as_str() {
-                "name" => Some(node.name.clone()),
-                "version" => node.version.clone(),
-                "description" => node.description.clone(),
-                "license" => node.license.clone(),
-                "homepage" => node.homepage.clone(),
-                "location" => Some(node.location.clone()),
-                "path" => node.path.as_ref().map(|p| p.to_string_lossy().to_string()),
-                "realpath" => node
-                    .realpath
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string()),
-                "resolved" => node.resolved.clone(),
-                "integrity" => node.integrity.clone(),
-                "dev" => Some(node.dev.to_string()),
-                "optional" => Some(node.optional.to_string()),
-                "peer" => Some(node.peer.to_string()),
-                "inBundle" => Some(node.in_bundle.to_string()),
-                "deduped" => Some(node.deduped.to_string()),
-                "overridden" => Some(node.overridden.to_string()),
-                "extraneous" => Some(node.extraneous.to_string()),
-                "missing" => Some(node.missing.to_string()),
-                "invalid" => node.invalid.clone(),
-                _ => {
-                    // Check raw manifest if present
-                    if let Some(raw) = &node.raw_manifest {
-                        if let Some(v) = get_nested_json_val(raw, name) {
-                            match v {
-                                Value::String(s) => Some(s.clone()),
-                                Value::Bool(b) => Some(b.to_string()),
-                                Value::Number(n) => Some(n.to_string()),
-                                _ => Some(v.to_string()),
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
+        SimpleSelector::Attribute { name, op, val, insensitive } => {
+            let actual = node
+                .raw_manifest
+                .as_ref()
+                .and_then(|m| m.get(name));
+            let fallback = match name.as_str() {
+                "name" => Some(Value::String(node.name.clone())),
+                "version" => node.version.clone().map(Value::String),
+                _ => None,
             };
-
-            match (op, val) {
-                (None, _) => actual_str.is_some() && !actual_str.as_ref().unwrap().is_empty(),
-                (Some(AttrOp::Exact), Some(expected)) => {
-                    if let Some(act) = &actual_str {
-                        act == expected
-                    } else {
-                        false
-                    }
-                }
-                (Some(AttrOp::Prefix), Some(expected)) => {
-                    if name == "version" {
-                        if let Some(v_str) = &node.version {
-                            let range_str = format!("^{expected}");
-                            if let (Ok(r), Ok(v)) =
-                                (Range::parse(&range_str), Version::parse(v_str))
-                            {
-                                return r.satisfies(&v);
-                            }
-                        }
-                    }
-                    actual_str.map(|s| s.starts_with(expected)).unwrap_or(false)
-                }
-                (Some(AttrOp::Tilde), Some(expected)) => {
-                    if name == "version" {
-                        if let Some(v_str) = &node.version {
-                            let range_str = format!("~{expected}");
-                            if let (Ok(r), Ok(v)) =
-                                (Range::parse(&range_str), Version::parse(v_str))
-                            {
-                                return r.satisfies(&v);
-                            }
-                        }
-                    }
-                    actual_str
-                        .map(|s| s.split_whitespace().any(|w| w == expected))
-                        .unwrap_or(false)
-                }
-                (Some(AttrOp::Substring), Some(expected)) => {
-                    actual_str.map(|s| s.contains(expected)).unwrap_or(false)
-                }
-                (Some(AttrOp::Suffix), Some(expected)) => {
-                    actual_str.map(|s| s.ends_with(expected)).unwrap_or(false)
-                }
-                _ => false,
-            }
+            let actual = actual.or(fallback.as_ref());
+            attributes::matches(actual, op.as_ref(), val.as_deref(), *insensitive)
         }
     }
 }
@@ -630,7 +567,8 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
         ..Default::default()
     };
 
-    let root_node = build_dependency_tree(project_dir, &tree_opts)?;
+    let mut root_node = build_dependency_tree(project_dir, &tree_opts)?;
+    normalize_workspace_nodes(&mut root_node, project_dir);
     let all_nodes = root_node.collect_all_nodes();
 
     let mut all_nodes_map = HashMap::new();
@@ -652,14 +590,112 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
 
     for node in all_nodes {
         if matches_query(&query_selector, node, &all_nodes_map) {
-            matched_json_nodes.push(node.to_query_json());
+            matched_json_nodes.push(ordered_query_node(node));
         }
     }
 
-    let json_output = serde_json::to_string_pretty(&Value::Array(matched_json_nodes))?;
+    let json_output = serde_json::to_string_pretty(&matched_json_nodes)?;
     println!("{json_output}");
 
     Ok(0)
+}
+
+fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
+    let mut replacements = HashMap::new();
+    let workspaces: HashSet<_> = rnpm_core::workspace::discover_workspaces(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            m.path
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
+    fn normalize(
+        node: &mut InspectedNode,
+        root: &Path,
+        replacements: &mut HashMap<String, String>,
+        workspaces: &HashSet<String>,
+    ) {
+        node.is_workspace = node
+            .realpath
+            .as_ref()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .is_some_and(|p| workspaces.contains(&p.to_string_lossy().replace('\\', "/")));
+        if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
+            if path != realpath {
+                if let Ok(location) = realpath.strip_prefix(root) {
+                    let location = location.to_string_lossy().replace('\\', "/");
+                    replacements.insert(node.location.clone(), location.clone());
+                    node.location = location;
+                    node.path = Some(realpath.clone());
+                    node.from.clear();
+                    node.resolved = None;
+                }
+            }
+        }
+        for child in node.dependencies.values_mut() {
+            normalize(child, root, replacements, workspaces);
+        }
+    }
+    fn fix_from(node: &mut InspectedNode, replacements: &HashMap<String, String>) {
+        for from in &mut node.from {
+            if let Some(target) = replacements.get(from) {
+                *from = target.clone();
+            }
+        }
+        for child in node.dependencies.values_mut() {
+            fix_from(child, replacements);
+        }
+    }
+    normalize(node, root, &mut replacements, &workspaces);
+    fix_from(node, &replacements);
+}
+
+fn ordered_query_node(node: &InspectedNode) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::OrderedJsonValue;
+    let computed = node.to_query_json();
+    let mut map: rnpm_core::ordered_json::OrderedJsonMap = node
+        .path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p.join("package.json")).ok())
+        .and_then(|s| serde_json::from_str::<OrderedJsonValue>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_else(|| {
+            let mut map = rnpm_core::ordered_json::OrderedJsonMap::new();
+            for key in ["name", "version"] {
+                if let Some(value) = computed.get(key) {
+                    map.insert(key.to_string(), value.clone().into());
+                }
+            }
+            if let Some(Value::Object(raw)) = &node.raw_manifest {
+                for (key, value) in raw {
+                    map.insert(key.clone(), value.clone().into());
+                }
+            }
+            map
+        });
+    for key in [
+        "_id",
+        "pkgid",
+        "location",
+        "path",
+        "realpath",
+        "resolved",
+        "from",
+        "to",
+        "dev",
+        "inBundle",
+        "deduped",
+        "overridden",
+        "queryContext",
+    ] {
+        if let Some(value) = computed.get(key) {
+            map.insert(key.to_string(), value.clone().into());
+        }
+    }
+    OrderedJsonValue::Object(map)
 }
 
 #[cfg(test)]
@@ -685,6 +721,7 @@ mod tests {
                 name: "name".to_string(),
                 op: Some(AttrOp::Exact),
                 val: Some("react".to_string()),
+                insensitive: false,
             }
         );
 
@@ -695,6 +732,7 @@ mod tests {
                 name: "version".to_string(),
                 op: Some(AttrOp::Prefix),
                 val: Some("18".to_string()),
+                insensitive: false,
             }
         );
     }

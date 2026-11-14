@@ -753,6 +753,169 @@ fn flatten_package_json_to_env(
     }
 }
 
+/// npm release whose CLI contract rnpm follows.
+pub const NPM_VERSION: &str = "11.20.0";
+
+/// Absolute path of the `node` executable on PATH.
+pub fn node_executable() -> Option<PathBuf> {
+    static NODE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        let exts: Vec<String> = if cfg!(windows) {
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(str::to_string)
+                .collect()
+        } else {
+            vec![String::new()]
+        };
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .flat_map(|dir| exts.iter().map(move |e| dir.join(format!("node{e}"))))
+            .find(|p| p.is_file())
+            .map(|p| {
+                // Report the on-disk spelling (node.exe, not node.EXE).
+                std::fs::canonicalize(&p)
+                    .ok()
+                    .map(|c| {
+                        let s = c.to_string_lossy().to_string();
+                        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+                    })
+                    .unwrap_or(p)
+            })
+    })
+    .clone()
+}
+
+/// Version string of the `node` on PATH (`v26.13.0`), or `unknown`.
+pub fn node_version() -> String {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            node_executable()
+                .and_then(|n| std::process::Command::new(n).arg("--version").output().ok())
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .clone()
+}
+
+/// npm's default `user-agent`:
+/// `npm/{npm-version} node/{node-version} {platform} {arch} workspaces/{bool} {ci}`.
+pub fn npm_user_agent() -> String {
+    let platform = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        other => other,
+    };
+    let ci = [
+        ("GITHUB_ACTIONS", "github-actions"),
+        ("GITLAB_CI", "gitlab-ci"),
+        ("CIRCLECI", "circleci"),
+        ("TRAVIS", "travis-ci"),
+        ("BUILDKITE", "buildkite"),
+        ("TF_BUILD", "azure-pipelines"),
+    ]
+    .iter()
+    .find(|(var, _)| std::env::var_os(var).is_some())
+    .map(|(_, name)| format!(" ci/{name}"))
+    .unwrap_or_default();
+    format!(
+        "npm/{NPM_VERSION} node/{} {platform} {arch} workspaces/false{ci}",
+        node_version()
+    )
+}
+
+/// A Node entry point for `npm_execpath`: tools run `node $npm_execpath ...`,
+/// so rnpm provides a small script that forwards to the native binary.
+pub fn node_entrypoint() -> Option<PathBuf> {
+    static ENTRY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ENTRY
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let exe_json = serde_json::to_string(&exe.to_string_lossy()).ok()?;
+            let script = format!(
+                "#!/usr/bin/env node\n// Forwards to the rnpm binary so `node $npm_execpath` works.\nconst {{ spawnSync }} = require('child_process')\nconst r = spawnSync({exe_json}, process.argv.slice(2), {{ stdio: 'inherit' }})\nprocess.exit(r.status === null ? 1 : r.status)\n"
+            );
+            let candidates = [
+                exe.parent().map(|d| d.join("rnpm-cli.js")),
+                Some(std::env::temp_dir().join("rnpm").join("rnpm-cli.js")),
+            ];
+            candidates.into_iter().flatten().find(|path| {
+                if std::fs::read_to_string(path).is_ok_and(|s| s == script) {
+                    return true;
+                }
+                path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                    && std::fs::write(path, &script).is_ok()
+            })
+        })
+        .clone()
+}
+
+/// Config npm exports to scripts (@npmcli/config set-envs): non-default
+/// settings, plus prefixes, cache, userconfig, node-gyp and npm version.
+fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
+    for (key, value) in &config.npmrc.settings {
+        if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
+            continue;
+        }
+        out.push((format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()), value.clone()));
+    }
+    let global_prefix = config
+        .get("prefix")
+        .map(PathBuf::from)
+        .unwrap_or_else(rnpm_config::find_global_prefix);
+    let prefix = global_prefix.to_string_lossy().to_string();
+    out.push(("npm_config_global_prefix".into(), prefix.clone()));
+    out.push(("npm_config_prefix".into(), prefix));
+    out.push((
+        "npm_config_local_prefix".into(),
+        project_root.to_string_lossy().to_string(),
+    ));
+    let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("npm-cache")
+        } else {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".npm")
+        }
+    });
+    out.push(("npm_config_cache".into(), cache.to_string_lossy().to_string()));
+    if let Some(user) = rnpm_config::find_user_npmrc() {
+        out.push(("npm_config_userconfig".into(), user.to_string_lossy().to_string()));
+    }
+    if let Some(gyp) = node_executable()
+        .and_then(|n| n.parent().map(Path::to_path_buf))
+        .map(|d| {
+            if cfg!(windows) {
+                d.join("node_modules")
+            } else {
+                d.join("..").join("lib").join("node_modules")
+            }
+        })
+        .map(|d| d.join("npm").join("node_modules").join("node-gyp").join("bin").join("node-gyp.js"))
+        .filter(|p| p.is_file())
+    {
+        out.push(("npm_config_node_gyp".into(), gyp.to_string_lossy().to_string()));
+    }
+    out.push(("npm_config_npm_version".into(), NPM_VERSION.into()));
+    out
+}
+
 /// Builds the scrubbed and populated environment map for the lifecycle script.
 pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
@@ -777,16 +940,10 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     if let Some(ua) = env.get_mut("npm_config_user_agent") {
         *ua = scrub_text(ua);
     } else {
-        env.insert(
-            "npm_config_user_agent".to_string(),
-            format!(
-                "rnpm/{} node/{} {} {}",
-                env!("CARGO_PKG_VERSION"),
-                "v20.0.0",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ),
-        );
+        env.insert("npm_config_user_agent".to_string(), npm_user_agent());
+    }
+    for (key, value) in npm_config_env(&ctx.project_root) {
+        env.entry(key).or_insert(value);
     }
 
     // 3. Hierarchical PATH construction:
@@ -816,12 +973,12 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         path_entries.push(root_bin);
     }
 
-    // Node executable directory
+    // Node executable directory (absolute, like npm's process.execPath)
     let node_bin = ctx.node_execpath.clone().unwrap_or_else(|| {
         if let Ok(cur_node) = std::env::var("NODE") {
             PathBuf::from(cur_node)
         } else {
-            PathBuf::from("node")
+            node_executable().unwrap_or_else(|| PathBuf::from("node"))
         }
     });
 
@@ -909,6 +1066,7 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     let rnpm_exec = ctx
         .npm_execpath
         .clone()
+        .or_else(node_entrypoint)
         .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm")));
     env.insert(
         "npm_execpath".to_string(),
@@ -1071,6 +1229,13 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
                             g.terminate(124);
                         }
                         let _ = child.kill();
+                        let _ = child.wait();
+                        if let Some(handle) = stdout_handle {
+                            let _ = handle.join();
+                        }
+                        if let Some(handle) = stderr_handle {
+                            let _ = handle.join();
+                        }
                         return Err(anyhow::Error::from(ScriptExitError {
                             exit_code: 124,
                             message: format!(
@@ -1091,6 +1256,12 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
             )
         })?
     };
+
+    // Descendants may inherit the pipe handles after the shell exits. Reap the
+    // process tree before waiting for EOF, just as the async executor does.
+    if let Some(ref g) = guard {
+        g.terminate(0);
+    }
 
     let stdout_str = stdout_handle
         .and_then(|h| h.join().ok())
@@ -1122,6 +1293,16 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     }
 
     Ok(status)
+}
+
+// Termination requests are asynchronous on Windows. Do not detach process waits
+// or pipe readers after an arbitrary 500ms; let the actual completion wake us.
+async fn await_terminated_task<T>(task: &mut tokio::task::JoinHandle<T>) {
+    match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("Terminated process cleanup task failed: {error}"),
+        Err(_) => warn!("Terminated process cleanup did not complete within 60 seconds"),
+    }
 }
 
 /// Spawns and executes a lifecycle script asynchronously, enforcing process-tree signal cleanup.
@@ -1205,7 +1386,7 @@ where
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let stdout_task = tokio::task::spawn_blocking(move || {
+    let mut stdout_task = tokio::task::spawn_blocking(move || {
         if let Some(mut r) = child_stdout {
             drain_and_scrub_reader(&mut r)
         } else {
@@ -1213,7 +1394,7 @@ where
         }
     });
 
-    let stderr_task = tokio::task::spawn_blocking(move || {
+    let mut stderr_task = tokio::task::spawn_blocking(move || {
         if let Some(mut r) = child_stderr {
             drain_and_scrub_reader(&mut r)
         } else {
@@ -1295,7 +1476,9 @@ where
                 g.terminate(124);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 124,
                 message: format!("Lifecycle script '{}' timed out after {:?}", ctx.event, ctx.timeout.unwrap_or_default()),
@@ -1308,7 +1491,9 @@ where
                 g.terminate(exit_code);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: exit_code as i32,
                 message: format!("Lifecycle execution for {pkg_name} terminated by {sig}"),
@@ -1320,7 +1505,9 @@ where
                 g.terminate(143);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 143,
                 message: format!("Lifecycle execution for {pkg_name} aborted by signal"),
@@ -1560,7 +1747,10 @@ pub fn matches_filter(
         .to_string();
     if let Ok(rel) = member_path.strip_prefix(root_dir) {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str == norm_filter || glob_match(&norm_filter, &rel_str) {
+        if rel_str == norm_filter
+            || glob_match(&norm_filter, &rel_str)
+            || rel_str.starts_with(&format!("{}/", norm_filter.trim_end_matches('/')))
+        {
             return true;
         }
     }
@@ -2054,6 +2244,23 @@ pub async fn execute_topological_with_abort(
     opts: &LifecycleOptions,
     abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
+    execute_dependency_hooks_with_abort(nodes, opts, abort_rx.clone()).await?;
+    execute_root_hooks_with_abort(root_manifest, opts, abort_rx).await
+}
+
+/// Build dependencies before persisting the reified tree's metadata.
+pub async fn execute_dependency_hooks(
+    nodes: &[LifecyclePackageNode],
+    opts: &LifecycleOptions,
+) -> Result<()> {
+    execute_dependency_hooks_with_abort(nodes, opts, None).await
+}
+
+async fn execute_dependency_hooks_with_abort(
+    nodes: &[LifecyclePackageNode],
+    opts: &LifecycleOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
     if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
         return Ok(());
     }
@@ -2149,9 +2356,8 @@ pub async fn execute_topological_with_abort(
                 ctx.timeout = opts.timeout;
                 ctx.sandbox_policy = opts.sandbox_policy.clone();
                 ctx.foreground_scripts = opts.foreground_scripts;
-                if opts.foreground_scripts {
-                    ctx.capture_output = false;
-                }
+                // Dependency build output is captured and only shown on failure.
+                ctx.capture_output = opts.capture_output && !opts.foreground_scripts;
 
                 let abort_fut = {
                     let mut rx_opt = abort_rx.clone();
@@ -2186,12 +2392,16 @@ pub async fn execute_topological_with_abort(
                             // Break hook loop for this optional dependency; isolate failure
                             break;
                         } else {
-                            return Err(anyhow::anyhow!(
-                                "Lifecycle script '{}' failed for package {} with exit code: {:?}",
-                                hook,
-                                node.manifest.name.as_deref().unwrap_or("unknown"),
-                                status.code()
-                            ));
+                            // npm: exit with the script's code and replay its output.
+                            let mut failure = ScriptExitError::lifecycle_failure(&ctx, &status);
+                            if let Some(out) = ctx.captured_output.lock().ok().and_then(|o| o.clone()) {
+                                for line in out.stdout.lines().chain(out.stderr.lines()) {
+                                    failure.message.push_str("
+npm error ");
+                                    failure.message.push_str(line);
+                                }
+                            }
+                            return Err(anyhow::Error::from(failure));
                         }
                     }
                     Err(e) => {
@@ -2222,6 +2432,22 @@ pub async fn execute_topological_with_abort(
         }
     }
 
+    Ok(())
+}
+
+/// Run root install hooks after reification has persisted the public lockfile.
+pub async fn execute_root_hooks(root_manifest: &Manifest, opts: &LifecycleOptions) -> Result<()> {
+    execute_root_hooks_with_abort(root_manifest, opts, None).await
+}
+
+async fn execute_root_hooks_with_abort(
+    root_manifest: &Manifest,
+    opts: &LifecycleOptions,
+    abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
+        return Ok(());
+    }
     let root_hooks = [
         "preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
     ];

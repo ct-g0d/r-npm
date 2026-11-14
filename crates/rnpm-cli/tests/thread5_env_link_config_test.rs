@@ -101,7 +101,7 @@ fn test_config_cli_set_get_delete_list() {
     let list_stdout = String::from_utf8_lossy(&out.stdout);
     assert!(list_stdout.contains("test-key = \"test-value-123\""));
     assert!(list_stdout.contains("npm local prefix ="));
-    assert!(list_stdout.contains("npm global prefix ="));
+    assert!(list_stdout.contains("; node bin location ="));
 
     // 6. Config delete
     let out = isolated_cmd(rnpm_bin, &proj_dir, &user_home, &global_prefix)

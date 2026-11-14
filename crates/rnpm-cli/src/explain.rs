@@ -24,6 +24,10 @@ struct Dependent<'a> {
     kind: &'a str,
     name: &'a str,
     spec: &'a str,
+    #[serde(rename = "rawSpec", skip_serializing_if = "Option::is_none")]
+    raw_spec: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    overridden: bool,
     from: FromNode<'a>,
 }
 
@@ -129,7 +133,13 @@ fn dependents<'a>(
             result.push(Dependent {
                 kind,
                 name: &child.name,
-                spec,
+                spec: if child.overridden {
+                    child.required.as_deref().unwrap_or(spec)
+                } else {
+                    spec
+                },
+                raw_spec: child.overridden.then_some(spec),
+                overridden: child.overridden,
                 from,
             });
         }
@@ -170,22 +180,61 @@ pub fn run_explain(project_dir: &Path, package: &str, json: bool) -> anyhow::Res
     if json {
         println!("{}", serde_json::to_string_pretty(&matches)?);
     } else {
-        for node in matches {
+        for (i, node) in matches.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            let mut flags = String::new();
+            for (flag, enabled) in [
+                ("dev", node.dev),
+                ("optional", node.optional),
+                ("peer", node.peer),
+                ("bundled", node.bundled),
+                ("overridden", node.overridden),
+            ] {
+                if enabled {
+                    flags.push_str(&format!(" {flag}"));
+                }
+            }
             println!(
-                "{}@{}\n{}",
+                "{}@{}{}\n{}",
                 node.name,
                 node.version.unwrap_or("unknown"),
+                flags,
                 node.location
             );
-            for edge in node.dependents {
-                let source = if edge.from.name.is_none() {
-                    "the root project"
-                } else {
-                    edge.from.location
-                };
-                println!("  {}@\"{}\" from {}", edge.name, edge.spec, source);
-            }
+            print_dependents(&node.dependents, "  ");
         }
     }
     Ok(())
+}
+
+fn print_dependents(edges: &[Dependent<'_>], indent: &str) {
+    for edge in edges {
+        let kind = if edge.kind == "prod" {
+            String::new()
+        } else {
+            format!("{} ", edge.kind)
+        };
+        let overridden = if edge.overridden { "overridden " } else { "" };
+        let was = edge
+            .raw_spec
+            .map(|s| format!(" (was \"{s}\")"))
+            .unwrap_or_default();
+        let source = edge
+            .from
+            .name
+            .map(|name| format!("{name}@{}", edge.from.version.unwrap_or("unknown")))
+            .unwrap_or_else(|| "the root project".to_string());
+        println!(
+            "{indent}{kind}{overridden}{}@\"{}\"{was} from {source}",
+            edge.name, edge.spec
+        );
+        if edge.from.name.is_some() {
+            println!("{indent}{}", edge.from.location);
+            if let Some(edges) = &edge.from.dependents {
+                print_dependents(edges, &format!("{indent}  "));
+            }
+        }
+    }
 }

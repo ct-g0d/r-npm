@@ -225,6 +225,8 @@ pub fn determine_placement(
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
+        None,
+        true,
     )
 }
 
@@ -243,6 +245,8 @@ pub fn determine_placement_with_peers(
         String,
         rnpm_core::manifest::PeerDependencyMeta,
     >,
+    resolved_version: Option<&str>,
+    placing_peer: bool,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
@@ -296,6 +300,7 @@ pub fn determine_placement_with_peers(
     } else {
         // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
         if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target)
+            && (placing_peer || !root_peer_conflicts(graph, &root_target, peer_dependencies, peer_dependencies_meta))
             && !candidate_has_incompatible_peer(
                 graph,
                 &root_target,
@@ -365,6 +370,9 @@ pub fn determine_placement_with_peers(
             install_name,
             package_name,
             target,
+            resolved_version,
+        ) && !candidate_shadows_descendant_dep(
+            graph, ancestor, install_name, resolved_version,
         ) {
             return PlacementDecision::PlaceNew(candidate);
         }
@@ -391,6 +399,7 @@ fn candidate_shadows_ancestor_dep(
     install_name: &str,
     package_name: &str,
     target: &PackageTarget,
+    resolved_version: Option<&str>,
 ) -> bool {
     let Some(ancestor_node) = graph.nodes.get(ancestor) else {
         return false;
@@ -407,6 +416,9 @@ fn candidate_shadows_ancestor_dep(
     };
 
     if let Ok(req_target) = PackageTarget::parse(spec) {
+        if let Some(version) = resolved_version {
+            return !version_satisfies_target(version, &req_target);
+        }
         if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
             if node_satisfies_target(visible, &req_target)
                 && !node_satisfies_target(visible, target)
@@ -431,6 +443,41 @@ fn candidate_shadows_ancestor_dep(
         }
     }
     false
+}
+
+// CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
+// must not intercept a valid descendant edge that currently resolves above
+// this scope. Otherwise a later sibling silently breaks an earlier branch.
+fn candidate_shadows_descendant_dep(
+    graph: &DependencyGraph,
+    scope: &str,
+    install_name: &str,
+    resolved_version: Option<&str>,
+) -> bool {
+    let Some(version) = resolved_version else { return false; };
+    let prefix = format!("{scope}/node_modules/");
+    // Arborist attaches edgesOut when a node enters the tree, before that
+    // node's turn in depsQueue. Our graph.edges only contains processed
+    // tasks, so also inspect pending edges from the manifest.
+    if graph.nodes.values().filter(|node| node.location.starts_with(&prefix)).any(|node| {
+        let Some(spec) = node.optional_dependencies.get(install_name)
+            .or_else(|| node.dependencies.get(install_name))
+            .or_else(|| node.peer_dependencies.get(install_name)) else { return false; };
+        let Ok(target) = PackageTarget::parse(spec) else { return false; };
+        find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
+            !current.location.starts_with(&prefix) && node_satisfies_target(current, &target)
+                && !version_satisfies_target(version, &target)
+        })
+    }) { return true; }
+    graph.edges.iter().any(|edge| {
+        if edge.install_name != install_name || !edge.from_location.starts_with(&prefix)
+            || edge.to_location.starts_with(&prefix) {
+            return false;
+        }
+        let Ok(target) = PackageTarget::parse(&edge.spec) else { return false; };
+        graph.nodes.get(&edge.to_location).is_some_and(|current| node_satisfies_target(current, &target))
+            && !version_satisfies_target(version, &target)
+    })
 }
 
 fn candidate_has_incompatible_peer(
@@ -490,6 +537,30 @@ fn candidate_has_incompatible_peer(
         }
 
         false
+    })
+}
+
+/// can-place-dep: a required peer that is visible but incompatible at the
+/// project root is a CONFLICT there, so a regular dependency nests deeper,
+/// where npm overrides the peer with a warning instead of ERESOLVE.
+fn root_peer_conflicts(
+    graph: &DependencyGraph,
+    candidate_location: &str,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
+) -> bool {
+    peer_dependencies.iter().any(|(peer_name, peer_spec)| {
+        if peer_dependencies_meta.get(peer_name).is_some_and(|meta| meta.optional) {
+            return false;
+        }
+        let Ok(target) = PackageTarget::parse(peer_spec) else {
+            return false;
+        };
+        find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
+            .is_some_and(|existing| !node_satisfies_target(existing, &target))
     })
 }
 

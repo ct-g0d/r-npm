@@ -30,10 +30,6 @@ pub(crate) async fn run(args: UnpublishArgs, current_dir: PathBuf) -> Result<()>
         ));
     }
 
-    if args.force {
-        eprintln!("npm warn using --force Recommended protections disabled.");
-    }
-
     let target_display = if let Some(ref ver) = version {
         format!("{package}@{ver}")
     } else {

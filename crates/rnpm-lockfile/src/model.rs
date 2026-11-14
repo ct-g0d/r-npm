@@ -743,6 +743,20 @@ pub struct LockfileV3 {
     pub packages: BTreeMap<String, LockfilePackage>,
 }
 
+// Shrinkwrap.inferFormattingOptions takes formatting from package.json, even
+// when an existing lockfile uses another newline or indentation style.
+fn project_lockfile_format(project_dir: &Path, fallbacks: &[std::path::PathBuf]) -> rnpm_core::ManifestFormat {
+    let mut format = std::iter::once(project_dir.join("package.json"))
+        .chain(fallbacks.iter().cloned())
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
+        .unwrap_or_default();
+    if format.indent.is_empty() {
+        format.indent = rnpm_core::ManifestFormat::default().indent;
+    }
+    format
+}
+
 impl LockfileV3 {
     /// Create a new LockfileV3 with an empty root package `""`.
     pub fn new(name: impl Into<String>, version: Option<String>) -> Self {
@@ -1480,40 +1494,38 @@ impl LockfileV3 {
     }
 
     /// Save using npm lockfile-version semantics (1, 2, or 3).
-    pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
-        let format = if path.exists() {
-            std::fs::read_to_string(path)
-                .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                .unwrap_or_default()
-        } else if let Some(parent) = path.parent() {
-            let root_dir = if parent.ends_with("node_modules") {
-                parent.parent().unwrap_or(parent)
-            } else {
-                parent
-            };
-            let lock_path = root_dir.join("package-lock.json");
-            let sw_path = root_dir.join("npm-shrinkwrap.json");
-            let pkg_json = root_dir.join("package.json");
-            if lock_path.exists() {
-                std::fs::read_to_string(&lock_path)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                    .unwrap_or_default()
-            } else if sw_path.exists() {
-                std::fs::read_to_string(&sw_path)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                    .unwrap_or_default()
-            } else if pkg_json.exists() {
-                std::fs::read_to_string(&pkg_json)
-                    .map(|s| rnpm_core::ManifestFormat::detect(&s))
-                    .unwrap_or_default()
-            } else {
-                rnpm_core::ManifestFormat::default()
-            }
-        } else {
-            rnpm_core::ManifestFormat::default()
+    /// Copy without `resolved` on registry tarballs when
+    /// `omit-lockfile-registry-resolved` is set.
+    fn for_writing(&self) -> std::borrow::Cow<'_, Self> {
+        let registries = OMIT_REGISTRY_RESOLVED.read().ok().and_then(|g| g.clone());
+        let Some(registries) = registries else {
+            return std::borrow::Cow::Borrowed(self);
         };
+        let is_registry = |r: &str| registries.iter().any(|base| r.starts_with(base.as_str()));
+        let mut copy = self.clone();
+        for pkg in copy.packages.values_mut() {
+            if pkg.resolved.as_deref().is_some_and(is_registry) {
+                pkg.resolved = None;
+                if let Some(obj) = pkg.raw_value.as_mut().and_then(|v| v.as_object_mut()) {
+                    obj.remove("resolved");
+                }
+            }
+        }
+        std::borrow::Cow::Owned(copy)
+    }
 
-        let content = self.to_json_string_version_formatted(version, &format)?;
+    pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
+        let this = self.for_writing();
+        let content_source: &Self = this.as_ref();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let root_dir = if parent.ends_with("node_modules") {
+            parent.parent().unwrap_or(parent)
+        } else {
+            parent
+        };
+        let format = project_lockfile_format(root_dir, &[path.to_path_buf()]);
+
+        let content = content_source.to_json_string_version_formatted(version, &format)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1674,8 +1686,13 @@ impl LockfileV3 {
     ///   npm's hidden lockfile lists only what is physically on disk.
     /// - Fields are ordered in npm's `json-stringify-nice` order so diffs against npm are minimal.
     pub fn save_hidden(&self, project_dir: &Path) -> Result<(), LockfileError> {
+        self.save_hidden_with_root_metadata(project_dir, true)
+    }
+
+    /// A new --no-save install has no persisted root metadata in its hidden lock.
+    pub fn save_hidden_with_root_metadata(&self, project_dir: &Path, root_metadata: bool) -> Result<(), LockfileError> {
         let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
-        let mut hidden = self.clone();
+        let mut hidden = self.for_writing().into_owned();
         hidden.lockfile_version = 3;
         hidden.packages.remove("");
         for pkg in hidden.packages.values_mut() {
@@ -1706,17 +1723,12 @@ impl LockfileV3 {
             true
         });
 
-        let format = [
+        let format = project_lockfile_format(project_dir, &[
             hidden_path.clone(),
             project_dir.join("package-lock.json"),
             project_dir.join("npm-shrinkwrap.json"),
-            project_dir.join("package.json"),
-        ]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
-        .unwrap_or_default();
-        let content = hidden.to_npm_json_string_formatted(&format)?;
+        ]);
+        let content = hidden.to_npm_json_string_formatted(&format, root_metadata)?;
 
         if let Some(parent) = hidden_path.parent() {
             fs::create_dir_all(parent)?;
@@ -1727,15 +1739,16 @@ impl LockfileV3 {
 
     /// Serializes with npm's `json-stringify-nice` key ordering so diffs against npm are minimal.
     pub fn to_npm_json_string(&self) -> Result<String, LockfileError> {
-        self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default())
+        self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default(), true)
     }
 
     fn to_npm_json_string_formatted(
         &self,
         format: &rnpm_core::ManifestFormat,
+        root_metadata: bool,
     ) -> Result<String, LockfileError> {
         let has_any_raw = self.packages.values().any(|p| p.raw_value.is_some());
-        let value = if has_any_raw {
+        let mut value = if has_any_raw {
             let mut root = serde_json::Map::new();
             root.insert("name".into(), serde_json::Value::String(self.name.clone()));
             if let Some(v) = &self.version {
@@ -1772,6 +1785,12 @@ impl LockfileV3 {
             copy.packages = normalized_packages;
             serde_json::to_value(&copy)?
         };
+        if !root_metadata {
+            if let Some(root) = value.as_object_mut() {
+                root.remove("name");
+                root.remove("version");
+            }
+        }
         let mut out = String::new();
         stringify_npm_nice_indent(&value, &format.indent, 0, &mut out);
         if !out.ends_with('\n') {
@@ -1819,6 +1838,19 @@ const NPM_CHAR_RANK: [u8; 256] = [
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
 ];
+
+static OMIT_REGISTRY_RESOLVED: std::sync::RwLock<Option<Vec<String>>> =
+    std::sync::RwLock::new(None);
+
+/// npm's `omit-lockfile-registry-resolved`: write registry packages without
+/// `resolved`, so installs fetch them from whichever registry is configured.
+/// `registries` lists the configured registry URLs whose tarballs count as
+/// registry dependencies; `None` keeps `resolved`.
+pub fn set_omit_registry_resolved(registries: Option<Vec<String>>) {
+    if let Ok(mut guard) = OMIT_REGISTRY_RESOLVED.write() {
+        *guard = registries;
+    }
+}
 
 pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let a_bytes = a.as_bytes();
@@ -2003,3 +2035,4 @@ pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
 
     !(os_ok && cpu_ok && libc_ok)
 }
+

@@ -27,6 +27,22 @@ pub fn default_user_agent() -> String {
 /// Abbreviated metadata MIME type for npm registry.
 pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 
+static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Install the CLI's canonical command and expanded npm user agent once per
+/// invocation. Library callers retain their configured request identity.
+pub fn set_cli_request_context(command: String, user_agent: String) {
+    let _ = CLI_REQUEST_CONTEXT.set((command, user_agent));
+}
+
+fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
+    let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
+        .into_iter()
+        .filter_map(|key| headers.get(key)?.to_str().ok().map(|value| (key.into(), value.into())))
+        .collect();
+    serde_json::json!({ "response": { "headers": headers } })
+}
+
 /// Maximum number of HTTP redirects to follow before failing.
 pub const MAX_REDIRECTS: usize = 10;
 
@@ -107,9 +123,10 @@ pub enum MetadataFetchResult {
     Fresh {
         metadata: AbbreviatedPackageMetadata,
         etag: Option<String>,
+        cache_metadata: serde_json::Value,
     },
     /// Server returned HTTP 304 Not Modified; cached data is still valid.
-    NotModified { etag: Option<String> },
+    NotModified { etag: Option<String>, cache_metadata: serde_json::Value },
 }
 
 impl MetadataFetchResult {
@@ -291,6 +308,8 @@ pub struct RegistryClientConfig {
     pub retry_on_status: HashSet<u16>,
     pub scoped_registries: std::collections::BTreeMap<String, Url>,
     pub auth_tokens: std::collections::BTreeMap<String, String>,
+    /// URI-scoped Basic credentials (base64 `user:password`).
+    pub basic_auths: std::collections::BTreeMap<String, String>,
     pub circuit_breaker_enabled: bool,
     pub circuit_breaker_failure_threshold: usize,
     pub circuit_breaker_reset_timeout: Duration,
@@ -339,6 +358,7 @@ impl Default for RegistryClientConfig {
             retry_on_status,
             scoped_registries: std::collections::BTreeMap::new(),
             auth_tokens: std::collections::BTreeMap::new(),
+            basic_auths: std::collections::BTreeMap::new(),
             circuit_breaker_enabled: false,
             circuit_breaker_failure_threshold: 5,
             circuit_breaker_reset_timeout: Duration::from_secs(30),
@@ -593,11 +613,16 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
         let mut headers = HeaderMap::new();
+        let cli_context = CLI_REQUEST_CONTEXT.get();
+        let agent = cli_context.filter(|_| config.user_agent == default_user_agent()).map(|(_, agent)| agent.as_str()).unwrap_or(&config.user_agent);
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&config.user_agent)
+            HeaderValue::from_str(agent)
                 .map_err(|e| RegistryError::Other(e.to_string()))?,
         );
+        if let Some((command, _)) = cli_context {
+            headers.insert("npm-command", HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?);
+        }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         let max_idle = if config.pool_max_idle_per_host == 0 {
@@ -869,6 +894,31 @@ impl RegistryClient {
         false
     }
 
+    /// The `Authorization` value npm would send: a Bearer token when one is
+    /// configured, otherwise URI-scoped Basic credentials.
+    pub fn auth_header_for_url(&self, url: &Url) -> Option<String> {
+        if let Some(token) = self.auth_token_for_url(url) {
+            return Some(format!("Bearer {token}"));
+        }
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        let mut path = url.path().to_string();
+        loop {
+            let key = format!("//{host}{port}{}", if path.ends_with('/') { path.clone() } else { format!("{path}/") });
+            if let Some(basic) = self.config.basic_auths.get(&key) {
+                return Some(format!("Basic {basic}"));
+            }
+            if path == "/" || path.is_empty() {
+                return None;
+            }
+            let trimmed = path.trim_end_matches('/');
+            path = match trimmed.rfind('/') {
+                Some(i) => trimmed[..=i].to_string(),
+                None => "/".to_string(),
+            };
+        }
+    }
+
     /// Retrieve the auth token for a target URL if configured in `auth_tokens` or fallback to `auth_token`.
     /// Never returns the fallback registry auth token to untrusted hosts.
     pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
@@ -1086,8 +1136,8 @@ impl RegistryClient {
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
 
                 if should_send_auth {
-                    if let Some(token) = self.auth_token_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    if let Some(auth) = self.auth_header_for_url(&current_url) {
+                        req = req.header(AUTHORIZATION, auth);
                     }
                 } else {
                     debug!(
@@ -1326,8 +1376,8 @@ impl RegistryClient {
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
 
                 if should_send_auth {
-                    if let Some(token) = self.auth_token_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, format!("Bearer {token}"));
+                    if let Some(auth) = self.auth_header_for_url(&current_url) {
+                        req = req.header(AUTHORIZATION, auth);
                     }
                 } else {
                     debug!(
@@ -1600,14 +1650,8 @@ impl RegistryClient {
         &self,
         package_name: &str,
     ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-        let url = self.package_metadata_url(package_name)?;
         match self
-            .get_package_metadata_from_url_conditional_with_accept(
-                package_name,
-                url,
-                None,
-                "application/json",
-            )
+            .get_package_metadata_full_conditional(package_name, None)
             .await?
         {
             MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
@@ -1615,6 +1659,23 @@ impl RegistryClient {
                 "Unexpected 304 Not Modified response for full metadata request".into(),
             )),
         }
+    }
+
+    /// Arborist resolves manifests from full packuments, including lockfile
+    /// fields absent from the abbreviated install representation.
+    pub async fn get_package_metadata_full_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_from_url_conditional_with_accept(
+            package_name,
+            url,
+            if_none_match,
+            "application/json",
+        )
+        .await
     }
 
     async fn get_package_metadata_from_url_conditional_with_accept(
@@ -1637,6 +1698,7 @@ impl RegistryClient {
                 .await?;
 
             let status = resp.status();
+            let cache_metadata = packument_cache_metadata(resp.headers());
             if status == StatusCode::NOT_MODIFIED {
                 let etag = resp
                     .headers()
@@ -1644,10 +1706,12 @@ impl RegistryClient {
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string())
                     .or_else(|| if_none_match.map(|s| s.to_string()));
-                return Ok(MetadataFetchResult::NotModified { etag });
+                return Ok(MetadataFetchResult::NotModified { etag, cache_metadata });
             }
 
             if status == StatusCode::NOT_FOUND {
+                let body = resp.text().await.unwrap_or_default();
+                crate::not_found::record(package_name, url.as_str(), &body);
                 return Err(RegistryError::PackageNotFound {
                     package: package_name.to_string(),
                     status: 404,
@@ -1784,7 +1848,7 @@ impl RegistryClient {
 
             let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
             metadata.validate()?;
-            return Ok(MetadataFetchResult::Fresh { metadata, etag });
+            return Ok(MetadataFetchResult::Fresh { metadata, etag, cache_metadata });
         }
     }
 
@@ -1823,15 +1887,37 @@ impl RegistryClient {
         &self,
         packages: &[(S, Option<String>)],
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, NPM_INSTALL_V1_JSON)
+            .await
+    }
+
+    pub async fn get_package_metadata_full_conditional_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, "application/json")
+            .await
+    }
+
+    async fn get_package_metadata_conditional_concurrent_with_accept<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+        accept: &'static str,
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
             let client = self.clone();
             let name = pkg.as_ref().to_string();
             let etag = if_none_match.clone();
             join_set.spawn(async move {
-                let res = client
-                    .get_package_metadata_conditional(&name, etag.as_deref())
-                    .await;
+                let res = match client.package_metadata_url(&name) {
+                    Ok(url) => client
+                        .get_package_metadata_from_url_conditional_with_accept(
+                            &name, url, etag.as_deref(), accept,
+                        )
+                        .await,
+                    Err(error) => Err(error),
+                };
                 (idx, res)
             });
         }
@@ -2500,7 +2586,22 @@ impl RegistryClient {
             return Ok(());
         }
 
+        let www_authenticate = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body_text = resp.text().await.unwrap_or_default();
+
+        if status == StatusCode::UNAUTHORIZED {
+            if let Some(www_authenticate) = www_authenticate {
+                return Err(RegistryError::AuthChallenge {
+                    url: target_url.to_string(),
+                    www_authenticate,
+                    body: body_text,
+                });
+            }
+        }
 
         if status == StatusCode::CONFLICT {
             return Err(RegistryError::PublishConflict {
@@ -2923,18 +3024,95 @@ impl RegistryClient {
     ) -> Result<(), RegistryError> {
         let reg_url = registry.unwrap_or(&self.config.default_registry);
         let encoded = encode_package_name(package_name);
-        let suffix = version.map(|v| format!("/{}", v)).unwrap_or_default();
         if let Some(v) = version {
             validate_admin_token(v)?;
         }
-        let target = Url::parse(&format!(
-            "{}/{encoded}{suffix}",
-            reg_url.as_str().trim_end_matches('/')
-        ))
-        .map_err(RegistryError::UrlParse)?;
-        self.admin_json_request(Method::DELETE, target, None, otp)
-            .await?;
-        Ok(())
+        let base = format!("{}/{encoded}", reg_url.as_str().trim_end_matches('/'));
+        let read_url = Url::parse(&format!("{base}?write=true"))?;
+        let result: Result<(), RegistryError> = async {
+            let mut document = self
+                .admin_json_request(Method::GET, read_url.clone(), None, None)
+                .await?;
+            let versions = document.get("versions").and_then(|v| v.as_object());
+            let count = versions.map_or(0, |v| v.len());
+            let specific = version.filter(|v| *v != "*");
+            let version_doc = specific.and_then(|version| versions?.get(version)).cloned();
+            if specific.is_some() && version_doc.is_none() && count > 0 {
+                return Ok(());
+            }
+            let revision = document
+                .get("_rev")
+                .and_then(|v| v.as_str())
+                .unwrap_or("undefined");
+            let write_url = Url::parse(&format!("{base}/-rev/{revision}"))?;
+            if specific.is_none() || count <= 1 {
+                self.admin_json_request(Method::DELETE, write_url, None, otp)
+                    .await?;
+                return Ok(());
+            }
+            let version = specific.unwrap();
+            let tarball = version_doc
+                .as_ref()
+                .and_then(|v| v.get("dist"))
+                .and_then(|v| v.get("tarball"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(versions) = document.get_mut("versions").and_then(|v| v.as_object_mut()) {
+                versions.remove(version);
+            }
+            let remaining_latest = document
+                .get("versions")
+                .and_then(|v| v.as_object())
+                .into_iter()
+                .flat_map(|v| v.keys())
+                .filter_map(|v| rnpm_core::semver::Version::parse(v).ok())
+                .max()
+                .map(|v| v.to_string());
+            if let Some(tags) = document
+                .get_mut("dist-tags")
+                .and_then(|v| v.as_object_mut())
+            {
+                let removed_latest = tags.get("latest").and_then(|v| v.as_str()) == Some(version);
+                tags.retain(|_, value| value.as_str() != Some(version));
+                if removed_latest {
+                    if let Some(latest) = remaining_latest {
+                        tags.insert("latest".into(), latest.into());
+                    }
+                }
+            }
+            if let Some(object) = document.as_object_mut() {
+                object.remove("_revisions");
+                object.remove("_attachments");
+            }
+            self.admin_json_request(Method::PUT, write_url, Some(document), otp)
+                .await?;
+            let refreshed = self
+                .admin_json_request(Method::GET, read_url, None, None)
+                .await?;
+            let revision = refreshed
+                .get("_rev")
+                .and_then(|v| v.as_str())
+                .unwrap_or("undefined");
+            if let Some(tarball) = tarball {
+                let url = Url::parse(&tarball)?;
+                let relative_path = url
+                    .path()
+                    .strip_prefix(reg_url.path())
+                    .unwrap_or(url.path().trim_start_matches('/'));
+                let target = Url::parse(&format!(
+                    "{}/{relative_path}/-rev/{revision}",
+                    reg_url.as_str().trim_end_matches('/')
+                ))?;
+                self.admin_json_request(Method::DELETE, target, None, otp)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Err(error) if error.status_code() == Some(404) => Ok(()),
+            result => result,
+        }
     }
 
     /// Set or clear a deprecation message on one version.
@@ -3074,6 +3252,10 @@ impl RegistryClient {
             users.insert(username, serde_json::Value::Bool(true));
         } else {
             users.remove(&username);
+        }
+        // npm sends only the identity, revision, and users map for this update.
+        if let Some(object) = document.as_object_mut() {
+            object.retain(|key, _| matches!(key.as_str(), "_id" | "_rev" | "users"));
         }
         self.admin_json_request(Method::PUT, package_url, Some(document), otp)
             .await?;
@@ -3406,6 +3588,32 @@ impl RegistryClient {
             reg_url.as_str().trim_end_matches('/')
         ))
         .map_err(RegistryError::UrlParse)?;
+        self.admin_json_request(Method::GET, target, None, None)
+            .await
+    }
+
+    /// One page of `GET /-/stage`, optionally filtered to one package.
+    pub async fn stage_list_page(
+        &self,
+        registry: Option<&Url>,
+        page: u64,
+        per_page: u64,
+        package: Option<&str>,
+    ) -> Result<serde_json::Value, RegistryError> {
+        let reg_url = registry.unwrap_or(&self.config.default_registry);
+        let mut target = Url::parse(&format!(
+            "{}/-/stage",
+            reg_url.as_str().trim_end_matches('/')
+        ))
+        .map_err(RegistryError::UrlParse)?;
+        {
+            let mut query = target.query_pairs_mut();
+            query.append_pair("page", &page.to_string());
+            query.append_pair("perPage", &per_page.to_string());
+            if let Some(package) = package {
+                query.append_pair("package", package);
+            }
+        }
         self.admin_json_request(Method::GET, target, None, None)
             .await
     }

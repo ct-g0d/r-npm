@@ -20,7 +20,7 @@ pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrit
 pub use migration::{
     load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
 };
-pub use model::{LockfilePackage, LockfileV3, PackageBin, PackageEngines};
+pub use model::{set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines};
 pub use rnpm_core::manifest::BundledDependencies;
 
 #[cfg(test)]
@@ -427,11 +427,11 @@ mod tests {
         let text = std::fs::read_to_string(&hidden).unwrap();
         assert!(text.starts_with("{\r\n\t\"name\""), "{text:?}");
         assert!(!text.starts_with('\u{feff}'));
-        // Existing lockfile formatting wins over the manifest on subsequent saves.
+        // npm takes the format from package.json, not from an existing lockfile.
         std::fs::write(&hidden, "{\n    \"name\": \"app\"\n}\n").unwrap();
         lock.save_hidden(project).unwrap();
         let text = std::fs::read_to_string(hidden).unwrap();
-        assert!(text.starts_with("{\n    \"name\""), "{text:?}");
+        assert!(text.starts_with("{\r\n\t\"name\""), "{text:?}");
     }
 
     #[test]

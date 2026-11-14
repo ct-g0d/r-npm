@@ -3,511 +3,4492 @@
     "command": "access",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `access 2fa-required` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "access list packages mock-user --json",
+    "probes": [
+      {
+        "name": "registry-access",
+        "args": [
+          "access",
+          "list",
+          "packages",
+          "mock-user",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "adduser",
     "aliases": "add-user",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Add a registry user account  Usage: npm adduser  Options: [--registry <registry>...\" vs rnpm=\"Log in to a registry  Usage: rnpm.exe login [OPTIONS]  Options:       --registry...\"",
-    "checkMethod": "Ran `adduser --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "adduser --auth-type=web; adduser --auth-type=web --browser=false; adduser --auth-type=legacy; adduser --auth-type=web",
+    "probes": [
+      {
+        "name": "registry-adduser",
+        "args": [
+          "adduser",
+          "--auth-type=web"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-web-success",
+        "args": [
+          "adduser",
+          "--auth-type=web",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-legacy-couch-success",
+        "args": [
+          "adduser",
+          "--auth-type=legacy"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-adduser-web-couch-success",
+        "args": [
+          "adduser",
+          "--auth-type=web"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "approve-scripts",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Approve install scripts for specific dependencies  Usage: npm approve-scripts <p...\" vs rnpm=\"Manage lifecycle script approval policy  Usage: rnpm.exe approve-scripts [OPTION...\"",
-    "checkMethod": "Ran `approve-scripts --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "approve-scripts dep",
+    "probes": [
+      {
+        "name": "command-approve-scripts",
+        "args": [
+          "approve-scripts",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "audit",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `audit` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "audit --json; audit --json",
+    "probes": [
+      {
+        "name": "command-audit",
+        "args": [
+          "audit",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-audit",
+        "args": [
+          "audit",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "bugs",
     "aliases": "issues",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `bugs` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "bugs --browser=false",
+    "probes": [
+      {
+        "name": "command-bugs",
+        "args": [
+          "bugs",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "cache",
     "aliases": "",
-    "status": "missing",
-    "diffs": "Command not implemented in rnpm (reports unknown command); stdout format differs: npm=\"make-fetch-happen:request-cache:http://127.0.0.1:19876/custom.tgz make-fetch-hap...\" vs rnpm=\"Unknown command: \"cache\"  To see a list of supported npm commands, run:   npm he...\"",
-    "checkMethod": "Ran `cache ls` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "cache ls; cache add dep@1.0.0; cache ls",
+    "probes": [
+      {
+        "name": "command-cache",
+        "args": [
+          "cache",
+          "ls"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "cache-add-registry",
+        "args": [
+          "cache",
+          "add",
+          "dep@1.0.0"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "cache-list-populated",
+        "args": [
+          "cache",
+          "ls"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ci",
     "aliases": "clean-install, ic, install-clean, isntall-clean",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `ci` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "ci; ci; ci --ignore-scripts",
+    "probes": [
+      {
+        "name": "failing-ci-preserves-hidden-lock",
+        "args": [
+          "ci"
+        ],
+        "npmExit": 7,
+        "rnpmExit": 7,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "command-ci",
+        "args": [
+          "ci"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-ci",
+        "args": [
+          "ci",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "completion",
     "aliases": "",
-    "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `completion` on fresh fixture directory"
+    "status": "partial",
+    "diffs": "No successful operation demonstrated (negative/unsupported/interactive probe only)",
+    "checkMethod": "completion",
+    "probes": [
+      {
+        "name": "command-completion",
+        "args": [
+          "completion"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "config",
     "aliases": "c",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"; \"builtin\" config from C:\\Program Files\\nodejs\\node_modules\\npm\\npmrc  prefix =...\" vs rnpm=\"; environment-related config audit = \"false\" fund = \"false\" update-notifier = \"f...\"",
-    "checkMethod": "Ran `config list` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "config get registry",
+    "probes": [
+      {
+        "name": "command-config",
+        "args": [
+          "config",
+          "get",
+          "registry"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "dedupe",
     "aliases": "ddp",
-    "status": "partial",
-    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 2s...\" vs rnpm=\"rnpm: tree is already deduplicated...\"",
-    "checkMethod": "Ran `dedupe` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "dedupe",
+    "probes": [
+      {
+        "name": "command-dedupe",
+        "args": [
+          "dedupe"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "deny-scripts",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Deny install scripts for specific dependencies  Usage: npm deny-scripts <pkg> [<...\" vs rnpm=\"Remove lifecycle script approval entries  Usage: rnpm.exe deny-scripts [OPTIONS]...\"",
-    "checkMethod": "Ran `deny-scripts --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "deny-scripts dep",
+    "probes": [
+      {
+        "name": "command-deny-scripts",
+        "args": [
+          "deny-scripts",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "deprecate",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Deprecate a version of a package  Usage: npm deprecate <package-spec> <message> ...\" vs rnpm=\"Mark package versions as deprecated  Usage: rnpm.exe deprecate [OPTIONS] <PACKAG...\"",
-    "checkMethod": "Ran `deprecate --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "deprecate dep@1.0.0 old",
+    "probes": [
+      {
+        "name": "registry-deprecate",
+        "args": [
+          "deprecate",
+          "dep@1.0.0",
+          "old"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "diff",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `diff` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "diff --diff=dep@1.0.0 --diff=dep@1.1.0",
+    "probes": [
+      {
+        "name": "command-diff",
+        "args": [
+          "diff",
+          "--diff=dep@1.0.0",
+          "--diff=dep@1.1.0"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "dist-tag",
     "aliases": "dist-tags",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"latest: 7.0.0...\" vs rnpm=\"latest: \"7.0.0\"...\"",
-    "checkMethod": "Ran `dist-tag ls is-number` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "dist-tag ls dep",
+    "probes": [
+      {
+        "name": "registry-dist-tag",
+        "args": [
+          "dist-tag",
+          "ls",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "docs",
     "aliases": "home",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `docs` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "docs --browser=false",
+    "probes": [
+      {
+        "name": "command-docs",
+        "args": [
+          "docs",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "doctor",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Check the health of your npm environment  Usage: npm doctor [connection] [regist...\" vs rnpm=\"Check the local npm/rnpm installation and machine performance diagnostics  Usage...\"",
-    "checkMethod": "Ran `doctor --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "doctor connection; doctor registry; doctor environment; doctor unknown",
+    "probes": [
+      {
+        "name": "command-doctor",
+        "args": [
+          "doctor",
+          "connection"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-registry",
+        "args": [
+          "doctor",
+          "registry"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-environment",
+        "args": [
+          "doctor",
+          "environment"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "doctor-unknown",
+        "args": [
+          "doctor",
+          "unknown"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "edit",
     "aliases": "",
     "status": "matching",
-    "diffs": "Package lookup, editor quoting, ENOENT error, exit code propagation and post-editor rebuild match npm parity",
-    "checkMethod": "Ran stub editor recorder and rebuild assertion against npm oracle parity test"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "edit dep --editor=node editor.cjs",
+    "probes": [
+      {
+        "name": "command-edit",
+        "args": [
+          "edit",
+          "dep",
+          "--editor=node editor.cjs"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "exec",
     "aliases": "x",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `exec -- node -e console.log(\"exec_ok\")` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "exec --call=node -p 123",
+    "probes": [
+      {
+        "name": "command-exec",
+        "args": [
+          "exec",
+          "--call=node -p 123"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "explain",
     "aliases": "why",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `explain is-number` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "explain dep --json",
+    "probes": [
+      {
+        "name": "command-explain",
+        "args": [
+          "explain",
+          "dep",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "explore",
     "aliases": "",
     "status": "matching",
-    "diffs": "Child command execution, cwd navigation, scoped lookup, PATH prepending, lifecycle env and exit codes match npm parity",
-    "checkMethod": "Ran explicit child command recording cwd, env, and exit code against npm oracle parity test"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "explore dep -- node -p 123",
+    "probes": [
+      {
+        "name": "command-explore",
+        "args": [
+          "explore",
+          "dep",
+          "--",
+          "node",
+          "-p",
+          "123"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "find-dupes",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"add is-number 7.0.0  added 1 package in 717ms...\" vs rnpm=\"rnpm: find-dupes: no duplicate packages found...\"",
-    "checkMethod": "Ran `find-dupes` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "find-dupes",
+    "probes": [
+      {
+        "name": "command-find-dupes",
+        "args": [
+          "find-dupes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "fund",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"test-pkg@1.0.0...\" vs rnpm=\"0 packages are looking for funding...\"",
-    "checkMethod": "Ran `fund` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "fund --json; fund --json",
+    "probes": [
+      {
+        "name": "command-fund",
+        "args": [
+          "fund",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-fund",
+        "args": [
+          "fund",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "get",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `get registry` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "get registry",
+    "probes": [
+      {
+        "name": "command-get",
+        "args": [
+          "get",
+          "registry"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "help",
     "aliases": "hlep",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"npm <command>  Usage:  npm install        install all the dependencies in your p...\" vs rnpm=\"High performance Rust implementation of npm workflows  Usage: rnpm <COMMAND>  Co...\"",
-    "checkMethod": "Ran `help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "help",
+    "probes": [
+      {
+        "name": "command-help",
+        "args": [
+          "help"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "help-search",
     "aliases": "",
     "status": "matching",
-    "diffs": "Local offline doc search, scoring, term hit ranking, and formatted terminal outputs match npm parity without network",
-    "checkMethod": "Ran offline documentation search against concrete markdown fixtures and embedded doc corpus"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "help-search install",
+    "probes": [
+      {
+        "name": "command-help-search",
+        "args": [
+          "help-search",
+          "install"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "init",
     "aliases": "create, innit",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Wrote to C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UE...\" vs rnpm=\"Wrote to C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UE...\"",
-    "checkMethod": "Ran `init -y` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "init -y --silent",
+    "probes": [
+      {
+        "name": "command-init",
+        "args": [
+          "init",
+          "-y",
+          "--silent"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install",
     "aliases": "add, i, in, ins, inst, insta, instal, isnt, isnta, isntal, isntall",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"up to date in 1s...\" vs rnpm=\"rnpm: successfully installed 0 package(s) (cache hits: 0, misses: 0)...\"",
-    "checkMethod": "Ran `install --package-lock-only` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "install --ignore-scripts; install; install dep@1.0.0; install dep@1.0.0 --ignore-scripts -w a; install dep@1.0.0 --ignore-scripts --workspace=a; install dep@1.0.0 --ignore-scripts -wa; install dep@1.0.0 --ignore-scripts -w ./packages/a; install dep@1.0.0 --ignore-scripts -w packages/a; install dep@1.0.0 --ignore-scripts -w packages; install dep@1.0.0 --ignore-scripts -w a --workspace b; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts --save-prefix=~; install dep@1.0.0 --ignore-scripts --save-exact; install dep@~1.0.0 --ignore-scripts; install dep@next --ignore-scripts; install aliased@npm:dep@1.0.0 --ignore-scripts; install http://127.0.0.1:53724/dep-1.0.0.tgz --ignore-scripts; install ./dep.tgz --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install --ignore-scripts; install git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-xfbEJn/git-dependency --ignore-scripts; install aliased@npm:dep@~1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install dep@1.0.0 --ignore-scripts; install changing --ignore-scripts; install --ignore-scripts",
+    "probes": [
+      {
+        "name": "empty-install-hidden-lock",
+        "args": [
+          "install",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "failing-lifecycle-public-lock",
+        "args": [
+          "install"
+        ],
+        "npmExit": 7,
+        "rnpmExit": 7,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "explicit-install-skips-root-hooks",
+        "args": [
+          "install",
+          "dep@1.0.0"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-name",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-w",
+          "a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-long-equals",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "--workspace=a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-short-attached",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-wa"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-path",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-w",
+          "./packages/a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-bare-directory",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-w",
+          "packages/a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-parent-directory",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-w",
+          "packages"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-install-multiple",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "-w",
+          "a",
+          "--workspace",
+          "b"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-default",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-prefix",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "--save-prefix=~"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-exact",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts",
+          "--save-exact"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-range",
+        "args": [
+          "install",
+          "dep@~1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-tag",
+        "args": [
+          "install",
+          "dep@next",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-alias",
+        "args": [
+          "install",
+          "aliased@npm:dep@1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-url",
+        "args": [
+          "install",
+          "http://127.0.0.1:53724/dep-1.0.0.tgz",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-file",
+        "args": [
+          "install",
+          "./dep.tgz",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "shadow-url-registry",
+        "args": [
+          "install",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "shadow-file-registry",
+        "args": [
+          "install",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "shadow-git-registry",
+        "args": [
+          "install",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-git",
+        "args": [
+          "install",
+          "git+file:///C:/Users/CHARL_%7E1/AppData/Local/Temp/rnpm-replacement-xfbEJn/git-dependency",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-alias-range",
+        "args": [
+          "install",
+          "aliased@npm:dep@~1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-config-save-prefix",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "save-config-save-exact",
+        "args": [
+          "install",
+          "dep@1.0.0",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "cache-revalidate-changed-packument",
+        "args": [
+          "install",
+          "changing",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-install",
+        "args": [
+          "install",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-ci-test",
     "aliases": "cit, clean-install-test, sit",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Install a project with a clean slate and run tests  Usage: npm install-ci-test  ...\" vs rnpm=\"Install dependencies and run the CI test script  Usage: rnpm.exe install-ci-test...\"",
-    "checkMethod": "Ran `install-ci-test --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "install-ci-test",
+    "probes": [
+      {
+        "name": "command-install-ci-test",
+        "args": [
+          "install-ci-test"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-scripts",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Manage install-script approvals for dependencies  Usage: npm install-scripts app...\" vs rnpm=\"Install dependencies and run install scripts  Usage: rnpm.exe install-scripts [O...\"",
-    "checkMethod": "Ran `install-scripts --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "install-scripts ls",
+    "probes": [
+      {
+        "name": "command-install-scripts",
+        "args": [
+          "install-scripts",
+          "ls"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "install-test",
     "aliases": "it",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Install package(s) and run tests  Usage: npm install-test [<package-spec> ...]  ...\" vs rnpm=\"Install dependencies and run the test script  Usage: rnpm.exe install-test [ARGS...\"",
-    "checkMethod": "Ran `install-test --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "install-test",
+    "probes": [
+      {
+        "name": "command-install-test",
+        "args": [
+          "install-test"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "link",
     "aliases": "ln",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Symlink a package folder  Usage: npm link [<package-spec>]  Options: [-S|--save|...\" vs rnpm=\"Link a package folder locally or globally  Usage: rnpm.exe link [PACKAGE]  Argum...\"",
-    "checkMethod": "Ran `link --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "link --ignore-scripts",
+    "probes": [
+      {
+        "name": "command-link",
+        "args": [
+          "link",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ll",
     "aliases": "la",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"...\" vs rnpm=\"test-pkg@1.0.0 | C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bc...\"",
-    "checkMethod": "Ran `ll` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "ll --json",
+    "probes": [
+      {
+        "name": "command-ll",
+        "args": [
+          "ll",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "login",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Login to a registry user account  Usage: npm login  Options: [--registry <regist...\" vs rnpm=\"Log in to a registry  Usage: rnpm.exe login [OPTIONS]  Options:       --registry...\"",
-    "checkMethod": "Ran `login --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "login --auth-type=web; login --auth-type=web --browser=false; login --auth-type=legacy; login --auth-type=web",
+    "probes": [
+      {
+        "name": "registry-login",
+        "args": [
+          "login",
+          "--auth-type=web"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-web-success",
+        "args": [
+          "login",
+          "--auth-type=web",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-legacy-couch-success",
+        "args": [
+          "login",
+          "--auth-type=legacy"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-login-web-couch-success",
+        "args": [
+          "login",
+          "--auth-type=web"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "logout",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Log out of the registry  Usage: npm logout  Options: [--registry <registry>] [--...\" vs rnpm=\"Log out of a registry  Usage: rnpm.exe logout [OPTIONS]  Options:       --regist...\"",
-    "checkMethod": "Ran `logout --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "logout",
+    "probes": [
+      {
+        "name": "registry-logout",
+        "args": [
+          "logout"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ls",
     "aliases": "list",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"test-pkg@1.0.0 C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\...\" vs rnpm=\"test-pkg@1.0.0 C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\...\"",
-    "checkMethod": "Ran `ls` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls; ls --json; ls --all; ls --all --json; ls --json; ls; ls --json; ls --all --json",
+    "probes": [
+      {
+        "name": "ls-missing",
+        "args": [
+          "ls"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-missing--json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-missing--all",
+        "args": [
+          "ls",
+          "--all"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-missing--all---json",
+        "args": [
+          "ls",
+          "--all",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-invalid",
+        "args": [
+          "ls"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-invalid--json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-invalid--all",
+        "args": [
+          "ls",
+          "--all"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-invalid--all---json",
+        "args": [
+          "ls",
+          "--all",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-extraneous",
+        "args": [
+          "ls"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-extraneous--json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-extraneous--all",
+        "args": [
+          "ls",
+          "--all"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-extraneous--all---json",
+        "args": [
+          "ls",
+          "--all",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-complete",
+        "args": [
+          "ls"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-complete--json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-complete--all",
+        "args": [
+          "ls",
+          "--all"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-complete--all---json",
+        "args": [
+          "ls",
+          "--all",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-single-missing-json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-only-extraneous",
+        "args": [
+          "ls"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-only-extraneous--json",
+        "args": [
+          "ls",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "ls-only-extraneous--all---json",
+        "args": [
+          "ls",
+          "--all",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "org",
     "aliases": "ogr",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Manage orgs  Usage: npm org set orgname username [developer | admin | owner] npm...\" vs rnpm=\"Manage npm organizations  Usage: rnpm.exe org [OPTIONS] [ACTION] [ARGS]...  Argu...\"",
-    "checkMethod": "Ran `org --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "org ls mock-org --json",
+    "probes": [
+      {
+        "name": "registry-org",
+        "args": [
+          "org",
+          "ls",
+          "mock-org",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "outdated",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Package    Current  Wanted  Latest  Location  Depended by is-number  MISSING   7...\" vs rnpm=\"Package    Current  Wanted  Latest  Location                Depended by is-numbe...\"",
-    "checkMethod": "Ran `outdated` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "outdated --json; outdated --json",
+    "probes": [
+      {
+        "name": "command-outdated",
+        "args": [
+          "outdated",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-outdated",
+        "args": [
+          "outdated",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "owner",
     "aliases": "author",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"doowb <brian.woodward@gmail.com> jonschlinkert <github@sellside.com> realityking...\" vs rnpm=\"doowb\twrite jonschlinkert\twrite realityking\twrite...\"",
-    "checkMethod": "Ran `owner ls is-number` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "owner ls dep",
+    "probes": [
+      {
+        "name": "registry-owner",
+        "args": [
+          "owner",
+          "ls",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "pack",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `pack --dry-run` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "pack --dry-run --json --ignore-scripts; pack --dry-run --json --ignore-scripts; pack --dry-run --json --ignore-scripts; pack --dry-run --json --ignore-scripts; pack --dry-run --json --ignore-scripts",
+    "probes": [
+      {
+        "name": "pack-explicit-file-vs-root-ignore",
+        "args": [
+          "pack",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "pack-nested-ignore",
+        "args": [
+          "pack",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "pack-explicit-nested-file",
+        "args": [
+          "pack",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "pack-nested-gitignore",
+        "args": [
+          "pack",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "pack-nested-ignore-negation",
+        "args": [
+          "pack",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "ping",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `ping` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "ping --json",
+    "probes": [
+      {
+        "name": "command-ping",
+        "args": [
+          "ping",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "pkg",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"\"test-pkg\"...\" vs rnpm=\"test-pkg...\"",
-    "checkMethod": "Ran `pkg get name` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "pkg get name",
+    "probes": [
+      {
+        "name": "command-pkg",
+        "args": [
+          "pkg",
+          "get",
+          "name"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "prefix",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\" vs rnpm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\"",
-    "checkMethod": "Ran `prefix` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "prefix",
+    "probes": [
+      {
+        "name": "command-prefix",
+        "args": [
+          "prefix"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "profile",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Change settings on your registry profile  Usage: npm profile enable-2fa [auth-on...\" vs rnpm=\"Manage npm profile information  Usage: rnpm.exe profile [OPTIONS] [ACTION] [ARGS...\"",
-    "checkMethod": "Ran `profile --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "profile get --json",
+    "probes": [
+      {
+        "name": "registry-profile",
+        "args": [
+          "profile",
+          "get",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "prune",
     "aliases": "",
-    "status": "partial",
-    "diffs": "File system changes differ: npm wrote [node_modules/, node_modules\\.package-lock.json, node_modules\\is-number/, node_modules\\is-number\\LICENSE, node_modules\\is-number\\README.md, node_modules\\is-number\\index.js, node_modules\\is-number\\package.json, package-lock.json], rnpm wrote []; stdout format differs: npm=\"added 1 package in 832ms...\" vs rnpm=\"rnpm: no extraneous packages pruned...\"",
-    "checkMethod": "Ran `prune` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "prune",
+    "probes": [
+      {
+        "name": "command-prune",
+        "args": [
+          "prune"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "publish",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `publish --dry-run` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "publish --dry-run --json --ignore-scripts",
+    "probes": [
+      {
+        "name": "command-publish",
+        "args": [
+          "publish",
+          "--dry-run",
+          "--json",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "query",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"[   {     \"name\": \"test-pkg\",     \"version\": \"1.0.0\",     \"description\": \"test f...\" vs rnpm=\"[   {     \"_id\": \"test-pkg@1.0.0\",     \"deduped\": false,     \"description\": \"tes...\"",
-    "checkMethod": "Ran `query :root` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "query :root",
+    "probes": [
+      {
+        "name": "command-query",
+        "args": [
+          "query",
+          ":root"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "rebuild",
     "aliases": "rb",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"rebuilt dependencies successfully...\" vs rnpm=\"rnpm: rebuild: no packages required rebuilding...\"",
-    "checkMethod": "Ran `rebuild` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "rebuild",
+    "probes": [
+      {
+        "name": "command-rebuild",
+        "args": [
+          "rebuild"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "repo",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `repo` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "repo --browser=false",
+    "probes": [
+      {
+        "name": "command-repo",
+        "args": [
+          "repo",
+          "--browser=false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "restart",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `restart` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "restart",
+    "probes": [
+      {
+        "name": "command-restart",
+        "args": [
+          "restart"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "root",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\" vs rnpm=\"C:\\Users\\charl_qez1ct5\\.t3\\userdata\\antigravity-tmp\\1160a0fb1bcd\\run-UEkG3I\\npm-...\"",
-    "checkMethod": "Ran `root` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "root",
+    "probes": [
+      {
+        "name": "command-root",
+        "args": [
+          "root"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "run",
     "aliases": "run-script, rum, urn",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `run test` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "run probe -w a; run probe --workspace=a; run probe -wa; run probe -w ./packages/a; run probe -w packages/a; run probe -w packages; run probe -w a --workspace b; run probe",
+    "probes": [
+      {
+        "name": "workspace-run-name",
+        "args": [
+          "run",
+          "probe",
+          "-w",
+          "a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-long-equals",
+        "args": [
+          "run",
+          "probe",
+          "--workspace=a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-short-attached",
+        "args": [
+          "run",
+          "probe",
+          "-wa"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-path",
+        "args": [
+          "run",
+          "probe",
+          "-w",
+          "./packages/a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-bare-directory",
+        "args": [
+          "run",
+          "probe",
+          "-w",
+          "packages/a"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-parent-directory",
+        "args": [
+          "run",
+          "probe",
+          "-w",
+          "packages"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "workspace-run-multiple",
+        "args": [
+          "run",
+          "probe",
+          "-w",
+          "a",
+          "--workspace",
+          "b"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "command-run",
+        "args": [
+          "run",
+          "probe"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "sbom",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Generate a Software Bill of Materials (SBOM)  Usage: npm sbom  Options: [--omit ...\" vs rnpm=\"Generate Software Bill of Materials (SBOM)  Usage: rnpm.exe sbom [OPTIONS]  Opti...\"",
-    "checkMethod": "Ran `sbom --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "sbom --sbom-format=cyclonedx; sbom --sbom-format=spdx; sbom --sbom-format=cyclonedx; sbom --sbom-format=cyclonedx --sbom-type=application; sbom --sbom-format=spdx --omit=dev; sbom --sbom-format=cyclonedx --package-lock-only; sbom; sbom --sbom-format=spdx --package-lock-only; sbom --sbom-format=spdx",
+    "probes": [
+      {
+        "name": "command-sbom",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-spdx",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-cyclonedx",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-cyclonedx-application",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx",
+          "--sbom-type=application"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-omit-dev",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx",
+          "--omit=dev"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-populated-lock-only",
+        "args": [
+          "sbom",
+          "--sbom-format=cyclonedx",
+          "--package-lock-only"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-missing-format",
+        "args": [
+          "sbom"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-lock-only-without-lock",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx",
+          "--package-lock-only"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "sbom-missing-dependency",
+        "args": [
+          "sbom",
+          "--sbom-format=spdx"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "search",
     "aliases": "find, s, se",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"is-number Returns true if a number or string value is a finite number. Useful fo...\" vs rnpm=\"is-number@7.0.0\tReturns true if a number or string value is a finite number. Use...\"",
-    "checkMethod": "Ran `search is-number` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "search --json mock",
+    "probes": [
+      {
+        "name": "command-search",
+        "args": [
+          "search",
+          "--json",
+          "mock"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "set",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `set foo=bar` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "set fund false",
+    "probes": [
+      {
+        "name": "command-set",
+        "args": [
+          "set",
+          "fund",
+          "false"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "shrinkwrap",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"...\" vs rnpm=\"npm-shrinkwrap.json up to date...\"",
-    "checkMethod": "Ran `shrinkwrap` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "shrinkwrap",
+    "probes": [
+      {
+        "name": "command-shrinkwrap",
+        "args": [
+          "shrinkwrap"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stage",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Stage packages for publishing, deferring proof-of-presence (2FA) to a later poin...\" vs rnpm=\"Manage staged package versions  Usage: rnpm.exe stage [OPTIONS] [ACTION] [ARGS]....\"",
-    "checkMethod": "Ran `stage --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "stage list dep --json; stage list; stage list --json; stage list empty-pkg; stage list dep@1; stage; stage view 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage view 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --json; stage view; stage view nope; stage approve 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage reject 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage approve; stage download 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed; stage download 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --json; stage download; stage download nope; stage publish --ignore-scripts; stage publish --ignore-scripts --json; stage publish --dry-run --ignore-scripts; stage publish --dry-run --ignore-scripts --json",
+    "probes": [
+      {
+        "name": "registry-stage",
+        "args": [
+          "stage",
+          "list",
+          "dep",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list",
+        "args": [
+          "stage",
+          "list"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-json",
+        "args": [
+          "stage",
+          "list",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-filter-empty",
+        "args": [
+          "stage",
+          "list",
+          "empty-pkg"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-list-version-spec",
+        "args": [
+          "stage",
+          "list",
+          "dep@1"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-bare",
+        "args": [
+          "stage"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view",
+        "args": [
+          "stage",
+          "view",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-json",
+        "args": [
+          "stage",
+          "view",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-missing-id",
+        "args": [
+          "stage",
+          "view"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-view-invalid-id",
+        "args": [
+          "stage",
+          "view",
+          "nope"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-approve",
+        "args": [
+          "stage",
+          "approve",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-reject",
+        "args": [
+          "stage",
+          "reject",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-approve-missing-id",
+        "args": [
+          "stage",
+          "approve"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download",
+        "args": [
+          "stage",
+          "download",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-json",
+        "args": [
+          "stage",
+          "download",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-missing",
+        "args": [
+          "stage",
+          "download"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-download-invalid",
+        "args": [
+          "stage",
+          "download",
+          "nope"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish",
+        "args": [
+          "stage",
+          "publish",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-json",
+        "args": [
+          "stage",
+          "publish",
+          "--ignore-scripts",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-dry-run",
+        "args": [
+          "stage",
+          "publish",
+          "--dry-run",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "stage-publish-dry-run-json",
+        "args": [
+          "stage",
+          "publish",
+          "--dry-run",
+          "--ignore-scripts",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "star",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Mark your favorite packages  Usage: npm star [<package-spec>...]  Options: [--re...\" vs rnpm=\"Star a package  Usage: rnpm.exe star [OPTIONS] [PACKAGES]...  Arguments:   [PACK...\"",
-    "checkMethod": "Ran `star --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "star dep",
+    "probes": [
+      {
+        "name": "registry-star",
+        "args": [
+          "star",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stars",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"View packages marked as favorites  Usage: npm stars [<user>]  Options: [--regist...\" vs rnpm=\"Show packages starred by the current user  Usage: rnpm.exe stars [OPTIONS] [USER...\"",
-    "checkMethod": "Ran `stars --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "stars mock-user",
+    "probes": [
+      {
+        "name": "registry-stars",
+        "args": [
+          "stars",
+          "mock-user"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "start",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `start` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "start",
+    "probes": [
+      {
+        "name": "command-start",
+        "args": [
+          "start"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "stop",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `stop` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "stop",
+    "probes": [
+      {
+        "name": "command-stop",
+        "args": [
+          "stop"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "team",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Manage organization teams and team memberships  Usage: npm team create <scope:te...\" vs rnpm=\"Manage npm teams  Usage: rnpm.exe team [OPTIONS] [ACTION] [ARGS]...  Arguments: ...\"",
-    "checkMethod": "Ran `team --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "team ls mock-org --json",
+    "probes": [
+      {
+        "name": "registry-team",
+        "args": [
+          "team",
+          "ls",
+          "mock-org",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "test",
     "aliases": "tst, t",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `test` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "test",
+    "probes": [
+      {
+        "name": "command-test",
+        "args": [
+          "test"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "token",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Manage your authentication tokens  Usage: npm token list npm token revoke <id|to...\" vs rnpm=\"Manage registry authentication tokens  Usage: rnpm.exe token [OPTIONS] [COMMAND]...\"",
-    "checkMethod": "Ran `token --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "token list --json",
+    "probes": [
+      {
+        "name": "registry-token",
+        "args": [
+          "token",
+          "list",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "trust",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Create a trusted relationship between a package and a OIDC provider  Usage: npm ...\" vs rnpm=\"Record package trust metadata  Usage: rnpm.exe trust [OPTIONS] [ACTION] [ARGS].....\"",
-    "checkMethod": "Ran `trust --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "trust list dep --json; trust list dep; trust list dep --json; trust list parent; trust list; trust revoke dep --id=trust-1; trust revoke dep --id=trust-1 --dry-run; trust revoke dep; trust; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --yes; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --yes --json; trust github dep --file publish.yml --repository mock/repo --environment prod --allow-publish --allow-stage-publish --dry-run; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --yes; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --yes --json; trust gitlab dep --file .gitlab-ci.yml --project mock/repo --environment prod --allow-publish --allow-stage-publish --dry-run; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --yes; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --yes --json; trust circleci dep --org-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --project-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --pipeline-definition-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --vcs-origin github.com/mock/repo --context-id 6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed --allow-publish --allow-stage-publish --dry-run",
+    "probes": [
+      {
+        "name": "registry-trust",
+        "args": [
+          "trust",
+          "list",
+          "dep",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list",
+        "args": [
+          "trust",
+          "list",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-json",
+        "args": [
+          "trust",
+          "list",
+          "dep",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-empty",
+        "args": [
+          "trust",
+          "list",
+          "parent"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-list-from-manifest",
+        "args": [
+          "trust",
+          "list"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke",
+        "args": [
+          "trust",
+          "revoke",
+          "dep",
+          "--id=trust-1"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke-dry-run",
+        "args": [
+          "trust",
+          "revoke",
+          "dep",
+          "--id=trust-1",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-revoke-missing-id",
+        "args": [
+          "trust",
+          "revoke",
+          "dep"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-bare",
+        "args": [
+          "trust"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-create",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-create-json",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-github-dry-run",
+        "args": [
+          "trust",
+          "github",
+          "dep",
+          "--file",
+          "publish.yml",
+          "--repository",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-create",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-create-json",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-gitlab-dry-run",
+        "args": [
+          "trust",
+          "gitlab",
+          "dep",
+          "--file",
+          ".gitlab-ci.yml",
+          "--project",
+          "mock/repo",
+          "--environment",
+          "prod",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-create",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-create-json",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--yes",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "trust-create-circleci-dry-run",
+        "args": [
+          "trust",
+          "circleci",
+          "dep",
+          "--org-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--project-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--pipeline-definition-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--vcs-origin",
+          "github.com/mock/repo",
+          "--context-id",
+          "6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed",
+          "--allow-publish",
+          "--allow-stage-publish",
+          "--dry-run"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "undeprecate",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Undeprecate a version of a package  Usage: npm undeprecate <package-spec>  Optio...\" vs rnpm=\"Remove a package deprecation notice  Usage: rnpm.exe undeprecate [OPTIONS] <PACK...\"",
-    "checkMethod": "Ran `undeprecate --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "undeprecate dep@1.0.0",
+    "probes": [
+      {
+        "name": "registry-undeprecate",
+        "args": [
+          "undeprecate",
+          "dep@1.0.0"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "uninstall",
     "aliases": "unlink, remove, rm, r, un",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Remove a package  Usage: npm uninstall [<@scope>/]<pkg>...  Options: [-S|--save|...\" vs rnpm=\"Remove a package from project dependencies  Usage: rnpm.exe uninstall [OPTIONS] ...\"",
-    "checkMethod": "Ran `uninstall --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "uninstall dep; uninstall parent",
+    "probes": [
+      {
+        "name": "command-uninstall",
+        "args": [
+          "uninstall",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-uninstall",
+        "args": [
+          "uninstall",
+          "parent"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "unpublish",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Remove a package from the registry  Usage: npm unpublish [<package-spec>]  Optio...\" vs rnpm=\"Remove a package or package version from a registry  Usage: rnpm.exe unpublish [...\"",
-    "checkMethod": "Ran `unpublish --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "unpublish dep@1.0.0 --force",
+    "probes": [
+      {
+        "name": "registry-unpublish",
+        "args": [
+          "unpublish",
+          "dep@1.0.0",
+          "--force"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "unstar",
     "aliases": "",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"Remove an item from your favorite packages  Usage: npm unstar [<package-spec>......\" vs rnpm=\"Unstar a package  Usage: rnpm.exe unstar [OPTIONS] [PACKAGES]...  Arguments:   [...\"",
-    "checkMethod": "Ran `unstar --help` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "unstar dep",
+    "probes": [
+      {
+        "name": "registry-unstar",
+        "args": [
+          "unstar",
+          "dep"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "update",
     "aliases": "u, up, upgrade, udpate",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"added 1 package in 760ms...\" vs rnpm=\"rnpm: updated is-number none -> 7.0.0 rnpm: successfully updated 1 package(s) (c...\"",
-    "checkMethod": "Ran `update` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "update; update --ignore-scripts",
+    "probes": [
+      {
+        "name": "command-update",
+        "args": [
+          "update"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "populated-update",
+        "args": [
+          "update",
+          "--ignore-scripts"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "version",
     "aliases": "verison",
-    "status": "partial",
-    "diffs": "stdout format differs: npm=\"{   'test-pkg': '1.0.0',   npm: '11.20.0',   node: '26.13.0',   acorn: '8.19.0',...\" vs rnpm=\"{   acorn: '8.19.0',   ada: '4.0.0',   amaro: '1.1.11',   ares: '1.34.9',   brot...\"",
-    "checkMethod": "Ran `version` on fresh fixture directory"
+    "status": "matching",
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "version patch --no-git-tag-version",
+    "probes": [
+      {
+        "name": "command-version",
+        "args": [
+          "version",
+          "patch",
+          "--no-git-tag-version"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "view",
     "aliases": "info, show, v",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `view is-number version` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "view dep@1.0.0 version --json",
+    "probes": [
+      {
+        "name": "registry-view",
+        "args": [
+          "view",
+          "dep@1.0.0",
+          "version",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "whoami",
     "aliases": "",
     "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `whoami` on fresh fixture directory"
+    "diffs": "All registered behavioral probes match on this Windows host; broader behavior is unverified.",
+    "checkMethod": "whoami --json; whoami --json",
+    "probes": [
+      {
+        "name": "command-whoami",
+        "args": [
+          "whoami",
+          "--json"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      },
+      {
+        "name": "registry-whoami",
+        "args": [
+          "whoami",
+          "--json"
+        ],
+        "npmExit": 0,
+        "rnpmExit": 0,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   },
   {
     "command": "set-script",
     "aliases": "",
-    "status": "matching",
-    "diffs": "Stdout, stderr, exit code and file changes match expected parity",
-    "checkMethod": "Ran `set-script --help` on fresh fixture directory"
+    "status": "partial",
+    "diffs": "No successful operation demonstrated (negative/unsupported/interactive probe only)",
+    "checkMethod": "set-script probe node -p 123",
+    "probes": [
+      {
+        "name": "command-set-script",
+        "args": [
+          "set-script",
+          "probe",
+          "node -p 123"
+        ],
+        "npmExit": 1,
+        "rnpmExit": 1,
+        "match": true,
+        "comparison": {
+          "execution": true,
+          "exit": true,
+          "stdout": true,
+          "stderr": true,
+          "files": true,
+          "mutations": true
+        }
+      }
+    ],
+    "evidence": "docs/npm-replacement-results-2026-11-13.json",
+    "binary_sha256": "eef18313458ca09aced0749e48871250840123021923d733fc2c02596ba1531d"
   }
 ]

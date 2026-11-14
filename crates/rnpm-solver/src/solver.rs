@@ -65,9 +65,11 @@ struct ResolveTask {
     install_name: String,
     raw_spec: String,
     dep_type: DependencyType,
-    dev_path: bool,
     parent_depth: usize,
     ancestors: std::sync::Arc<Vec<String>>,
+    /// A second edge whose range should guide version choice, as
+    /// arborist's nodeFromEdge(parentEdge, parent, secondEdge) does.
+    advisory: Option<String>,
 }
 
 /// Main solver coordinator for building the dependency graph.
@@ -78,6 +80,8 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     peer_ctx: PeerContext,
     graph: DependencyGraph,
     queue: VecDeque<ResolveTask>,
+    /// Root edges already resolved early for a peer set.
+    preplaced: std::collections::HashSet<String>,
 }
 
 /// Compares two strings using Arborist-compatible collation.
@@ -127,6 +131,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             peer_ctx: PeerContext::new(),
             graph: DependencyGraph::new(),
             queue: VecDeque::new(),
+            preplaced: std::collections::HashSet::new(),
         }
     }
 
@@ -171,9 +176,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             install_name,
             raw_spec,
             dep_type,
-            dev_path: dep_type == DependencyType::Dev,
             parent_depth,
             ancestors,
+            advisory: None,
         });
     }
 
@@ -182,9 +187,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .queue
             .binary_search_by(|queued| {
                 queued
-                    .dev_path
-                    .cmp(&task.dev_path)
-                    .then_with(|| queued.parent_depth.cmp(&task.parent_depth))
+                    .parent_depth
+                    .cmp(&task.parent_depth)
                     .then_with(|| arborist_compare(&queued.parent_location, &task.parent_location))
                     .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
             })
@@ -192,10 +196,36 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.queue.insert(pos, task);
     }
 
+    /// arborist conflictOK: a peer conflict is fatal only for a package placed
+    /// directly in the project (under the root or a workspace), or with
+    /// --strict-peer-deps; deeper conflicts are overridden with a warning.
+    fn peer_conflict_is_fatal(&self, owner_location: &str) -> bool {
+        if self.options.legacy_peer_deps {
+            return false;
+        }
+        if self.options.strict_peer_deps {
+            return true;
+        }
+        let parent = owner_location.rsplit_once("/node_modules/").map(|(p, _)| p).unwrap_or("");
+        self.options.is_strict_peers() && !parent.contains("node_modules")
+    }
+
     /// Processes all queued dependency resolution tasks until completion.
     pub fn resolve_tasks(&mut self) -> Result<(), SolverError> {
         while let Some(task) = self.queue.pop_front() {
-            self.process_task(task)?;
+            // Arborist queues nodes, then places all of a node's problem
+            // edges before visiting another node. A newly hoisted child can
+            // sort ahead of its parent, so freeze this batch before placing
+            // any edges that might enqueue that child's dependencies.
+            let mut siblings = vec![task];
+            while self.queue.front().is_some_and(|queued| {
+                queued.parent_location == siblings[0].parent_location
+            }) {
+                siblings.push(self.queue.pop_front().unwrap());
+            }
+            for task in siblings {
+                self.process_task(task)?;
+            }
         }
         Ok(())
     }
@@ -279,12 +309,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
         self.graph.nodes.insert(String::new(), root_node);
 
-        // Collect root dependencies with npm's precedence order. npm walks
-        // production dependencies before dev-only branches, so a compatible
-        // package first reached through a production dependency gets the
-        // highest hoisting priority. Keep the BTreeMap for deterministic
-        // fallback ordering and duplicate/override semantics, then enqueue
-        // the effective entries by dependency class.
+        // Collect effective root dependency types, then place their edges
+        // in name order. Arborist's node queue uses depth and path rather
+        // than giving production subtrees precedence over dev subtrees.
         let mut root_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
 
         // 1. devDependencies (if enabled)
@@ -339,9 +366,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         install_name: install_name.to_string(),
                         raw_spec,
                         dep_type,
-                        dev_path: dep_type == DependencyType::Dev,
                         parent_depth: 0,
                         ancestors: root_ancestors.clone(),
+                        advisory: None,
                     });
                 }
             };
@@ -372,15 +399,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.provider.prefetch_packages(&root_names);
 
         // Process resolution queue
-        while let Some(task) = self.queue.pop_front() {
-            self.process_task(task)?;
-        }
+        self.resolve_tasks()?;
 
         self.graph.normalize_dependency_flags();
         Ok(self.graph)
     }
 
     fn process_task(&mut self, task: ResolveTask) -> Result<(), SolverError> {
+        if task.advisory.is_none()
+            && task.parent_location.is_empty()
+            && self.preplaced.contains(&task.install_name)
+        {
+            return Ok(());
+        }
         if self.options.legacy_peer_deps
             && (task.dep_type == DependencyType::Peer
                 || task.dep_type == DependencyType::PeerOptional)
@@ -491,7 +522,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 ) {
                     if !crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         if task.dep_type == DependencyType::Peer {
-                            if self.options.is_strict_peers() {
+                            if self.peer_conflict_is_fatal(&task.parent_location) {
                                 return Err(SolverError::peer_conflict(
                                     &task.parent_package_name,
                                     &dep_spec.package_name,
@@ -558,7 +589,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         });
                         return Ok(());
                     } else if task.dep_type == DependencyType::Peer {
-                        if self.options.is_strict_peers() {
+                        if self.peer_conflict_is_fatal(&task.parent_location) {
                             return Err(SolverError::peer_conflict(
                                 &task.parent_package_name,
                                 &dep_spec.package_name,
@@ -579,13 +610,27 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
                                 task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
                             );
+                            // npm warns "ERESOLVE overriding peer dependency"
+                            // and keeps the visible node; the edge stays invalid.
+                            self.graph.edges.push(DependencyEdge {
+                                from_location: task.parent_location,
+                                to_location: existing.location.clone(),
+                                install_name: task.install_name,
+                                package_name: dep_spec.package_name,
+                                spec: effective_spec,
+                                dep_type: task.dep_type,
+                            });
+                            return Ok(());
                         }
                     } else if task.dep_type == DependencyType::PeerOptional {
-                        debug!(
-                            "Optional peer dependency '{}' for '{}' conflicts with installed {}@{} at '{}'; omitting optional peer",
-                            dep_spec.package_name, task.parent_package_name, existing.name, existing.version, existing.location
-                        );
-                        return Ok(());
+                        // loadPeerSet resolves an incompatible optional peer
+                        // when its owner can nest with a new sibling provider.
+                        // A missing optional peer still never triggers a fetch.
+                        let sibling = task.parent_location.rsplit_once("/node_modules/")
+                            .map(|(scope, _)| format!("{scope}/node_modules/{}", task.install_name));
+                        if sibling.as_ref().is_none_or(|location| self.graph.nodes.contains_key(location)) {
+                            return Ok(());
+                        }
                     }
                 }
             } else if task.dep_type == DependencyType::PeerOptional {
@@ -639,12 +684,42 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             });
         };
 
+        // Optional peers do not trigger installation, but still constrain a
+        // peer set once another member requires that package. Match the
+        // advisory parent edge used by Arborist's loadPeerSet/nodeFromEdge.
+        let peer_scope = task.parent_location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("");
+        let mut peer_advisories: Vec<PackageTarget> = if is_peer {
+            self.graph.nodes.values().filter(|node| {
+                node.location.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("") == peer_scope
+                    && node.peer_dependencies_meta.get(&task.install_name).is_some_and(|meta| meta.optional)
+            }).filter_map(|node| node.peer_dependencies.get(&task.install_name))
+                .filter_map(|spec| PackageTarget::parse(spec).ok()).collect()
+        } else { Vec::new() };
+        // loadPeerSet resolves the virtual parent's edge first, using the
+        // peer edge as an advisory constraint. The incoming dependency
+        // identifies that source even when the plugin itself was hoisted.
+        if is_peer {
+            for incoming in self.graph.edges.iter().filter(|edge| edge.to_location == task.parent_location) {
+                if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
+                    if let Some(spec) = source.optional_dependencies.get(&task.install_name)
+                        .or_else(|| source.dependencies.get(&task.install_name)) {
+                        if let Ok(target) = PackageTarget::parse(spec) { peer_advisories.push(target); }
+                    }
+                }
+            }
+        }
+        if let Some(advisory) = task.advisory.as_deref() {
+            if let Ok(target) = PackageTarget::parse(advisory) {
+                peer_advisories.push(target);
+            }
+        }
         let matched_version_opt = self.select_version(
             &task.parent_location,
             &dep_spec.package_name,
             &pkg_meta,
             &dep_spec.target,
-        );
+            &peer_advisories,
+        ).or_else(|| self.select_version(&task.parent_location, &dep_spec.package_name, &pkg_meta, &dep_spec.target, &[]));
         let Some(chosen_version) = matched_version_opt else {
             if task.dep_type == DependencyType::Optional
                 || task.dep_type == DependencyType::PeerOptional
@@ -733,6 +808,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &chosen_version.dependencies,
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
+            Some(&chosen_version.version),
+            is_peer,
         );
 
         let is_unlocked = self
@@ -835,6 +912,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &chosen_version.dependencies,
                 &chosen_version.peer_dependencies,
                 &chosen_version.peer_dependencies_meta,
+                Some(&chosen_version.version),
+                is_peer,
             );
         }
         let parent_skipped = self
@@ -1017,6 +1096,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     }
                 }
 
+                // Bundled dependencies ship inside the package tarball; npm
+                // never resolves them from the registry.
+                let bundled = chosen_version
+                    .extra
+                    .get("bundleDependencies")
+                    .or_else(|| chosen_version.extra.get("bundledDependencies"));
+                match bundled {
+                    Some(serde_json::Value::Array(names)) => {
+                        for name in names.iter().filter_map(|n| n.as_str()) {
+                            child_deps.remove(name);
+                        }
+                    }
+                    // `true` bundles every dependency.
+                    Some(serde_json::Value::Bool(true)) => {
+                        let names: Vec<String> =
+                            chosen_version.dependencies.keys().cloned().collect();
+                        for name in names {
+                            child_deps.remove(&name);
+                        }
+                    }
+                    _ => {}
+                }
+
                 // npm's Arborist walks package dependency names in sorted
                 // order.  Registry packuments preserve insertion order, but
                 // using that order here changes which compatible version wins
@@ -1032,9 +1134,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         install_name: c_name,
                         raw_spec: c_spec,
                         dep_type: c_type,
-                        dev_path: task.dev_path || c_type == DependencyType::Dev,
                         parent_depth: child_depth,
                         ancestors: child_ancestors.clone(),
+                        advisory: None,
                     })
                     .collect::<Vec<_>>();
                 // Keep a package's direct dependencies ahead of their
@@ -1045,8 +1147,52 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let child_names: Vec<&str> =
                     child_tasks.iter().map(|t| t.install_name.as_str()).collect();
                 self.provider.prefetch_packages(&child_names);
+                let mut peer_tasks = Vec::new();
                 for child_task in child_tasks {
-                    self.push_task(child_task);
+                    // PlaceDep places a candidate together with its required
+                    // peer set, before any queued node is expanded. Explicit
+                    // root dependencies still own their reserved slots.
+                    let peer_scope = target_loc.rsplit_once("/node_modules/").map(|(scope, _)| scope).unwrap_or("");
+                    let provider_pending = self.graph.nodes.get(peer_scope).is_some_and(|parent| {
+                        [&parent.dependencies, &parent.dev_dependencies, &parent.optional_dependencies]
+                            .iter().any(|deps| deps.contains_key(&child_task.install_name))
+                            && !self.graph.nodes.contains_key(&if peer_scope.is_empty() { format!("node_modules/{}", child_task.install_name) } else { format!("{peer_scope}/node_modules/{}", child_task.install_name) })
+                    });
+                    let is_peer_child = matches!(child_task.dep_type, DependencyType::Peer | DependencyType::PeerOptional);
+                    if is_peer_child && !provider_pending {
+                        peer_tasks.push(child_task);
+                    } else if is_peer_child && peer_scope.is_empty() && child_task.dep_type == DependencyType::Peer {
+                        // loadPeerSet: when the peer would land beside a root
+                        // edge for the same name, resolve that root edge now,
+                        // with the peer range as the advisory second edge.
+                        let root = &self.graph.nodes[""];
+                        let name = child_task.install_name.clone();
+                        let root_edge = root.optional_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Optional))
+                            .or_else(|| root.dependencies.get(&name).map(|s| (s.clone(), DependencyType::Prod)))
+                            .or_else(|| root.dev_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Dev)));
+                        if let Some((raw_spec, dep_type)) = root_edge {
+                            let root_task = ResolveTask {
+                                parent_location: String::new(),
+                                parent_package_name: root.name.clone(),
+                                install_name: name.clone(),
+                                raw_spec,
+                                dep_type,
+                                parent_depth: 0,
+                                ancestors: std::sync::Arc::new(vec![root.name.clone()]),
+                                advisory: Some(child_task.raw_spec.clone()),
+                            };
+                            self.preplaced.insert(name);
+                            peer_tasks.push(root_task);
+                            peer_tasks.push(child_task);
+                        } else {
+                            self.push_task(child_task);
+                        }
+                    } else {
+                        self.push_task(child_task);
+                    }
+                }
+                for peer_task in peer_tasks {
+                    self.process_task(peer_task)?;
                 }
             }
         }
@@ -1164,6 +1310,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         pkg_name: &str,
         meta: &'b PackageMetadata,
         target: &PackageTarget,
+        advisories: &[PackageTarget],
     ) -> Option<&'b PackageVersionMetadata> {
         let is_unlocked = self.options.unlocked_packages.contains(pkg_name)
             || self
@@ -1243,7 +1390,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
                         if let Ok(v) = Version::parse(&latest.version) {
-                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none() {
+                            if range.satisfies(&v) && is_safe(&v) && latest.deprecated.is_none()
+                                && advisories.iter().all(|target| crate::hoisting::version_satisfies_target(&latest.version, target)) {
                                 return Some(latest);
                             }
                         }
@@ -1256,7 +1404,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
                 for (ver_str, v_meta) in &meta.versions {
                     if let Ok(parsed) = Version::parse(ver_str) {
-                        if range.satisfies(&parsed) {
+                        if range.satisfies(&parsed) && advisories.iter().all(|target| crate::hoisting::version_satisfies_target(ver_str, target)) {
                             let safe = is_safe(&parsed);
                             if safe {
                                 if v_meta.deprecated.is_none() {
@@ -1305,7 +1453,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
             }
             PackageTarget::Alias { target, .. } => {
-                self.select_version(parent_location, pkg_name, meta, target)
+                self.select_version(parent_location, pkg_name, meta, target, advisories)
             }
             PackageTarget::Url(u) => {
                 let u_str = u.as_str();
@@ -1432,7 +1580,7 @@ pub fn resolve_fast_path(
 
     let overrides = Overrides::from_json_value(
         manifest.extra.get("overrides"),
-        manifest.dependencies.clone(),
+        Overrides::reference_specs(manifest),
     );
 
     let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
@@ -1664,7 +1812,7 @@ pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
     }
     let overrides = Overrides::from_json_value(
         manifest.extra.get("overrides"),
-        manifest.dependencies.clone(),
+        Overrides::reference_specs(manifest),
     );
     let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)

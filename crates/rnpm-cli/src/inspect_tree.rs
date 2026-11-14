@@ -1,3 +1,6 @@
+#[path = "inspect_overrides.rs"]
+mod overrides;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -30,6 +33,10 @@ pub struct InspectedNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pkgid: Option<String>,
 
+    #[serde(skip)]
+    pub is_workspace: bool,
+    #[serde(skip)]
+    pub is_link: bool,
     pub location: String, // "" for root, "node_modules/foo"
     pub path: Option<PathBuf>,
     pub realpath: Option<PathBuf>,
@@ -94,6 +101,8 @@ impl InspectedNode {
             homepage: None,
             repository: None,
             engines: None,
+            is_workspace: false,
+            is_link: false,
             location: String::new(),
             path: Some(project_dir.to_path_buf()),
             realpath: Some(project_dir.to_path_buf()),
@@ -259,7 +268,7 @@ pub struct TreeOptions {
 
 /// Discovered package on disk.
 #[derive(Debug, Clone)]
-struct DiskPackage {
+pub(crate) struct DiskPackage {
     pub location: String, // e.g. "node_modules/foo"
     pub dir_path: PathBuf,
     pub name: String,
@@ -275,7 +284,7 @@ struct RawDiskEntry {
 }
 
 /// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
-fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
+pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
     let root_nm = project_dir.join("node_modules");
     if !root_nm.is_dir() {
         return HashMap::new();
@@ -502,6 +511,7 @@ pub fn build_dependency_tree(
         if let Some(lock) = lockfile {
             build_tree_from_lockfile(&mut root, project_dir, &lock, options)?;
         }
+        overrides::apply(&mut root);
         return Ok(root);
     }
 
@@ -543,7 +553,8 @@ pub fn build_dependency_tree(
                     .or_insert((req.clone(), "peer", is_opt));
             }
         }
-        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m) {
+        if let Ok(members) = rnpm_core::workspace::discover_workspaces_from_manifest(project_dir, m)
+        {
             for member in members {
                 let expected_loc = format!("node_modules/{}", member.name);
                 if disk_packages.contains_key(&expected_loc) {
@@ -800,6 +811,8 @@ pub fn build_dependency_tree(
         &mut ancestors,
     );
 
+    overrides::apply(&mut root);
+
     Ok(root)
 }
 
@@ -924,6 +937,20 @@ fn create_node_from_disk(
         }
     });
 
+    let realpath = std::fs::canonicalize(&disk_pkg.dir_path)
+        .ok()
+        .map(|p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")))
+        .unwrap_or_else(|| disk_pkg.dir_path.clone());
+    let resolved = if realpath != disk_pkg.dir_path {
+        realpath
+            .strip_prefix(_project_dir)
+            .ok()
+            .map(|p| format!("file:../{}", p.display().to_string().replace('\\', "/")))
+            .or(resolved)
+    } else {
+        resolved
+    };
+
     InspectedNode {
         name: disk_pkg.name.clone(),
         version: disk_pkg.version.clone(),
@@ -934,9 +961,11 @@ fn create_node_from_disk(
         engines,
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: realpath != disk_pkg.dir_path,
         location: disk_pkg.location.clone(),
         path: Some(disk_pkg.dir_path.clone()),
-        realpath: Some(disk_pkg.dir_path.clone()),
+        realpath: Some(realpath),
         resolved,
         integrity,
         from: Vec::new(),
@@ -975,6 +1004,8 @@ fn create_missing_node(
         engines: None,
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: false,
         location: location.to_string(),
         path: None,
         realpath: None,
@@ -1095,6 +1126,8 @@ fn create_node_from_lock(
         engines: pkg.engines_map(),
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
+        is_workspace: false,
+        is_link: false,
         location: location.to_string(),
         path: Some(path.clone()),
         realpath: Some(path),

@@ -1,0 +1,2771 @@
+{
+  "imported": "2026-11-14T02:14:46.745Z",
+  "description": "Unmodified package/package.json files extracted from pinned public npm tarballs. These are published development manifests, not generated dependency-only consumers.",
+  "projects": [
+    {
+      "id": "next",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "next",
+        "version": "16.4.6",
+        "source": "https://registry.npmjs.org/next/16.4.6",
+        "tarball": "https://registry.npmjs.org/next/-/next-16.4.6.tgz",
+        "integrity": "sha512-QZJiYhaZLJMo2KpkQGQIwvmd79WVsAWeYIU554a8d7zArS3si/IRy3lBNV/rtYhE70oLwdLYhPAXLPx8HwcwtA==",
+        "tarball_sha256": "954cc114e2e4f57464f6d2f6640ec9b7a8e493ad4373c692b2d37d135da2806a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/next/package.json",
+          "sha256": "ed29e68845a44d4cd30518dd0df0554fcf6f6ada99b81f4e8798d26dc6964f82"
+        }
+      }
+    },
+    {
+      "id": "nuxt",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "nuxt",
+        "version": "4.6.4",
+        "source": "https://registry.npmjs.org/nuxt/4.6.4",
+        "tarball": "https://registry.npmjs.org/nuxt/-/nuxt-4.6.4.tgz",
+        "integrity": "sha512-nxeBPQp64cw6VmxFdrShRaMC7wln0UADaD7IB59o5LlP5rZqH8ZWbzONRralQksqj62UXowJSSaDGY+94XM+Gg==",
+        "tarball_sha256": "5679a3677a27280058b2e507411944207d9abf630fcc394bc4116ba9aa0a83f0",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/nuxt/package.json",
+          "sha256": "315520362dd0146f1531174ccab233e13445b1b963f6262b2fe553cad442ac51"
+        }
+      }
+    },
+    {
+      "id": "remix-run-react",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@remix-run/react",
+        "version": "2.17.5",
+        "source": "https://registry.npmjs.org/%40remix-run%2Freact/2.17.5",
+        "tarball": "https://registry.npmjs.org/@remix-run/react/-/react-2.17.5.tgz",
+        "integrity": "sha512-ya6OQ+T9yS4u8www75f4dH11NIYeK8K0eMrei+q4BTp6NrY2lqLTBfHqVlc23ZsUnWqdLUII4hzySVv+AJbTWA==",
+        "tarball_sha256": "5c5a5ada2635ce7faa938fe3f7b156c604b2ed717fc39939f1e23e8996fe75dc",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/remix-run-react/package.json",
+          "sha256": "d22b480db6123d596e3205f29d0a75a7217b341372fc592339583cd4af137cb2"
+        }
+      }
+    },
+    {
+      "id": "astro",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "astro",
+        "version": "7.4.12",
+        "source": "https://registry.npmjs.org/astro/7.4.12",
+        "tarball": "https://registry.npmjs.org/astro/-/astro-7.4.12.tgz",
+        "integrity": "sha512-DKX+Ds0rqV49HrLwEB9JFrCyfvQeC16FCe1HrPK8S3osiJH/e2vQ22CHIDOpI48UaeiPbxPT26peXgGTy6w0ig==",
+        "tarball_sha256": "87399c9d26d97d06fa0455bf830641ab4b10b17abb6582af2760e7d8ba9fdfbe",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/astro/package.json",
+          "sha256": "88522cd788d4ab4e74ae60fe55998230dbd953ed4577c6d0e136eea233b97fd4"
+        }
+      }
+    },
+    {
+      "id": "sveltejs-kit",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@sveltejs/kit",
+        "version": "3.2.0",
+        "source": "https://registry.npmjs.org/%40sveltejs%2Fkit/3.2.0",
+        "tarball": "https://registry.npmjs.org/@sveltejs/kit/-/kit-3.2.0.tgz",
+        "integrity": "sha512-zhb8GTeFd/6BwfqaY4wKIF7eFACYOgn/KNppV6UHFBHk174B4d7xTtN7x0PxaPPlwnCTgbnpaYF6r9lirz0Biw==",
+        "tarball_sha256": "9516206763fc4cb87c6c2902e6460d90ce5a979dc9d4e29224f537db4a51f1f7",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/sveltejs-kit/package.json",
+          "sha256": "de425b4f14dff535b90cf398605ce7233da1585c7167541127bf7b2b2cbea46c"
+        }
+      }
+    },
+    {
+      "id": "angular-core",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@angular/core",
+        "version": "22.2.6",
+        "source": "https://registry.npmjs.org/%40angular%2Fcore/22.2.6",
+        "tarball": "https://registry.npmjs.org/@angular/core/-/core-22.2.6.tgz",
+        "integrity": "sha512-atESNSPsM0dBXU88aDtByBP4W/wb8USbhL16lsePyxBvAWtM1Xn7QBB489QTmHpY6VCXHnqMhXWcrZsDpoIBsw==",
+        "tarball_sha256": "21bc3f74418e6ccd318edd589aa8de6466e16b448f67808d227f12468a767741",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/angular-core/package.json",
+          "sha256": "53eb869869c4acdaa8e7cacd1437deb1514eeadf38682e16bcfc5610d5dbc420"
+        }
+      }
+    },
+    {
+      "id": "vue",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "vue",
+        "version": "3.5.45",
+        "source": "https://registry.npmjs.org/vue/3.5.45",
+        "tarball": "https://registry.npmjs.org/vue/-/vue-3.5.45.tgz",
+        "integrity": "sha512-3cvsib8m9c0vB24+MDKsgcW4+Da4xaBl9Z/5Tbm2pmSIsRPxcil4cdXjXlVsmJ2g64XJo5h+IRd7rsdGT9pZaw==",
+        "tarball_sha256": "c2ec36a9b719e4277785f1ad36a1bb0424d8d32f0bea24abcce862e26821d585",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/vue/package.json",
+          "sha256": "0ff842d6a96dad3c940d099316bc21de8fd25f0d4a3d9206b64921989ea10cd2"
+        }
+      }
+    },
+    {
+      "id": "nestjs-core",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@nestjs/core",
+        "version": "12.5.0",
+        "source": "https://registry.npmjs.org/%40nestjs%2Fcore/12.5.0",
+        "tarball": "https://registry.npmjs.org/@nestjs/core/-/core-12.5.0.tgz",
+        "integrity": "sha512-o6auZGZNwIhc0NT7YDxK3j9EKt3k651moerLD5NSsU0EY2fqTRO8PBBJXIprVHVLnzYNWwFfgsUUzDFSPo0vAg==",
+        "tarball_sha256": "abef60f63506f18e8b487562da8e0a78908fec9b8d13ac756be2533da029af2a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/nestjs-core/package.json",
+          "sha256": "5551e40bf3a168ebe187d2b7513bf9e2f0025a66efd07110b5512fb7041f6ce6"
+        }
+      }
+    },
+    {
+      "id": "electron",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "electron",
+        "version": "45.3.2",
+        "source": "https://registry.npmjs.org/electron/45.3.2",
+        "tarball": "https://registry.npmjs.org/electron/-/electron-45.3.2.tgz",
+        "integrity": "sha512-bPO0MMvJCdKdPfXgd3ES8zupu+ocr6XmSuRGwyZazTiigTz8jE7rwukSkck0iomS6UZeFuCwzu0uanMD/D34uw==",
+        "tarball_sha256": "1503b66f8b5359346fe69e7a0062db69f9384bed921fc206fcd65d827fb29857",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/electron/package.json",
+          "sha256": "30c0baca8c767b727314d511b73b2a4789b801e99c1ac4b76a1cc11597d6c45e"
+        }
+      }
+    },
+    {
+      "id": "react-native",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "react-native",
+        "version": "0.88.1",
+        "source": "https://registry.npmjs.org/react-native/0.88.1",
+        "tarball": "https://registry.npmjs.org/react-native/-/react-native-0.88.1.tgz",
+        "integrity": "sha512-wajWcLZ93GCN7k4Uwh4CS4L2Ah8ohcvkOXnvIYmh4Yvuqho5j3APZ9qozK+nQrHWSgauq4h8D3HN5DKK84SrHA==",
+        "tarball_sha256": "092228927de1b20001001f3bf1f494bd4bac5fff60da83f796655dc7b784489a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/react-native/package.json",
+          "sha256": "3f2bf69ed883e97a295b1de43f5a2d75d112ab45495153360c2fb521023c7f3f"
+        }
+      }
+    },
+    {
+      "id": "expo",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "expo",
+        "version": "58.0.25",
+        "source": "https://registry.npmjs.org/expo/58.0.25",
+        "tarball": "https://registry.npmjs.org/expo/-/expo-58.0.25.tgz",
+        "integrity": "sha512-Ih7pQYPS+2ZFS5APNtgOUp2AK/M+zfILK9Z5/wh6PoLn6XF3dh+nlcvugotytVzf8jX5/NBMcB7xJT+97oaNvw==",
+        "tarball_sha256": "537c5e486c7a2da0a6b36a56f641fcfaca50283c86e4950c3ecc34d23fbce0a0",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/expo/package.json",
+          "sha256": "ee4cba97fd54ae65c828cf61e7a53f0c962e1acfdadf0f6e7b58395cb046b013"
+        }
+      }
+    },
+    {
+      "id": "express",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "express",
+        "version": "5.3.0",
+        "source": "https://registry.npmjs.org/express/5.3.0",
+        "tarball": "https://registry.npmjs.org/express/-/express-5.3.0.tgz",
+        "integrity": "sha512-qCqy1xSoaugxOD4IVHb1ZWdkvCF2W3aE2okKouWj8VwJ+ztskSiXoBnCSJqfKT+cVPJhuJqe9YLbY425+Zh00g==",
+        "tarball_sha256": "62450d99e36dc393295f1ddd93cb9291e658c169f3b700b0110c1ae8fa799930",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/express/package.json",
+          "sha256": "9645053f08f43135ec21f46ae434e49e10528c9062fde7776b150f38a2335afe"
+        }
+      }
+    },
+    {
+      "id": "fastify",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "fastify",
+        "version": "5.12.8",
+        "source": "https://registry.npmjs.org/fastify/5.12.8",
+        "tarball": "https://registry.npmjs.org/fastify/-/fastify-5.12.8.tgz",
+        "integrity": "sha512-moP8exb2sCHLUbJkwp+I6C0padhy4D8lp0SdmzY7HhSdZuqm7O/u3o2aq7u8okaQ//33QDzj3G/u+FsSdB8Qzw==",
+        "tarball_sha256": "459048aabd9311309f4f95b36e8ca065e3a4613ded292bcf50442926931e4748",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/fastify/package.json",
+          "sha256": "1e70ff11857f54dcaf31ed0c2241a7f7771b26693c039d425c2d22fdb8ee0117"
+        }
+      }
+    },
+    {
+      "id": "koa",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "koa",
+        "version": "3.3.0",
+        "source": "https://registry.npmjs.org/koa/3.3.0",
+        "tarball": "https://registry.npmjs.org/koa/-/koa-3.3.0.tgz",
+        "integrity": "sha512-NdsWJYxVzUuYt718DtEQRhUXqqsAPA4VlaUGrlidjh/T2TP/4OQXqQg4ouUHfHD9f+tgmwLZWPm+JQLgqM9YbA==",
+        "tarball_sha256": "2b1cae002c5c8a066b9c77ac9bf197e2369ba8501fb76b75c9f21d474ef02cf4",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/koa/package.json",
+          "sha256": "13d5f71bc93cd712988efab6f6144d785a4ec60ed6508e3d0b8022abcad058cf"
+        }
+      }
+    },
+    {
+      "id": "hapi",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "hapi",
+        "version": "18.1.0",
+        "source": "https://registry.npmjs.org/hapi/18.1.0",
+        "tarball": "https://registry.npmjs.org/hapi/-/hapi-18.1.0.tgz",
+        "integrity": "sha512-nSU1VLyTAgp7P5gy47QzJIP2JAb+wOFvJIV3gnL0lFj/mD+HuTXhyUsDYXjF/dhADMVXVEz31z6SUHBJhtsvGA==",
+        "tarball_sha256": "bd2c362e7a668cbdfff03e7aca6502489994d79a6f4d4ec60d8b7f7c1bce5587",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/hapi/package.json",
+          "sha256": "1e621c03d5189cb3bd784d7e7680ee4b0bb50cd39709ec5e16a58b9e86738ca6"
+        }
+      }
+    },
+    {
+      "id": "svelte",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "svelte",
+        "version": "5.57.3",
+        "source": "https://registry.npmjs.org/svelte/5.57.3",
+        "tarball": "https://registry.npmjs.org/svelte/-/svelte-5.57.3.tgz",
+        "integrity": "sha512-5mAftM3SoDV9X0zdF386F9p2pv8iKOwi/KfBS1XnBAkVCKFzVOLHUoa8iGWAt4buoicLmyWVRpuuD5wplXOQsg==",
+        "tarball_sha256": "afda776761670addcd6f4345c1b4b0665c8dd11b82961cbfee9696d5d9f4546a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/svelte/package.json",
+          "sha256": "09eb2907115f906fcfbbf270222af7a07cd1f292aedf5ce5ecc8f93125bc6f82"
+        }
+      }
+    },
+    {
+      "id": "react",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "react",
+        "version": "19.3.1",
+        "source": "https://registry.npmjs.org/react/19.3.1",
+        "tarball": "https://registry.npmjs.org/react/-/react-19.3.1.tgz",
+        "integrity": "sha512-QNhWdt7nrgVWWQG58QuGsAR3jv3Hbe4mb4vz7w2csnHavciZJgda1CPNaldF6eVxv90ud3jUXpKlHL69gO38yw==",
+        "tarball_sha256": "56936913918dcf1f7a6fe58784e79df54b18200a88655ce809cf5e9c4ef871aa",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/react/package.json",
+          "sha256": "9cc9c3de5441a2eea7f41f52f3f2a15a4fc51f90c0b72741f0d7638643a85e67"
+        }
+      }
+    },
+    {
+      "id": "react-dom",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "react-dom",
+        "version": "19.3.1",
+        "source": "https://registry.npmjs.org/react-dom/19.3.1",
+        "tarball": "https://registry.npmjs.org/react-dom/-/react-dom-19.3.1.tgz",
+        "integrity": "sha512-Y0bARz53lhEC1NMCASs0/j+faB/zqt3R8hpvg1e8+61ZVJ4UL0UdC4cBbXfZMcIuhrfgeILTLe+ZeBCavQPtKQ==",
+        "tarball_sha256": "8b49975821eec6311e00d2b3f4b8337923253c876517388a33f9839c61ab262e",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/react-dom/package.json",
+          "sha256": "89d54f11575c9b0f7819962d9d72a31970dfb4d103f07e8b1d1b37e6d1fc3258"
+        }
+      }
+    },
+    {
+      "id": "preact",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "preact",
+        "version": "11.2.0",
+        "source": "https://registry.npmjs.org/preact/11.2.0",
+        "tarball": "https://registry.npmjs.org/preact/-/preact-11.2.0.tgz",
+        "integrity": "sha512-/HfHI/7N84e6GrWBJ3J280z3mLaRJiDcSvj/A+y/4AbLnND/1UlGHe1sR6oYuTGwId0nP7dqDU9OnLxMPZ7xBg==",
+        "tarball_sha256": "3c4456766bd32b6b534d52bf4e9c2a29b33e7eedf6e96ed479300ba1a7888ebf",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/preact/package.json",
+          "sha256": "5b3f459ed59d374733fc2ca1b3036c91d2b5c0cb5fbc9505221929e746c1ab03"
+        }
+      }
+    },
+    {
+      "id": "solid-js",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "solid-js",
+        "version": "1.9.19",
+        "source": "https://registry.npmjs.org/solid-js/1.9.19",
+        "tarball": "https://registry.npmjs.org/solid-js/-/solid-js-1.9.19.tgz",
+        "integrity": "sha512-NIrV/6o1FtmrA9iuAAYvnQJZaHrGcaH3LKSVj4kCiZfwqjCtJNDgIgR9XcqYl6KR/Lb3oRx1HrlyswPWR8SRvw==",
+        "tarball_sha256": "190fe058ac48aac6e6e1e83857c83f7cd84a947c62832cc5a693b76a33905aef",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/solid-js/package.json",
+          "sha256": "4e183d6f94fd39177333f6ec9354bead203d1b1b4c59679fe4e52750fcecd7d5"
+        }
+      }
+    },
+    {
+      "id": "lit",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "lit",
+        "version": "3.3.3",
+        "source": "https://registry.npmjs.org/lit/3.3.3",
+        "tarball": "https://registry.npmjs.org/lit/-/lit-3.3.3.tgz",
+        "integrity": "sha512-fycuvZg/hkpozL00lm1pEJH5nN/lr9ZXd6mJI2HSN4+Bzc+LDNdEApJ6HFbPkdFNHLvOplIIuJvxkS4XUxqirw==",
+        "tarball_sha256": "92f8d5bcd63e2d5efc41afd0a3d58a0a0f554ef826af9c8e368887c71949fd4d",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/lit/package.json",
+          "sha256": "b96d657d4a2e94394569b6a0f25881a4e4908a2682094d20d3b251ef7e1198a6"
+        }
+      }
+    },
+    {
+      "id": "alpinejs",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "alpinejs",
+        "version": "3.17.5",
+        "source": "https://registry.npmjs.org/alpinejs/3.17.5",
+        "tarball": "https://registry.npmjs.org/alpinejs/-/alpinejs-3.17.5.tgz",
+        "integrity": "sha512-XewMqRC6zjy8iaUPn86dxjvooAsNai3hUtQbdn0A5H2w7Jt10xHGZ1SczN5+Dvp3UKkuSEt9moy/UaUWOwKdnQ==",
+        "tarball_sha256": "fe3a5be16ef5d23edc188e8313ebbf6f3373cbed8b939c427060f3a5d2314c0b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/alpinejs/package.json",
+          "sha256": "608aceeacce5dba0947abca2aff76e22394b7e91c2dcc43a8f394bd25f1c6b25"
+        }
+      }
+    },
+    {
+      "id": "gatsby",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "gatsby",
+        "version": "5.16.1",
+        "source": "https://registry.npmjs.org/gatsby/5.16.1",
+        "tarball": "https://registry.npmjs.org/gatsby/-/gatsby-5.16.1.tgz",
+        "integrity": "sha512-SwwQQBM2F9ze7jI2tlZzw1spppL036x8TQ9+/0MaRlGlc7qVaUYm1jUvaH4Nge0ck4tS9VFwB0MROBxlNed+WQ==",
+        "tarball_sha256": "8c79a90089afdb3fc4895a2838f90a2d9e4355f2603101b10e0fcd063668b248",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/gatsby/package.json",
+          "sha256": "4eda3ba91be3dbe59ec8098ef06172f7ccb157235adb9d4b00dedcc4a501035f"
+        }
+      }
+    },
+    {
+      "id": "angular-cli",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@angular/cli",
+        "version": "22.2.7",
+        "source": "https://registry.npmjs.org/%40angular%2Fcli/22.2.7",
+        "tarball": "https://registry.npmjs.org/@angular/cli/-/cli-22.2.7.tgz",
+        "integrity": "sha512-TtO2qiDJj3OjeqZ1V/SiDYkwBKDVk45PxDBxjNksw5sLe2H122RYjdcVPDteEGJjAJGwnP2qkQ5wa/6YRitNiA==",
+        "tarball_sha256": "f77fef613d5afac2d68b5a0f80153655b58b07d6cc8c4f21f2682e5f57b9950b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/angular-cli/package.json",
+          "sha256": "eadfa1208939b30c3ca07378020e805af9dcb1193384f457265aa72a7bd3e415"
+        }
+      }
+    },
+    {
+      "id": "nestjs-cli",
+      "category": "frameworks",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@nestjs/cli",
+        "version": "12.0.13",
+        "source": "https://registry.npmjs.org/%40nestjs%2Fcli/12.0.13",
+        "tarball": "https://registry.npmjs.org/@nestjs/cli/-/cli-12.0.13.tgz",
+        "integrity": "sha512-dfb9zbM4VRUQnkjt0IyhYWxiScDq/4j8m6Y5f6PKvg6LK47XbzBeWKCBdqVFQV85uAHdJiMa8nyemAu0xvujRQ==",
+        "tarball_sha256": "f6b0d1ff858a8d24d467e11aaa609b126731cc1c821b0bb201e9a0451f5333ba",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/nestjs-cli/package.json",
+          "sha256": "2dd47854d1f38dd52253eb348222aec421f0487109e24e09d57d3172739a0c60"
+        }
+      }
+    },
+    {
+      "id": "webpack",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "webpack",
+        "version": "5.112.2",
+        "source": "https://registry.npmjs.org/webpack/5.112.2",
+        "tarball": "https://registry.npmjs.org/webpack/-/webpack-5.112.2.tgz",
+        "integrity": "sha512-B2tp1LI9D8GVpPDqprdt12ukTkXXahj9MzqSWJq4faSPgOUM7CdZaGAB6HrL/8E6UwbBpdj4vzWDbKoFnVoU6g==",
+        "tarball_sha256": "fb618a5eba0f16fa43ed720cc4634df4e88c65d594c0e0ad2c5c0c9be4057dfe",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/webpack/package.json",
+          "sha256": "43585941d603ddd3eb52af3e8ba3244ef046156a27b9108c057f26776636e769"
+        }
+      }
+    },
+    {
+      "id": "webpack-cli",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "webpack-cli",
+        "version": "7.3.1",
+        "source": "https://registry.npmjs.org/webpack-cli/7.3.1",
+        "tarball": "https://registry.npmjs.org/webpack-cli/-/webpack-cli-7.3.1.tgz",
+        "integrity": "sha512-enXzN0/2fWHX3tP2gpTV6U8/zz5RSbfWjSAc0VXOi0+hOY4ePdHanA+2kxrAC/SX0LHO4fOX5c9G1TdwpvUj/g==",
+        "tarball_sha256": "833aab597a1f8748bd943a961763fe4a5640c7efa6c6e5c0e88a497db90c42dd",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/webpack-cli/package.json",
+          "sha256": "b63e47eeb085fb945bc276840dcf165a13d0824b7d3a42e3be135d59966aa90d"
+        }
+      }
+    },
+    {
+      "id": "rollup",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "rollup",
+        "version": "4.68.3",
+        "source": "https://registry.npmjs.org/rollup/4.68.3",
+        "tarball": "https://registry.npmjs.org/rollup/-/rollup-4.68.3.tgz",
+        "integrity": "sha512-wd2gavj7CEQv52rdcVqfUupO/KPIKcoJKxyFWl4cOqYZGMQEOSijJRkliz0dRa7gpkj/h4TRqyWa+dJJi6T0OA==",
+        "tarball_sha256": "d60a21950213b4d483660d7d1f09e50ad677a0274d68e95a594e9fca5fd04c16",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/rollup/package.json",
+          "sha256": "f401580e48a4716e8993e3f4afb9926f26ace3a3a40fe7f37c456fff4a94f583"
+        }
+      }
+    },
+    {
+      "id": "babel-core",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@babel/core",
+        "version": "8.1.2",
+        "source": "https://registry.npmjs.org/%40babel%2Fcore/8.1.2",
+        "tarball": "https://registry.npmjs.org/@babel/core/-/core-8.1.2.tgz",
+        "integrity": "sha512-xqDajHAAOjklW5UtWzFd9vSmlQ16+emgGi0HsyDQFGRQWZ/GjuwCoYGC3PnHxspmOR+HJBzDIOkMxNq/VvC98w==",
+        "tarball_sha256": "68254d3da2ed96677b3725158e96de58afda718661a6d4c2e8429da8a10e3016",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/babel-core/package.json",
+          "sha256": "e1a939b2bf40c7f2821ab337548a13e051770075f0bd2d3c21cdf93eed79c9e1"
+        }
+      }
+    },
+    {
+      "id": "babel-cli",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@babel/cli",
+        "version": "8.1.0",
+        "source": "https://registry.npmjs.org/%40babel%2Fcli/8.1.0",
+        "tarball": "https://registry.npmjs.org/@babel/cli/-/cli-8.1.0.tgz",
+        "integrity": "sha512-C4fCHysy+LdXz6nsk59mAKoYBrYTxkbJb6sCEqyx1E8C5+77dEc4I4FjmIO6crtWvHxvn+sL5VD/tIjtQMYceQ==",
+        "tarball_sha256": "b7a1c775b4427d5023009da693c3176650dc42b52e6c6d9207befbe489845c6a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/babel-cli/package.json",
+          "sha256": "0d5f0d21b1c841261b1a4c0137d09348da574c20539331141da2a4961c307d5d"
+        }
+      }
+    },
+    {
+      "id": "eslint",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "eslint",
+        "version": "10.15.0",
+        "source": "https://registry.npmjs.org/eslint/10.15.0",
+        "tarball": "https://registry.npmjs.org/eslint/-/eslint-10.15.0.tgz",
+        "integrity": "sha512-+5Wg4p+ze3sG1WErYgUO/3H1IQIfFBymVUA0Fo/XTeBOLS6UQIUekpSJ8sdRkn7O7wjh84b55w/roqavH2aScg==",
+        "tarball_sha256": "8cb5e45fb5b1174e4216d546b69d37c0ac5cb5d9ba8342946a04af1f59605edb",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/eslint/package.json",
+          "sha256": "26b9157269c108314b524f3acbfc05cd173f1956cff57387f98e35481bdaec6b"
+        }
+      }
+    },
+    {
+      "id": "typescript-eslint",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "typescript-eslint",
+        "version": "8.72.2",
+        "source": "https://registry.npmjs.org/typescript-eslint/8.72.2",
+        "tarball": "https://registry.npmjs.org/typescript-eslint/-/typescript-eslint-8.72.2.tgz",
+        "integrity": "sha512-c/+AKMW1KB81r28Sp0AAdcyXj5dzNmAsZFcsrxKbZTKmcBK2xIwBR31dcSYSDu3bKmzXe8GKrSxO+eDQ401Uzg==",
+        "tarball_sha256": "3491d67b276366e650d6559be27183093f2592937f725d28e61c6e125471e073",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/typescript-eslint/package.json",
+          "sha256": "63be1682d8d4316c82e2af67e5d9f703b899db39a5e9368f75c2ee31dcbeb763"
+        }
+      }
+    },
+    {
+      "id": "typescript",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "typescript",
+        "version": "7.0.2",
+        "source": "https://registry.npmjs.org/typescript/7.0.2",
+        "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz",
+        "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==",
+        "tarball_sha256": "da2513f4b95176d6dde8b51aab7afe8a927656c9d277369793f77f7e59371c08",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/typescript/package.json",
+          "sha256": "3722b30210616a13a3213ded11575ba6b2dbab10c32a5ef67afca8513e27017e"
+        }
+      }
+    },
+    {
+      "id": "jest",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "jest",
+        "version": "30.5.2",
+        "source": "https://registry.npmjs.org/jest/30.5.2",
+        "tarball": "https://registry.npmjs.org/jest/-/jest-30.5.2.tgz",
+        "integrity": "sha512-3gnpdBIza8ijCl3iMV9ChE3hSt1+46865qqod863gQtJr1DixOkAU5DoGbi3u+XlRcw++BhZQMu/y4xBdHBvSQ==",
+        "tarball_sha256": "aa278879dd8634e13f3392d28a0e1310d87117bcb5a0c59beea7a530be24dd8c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/jest/package.json",
+          "sha256": "4df6c2fc24e5017d0e6f54cbd9ad3203551c00f4b1d08f50007cf18f8754cd4d"
+        }
+      }
+    },
+    {
+      "id": "vitest",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "vitest",
+        "version": "5.1.0",
+        "source": "https://registry.npmjs.org/vitest/5.1.0",
+        "tarball": "https://registry.npmjs.org/vitest/-/vitest-5.1.0.tgz",
+        "integrity": "sha512-MzmNFnrwa8v8lF1bLxw3UJ4EREwVOVb75VqJZmUDRjJ6EluK/x9th7qTbaeDk41WxE1GxWqmTXcdsfobfH5sOA==",
+        "tarball_sha256": "3a56217bdf139acc6514819b274de08c02350cc96e6df616a0bc5219f4c7edad",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/vitest/package.json",
+          "sha256": "cc2979885d9d149c8456128e7ae48038d815352cf1e6d1932eb631057a99f973"
+        }
+      }
+    },
+    {
+      "id": "playwright-test",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@playwright/test",
+        "version": "1.65.1",
+        "source": "https://registry.npmjs.org/%40playwright%2Ftest/1.65.1",
+        "tarball": "https://registry.npmjs.org/@playwright/test/-/test-1.65.1.tgz",
+        "integrity": "sha512-y+NCIRm2LvY4slUVWvGh1nujJ8RF/hEisIsq2mtUPgdQC4L701bq5hZGMhrpeXjACvwvO9tj5dJqhvM6TP9lbw==",
+        "tarball_sha256": "025a0b1ab36fd4e5f4ede6c9397020b9c3805d8f19c75a16989a02d70a88f37b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/playwright-test/package.json",
+          "sha256": "72ff26856a8b26394f293275b6b485e85823218524f41a9c65c62615cd783542"
+        }
+      }
+    },
+    {
+      "id": "storybook",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "storybook",
+        "version": "10.6.7",
+        "source": "https://registry.npmjs.org/storybook/10.6.7",
+        "tarball": "https://registry.npmjs.org/storybook/-/storybook-10.6.7.tgz",
+        "integrity": "sha512-/1h87XqC+8tZ5PQ/GVWOg78tCQuEAshYWwok5niBcnHEKzZy6Ls06uuT5/rhQ3iUB0y8iexEVHmUe3jaaxNguw==",
+        "tarball_sha256": "cbc8c74dd86a71aa38363219f5b619bef2dc296710855276777b3939a486b870",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/storybook/package.json",
+          "sha256": "0848b0d32085c73d68f5337d58a6fb24107997fd725fe2fae58da98122a36590"
+        }
+      }
+    },
+    {
+      "id": "prisma",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "prisma",
+        "version": "8.0.0-rc.33",
+        "source": "https://registry.npmjs.org/prisma/8.0.0-rc.33",
+        "tarball": "https://registry.npmjs.org/prisma/-/prisma-8.0.0-rc.33.tgz",
+        "integrity": "sha512-l/HTB0GbzWwk6wG9T3k2EjpNXR14jRaf0CWju3WgY2AF5b0RTZUUXleT+S3ucO47qiSDF3Un3C09n+HAHs1KAA==",
+        "tarball_sha256": "355a35f560c27a9ebfa8fbf9cf66f2382877b5aafa5c014b172f311a9f1983f2",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/prisma/package.json",
+          "sha256": "5fc817eae1ec34642497be45c473429ac8513472ee5a51f6c7f5b3e72d7ac565"
+        }
+      }
+    },
+    {
+      "id": "prisma-client",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@prisma/client",
+        "version": "7.10.1",
+        "source": "https://registry.npmjs.org/%40prisma%2Fclient/7.10.1",
+        "tarball": "https://registry.npmjs.org/@prisma/client/-/client-7.10.1.tgz",
+        "integrity": "sha512-5tgAbFGh//zVOC6WPNVgziOErJHYkUE+wmqCwbIyq6IrTXUYtv9y2iBFGh/Owo99Mx0+cr0j1FOrxkYBMuyhaQ==",
+        "tarball_sha256": "f61ebcb6989355c08edeb0596753d8afee6429eadab7b50074dedcb220cfc622",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/prisma-client/package.json",
+          "sha256": "236a224c2f1d68f19a00996e21c2c212ce0b319eaee1228c001b06c8dafd3d1d"
+        }
+      }
+    },
+    {
+      "id": "vite",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "vite",
+        "version": "8.3.8",
+        "source": "https://registry.npmjs.org/vite/8.3.8",
+        "tarball": "https://registry.npmjs.org/vite/-/vite-8.3.8.tgz",
+        "integrity": "sha512-LzOn3h9rG/0vhLdXrV4yJ4QFA9eEoqCl+Yx+kGJd7aB9w6nfNgVHKSYwLPZUHrz4ZGa+t+kXjV9itvcHDLQouA==",
+        "tarball_sha256": "96b14ea41f889b70b1ccf74dd5861e365816fce8632c5073ce8d70c90509738b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/vite/package.json",
+          "sha256": "149cf436b89044371ae3cb35ac0e687ee75c6e8412962c7ce671f3d1a4a09d82"
+        }
+      }
+    },
+    {
+      "id": "parcel",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "parcel",
+        "version": "2.16.4",
+        "source": "https://registry.npmjs.org/parcel/2.16.4",
+        "tarball": "https://registry.npmjs.org/parcel/-/parcel-2.16.4.tgz",
+        "integrity": "sha512-RQlrqs4ujYNJpTQi+dITqPKNhRWEqpjPd1YBcGp50Wy3FcJHpwu0/iRm7XWz2dKU/Bwp2qCcVYPIeEDYi2uOUw==",
+        "tarball_sha256": "6d791475da54b4625c0065d46e078fafcecc06c1b2c7aa2dea660d9f7bc2a22c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/parcel/package.json",
+          "sha256": "fb108dd042e9c534809098319f80bb83e9018284c71b364049c65bb8b685cab6"
+        }
+      }
+    },
+    {
+      "id": "esbuild",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "esbuild",
+        "version": "0.28.2",
+        "source": "https://registry.npmjs.org/esbuild/0.28.2",
+        "tarball": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+        "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
+        "tarball_sha256": "e045f94c235c7adc50e77ba2a579c7bec41b496b6b47c3a7845f7c1e19959a88",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/esbuild/package.json",
+          "sha256": "9d0bc453f4e791553c4cc2298ba023b409241fd9801e494741666eb0f6051490"
+        }
+      }
+    },
+    {
+      "id": "swc-core",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@swc/core",
+        "version": "1.16.22",
+        "source": "https://registry.npmjs.org/%40swc%2Fcore/1.16.22",
+        "tarball": "https://registry.npmjs.org/@swc/core/-/core-1.16.22.tgz",
+        "integrity": "sha512-kFqhtSmmNSZqJXIK0l9rF+oNg2efaZoeNbN/4qwbNTWfMRKApc6n7rKx827bw8K+4kmu7iH0LZ144QJTQzulHw==",
+        "tarball_sha256": "19ba0ac64879bd90305b34942e127d47dcdbf55ca200781ec79b6472edfdf650",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/swc-core/package.json",
+          "sha256": "406ce4e5b5b2e35b541152c75aca2e8f9dc9f522335453cb3f9fb8414c9afad4"
+        }
+      }
+    },
+    {
+      "id": "tsup",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "tsup",
+        "version": "9.0.0",
+        "source": "https://registry.npmjs.org/tsup/9.0.0",
+        "tarball": "https://registry.npmjs.org/tsup/-/tsup-9.0.0.tgz",
+        "integrity": "sha512-DHgb0bfo2gFKybOa8dRFMiHSqzWWhMkfNK0f902VVquWQtDBWExNgidHszjjDKaFd12pWPgzumpWf9nGr3gzFg==",
+        "tarball_sha256": "a769bdcf50e9170661dc9dbda4b597cc98de4194414f610386c458e9fcb55148",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/tsup/package.json",
+          "sha256": "0e2c62405f63280e942712c7e1b5930cfd4d125aa3fc5d862c25541529b99e62"
+        }
+      }
+    },
+    {
+      "id": "tsx",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "tsx",
+        "version": "4.23.15",
+        "source": "https://registry.npmjs.org/tsx/4.23.15",
+        "tarball": "https://registry.npmjs.org/tsx/-/tsx-4.23.15.tgz",
+        "integrity": "sha512-Yiex1Ovn8z2xPpOWckIiysV1SSyRMY9BkLF++q0yKiDxCqRhosKfMg3janKkiLBwZ5c/YryloKwGZcrEmtwxKw==",
+        "tarball_sha256": "60eeb6697e987b40ea1944061f186c2314b8381fd6da4dc1bdbe75e0744a9f78",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/tsx/package.json",
+          "sha256": "ab5f14c4251638844ade3905d3cfc52fc1c833644694d655a05f6d0ca746b83c"
+        }
+      }
+    },
+    {
+      "id": "postcss",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "postcss",
+        "version": "8.5.33",
+        "source": "https://registry.npmjs.org/postcss/8.5.33",
+        "tarball": "https://registry.npmjs.org/postcss/-/postcss-8.5.33.tgz",
+        "integrity": "sha512-RVHEU9/Pp1Fnjr/MpAJsZoADukCKhfIi15OunEYiGktIkYLkPVvC1sioWolGDS7XByMTx9m/IGbro0Js13zhnQ==",
+        "tarball_sha256": "ed476390bb68df554790d035a942608a4d6ec0ec65147f9eaef182a24d815a8f",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/postcss/package.json",
+          "sha256": "8c54659dbae525ebc655d3d329a5c329967471ebc85efcac2066b3f1e9ffab6a"
+        }
+      }
+    },
+    {
+      "id": "tailwindcss",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "tailwindcss",
+        "version": "4.3.5",
+        "source": "https://registry.npmjs.org/tailwindcss/4.3.5",
+        "tarball": "https://registry.npmjs.org/tailwindcss/-/tailwindcss-4.3.5.tgz",
+        "integrity": "sha512-FcQk9BuffmEHJP2G0XmB2SplU1aLTI7j07Kunk+U74Ny+XiWOtzXz9aujFZ/avntw1e2cOv/3PkgzflQ7gX2vQ==",
+        "tarball_sha256": "3e30a765102ecded1dc1bf50d95de93d94ae0807f86cda155bb2aff4945ebb8b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/tailwindcss/package.json",
+          "sha256": "0bebd8cd02b53e6b7d24bacdec146bf9461f5491b61cb06dfb5cd69c8cadea90"
+        }
+      }
+    },
+    {
+      "id": "sass",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "sass",
+        "version": "1.108.2",
+        "source": "https://registry.npmjs.org/sass/1.108.2",
+        "tarball": "https://registry.npmjs.org/sass/-/sass-1.108.2.tgz",
+        "integrity": "sha512-kugK8djotnG9HQRPTOf36asKYlxg8rWWsNLYHOgWDIVOiZQqlRfKBgF4XXM6kfw146kIDMvm57B4GIkvDSyTzA==",
+        "tarball_sha256": "a3398fa194c3379174bac6650bdaad077d1fbe71c4e58e817b2e213d1479bbfe",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/sass/package.json",
+          "sha256": "25de6e707b2b2d2071e657fa51fff75aba5a1b050bbeef214267bc0a22c044c6"
+        }
+      }
+    },
+    {
+      "id": "less",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "less",
+        "version": "4.9.1",
+        "source": "https://registry.npmjs.org/less/4.9.1",
+        "tarball": "https://registry.npmjs.org/less/-/less-4.9.1.tgz",
+        "integrity": "sha512-orp15PfJvvNDIqJdVWzMI9Sjpjp3VTiw3sfvbB+67LlISTEn8uVT2EdYSuyl02BLvaftv6sdk9Umnxmm5rckmg==",
+        "tarball_sha256": "dc91904c4a288ef3f2835f163c8ec4629d7dd7a5388255fc124873f5cdbb4d03",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/less/package.json",
+          "sha256": "f83f6d9772f793df58961be1ccb7d14cccdb786c471482bcc696e116614dbcfb"
+        }
+      }
+    },
+    {
+      "id": "prettier",
+      "category": "tooling",
+      "kind": "published-manifest",
+      "source": {
+        "package": "prettier",
+        "version": "3.10.1",
+        "source": "https://registry.npmjs.org/prettier/3.10.1",
+        "tarball": "https://registry.npmjs.org/prettier/-/prettier-3.10.1.tgz",
+        "integrity": "sha512-70vp3ZUYoPlFbF9uiTdXHUUCGEIp7d4+6p+8DYbkm2jP7x/3i/paXVF6dopSI3zd/CEitrZN1rc4i85xWmmXlg==",
+        "tarball_sha256": "8625d008f4f0d7d513509ecc269b4b2a551a6f1ea3a57ac880e13e84a434213c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/prettier/package.json",
+          "sha256": "cb9ae63b95680b2d1e3e513d5594d0cc680cce46770b8091c4609036d242f2ee"
+        }
+      }
+    },
+    {
+      "id": "axios",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "axios",
+        "version": "1.21.1",
+        "source": "https://registry.npmjs.org/axios/1.21.1",
+        "tarball": "https://registry.npmjs.org/axios/-/axios-1.21.1.tgz",
+        "integrity": "sha512-6eI5Q/Y4u/Um9dDlsRoq5pY2rxnUTv+L4PpLitnbk/i4jb3MxLZ5CsN5Ih3IysbeRYK4pR+P7qfMsOQl9fwwFQ==",
+        "tarball_sha256": "5659acb8c9414ad88aa539db8e529947c9bac8cdf55973e314a078fc0205751c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/axios/package.json",
+          "sha256": "65f87e1420173239f4a02fb17e52641f7dc8635b17aa5e0761f5d968eab23077"
+        }
+      }
+    },
+    {
+      "id": "got",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "got",
+        "version": "16.2.0",
+        "source": "https://registry.npmjs.org/got/16.2.0",
+        "tarball": "https://registry.npmjs.org/got/-/got-16.2.0.tgz",
+        "integrity": "sha512-aOgWdlVL/pipu3Cqr9okwOdRZPsWwntgTup+eTn2fE1k4vky6oybjVUZxCSdAfOJkSxoyGKcGlgxf2+LcPdgVg==",
+        "tarball_sha256": "153181a8548227e4d27bfc8385cba9f4ee394ece69494ec148fe2a8c5fda48e3",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/got/package.json",
+          "sha256": "9724615cf8dccbb5c6f04a7451b0754b532da92e545e68a98bd6967571f79156"
+        }
+      }
+    },
+    {
+      "id": "undici",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "undici",
+        "version": "8.12.4",
+        "source": "https://registry.npmjs.org/undici/8.12.4",
+        "tarball": "https://registry.npmjs.org/undici/-/undici-8.12.4.tgz",
+        "integrity": "sha512-8Mx+uNKKER2bA4AdtedkqRbwUCIJFr2nJckXRe5yrDqzePqwLP7VNcctN8/XdmDSbF7mS+jJKIszlL+vbam1VA==",
+        "tarball_sha256": "26058cdb2174623666e823e6b44ccfef8d5c1955107f979b8083904b61a0ce6e",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/undici/package.json",
+          "sha256": "1c0aa5632e07578a71cd3c31fe7a75c85e7d0071ec5238a302d4b5a11aeed5b7"
+        }
+      }
+    },
+    {
+      "id": "chalk",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "chalk",
+        "version": "6.0.1",
+        "source": "https://registry.npmjs.org/chalk/6.0.1",
+        "tarball": "https://registry.npmjs.org/chalk/-/chalk-6.0.1.tgz",
+        "integrity": "sha512-/Ce6KNm3vIbWdMlNna6RVIZ/ICQxnJxCicet5LBKK9ZffBkqzDw0xh9EiKSljdRtiIQ1S1z4YgcscUUGzNCWrA==",
+        "tarball_sha256": "22a5b05d62a304c950f24dedb466ea07fb4b458e58bb37b2fe2c69ed2c9ba6c3",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/chalk/package.json",
+          "sha256": "7116220f70a118975f834e1fd95ee3ecf6a23cb198a94d6845a4cea256007d01"
+        }
+      }
+    },
+    {
+      "id": "commander",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "commander",
+        "version": "15.1.0",
+        "source": "https://registry.npmjs.org/commander/15.1.0",
+        "tarball": "https://registry.npmjs.org/commander/-/commander-15.1.0.tgz",
+        "integrity": "sha512-cgnQ88TRrWcC7pVq46RzJVRMktu3W2RcbnoidnfBsl1bmDCBwJS/udcIZpKoCrbAYYaCqsz1yZCVIgbIaU3ddQ==",
+        "tarball_sha256": "308f16a324f6d0c889c1a388858868d84e1b4eb4e2bf856caa001f01c1c55bdf",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/commander/package.json",
+          "sha256": "130b7d64b2681da74e60757da092067ec3b69315acbb4549c79f9f0e1d13a40d"
+        }
+      }
+    },
+    {
+      "id": "yargs",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "yargs",
+        "version": "18.2.0",
+        "source": "https://registry.npmjs.org/yargs/18.2.0",
+        "tarball": "https://registry.npmjs.org/yargs/-/yargs-18.2.0.tgz",
+        "integrity": "sha512-9OpKOLeaoNFecEp7P6iYbzze/5CqWoH7N3SMs/6y1XF4nMvFMspEGZzJ6uFi9MmQwXhyzqYoSEKO3tvA3Z/o2w==",
+        "tarball_sha256": "44ddd9d39e41a7d73dd794b6d229f2b92fd655d394ef59e2ca34d31df6181d13",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/yargs/package.json",
+          "sha256": "d60c24ef770ba9512defe2b7113c4dabd677f8a2c39bc119cf3979823083b192"
+        }
+      }
+    },
+    {
+      "id": "inquirer",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "inquirer",
+        "version": "14.3.0",
+        "source": "https://registry.npmjs.org/inquirer/14.3.0",
+        "tarball": "https://registry.npmjs.org/inquirer/-/inquirer-14.3.0.tgz",
+        "integrity": "sha512-luTfZn0mTWxWrqFu6It+DPoSUpMaZaIXDHBC4OFA0lVJJqqd5vS7P693UazbrlDUK8IjlXBnmAGIThV9H2eZ2w==",
+        "tarball_sha256": "fb81853892e5991c242489a5a212e70c7d2fe3102bf57775af403cdc684b0989",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/inquirer/package.json",
+          "sha256": "f6fabb434fda1793c49434e4ba489813d3d5a6dd499af8de1f2b88d616c7d521"
+        }
+      }
+    },
+    {
+      "id": "ora",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "ora",
+        "version": "10.0.0",
+        "source": "https://registry.npmjs.org/ora/10.0.0",
+        "tarball": "https://registry.npmjs.org/ora/-/ora-10.0.0.tgz",
+        "integrity": "sha512-jlxvSlLi1aKgPUnRf8NMjwyor1CM4K+faxuycHYTvygjjtkM596tQBXGEp/PQAVqzftrCBMRJlw6+RAJS5nOtQ==",
+        "tarball_sha256": "515e665ee74b8ef571618842f757b605eaa54aff072dbbc3956a3157fac1d7bb",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/ora/package.json",
+          "sha256": "75af589171085a44efde4278b209e6a270440c14e4e91978d38a41b3f8778393"
+        }
+      }
+    },
+    {
+      "id": "winston",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "winston",
+        "version": "3.19.0",
+        "source": "https://registry.npmjs.org/winston/3.19.0",
+        "tarball": "https://registry.npmjs.org/winston/-/winston-3.19.0.tgz",
+        "integrity": "sha512-LZNJgPzfKR+/J3cHkxcpHKpKKvGfDZVPS4hfJCc4cCG0CgYzvlD6yE/S3CIL/Yt91ak327YCpiF/0MyeZHEHKA==",
+        "tarball_sha256": "4183f422c69153b58b8595d3ec06c523087ca1a978006e1a6db63e199c18748e",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/winston/package.json",
+          "sha256": "f96cc6b8da151f7237b2fe38629ed06f55b7f230b281a70ddfa128e1b2648e6c"
+        }
+      }
+    },
+    {
+      "id": "pino",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "pino",
+        "version": "10.4.0",
+        "source": "https://registry.npmjs.org/pino/10.4.0",
+        "tarball": "https://registry.npmjs.org/pino/-/pino-10.4.0.tgz",
+        "integrity": "sha512-bk1ZMTwG/Vymx+zPoa28MhNzucFvXJWp3csrSuxuHPSMeUettaCoQ5Jvg07mtC4JGNpcfTwz41oVCnNgBK9+vA==",
+        "tarball_sha256": "f745d3dee0bddd39f11226335ee6dbbe3d49cc037168f2b31a8cdbe78f0e6216",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/pino/package.json",
+          "sha256": "882af7236d74b02e48c0963ef69bf2d549568bcf0b076a7dbec8174082943b72"
+        }
+      }
+    },
+    {
+      "id": "debug",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "debug",
+        "version": "4.4.3",
+        "source": "https://registry.npmjs.org/debug/4.4.3",
+        "tarball": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
+        "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
+        "tarball_sha256": "89c1ac9c946ee8905a875837114528e97eeae35e03be3190584b2216af43e4a7",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/debug/package.json",
+          "sha256": "ea8e33d63fe5f3a4c36609b6c3df8e2ef1f8b8ba2fc3a2e1e53cb27291f384af"
+        }
+      }
+    },
+    {
+      "id": "dotenv",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "dotenv",
+        "version": "18.0.10",
+        "source": "https://registry.npmjs.org/dotenv/18.0.10",
+        "tarball": "https://registry.npmjs.org/dotenv/-/dotenv-18.0.10.tgz",
+        "integrity": "sha512-89FAA1xchzK2mxVWdr5F/0rldwiueXs6zJM86rO66EzekR1iBdiXRthyG+m5GvkJaFH3C2LESzamTkgndmLT2A==",
+        "tarball_sha256": "20a0bc8a1cf06b168161a943ddb0ec557482af479dfa3023db2118399ec0a3b7",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/dotenv/package.json",
+          "sha256": "99b0931dcb49682a781c9759dce5dd8f37f71a9c52fe8f74ed6f2d91814b7d18"
+        }
+      }
+    },
+    {
+      "id": "zod",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "zod",
+        "version": "4.6.7",
+        "source": "https://registry.npmjs.org/zod/4.6.7",
+        "tarball": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
+        "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
+        "tarball_sha256": "84efd155bed93270286e793fc951be270b536cbd5b0eeb111f0fa3967201d698",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/zod/package.json",
+          "sha256": "c2d190d9ee4e0bdb60332aaa2130a6a98d65ddb903fe1d29248b15de57832c45"
+        }
+      }
+    },
+    {
+      "id": "joi",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "joi",
+        "version": "18.3.2",
+        "source": "https://registry.npmjs.org/joi/18.3.2",
+        "tarball": "https://registry.npmjs.org/joi/-/joi-18.3.2.tgz",
+        "integrity": "sha512-iUivApKYw5GpZmq2Sy6El99j7noo8QSUFZlyQtr3HCkosC/b5wKF6/Y3teiHIlaM8WI38sAT3P+51rB0lhAhJA==",
+        "tarball_sha256": "32e56f6aa607770c0f34cbe209e197b887c7815f9d31e8a03944f3cd54cc19b7",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/joi/package.json",
+          "sha256": "2fd4fb51431460228b897b1c9344a154666363d4fe6feef86306531a097ecc0d"
+        }
+      }
+    },
+    {
+      "id": "ajv",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "ajv",
+        "version": "8.20.0",
+        "source": "https://registry.npmjs.org/ajv/8.20.0",
+        "tarball": "https://registry.npmjs.org/ajv/-/ajv-8.20.0.tgz",
+        "integrity": "sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==",
+        "tarball_sha256": "b2f0b3a893bbb8cc5efb6814f08b1499e19e31d5dd73683f5893382f48f6e7b3",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/ajv/package.json",
+          "sha256": "1f9033ee5a6515e7d76938b7072941862d1ed228a6879cc7fe10cdeb75107989"
+        }
+      }
+    },
+    {
+      "id": "lodash",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "lodash",
+        "version": "4.18.1",
+        "source": "https://registry.npmjs.org/lodash/4.18.1",
+        "tarball": "https://registry.npmjs.org/lodash/-/lodash-4.18.1.tgz",
+        "integrity": "sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q==",
+        "tarball_sha256": "696942c2a488c9d7428e9ca5f12ccf03b52de01dcdbfe4d4751d392f0491ae16",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/lodash/package.json",
+          "sha256": "5ef0a453b679125b155af19e1477f93b577ea826a57e1545f77608d326966e6a"
+        }
+      }
+    },
+    {
+      "id": "ramda",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "ramda",
+        "version": "0.32.0",
+        "source": "https://registry.npmjs.org/ramda/0.32.0",
+        "tarball": "https://registry.npmjs.org/ramda/-/ramda-0.32.0.tgz",
+        "integrity": "sha512-GQWAHhxhxWBWA8oIBr1XahFVjQ9Fic6MK9ikijfd4TZHfE2+urfk+irVlR5VOn48uwMgM+loRRBJd6Yjsbc0zQ==",
+        "tarball_sha256": "e99a665207ddba7c1177c8062f607c37d31ac376674d41200418627428863967",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/ramda/package.json",
+          "sha256": "9609f9bcbe6cbc2b9038f9a5c65f402c6419b87fdf952a9355b7200986ed455a"
+        }
+      }
+    },
+    {
+      "id": "rxjs",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "rxjs",
+        "version": "7.8.2",
+        "source": "https://registry.npmjs.org/rxjs/7.8.2",
+        "tarball": "https://registry.npmjs.org/rxjs/-/rxjs-7.8.2.tgz",
+        "integrity": "sha512-dhKf903U/PQZY6boNNtAGdWbG85WAbjT/1xYoZIC7FAY0yWapOBQVsVrDl58W86//e1VpMNBtRV4MaXfdMySFA==",
+        "tarball_sha256": "2312f8ffd9726ffd7bd53ea12c5f13663d09a3dc3326f448c70b88f5ef6fac82",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/rxjs/package.json",
+          "sha256": "2399f5d968d1d693ecd206e7972fd26cb7e3daa45931ecc12202b3a924be38b7"
+        }
+      }
+    },
+    {
+      "id": "tanstack-react-query",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@tanstack/react-query",
+        "version": "5.107.1",
+        "source": "https://registry.npmjs.org/%40tanstack%2Freact-query/5.107.1",
+        "tarball": "https://registry.npmjs.org/@tanstack/react-query/-/react-query-5.107.1.tgz",
+        "integrity": "sha512-udCOOLp3ZAheUrIHLCe+ZZge6nr2ZUrGMSWcCuXsjY1Bf2JeeE09oxst97PILiCY6N8xo/7bIo3Hvz13zh06FA==",
+        "tarball_sha256": "66722513e2e4fc74fb10070c517eb2d952993c9f960bcbfb0222dbe16f5b8ee8",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/tanstack-react-query/package.json",
+          "sha256": "2a2d66d46321b0a124a3ad5f8d6378ec08621bcc18f91ab3128b4fc884d51cbe"
+        }
+      }
+    },
+    {
+      "id": "reduxjs-toolkit",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@reduxjs/toolkit",
+        "version": "2.14.0",
+        "source": "https://registry.npmjs.org/%40reduxjs%2Ftoolkit/2.14.0",
+        "tarball": "https://registry.npmjs.org/@reduxjs/toolkit/-/toolkit-2.14.0.tgz",
+        "integrity": "sha512-m/PxMwRe0xLL6XUsAgy0YjInklHcfi9uMwFhJk+QINqjxqPvyc89T5cMjszA5bDmTE0gwGc7zr9LRO4gL+mhaw==",
+        "tarball_sha256": "1e5a0946e81e9c365141d18c7067221b48ba66c6858d0a6e23296a31b095f82b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/reduxjs-toolkit/package.json",
+          "sha256": "d16ccd98ba34b171f6f63c1b7b5d4c0f08990506c54ad9115e13c5a6cc117bd5"
+        }
+      }
+    },
+    {
+      "id": "react-router",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "react-router",
+        "version": "8.5.1",
+        "source": "https://registry.npmjs.org/react-router/8.5.1",
+        "tarball": "https://registry.npmjs.org/react-router/-/react-router-8.5.1.tgz",
+        "integrity": "sha512-5u1eQ46QjuXjNfEnLwzrnou1Bm5dquO3xjVYkkMYCudtkicD2AQHtx+fvXzPATtPJx8TW6DR1x1TDRqsfHyZBw==",
+        "tarball_sha256": "f9fae83c2c8e5263a34f481efb3cb1e9271564e74c67f398192493e4ed8a8a31",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/react-router/package.json",
+          "sha256": "17519ee453fbbdb49834b891a0d6dc592a5556b4de9082a02be59ec3d74ac40a"
+        }
+      }
+    },
+    {
+      "id": "react-hook-form",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "react-hook-form",
+        "version": "7.92.0",
+        "source": "https://registry.npmjs.org/react-hook-form/7.92.0",
+        "tarball": "https://registry.npmjs.org/react-hook-form/-/react-hook-form-7.92.0.tgz",
+        "integrity": "sha512-O5ILyY5fYHN7N13Pfxpe55KboyNFsJdM03BHpshQkClJd8raugiAUGY7VjifITrfhVxyx81ko25azXCoayhf1w==",
+        "tarball_sha256": "8af1f8eb8538a6e5ae026702c175d457e95ee59d7ba4add445885d6ee88e1a7b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/react-hook-form/package.json",
+          "sha256": "e176576c9c5bc0249789faef03b137c66ab9724596fb89ede1d6ddd1b6509d16"
+        }
+      }
+    },
+    {
+      "id": "mui-material",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@mui/material",
+        "version": "9.5.0",
+        "source": "https://registry.npmjs.org/%40mui%2Fmaterial/9.5.0",
+        "tarball": "https://registry.npmjs.org/@mui/material/-/material-9.5.0.tgz",
+        "integrity": "sha512-QgqvdVjZoKxP8E8SBxYY6LrdV+kw00moXweZQWBbMMdifPKZAGfUaaXhGKIca6fjKnCL6HJIe/AWWCpqNvyHVw==",
+        "tarball_sha256": "0b222105eac08eebc55fe9d071c07766df1db7027ab5ae21e6f3c3ec7dfff032",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/mui-material/package.json",
+          "sha256": "acf625bc2bcc8fd35032975dfbb1a8271f70c36f77afc50e982c4e2e4b3f79b5"
+        }
+      }
+    },
+    {
+      "id": "emotion-react",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@emotion/react",
+        "version": "11.14.0",
+        "source": "https://registry.npmjs.org/%40emotion%2Freact/11.14.0",
+        "tarball": "https://registry.npmjs.org/@emotion/react/-/react-11.14.0.tgz",
+        "integrity": "sha512-O000MLDBDdk/EohJPFUqvnp4qnHeYkVP5B0xEG0D/L7cOKP9kefu2DXn8dj74cQfsEzUqh+sr1RzFqiL1o+PpA==",
+        "tarball_sha256": "56ab452022e865baa9fc02d12ad5a57b2c0d8884c5cc1b0bff5308a26d92b1f4",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/emotion-react/package.json",
+          "sha256": "8333c1571eb89fe5a7a52dce7767867e679c81efa58f673120216c15c96b6709"
+        }
+      }
+    },
+    {
+      "id": "antd",
+      "category": "libraries",
+      "kind": "published-manifest",
+      "source": {
+        "package": "antd",
+        "version": "6.7.0",
+        "source": "https://registry.npmjs.org/antd/6.7.0",
+        "tarball": "https://registry.npmjs.org/antd/-/antd-6.7.0.tgz",
+        "integrity": "sha512-QwFK+butqX4HA3xG2zWN9OOQVLdlV4S3WC5BETtDEXGypBlSZy0LPFFwQIGJl10UtGAQi3p6Z4WiDVf7nr4FcA==",
+        "tarball_sha256": "a50a9c54e9619e8c38f507ea9745b3b1b4e188b7922e7236397271ae16bf75a3",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/antd/package.json",
+          "sha256": "8a0b542eecba031b2d9600370d5c18afbdae825fd62eab772f037a8b1783f9c6"
+        }
+      }
+    },
+    {
+      "id": "sharp",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "sharp",
+        "version": "0.35.5",
+        "source": "https://registry.npmjs.org/sharp/0.35.5",
+        "tarball": "https://registry.npmjs.org/sharp/-/sharp-0.35.5.tgz",
+        "integrity": "sha512-Ywn4OnzGukp7CDMrp08RQ50YKmuwG47brZgIVPTvBaaAfQlRlygrRqSrxdCiL9M+LlzLBiJ68IR1QqvzHyjC7g==",
+        "tarball_sha256": "3b6bbbe6b308f5c383938ca4a31926cd5d79c4651ed8c5fda16a97da2014a9ac",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/sharp/package.json",
+          "sha256": "ad4a2535d72eb638053a38867b1abf43c328cd1c1dbae5cf4172d498365a8b97"
+        }
+      }
+    },
+    {
+      "id": "bcrypt",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "bcrypt",
+        "version": "6.0.0",
+        "source": "https://registry.npmjs.org/bcrypt/6.0.0",
+        "tarball": "https://registry.npmjs.org/bcrypt/-/bcrypt-6.0.0.tgz",
+        "integrity": "sha512-cU8v/EGSrnH+HnxV2z0J7/blxH8gq7Xh2JFT6Aroax7UohdmiJJlxApMxtKfuI7z68NvvVcmR78k2LbT6efhRg==",
+        "tarball_sha256": "3b2478cda06f066c744e06cd0b68f55e14cc546c19ee2b80be600dfc65b5ae20",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/bcrypt/package.json",
+          "sha256": "33510b2b8859265a413ab101cdf961b1c9b076d93496f52d8ac7eacc007859a4"
+        }
+      }
+    },
+    {
+      "id": "sqlite3",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "sqlite3",
+        "version": "6.0.1",
+        "source": "https://registry.npmjs.org/sqlite3/6.0.1",
+        "tarball": "https://registry.npmjs.org/sqlite3/-/sqlite3-6.0.1.tgz",
+        "integrity": "sha512-X0czUUMG2tmSqJpEQa3tCuZSHKIx8PwM53vLZzKp/o6Rpy25fiVfjdbnZ988M8+O3ZWR1ih0K255VumCb3MAnQ==",
+        "tarball_sha256": "ab8d044a93e05bd031d7ea75547c7fa60387cdc259d27f93c0e3e2832c4b1df9",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/sqlite3/package.json",
+          "sha256": "7764f6dbb79770566981e23861882accc7b30e83622c0d2fb4854e7e0beb1861"
+        }
+      }
+    },
+    {
+      "id": "better-sqlite3",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "better-sqlite3",
+        "version": "13.1.1",
+        "source": "https://registry.npmjs.org/better-sqlite3/13.1.1",
+        "tarball": "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-13.1.1.tgz",
+        "integrity": "sha512-JjyLCATp+VLxZVFyWkicyzKYwpEFLCrV4MmshW97xv3JXdhw5jBDcsbEWRGm2L/96E+k7rtjON8q9nml05h3Pw==",
+        "tarball_sha256": "48ae9bb840ce3490951ebf3ef8def7ada9306983627ef2232c3443e8a5cd2598",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/better-sqlite3/package.json",
+          "sha256": "910b6a55961a148c2915db06b9275f20484b6da79676fa82f1a2f4a490da9565"
+        }
+      }
+    },
+    {
+      "id": "canvas",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "canvas",
+        "version": "3.2.3",
+        "source": "https://registry.npmjs.org/canvas/3.2.3",
+        "tarball": "https://registry.npmjs.org/canvas/-/canvas-3.2.3.tgz",
+        "integrity": "sha512-PzE5nJZPz72YUAfo8oTp0u3fqqY7IzlTubneAihqDYAUcBk7ryeCmBbdJBEdaH0bptSOe2VT2Zwcb3UaFyaSWw==",
+        "tarball_sha256": "8b0e958df3511566da8e797da68035d0b2425f13a4b6879b5b3e39bca2f96217",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/canvas/package.json",
+          "sha256": "a0d8fc7c96dc8c05154d93f27d646a09e6dcf74cb8bb6efe7f9179bb22e1e29f"
+        }
+      }
+    },
+    {
+      "id": "argon2",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "argon2",
+        "version": "0.45.2",
+        "source": "https://registry.npmjs.org/argon2/0.45.2",
+        "tarball": "https://registry.npmjs.org/argon2/-/argon2-0.45.2.tgz",
+        "integrity": "sha512-41gOiSQBpQf+7H7HyLZbUqRZxrNk5ps39TsJKILjWuOyAOialUkztuIVL/Y/l+n5iSA2C4/jFg3FUYso/cX7TA==",
+        "tarball_sha256": "1f5f177ba0e1ce88ed26983d5ea565a55fa0e4eb4c6213943667ea945f61dba2",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/argon2/package.json",
+          "sha256": "db00cea37550fc39417cf75becdeff175ad39f3f4670cbc99e46805377bbe837"
+        }
+      }
+    },
+    {
+      "id": "node-sass",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "node-sass",
+        "version": "9.0.0",
+        "source": "https://registry.npmjs.org/node-sass/9.0.0",
+        "tarball": "https://registry.npmjs.org/node-sass/-/node-sass-9.0.0.tgz",
+        "integrity": "sha512-yltEuuLrfH6M7Pq2gAj5B6Zm7m+gdZoG66wTqG6mIZV/zijq3M2OO2HswtT6oBspPyFhHDcaxWpsBm0fRNDHPg==",
+        "tarball_sha256": "5d28db5f71284fb2ef2ec8e1fa66de7ff5e3d62bad4a514141d3a660cd1a159d",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/node-sass/package.json",
+          "sha256": "683134bc8d00c80fea526703e1926489535123e84f1d99f160d8c339455f42ce"
+        }
+      }
+    },
+    {
+      "id": "node-pty",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "node-pty",
+        "version": "1.1.0",
+        "source": "https://registry.npmjs.org/node-pty/1.1.0",
+        "tarball": "https://registry.npmjs.org/node-pty/-/node-pty-1.1.0.tgz",
+        "integrity": "sha512-20JqtutY6JPXTUnL0ij1uad7Qe1baT46lyolh2sSENDd4sTzKZ4nmAFkeAARDKwmlLjPx6XKRlwRUxwjOy+lUg==",
+        "tarball_sha256": "c7517f19083ddcb05f276904680eb2b11a6b5ecab778b8e4e5685a6d645b3f60",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/node-pty/package.json",
+          "sha256": "f8b6a14f7022c14f1cd5d109486f5dacd32bffb63a9a63e38eced37dacb47439"
+        }
+      }
+    },
+    {
+      "id": "utf-8-validate",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "utf-8-validate",
+        "version": "6.0.6",
+        "source": "https://registry.npmjs.org/utf-8-validate/6.0.6",
+        "tarball": "https://registry.npmjs.org/utf-8-validate/-/utf-8-validate-6.0.6.tgz",
+        "integrity": "sha512-q3l3P9UtEEiAHcsgsqTgf9PPjctrDWoIXW3NpOHFdRDbLvu4DLIcxHangJ4RLrWkBcKjmcs/6NkerI8T/rE4LA==",
+        "tarball_sha256": "f65e05feb1174937bd67b5ddb7a70d5eed314989d2bc8637e1594e1623c4a00f",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/utf-8-validate/package.json",
+          "sha256": "75c6c1c5441fcc22114f12ddd202de797f606c1dc056f6c5181ed0abd4cda329"
+        }
+      }
+    },
+    {
+      "id": "bufferutil",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "bufferutil",
+        "version": "4.2.0",
+        "source": "https://registry.npmjs.org/bufferutil/4.2.0",
+        "tarball": "https://registry.npmjs.org/bufferutil/-/bufferutil-4.2.0.tgz",
+        "integrity": "sha512-gyy58jET9kst2IGyBKb96a4Y2bPGTHXGyCd0/1eqIV3hr1Sz3VxtA8n7bXh8fLIuE2K6Z0Upax5a5Msx+HU1IQ==",
+        "tarball_sha256": "5188503861441cf6431dc8343e63c677605c19cd3b1cf8b19c4fb381ce4a9094",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/bufferutil/package.json",
+          "sha256": "f43da6e419de53f59783bf6a751e08243ccd04a86a12d52a6257066ee11c96fb"
+        }
+      }
+    },
+    {
+      "id": "lmdb",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "lmdb",
+        "version": "3.5.10",
+        "source": "https://registry.npmjs.org/lmdb/3.5.10",
+        "tarball": "https://registry.npmjs.org/lmdb/-/lmdb-3.5.10.tgz",
+        "integrity": "sha512-BmqrG6y8xxmmNvEARFLy/6Nxst+Iy05l2XnfbLog+j/yRAEL3MBTmxj1a3R18h9PJ4gw7gEkSypC5iAUNwPWhQ==",
+        "tarball_sha256": "1719c5b737bfaef5c8c05ab1aac630c0938ab77382275cef382dbca744a2df2c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/lmdb/package.json",
+          "sha256": "872c88626887c94e2f96844fda556b49b1c92d3b2285d2a8d150a1b28ab20f63"
+        }
+      }
+    },
+    {
+      "id": "level",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "level",
+        "version": "10.0.0",
+        "source": "https://registry.npmjs.org/level/10.0.0",
+        "tarball": "https://registry.npmjs.org/level/-/level-10.0.0.tgz",
+        "integrity": "sha512-aZJvdfRr/f0VBbSRF5C81FHON47ZsC2TkGxbBezXpGGXAUEL/s6+GP73nnhAYRSCIqUNsmJjfeOF4lzRDKbUig==",
+        "tarball_sha256": "87aae35b297e73a1db25112279a4f6bd4604cea11fb247c4b1a79485eb9cc06b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/level/package.json",
+          "sha256": "a341c43613fe39227d9cced6805e5c4db644fa068296e2fd07cfc242f7808088"
+        }
+      }
+    },
+    {
+      "id": "snappy",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "snappy",
+        "version": "7.4.4",
+        "source": "https://registry.npmjs.org/snappy/7.4.4",
+        "tarball": "https://registry.npmjs.org/snappy/-/snappy-7.4.4.tgz",
+        "integrity": "sha512-F9BsNSAePMi9lloD5+T6TdhnQ9Z4xwH0wf8Hd4Rk3NavI4A5dc/1LV71qF6sxfbeeHq4tWY+VFWfqSND74EZFQ==",
+        "tarball_sha256": "012f991fa3199b45fdce9bbc45f51cab8e3c04945479e7e51d7e5ba1888e7c25",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/snappy/package.json",
+          "sha256": "10af7630f535867ca360b557122a1043c459d146548a32363773a1d46664ff72"
+        }
+      }
+    },
+    {
+      "id": "isolated-vm",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "isolated-vm",
+        "version": "7.0.2",
+        "source": "https://registry.npmjs.org/isolated-vm/7.0.2",
+        "tarball": "https://registry.npmjs.org/isolated-vm/-/isolated-vm-7.0.2.tgz",
+        "integrity": "sha512-Z1sYxpptGyGiKblG16EJEdP5x9/68C6AuqFFsewnrxlwSlrTLHKqtRMogOjcYZ0f8/cijMaRi+XwiHVQ1+uG+g==",
+        "tarball_sha256": "a7de21e58b64fcd33d22050b123cc7d56c576f2c3dd95fff0e5bce784da0dd2a",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/isolated-vm/package.json",
+          "sha256": "769118bbe32df6749e6fb67f83d104be8ebb8e8af4cedf23301bbe6b9ac178d0"
+        }
+      }
+    },
+    {
+      "id": "keytar",
+      "category": "native",
+      "kind": "published-manifest",
+      "source": {
+        "package": "keytar",
+        "version": "7.9.0",
+        "source": "https://registry.npmjs.org/keytar/7.9.0",
+        "tarball": "https://registry.npmjs.org/keytar/-/keytar-7.9.0.tgz",
+        "integrity": "sha512-VPD8mtVtm5JNtA2AErl6Chp06JBfy7diFQ7TQQhdpWOl6MrCRB+eRbvAZUsbGQS9kiMq0coJsy0W0vHpDCkWsQ==",
+        "tarball_sha256": "3b0faf5e59063f0cfc90d2ca3122568966cd9404fc5f761c7b2b2b2addea1973",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/keytar/package.json",
+          "sha256": "a61ef35e2be5303ebd66939abafc243a9a2427e8f4d707abb0e34301be80c3c5"
+        }
+      }
+    },
+    {
+      "id": "npm",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "npm",
+        "version": "12.2.2",
+        "source": "https://registry.npmjs.org/npm/12.2.2",
+        "tarball": "https://registry.npmjs.org/npm/-/npm-12.2.2.tgz",
+        "integrity": "sha512-KglgbZyacf7jH+FHuNRqVuCzQi8VhI2a7J87Ix43FsPTuZoGWmIXXGdZtBUOA79vwL+IJREqURVzupA7PsQTcA==",
+        "tarball_sha256": "07fecbf753e2c3bc10ebeb3e9ed8738f6a0cc1292998b79e2e9f1dd2a5525e0c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/npm/package.json",
+          "sha256": "44c37a6a06ae01d4ad987bc4710031ae3a42d47173100316e4913ab2cd113cd3"
+        }
+      }
+    },
+    {
+      "id": "pnpm",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "pnpm",
+        "version": "12.18.0",
+        "source": "https://registry.npmjs.org/pnpm/12.18.0",
+        "tarball": "https://registry.npmjs.org/pnpm/-/pnpm-12.18.0.tgz",
+        "integrity": "sha512-nXiC1dyCFH7PxOBiqjSDTgrQKWcQoYN6ERWuASEn02txCeMhrBWYod0KZVl2gbHpmRfhLtDXSerpEYeUM2O+sw==",
+        "tarball_sha256": "29d1d7d99bf6ec6d0a3dbb0ec5656f0d16e997e8be676ca45c581d11cb71f753",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/pnpm/package.json",
+          "sha256": "616b5248ff980a054586b3c3425e52f9457a89f2d394e7d3857a461d561c2bd9"
+        }
+      }
+    },
+    {
+      "id": "yarn",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "yarn",
+        "version": "1.22.22",
+        "source": "https://registry.npmjs.org/yarn/1.22.22",
+        "tarball": "https://registry.npmjs.org/yarn/-/yarn-1.22.22.tgz",
+        "integrity": "sha512-prL3kGtyG7o9Z9Sv8IPfBNrWTDmXB4Qbes8A9rEzt6wkJV8mUvoirjU0Mp3GGAU06Y0XQyA3/2/RQFVuK7MTfg==",
+        "tarball_sha256": "c17d3797fb9a9115bf375e31bfd30058cac6bc9c3b8807a3d8cb2094794b51ca",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/yarn/package.json",
+          "sha256": "9533b84eaaeea708ab99bcf92772bc81c7389f90a04f8b0188c163f9b3b621c3"
+        }
+      }
+    },
+    {
+      "id": "npm-check-updates",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "npm-check-updates",
+        "version": "23.1.1",
+        "source": "https://registry.npmjs.org/npm-check-updates/23.1.1",
+        "tarball": "https://registry.npmjs.org/npm-check-updates/-/npm-check-updates-23.1.1.tgz",
+        "integrity": "sha512-UzYDvvsQRkmXR59g9SqsQxygYp7AhFpfEcOOGOJaB/P7pF/XlaqIYLK3UjUGfMHH1+aS2nZvJRaIsk2nk0z5ag==",
+        "tarball_sha256": "725dd4f00b14a5d58913c665a263b432d88decffb92ab49654c2ca1499fab9f5",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/npm-check-updates/package.json",
+          "sha256": "e957b573ce283b2edeb63af45ad2813c6d350cd93d35c6187e21c88a43c29b3a"
+        }
+      }
+    },
+    {
+      "id": "pacote",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "pacote",
+        "version": "22.0.1",
+        "source": "https://registry.npmjs.org/pacote/22.0.1",
+        "tarball": "https://registry.npmjs.org/pacote/-/pacote-22.0.1.tgz",
+        "integrity": "sha512-pu51B21E5u3MXD+ujjYO09ppqXmFLph1iPR17ySgKoakAj/iDApcMoQprUff8Wj96emV2tFhMRFkCvEMFnIDPQ==",
+        "tarball_sha256": "7d97cd6a838742d781fb5f777c7b4acfedc5c118e9852061682896c2a43c6ebe",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/pacote/package.json",
+          "sha256": "9e94fa709325911bbfbce7617209ab3aceabce938f240b03a6ed0d5780b8ff2e"
+        }
+      }
+    },
+    {
+      "id": "npmcli-arborist",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "@npmcli/arborist",
+        "version": "10.0.4",
+        "source": "https://registry.npmjs.org/%40npmcli%2Farborist/10.0.4",
+        "tarball": "https://registry.npmjs.org/@npmcli/arborist/-/arborist-10.0.4.tgz",
+        "integrity": "sha512-QMVxWzrv+XmBjjBGIqEQTQ1uKzfAA7YTT0Q7AaJ5MvmlsfWLffV5mt9pZGUAugHg4q/lIMHzkhFgWMgqFo87kA==",
+        "tarball_sha256": "bd7629ad9ac2c2a6f5fce1fbfe54df8a93a3a972b3c728ccf19f1cc56cc6bee8",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/npmcli-arborist/package.json",
+          "sha256": "9e1009c8b34c1f19477fe0d9da3909219614588a9cad6a4c46a8ecd595a0e777"
+        }
+      }
+    },
+    {
+      "id": "cacache",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "cacache",
+        "version": "21.0.2",
+        "source": "https://registry.npmjs.org/cacache/21.0.2",
+        "tarball": "https://registry.npmjs.org/cacache/-/cacache-21.0.2.tgz",
+        "integrity": "sha512-P1W9H2p3vBmvDhk5g/82aKTOxB3RpHK55IdiH2cAjX7Ts0bE/3OJI9F8HHoNTrCqsZq9XM3XB+ZblaDL8Ycd/g==",
+        "tarball_sha256": "d9509dbdc9f6cd832aa27c6a8fc71a719df6b86b1b5f574e82c3ae1e8bc061d2",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/cacache/package.json",
+          "sha256": "4e28a924352037c824d2bd18a7969eddda42eae1cff4dba2aa1cd2a2ff5f6b4a"
+        }
+      }
+    },
+    {
+      "id": "tar",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "tar",
+        "version": "7.5.23",
+        "source": "https://registry.npmjs.org/tar/7.5.23",
+        "tarball": "https://registry.npmjs.org/tar/-/tar-7.5.23.tgz",
+        "integrity": "sha512-lkukzdoGngZHJZXxW4S/E4Fp9ghTDlyZXrQGRNoJ/LXvDKcXUTq2sg5yQe74po7Voea6n/IN09+wE/QvJMiifA==",
+        "tarball_sha256": "0fa9bdbc6ad7dfbc1814e3dbe6166e1c5140e49646a7f91f3b5fcf0a9bb2db01",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/tar/package.json",
+          "sha256": "a19d6f10761450394badb32d46fb7a44734ed1c238651c786db2ab521103781f"
+        }
+      }
+    },
+    {
+      "id": "node-gyp",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "node-gyp",
+        "version": "13.1.0",
+        "source": "https://registry.npmjs.org/node-gyp/13.1.0",
+        "tarball": "https://registry.npmjs.org/node-gyp/-/node-gyp-13.1.0.tgz",
+        "integrity": "sha512-FpNzOLFACKG0oRBYbZ5WOeWD1EqRTIWX90MaRIWTO18lVYPx8fqIjrdS3pihjnCkSmgop6zVGkSqg1vXZLksuw==",
+        "tarball_sha256": "15663ca4944844139023390f057e86f1897d855959ea7e96f151d4873be8c71f",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/node-gyp/package.json",
+          "sha256": "ec97545c723a1b046b627b426e16977e473a64971a542a653a854fbbace6aca4"
+        }
+      }
+    },
+    {
+      "id": "prebuild-install",
+      "category": "packaging",
+      "kind": "published-manifest",
+      "source": {
+        "package": "prebuild-install",
+        "version": "7.1.3",
+        "source": "https://registry.npmjs.org/prebuild-install/7.1.3",
+        "tarball": "https://registry.npmjs.org/prebuild-install/-/prebuild-install-7.1.3.tgz",
+        "integrity": "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==",
+        "tarball_sha256": "6741b8ecf3c24c0a652748ca362560405b38797c760ccff531ab61f14930f9ab",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "files": {
+        "package.json": {
+          "path": "published/prebuild-install/package.json",
+          "sha256": "d8502f5ce977ea10cc7e91e95b595ce845e838cf412801230e9a2f211ad68039"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-berry",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-berry/package.json"
+      },
+      "files": {
+        "apps/docs/package.json": {
+          "path": "templates/workspace-with-berry/apps/docs/package.json",
+          "sha256": "35f396cb7e75c3ed1a4ef97998086b7513b330d0f84c3d8c540c09db46a693e5"
+        },
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-berry/apps/web/package.json",
+          "sha256": "b550b3df7d2c5b4b48a6f35e71ca5c680a191e293d31236ce2763ea746dc55ce"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-berry/package.json",
+          "sha256": "7c12e5c88e724c8b4d557775989e55087826c63f9f0d9f06726e94c79d1d88b4"
+        },
+        "packages/eslint-config/package.json": {
+          "path": "templates/workspace-with-berry/packages/eslint-config/package.json",
+          "sha256": "bf5aac6afbf968f9891306f2c9957a064caa8621358b50d927fc78e8ff791a08"
+        },
+        "packages/tsconfig/package.json": {
+          "path": "templates/workspace-with-berry/packages/tsconfig/package.json",
+          "sha256": "1b052630b59910c9273f185b3dff166efd6c7f00cca006f34d93e358912eaf4b"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-berry/packages/ui/package.json",
+          "sha256": "cfe7e2186cb554da267a9af526b921760b54ff813245fa3c3f2b1b6470403c5e"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-docker",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-docker/package.json"
+      },
+      "files": {
+        "apps/api/package.json": {
+          "path": "templates/workspace-with-docker/apps/api/package.json",
+          "sha256": "8125a7401e01e551e0e7ac740f75528d45fcac71b3c096343f3cede3b04460b4"
+        },
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-docker/apps/web/package.json",
+          "sha256": "8efb92a02fc7ba5476f6a704b66b3dfc6c2f1ce2b264ae64fd0fa2c1e2b8079a"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-docker/package.json",
+          "sha256": "e58e95341d19a5c80a3afa9179602a3e8060dc76998cbe4ae7fdba661f720280"
+        },
+        "packages/eslint-config/package.json": {
+          "path": "templates/workspace-with-docker/packages/eslint-config/package.json",
+          "sha256": "97b01d46eefe55ced1da5a64cb8ce72626ce14ad842e92c8b7ffae70b84ebd11"
+        },
+        "packages/jest-presets/package.json": {
+          "path": "templates/workspace-with-docker/packages/jest-presets/package.json",
+          "sha256": "2e41e3455ed16e055177aedfdaf9db4677e8eb7eef810edfe42d74accb125533"
+        },
+        "packages/logger/package.json": {
+          "path": "templates/workspace-with-docker/packages/logger/package.json",
+          "sha256": "bec4ec24baf110208eb41aa3323af6ccbc171f3d0edf3b286f4257e9241bc2d7"
+        },
+        "packages/typescript-config/package.json": {
+          "path": "templates/workspace-with-docker/packages/typescript-config/package.json",
+          "sha256": "1b052630b59910c9273f185b3dff166efd6c7f00cca006f34d93e358912eaf4b"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-docker/packages/ui/package.json",
+          "sha256": "d9565dae423c40cbe67bf227b140906c6e1db8cf3136797fc1f9f3c6292cc340"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-nextjs-elysia",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-nextjs-elysia/package.json"
+      },
+      "files": {
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-nextjs-elysia/apps/web/package.json",
+          "sha256": "10c1987b0a7239386b55b75ace59aa88d37a43e31fa4adde4f9b8255c7240d8c"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-nextjs-elysia/package.json",
+          "sha256": "66b97c1d8cc8279da80f45cc3dc4ae642e988a7568d2d31bd454f42ecc5bf24a"
+        },
+        "packages/contract/package.json": {
+          "path": "templates/workspace-with-nextjs-elysia/packages/contract/package.json",
+          "sha256": "5536ba3fcb475c0a1048da20822f3adab198e9792dfe355630374aea0fad8559"
+        },
+        "packages/typescript-config/package.json": {
+          "path": "templates/workspace-with-nextjs-elysia/packages/typescript-config/package.json",
+          "sha256": "1b052630b59910c9273f185b3dff166efd6c7f00cca006f34d93e358912eaf4b"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-nextjs-elysia/packages/ui/package.json",
+          "sha256": "88ae4f941b598cb44d3c692ca267f175db7a252c72ada936f8900e49ca7359ea"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-npm",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-npm/package.json"
+      },
+      "files": {
+        "apps/docs/package.json": {
+          "path": "templates/workspace-with-npm/apps/docs/package.json",
+          "sha256": "e63ebefa4f708a0466b703a6eaeb05899538fe36e30aa28042a8afa3bf91371f"
+        },
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-npm/apps/web/package.json",
+          "sha256": "ffc831b387a8b990551f8d3ac673d93286caf5f857c6472929f3beef46ff73d2"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-npm/package.json",
+          "sha256": "99f7395d816bdda84b6f2e911d004168b585274dd4ca3dff922dd7eaa5ca09cd"
+        },
+        "packages/eslint-config/package.json": {
+          "path": "templates/workspace-with-npm/packages/eslint-config/package.json",
+          "sha256": "0b43dc9c4446e7da311f36864ee682ea14a48c56123583942507402c311194bb"
+        },
+        "packages/typescript-config/package.json": {
+          "path": "templates/workspace-with-npm/packages/typescript-config/package.json",
+          "sha256": "1b052630b59910c9273f185b3dff166efd6c7f00cca006f34d93e358912eaf4b"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-npm/packages/ui/package.json",
+          "sha256": "159ea51fc3efa42a029ebc2bb81bfedbae697be0cf04e425d209962773e681e8"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-react-native-web",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-react-native-web/package.json"
+      },
+      "files": {
+        "apps/native/package.json": {
+          "path": "templates/workspace-with-react-native-web/apps/native/package.json",
+          "sha256": "296cfb7490ad68e14d73f7ea9d8a937cbb2b2be9f626e4c511da69910481c21b"
+        },
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-react-native-web/apps/web/package.json",
+          "sha256": "36c4ecb529ed761b5b871f2012fe00abf856eec74d9c8f624478e0b6077d249d"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-react-native-web/package.json",
+          "sha256": "b4fd3c0f747903de0369e1f2c491ac5bff5cf81dd5533f14a29aa5c63c7b4be6"
+        },
+        "packages/typescript-config/package.json": {
+          "path": "templates/workspace-with-react-native-web/packages/typescript-config/package.json",
+          "sha256": "44ab06f4e102285168518c223de8c3afc07c41b8379d26983e920b9f88298def"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-react-native-web/packages/ui/package.json",
+          "sha256": "838ed46abd354001ad27cfd4626066f6399712cf4f164c182e03fa8ef118bc1b"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-rsbuild-module-federation",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-rsbuild-module-federation/package.json"
+      },
+      "files": {
+        "host/package.json": {
+          "path": "templates/workspace-with-rsbuild-module-federation/host/package.json",
+          "sha256": "e460189aa256e3b69b05aaca5a452afeeef7ec9be4158e104c6d701a64440973"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-rsbuild-module-federation/package.json",
+          "sha256": "732c6d26c402ff369ca691bbb49b41f6e4faeefe570341eb89533dc3649fb497"
+        },
+        "remote/package.json": {
+          "path": "templates/workspace-with-rsbuild-module-federation/remote/package.json",
+          "sha256": "58cb930801792267a2cbf99d4119dc57ff884829cd9a72872537fe4ae284034d"
+        },
+        "shared-ui/package.json": {
+          "path": "templates/workspace-with-rsbuild-module-federation/shared-ui/package.json",
+          "sha256": "4ea7834433b73fe03c5390aa6b3bbdef6ff22a6f5782a7938700d01ee7dfae99"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-vite-module-federation",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-vite-module-federation/package.json"
+      },
+      "files": {
+        "host/package.json": {
+          "path": "templates/workspace-with-vite-module-federation/host/package.json",
+          "sha256": "3718d33d9e4af3b94879e6fdbae95e9fae8bf41606a18f1cd903e111eda3f8b7"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-vite-module-federation/package.json",
+          "sha256": "c656c7686b2a9ecf67baa55ea84866d626e0908569ca36892c444aaccc536d6e"
+        },
+        "remote/package.json": {
+          "path": "templates/workspace-with-vite-module-federation/remote/package.json",
+          "sha256": "6b0341e20c2a6f853e72abfce6b56b657843b1cf12d3946358e2f780ad688fb8"
+        },
+        "shared-ui/package.json": {
+          "path": "templates/workspace-with-vite-module-federation/shared-ui/package.json",
+          "sha256": "e66d778897d4f1f890a611b3383c22f95e275e8031ecd5dbf0c755b8f0b11648"
+        }
+      }
+    },
+    {
+      "id": "workspace-with-yarn",
+      "kind": "official-workspace-template",
+      "category": "workspaces",
+      "source": {
+        "repository": "vercel/turborepo",
+        "revision": "b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/vercel/turborepo/b7571c4e4b9fab26acfba1b2e0e6f87aefc3559f/examples/with-yarn/package.json"
+      },
+      "files": {
+        "apps/docs/package.json": {
+          "path": "templates/workspace-with-yarn/apps/docs/package.json",
+          "sha256": "dfee7b812c0c3758d2f811b0be6b726aa9ac0cea2170d6878f1fe59dadb8193e"
+        },
+        "apps/web/package.json": {
+          "path": "templates/workspace-with-yarn/apps/web/package.json",
+          "sha256": "136289e79d8c68108a441332e97223080b4d1e31546a1c00c2e0caae8170e4e1"
+        },
+        "package.json": {
+          "path": "templates/workspace-with-yarn/package.json",
+          "sha256": "c381253e27409e75d7082835d5fe2d4c2b84b5d4c67c480c5cdfc4f5c445306c"
+        },
+        "packages/eslint-config/package.json": {
+          "path": "templates/workspace-with-yarn/packages/eslint-config/package.json",
+          "sha256": "0bdc0478609b804ed5bc7dfb2f6b11f489f876c967963ae6c620cf45398ba681"
+        },
+        "packages/typescript-config/package.json": {
+          "path": "templates/workspace-with-yarn/packages/typescript-config/package.json",
+          "sha256": "1b052630b59910c9273f185b3dff166efd6c7f00cca006f34d93e358912eaf4b"
+        },
+        "packages/ui/package.json": {
+          "path": "templates/workspace-with-yarn/packages/ui/package.json",
+          "sha256": "83461f86ebb9e46b0cbacfeab880d7ea416586e7c623417c5ab7b074251071b6"
+        }
+      }
+    },
+    {
+      "id": "workspace-npm-cli",
+      "kind": "official-workspace-manifests",
+      "category": "workspaces",
+      "source": {
+        "repository": "npm/cli",
+        "revision": "8f92e740ee1547568779284005454ce2f1a5e58b",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/npm/cli/8f92e740ee1547568779284005454ce2f1a5e58b/package.json"
+      },
+      "files": {
+        "package.json": {
+          "path": "templates/workspace-npm-cli/package.json",
+          "sha256": "44c37a6a06ae01d4ad987bc4710031ae3a42d47173100316e4913ab2cd113cd3"
+        },
+        "docs/package.json": {
+          "path": "templates/workspace-npm-cli/docs/package.json",
+          "sha256": "73d701e8cbb6a04d9fa60b55f59e03365c351433e923c155eca1dc3bf8e5c07d"
+        },
+        "mock-globals/package.json": {
+          "path": "templates/workspace-npm-cli/mock-globals/package.json",
+          "sha256": "be8b563a9b1b61cf513d536ad450ca8b8abb71421157681dfdef939e71e8e1f2"
+        },
+        "mock-registry/package.json": {
+          "path": "templates/workspace-npm-cli/mock-registry/package.json",
+          "sha256": "3ea0649f0efed3b0f2b3be5efa2211303ffaf0d9e07d2dad80ce4dc8fbfa9d06"
+        },
+        "smoke-tests/package.json": {
+          "path": "templates/workspace-npm-cli/smoke-tests/package.json",
+          "sha256": "df6c5a58265d9930b73ce3760be81e6d56339a203914fc9b7b046460a0f8a5ee"
+        },
+        "workspaces/arborist/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/arborist/package.json",
+          "sha256": "9e1009c8b34c1f19477fe0d9da3909219614588a9cad6a4c46a8ecd595a0e777"
+        },
+        "workspaces/config/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/config/package.json",
+          "sha256": "0054d7e79a28bb6b377a4fb729f5af2d8480c80302cc6f79d8ef9bbfc22b2a5f"
+        },
+        "workspaces/libnpmaccess/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmaccess/package.json",
+          "sha256": "0cd4fe29ee0b77290231dd55d7cbd0e3e5cb8fd0952087065491376b3c4aa262"
+        },
+        "workspaces/libnpmdiff/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmdiff/package.json",
+          "sha256": "899ff569cf16dacc4e80e44c8766218cc385e9f7252de5f53b42c3c1a30f751b"
+        },
+        "workspaces/libnpmexec/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmexec/package.json",
+          "sha256": "3aac0cc9bf3c900a9d9a48b33abfb0f39f6f4b6e67ed4515dc589140d0326d78"
+        },
+        "workspaces/libnpmfund/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmfund/package.json",
+          "sha256": "c4fecf2243e953e28e29cbbf9b6c580f0fd0c3ccc80c618465d9e84a4373bea6"
+        },
+        "workspaces/libnpmorg/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmorg/package.json",
+          "sha256": "b8df36a3346a0484bf6d3e1b162d19b75a6d8d210c35f7191bf0078fad972c04"
+        },
+        "workspaces/libnpmpack/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmpack/package.json",
+          "sha256": "17f0f043c378ee976aec55e5471b3f4b7fb1debbf80f12b0926c0ddcfd112b85"
+        },
+        "workspaces/libnpmpublish/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmpublish/package.json",
+          "sha256": "b3c11b3f08adb1a2ebb0dc443a1ed17d8838398405598bd9fcd8f1451e9902cb"
+        },
+        "workspaces/libnpmsearch/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmsearch/package.json",
+          "sha256": "c5626cffd6ca6aaab862173741840b7900532d47d7543bec046ebcd8fd1149f4"
+        },
+        "workspaces/libnpmteam/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmteam/package.json",
+          "sha256": "640626cd8e76738123e9d236c3da7426a86b44c53f209375655b932a46db895c"
+        },
+        "workspaces/libnpmversion/package.json": {
+          "path": "templates/workspace-npm-cli/workspaces/libnpmversion/package.json",
+          "sha256": "c1d2e2273555734170020ceba06915cead4aa5da3f27bdf066380520b147a38e"
+        }
+      }
+    },
+    {
+      "id": "workspace-lerna-lerna",
+      "kind": "official-workspace-manifests",
+      "category": "workspaces",
+      "source": {
+        "repository": "lerna/lerna",
+        "revision": "2a7ecf27c271a8f0b3616b7d91bb76bab3344f01",
+        "date": "2026-11-14T02:17:24.639Z",
+        "source": "https://raw.githubusercontent.com/lerna/lerna/2a7ecf27c271a8f0b3616b7d91bb76bab3344f01/package.json"
+      },
+      "files": {
+        "package.json": {
+          "path": "templates/workspace-lerna-lerna/package.json",
+          "sha256": "a820ebd34be609f1f39ef1e6c312b1ee8a5912442e760b7b1abd4fd8c9740e62"
+        },
+        "libs/e2e-utils/package.json": {
+          "path": "templates/workspace-lerna-lerna/libs/e2e-utils/package.json",
+          "sha256": "7c71ad347025e2ff6b04e31e848f107d35d13cdd237af0aa99c2b51dab326fe7"
+        },
+        "packages/lerna/package.json": {
+          "path": "templates/workspace-lerna-lerna/packages/lerna/package.json",
+          "sha256": "ad714c163eee2d33319442414eac5381141ef5062a5a9dae91c89ef814c67d09"
+        },
+        "website/package.json": {
+          "path": "templates/workspace-lerna-lerna/website/package.json",
+          "sha256": "e93c5826e81a74bbdb1a240817e8cb13bf251eb2da664175167e8431df97a263"
+        }
+      }
+    },
+    {
+      "id": "scripts-sharp",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "sharp",
+        "version": "0.35.5",
+        "source": "https://registry.npmjs.org/sharp/0.35.5",
+        "tarball": "https://registry.npmjs.org/sharp/-/sharp-0.35.5.tgz",
+        "integrity": "sha512-Ywn4OnzGukp7CDMrp08RQ50YKmuwG47brZgIVPTvBaaAfQlRlygrRqSrxdCiL9M+LlzLBiJ68IR1QqvzHyjC7g==",
+        "tarball_sha256": "3b6bbbe6b308f5c383938ca4a31926cd5d79c4651ed8c5fda16a97da2014a9ac",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"sharp\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-sharp/package.json",
+          "sha256": "db07f1072e954c69843969ebaddc89405383e8ce06de64b80e326b4d74003c79"
+        }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-sharp-v1.json",
+          "sha256": "1136e1fec0f0bd2ab205744fabbdbd644258743a514494d4b65909786c729039",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-sharp-v2.json",
+          "sha256": "477c1769eedef6da0e6bc6e93edf07051b6cf92d27a20bf8201b8c7e366ee662",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-sharp-v3.json",
+          "sha256": "73ac9c5e4291f0390da25c801045d91f326b6f2e8855bd5be9a29c84ba3a6920",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        }
+      }
+    },
+    {
+      "id": "scripts-bcrypt",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "bcrypt",
+        "version": "6.0.0",
+        "source": "https://registry.npmjs.org/bcrypt/6.0.0",
+        "tarball": "https://registry.npmjs.org/bcrypt/-/bcrypt-6.0.0.tgz",
+        "integrity": "sha512-cU8v/EGSrnH+HnxV2z0J7/blxH8gq7Xh2JFT6Aroax7UohdmiJJlxApMxtKfuI7z68NvvVcmR78k2LbT6efhRg==",
+        "tarball_sha256": "3b2478cda06f066c744e06cd0b68f55e14cc546c19ee2b80be600dfc65b5ae20",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"bcrypt\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-bcrypt/package.json",
+          "sha256": "8ccad4eaef3295715ba80a0c7222931dd45120ece7ee425f96388d2e369542ba"
+        }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-bcrypt-v1.json",
+          "sha256": "dfce38399a752c0099d31e8b8ce563f118ff808c28457cf3d81fe9c56cecd4f6",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-bcrypt-v2.json",
+          "sha256": "c5b0b4db0050c5a1705be16a72d01d02afd2d184feac4dbfa8e3933d353bcc66",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-bcrypt-v3.json",
+          "sha256": "a9977bf40bb9578d2189d5c0c50a555afaac1915a01dc0367efc27a28eb90814",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        }
+      }
+    },
+    {
+      "id": "scripts-sqlite3",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "sqlite3",
+        "version": "6.0.1",
+        "source": "https://registry.npmjs.org/sqlite3/6.0.1",
+        "tarball": "https://registry.npmjs.org/sqlite3/-/sqlite3-6.0.1.tgz",
+        "integrity": "sha512-X0czUUMG2tmSqJpEQa3tCuZSHKIx8PwM53vLZzKp/o6Rpy25fiVfjdbnZ988M8+O3ZWR1ih0K255VumCb3MAnQ==",
+        "tarball_sha256": "ab8d044a93e05bd031d7ea75547c7fa60387cdc259d27f93c0e3e2832c4b1df9",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"sqlite3\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-sqlite3/package.json",
+          "sha256": "f5c9870451a5371bb65094c2660abbfa6913bdd44b6aa4679a90cc7e945d9b1d"
+        }
+      }
+    },
+    {
+      "id": "scripts-better-sqlite3",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "better-sqlite3",
+        "version": "13.1.1",
+        "source": "https://registry.npmjs.org/better-sqlite3/13.1.1",
+        "tarball": "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-13.1.1.tgz",
+        "integrity": "sha512-JjyLCATp+VLxZVFyWkicyzKYwpEFLCrV4MmshW97xv3JXdhw5jBDcsbEWRGm2L/96E+k7rtjON8q9nml05h3Pw==",
+        "tarball_sha256": "48ae9bb840ce3490951ebf3ef8def7ada9306983627ef2232c3443e8a5cd2598",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"better-sqlite3\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-better-sqlite3/package.json",
+          "sha256": "dfefa1d2631dc14a2daf8ca7a30eaf44cd5e34919024bdc7a04113cb5dcdd106"
+        }
+      }
+    },
+    {
+      "id": "scripts-canvas",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "canvas",
+        "version": "3.2.3",
+        "source": "https://registry.npmjs.org/canvas/3.2.3",
+        "tarball": "https://registry.npmjs.org/canvas/-/canvas-3.2.3.tgz",
+        "integrity": "sha512-PzE5nJZPz72YUAfo8oTp0u3fqqY7IzlTubneAihqDYAUcBk7ryeCmBbdJBEdaH0bptSOe2VT2Zwcb3UaFyaSWw==",
+        "tarball_sha256": "8b0e958df3511566da8e797da68035d0b2425f13a4b6879b5b3e39bca2f96217",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"canvas\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-canvas/package.json",
+          "sha256": "e64bf76290e56c803b5981a14bee690628ed88ab372e58b28432ab50c485d182"
+        }
+      }
+    },
+    {
+      "id": "scripts-argon2",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "argon2",
+        "version": "0.45.2",
+        "source": "https://registry.npmjs.org/argon2/0.45.2",
+        "tarball": "https://registry.npmjs.org/argon2/-/argon2-0.45.2.tgz",
+        "integrity": "sha512-41gOiSQBpQf+7H7HyLZbUqRZxrNk5ps39TsJKILjWuOyAOialUkztuIVL/Y/l+n5iSA2C4/jFg3FUYso/cX7TA==",
+        "tarball_sha256": "1f5f177ba0e1ce88ed26983d5ea565a55fa0e4eb4c6213943667ea945f61dba2",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"argon2\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-argon2/package.json",
+          "sha256": "988785834b3168547e5c4af4afb64de0c4dd349acd31d9c5e360b4ff5d841d2f"
+        }
+      }
+    },
+    {
+      "id": "scripts-node-pty",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "node-pty",
+        "version": "1.1.0",
+        "source": "https://registry.npmjs.org/node-pty/1.1.0",
+        "tarball": "https://registry.npmjs.org/node-pty/-/node-pty-1.1.0.tgz",
+        "integrity": "sha512-20JqtutY6JPXTUnL0ij1uad7Qe1baT46lyolh2sSENDd4sTzKZ4nmAFkeAARDKwmlLjPx6XKRlwRUxwjOy+lUg==",
+        "tarball_sha256": "c7517f19083ddcb05f276904680eb2b11a6b5ecab778b8e4e5685a6d645b3f60",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"node-pty\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-node-pty/package.json",
+          "sha256": "2b8037bff81b87397c34e2bde8327086b565abf4b22c28e21747739c015bd411"
+        }
+      }
+    },
+    {
+      "id": "scripts-utf-8-validate",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "utf-8-validate",
+        "version": "6.0.6",
+        "source": "https://registry.npmjs.org/utf-8-validate/6.0.6",
+        "tarball": "https://registry.npmjs.org/utf-8-validate/-/utf-8-validate-6.0.6.tgz",
+        "integrity": "sha512-q3l3P9UtEEiAHcsgsqTgf9PPjctrDWoIXW3NpOHFdRDbLvu4DLIcxHangJ4RLrWkBcKjmcs/6NkerI8T/rE4LA==",
+        "tarball_sha256": "f65e05feb1174937bd67b5ddb7a70d5eed314989d2bc8637e1594e1623c4a00f",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"utf-8-validate\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-utf-8-validate/package.json",
+          "sha256": "827306f75c6c3b03fecd7027bd103a3d346398f265969bbe0ba6a0bfad7362ed"
+        }
+      }
+    },
+    {
+      "id": "scripts-bufferutil",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "bufferutil",
+        "version": "4.2.0",
+        "source": "https://registry.npmjs.org/bufferutil/4.2.0",
+        "tarball": "https://registry.npmjs.org/bufferutil/-/bufferutil-4.2.0.tgz",
+        "integrity": "sha512-gyy58jET9kst2IGyBKb96a4Y2bPGTHXGyCd0/1eqIV3hr1Sz3VxtA8n7bXh8fLIuE2K6Z0Upax5a5Msx+HU1IQ==",
+        "tarball_sha256": "5188503861441cf6431dc8343e63c677605c19cd3b1cf8b19c4fb381ce4a9094",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"bufferutil\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-bufferutil/package.json",
+          "sha256": "ae69f9e8329fb7d7807bae8ef6495ba6f76f1ab38adc9441dbeb6c53696f9a06"
+        }
+      }
+    },
+    {
+      "id": "scripts-lmdb",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "lmdb",
+        "version": "3.5.10",
+        "source": "https://registry.npmjs.org/lmdb/3.5.10",
+        "tarball": "https://registry.npmjs.org/lmdb/-/lmdb-3.5.10.tgz",
+        "integrity": "sha512-BmqrG6y8xxmmNvEARFLy/6Nxst+Iy05l2XnfbLog+j/yRAEL3MBTmxj1a3R18h9PJ4gw7gEkSypC5iAUNwPWhQ==",
+        "tarball_sha256": "1719c5b737bfaef5c8c05ab1aac630c0938ab77382275cef382dbca744a2df2c",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"lmdb\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-lmdb/package.json",
+          "sha256": "74450ffe4608178e12c92240956c755feb1e35cf375394c0337aab960148442a"
+        }
+      }
+    },
+    {
+      "id": "scripts-level",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "level",
+        "version": "10.0.0",
+        "source": "https://registry.npmjs.org/level/10.0.0",
+        "tarball": "https://registry.npmjs.org/level/-/level-10.0.0.tgz",
+        "integrity": "sha512-aZJvdfRr/f0VBbSRF5C81FHON47ZsC2TkGxbBezXpGGXAUEL/s6+GP73nnhAYRSCIqUNsmJjfeOF4lzRDKbUig==",
+        "tarball_sha256": "87aae35b297e73a1db25112279a4f6bd4604cea11fb247c4b1a79485eb9cc06b",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"level\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-level/package.json",
+          "sha256": "b671ea80aaacbe5990e0ff700c3594106a326e7e26307924d13164460af540a0"
+        }
+      }
+    },
+    {
+      "id": "scripts-snappy",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "snappy",
+        "version": "7.4.4",
+        "source": "https://registry.npmjs.org/snappy/7.4.4",
+        "tarball": "https://registry.npmjs.org/snappy/-/snappy-7.4.4.tgz",
+        "integrity": "sha512-F9BsNSAePMi9lloD5+T6TdhnQ9Z4xwH0wf8Hd4Rk3NavI4A5dc/1LV71qF6sxfbeeHq4tWY+VFWfqSND74EZFQ==",
+        "tarball_sha256": "012f991fa3199b45fdce9bbc45f51cab8e3c04945479e7e51d7e5ba1888e7c25",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"snappy\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-snappy/package.json",
+          "sha256": "621011acd1abd272d8ca398f82479ff9fedbaa538caec30ebccef9dc4cc8974e"
+        }
+      }
+    },
+    {
+      "id": "scripts-keytar",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "keytar",
+        "version": "7.9.0",
+        "source": "https://registry.npmjs.org/keytar/7.9.0",
+        "tarball": "https://registry.npmjs.org/keytar/-/keytar-7.9.0.tgz",
+        "integrity": "sha512-VPD8mtVtm5JNtA2AErl6Chp06JBfy7diFQ7TQQhdpWOl6MrCRB+eRbvAZUsbGQS9kiMq0coJsy0W0vHpDCkWsQ==",
+        "tarball_sha256": "3b0faf5e59063f0cfc90d2ca3122568966cd9404fc5f761c7b2b2b2addea1973",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"keytar\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-keytar/package.json",
+          "sha256": "6f1144aa65f889772b45bf938e6a4c55303a30aba43ab46b67f5f0d9cc3a548a"
+        }
+      }
+    },
+    {
+      "id": "scripts-esbuild",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "esbuild",
+        "version": "0.28.2",
+        "source": "https://registry.npmjs.org/esbuild/0.28.2",
+        "tarball": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+        "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
+        "tarball_sha256": "e045f94c235c7adc50e77ba2a579c7bec41b496b6b47c3a7845f7c1e19959a88",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"esbuild\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-esbuild/package.json",
+          "sha256": "c88c757ad28fc6290cea4afdde6381152002d847d0d93b95a6352579e687b62e"
+        }
+      },
+      "locks": {
+        "1": {
+          "path": "locks/scripts-esbuild-v1.json",
+          "sha256": "9c858371a09dec7ebc47537cf94402a2c535736416ecfb80b50b37eaaa3e3ab8",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "2": {
+          "path": "locks/scripts-esbuild-v2.json",
+          "sha256": "69f7a3e494c414f4a0d0f3b4181395987e03d24b2ca377ed11ce410e07064a9c",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        },
+        "3": {
+          "path": "locks/scripts-esbuild-v3.json",
+          "sha256": "eb089e73318f02e457a0b39cfda80074a3af451ed8f0fad6298be087afded34a",
+          "date": "2026-11-14T02:23:51.580Z",
+          "npm": "11.20.0"
+        }
+      }
+    },
+    {
+      "id": "scripts-swc-core",
+      "kind": "script-consumer",
+      "category": "native-scripts",
+      "source": {
+        "package": "@swc/core",
+        "version": "1.16.22",
+        "source": "https://registry.npmjs.org/%40swc%2Fcore/1.16.22",
+        "tarball": "https://registry.npmjs.org/@swc/core/-/core-1.16.22.tgz",
+        "integrity": "sha512-kFqhtSmmNSZqJXIK0l9rF+oNg2efaZoeNbN/4qwbNTWfMRKApc6n7rKx827bw8K+4kmu7iH0LZ144QJTQzulHw==",
+        "tarball_sha256": "19ba0ac64879bd90305b34942e127d47dcdbf55ca200781ec79b6472edfdf650",
+        "date": "2026-11-14T02:14:46.745Z"
+      },
+      "smoke": "require(\"@swc/core\")",
+      "files": {
+        "package.json": {
+          "path": "consumers/scripts-swc-core/package.json",
+          "sha256": "0996859ec0f3620f9808476a96cb35fc52e42cf68939d4b00d110fad7f1935ba"
+        }
+      }
+    }
+  ]
+}

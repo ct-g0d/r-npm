@@ -189,9 +189,12 @@ fn test_unsupported_commands_gate_e_diagnostics() {
 
 #[test]
 fn test_unsupported_flags_gate_e_diagnostics() {
-    let flags = ["--production", "--save-bundle"];
+    // npm 11 accepts --production (as --omit=dev) and --save-bundle.
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--production"]).is_none());
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
+    let flags = ["--legacy-peer-deps", "--strict-peer-deps"];
     for flag in flags {
-        let res = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+        let res = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
         assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
         let (code, msg) = res.unwrap();
         assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
@@ -1250,10 +1253,11 @@ async fn test_cli_audit_unsupported_command_filtering() {
 
 #[tokio::test]
 async fn test_cli_unsupported_flags_filtering() {
-    let test_flags = ["--production"];
+    assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
+    let test_flags = ["--legacy-peer-deps", "--strict-peer-deps"];
 
     for flag in test_flags {
-        let check = check_unsupported_cli_invocation(vec!["rnpm", "install", flag]);
+        let check = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
         assert!(
             check.is_some(),
             "Expected unsupported flag check to trigger for '{flag}'"
@@ -2382,7 +2386,7 @@ fn test_cli_parse_whoami_ping_login_logout_token() {
         _ => panic!("Expected Commands::Ping"),
     }
 
-    // login / adduser alias
+    // login and adduser retain distinct authentication request bodies.
     let parsed_login = Cli::try_parse_from([
         "rnpm",
         "login",
@@ -2405,8 +2409,8 @@ fn test_cli_parse_whoami_ping_login_logout_token() {
     }
     let parsed_adduser = Cli::try_parse_from(["rnpm", "adduser"]).unwrap();
     match parsed_adduser.command {
-        Commands::Login { .. } => {}
-        _ => panic!("Expected Commands::Login via adduser"),
+        Commands::Adduser { .. } => {}
+        _ => panic!("Expected Commands::Adduser"),
     }
 
     // logout
@@ -2510,7 +2514,7 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "get", "foo"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::Get { key },
+            action: ConfigAction::Get { key, .. },
         } => {
             assert_eq!(key, Some("foo".to_string()));
         }
@@ -2521,7 +2525,7 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "get"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::Get { key },
+            action: ConfigAction::Get { key, .. },
         } => {
             assert!(key.is_none());
         }
@@ -2542,7 +2546,7 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "list", "--json"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::List { json },
+            action: ConfigAction::List { json, .. },
         } => {
             assert!(json);
         }
@@ -2948,7 +2952,7 @@ async fn test_org_rm_followup_error_propagation_and_order() {
                             let (status_line, body) = if method == "DELETE" && path == "/-/org/acme/user" {
                                 ("HTTP/1.1 200 OK", "{\"user\":\"alice\"}".to_string())
                             } else if method == "GET" && path == "/-/org/acme/user" {
-                                ("HTTP/1.1 403 Forbidden", "{\"message\":\"forbidden roster\"}".to_string())
+                                ("HTTP/1.1 403 Forbidden", "{\"error\":\"forbidden roster\"}".to_string())
                             } else {
                                 ("HTTP/1.1 404 Not Found", "{}".to_string())
                             };
@@ -3423,14 +3427,15 @@ fn test_http_error_formatting_parity() {
 
     let target = reqwest::Url::parse("http://127.0.0.1:8080/-/npm/v1/user").unwrap();
 
+    // npm-registry-fetch's HttpErrorGeneral appends only `body.error`.
     // 401
-    let err_401 = format_http_error("GET", &target, reqwest::StatusCode::UNAUTHORIZED, "{\"message\":\"login required\"}");
+    let err_401 = format_http_error("GET", &target, reqwest::StatusCode::UNAUTHORIZED, "{\"error\":\"login required\"}");
     let s_401 = err_401.to_string();
     assert!(s_401.contains("npm error code E401"), "Got: {s_401}");
     assert!(s_401.contains("401 Unauthorized - GET http://127.0.0.1:8080/-/npm/v1/user - login required"), "Got: {s_401}");
 
     // 403 (with security policy note)
-    let err_403 = format_http_error("GET", &target, reqwest::StatusCode::FORBIDDEN, "{\"message\":\"forbidden roster\"}");
+    let err_403 = format_http_error("GET", &target, reqwest::StatusCode::FORBIDDEN, "{\"error\":\"forbidden roster\"}");
     let s_403 = err_403.to_string();
     assert!(s_403.contains("npm error code E403"), "Got: {s_403}");
     assert!(s_403.contains("403 Forbidden - GET http://127.0.0.1:8080/-/npm/v1/user - forbidden roster"), "Got: {s_403}");

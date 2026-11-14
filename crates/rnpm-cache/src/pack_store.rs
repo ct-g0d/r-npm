@@ -689,6 +689,19 @@ impl PackStore {
         Self::new(loc)
     }
 
+    /// Remove reusable package content without following linked dependencies
+    /// outside the store or deleting unrelated files in a custom directory.
+    pub fn clean_at(root: &Path) -> Result<(), CacheError> {
+        for name in ["packs", "cas", "tmp", "linked"] {
+            rnpm_fs::remove_dir_all_safe(&root.join(name))?;
+        }
+        match fs::remove_dir(root) {
+            Ok(()) => Ok(()),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Root directory of the pack store.
     pub fn root(&self) -> &Path {
         &self.root
@@ -3242,5 +3255,22 @@ mod tests {
         let bytes = tar.into_inner().unwrap();
         let target = tempdir().unwrap();
         assert!(PackStore::decode_package_tarball(&bytes, target.path(), "escape").is_err());
+    }
+
+    #[test]
+    fn clean_store_removes_content_and_preserves_link_targets() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("store");
+        let external = temp.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("keep.txt"), "keep").unwrap();
+        let store = PackStore::new(&root).unwrap();
+        fs::write(store.cas_dir().join("cached"), "private content").unwrap();
+        fs::create_dir_all(root.join("linked")).unwrap();
+        rnpm_fs::create_junction(&root.join("linked/dep"), &external).unwrap();
+        drop(store);
+        PackStore::clean_at(&root).unwrap();
+        assert!(!root.exists());
+        assert_eq!(fs::read_to_string(external.join("keep.txt")).unwrap(), "keep");
     }
 }

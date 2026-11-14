@@ -7,6 +7,12 @@ use serde::{
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
 
+fn deserialize_license<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    // Arborist's shrinkwrap stores the type from legacy license objects.
+    Ok(value.as_str().or_else(|| value.get("type").and_then(|v| v.as_str())).map(str::to_owned))
+}
+
 pub fn deserialize_unique_versions<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
@@ -27,13 +33,38 @@ where
             M: MapAccess<'de>,
         {
             let mut map = BTreeMap::new();
-            while let Some((key, value)) = access.next_entry::<String, AbbreviatedVersion>()? {
+            while let Some((key, mut value)) = access.next_entry::<String, serde_json::Value>()? {
                 if map.contains_key(&key) {
                     return Err(de::Error::custom(format!(
                         "duplicate version key '{key}' found in packument metadata"
                     )));
                 }
-                map.insert(key, value);
+                // Full packuments retain historical manifest spellings and
+                // types. Apply pacote's package-json normalization before
+                // deserializing the resolver's typed manifest representation.
+                if let Some(object) = value.as_object_mut() {
+                    if object.get("deprecated") == Some(&serde_json::Value::Bool(false)) {
+                        object.remove("deprecated");
+                    }
+                    if let Some(legacy) = object.remove("bundledDependencies") {
+                        object.entry("bundleDependencies").or_insert(legacy);
+                    }
+                    if let Some(bundled) = object.get("bundleDependencies") {
+                        let names = match bundled {
+                            serde_json::Value::Bool(true) => object.get("dependencies").and_then(|v| v.as_object()).map(|deps| deps.keys().cloned().collect::<Vec<_>>()),
+                            serde_json::Value::Object(deps) => Some(deps.keys().cloned().collect()),
+                            serde_json::Value::Array(_) => None,
+                            _ => Some(Vec::new()),
+                        };
+                        if let Some(names) = names {
+                            object.insert("bundleDependencies".into(), serde_json::json!(names));
+                        }
+                    }
+                }
+                let engines_raw = value.get("engines").filter(|v| v.is_array() || v.is_string()).cloned();
+                let mut version: AbbreviatedVersion = serde_json::from_value(value).map_err(de::Error::custom)?;
+                if engines_raw.is_some() { version.engines_raw = engines_raw; }
+                map.insert(key, version);
             }
             Ok(map)
         }
@@ -94,9 +125,14 @@ where
         where
             S: SeqAccess<'de>,
         {
+            // Published packuments contain entries such as `"libc": [null]`
+            // (@oxc-parser bindings); npm keeps reading the document, so
+            // non-string entries are dropped instead of failing the parse.
             let mut list = Vec::new();
-            while let Some(item) = seq.next_element::<String>()? {
-                list.push(item);
+            while let Some(item) = seq.next_element::<serde_json::Value>()? {
+                if let serde_json::Value::String(s) = item {
+                    list.push(s);
+                }
             }
             Ok(list)
         }
@@ -231,10 +267,13 @@ pub struct AbbreviatedVersion {
     pub bundle_dependencies: Vec<String>,
     #[serde(default)]
     pub bin: Option<PackageBin>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_license")]
     pub license: Option<String>,
     #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: HashMap<String, String>,
+    /// Retain legacy engine shapes across the typed packument disk cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines_raw: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
     pub os: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_vec_or_string")]
@@ -300,12 +339,8 @@ impl AbbreviatedPackageMetadata {
                     "dist-tag version target for '{tag_name}' contains forbidden CR/LF characters: {tag_ver:?}"
                 )));
             }
-            if !self.versions.is_empty() && !self.versions.contains_key(tag_ver) {
-                return Err(RegistryError::MalformedMetadata(format!(
-                    "dist-tag '{tag_name}' points to non-existent version '{tag_ver}' in package '{}'",
-                    self.name
-                )));
-            }
+            // A dist-tag may dangle after an unpublish. npm keeps such
+            // packuments usable and only fails when that tag is requested.
         }
 
         // Validate versions
@@ -387,6 +422,19 @@ impl AbbreviatedPackageMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_platform_lists_tolerate_null_entries() {
+        // Shape published by @oxc-parser/binding-win32-arm64-msvc.
+        let json = r#"{
+            "name": "binding", "version": "1.0.0",
+            "dist": { "tarball": "https://r/b.tgz" },
+            "os": ["win32"], "cpu": ["arm64"], "libc": [null]
+        }"#;
+        let version: AbbreviatedVersion = serde_json::from_str(json).unwrap();
+        assert_eq!(version.os, ["win32"]);
+        assert!(version.libc.is_empty());
+    }
 
     #[test]
     fn test_deserialize_abbreviated_metadata() {
@@ -516,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_spoofed_dist_tags() {
+    fn test_dangling_dist_tags_are_tolerated_like_npm() {
         let json = r#"{
             "name": "example",
             "dist-tags": { "latest": "9.9.9" },
@@ -529,11 +577,8 @@ mod tests {
             }
         }"#;
         let meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
-        let err = meta.validate().unwrap_err();
-        assert!(err.is_malformed_metadata());
-        assert!(err
-            .to_string()
-            .contains("points to non-existent version '9.9.9'"));
+        meta.validate()
+            .expect("npm accepts packuments whose dist-tag names a missing version");
     }
 
     #[test]

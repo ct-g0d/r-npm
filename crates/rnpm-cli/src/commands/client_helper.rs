@@ -169,32 +169,29 @@ pub(crate) fn format_http_error(
     status: reqwest::StatusCode,
     body: &str,
 ) -> anyhow::Error {
-    let code = status.as_u16();
-    let reason = status.canonical_reason().unwrap_or("Error");
-    let msg = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("error"))
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                reason.to_ascii_lowercase()
-            } else {
-                body.trim().to_string()
-            }
-        });
+    format_http_error_with_auth(method, target_url, status, None, body)
+}
 
-    if code == 403 {
-        anyhow::anyhow!(
-            "npm error code E403\nnpm error 403 403 Forbidden - {method} {target_url} - {msg}\nnpm error 403 In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy, or on a server you do not have access to."
-        )
-    } else {
-        anyhow::anyhow!(
-            "npm error code E{code}\nnpm error {code} {reason} - {method} {target_url} - {msg}"
-        )
+/// Renders a failed registry response the way npm does, including the
+/// `www-authenticate` challenge npm-registry-fetch inspects on a 401.
+pub(crate) fn format_http_error_with_auth(
+    method: &str,
+    target_url: &Url,
+    status: reqwest::StatusCode,
+    www_authenticate: Option<&str>,
+    body: &str,
+) -> anyhow::Error {
+    use crate::http_errors::{auth_error_block, e404_block, general_message, package_name_from_url};
+    if let Some(block) = auth_error_block(method, target_url.as_str(), status, www_authenticate, body) {
+        return anyhow::anyhow!(block);
+    }
+    let message = general_message(method, target_url.as_str(), status, body);
+    match status.as_u16() {
+        404 => anyhow::anyhow!(e404_block(&message, package_name_from_url(target_url).as_deref())),
+        403 => anyhow::anyhow!(
+            "npm error code E403\nnpm error 403 {message}\nnpm error 403 In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy, or on a server you do not have access to."
+        ),
+        code => anyhow::anyhow!("npm error code E{code}\nnpm error {message}"),
     }
 }
 

@@ -1,0 +1,8 @@
+{
+  "name": "scripts-better-sqlite3",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "13.1.1"
+  }
+}

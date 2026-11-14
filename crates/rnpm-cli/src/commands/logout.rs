@@ -71,7 +71,8 @@ pub(crate) async fn run(
     let auth_key = auth_key_for_registry(&registry_url);
     let user_npmrc = rnpm_config::get_default_user_npmrc();
     if user_npmrc.is_file() {
-        let _ = rnpm_config::delete_config_value_from_file(&user_npmrc, &auth_key);
+        rnpm_config::delete_config_value_from_file(&user_npmrc, &auth_key)?;
+        if std::fs::read_to_string(&user_npmrc)?.trim().is_empty() { std::fs::remove_file(&user_npmrc)?; }
     }
     let local_npmrc = current_dir.join(".npmrc");
     if local_npmrc.is_file() {
@@ -81,7 +82,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-fn auth_key_for_registry(registry: &Url) -> String {
+pub(super) fn auth_key_for_registry(registry: &Url) -> String {
     let host = registry.host_str().unwrap_or_default();
     let port = registry.port().map(|p| format!(":{p}")).unwrap_or_default();
     let path = if registry.path().is_empty() {

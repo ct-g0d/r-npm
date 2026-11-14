@@ -49,7 +49,8 @@ fn test_cli_cache_clean_with_force() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rnpm: cache cleared successfully"));
+    // npm prints nothing on stdout for a successful `cache clean --force`.
+    assert!(stdout.is_empty(), "unexpected stdout: {stdout}");
 
     assert!(!content_dir.join("test-blob").exists());
 }

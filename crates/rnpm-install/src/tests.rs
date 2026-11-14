@@ -15,6 +15,26 @@ use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
+#[test]
+fn packument_freshness_honors_http_policy_and_age() {
+    let mut entry = rnpm_cache::IndexEntry::new("test".into(), "".into(), "".into(), 0, None);
+    assert!(!crate::is_packument_fresh(&entry, false, false));
+    for (control, age, expected) in [
+        ("public, max-age=300", "0", true),
+        ("max-age=0", "0", false),
+        ("max-age=300, no-cache", "0", false),
+        ("no-store, max-age=300", "0", false),
+        ("max-age=300", "400", false),
+    ] {
+        entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":control,"age":age}}}));
+        assert_eq!(crate::is_packument_fresh(&entry, false, false), expected, "{control}, age={age}");
+    }
+    entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":"max-age=300","date":"Thu, 01 Jan 1970 00:00:00 GMT"}}}));
+    assert!(!crate::is_packument_fresh(&entry, false, false));
+    assert!(crate::is_packument_fresh(&entry, true, false));
+    assert!(crate::is_packument_fresh(&entry, false, true));
+}
+
 #[tokio::test]
 async fn persistence_failure_waits_for_remaining_jobs() {
     for panic_first in [false, true] {
@@ -4248,12 +4268,8 @@ fn test_enrich_lockfile_ignores_deprecated_licenses_array() {
 
 #[tokio::test]
 async fn test_enrich_lockfile_never_makes_network_requests() {
-    use rnpm_registry::{http_request_count, reset_http_request_count};
-
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
-
-    reset_http_request_count();
 
     let mut lockfile = LockfileV3::new("no-net-app", Some("1.0.0".to_string()));
     lockfile.insert_package(
@@ -4271,12 +4287,12 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
     };
     let mut installer = Installer::new(options).unwrap();
 
-    let before_requests = http_request_count();
+    let before_requests = installer.registry_client.http_requests();
     installer
         .enrich_lockfile_from_registry(&mut lockfile)
         .await
         .unwrap();
-    let after_requests = http_request_count();
+    let after_requests = installer.registry_client.http_requests();
 
     assert_eq!(
         before_requests, after_requests,
@@ -4367,4 +4383,73 @@ async fn test_enrich_lockfile_with_scoped_package_license_and_libc() {
         assert_eq!(pkg.license.as_deref(), Some("MIT"));
         assert_eq!(pkg.libc.as_deref(), Some(&["musl".to_string()][..]));
     }
+}
+
+#[tokio::test]
+async fn public_lockfile_precedes_root_hooks_and_survives_failure() {
+    for hook in ["preinstall", "postinstall", "prepare"] {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let script = "node -e \"if(!require('fs').existsSync('package-lock.json'))process.exit(91);process.exit(7)\"";
+        let manifest = serde_json::json!({"name":"root-hook-order", "version":"1.0.0", "scripts":{hook:script}});
+        fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+        let options = InstallOptions {
+            project_dir: root.clone(),
+            cache_dir: Some(tmp.path().join("cache")),
+            offline: true,
+            ..Default::default()
+        };
+        let error = Installer::new(options).unwrap().run().await.unwrap_err();
+        let exit = error
+            .downcast_ref::<rnpm_lifecycle::ScriptExitError>()
+            .unwrap();
+        assert_eq!(exit.exit_code, 7, "{hook}: {error:#}");
+        let lock: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("package-lock.json")).unwrap()).unwrap();
+        assert_eq!(lock["packages"][""]["name"], "root-hook-order");
+        assert!(!root.join("node_modules/.package-lock.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn filtered_workspace_reify_keeps_unselected_members_only_in_public_lock() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","version":"1.0.0","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for name in ["first", "second"] {
+        fs::create_dir_all(root.join("packages").join(name)).unwrap();
+        fs::write(
+            root.join("packages").join(name).join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+    }
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        cache_dir: Some(tmp.path().join("cache")),
+        workspace: vec!["first".into()],
+        offline: true,
+        ignore_scripts: true,
+        ..Default::default()
+    };
+    let summary = Installer::new(options).unwrap().run().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+    assert!(root.join("node_modules/first/package.json").is_file());
+    assert!(!root.join("node_modules/second").exists());
+    let public: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("package-lock.json")).unwrap()).unwrap();
+    assert!(public["packages"]["packages/first"].get("name").is_none());
+    assert!(public["packages"]["packages/second"].is_object());
+    let hidden: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("node_modules/.package-lock.json")).unwrap())
+            .unwrap();
+    assert!(hidden["packages"]["packages/first"].is_object());
+    assert!(hidden["packages"].get("packages/second").is_none());
+    assert!(hidden["packages"].get("node_modules/second").is_none());
 }

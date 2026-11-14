@@ -29,7 +29,17 @@ fn test_cache_add_and_ls_and_verify() {
 
     assert!(add_output.status.success(), "cache add failed: {}", String::from_utf8_lossy(&add_output.stderr));
     let stdout = String::from_utf8_lossy(&add_output.stdout);
-    assert!(stdout.contains("Added"));
+    assert!(stdout.is_empty(), "npm cache add is silent");
+    let key = format!(
+        "pacote:tarball:file:{}",
+        sample_file.to_string_lossy().replace('\\', "/")
+    );
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    let (_, cached) = cache
+        .get(&key)
+        .unwrap()
+        .expect("archive bytes must be cached");
+    assert_eq!(cached, b"sample package archive content");
 
     // Test cache ls
     let ls_output = Command::new(rnpm_bin)
@@ -45,7 +55,7 @@ fn test_cache_add_and_ls_and_verify() {
 
     assert!(ls_output.status.success(), "cache ls failed: {}", String::from_utf8_lossy(&ls_output.stderr));
     let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
-    assert!(ls_stdout.contains("_cacache") || !ls_stdout.is_empty());
+    assert_eq!(ls_stdout.trim(), key);
 
     // Test cache verify
     let verify_output = Command::new(rnpm_bin)

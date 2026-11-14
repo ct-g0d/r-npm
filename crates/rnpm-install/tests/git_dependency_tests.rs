@@ -463,10 +463,11 @@ async fn test_git_clone_failure_error_handling() {
     .unwrap();
 
     let err = installer.install().await.unwrap_err();
-    assert!(
-        err.to_string().contains("Failed to clone git repository"),
-        "Expected clone failure error: {err}"
-    );
+    let message = err.to_string();
+    assert!(message.contains("npm error code 128"), "{message}");
+    assert!(message.contains("npm error An unknown git error occurred"), "{message}");
+    assert!(message.contains("npm error command git --no-replace-objects ls-remote file:///definitely/nonexistent/repo/on/disk.git"), "{message}");
+    assert!(message.contains("npm error fatal:"), "{message}");
 }
 
 #[tokio::test]

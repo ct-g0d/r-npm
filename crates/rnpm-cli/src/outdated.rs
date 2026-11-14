@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+#[derive(Debug)]
+pub struct OutdatedStatus;
+impl std::fmt::Display for OutdatedStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("outdated dependencies found")
+    }
+}
+impl std::error::Error for OutdatedStatus {}
+
 /// Options for outdated command.
 #[derive(Debug, Clone, Default)]
 pub struct OutdatedOptions {
@@ -23,6 +32,10 @@ pub struct OutdatedOptions {
     pub parseable: bool,
     /// Custom npm registry URL
     pub registry: Option<String>,
+    pub global: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
+    pub include_workspace_root: bool,
 }
 
 /// Outdated package record holding inspection and registry resolution results.
@@ -95,26 +108,29 @@ pub async fn run_outdated_inner(
     options: &OutdatedOptions,
 ) -> anyhow::Result<(i32, String)> {
     let manifest_path = project_dir.join("package.json");
-    if !manifest_path.exists() {
+    if !manifest_path.exists() && !options.global {
         return Err(anyhow::anyhow!(
             "package.json not found in {}",
             project_dir.display()
         ));
     }
 
-    let manifest_content = std::fs::read_to_string(&manifest_path)?;
+    let manifest_content = if options.global {
+        "{}".to_string()
+    } else {
+        std::fs::read_to_string(&manifest_path)?
+    };
     let manifest: Manifest = serde_json::from_str(&manifest_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse package.json: {e}"))?;
 
-    let root_name = manifest
-        .name
-        .clone()
-        .or_else(|| {
-            project_dir
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "project".to_string());
+    let root_name = if options.global {
+        "global".to_string()
+    } else {
+        project_dir
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string())
+    };
 
     let abs_project_dir = if project_dir.is_absolute() {
         project_dir.to_path_buf()
@@ -148,6 +164,90 @@ pub async fn run_outdated_inner(
                     location_rel: format!("node_modules/{name}"),
                     depended_by_location: root_location_str.clone(),
                 });
+            }
+        }
+    }
+
+    let mut workspace_ids = BTreeMap::new();
+    if options.global {
+        for (loc, pkg) in crate::inspect_tree::scan_disk_packages(project_dir) {
+            if loc.matches("node_modules/").count() != 1 {
+                continue;
+            }
+            declared_deps.push(DeclaredDep {
+                name: pkg.name,
+                declared_spec: "*".to_string(),
+                package_type: "dependencies".to_string(),
+                depended_by: "global".to_string(),
+                location_rel: loc,
+                depended_by_location: "global".to_string(),
+            });
+        }
+    } else {
+        let members = if options.workspaces || !options.workspace.is_empty() {
+            crate::select_workspace_members(project_dir, &options.workspace, false)?
+        } else {
+            rnpm_core::workspace::discover_workspaces(project_dir).unwrap_or_default()
+        };
+        if (options.workspaces || !options.workspace.is_empty()) && !options.include_workspace_root
+        {
+            declared_deps.clear();
+        }
+        let disk = crate::inspect_tree::scan_disk_packages(project_dir);
+        for member in members {
+            let member_path = member.path;
+            let member_loc = member_path
+                .strip_prefix(project_dir)
+                .unwrap_or(&member_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            workspace_ids.insert(
+                member.name.clone(),
+                format!(
+                    "{}@{}",
+                    member.name,
+                    member.version.as_deref().unwrap_or("")
+                ),
+            );
+            for (deps, kind) in [
+                (&member.manifest.dependencies, "dependencies"),
+                (&member.manifest.dev_dependencies, "devDependencies"),
+                (
+                    &member.manifest.optional_dependencies,
+                    "optionalDependencies",
+                ),
+                (&member.manifest.peer_dependencies, "peerDependencies"),
+            ] {
+                for (name, spec) in deps {
+                    if Range::parse(spec).is_err() {
+                        continue;
+                    }
+                    let mut parent = member_loc.as_str();
+                    let location = loop {
+                        let loc = if parent.is_empty() {
+                            format!("node_modules/{name}")
+                        } else {
+                            format!("{parent}/node_modules/{name}")
+                        };
+                        if disk.contains_key(&loc)
+                            || project_dir.join(&loc).join("package.json").is_file()
+                        {
+                            break loc;
+                        }
+                        if parent.is_empty() {
+                            break format!("node_modules/{name}");
+                        }
+                        parent = parent.rsplit_once('/').map_or("", |(p, _)| p);
+                    };
+                    declared_deps.push(DeclaredDep {
+                        name: name.clone(),
+                        declared_spec: spec.clone(),
+                        package_type: kind.to_string(),
+                        depended_by: member.name.clone(),
+                        location_rel: location,
+                        depended_by_location: member_loc.clone(),
+                    });
+                }
             }
         }
     }
@@ -337,14 +437,24 @@ pub async fn run_outdated_inner(
     }
 
     let formatted = if options.json {
-        let json_val = format_json(&outdated_packages, options.long);
+        let json_val = ordered_json(&outdated_packages, options.long);
         format!("{}\n", serde_json::to_string_pretty(&json_val)?)
     } else if options.parseable {
         let lines = format_parseable(&outdated_packages);
         format!("{}\n", lines.join("\n"))
     } else if options.long {
+        for pkg in &mut outdated_packages {
+            if let Some(id) = workspace_ids.get(&pkg.dependent) {
+                pkg.dependent = id.clone();
+            }
+        }
         format!("{}\n", format_long(&outdated_packages))
     } else {
+        for pkg in &mut outdated_packages {
+            if let Some(id) = workspace_ids.get(&pkg.dependent) {
+                pkg.dependent = id.clone();
+            }
+        }
         format!("{}\n", format_tabular(&outdated_packages))
     };
 
@@ -434,7 +544,11 @@ pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
     ];
 
     for pkg in packages {
-        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
+        let loc = if pkg.current == "MISSING" {
+            "-"
+        } else {
+            pkg.location.as_str()
+        };
         col_widths[0] = col_widths[0].max(pkg.name.len());
         col_widths[1] = col_widths[1].max(pkg.current.len());
         col_widths[2] = col_widths[2].max(pkg.wanted.len());
@@ -464,7 +578,11 @@ pub fn format_tabular(packages: &[OutdatedPackage]) -> String {
 
     // Format rows
     for pkg in packages {
-        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
+        let loc = if pkg.current == "MISSING" {
+            "-"
+        } else {
+            pkg.location.as_str()
+        };
         let cols = [
             pkg.name.as_str(),
             pkg.current.as_str(),
@@ -522,7 +640,11 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
     ];
 
     for pkg in packages {
-        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
+        let loc = if pkg.current == "MISSING" {
+            "-"
+        } else {
+            pkg.location.as_str()
+        };
         col_widths[0] = col_widths[0].max(pkg.name.len());
         col_widths[1] = col_widths[1].max(pkg.current.len());
         col_widths[2] = col_widths[2].max(pkg.wanted.len());
@@ -554,7 +676,11 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
 
     // Format rows
     for pkg in packages {
-        let loc = if pkg.current == "MISSING" { "-" } else { pkg.location.as_str() };
+        let loc = if pkg.current == "MISSING" {
+            "-"
+        } else {
+            pkg.location.as_str()
+        };
         let hp_str = pkg.homepage.as_deref().unwrap_or("");
         let cols = [
             pkg.name.as_str(),
@@ -595,7 +721,10 @@ pub fn format_json(packages: &[OutdatedPackage], long: bool) -> serde_json::Valu
         let (current, location) = if pkg.current == "MISSING" {
             (None, None)
         } else {
-            (Some(pkg.current.clone()), Some(pkg.absolute_location.clone()))
+            (
+                Some(pkg.current.clone()),
+                Some(pkg.absolute_location.clone()),
+            )
         };
 
         let entry = OutdatedJsonEntry {
@@ -774,6 +903,54 @@ fn extract_parent_name_from_path(path: &str) -> Option<String> {
     None
 }
 
+fn ordered_json(
+    packages: &[OutdatedPackage],
+    long: bool,
+) -> rnpm_core::ordered_json::OrderedJsonValue {
+    use rnpm_core::ordered_json::{OrderedJsonMap as Map, OrderedJsonValue as Value};
+    let mut result = Map::new();
+    for pkg in packages {
+        let mut item = Map::new();
+        if pkg.current != "MISSING" {
+            item.insert("current".into(), Value::String(pkg.current.clone()));
+        }
+        for (key, value) in [
+            ("wanted", &pkg.wanted),
+            ("latest", &pkg.latest),
+            ("dependent", &pkg.dependent),
+        ] {
+            item.insert(key.into(), Value::String(value.clone()));
+        }
+        if pkg.current != "MISSING" {
+            item.insert(
+                "location".into(),
+                Value::String(pkg.absolute_location.clone()),
+            );
+        }
+        if long {
+            item.insert("type".into(), Value::String(pkg.package_type.clone()));
+            if let Some(homepage) = &pkg.homepage {
+                item.insert("homepage".into(), Value::String(homepage.clone()));
+            }
+            item.insert(
+                "dependedByLocation".into(),
+                Value::String(pkg.dependent_location.clone()),
+            );
+        }
+        let value = Value::Object(item);
+        if let Some(previous) = result.get_mut(&pkg.name) {
+            if let Value::Array(items) = previous {
+                items.push(value);
+            } else {
+                *previous = Value::Array(vec![previous.clone(), value]);
+            }
+        } else {
+            result.insert(pkg.name.clone(), value);
+        }
+    }
+    Value::Object(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +981,7 @@ mod tests {
             bin: None,
             license: None,
             engines: HashMap::new(),
+            engines_raw: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -1280,7 +1458,10 @@ mod tests {
         assert_eq!(parsed["chalk"]["current"], "2.4.0");
         assert_eq!(parsed["chalk"]["wanted"], "2.4.2");
         assert_eq!(parsed["chalk"]["latest"], "6.0.1");
-        assert_eq!(parsed["chalk"]["dependent"], "my-app");
+        assert_eq!(
+            parsed["chalk"]["dependent"],
+            project_dir.file_name().unwrap().to_str().unwrap()
+        );
 
         // Parseable mode returns colon-delimited output with exit code 1
         let parseable_options = OutdatedOptions {
@@ -1292,7 +1473,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code_p, 1);
-        assert!(output_p.contains("chalk@2.4.2:chalk@2.4.0:chalk@6.0.1:my-app"));
+        assert!(output_p.contains(&format!(
+            "chalk@2.4.2:chalk@2.4.0:chalk@6.0.1:{}",
+            project_dir.file_name().unwrap().to_str().unwrap()
+        )));
 
         let _ = mock_server.shutdown.send(());
     }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir: PathBuf) -> Result<()> {
     let start_time = std::time::Instant::now();
     let nm_dir = current_dir.join("node_modules");
-    let needs_reify = !nm_dir.exists();
+    let needs_reify = !nm_dir.exists() && has_declared_dependencies(&current_dir)?;
 
     let total_added = if needs_reify {
         let install_options = InstallOptions {
@@ -46,7 +46,6 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
                 let pkg_word = if total_added == 1 { "package" } else { "packages" };
                 println!("\nadded {total_added} {pkg_word} in {time_str}");
             } else {
-                println!("rnpm: dedupe dry-run: tree is already deduplicated, no duplicates found");
                 println!("\nup to date in {time_str}");
             }
         } else {
@@ -76,7 +75,6 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
             let pkg_word = if total_added == 1 { "package" } else { "packages" };
             println!("\nadded {total_added} {pkg_word} in {time_str}");
         } else {
-            println!("rnpm: tree is already deduplicated");
             println!("\nup to date in {time_str}");
         }
     } else {
@@ -107,7 +105,7 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
 pub(crate) async fn run_find_dupes(packages: Vec<String>, current_dir: PathBuf) -> Result<()> {
     let start_time = std::time::Instant::now();
     let nm_dir = current_dir.join("node_modules");
-    let needs_reify = !nm_dir.exists();
+    let needs_reify = !nm_dir.exists() && has_declared_dependencies(&current_dir)?;
 
     let total_added = if needs_reify {
         let install_options = InstallOptions {
@@ -146,7 +144,6 @@ pub(crate) async fn run_find_dupes(packages: Vec<String>, current_dir: PathBuf) 
             let pkg_word = if total_added == 1 { "package" } else { "packages" };
             println!("\nadded {total_added} {pkg_word} in {time_str}");
         } else {
-            println!("rnpm: find-dupes: no duplicate packages found");
             println!("\nup to date in {time_str}");
         }
     } else {
@@ -163,4 +160,13 @@ pub(crate) async fn run_find_dupes(packages: Vec<String>, current_dir: PathBuf) 
     }
 
     Ok(())
+}
+
+fn has_declared_dependencies(dir: &std::path::Path) -> Result<bool> {
+    let m = rnpm_core::manifest::Manifest::from_file(dir.join("package.json"))?;
+    Ok(!m.dependencies.is_empty()
+        || !m.dev_dependencies.is_empty()
+        || !m.optional_dependencies.is_empty()
+        || !m.peer_dependencies.is_empty()
+        || !m.workspace_patterns().is_empty())
 }

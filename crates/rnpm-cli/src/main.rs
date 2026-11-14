@@ -9,6 +9,8 @@ pub mod diff;
 pub mod doctor;
 pub mod init;
 pub mod inspect_tree;
+pub mod json_errors;
+pub(crate) mod http_errors;
 pub mod list;
 pub mod outdated;
 pub mod query;
@@ -805,11 +807,11 @@ pub(crate) enum Commands {
     /// Generate Software Bill of Materials (SBOM)
     Sbom {
         /// SBOM specification format (spdx, cyclonedx)
-        #[arg(long = "sbom-format", default_value = "spdx")]
+        #[arg(long = "sbom-format", default_value = "")]
         sbom_format: String,
 
         /// CycloneDX component type (library, application, framework)
-        #[arg(long = "sbom-type", default_value = "application")]
+        #[arg(long = "sbom-type", default_value = "library")]
         sbom_type: String,
 
         /// Inspect only package-lock.json without requiring node_modules
@@ -945,6 +947,14 @@ pub(crate) enum Commands {
         /// Custom npm registry URL
         #[arg(long)]
         registry: Option<String>,
+        #[arg(short = 'g', long)]
+        global: bool,
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+        #[arg(long)]
+        workspaces: bool,
+        #[arg(long = "include-workspace-root")]
+        include_workspace_root: bool,
     },
 
     /// View package information from registry
@@ -1039,7 +1049,6 @@ pub(crate) enum Commands {
     },
 
     /// Log in to a registry
-    #[command(alias = "adduser", alias = "add-user")]
     Login {
         /// Custom registry URL
         #[arg(long)]
@@ -1054,6 +1063,19 @@ pub(crate) enum Commands {
         scope: Option<String>,
 
         /// One-time password for legacy/basic authentication
+        #[arg(long)]
+        otp: Option<String>,
+    },
+
+    /// Add a registry user account
+    #[command(alias = "add-user")]
+    Adduser {
+        #[arg(long)]
+        registry: Option<String>,
+        #[arg(long)]
+        auth_type: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
         #[arg(long)]
         otp: Option<String>,
     },
@@ -1108,14 +1130,16 @@ pub(crate) enum Commands {
     /// Manage package distribution tags.
     #[command(alias = "dist-tags")]
     DistTag {
-        #[command(subcommand)]
-        action: DistTagAction,
+        /// `add <spec> [<tag>]`, `rm <spec> <tag>` or `ls [<spec>]`.
+        args: Vec<String>,
         #[arg(long)]
         registry: Option<String>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
         otp: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Manage package owners/collaborators.
     #[command(alias = "author")]
@@ -1411,12 +1435,16 @@ pub(crate) enum Commands {
         json: bool,
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 
     /// Retrieve a configuration value (npm get alias)
     Get {
         /// Configuration key to retrieve
         key: Option<String>,
+        /// Further keys (`key=value` lines are printed for several keys)
+        extra_keys: Vec<String>,
     },
 
     /// Set a configuration value (npm set alias)
@@ -1493,20 +1521,6 @@ pub(crate) enum TokenAction {
 }
 
 #[derive(Subcommand, Debug, Clone)]
-pub(crate) enum DistTagAction {
-    /// List tags for a package.
-    Ls { package: Option<String> },
-    /// Add or replace a tag.
-    Add {
-        package: String,
-        tag: Option<String>,
-    },
-    /// Remove a tag.
-    #[command(alias = "remove")]
-    Rm { package: String, tag: String },
-}
-
-#[derive(Subcommand, Debug, Clone)]
 pub(crate) enum OwnerAction {
     /// List package owners.
     Ls { package: String },
@@ -1536,6 +1550,8 @@ pub(crate) enum ConfigAction {
     Get {
         /// Configuration key to retrieve
         key: Option<String>,
+        /// Further keys (`key=value` lines are printed for several keys)
+        extra_keys: Vec<String>,
     },
     /// Delete a configuration key
     #[command(alias = "rm", alias = "del")]
@@ -1555,6 +1571,8 @@ pub(crate) enum ConfigAction {
         /// Output configuration in JSON format
         #[arg(long)]
         json: bool,
+        #[arg(short = 'l', long)]
+        long: bool,
     },
     /// Open the config file in an editor
     Edit,
@@ -1642,20 +1660,6 @@ where
 
     let first = &args[1];
 
-    let unsupported_commands: [&str; 1] = ["definitely-unknown-command"];
-
-    if unsupported_commands.contains(&first.as_str()) {
-        return Some((
-            "ERR_UNSUPPORTED_COMMAND".to_string(),
-            format!(
-                "npm error code ERR_UNSUPPORTED_COMMAND\n\
-                 npm error The command '{}' is not currently implemented in rnpm.\n\
-                 npm error See docs/compatibility-contract.md for the active compatibility surface.",
-                first
-            ),
-        ));
-    }
-
     // Determine the slice of arguments to check for unsupported flags.
     // 1. Any arguments after "--" are forwarded payloads and never scanned.
     let pre_dash_dash = if let Some(dash_dash_idx) = args.iter().position(|a| a == "--") {
@@ -1718,8 +1722,6 @@ where
     let unsupported_flags = [
         "--legacy-peer-deps",
         "--strict-peer-deps",
-        "--save-bundle",
-        "--production",
     ];
 
     let mut i = 0;
@@ -2185,12 +2187,23 @@ where
             // npm accepts the lowercase short form as an alias for --version.
             // clap's generated version flag is -V, so normalize it before parsing.
             result.push("--version".to_string());
+        } else if arg == "--production"
+            && args.get(1).is_some_and(|c| c != "prune")
+        {
+            if !args.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent") {
+                eprintln!("npm warn config production Use `--omit=dev` instead.");
+            }
+            result.push("--omit=dev".to_string());
         } else if arg == "--legacy-bundling" {
             result.push("--install-strategy=nested".to_string());
         } else if arg == "--global-style" {
             result.push("--install-strategy=shallow".to_string());
         } else if arg == "-ws" {
             result.push("--workspaces".to_string());
+        } else if arg == "-wa" {
+            // npm's nopt expands the short cluster to -w --all, consuming
+            // --all as the workspace value rather than selecting workspace a.
+            result.push("--workspace=--all".to_string());
         } else if let Some(rest) = arg.strip_prefix("-ws=") {
             result.push(format!("--workspaces={rest}"));
         } else if arg == "--git-tag-version=false" || arg == "--git-tag-version=0" {
@@ -2853,7 +2866,8 @@ where
         };
 
         if !is_forwarded {
-            println!("rnpm {}", env!("CARGO_PKG_VERSION"));
+            // Tools parse `npm -v` as a bare semver of the npm release.
+            println!("{}", crate::version::NPM_VERSION);
             std::process::exit(0);
         }
     }
@@ -3030,6 +3044,51 @@ fn parse_package_spec(spec: &str) -> (String, String) {
     } else {
         (spec.to_string(), "*".to_string())
     }
+}
+
+/// Install `specs` into a cached npx environment and return its directory.
+pub(crate) async fn ensure_npx_environment(
+    specs: &[String],
+    registry: Option<String>,
+    cache: Option<PathBuf>,
+    offline: bool,
+) -> anyhow::Result<PathBuf> {
+    let cache_path = cache.unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
+    });
+    let safe: String = specs
+        .join("+")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') { c } else { '_' })
+        .collect();
+    let env_dir = cache_path.join("_npx").join(safe);
+    let mut deps = serde_json::Map::new();
+    for spec in specs {
+        let (name, req) = parse_package_spec(spec);
+        deps.insert(name, serde_json::Value::String(req));
+    }
+    let manifest = serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
+    let manifest_text = serde_json::to_string_pretty(&manifest)?;
+    let installed = env_dir.join("node_modules").is_dir()
+        && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
+    if !installed {
+        if offline {
+            anyhow::bail!("npm error code ENOTCACHED\nnpm error request to install {} failed: cache mode is 'only-if-cached'", specs.join(" "));
+        }
+        std::fs::create_dir_all(&env_dir)?;
+        std::fs::write(env_dir.join("package.json"), &manifest_text)?;
+        let mut installer = Installer::new(InstallOptions {
+            project_dir: env_dir.clone(),
+            registry_url: registry,
+            cache_dir: Some(cache_path),
+            silent: true,
+            ..Default::default()
+        })?;
+        installer.run().await?;
+    }
+    Ok(env_dir)
 }
 
 pub(crate) async fn execute_exec(
@@ -3384,6 +3443,122 @@ pub(crate) fn run_lifecycle_hook(
     Ok(())
 }
 
+/// Fields @npmcli/package-json's `prepare` and libnpmpublish's
+/// `patchManifest` add to the published manifest: `readme` and
+/// `readmeFilename`, `_nodeVersion` and `_npmVersion`. `readme_source`
+/// lists candidate file names and reads one.
+pub(crate) fn prepare_publish_manifest(
+    manifest: &mut serde_json::Value,
+    file_names: &[String],
+    read: impl Fn(&str) -> Option<String>,
+) {
+    let Some(obj) = manifest.as_object_mut() else {
+        return;
+    };
+    if obj.get("readme").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+        let mut names: Vec<&String> = file_names
+            .iter()
+            .filter(|f| !f.contains('/'))
+            .filter(|f| {
+                let lower = f.to_ascii_lowercase();
+                lower == "readme" || lower.starts_with("readme.")
+            })
+            .collect();
+        names.sort();
+        // `/\.m?a?r?k?d?o?w?n?$/i` wins; a bare README is the fallback.
+        let markdown = |f: &str| {
+            f.rfind('.').is_some_and(|i| {
+                let ext = f[i + 1..].to_ascii_lowercase();
+                let mut want = "markdown".chars().peekable();
+                ext.chars().all(|c| {
+                    while let Some(&w) = want.peek() {
+                        want.next();
+                        if w == c {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+        };
+        let chosen = names
+            .iter()
+            .find(|f| markdown(f))
+            .or_else(|| names.iter().find(|f| f.eq_ignore_ascii_case("readme")));
+        let mut readme = None;
+        if let Some(file) = chosen {
+            if let Some(text) = read(file) {
+                readme = Some(text);
+                obj.insert("readmeFilename".into(), serde_json::Value::String((*file).clone()));
+            }
+        }
+        obj.insert(
+            "readme".into(),
+            serde_json::Value::String(
+                readme
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "ERROR: No README data found!".into()),
+            ),
+        );
+    }
+    if let Ok(out) = std::process::Command::new("node").arg("--version").output() {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
+            obj.insert("_nodeVersion".into(), serde_json::Value::String(v));
+        }
+    }
+    obj.insert(
+        "_npmVersion".into(),
+        serde_json::Value::String(crate::version::NPM_VERSION.into()),
+    );
+}
+
+/// npm's ci-info name for the CI provider, or `null` outside a known one.
+fn ci_provider_name() -> &'static str {
+    let set = |k: &str| std::env::var_os(k).is_some();
+    if set("GITHUB_ACTIONS") {
+        "GitHub Actions"
+    } else if set("GITLAB_CI") {
+        "GitLab CI"
+    } else if set("CIRCLECI") {
+        "CircleCI"
+    } else if set("TRAVIS") {
+        "Travis CI"
+    } else if set("BUILDKITE") {
+        "Buildkite"
+    } else if set("TF_BUILD") {
+        "Azure Pipelines"
+    } else if set("JENKINS_URL") && set("BUILD_ID") {
+        "Jenkins"
+    } else if set("BITBUCKET_COMMIT") {
+        "Bitbucket Pipelines"
+    } else {
+        "null"
+    }
+}
+
+/// libnpmpublish's provenance prerequisites. rnpm cannot sign a Sigstore
+/// bundle, so where npm would generate one rnpm refuses instead of
+/// publishing without the attestation it was asked for.
+fn ensure_provenance_generation() -> anyhow::Result<()> {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        if std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_none() {
+            anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitHub Actions requires \"write\" access to the \"id-token\" permission");
+        }
+    } else if std::env::var_os("GITLAB_CI").is_some() {
+        if std::env::var_os("SIGSTORE_ID_TOKEN").is_none() {
+            anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitLab CI requires \"SIGSTORE_ID_TOKEN\" with \"sigstore\" audience to be present in \"id_tokens\". For more info see:\nnpm error https://docs.gitlab.com/ee/ci/secrets/id_token_authentication.html");
+        }
+    } else {
+        anyhow::bail!(
+            "npm error code EUSAGE\nnpm error Automatic provenance generation not supported for provider: {}",
+            ci_provider_name()
+        );
+    }
+    anyhow::bail!("npm error code EUSAGE\nnpm error rnpm cannot generate Sigstore provenance attestations; publish this version with npm or without --provenance")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_publish(
     current_dir: PathBuf,
     target: PathBuf,
@@ -3396,49 +3571,69 @@ pub(crate) async fn execute_publish(
     ignore_scripts: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let package_dir = if target.is_absolute() {
+    let target_path = if target.is_absolute() {
         target
     } else {
         current_dir.join(target)
     };
+    // `npm publish <tarball>` publishes the archive as-is and runs no scripts.
+    let tarball_spec = target_path.is_file();
+    let package_dir = if tarball_spec {
+        current_dir.clone()
+    } else {
+        target_path.clone()
+    };
 
-    let manifest_path = package_dir.join("package.json");
-    if !manifest_path.exists() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENOENT\nnpm error package.json not found in {}",
-            package_dir.display()
-        ));
-    }
+    let script_config = rnpm_config::Config::load(Some(&package_dir))?;
+    let is_silent = script_config.get("loglevel") == Some("silent");
+    let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
-    let manifest_content = std::fs::read_to_string(&manifest_path)?;
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest_content).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}"
-            )
+    let (summary, tarball_bytes, manifest_json) = if tarball_spec {
+        let bytes = std::fs::read(&target_path)?;
+        let (summary, manifest_json) = rnpm_fs::summarize_tarball(&bytes).map_err(|e| {
+            anyhow::anyhow!("npm error code ENOENT\nnpm error Could not read {}: {e}", target_path.display())
         })?;
-
-    if manifest_json
-        .get("private")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(anyhow::anyhow!(
-            "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
-        ));
-    }
-
-    let manifest = Manifest::from_file(&manifest_path)?;
-    let pkg_name = manifest.name.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field"
-        )
-    })?;
-    let pkg_version = manifest.version.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field"
-        )
-    })?;
+        (summary, bytes, manifest_json)
+    } else {
+        let manifest_path = package_dir.join("package.json");
+        if !manifest_path.exists() {
+            return Err(anyhow::anyhow!(
+                "npm error code ENOENT\nnpm error package.json not found in {}",
+                package_dir.display()
+            ));
+        }
+        let manifest_content = std::fs::read_to_string(&manifest_path)?;
+        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).map_err(|e| {
+            anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}")
+        })?;
+        if manifest_json.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(anyhow::anyhow!(
+                "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
+            ));
+        }
+        let manifest = Manifest::from_file(&manifest_path)?;
+        if manifest.name.is_none() {
+            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field");
+        }
+        if manifest.version.is_none() {
+            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field");
+        }
+        run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
+        let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
+            .map_err(|e| anyhow::anyhow!("npm error pack failed: {e}"))?;
+        let updated = Manifest::from_file(&manifest_path).unwrap_or(manifest);
+        run_lifecycle_hook(&package_dir, &updated, "postpack", ignore_scripts, foreground, is_silent, json)?;
+        // Re-read: hooks may have changed package.json (including publishConfig).
+        let manifest_json = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(manifest_json);
+        (summary, bytes, manifest_json)
+    };
+    let pkg_name = summary.name.clone();
+    let pkg_version = summary.version.clone();
 
     if let Some(ref acc) = access {
         if acc != "public" && acc != "restricted" {
@@ -3449,175 +3644,8 @@ pub(crate) async fn execute_publish(
         }
     }
 
-    if provenance {
-        let is_ci = std::env::var("CI").is_ok()
-            || std::env::var("GITHUB_ACTIONS").is_ok()
-            || std::env::var("GITLAB_CI").is_ok()
-            || std::env::var("CIRCLECI").is_ok()
-            || std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").is_ok();
-        if !is_ci && !dry_run {
-            return Err(anyhow::anyhow!(
-                "npm error code EUSAGE\nnpm error --provenance can only be used from a supported CI/CD environment (such as GitHub Actions or GitLab CI)"
-            ));
-        }
-    }
-
-    let script_config = rnpm_config::Config::load(Some(&package_dir))?;
-    let is_silent = script_config.get("loglevel") == Some("silent");
-    let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
-
-    // 1. prepublishOnly
-    run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
-
-    // 2. prepack
-    run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
-
-    run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
-
-    let updated_manifest = Manifest::from_file(&manifest_path).unwrap_or_else(|_| manifest.clone());
-    let updated_manifest_content =
-        std::fs::read_to_string(&manifest_path).unwrap_or_else(|_| manifest_content.clone());
-    let updated_manifest_json: serde_json::Value =
-        serde_json::from_str(&updated_manifest_content).unwrap_or_else(|_| manifest_json.clone());
-
-    // 3. Packaging into memory using canonical rnpm-fs tarball pack logic
-    let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
-        Ok(res) => res,
-        Err(e) => {
-            return Err(anyhow::anyhow!("npm error pack failed: {e}"));
-        }
-    };
-
-    // 4. postpack
-    run_lifecycle_hook(&package_dir, &updated_manifest, "postpack", ignore_scripts, foreground, is_silent, json)?;
-
-    if dry_run {
-        if json {
-            let id = format!("{}@{}", summary.name, summary.version);
-            let files_json = summary.files.iter().map(|f| serde_json::json!({
-                "path": f.path,
-                "size": f.size,
-                "mode": f.mode,
-            })).collect::<Vec<_>>();
-            let pkg_details = serde_json::json!({
-                "id": id,
-                "name": summary.name,
-                "version": summary.version,
-                "size": summary.package_size,
-                "unpackedSize": summary.unpacked_size,
-                "shasum": summary.shasum,
-                "integrity": summary.integrity,
-                "filename": summary.filename,
-                "files": files_json,
-                "entryCount": summary.entry_count,
-                "bundled": summary.bundled,
-            });
-            let json_output = serde_json::json!({ summary.name.clone(): pkg_details });
-            println!("{}", serde_json::to_string_pretty(&json_output)?);
-        } else {
-            if !is_silent {
-                print_pack_notices(&summary);
-            }
-            if provenance {
-                eprintln!(
-                    "npm notice provenance would be generated and verified in CI environment"
-                );
-            }
-            if !is_silent { println!("+ {}@{}", summary.name, summary.version); }
-        }
-        let config = rnpm_config::Config::load(Some(&package_dir))?;
-        if config.get("loglevel") != Some("silent") {
-            let registry = registry.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
-                .and_then(|c| c.get("registry")).and_then(|v| v.as_str()))
-                .unwrap_or(config.npmrc.registry.as_str());
-            let registry_url = Url::parse(registry)?;
-            if config.npmrc.get_auth_token(&registry_url).is_none() {
-                eprintln!("npm warn publish This command requires you to be logged in to {registry_url} (dry-run)");
-            }
-            eprintln!("npm notice Publishing to {registry_url} with tag {tag} and {} access (dry-run)",
-                access.as_deref().or_else(|| updated_manifest_json.get("publishConfig")
-                    .and_then(|c| c.get("access")).and_then(|v| v.as_str())).unwrap_or("default"));
-        }
-        return Ok(());
-    }
-
-    // 5. publish
-    run_lifecycle_hook(&package_dir, &updated_manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
-
-    let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
-    let registry_url = if let Some(ref reg_str) = registry {
-        Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
-        })?
-    } else if let Some(pub_reg) = updated_manifest_json
-        .get("publishConfig")
-        .and_then(|c| c.get("registry"))
-        .and_then(|r| r.as_str())
-    {
-        Url::parse(pub_reg).map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid publishConfig registry URL '{pub_reg}': {e}"))?
-    } else {
-        config.npmrc.registry_for_package(&pkg_name).clone()
-    };
-
-    let effective_access = access.as_deref().or_else(|| {
-        updated_manifest_json
-            .get("publishConfig")
-            .and_then(|c| c.get("access"))
-            .and_then(|a| a.as_str())
-    });
-
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: registry_url.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        ..Default::default()
-    };
-    let token = config.npmrc.get_auth_token(&registry_url);
-    if token.is_none() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to <{registry_url}>\nnpm error You need a valid auth token to publish."
-        ));
-    }
-    if let Some(token) = token {
-        client_config.auth_token = Some(token.to_string());
-    }
-
-    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-
-    let tarball_data = rnpm_registry::PublishTarballData {
-        filename: &summary.filename,
-        bytes: &tarball_bytes,
-        shasum: &summary.shasum,
-        integrity: &summary.integrity,
-    };
-
-    let desc = updated_manifest_json
-        .get("description")
-        .and_then(|d| d.as_str());
-
-    let payload_opts = rnpm_registry::PublishPayloadOptions {
-        name: &pkg_name,
-        version: &pkg_version,
-        description: desc,
-        tag: &tag,
-        access: effective_access,
-        manifest: &updated_manifest_json,
-        tarball: tarball_data,
-        registry_url: &registry_url,
-        provenance_attestation: None,
-    };
-
-    let payload = rnpm_registry::create_publish_payload(&payload_opts);
-
-    // Send HTTP PUT request to registry
-    client
-        .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
-        .await?;
-
-    if json {
-        let json_output = serde_json::json!({
+    let pack_json = || {
+        serde_json::json!({
             summary.name.clone(): {
                 "id": format!("{}@{}", summary.name, summary.version),
                 "name": summary.name,
@@ -3635,135 +3663,211 @@ pub(crate) async fn execute_publish(
                 "entryCount": summary.entry_count,
                 "bundled": summary.bundled,
             }
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else {
-        if !is_silent {
-            print_pack_notices(&summary);
-        }
-        if provenance {
-            eprintln!("npm notice published with provenance attestations");
-        }
-        println!("+ {}@{}", summary.name, summary.version);
+        })
+    };
+
+    let force = script_config.get_bool("force").unwrap_or(false);
+    let is_default_tag = !std::env::args().any(|a| a == "--tag" || a.starts_with("--tag="))
+        && manifest_json
+            .get("publishConfig")
+            .and_then(|c| c.get("tag"))
+            .is_none();
+    let parsed_version = rnpm_core::semver::Version::parse(&pkg_version).ok();
+    if !force
+        && is_default_tag
+        && parsed_version.as_ref().is_some_and(|v| !v.prerelease.is_empty())
+    {
+        anyhow::bail!("npm error You must specify a tag using --tag when publishing a prerelease version.");
     }
 
-    // 6. postpublish
-    run_lifecycle_hook(
-        &package_dir,
-        &updated_manifest,
-        "postpublish",
-        ignore_scripts,
-        foreground,
-        is_silent,
-        json,
-    )?;
+    // npm shows the contents before authenticating so they are visible while
+    // an OTP is pending.
+    if !json && !is_silent {
+        print_pack_notices(&summary);
+    }
 
-    Ok(())
-}
-
-
-
-async fn execute_login(
-    current_dir: &std::path::Path,
-    registry: Option<String>,
-    auth_type: Option<String>,
-    scope: Option<String>,
-    otp: Option<String>,
-) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
         Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!(
-                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
-            )
+            anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}")
+        })?
+    } else if let Some(pub_reg) = manifest_json
+        .get("publishConfig")
+        .and_then(|c| c.get("registry"))
+        .and_then(|r| r.as_str())
+    {
+        Url::parse(pub_reg).map_err(|e| {
+            anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid publishConfig registry URL '{pub_reg}': {e}")
         })?
     } else {
-        config.npmrc.registry.clone()
+        config.npmrc.registry_for_package(&pkg_name).clone()
     };
 
-    let auth_str = auth_type.unwrap_or_else(|| "web".to_string());
-    let token = std::env::var("NPM_TOKEN")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let token = if let Some(token) = token {
-        token
-    } else if auth_str == "legacy" || auth_str == "basic" {
-        let username = std::env::var("NPM_USERNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code ENEEDAUTH\nnpm error set NPM_USERNAME for legacy login"
-                )
-            })?;
-        let password = std::env::var("NPM_PASSWORD")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "npm error code ENEEDAUTH\nnpm error set NPM_PASSWORD for legacy login"
-                )
-            })?;
-        let mut client_config = rnpm_registry::RegistryClientConfig {
-            default_registry: registry_url.clone(),
-            ..Default::default()
-        };
-        client_config.scoped_registries = config.npmrc.scoped_registries.clone();
-        let client = rnpm_registry::RegistryClient::with_config(client_config)?;
-        let otp = otp.or_else(|| std::env::var("NPM_OTP").ok());
-        let response = client
-            .login_legacy(Some(&registry_url), &username, &password, otp.as_deref())
-            .await?;
-        response.get("token").and_then(|v| v.as_str()).map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("npm error code EAUTHUNKNOWN\nnpm error registry login response did not contain a token"))?
-    } else {
-        return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error Set NPM_TOKEN to a registry token before running rnpm login"
-        ));
+    let mut client_config = rnpm_registry::RegistryClientConfig {
+        default_registry: registry_url.clone(),
+        scoped_registries: config.npmrc.scoped_registries.clone(),
+        auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
+        ..Default::default()
     };
-
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "npm error code ENOENT\nnpm error Cannot determine the user home directory"
-            )
-        })?;
-    let user_npmrc = PathBuf::from(home).join(".npmrc");
-    let key = auth_key_for_registry(&registry_url);
-    rnpm_config::set_config_value_in_file(&user_npmrc, &key, &token)?;
-    if let Some(scope) = scope {
-        let scope = if scope.starts_with('@') {
-            scope
-        } else {
-            format!("@{scope}")
-        };
-        rnpm_config::set_config_value_in_file(
-            &user_npmrc,
-            &format!("{scope}:registry"),
-            registry_url.as_str(),
-        )?;
+    if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
+        client_config.auth_token = Some(token.to_string());
     }
-    let _ = current_dir;
-    println!(
-        "Logged in to {} using {} authentication",
-        registry_url, auth_str
-    );
+    let client = rnpm_registry::RegistryClient::with_config(client_config)?;
+    let has_creds = client.auth_header_for_url(&registry_url).is_some();
+    if !has_creds {
+        let msg = format!("This command requires you to be logged in to {registry_url}");
+        if dry_run {
+            if !is_silent {
+                eprintln!("npm warn publish {msg} (dry-run)");
+            }
+        } else {
+            anyhow::bail!("npm error code ENEEDAUTH\nnpm error need auth {msg}\nnpm error need auth You need to authorize this machine using `npm adduser`");
+        }
+    }
 
+    if !force {
+        // npm refuses to overwrite a version or to move `latest` backwards.
+        if let Ok(existing) = client.get_package_metadata(&pkg_name).await {
+            if existing.versions.contains_key(&pkg_version) {
+                anyhow::bail!(
+                    "npm error You cannot publish over the previously published versions: {pkg_version}."
+                );
+            }
+            let highest = existing
+                .versions
+                .keys()
+                .filter_map(|v| rnpm_core::semver::Version::parse(v).ok())
+                .max();
+            if let (Some(highest), Some(current)) = (highest, parsed_version.as_ref()) {
+                if is_default_tag && &highest >= current {
+                    anyhow::bail!(
+                        "npm error Cannot implicitly apply the \"latest\" tag because previously published version {highest} is higher than the new version {pkg_version}. You must specify a tag using --tag."
+                    );
+                }
+            }
+        }
+    }
+
+    let effective_access = access.as_deref().or_else(|| {
+        manifest_json
+            .get("publishConfig")
+            .and_then(|c| c.get("access"))
+            .and_then(|a| a.as_str())
+    });
+    if !is_silent {
+        eprintln!(
+            "npm notice Publishing to {registry_url} with tag {tag} and {} access{}",
+            effective_access.unwrap_or("default"),
+            if dry_run { " (dry-run)" } else { "" }
+        );
+    }
+
+    if !dry_run {
+        if provenance {
+            ensure_provenance_generation()?;
+        }
+        let mut publish_manifest = manifest_json.clone();
+        if tarball_spec {
+            let names: Vec<String> = summary.files.iter().map(|f| f.path.clone()).collect();
+            prepare_publish_manifest(&mut publish_manifest, &names, |f| {
+                rnpm_fs::read_tarball_text(&tarball_bytes, f)
+            });
+        } else {
+            let names: Vec<String> = std::fs::read_dir(&package_dir)
+                .map(|it| {
+                    it.flatten()
+                        .filter(|e| e.path().is_file())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            prepare_publish_manifest(&mut publish_manifest, &names, |f| {
+                std::fs::read_to_string(package_dir.join(f)).ok()
+            });
+        }
+        let tarball_data = rnpm_registry::PublishTarballData {
+            filename: &summary.filename,
+            bytes: &tarball_bytes,
+            shasum: &summary.shasum,
+            integrity: &summary.integrity,
+        };
+        let payload_opts = rnpm_registry::PublishPayloadOptions {
+            name: &pkg_name,
+            version: &pkg_version,
+            description: manifest_json.get("description").and_then(|d| d.as_str()),
+            tag: &tag,
+            access: effective_access,
+            manifest: &publish_manifest,
+            tarball: tarball_data,
+            registry_url: &registry_url,
+            provenance_attestation: None,
+        };
+        let payload = rnpm_registry::create_publish_payload(&payload_opts);
+        let put_url = registry_url
+            .join(&rnpm_config::encode_package_name(&pkg_name))
+            .unwrap_or_else(|_| registry_url.clone());
+        let mut otp = otp;
+        let mut may_prompt = true;
+        loop {
+            let result = client
+                .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
+                .await
+                .map_err(|err| {
+                    use rnpm_registry::RegistryError as E;
+                    let status_error = |status: u16, www: Option<&str>, body: &str| {
+                        commands::client_helper::format_http_error_with_auth(
+                            "PUT",
+                            &put_url,
+                            reqwest::StatusCode::from_u16(status)
+                                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                            www,
+                            body,
+                        )
+                    };
+                    match err {
+                        E::Forbidden { status, message, .. }
+                        | E::Unauthorized { status, message, .. }
+                        | E::PublishConflict { status, message, .. } => status_error(status, None, &message),
+                        E::AuthChallenge { www_authenticate, body, .. } => {
+                            status_error(401, Some(&www_authenticate), &body)
+                        }
+                        E::ServerError { status, body } => status_error(status, None, &body),
+                        other => anyhow::anyhow!(other),
+                    }
+                });
+            match result {
+                // npm's otplease: on a terminal, prompt for the code and retry once.
+                Err(err) if may_prompt && http_errors::is_otp_error(&err) => {
+                    may_prompt = false;
+                    match http_errors::prompt_otp() {
+                        Some(code) => otp = Some(code),
+                        None => return Err(err),
+                    }
+                }
+                other => break other?,
+            }
+        }
+    }
+
+    // JSON is only printed once the publish has completed.
+    if json {
+        println!("{}", serde_json::to_string_pretty(&pack_json())?);
+    }
+
+    // `publish` and `postpublish` run only after a successful upload, and
+    // only for directory specs.
+    if !tarball_spec {
+        let manifest = Manifest::from_file(package_dir.join("package.json"))?;
+        run_lifecycle_hook(&package_dir, &manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(&package_dir, &manifest, "postpublish", ignore_scripts, foreground, is_silent, json)?;
+    }
+
+    if !json && !is_silent {
+        println!("+ {pkg_name}@{pkg_version}");
+    }
     Ok(())
 }
-
-fn auth_key_for_registry(registry: &Url) -> String {
-    let host = registry.host_str().unwrap_or_default();
-    let port = registry.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = if registry.path().is_empty() {
-        "/".to_string()
-    } else {
-        format!("{}/", registry.path().trim_end_matches('/'))
-    };
-    format!("//{host}{port}{path}:_authToken")
-}
-
 
 
 
@@ -3784,6 +3888,7 @@ pub(crate) fn make_registry_client(
         default_registry: registry_url.clone(),
         scoped_registries: config.npmrc.scoped_registries.clone(),
         auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
         ..Default::default()
     };
     if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
@@ -3814,17 +3919,6 @@ pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> 
         ));
     }
     Ok((name, version))
-}
-
-pub(crate) fn package_name_from_spec(spec: &str) -> &str {
-    if let Some(stripped) = spec.strip_prefix('@') {
-        stripped
-            .rfind('@')
-            .map(|idx| &spec[..idx + 1])
-            .unwrap_or(spec)
-    } else {
-        spec.split_once('@').map(|(name, _)| name).unwrap_or(spec)
-    }
 }
 
 pub(crate) fn package_name_from_manifest(current_dir: &Path) -> anyhow::Result<String> {
@@ -3908,6 +4002,8 @@ async fn run_audit_fix(
     registry: Option<String>,
     dry_run: bool,
     force: bool,
+    json: bool,
+    audit_level: &str,
 ) -> anyhow::Result<()> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -3934,9 +4030,8 @@ async fn run_audit_fix(
     let initial_vulns = initial_report.metadata.vulnerabilities.total;
 
     if initial_vulns == 0 {
-        println!("found 0 vulnerabilities");
-        println!("fixed 0 packages");
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     // Parse package.json to identify declared dependency ranges
@@ -4108,12 +4203,8 @@ async fn run_audit_fix(
     }
 
     if targets_to_update.is_empty() {
-        println!("found 0 vulnerabilities to fix");
-        audit::print_concise_audit_summary(&initial_report);
-        if packages_needing_force > 0 {
-            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
-        }
-        return Ok(());
+        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
     }
 
     if dry_run {
@@ -4207,7 +4298,7 @@ async fn run_audit_fix(
         println!("found 0 vulnerabilities");
     }
 
-    Ok(())
+    audit::check_report_threshold(&post_report, audit_level)
 }
 
 fn should_cleanup_trash(cmd: &Commands) -> bool {
@@ -4423,7 +4514,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 legacy_peer_deps,
                 strict_peer_deps,
                 save_dev,
-                save_exact,
+                save_exact: save_exact || config.get_bool("save-exact").unwrap_or(false),
                 save_prefix: effective_save_prefix,
                 save_prod,
                 save_optional,
@@ -4852,6 +4943,25 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     );
                     ctx.package_version = manifest.version;
                     ctx.extra_env = lifecycle_config_env(&target_dir);
+                    // `exec --package=x -c cmd`: install the packages into an
+                    // npx environment and put its bins first on PATH.
+                    if !packages.is_empty() {
+                        let env_dir = ensure_npx_environment(
+                            &packages,
+                            registry.clone(),
+                            cache.clone(),
+                            offline,
+                        )
+                        .await?;
+                        let bin = env_dir.join("node_modules").join(".bin");
+                        let mut paths = vec![bin];
+                        if let Some(existing) = std::env::var_os("PATH") {
+                            paths.extend(std::env::split_paths(&existing));
+                        }
+                        if let Ok(joined) = std::env::join_paths(paths) {
+                            std::env::set_var("PATH", joined);
+                        }
+                    }
                     let status = execute_lifecycle_script(&ctx)?;
                     if !status.success() {
                         let code = rnpm_lifecycle::extract_exit_status_code(&status);
@@ -5091,13 +5201,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             ..
         } => {
             if action.as_deref() == Some("fix") {
-                run_audit_fix(&current_dir, registry, dry_run, force).await?;
+                run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
             } else {
                 audit::run_audit(&current_dir, registry, json, &audit_level).await?;
             }
         }
         Commands::Cache { action, cache } => {
-            commands::cache::run(action, cache, current_dir)?;
+            commands::cache::run(action, cache, current_dir).await?;
         }
         Commands::Diff {
             specs,
@@ -5216,10 +5326,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 } else {
                     Vec::new()
                 };
-                select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
-                if packages.is_empty() && !ws_filters.is_empty() {
-                    packages.extend(ws_filters);
-                }
+                let members = select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
+                if packages.is_empty() { packages.extend(members.into_iter().map(|m| m.name)); }
             }
 
             let opts = list::ListOptions {
@@ -5233,7 +5341,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit,
                 is_global,
             };
-            let code = list::run_list(&target_dir, &opts)?;
+            let code = if ws_in_overrides { list::run_workspace_list(&target_dir, &opts)? } else { list::run_list(&target_dir, &opts)? };
             if code != 0 {
                 return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
                     exit_code: code,
@@ -5241,15 +5349,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }));
             }
         }
-        Commands::Outdated {
-            packages,
-            all,
-            json,
-            long,
-            parseable,
-            registry,
-        } => {
-            commands::outdated::run(packages, all, json, long, parseable, registry, current_dir).await?;
+        Commands::Outdated { packages, all, json, long, parseable, registry, global, workspace, workspaces, include_workspace_root } => {
+            let target_dir = if global { rnpm_config::find_global_prefix() } else { current_dir };
+            let opts = outdated::OutdatedOptions {packages,all,json,long,parseable,registry,global,workspace,workspaces,include_workspace_root};
+            commands::outdated::run(opts,target_dir).await?;
         }
         Commands::View {
             args,
@@ -5304,7 +5407,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             scope,
             otp,
         } => {
-            execute_login(&current_dir, registry, auth_type, scope, otp).await?;
+            commands::login::run(&current_dir, registry, auth_type, scope, otp, false).await?;
+        }
+        Commands::Adduser { registry, auth_type, scope, otp } => {
+            commands::login::run(&current_dir, registry, auth_type, scope, otp, true).await?;
         }
         Commands::Logout { registry, scope } => {
             commands::logout::run(&current_dir, registry, scope).await?;
@@ -5360,11 +5466,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::DistTag {
-            action,
+            args,
             registry,
-            json,
+            json: _,
             otp,
-        } => commands::dist_tag::run(current_dir, action, registry, json, otp).await?,
+            tag,
+        } => commands::dist_tag::run(current_dir, args, registry, otp, tag).await?,
         Commands::Owner {
             action,
             registry,
@@ -5555,48 +5662,18 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if is_perf {
                 doctor::run_doctor_perf(&current_dir, json).await?;
             } else {
-                doctor::run_doctor_standard(&current_dir, json).await?;
+                let groups: Vec<String> = action.into_iter().chain(args).collect();
+                doctor::run_npm_doctor(&current_dir, &groups).await?;
             }
         }
         Commands::Fund { package, json } => {
-            let count = audit::count_funding_packages(&current_dir);
-            let manifest_path = current_dir.join("package.json");
-            let (pkg_name, pkg_version) = if manifest_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let n = val.get("name").and_then(|v| v.as_str()).unwrap_or("project").to_string();
-                        let v = val.get("version").and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
-                        (n, v)
-                    } else {
-                        ("project".to_string(), "1.0.0".to_string())
-                    }
-                } else {
-                    ("project".to_string(), "1.0.0".to_string())
-                }
-            } else {
-                ("project".to_string(), "1.0.0".to_string())
-            };
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "length": count,
-                        "name": pkg_name,
-                        "version": pkg_version,
-                        "dependencies": {}
-                    }))?
-                );
-            } else if let Some(package) = package {
-                println!("{package}: funding metadata is available in package.json");
-            } else {
-                println!("{pkg_name}@{pkg_version}");
-            }
+            commands::fund::run(&current_dir, package, json).await?;
         }
         Commands::Explain { package, json } => {
             explain::run_explain(&current_dir, &package, json)?;
         }
         Commands::Bugs { packages, .. } => {
+            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
@@ -5607,21 +5684,22 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .or_else(|| value.get("bugs").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 if url.is_empty() {
-                    println!("https://www.npmjs.com/package/{package}?activeTab=issues");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", &format!("https://www.npmjs.com/package/{package}?activeTab=issues"));
                 } else {
-                    println!("{url}");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", url);
                 }
             }
         }
         Commands::Docs { packages, .. } => {
+            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
                 let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
                 if url.is_empty() {
-                    println!("https://www.npmjs.com/package/{package}?activeTab=readme");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", &format!("https://www.npmjs.com/package/{package}?activeTab=readme"));
                 } else {
-                    println!("{url}");
+                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", url);
                 }
             }
         }
@@ -5637,7 +5715,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .and_then(|v| v.get("url").or(Some(v)))
                     .and_then(|v| v.as_str());
                 if let Some(r) = repo {
-                    println!("{r}");
+                    let name = value.as_ref().and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    print_package_url(&current_dir, name, "repo", r.trim_end_matches(".git"));
                     return Ok(());
                 } else {
                     return Err(anyhow::anyhow!("npm error no repository"));
@@ -5660,7 +5739,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         .and_then(|v| v.as_str())
                         .or_else(|| value.get("repository").and_then(|v| v.as_str()))
                     {
-                        println!("{repo}");
+                        print_package_url(&current_dir, &package, "repo", repo.trim_end_matches(".git"));
                         continue;
                     }
                 }
@@ -5678,7 +5757,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                             .and_then(|v| v.extra.get("repository"))
                             .and_then(|v| v.as_str())
                     });
-                println!("{}", repo.unwrap_or("https://www.npmjs.com/package/"));
+                print_package_url(&current_dir, &package, "repo", repo.unwrap_or("https://www.npmjs.com/package/").trim_end_matches(".git"));
                 let _ = registry_url;
             }
         }
@@ -5705,59 +5784,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             args,
             registry,
             otp,
-            json: _,
+            json,
         } => {
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            let value = match action.as_deref().unwrap_or("list") {
-                "list" | "ls" => client.stage_list(Some(&registry_url)).await?,
-                "view" | "show" => {
-                    client
-                        .stage_view(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage view <stage-id>"
-                                )
-                            })?,
-                        )
-                        .await?
-                }
-                "approve" => {
-                    client
-                        .stage_approve(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage approve <stage-id>"
-                                )
-                            })?,
-                            otp.as_deref(),
-                        )
-                        .await?
-                }
-                "reject" | "delete" => {
-                    client
-                        .stage_reject(
-                            Some(&registry_url),
-                            args.first().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error stage reject <stage-id>"
-                                )
-                            })?,
-                            otp.as_deref(),
-                        )
-                        .await?;
-                    serde_json::Value::Null
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error unknown stage command: {other}"
-                    ))
-                }
-            };
-            if !value.is_null() {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            commands::stage::run_stage(
+                action.as_deref(),
+                &args,
+                registry,
+                otp.as_deref(),
+                json,
+                &current_dir,
+            )
+            .await?;
         }
         Commands::InstallCiTest { args } => {
             commands::install_test::run_install_ci_test(args, current_dir).await?;
@@ -5789,12 +5826,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             dry_run,
         } => {
-            run_audit_fix(&current_dir, registry, dry_run, force).await?;
+            run_audit_fix(&current_dir, registry, dry_run, force, false, "low").await?;
         }
         Commands::Trust {
             action,
             args,
-            yes: _,
+            yes,
             registry,
             id,
             otp,
@@ -5810,127 +5847,32 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             allow_publish,
             allow_stage_publish,
             json,
+            dry_run,
         } => {
-            let action = action.unwrap_or_else(|| "list".into());
-            let package = args
-                .first()
-                .cloned()
-                .or_else(|| package_name_from_manifest(&current_dir).ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "npm error code ENEEDPACKAGE\nnpm error package name must be specified"
-                    )
-                })?;
-            let (registry_url, client) = make_registry_client(&current_dir, registry)?;
-            match action.as_str() {
-                "list" => {
-                    let value = client.trust_list(Some(&registry_url), &package).await?;
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                }
-                "revoke" => {
-                    let id = id.or_else(|| args.get(1).cloned()).ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust revoke requires --id=<trust-id>"))?;
-                    client
-                        .trust_revoke(Some(&registry_url), &package, &id, otp.as_deref())
-                        .await?;
-                    println!("revoked trusted configuration {id} for {package}");
-                }
-                "github" | "gitlab" | "circleci" => {
-                    if !allow_publish && !allow_stage_publish {
-                        return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error trust {action} requires --allow-publish or --allow-stage-publish"));
-                    }
-                    let claims = match action.as_str() {
-                        "github" => {
-                            let file = workflow_file.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error trust github requires --file"
-                                )
-                            })?;
-                            if !file.ends_with(".yml") && !file.ends_with(".yaml") {
-                                return Err(anyhow::anyhow!("npm error code EUSAGE\nnpm error workflow file must end in .yml or .yaml"));
-                            }
-                            let mut claims = serde_json::Map::new();
-                            if let Some(repo) = repository {
-                                claims.insert("repository".into(), serde_json::Value::String(repo));
-                            }
-                            let mut workflow = serde_json::Map::new();
-                            workflow.insert("file".into(), serde_json::Value::String(file));
-                            claims
-                                .insert("workflow_ref".into(), serde_json::Value::Object(workflow));
-                            if let Some(env) = environment {
-                                claims.insert("environment".into(), serde_json::Value::String(env));
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                        "gitlab" => {
-                            let file = workflow_file.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "npm error code EUSAGE\nnpm error trust gitlab requires --file"
-                                )
-                            })?;
-                            let mut claims = serde_json::Map::new();
-                            if let Some(project) = project.or(repository) {
-                                claims.insert(
-                                    "project_path".into(),
-                                    serde_json::Value::String(project),
-                                );
-                            }
-                            claims.insert("ref_path".into(), serde_json::Value::String(file));
-                            if let Some(env) = environment {
-                                claims.insert("environment".into(), serde_json::Value::String(env));
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                        _ => {
-                            let org = org_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --org-id"))?;
-                            let project_id = project_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --project-id"))?;
-                            let pipeline = pipeline_definition_id.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --pipeline-definition-id"))?;
-                            let origin = vcs_origin.ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error trust circleci requires --vcs-origin"))?;
-                            let mut claims = serde_json::Map::new();
-                            for (key, value) in [
-                                ("organization_id", org),
-                                ("project_id", project_id),
-                                ("pipeline_definition_id", pipeline),
-                                ("vcs_origin", origin),
-                            ] {
-                                claims.insert(key.into(), serde_json::Value::String(value));
-                            }
-                            if !context_id.is_empty() {
-                                claims.insert(
-                                    "context_id".into(),
-                                    serde_json::Value::Array(
-                                        context_id
-                                            .into_iter()
-                                            .map(serde_json::Value::String)
-                                            .collect(),
-                                    ),
-                                );
-                            }
-                            serde_json::Value::Object(claims)
-                        }
-                    };
-                    let mut permissions = Vec::new();
-                    if allow_publish {
-                        permissions.push(serde_json::Value::String("createPackage".into()));
-                    }
-                    if allow_stage_publish {
-                        permissions.push(serde_json::Value::String("createStagedPackage".into()));
-                    }
-                    let config = serde_json::json!([{"type": action, "claims": claims, "permissions": permissions}]);
-                    let value = client
-                        .trust_create(Some(&registry_url), &package, config, otp.as_deref())
-                        .await?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&value)?);
-                    } else {
-                        println!("trusted {package} with {action}");
-                    }
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error Unknown trust command: {other}"
-                    ))
-                }
+            let Some(action) = action else {
+                return Err(commands::stage::usage_error(None, commands::stage::TRUST_USAGE));
+            };
+            if action == "list" {
+                return commands::stage::run_trust_list(&args, registry, json, &current_dir).await;
             }
+            if action == "revoke" {
+                return commands::stage::run_trust_revoke(
+                    &args,
+                    id,
+                    registry,
+                    otp.as_deref(),
+                    dry_run,
+                    json,
+                    &current_dir,
+                )
+                .await;
+            }
+            commands::trust::run(commands::trust::CreateArgs {
+                provider: action, package: args.first().cloned(), registry, otp,
+                file: workflow_file, repository, environment, project, org_id,
+                project_id, pipeline_definition_id, vcs_origin, context_ids: context_id,
+                allow_publish, allow_stage_publish, yes, json, dry_run,
+            }, &current_dir).await?;
         }
         Commands::Hook { registry, .. } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
@@ -5953,8 +5895,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 "npm error code ENOTSUP\nnpm error hook is not supported by the active registry"
             ));
         }
-        Commands::Get { key } => {
-            commands::config::run_get(key.as_deref(), &current_dir)?;
+        Commands::Get { key, extra_keys } => {
+            commands::config::run_get_keys(key.as_deref(), &extra_keys, &current_dir)?;
         }
         Commands::Set {
             key,
@@ -6005,33 +5947,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             if topic_str == "install-strategy" || topic_str == "install_strategy" {
                 print_help_install_strategy();
             } else if topic.is_empty() {
-                println!(
-r#"npm <command>
-
-Usage:
-
-npm install        install all the dependencies in your project
-npm install <foo>  add the <foo> dependency to your project
-npm test           run this project's tests
-npm run <foo>      run the script named <foo>
-npm <command> -h   quick help on <command>
-npm -l             display usage info for all commands
-npm help <term>    search for help on <term> (in a browser)
-npm help npm       more involved overview (in a browser)
-
-All commands:
-
-    access, adduser, audit, bugs, cache, ci, completion,
-    config, dedupe, deprecate, diff, dist-tag, docs, doctor,
-    edit, exec, explain, explore, find-dupes, fund, get, help,
-    help-search, hook, init, install, install-ci-test,
-    install-test, link, ll, login, logout, ls, org, outdated,
-    owner, pack, ping, pkg, prefix, profile, prune, publish,
-    query, rebuild, repo, restart, root, run-script, sbom,
-    search, set, shrinkwrap, star, stars, start, stop, team,
-    test, token, uninstall, unpublish, unstar, update, version,
-    view, whoami"#
-                );
+                print!("{}", npm_usage());
             } else {
                 let cmd = Cli::command();
                 if let Some(sub) = cmd.find_subcommand(&topic[0]) {
@@ -6048,6 +5964,76 @@ All commands:
     }
 
     Ok(())
+}
+
+/// Command list printed by `npm help` (npm's lib/utils/cmd-list.js).
+const NPM_COMMANDS: &[&str] = &[
+    "access", "adduser", "approve-scripts", "audit", "bugs", "cache", "ci", "completion",
+    "config", "dedupe", "deny-scripts", "deprecate", "diff", "dist-tag", "docs", "doctor",
+    "edit", "exec", "explain", "explore", "find-dupes", "fund", "get", "help", "help-search",
+    "init", "install", "install-ci-test", "install-scripts", "install-test", "link", "ll",
+    "login", "logout", "ls", "org", "outdated", "owner", "pack", "ping", "pkg", "prefix",
+    "profile", "prune", "publish", "query", "rebuild", "repo", "restart", "root", "run",
+    "sbom", "search", "set", "shrinkwrap", "stage", "star", "stars", "start", "stop", "team",
+    "test", "token", "trust", "undeprecate", "uninstall", "unpublish", "unstar", "update",
+    "version", "view", "whoami",
+];
+
+/// Wraps the command list like npm's utils/npm-usage.js for a non-TTY stdout.
+fn npm_command_names() -> String {
+    const LINE: usize = 60;
+    let mut out = vec![String::new()];
+    for c in NPM_COMMANDS {
+        let last = out.last_mut().expect("non-empty");
+        if last.len() + c.len() + 2 < LINE {
+            last.push_str(", ");
+            last.push_str(c);
+        } else {
+            last.push(',');
+            out.push((*c).to_string());
+        }
+    }
+    let joined = out.join("\n    ");
+    format!("\n    {}", &joined[2..])
+}
+
+fn npm_usage() -> String {
+    let userconfig = rnpm_config::find_user_npmrc()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let root = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.display().to_string()))
+        .unwrap_or_default();
+    format!(
+        "npm <command>
+
+Usage:
+
+npm install        install all the dependencies in your project
+npm install <foo>  add the <foo> dependency to your project
+npm test           run this project's tests
+npm run <foo>      run the script named <foo>
+npm <command> -h   quick help on <command>
+npm -l             display usage info for all commands
+npm help <term>    search for help on <term> (in a browser)
+npm help npm       more involved overview (in a browser)
+
+All commands:
+{}
+
+Specify configs in the ini-formatted file:
+    {userconfig}
+or on the command line via: npm <command> --key=value
+
+More configuration info: npm help config
+Configuration fields: npm help 7 config
+
+npm@{} {root}
+",
+        npm_command_names(),
+        crate::version::NPM_VERSION,
+    )
 }
 
 fn print_help_install_strategy() {
@@ -6106,6 +6092,12 @@ CONFIGURATION
     );
 }
 
+fn print_package_url(dir: &Path, name: &str, command: &str, url: &str) {
+    if rnpm_config::Config::load(Some(dir)).ok().is_some_and(|config| config.get("browser") == Some("false")) {
+        println!("{name} {command} available at the following URL:\n{url}");
+    } else { println!("{url}"); }
+}
+
 pub(crate) fn use_unicode(dir: &Path) -> bool {
     rnpm_config::Config::load(Some(dir)).ok().and_then(|config| config.get_bool("unicode"))
         .unwrap_or_else(|| {
@@ -6114,6 +6106,19 @@ pub(crate) fn use_unicode(dir: &Path) -> bool {
                 .unwrap_or_default().to_ascii_uppercase();
             locale.ends_with("UTF8") || locale.ends_with("UTF-8")
         })
+}
+
+/// True when npm's loglevel resolves to `silent` for this directory.
+pub(crate) fn is_loglevel_silent(dir: &Path) -> bool {
+    let overrides = rnpm_config::get_process_cli_overrides();
+    overrides
+        .as_ref()
+        .and_then(|o| o.get("loglevel"))
+        .map(|s| s == "silent")
+        .unwrap_or(false)
+        || rnpm_config::Config::load(Some(dir))
+            .ok()
+            .is_some_and(|c| c.get("loglevel") == Some("silent"))
 }
 
 pub(crate) fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
@@ -6264,16 +6269,188 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
     env
 }
 
+/// `--json` (or `json=true` config) is in effect for this invocation.
+fn json_error_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == "--json" || a == "--json=true")
+        || std::env::current_dir()
+            .ok()
+            .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+            .and_then(|c| c.get_bool("json"))
+            .unwrap_or(false)
+}
+
+/// npm's `jsonError`: `{ error: { code?, summary, detail } }` built from a
+/// rendered `npm error` block. Summary is the message; detail starts at the
+/// explanatory lines npm keeps separate.
+fn npm_json_error(block: &str) -> String {
+    let mut code = None;
+    let mut lines: Vec<String> = Vec::new();
+    for line in block.lines() {
+        let Some(rest) = line.strip_prefix("npm error").map(|r| r.strip_prefix(' ').unwrap_or(r)) else {
+            continue;
+        };
+        if let Some(c) = rest.strip_prefix("code ").filter(|_| code.is_none() && lines.is_empty()) {
+            code = Some(c.trim().to_string());
+            continue;
+        }
+        if rest.starts_with("A complete log of this run") || rest.starts_with("Log files were not written") {
+            continue;
+        }
+        lines.push(rest.to_string());
+    }
+    while lines.first().is_some_and(|l| l.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    const DETAIL_STARTS: &[&str] = &[
+        "403 In most cases",
+        "Failed to parse JSON data.",
+        "notarget In most cases",
+        "need auth You need to authorize",
+        "404 \u{0027}",
+        "You can provide a one-time password",
+        "Open this URL in your browser",
+        "To correct this please try logging in again",
+        "If you were trying to login",
+    ];
+    let lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| l.strip_prefix("JSON.parse ").map(str::to_string).unwrap_or(l))
+        .collect();
+    let split = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, l)| DETAIL_STARTS.iter().any(|p| l.starts_with(p)) || l.as_str() == "404")
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    let strip = |l: &String| {
+        for prefix in ["403 ", "404 ", "notarget ", "need auth ", "notsup ", "engine "] {
+            if let Some(rest) = l.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+        if l == "404" {
+            return String::new();
+        }
+        l.clone()
+    };
+    // npm's jsonError trims both joined strings.
+    let summary = lines[..split].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
+    let detail = lines[split..].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
+    let mut error = serde_json::Map::new();
+    if let Some(code) = code {
+        error.insert("code".into(), serde_json::Value::String(code));
+    }
+    error.insert("summary".into(), serde_json::Value::String(summary));
+    error.insert("detail".into(), serde_json::Value::String(detail));
+    serde_json::to_string_pretty(&serde_json::json!({ "error": error })).unwrap_or_default()
+}
+
 fn finish_cli_error(err: &anyhow::Error) -> ! {
+    if err.is::<commands::login::InputClosed>() {
+        std::process::exit(1);
+    }
+    if err.is::<outdated::OutdatedStatus>() {
+        std::process::exit(1);
+    }
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
         if exit.message.starts_with("npm error ") { eprintln!("{}", exit.message); }
+        write_error_log(err);
         std::process::exit(exit.exit_code);
     }
-    let diagnostic = diagnostics::classify_error(err);
-    if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
-    else { print_structured_error(err); }
+    let rendered = format!("{err:#}");
+    if json_error_requested() {
+        let block = if rendered.starts_with("npm error ") {
+            rendered.clone()
+        } else {
+            diagnostics::classify_error(err).format_npm()
+        };
+        println!("{}", npm_json_error(&block));
+    }
+    if rendered.starts_with("npm error ") {
+        // Already a complete npm error block: keep its code and blank lines.
+        eprintln!("{}", rendered.trim_end());
+    } else {
+        let diagnostic = diagnostics::classify_error(err);
+        if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
+        else { print_structured_error(err); }
+    }
+    write_error_log(err);
     let missing_manifest = format!("{err:#}").contains("package.json not found");
-    std::process::exit(if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 });
+    let status = diagnostics::classify_error(err).code.parse::<i32>().unwrap_or({
+        if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 }
+    });
+    std::process::exit(status);
+}
+
+fn write_error_log(err: &anyhow::Error) {
+    use std::io::Write;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = rnpm_config::Config::load(Some(&cwd)).unwrap_or_default();
+    if let Some(max) = config
+        .get("logs-max")
+        .filter(|v| v.parse::<i64>().is_ok_and(|n| n <= 0))
+    {
+        eprintln!("npm error Log files were not written due to the config logs-max={max}");
+        return;
+    }
+    let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("npm-cache")
+    });
+    let log_dir = config
+        .get("logs-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cache.join("_logs"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp = format!(
+        "{}_{:03}Z",
+        sbom::current_rfc3339_time()
+            .trim_end_matches('Z')
+            .replace(':', "_"),
+        now.subsec_millis()
+    );
+    let dir_created = std::fs::create_dir_all(&log_dir).is_ok();
+    // npm never opens a log file for `completion` (utils/log-file.js), so it
+    // reports that the logs directory could not be written.
+    let is_completion = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|c| c == "completion");
+    if !dir_created || is_completion {
+        eprintln!(
+            "npm error Log files were not written due to an error writing to the directory: {}\nnpm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal",
+            log_dir.display()
+        );
+        return;
+    }
+    for index in 0..10 {
+        let log = log_dir.join(format!("{timestamp}-debug-{index}.log"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log)
+        {
+            Ok(mut file) => {
+                if writeln!(file, "0 verbose cwd {}\n1 error {err:#}", cwd.display()).is_ok() {
+                    eprintln!(
+                        "npm error A complete log of this run can be found in: {}",
+                        log.display()
+                    );
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn main() {
@@ -6420,12 +6597,46 @@ fn main() {
             if rendered.contains("unrecognized subcommand") {
                 let first_arg = filtered_args.get(1).cloned().unwrap_or_default();
                 println!("Unknown command: \"{first_arg}\"\n\nTo see a list of supported npm commands, run:\n  npm help");
+                if json_error_requested() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": { "code": "EUNKNOWNCOMMAND", "summary": "", "detail": "" }
+                        }))
+                        .unwrap_or_default()
+                    );
+                }
             } else {
                 eprintln!("{rendered}");
             }
             std::process::exit(1);
         }
     };
+
+    if let Some(command) = Cli::command().try_get_matches_from(&filtered_args).ok()
+        .and_then(|matches| matches.subcommand_name().map(str::to_owned)) {
+        let config = std::env::current_dir().ok().and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok()).unwrap_or_default();
+        let mut agent = config.npmrc.settings.get("user-agent").cloned().unwrap_or_else(rnpm_lifecycle::npm_user_agent);
+        if config.get_bool("workspaces") == Some(true) || config.get("workspace").is_some_and(|v| !v.is_empty()) {
+            agent = agent.replace("workspaces/false", "workspaces/true");
+        }
+        rnpm_registry::client::set_cli_request_context(command, agent);
+    }
+
+    // npm warns whenever force is in effect, whatever the command.
+    {
+        let raw: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
+        let silent = raw.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent");
+        let forced = raw.iter().any(|a| a == "--force" || a == "-f" || a == "--force=true")
+            || std::env::current_dir()
+                .ok()
+                .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+                .and_then(|c| c.get_bool("force"))
+                .unwrap_or(false);
+        if forced && !silent {
+            eprintln!("npm warn using --force Recommended protections disabled.");
+        }
+    }
 
     if filtered_args.get(1).is_some_and(|s| s == "la" || s == "ll") {
         if let Commands::List { ref mut long, .. } = cli.command {

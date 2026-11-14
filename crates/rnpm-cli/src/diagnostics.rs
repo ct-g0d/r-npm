@@ -42,8 +42,41 @@ impl Diagnostic {
     }
 }
 
+/// npm's E404 block for a registry package that does not exist, using the
+/// 404 response the registry client recorded for it.
+fn missing_package_diagnostic(name: &str, spec: &str) -> Diagnostic {
+    let (url, body) = rnpm_registry::not_found::lookup(name).unwrap_or_else(|| {
+        let config = rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
+        let registry = config.npmrc.registry_for_package(name).clone();
+        let url = format!(
+            "{}/{}",
+            registry.as_str().trim_end_matches('/'),
+            rnpm_config::encode_package_name(name)
+        );
+        (url, String::new())
+    });
+    let status = reqwest::StatusCode::NOT_FOUND;
+    let message = crate::http_errors::general_message("GET", &url, status, &body);
+    // npm-package-arg reports an empty spec as `*`; rnpm's default is `latest`.
+    let raw_spec = if spec.is_empty() || spec == "latest" { "*" } else { spec };
+    Diagnostic::new("E404", crate::http_errors::e404_block(&message, Some(&format!("{name}@{raw_spec}"))))
+}
+
+/// npm's EJSONPARSE block for the current project's package.json.
+fn npm_package_json_error() -> Option<String> {
+    let text = std::fs::read_to_string(std::env::current_dir().ok()?.join("package.json")).ok()?;
+    crate::json_errors::package_json_error(&text)
+}
+
 /// Classify an arbitrary error into a structured npm diagnostic with stable error code.
 pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
+    for cause in err.chain() {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some((code, message)) = rnpm_registry::network_errors::diagnostic(http) {
+                return Diagnostic::new(code, message);
+            }
+        }
+    }
     let err_str = format!("{:#}", err);
 
     // If the error string already contains an npm error block, preserve its code and message
@@ -75,10 +108,28 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ENOWORKSPACES" => "ENOWORKSPACES",
                 "ENOWORKSPACE" => "ENOWORKSPACE",
                 "ENOTCACHED" => "ENOTCACHED",
+                "ENOTSUP" => "ENOTSUP",
+                "ENOMATCH" => "ENOMATCH",
                 "FETCH_ERROR" => "FETCH_ERROR",
                 "EINVALIDURL" => "EINVALIDURL",
+                "ECONNREFUSED" => "ECONNREFUSED",
+                "ENOTFOUND" => "ENOTFOUND",
+                "ECONNRESET" => "ECONNRESET",
+                "ETIMEDOUT" => "ETIMEDOUT",
+                "128" => "128",
                 _ => "EUNKNOWN",
             };
+            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR" | "128") {
+                let mut block = err_str[idx..].to_string();
+                if code == "ECONNREFUSED" && err.chain().any(|cause| {
+                    matches!(cause.downcast_ref::<SolverError>(), Some(SolverError::PackageMetadata(..)))
+                }) {
+                    // Arborist failureNode uses '.' when no parent edge is
+                    // attached to a package metadata failure.
+                    block = block.replace("npm error   type: 'system'\n", "npm error   type: 'system',\nnpm error   requiredBy: '.'\n");
+                }
+                return Diagnostic::new(code, block);
+            }
             let remaining: Vec<String> = lines
                 .map(|l| {
                     let trimmed = l.trim();
@@ -120,9 +171,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
-                SolverError::UnresolvedDependency { message, .. }
+                SolverError::UnresolvedDependency { name, spec, message }
                     if message == "Package not found in metadata provider" => {
-                    return Diagnostic::new("E404", solver_err.to_string());
+                    return missing_package_diagnostic(name, spec);
                 }
                 SolverError::PeerConflict { .. } => {
                     return Diagnostic::new("ERESOLVE", solver_err.to_string());
@@ -314,6 +365,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
             column,
         }) = cause.downcast_ref::<ManifestError>()
         {
+            if let Some(block) = npm_package_json_error() {
+                return Diagnostic::new("EJSONPARSE", block);
+            }
             return Diagnostic::new(
                 "EJSONPARSE",
                 format!("Malformed JSON in manifest: {message} at line {line}, column {column}"),
@@ -353,6 +407,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     line,
                     column,
                 }) => {
+                    if let Some(block) = npm_package_json_error() {
+                        return Diagnostic::new("EJSONPARSE", block);
+                    }
                     return Diagnostic::new(
                         "EJSONPARSE",
                         format!(
@@ -375,7 +432,14 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
                 "Package not found in metadata provider" => {
-                    return Diagnostic::new("E404", err_str);
+                    let at = package_spec
+                        .char_indices()
+                        .skip(1)
+                        .find(|(_, c)| *c == '@')
+                        .map(|(i, _)| i)
+                        .unwrap_or(package_spec.len());
+                    let (name, spec) = package_spec.split_at(at);
+                    return missing_package_diagnostic(name, spec.strip_prefix('@').unwrap_or(spec));
                 }
                 _ => {}
             }

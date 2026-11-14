@@ -6,20 +6,28 @@ fn test_cli_doctor_standard_text_output() {
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
     let tmp = tempdir().unwrap();
 
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let registry = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 8192];
+        assert!(stream.read(&mut request).unwrap() > 0);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+    });
     let output = Command::new(rnpm_bin)
-        .arg("doctor")
+        .args(["doctor", "connection", "--registry", &registry])
+        .env("NPM_CONFIG_USERCONFIG", tmp.path().join("user.npmrc"))
+        .env("NPM_CONFIG_GLOBALCONFIG", tmp.path().join("global.npmrc"))
         .current_dir(tmp.path())
         .output()
         .expect("Failed to execute rnpm doctor");
 
     assert!(output.status.success(), "rnpm doctor should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rnpm doctor"));
-    assert!(stdout.contains("Platform"));
-    assert!(stdout.contains("Registry"));
-    assert!(stdout.contains("Dev Drive"));
-    assert!(stdout.contains("Seek Penalty"));
-    assert!(stdout.contains("rnpm doctor perf"));
+    // npm doctor renders each selected check, without the former custom report.
+    assert_eq!(stdout.replace("\r\n", "\n"), "Connecting to the registry\nOk\n\n");
+    server.join().unwrap();
 }
 
 #[test]
@@ -29,6 +37,7 @@ fn test_cli_doctor_standard_json_output() {
 
     let output = Command::new(rnpm_bin)
         .arg("doctor")
+        .arg("unknown")
         .arg("--json")
         .current_dir(tmp.path())
         .output()
@@ -36,14 +45,8 @@ fn test_cli_doctor_standard_json_output() {
 
     assert!(output.status.success(), "rnpm doctor --json should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let val: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("rnpm doctor --json must output valid JSON");
-
-    assert!(val.get("rnpm_version").is_some());
-    assert!(val.get("platform").is_some() || val.get("os").is_some());
-    assert!(val.get("registry").is_some());
-    assert!(val.get("cache_dir").is_some());
-    assert!(val.get("dev_drive").is_some());
+    // npm's --json does not invent a report; an unknown group selects no checks.
+    assert!(stdout.is_empty());
 }
 
 #[test]

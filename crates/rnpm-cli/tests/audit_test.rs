@@ -177,17 +177,19 @@ fn test_audit_fix_incompatible_requires_force() {
         .output()
         .expect("Failed to execute rnpm audit fix");
 
-    assert!(output.status.success());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unresolved vulnerabilities must fail audit fix"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("found 0 vulnerabilities to fix"),
-        "stdout must report 0 vulnerabilities to fix without --force, got:\n{stdout}"
+        stdout.contains("# npm audit report"),
+        "stdout must report the remaining vulnerabilities: {stdout}"
     );
     assert!(
-        stderr
-            .contains("Semver-major updates or breaking changes require `rnpm audit fix --force`"),
-        "stderr must explain semver-major updates require --force, got:\n{stderr}"
+        stdout.contains("npm audit fix --force"),
+        "stdout must explain the required forced remediation: {stdout}"
     );
 
     // Verify package.json is unmodified
@@ -529,10 +531,9 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
 
     // Seed npm's native content layout from the exact verified rnpm tarball.
     // rnpm also supports a legacy layout that npm itself does not read.
-    let integrity = rnpm_core::integrity::Integrity::parse(
-        lodash_entry["integrity"].as_str().unwrap(),
-    )
-    .unwrap();
+    let integrity =
+        rnpm_core::integrity::Integrity::parse(lodash_entry["integrity"].as_str().unwrap())
+            .unwrap();
     let cache = rnpm_cache::Cache::new(iso_cache.join("_cacache")).unwrap();
     let tarball = cache.get_by_integrity(&integrity).unwrap().unwrap();
     let digest = &integrity.entries[0];

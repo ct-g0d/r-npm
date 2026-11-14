@@ -53,8 +53,28 @@ impl Overrides {
     ) -> Result<Self, crate::error::SolverError> {
         Ok(Self::from_json_value(
             manifest.extra.get("overrides"),
-            manifest.dependencies.clone(),
+            Self::reference_specs(manifest),
         ))
+    }
+
+    /// Specs that `$name` override references resolve to. arborist's
+    /// edge.js looks in devDependencies, optionalDependencies, dependencies,
+    /// then peerDependencies of the root package.
+    pub fn reference_specs(manifest: &rnpm_core::manifest::Manifest) -> BTreeMap<String, String> {
+        let mut specs = BTreeMap::new();
+        for section in [
+            &manifest.peer_dependencies,
+            &manifest.dependencies,
+            &manifest.optional_dependencies,
+            &manifest.dev_dependencies,
+        ] {
+            for (name, spec) in section {
+                if !spec.is_empty() {
+                    specs.insert(name.clone(), spec.clone());
+                }
+            }
+        }
+        specs
     }
 
     /// Check if a dependency should be overridden.
@@ -411,6 +431,22 @@ mod tests {
         // Under qux: not overridden
         let under_qux = overrides.resolve_override("bar", "^1.0.0", &["qux"]);
         assert_eq!(under_qux, None);
+    }
+
+    #[test]
+    fn test_reference_override_resolves_dev_dependency_first() {
+        // rollup's published manifest: "overrides": { "vite": "$vite" } with vite in devDependencies.
+        let manifest: rnpm_core::manifest::Manifest = serde_json::from_value(serde_json::json!({
+            "name": "root",
+            "version": "1.0.0",
+            "dependencies": { "shared": "^1.0.0" },
+            "devDependencies": { "vite": "^7.0.0", "shared": "^2.0.0" },
+            "overrides": { "vite": "$vite", "shared": "$shared" }
+        }))
+        .unwrap();
+        let overrides = Overrides::from_manifest(&manifest).unwrap();
+        assert_eq!(overrides.resolve_override("vite", "^5.0.0", &["plugin"]), Some("^7.0.0".into()));
+        assert_eq!(overrides.resolve_override("shared", "^1.0.0", &["plugin"]), Some("^2.0.0".into()));
     }
 
     #[test]

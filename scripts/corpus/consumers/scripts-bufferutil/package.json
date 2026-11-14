@@ -1,0 +1,8 @@
+{
+  "name": "scripts-bufferutil",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "bufferutil": "4.2.0"
+  }
+}

@@ -33,6 +33,9 @@ tar = { workspace = true }
 data-encoding = { workspace = true }
 mimalloc = { version = "0.1", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rnpm-lockfile = { workspace = true }

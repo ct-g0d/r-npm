@@ -1,7 +1,5 @@
 use crate::error::FsError;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use path_clean::clean;
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::Manifest;
@@ -1205,7 +1203,10 @@ pub fn collect_pack_files(
     let npmignore_path = package_dir.join(".npmignore");
     let gitignore_path = package_dir.join(".gitignore");
 
-    let ignore_patterns = if npmignore_path.is_file() {
+    let ignore_patterns = if manifest.files.is_some() {
+        // npm-packlist's package.json rules disable both root ignore files.
+        Vec::new()
+    } else if npmignore_path.is_file() {
         parse_ignore_patterns(&npmignore_path)?
     } else if gitignore_path.is_file() {
         parse_ignore_patterns(&gitignore_path)?
@@ -1220,7 +1221,7 @@ pub fn collect_pack_files(
         package_dir,
         package_dir,
         &files_filter,
-        &ignore_patterns,
+        &[(String::new(), ignore_patterns)],
         manifest,
         &mut files_to_pack,
     )?;
@@ -1321,6 +1322,21 @@ fn collect_strictly_required_files(package_dir: &Path, manifest: &Manifest) -> V
         required.push(clean_bin.to_string());
     }
 
+    // npm-packlist promotes literal files entries to strict requirements. These
+    // survive even an ignore file in their parent directory; directory/glob
+    // entries remain subject to nested ignore rules.
+    if let Some(files) = &manifest.files {
+        for file in files {
+            let clean = file
+                .strip_prefix("./")
+                .unwrap_or(file)
+                .trim_start_matches('/');
+            if package_dir.join(clean).is_file() && !is_strictly_excluded(clean, false) {
+                required.push(clean.to_string());
+            }
+        }
+    }
+
     // Look for README*, LICENSE*, LICENCE*, COPYING* in root
     if let Ok(entries) = fs::read_dir(package_dir) {
         for entry in entries.flatten() {
@@ -1344,10 +1360,24 @@ fn walk_dir_collect(
     current_dir: &Path,
     root_dir: &Path,
     files_filter: &Option<Vec<String>>,
-    ignore_patterns: &[String],
+    inherited_ignores: &[(String, Vec<String>)],
     manifest: &Manifest,
     out: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), FsError> {
+    let mut ignore_scopes = inherited_ignores.to_vec();
+    if current_dir != root_dir {
+        let local = if current_dir.join(".npmignore").is_file() {
+            current_dir.join(".npmignore")
+        } else {
+            current_dir.join(".gitignore")
+        };
+        let prefix = current_dir
+            .strip_prefix(root_dir)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        ignore_scopes.push((format!("{prefix}/"), parse_ignore_patterns(&local)?));
+    }
     let entries = match fs::read_dir(current_dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -1377,20 +1407,13 @@ fn walk_dir_collect(
 
         if file_type.is_dir() {
             // Check if directory itself is ignored
-            if is_path_ignored(&format!("{rel_path}/"), ignore_patterns) {
+            if is_path_ignored(&rel_path, &ignore_scopes) {
                 continue;
             }
-            walk_dir_collect(
-                &path,
-                root_dir,
-                files_filter,
-                ignore_patterns,
-                manifest,
-                out,
-            )?;
+            walk_dir_collect(&path, root_dir, files_filter, &ignore_scopes, manifest, out)?;
         } else if file_type.is_file() {
             // Check if file is included
-            if should_include_file(&rel_path, files_filter, ignore_patterns, manifest) {
+            if should_include_file(&rel_path, files_filter, &ignore_scopes, manifest) {
                 out.push((rel_path, path));
             }
         }
@@ -1431,7 +1454,7 @@ fn is_strictly_excluded(rel_path: &str, is_dir: bool) -> bool {
 fn should_include_file(
     rel_path: &str,
     files_filter: &Option<Vec<String>>,
-    ignore_patterns: &[String],
+    ignore_patterns: &[(String, Vec<String>)],
     manifest: &Manifest,
 ) -> bool {
     // 1. If it's an always-included root file
@@ -1453,15 +1476,15 @@ fn should_include_file(
             if rel_path.starts_with(&format!("{clean_no_slash}/")) {
                 return true;
             }
-            // Wildcard match
-            match_glob(clean, rel_path)
+            // Glob match against the file or a directory containing it
+            match_glob_or_parent(clean_no_slash, rel_path)
         });
 
         if !matched {
             return false;
         }
 
-        // Within files list, check if explicitly ignored by .npmignore
+        // Only directory-local ignore rules remain when files is present.
         if is_path_ignored(rel_path, ignore_patterns) {
             return false;
         }
@@ -1525,20 +1548,21 @@ fn parse_ignore_patterns(path: &Path) -> Result<Vec<String>, FsError> {
     Ok(patterns)
 }
 
-fn is_path_ignored(rel_path: &str, patterns: &[String]) -> bool {
+fn is_path_ignored(rel_path: &str, scopes: &[(String, Vec<String>)]) -> bool {
     let mut ignored = false;
-
-    for pat in patterns {
-        let mut is_negated = false;
-        let p = if let Some(stripped) = pat.strip_prefix('!') {
-            is_negated = true;
-            stripped.trim()
-        } else {
-            pat.as_str()
+    for (prefix, patterns) in scopes {
+        let Some(local_path) = rel_path.strip_prefix(prefix) else {
+            continue;
         };
-
-        if match_ignore_rule(p, rel_path) {
-            ignored = !is_negated;
+        for pattern in patterns {
+            let (rule, is_negated) = if let Some(rule) = pattern.strip_prefix('!') {
+                (rule.trim(), true)
+            } else {
+                (pattern.as_str(), false)
+            };
+            if match_ignore_rule(rule, local_path) {
+                ignored = !is_negated;
+            }
         }
     }
 
@@ -1558,8 +1582,8 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
         }
     }
 
-    if clean_pat.contains('/') {
-        if match_glob(clean_pat, target_path) {
+    if clean_pat.trim_end_matches('/').contains('/') {
+        if match_glob_or_parent(clean_pat.trim_end_matches('/'), target_path) {
             return true;
         }
     } else {
@@ -1578,24 +1602,127 @@ fn match_ignore_rule(pattern: &str, path: &str) -> bool {
     false
 }
 
+/// minimatch-style path glob: `*` and `?` stay within a segment, `**`
+/// spans any number of segments (including none), `[...]` is a class and
+/// `{a,b}` alternatives are expanded.
 fn match_glob(pattern: &str, text: &str) -> bool {
-    if pattern == "*" || pattern == "**" {
-        return true;
-    }
+    expand_braces(pattern).iter().any(|p| {
+        let pat: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let txt: Vec<&str> = text.split('/').filter(|s| !s.is_empty()).collect();
+        match_segments(&pat, &txt)
+    })
+}
 
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        if text.starts_with(prefix) {
-            return true;
+/// True when the glob matches `text` or any directory containing it, which is
+/// how ignore-walk treats a matched directory.
+fn match_glob_or_parent(pattern: &str, text: &str) -> bool {
+    let segments: Vec<&str> = text.split('/').filter(|s| !s.is_empty()).collect();
+    (1..=segments.len()).any(|n| match_glob(pattern, &segments[..n].join("/")))
+}
+
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let mut depth = 0;
+    let mut close = None;
+    for (i, c) in pattern[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
         }
     }
-
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if text.ends_with(suffix) {
-            return true;
+    let Some(close) = close else {
+        return vec![pattern.to_string()];
+    };
+    let inner = &pattern[open + 1..close];
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
+    parts.push(&inner[start..]);
+    if parts.len() < 2 {
+        return vec![pattern.to_string()];
+    }
+    let (head, tail) = (&pattern[..open], &pattern[close + 1..]);
+    parts
+        .into_iter()
+        .flat_map(|part| expand_braces(&format!("{head}{part}{tail}")))
+        .collect()
+}
 
-    pattern == text
+fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
+    match pat.first() {
+        None => txt.is_empty(),
+        Some(&"**") => {
+            // `**` never matches dot-entries, mirroring minimatch's default.
+            match_segments(&pat[1..], txt)
+                || (!txt.is_empty()
+                    && !txt[0].starts_with('.')
+                    && match_segments(pat, &txt[1..]))
+        }
+        Some(seg) => {
+            !txt.is_empty() && match_segment(seg, txt[0]) && match_segments(&pat[1..], &txt[1..])
+        }
+    }
+}
+
+fn match_segment(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // A leading wildcard does not match a leading dot (minimatch `dot: false`).
+    if t.first() == Some(&'.') && matches!(p.first(), Some('*') | Some('?') | Some('[')) {
+        return false;
+    }
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some('[') => {
+                let Some(end) = p.iter().skip(1).position(|c| *c == ']').map(|i| i + 1) else {
+                    return !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..]);
+                };
+                let Some(&c) = t.first() else { return false };
+                let mut class = &p[1..end];
+                let negate = matches!(class.first(), Some('!') | Some('^'));
+                if negate {
+                    class = &class[1..];
+                }
+                let mut hit = false;
+                let mut i = 0;
+                while i < class.len() {
+                    if i + 2 < class.len() && class[i + 1] == '-' {
+                        hit |= class[i] <= c && c <= class[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= class[i] == c;
+                        i += 1;
+                    }
+                }
+                hit != negate && go(&p[end + 1..], &t[1..])
+            }
+            Some('\\') if p.len() > 1 => !t.is_empty() && t[0] == p[1] && go(&p[2..], &t[1..]),
+            Some(&c) => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        }
+    }
+    go(&p, &t)
 }
 
 /// Sort helper for npm pack files:
@@ -1605,14 +1732,91 @@ fn sort_pack_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
     let a_first_char = a.chars().next().unwrap_or('\0');
     let b_first_char = b.chars().next().unwrap_or('\0');
 
-    let a_is_upper = a_first_char.is_ascii_uppercase();
-    let b_is_upper = b_first_char.is_ascii_uppercase();
+    // npm's tar.js: `ch === ch.toUpperCase()`, so digits and punctuation
+    // sort with the uppercase group.
+    let a_is_upper = !a_first_char.is_lowercase();
+    let b_is_upper = !b_first_char.is_lowercase();
 
     match (a_is_upper, b_is_upper) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.cmp(b),
     }
+}
+
+/// Summarize an existing .tgz the way npm's `getContents` does, returning
+/// the summary and the parsed `package/package.json`.
+pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value), FsError> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let mut files = Vec::new();
+    let mut bundled: Vec<String> = Vec::new();
+    let mut unpacked_size = 0u64;
+    let mut entry_count = 0usize;
+    let mut manifest: Option<serde_json::Value> = None;
+    for entry in archive.entries().map_err(FsError::Io)? {
+        let mut entry = entry.map_err(FsError::Io)?;
+        let raw = entry.path().map_err(FsError::Io)?.to_string_lossy().replace('\\', "/");
+        let size = entry.header().size().map_err(FsError::Io)?;
+        let mode = entry.header().mode().map_err(FsError::Io)?;
+        entry_count += 1;
+        unpacked_size += size;
+        if let Some(rest) = raw.strip_prefix("package/node_modules/").filter(|r| !r.is_empty()) {
+            let mut parts = rest.split('/');
+            let first = parts.next().unwrap_or("");
+            let name = if first.starts_with('@') {
+                format!("{first}/{}", parts.next().unwrap_or(""))
+            } else {
+                first.to_string()
+            };
+            if !bundled.contains(&name) {
+                bundled.push(name);
+            }
+        }
+        let path = raw.strip_prefix("package/").unwrap_or(&raw).to_string();
+        if path == "package.json" {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).map_err(FsError::Io)?;
+            manifest = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok();
+        }
+        files.push(PackedFileEntry { path, size, mode });
+    }
+    let manifest = manifest.ok_or_else(|| {
+        FsError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "package.json not found in tarball",
+        ))
+    })?;
+    files.sort_by(|a, b| sort_pack_file_paths(&a.path, &b.path));
+    let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let summary = PackSummary {
+        filename: compute_tarball_filename(&name, &version),
+        name,
+        version,
+        package_size: bytes.len() as u64,
+        unpacked_size,
+        shasum: data_encoding::HEXLOWER.encode(&Algorithm::Sha1.compute_digest(bytes)),
+        integrity: Integrity::from_bytes(bytes, Algorithm::Sha512).to_string(),
+        files,
+        entry_count,
+        bundled,
+    };
+    Ok((summary, manifest))
+}
+
+/// Text of one `package/<path>` entry in a .tgz, if present.
+pub fn read_tarball_text(bytes: &[u8], inner_path: &str) -> Option<String> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let raw = entry.path().ok()?.to_string_lossy().replace('\\', "/");
+        if raw.strip_prefix("package/").unwrap_or(&raw) == inner_path {
+            let mut text = String::new();
+            entry.read_to_string(&mut text).ok()?;
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Create a tar.gz package archive for the project directory.
@@ -1644,15 +1848,32 @@ pub fn pack_directory(
     let filename = compute_tarball_filename(&name, &version);
 
     let files_to_pack = collect_pack_files(package_dir, &manifest)?;
+    // npm-packlist sorts archive entries by extension, basename, then path for
+    // compressibility. The public file list keeps its separate display order.
+    let mut archive_files: Vec<_> = files_to_pack.iter().collect();
+    archive_files.sort_by_key(|(path, _)| {
+        let file = Path::new(path);
+        (
+            file.extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            file.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            path.to_lowercase(),
+        )
+    });
 
     // Build tar archive in memory
     let mut tar_bytes = Vec::new();
     {
         let mut builder = Builder::new(&mut tar_bytes);
 
-        for (rel_path, full_path) in &files_to_pack {
+        for (rel_path, full_path) in archive_files {
             let file_data = fs::read(full_path)?;
-            let mut header = Header::new_gnu();
+            let mut header = Header::new_ustar();
             header.set_size(file_data.len() as u64);
 
             // Normalized mtime
@@ -1668,11 +1889,28 @@ pub fn pack_directory(
                 NPM_DEFAULT_FILE_MODE
             };
             header.set_mode(mode);
-            header.set_cksum();
-
             let entry_path = format!("package/{rel_path}");
+            header.set_path(entry_path).map_err(FsError::Io)?;
+            header.set_entry_type(tar::EntryType::Regular);
+            // node-tar's portable USTAR encoder leaves uid/gid unset, and uses
+            // octal digits followed by space + NUL (including checksum).
+            let bytes = header.as_mut_bytes();
+            bytes[108..124].fill(0);
+            for (start, end, value) in [
+                (100, 108, mode as u64),
+                (124, 136, file_data.len() as u64),
+                (136, 148, NPM_PACK_EPOCH_MTIME),
+                (329, 337, 0),
+                (337, 345, 0),
+            ] {
+                let encoded = format!("{:0width$o} \0", value, width = end - start - 2);
+                bytes[start..end].copy_from_slice(encoded.as_bytes());
+            }
+            bytes[148..156].fill(b' ');
+            let sum: u64 = bytes.iter().map(|b| *b as u64).sum();
+            bytes[148..156].copy_from_slice(format!("{sum:06o} \0").as_bytes());
             builder
-                .append_data(&mut header, entry_path, &file_data[..])
+                .append(&header, &file_data[..])
                 .map_err(FsError::Io)?;
         }
 
@@ -1680,9 +1918,7 @@ pub fn pack_directory(
     }
 
     // Compress with gzip level 9
-    let mut gz_encoder = GzEncoder::new(Vec::new(), Compression::best());
-    gz_encoder.write_all(&tar_bytes).map_err(FsError::Io)?;
-    let compressed_bytes = gz_encoder.finish().map_err(FsError::Io)?;
+    let compressed_bytes = npm_gzip(&tar_bytes)?;
 
     // Compute SHA-1 and SHA-512 hashes
     let sha1_digest = Algorithm::Sha1.compute_digest(&compressed_bytes);
@@ -1734,6 +1970,45 @@ pub fn pack_directory(
     Ok((summary, compressed_bytes))
 }
 
+/// npm's digests depend on the Node runtime's zlib byte stream. Different
+/// compliant DEFLATE implementations produce different digests. Use only the
+/// built-in zlib module, without requiring an npm installation.
+fn npm_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use std::process::{Command, Stdio};
+    const SCRIPT: &str = "const {pipeline,Transform}=require('node:stream');let first=true;pipeline(process.stdin,require('node:zlib').createGzip({level:9}),new Transform({transform(b,e,cb){if(first){b[9]=255;first=false;}cb(null,b);}}),process.stdout,e=>{if(e){console.error(e.message);process.exitCode=1;}});";
+    let mut command = Command::new("node");
+    command
+        .args(["-e", SCRIPT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn().map_err(FsError::Io)?;
+    let mut stdin = child.stdin.take().expect("piped child stdin");
+    let (output, written) = std::thread::scope(|scope| {
+        // Drain stdout while feeding stdin so large archives cannot deadlock
+        // when both OS pipes fill. Always reap the child, including EPIPE.
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        (output, writer.join())
+    });
+    let output = output.map_err(FsError::Io)?;
+    if !output.status.success() {
+        return Err(FsError::Io(std::io::Error::other(format!(
+            "Node gzip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    written
+        .map_err(|_| FsError::Io(std::io::Error::other("gzip input writer panicked")))?
+        .map_err(FsError::Io)?;
+    Ok(output.stdout)
+}
+
 fn is_file_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1755,4 +2030,39 @@ fn is_file_executable(path: &Path) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::{match_glob, match_glob_or_parent};
+
+    #[test]
+    fn globstar_matches_any_depth_including_none() {
+        assert!(match_glob("secrets/**/*.pem", "secrets/prod/key.pem"));
+        assert!(match_glob("secrets/**/*.pem", "secrets/key.pem"));
+        assert!(match_glob("dist/**/*.js", "dist/sub/deep/index.js"));
+        assert!(!match_glob("dist/**/*.js", "dist/sub/index.ts"));
+        assert!(!match_glob("dist/*.js", "dist/sub/index.js"));
+    }
+
+    #[test]
+    fn classes_braces_and_question_marks() {
+        assert!(match_glob("lib/*.{js,cjs}", "lib/a.cjs"));
+        assert!(!match_glob("lib/*.{js,cjs}", "lib/a.ts"));
+        assert!(match_glob("file?.txt", "file1.txt"));
+        assert!(match_glob("v[0-9].js", "v7.js"));
+        assert!(!match_glob("v[!0-9].js", "v7.js"));
+    }
+
+    #[test]
+    fn wildcards_skip_dotfiles_like_minimatch() {
+        assert!(!match_glob("*", ".env"));
+        assert!(!match_glob("**/*.js", ".hidden/a.js"));
+    }
+
+    #[test]
+    fn matched_directories_cover_their_contents() {
+        assert!(match_glob_or_parent("secrets/prod", "secrets/prod/key.pem"));
+        assert!(!match_glob_or_parent("secrets/prod", "secrets/production/key.pem"));
+    }
 }

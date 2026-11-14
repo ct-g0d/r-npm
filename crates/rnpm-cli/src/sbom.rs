@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ impl Default for SbomOptions {
     fn default() -> Self {
         Self {
             format: "spdx".to_string(),
-            sbom_type: "application".to_string(),
+            sbom_type: "library".to_string(),
             package_lock_only: false,
             omit: Vec::new(),
         }
@@ -113,557 +113,1081 @@ pub fn current_rfc3339_time() -> String {
     )
 }
 
-fn derive_package_name(path: &str) -> String {
-    let clean = path.replace('\\', "/");
-    let parts: Vec<&str> = clean.split('/').collect();
-    if let Some(idx) = parts.iter().rposition(|&p| p == "node_modules") {
-        if idx + 1 < parts.len() {
-            if parts[idx + 1].starts_with('@') && idx + 2 < parts.len() {
-                return format!("{}/{}", parts[idx + 1], parts[idx + 2]);
-            }
-            return parts[idx + 1].to_string();
+/// Current UTC time as `Date.prototype.toISOString()` renders it.
+pub fn current_iso_time_millis() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis();
+    let base = current_rfc3339_time();
+    format!("{}.{millis:03}Z", base.trim_end_matches('Z'))
+}
+
+const SBOM_USAGE: &str = "Generate a Software Bill of Materials (SBOM)
+
+Usage:
+npm sbom
+
+Options:
+[--omit <dev|optional|peer> [--omit <dev|optional|peer> ...]]
+[--package-lock-only] [--sbom-format <cyclonedx|spdx>]
+[--sbom-type <library|application|framework>]
+[-w|--workspace <workspace-name> [-w|--workspace <workspace-name> ...]]
+[--workspaces]
+
+  --omit
+    Dependency types to omit from the installation tree on disk.
+
+  --package-lock-only
+    If set to true, the current operation will only use the `package-lock.json`,
+
+  --sbom-format
+    SBOM format to use when generating SBOMs.
+
+  --sbom-type
+    The type of package described by the generated SBOM. For SPDX, this is the
+
+  -w|--workspace
+    Enable running a command in the context of the configured workspaces of the
+
+  --workspaces
+    Set to true to run the command in the context of **all** configured
+
+
+Run \"npm help sbom\" for more info";
+
+fn usage_error(message: &str) -> anyhow::Error {
+    let mut out = format!("npm error code EUSAGE\nnpm error\nnpm error {message}\nnpm error");
+    for line in SBOM_USAGE.lines() {
+        out.push('\n');
+        if line.is_empty() {
+            out.push_str("npm error");
+        } else {
+            out.push_str(&format!("npm error {line}"));
         }
     }
-    clean
+    anyhow::anyhow!(out)
 }
 
 // -------------------------------------------------------------------------
-// SPDX 2.3 Model
+// SPDX license expressions (port of spdx-expression-parse)
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxDocument {
-    pub spdx_version: String,
-    pub data_license: String,
-    #[serde(rename = "SPDXID")]
-    pub spdx_id: String,
-    pub name: String,
-    pub document_namespace: String,
-    pub creation_info: SpdxCreationInfo,
-    pub document_describes: Vec<String>,
-    pub packages: Vec<SpdxPackage>,
-    pub relationships: Vec<SpdxRelationship>,
+static SPDX_LICENSE_IDS: &str = include_str!("data/spdx-license-ids.txt");
+static SPDX_EXCEPTIONS: &str = include_str!("data/spdx-exceptions.txt");
+
+#[derive(Debug, PartialEq)]
+enum LicenseToken {
+    Op(String),
+    License(String),
+    Exception(String),
+    LicenseRef(String),
+    DocumentRef(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxCreationInfo {
-    pub creators: Vec<String>,
-    pub created: String,
+fn scan_license(source: &str) -> Option<Vec<LicenseToken>> {
+    let bytes = source.as_bytes();
+    let idstring = |i: usize| {
+        let mut j = i;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-' || bytes[j] == b'.')
+        {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    let mut tokens = Vec::new();
+    'outer: while i < bytes.len() {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let rest = &source[i..];
+        let upper = rest.to_ascii_uppercase();
+        for op in ["WITH", "AND", "OR"] {
+            if upper.starts_with(op) {
+                tokens.push(LicenseToken::Op(op.to_string()));
+                i += op.len();
+                continue 'outer;
+            }
+        }
+        if let c @ (b'(' | b')' | b':' | b'+') = bytes[i] {
+            if c == b'+' && i > 1 && bytes[i - 1] == b' ' {
+                return None;
+            }
+            tokens.push(LicenseToken::Op((c as char).to_string()));
+            i += 1;
+            continue;
+        }
+        for (prefix, is_doc) in [("DocumentRef-", true), ("LicenseRef-", false)] {
+            if rest.starts_with(prefix) {
+                let start = i + prefix.len();
+                let end = idstring(start);
+                if end == start {
+                    return None;
+                }
+                let value = source[start..end].to_string();
+                tokens.push(if is_doc {
+                    LicenseToken::DocumentRef(value)
+                } else {
+                    LicenseToken::LicenseRef(value)
+                });
+                i = end;
+                continue 'outer;
+            }
+        }
+        let end = idstring(i);
+        let id = &source[i..end];
+        if end > i && SPDX_LICENSE_IDS.lines().any(|l| l == id) {
+            tokens.push(LicenseToken::License(id.to_string()));
+        } else if end > i && SPDX_EXCEPTIONS.lines().any(|l| l == id) {
+            tokens.push(LicenseToken::Exception(id.to_string()));
+        } else {
+            return None;
+        }
+        i = end;
+    }
+    Some(tokens)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxPackage {
-    pub name: String,
-    #[serde(rename = "SPDXID")]
-    pub spdx_id: String,
-    pub version_info: String,
-    pub package_file_name: String,
-    pub download_location: String,
-    pub license_declared: String,
-    pub external_refs: Vec<SpdxExternalRef>,
-    pub checksums: Vec<SpdxChecksum>,
+/// Shape of a parsed license expression, as the SBOM writers use it.
+#[derive(Debug, PartialEq)]
+enum ParsedLicense {
+    Single(String),
+    Conjunction,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxExternalRef {
-    pub reference_category: String,
-    pub reference_type: String,
-    pub reference_locator: String,
+fn parse_license(source: &str) -> Option<ParsedLicense> {
+    let tokens = scan_license(source)?;
+    let mut pos = 0;
+    let node = parse_or(&tokens, &mut pos)?;
+    (pos == tokens.len()).then_some(node)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxChecksum {
-    pub algorithm: String,
-    pub checksum_value: String,
+fn is_op(tokens: &[LicenseToken], pos: usize, op: &str) -> bool {
+    matches!(tokens.get(pos), Some(LicenseToken::Op(o)) if o == op)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpdxRelationship {
-    pub spdx_element_id: String,
-    pub relationship_type: String,
-    pub related_spdx_element: String,
+fn parse_or(tokens: &[LicenseToken], pos: &mut usize) -> Option<ParsedLicense> {
+    let left = parse_and(tokens, pos)?;
+    if !is_op(tokens, *pos, "OR") {
+        return Some(left);
+    }
+    *pos += 1;
+    parse_or(tokens, pos)?;
+    Some(ParsedLicense::Conjunction)
+}
+
+fn parse_and(tokens: &[LicenseToken], pos: &mut usize) -> Option<ParsedLicense> {
+    let left = parse_atom(tokens, pos)?;
+    if !is_op(tokens, *pos, "AND") {
+        return Some(left);
+    }
+    *pos += 1;
+    parse_and(tokens, pos)?;
+    Some(ParsedLicense::Conjunction)
+}
+
+fn parse_atom(tokens: &[LicenseToken], pos: &mut usize) -> Option<ParsedLicense> {
+    if is_op(tokens, *pos, "(") {
+        *pos += 1;
+        let expr = parse_or(tokens, pos)?;
+        if !is_op(tokens, *pos, ")") {
+            return None;
+        }
+        *pos += 1;
+        return Some(expr);
+    }
+    let mut prefix = String::new();
+    if let Some(LicenseToken::DocumentRef(doc)) = tokens.get(*pos) {
+        if !is_op(tokens, *pos + 1, ":") {
+            return None;
+        }
+        prefix = format!("DocumentRef-{doc}:");
+        *pos += 2;
+    }
+    match tokens.get(*pos) {
+        Some(LicenseToken::LicenseRef(r)) => {
+            *pos += 1;
+            Some(ParsedLicense::Single(format!("{prefix}LicenseRef-{r}")))
+        }
+        Some(LicenseToken::License(id)) if prefix.is_empty() => {
+            *pos += 1;
+            if is_op(tokens, *pos, "+") {
+                *pos += 1;
+            }
+            if is_op(tokens, *pos, "WITH") {
+                *pos += 1;
+                match tokens.get(*pos) {
+                    Some(LicenseToken::Exception(_)) => *pos += 1,
+                    _ => return None,
+                }
+            }
+            Some(ParsedLicense::Single(id.clone()))
+        }
+        _ => None,
+    }
 }
 
 // -------------------------------------------------------------------------
-// CycloneDX 1.5 Model
+// Dependency tree: the subset of Arborist's loadActual / loadVirtual the
+// SBOM needs (edges with types, calc-dep-flags).
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxDocument {
-    #[serde(rename = "$schema")]
-    pub schema: String,
-    pub bom_format: String,
-    pub spec_version: String,
-    pub serial_number: String,
-    pub version: u32,
-    pub metadata: CycloneDxMetadata,
-    pub components: Vec<CycloneDxComponent>,
-    pub dependencies: Vec<CycloneDxDependency>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeType {
+    Prod,
+    Dev,
+    Optional,
+    Peer,
+    PeerOptional,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxMetadata {
-    pub timestamp: String,
-    pub tools: Vec<CycloneDxTool>,
-    pub lifecycles: Vec<CycloneDxLifecycle>,
-    pub component: CycloneDxRootComponent,
+impl EdgeType {
+    fn is_peer(self) -> bool {
+        matches!(self, EdgeType::Peer | EdgeType::PeerOptional)
+    }
+    fn is_optional(self) -> bool {
+        matches!(self, EdgeType::Optional | EdgeType::PeerOptional)
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxTool {
-    pub vendor: String,
-    pub name: String,
-    pub version: String,
+#[derive(Debug)]
+struct Edge {
+    name: String,
+    spec: String,
+    kind: EdgeType,
+    to: Option<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxLifecycle {
-    pub phase: String,
+#[derive(Debug)]
+struct Node {
+    /// Folder name (`node.name` in Arborist).
+    name: String,
+    location: String,
+    package: Value,
+    resolved: Option<String>,
+    integrity: Option<String>,
+    in_bundle: bool,
+    edges: Vec<Edge>,
+    dev: bool,
+    optional: bool,
+    dev_optional: bool,
+    peer: bool,
+    extraneous: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CycloneDxRootComponent {
-    #[serde(rename = "bom-ref")]
-    pub bom_ref: String,
-    #[serde(rename = "type")]
-    pub component_type: String,
-    pub name: String,
-    pub version: String,
-    pub purl: String,
+impl Node {
+    fn package_name(&self) -> String {
+        self.package
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.name.clone())
+    }
+
+    fn version(&self) -> String {
+        self.package
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn is_root(&self) -> bool {
+        self.location.is_empty()
+    }
+
+    /// Arborist `node.pkgid`.
+    fn pkgid(&self) -> String {
+        let pkg_name = self.package.get("name").and_then(Value::as_str).unwrap_or("");
+        let version = self.version();
+        if self.is_root() {
+            let name = if pkg_name.is_empty() { &self.name } else { pkg_name };
+            return format!("{name}@{version}");
+        }
+        if !pkg_name.is_empty() && pkg_name != self.name {
+            format!("{}@npm:{pkg_name}@{version}", self.name)
+        } else {
+            format!("{}@{version}", self.name)
+        }
+    }
+
+    /// `${packageName}@${version}`, the CycloneDX bom-ref.
+    fn id(&self) -> String {
+        format!("{}@{}", self.package_name(), self.version())
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxComponent {
-    #[serde(rename = "bom-ref")]
-    pub bom_ref: String,
-    #[serde(rename = "type")]
-    pub component_type: String,
-    pub name: String,
-    pub version: String,
-    pub purl: String,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub external_references: Vec<CycloneDxExternalReference>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub hashes: Vec<CycloneDxHash>,
+fn folder_name(location: &str) -> String {
+    location
+        .rsplit("node_modules/")
+        .next()
+        .unwrap_or(location)
+        .to_string()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CycloneDxExternalReference {
-    #[serde(rename = "type")]
-    pub ref_type: String,
-    pub url: String,
+fn edges_from_package(pkg: &Value, is_root: bool) -> Vec<(String, String, EdgeType)> {
+    // Arborist's #loadDeps order; a later type replaces an earlier edge.
+    let mut edges: Vec<(String, String, EdgeType)> = Vec::new();
+    let mut put = |name: &str, spec: &str, kind: EdgeType| {
+        let edge = (name.to_string(), spec.to_string(), kind);
+        match edges.iter_mut().find(|e| e.0 == name) {
+            Some(existing) => *existing = edge,
+            None => edges.push(edge),
+        }
+    };
+    let section = |key: &str| -> Vec<(String, String)> {
+        pkg.get(key)
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let peer_optional = |name: &str| {
+        pkg.get("peerDependenciesMeta")
+            .and_then(|m| m.get(name))
+            .and_then(|m| m.get("optional"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let peers = section("peerDependencies");
+    for (n, s) in peers.iter().filter(|(n, _)| !peer_optional(n)) {
+        put(n, s, EdgeType::Peer);
+    }
+    for (n, s) in peers.iter().filter(|(n, _)| peer_optional(n)) {
+        put(n, s, EdgeType::PeerOptional);
+    }
+    for (n, s) in section("dependencies") {
+        put(&n, &s, EdgeType::Prod);
+    }
+    for (n, s) in section("optionalDependencies") {
+        put(&n, &s, EdgeType::Optional);
+    }
+    if is_root {
+        for (n, s) in section("devDependencies") {
+            put(&n, &s, EdgeType::Dev);
+        }
+    }
+    edges
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CycloneDxHash {
-    pub alg: String,
-    pub content: String,
+fn read_json(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CycloneDxDependency {
-    #[serde(rename = "ref")]
-    pub component_ref: String,
-    pub depends_on: Vec<String>,
+fn new_node(project_dir: &Path, location: String, package: Value) -> Node {
+    let name = if location.is_empty() {
+        project_dir
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        folder_name(&location)
+    };
+    Node {
+        name,
+        location,
+        package,
+        resolved: None,
+        integrity: None,
+        in_bundle: false,
+        edges: Vec::new(),
+        dev: true,
+        optional: true,
+        dev_optional: true,
+        peer: true,
+        extraneous: true,
+    }
+}
+
+fn load_actual_nodes(project_dir: &Path, root_pkg: Value) -> Vec<Node> {
+    let lock = read_json(&project_dir.join("node_modules/.package-lock.json"))
+        .or_else(|| read_json(&project_dir.join("package-lock.json")));
+    let mut disk: Vec<_> = crate::inspect_tree::scan_disk_packages(project_dir)
+        .into_values()
+        .collect();
+    disk.sort_by(|a, b| a.location.cmp(&b.location));
+    let mut nodes = vec![new_node(project_dir, String::new(), root_pkg)];
+    for pkg in disk {
+        let raw = pkg.raw_json.clone().unwrap_or_else(|| json!({}));
+        let mut node = new_node(project_dir, pkg.location.clone(), raw);
+        let entry = lock
+            .as_ref()
+            .and_then(|l| l.get("packages"))
+            .and_then(|p| p.get(&pkg.location));
+        let field = |lock_key: &str, pkg_key: &str| {
+            entry
+                .and_then(|e| e.get(lock_key))
+                .or_else(|| node.package.get(pkg_key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        node.resolved = field("resolved", "_resolved");
+        node.integrity = field("integrity", "_integrity");
+        node.in_bundle = entry
+            .and_then(|e| e.get("inBundle"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        nodes.push(node);
+    }
+    nodes
+}
+
+fn load_virtual_nodes(project_dir: &Path, root_pkg: Value, lock: &Value) -> Vec<Node> {
+    let mut nodes = vec![new_node(project_dir, String::new(), root_pkg)];
+    let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
+        return nodes;
+    };
+    for (loc, entry) in packages {
+        if !loc.contains("node_modules/") {
+            continue;
+        }
+        let mut pkg = entry.clone();
+        if let Some(obj) = pkg.as_object_mut() {
+            obj.entry("name")
+                .or_insert_with(|| Value::String(folder_name(loc)));
+        }
+        let mut node = new_node(project_dir, loc.clone(), pkg);
+        node.resolved = entry.get("resolved").and_then(Value::as_str).map(str::to_string);
+        node.integrity = entry.get("integrity").and_then(Value::as_str).map(str::to_string);
+        node.in_bundle = entry.get("inBundle").and_then(Value::as_bool).unwrap_or(false);
+        let flag = |k: &str| entry.get(k).and_then(Value::as_bool).unwrap_or(false);
+        node.dev = flag("dev");
+        node.optional = flag("optional");
+        node.dev_optional = flag("devOptional") || node.dev || node.optional;
+        node.peer = flag("peer");
+        node.extraneous = flag("extraneous");
+        nodes.push(node);
+    }
+    nodes
+}
+
+fn link_edges(nodes: &mut [Node]) {
+    let index: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.location.clone(), i))
+        .collect();
+    for node in nodes.iter_mut() {
+        let loc = node.location.clone();
+        node.edges = edges_from_package(&node.package, node.is_root())
+            .into_iter()
+            .map(|(name, spec, kind)| {
+                let to = crate::inspect_tree::candidate_locations(&loc, &name)
+                    .iter()
+                    .find_map(|c| index.get(c).copied());
+                Edge { name, spec, kind, to }
+            })
+            .collect();
+    }
+}
+
+/// Port of Arborist's calc-dep-flags.
+fn calc_dep_flags(nodes: &mut [Node]) {
+    {
+        let root = &mut nodes[0];
+        root.dev = false;
+        root.optional = false;
+        root.dev_optional = false;
+        root.peer = false;
+        root.extraneous = false;
+    }
+    let mut seen = HashSet::new();
+    let mut queue = vec![0usize];
+    while let Some(i) = queue.pop() {
+        seen.insert(i);
+        let (dev, optional, dev_optional, peer, extraneous) = {
+            let n = &nodes[i];
+            (n.dev, n.optional, n.dev_optional, n.peer, n.extraneous)
+        };
+        let targets: Vec<(usize, EdgeType)> = nodes[i]
+            .edges
+            .iter()
+            .filter_map(|e| e.to.map(|t| (t, e.kind)))
+            .collect();
+        for (t, kind) in targets {
+            let to = &mut nodes[t];
+            let mut changed = false;
+            if to.extraneous && !extraneous && !(kind.is_peer() && kind.is_optional()) {
+                to.extraneous = false;
+                changed = true;
+            }
+            if to.dev && !dev && kind != EdgeType::Dev {
+                to.dev = false;
+                changed = true;
+            }
+            if to.optional && !optional && !kind.is_optional() {
+                to.optional = false;
+                changed = true;
+            }
+            if to.dev_optional
+                && !dev_optional
+                && !dev
+                && !optional
+                && kind != EdgeType::Dev
+                && !kind.is_optional()
+            {
+                to.dev_optional = false;
+                changed = true;
+            }
+            if to.peer && !peer && !kind.is_peer() {
+                to.peer = false;
+                changed = true;
+            }
+            if changed {
+                queue.push(t);
+            }
+        }
+    }
+    for i in seen.into_iter().filter(|i| *i != 0) {
+        let n = &mut nodes[i];
+        if n.dev_optional && (n.dev || n.optional) {
+            n.dev_optional = false;
+        }
+    }
+}
+
+/// Arborist `depValid` for the spec kinds that can be checked from disk.
+fn edge_valid(edge: &Edge, target: &Node) -> bool {
+    let (want_name, range) = match edge.spec.strip_prefix("npm:") {
+        Some(alias) => match alias.rfind('@').filter(|i| *i > 0) {
+            Some(i) => (alias[..i].to_string(), alias[i + 1..].to_string()),
+            None => (alias.to_string(), "*".to_string()),
+        },
+        None => (target.package_name(), edge.spec.clone()),
+    };
+    if target.package_name() != want_name {
+        return false;
+    }
+    let range = if range.trim().is_empty() {
+        "*".to_string()
+    } else {
+        range
+    };
+    match (
+        rnpm_core::semver::Range::parse(&range),
+        rnpm_core::semver::Version::parse(&target.version()),
+    ) {
+        (Ok(r), Ok(v)) => r.satisfies(&v),
+        (Ok(_), Err(_)) => false,
+        // Tags, git, file and URL specs cannot be checked against disk.
+        (Err(_), _) => true,
+    }
+}
+
+// -------------------------------------------------------------------------
+// normalize-package-data (only the fields the SBOM writers read)
+// -------------------------------------------------------------------------
+
+fn hosted_github(spec: &str) -> Option<(String, String)> {
+    let s = spec.trim();
+    let s = s
+        .strip_prefix("github:")
+        .or_else(|| s.strip_prefix("git+https://github.com/"))
+        .or_else(|| s.strip_prefix("https://github.com/"))
+        .or_else(|| s.strip_prefix("git://github.com/"))
+        .or_else(|| s.strip_prefix("git+ssh://git@github.com/"))
+        .or_else(|| s.strip_prefix("git@github.com:"))
+        .or_else(|| {
+            (!s.contains(':')
+                && s.matches('/').count() == 1
+                && !s.starts_with('.')
+                && !s.starts_with('@'))
+            .then_some(s)
+        })?;
+    let s = s.split('#').next().unwrap_or(s);
+    let (user, project) = s.split_once('/')?;
+    let project = project.trim_end_matches('/').trim_end_matches(".git");
+    if user.is_empty() || project.is_empty() || project.contains('/') {
+        return None;
+    }
+    Some((user.to_string(), project.to_string()))
+}
+
+fn parse_person(person: &str) -> Value {
+    let name_end = person.find(['<', '(']).unwrap_or(person.len());
+    let mut out = Map::new();
+    let name = person[..name_end].trim();
+    if !name.is_empty() {
+        out.insert("name".into(), Value::String(name.to_string()));
+    }
+    let between = |open: char, close: char| {
+        let start = person.find(open)? + 1;
+        let end = person[start..].find(close)? + start;
+        Some(person[start..end].to_string())
+    };
+    if let Some(email) = between('<', '>') {
+        out.insert("email".into(), Value::String(email));
+    }
+    if let Some(url) = between('(', ')') {
+        out.insert("url".into(), Value::String(url));
+    }
+    Value::Object(out)
+}
+
+fn normalize_package(pkg: &mut Value) {
+    let Some(obj) = pkg.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::String(repo)) = obj.get("repository").cloned() {
+        obj.insert("repository".into(), json!({ "type": "git", "url": repo }));
+    }
+    let repo_url = obj
+        .get("repository")
+        .and_then(|r| r.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some((user, project)) = repo_url.as_deref().and_then(hosted_github) {
+        if let Some(repo) = obj.get_mut("repository").and_then(Value::as_object_mut) {
+            repo.insert(
+                "url".into(),
+                Value::String(format!("git+https://github.com/{user}/{project}.git")),
+            );
+        }
+        obj.entry("bugs").or_insert_with(
+            || json!({ "url": format!("https://github.com/{user}/{project}/issues") }),
+        );
+        obj.entry("homepage").or_insert_with(|| {
+            Value::String(format!("https://github.com/{user}/{project}#readme"))
+        });
+    }
+    if let Some(Value::String(bugs)) = obj.get("bugs").cloned() {
+        let value = if bugs.contains('@') && !bugs.contains("://") {
+            json!({ "email": bugs })
+        } else {
+            json!({ "url": bugs })
+        };
+        obj.insert("bugs".into(), value);
+    }
+    if let Some(Value::String(author)) = obj.get("author").cloned() {
+        obj.insert("author".into(), parse_person(&author));
+    }
+}
+
+fn declared_license(pkg: &Value) -> Option<String> {
+    match pkg.get("license") {
+        Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+        Some(Value::Object(o)) => {
+            return o.get("type").and_then(Value::as_str).map(str::to_string)
+        }
+        _ => {}
+    }
+    let list = pkg.get("licenses")?.as_array()?;
+    let joined = list
+        .iter()
+        .filter_map(|l| match l {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => o.get("type").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(joined)
+}
+
+fn is_git_resolved(resolved: Option<&str>) -> bool {
+    resolved.is_some_and(|r| {
+        ["git+", "git://", "git@", "github:", "gitlab:", "bitbucket:"]
+            .iter()
+            .any(|p| r.starts_with(p))
+    })
+}
+
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn purl(node: &Node) -> String {
+    let base = make_purl(&node.package_name(), &node.version());
+    match node.resolved.as_deref() {
+        Some(r) if is_git_resolved(Some(r)) => format!("{base}?vcs_url={}", encode_uri_component(r)),
+        _ => base,
+    }
+}
+
+fn spdx_id(node: &Node) -> String {
+    let name = node.package_name();
+    let name = name.strip_prefix('@').unwrap_or(&name).replace('/', ".");
+    format!("SPDXRef-Package-{name}-{}", node.version())
+}
+
+fn non_empty_str<'a>(pkg: &'a Value, key: &str) -> Option<&'a str> {
+    pkg.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+}
+
+fn cyclonedx_item(node: &Node, package_type: &str) -> Value {
+    let pkg = &node.package;
+    let mut c = Map::new();
+    c.insert("bom-ref".into(), Value::String(node.id()));
+    c.insert("type".into(), Value::String(package_type.to_string()));
+    c.insert("name".into(), Value::String(node.name.clone()));
+    c.insert("version".into(), Value::String(node.version()));
+    let scope = if node.optional || node.dev_optional {
+        "optional"
+    } else {
+        "required"
+    };
+    c.insert("scope".into(), Value::String(scope.into()));
+    let author = match pkg.get("author") {
+        Some(Value::Object(o)) => o.get("name").and_then(Value::as_str).map(str::to_string),
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    if let Some(a) = author.filter(|a| !a.is_empty()) {
+        c.insert("author".into(), Value::String(a));
+    }
+    if let Some(d) = non_empty_str(pkg, "description") {
+        c.insert("description".into(), Value::String(d.to_string()));
+    }
+    c.insert("purl".into(), Value::String(purl(node)));
+    c.insert("properties".into(), json!([]));
+    c.insert("externalReferences".into(), json!([]));
+    if let Some((algo, hex)) = node.integrity.as_deref().and_then(integrity_to_hex) {
+        let alg = match algo.as_str() {
+            "sha1" => "SHA-1",
+            "sha256" => "SHA-256",
+            "sha384" => "SHA-384",
+            _ => "SHA-512",
+        };
+        c.insert("hashes".into(), json!([{ "alg": alg, "content": hex }]));
+    }
+    let mut properties = Vec::new();
+    let prop = |name: &str| json!({ "name": name, "value": "true" });
+    if node.dev && !node.is_root() {
+        properties.push(prop("cdx:npm:package:development"));
+    }
+    if pkg.get("private") == Some(&Value::Bool(true)) {
+        properties.push(prop("cdx:npm:package:private"));
+    }
+    if node.extraneous && !node.is_root() {
+        properties.push(prop("cdx:npm:package:extraneous"));
+    }
+    if node.in_bundle {
+        properties.push(prop("cdx:npm:package:bundled"));
+    }
+    let mut refs = Vec::new();
+    let ext = |t: &str, url: &str| json!({ "type": t, "url": url });
+    if let Some(r) = &node.resolved {
+        refs.push(ext("distribution", r));
+    }
+    if let Some(u) = pkg.get("repository").and_then(|r| r.get("url")).and_then(Value::as_str) {
+        refs.push(ext("vcs", u));
+    }
+    if let Some(h) = non_empty_str(pkg, "homepage") {
+        refs.push(ext("website", h));
+    }
+    if let Some(u) = pkg.get("bugs").and_then(|b| b.get("url")).and_then(Value::as_str) {
+        refs.push(ext("issue-tracker", u));
+    }
+    c.insert("properties".into(), Value::Array(properties));
+    c.insert("externalReferences".into(), Value::Array(refs));
+    let license = declared_license(pkg);
+    match license.as_deref().and_then(parse_license) {
+        Some(ParsedLicense::Single(id)) => {
+            c.insert("licenses".into(), json!([{ "license": { "id": id } }]));
+        }
+        Some(ParsedLicense::Conjunction) => {
+            c.insert("licenses".into(), json!([{ "expression": license }]));
+        }
+        None => {}
+    }
+    Value::Object(c)
+}
+
+fn spdx_item(node: &Node, package_type: Option<&str>) -> Value {
+    let pkg = &node.package;
+    let mut p = Map::new();
+    p.insert("name".into(), Value::String(node.package_name()));
+    p.insert("SPDXID".into(), Value::String(spdx_id(node)));
+    p.insert("versionInfo".into(), Value::String(node.version()));
+    p.insert("packageFileName".into(), Value::String(node.location.clone()));
+    if let Some(d) = non_empty_str(pkg, "description") {
+        p.insert("description".into(), Value::String(d.to_string()));
+    }
+    if let Some(t) = package_type {
+        p.insert("primaryPackagePurpose".into(), Value::String(t.to_uppercase()));
+    }
+    let download = node.resolved.clone().unwrap_or_else(|| "NOASSERTION".into());
+    p.insert("downloadLocation".into(), Value::String(download));
+    p.insert("filesAnalyzed".into(), Value::Bool(false));
+    let homepage = non_empty_str(pkg, "homepage").unwrap_or("NOASSERTION");
+    p.insert("homepage".into(), Value::String(homepage.to_string()));
+    let license = declared_license(pkg)
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "NOASSERTION".into());
+    p.insert("licenseDeclared".into(), Value::String(license));
+    p.insert(
+        "externalRefs".into(),
+        json!([{
+            "referenceCategory": "PACKAGE-MANAGER",
+            "referenceType": "purl",
+            "referenceLocator": purl(node),
+        }]),
+    );
+    if let Some((algo, hex)) = node.integrity.as_deref().and_then(integrity_to_hex) {
+        p.insert(
+            "checksums".into(),
+            json!([{ "algorithm": algo.to_uppercase(), "checksumValue": hex }]),
+        );
+    }
+    Value::Object(p)
+}
+
+fn detect_errors(nodes: &[Node], items: &[usize]) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut push = |e: String| {
+        if !errors.contains(&e) {
+            errors.push(e);
+        }
+    };
+    for &i in items {
+        let from = &nodes[i];
+        for edge in &from.edges {
+            match edge.to {
+                None if !edge.kind.is_optional() => push(format!(
+                    "missing: {}@{}, required by {}",
+                    edge.name,
+                    edge.spec,
+                    from.pkgid()
+                )),
+                Some(t) if !edge_valid(edge, &nodes[t]) => {
+                    let spec = if edge.spec.is_empty() { "*" } else { &edge.spec };
+                    push(format!(
+                        "invalid: {}, {spec} required by {}",
+                        nodes[t].pkgid(),
+                        from.pkgid()
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    errors
 }
 
 // -------------------------------------------------------------------------
 // Core SBOM Generator Logic
 // -------------------------------------------------------------------------
 
-/// Generate SBOM data structure from project directory.
-pub fn generate_sbom(
-    project_dir: &Path,
-    options: &SbomOptions,
-) -> anyhow::Result<serde_json::Value> {
-    let manifest_path = project_dir.join("package.json");
-    if !manifest_path.is_file() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENOENT\nnpm error package.json not found in {}",
-            project_dir.display()
+/// Generate the SBOM document for a project, matching `npm sbom`.
+pub fn generate_sbom(project_dir: &Path, options: &SbomOptions) -> anyhow::Result<Value> {
+    let format = options.format.to_ascii_lowercase();
+    if format.is_empty() {
+        return Err(usage_error(
+            "Must specify --sbom-format flag with one of: cyclonedx, spdx.",
         ));
     }
-
-    let lockfile_path = project_dir.join("package-lock.json");
-    if !lockfile_path.is_file() {
+    if format != "cyclonedx" && format != "spdx" {
         return Err(anyhow::anyhow!(
-            "npm error code ENOENT\nnpm error package-lock.json not found in {}",
-            project_dir.display()
+            "npm error code EUSAGE\nnpm error Invalid value for sbom-format: {format}"
         ));
     }
+    let root_pkg = read_json(&project_dir.join("package.json")).unwrap_or_else(|| json!({}));
+    let mut nodes = if options.package_lock_only {
+        let lock = read_json(&project_dir.join("npm-shrinkwrap.json"))
+            .or_else(|| read_json(&project_dir.join("package-lock.json")))
+            .ok_or_else(|| {
+                usage_error(
+                    "A package lock or shrinkwrap file is required in package-lock-only mode",
+                )
+            })?;
+        load_virtual_nodes(project_dir, root_pkg, &lock)
+    } else {
+        load_actual_nodes(project_dir, root_pkg)
+    };
+    link_edges(&mut nodes);
+    if options.package_lock_only {
+        let root = &mut nodes[0];
+        root.dev = false;
+        root.optional = false;
+        root.dev_optional = false;
+        root.peer = false;
+        root.extraneous = false;
+    } else {
+        calc_dep_flags(&mut nodes);
+    }
+    for node in &mut nodes {
+        normalize_package(&mut node.package);
+    }
 
-    let manifest = rnpm_core::manifest::Manifest::from_file(&manifest_path)?;
-    let root_name = manifest.name.unwrap_or_else(|| "project".to_string());
-    let root_version = manifest.version.unwrap_or_else(|| "1.0.0".to_string());
-
-    let lockfile = rnpm_lockfile::load_and_migrate(&lockfile_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load lockfile: {e}"))?;
-
-    let root_license = manifest
-        .extra
-        .get("license")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .or_else(|| lockfile.packages.get("").and_then(|r| r.license.clone()))
-        .unwrap_or_else(|| "NOASSERTION".to_string());
-
+    // Selector `:root,:root *<omits>,:extraneous`.
     let (omit_dev, omit_optional, omit_peer) = crate::parse_omit_options(&options.omit);
+    let mut reachable = vec![false; nodes.len()];
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        for t in nodes[i].edges.iter().filter_map(|e| e.to) {
+            if !reachable[t] {
+                reachable[t] = true;
+                stack.push(t);
+            }
+        }
+    }
+    let mut items: Vec<usize> = (0..nodes.len())
+        .filter(|&i| {
+            let n = &nodes[i];
+            i == 0
+                || n.extraneous
+                || (reachable[i]
+                    && !(omit_dev && n.dev)
+                    && !(omit_optional && n.optional)
+                    && !(omit_peer && n.peer))
+        })
+        .collect();
 
-    // 1. Filter packages
-    let mut included_paths: BTreeSet<String> = BTreeSet::new();
-    for (path, pkg) in &lockfile.packages {
-        if path.is_empty() {
-            included_paths.insert(path.clone());
-            continue;
-        }
-        if omit_dev && pkg.is_effective_dev() {
-            continue;
-        }
-        if omit_optional && pkg.is_effective_optional() {
-            continue;
-        }
-        if omit_peer && pkg.is_peer() {
-            continue;
-        }
-        included_paths.insert(path.clone());
+    let errors = detect_errors(&nodes, &items);
+    if !errors.is_empty() {
+        let body = errors
+            .iter()
+            .map(|e| format!("npm error {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow::anyhow!("npm error code ESBOMPROBLEMS\n{body}"));
     }
 
-    // 2. Compute parent -> children dependency map
-    let mut parent_to_children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for parent_path in &included_paths {
-        let pkg = match lockfile.packages.get(parent_path) {
-            Some(p) => p,
-            None => continue,
+    items.sort_by(|a, b| {
+        rnpm_lockfile::model::npm_key_compare(&nodes[*a].location, &nodes[*b].location)
+    });
+    let in_items: HashSet<usize> = items.iter().copied().collect();
+    let mut seen_ids = HashSet::new();
+    let unique_children: Vec<usize> = items
+        .iter()
+        .copied()
+        .filter(|&i| i != 0)
+        .filter(|&i| {
+            let id = if format == "spdx" {
+                spdx_id(&nodes[i])
+            } else {
+                nodes[i].id()
+            };
+            seen_ids.insert(id)
+        })
+        .collect();
+    let root = &nodes[0];
+    let package_type = options.sbom_type.as_str();
+
+    if format == "cyclonedx" {
+        let dependency = |i: usize| {
+            let mut depends_on: Vec<String> = Vec::new();
+            for t in nodes[i].edges.iter().filter_map(|e| e.to) {
+                let id = nodes[t].id();
+                if in_items.contains(&t) && !depends_on.contains(&id) {
+                    depends_on.push(id);
+                }
+            }
+            json!({ "ref": nodes[i].id(), "dependsOn": depends_on })
         };
-
-        let mut dep_names = BTreeSet::new();
-        if let Some(deps) = &pkg.dependencies {
-            for k in deps.keys() {
-                dep_names.insert(k.clone());
-            }
-        }
-        if parent_path.is_empty() && !omit_dev {
-            if let Some(dev_deps) = &pkg.dev_dependencies {
-                for k in dev_deps.keys() {
-                    dep_names.insert(k.clone());
-                }
-            }
-        }
-        if !omit_optional {
-            if let Some(opt_deps) = &pkg.optional_dependencies {
-                for k in opt_deps.keys() {
-                    dep_names.insert(k.clone());
-                }
-            }
-        }
-
-        let mut children = Vec::new();
-        for dep in dep_names {
-            let nested_path = if parent_path.is_empty() {
-                format!("node_modules/{dep}")
-            } else {
-                format!("{parent_path}/node_modules/{dep}")
-            };
-
-            if included_paths.contains(&nested_path) {
-                children.push(nested_path);
-            } else {
-                let hoisted_path = format!("node_modules/{dep}");
-                if included_paths.contains(&hoisted_path) {
-                    children.push(hoisted_path);
-                }
-            }
-        }
-        children.sort();
-        parent_to_children.insert(parent_path.clone(), children);
-    }
-
-    // 3. Render format
-    match options.format.to_ascii_lowercase().as_str() {
-        "spdx" => {
-            let root_spdx_id = format!("SPDXRef-Package-{}", sanitize_spdx(&root_name));
-            let mut packages = Vec::new();
-
-            // Root package
-            let root_purl = make_purl(&root_name, &root_version);
-            packages.push(SpdxPackage {
-                name: root_name.clone(),
-                spdx_id: root_spdx_id.clone(),
-                version_info: root_version.clone(),
-                package_file_name: "package.json".to_string(),
-                download_location: "NONE".to_string(),
-                license_declared: root_license,
-                external_refs: vec![SpdxExternalRef {
-                    reference_category: "PACKAGE-MANAGER".to_string(),
-                    reference_type: "purl".to_string(),
-                    reference_locator: root_purl,
+        let phase = if options.package_lock_only {
+            "pre-build"
+        } else {
+            "build"
+        };
+        let components: Vec<Value> = unique_children
+            .iter()
+            .map(|&i| cyclonedx_item(&nodes[i], "library"))
+            .collect();
+        let dependencies: Vec<Value> = std::iter::once(0)
+            .chain(unique_children.iter().copied())
+            .map(dependency)
+            .collect();
+        return Ok(json!({
+            "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "serialNumber": format!("urn:uuid:{}", generate_uuid()),
+            "version": 1,
+            "metadata": {
+                "timestamp": current_iso_time_millis(),
+                "lifecycles": [{ "phase": phase }],
+                "tools": [{
+                    "vendor": "npm",
+                    "name": "cli",
+                    "version": crate::version::NPM_VERSION,
                 }],
-                checksums: Vec::new(),
-            });
-
-            // Dependency packages
-            let mut path_to_spdx_id = BTreeMap::new();
-            path_to_spdx_id.insert("".to_string(), root_spdx_id.clone());
-
-            for path in &included_paths {
-                if path.is_empty() {
-                    continue;
-                }
-                let pkg = match lockfile.packages.get(path) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let name = pkg
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| derive_package_name(path));
-                let version = pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string());
-                let spdx_id = format!("SPDXRef-Package-{}", sanitize_spdx(path));
-                path_to_spdx_id.insert(path.clone(), spdx_id.clone());
-
-                let purl = make_purl(&name, &version);
-                let license = pkg
-                    .license
-                    .clone()
-                    .unwrap_or_else(|| "NOASSERTION".to_string());
-                let download = pkg
-                    .resolved
-                    .clone()
-                    .unwrap_or_else(|| "NOASSERTION".to_string());
-
-                let mut checksums = Vec::new();
-                if let Some(integrity) = &pkg.integrity {
-                    if let Some((algo, hex)) = integrity_to_hex(integrity) {
-                        let spdx_algo = match algo.as_str() {
-                            "sha512" => "SHA512".to_string(),
-                            "sha1" => "SHA1".to_string(),
-                            "sha256" => "SHA256".to_string(),
-                            other => other.to_ascii_uppercase(),
-                        };
-                        checksums.push(SpdxChecksum {
-                            algorithm: spdx_algo,
-                            checksum_value: hex,
-                        });
-                    }
-                }
-
-                packages.push(SpdxPackage {
-                    name,
-                    spdx_id,
-                    version_info: version,
-                    package_file_name: path.clone(),
-                    download_location: download,
-                    license_declared: license,
-                    external_refs: vec![SpdxExternalRef {
-                        reference_category: "PACKAGE-MANAGER".to_string(),
-                        reference_type: "purl".to_string(),
-                        reference_locator: purl,
-                    }],
-                    checksums,
-                });
-            }
-
-            // Relationships
-            let mut relationships = Vec::new();
-            relationships.push(SpdxRelationship {
-                spdx_element_id: "SPDXRef-DOCUMENT".to_string(),
-                relationship_type: "DESCRIBES".to_string(),
-                related_spdx_element: root_spdx_id.clone(),
-            });
-
-            for (parent_path, children) in &parent_to_children {
-                let parent_id = match path_to_spdx_id.get(parent_path) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                for child_path in children {
-                    let child_id = match path_to_spdx_id.get(child_path) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    relationships.push(SpdxRelationship {
-                        spdx_element_id: child_id.clone(),
-                        relationship_type: "DEPENDENCY_OF".to_string(),
-                        related_spdx_element: parent_id.clone(),
-                    });
-                }
-            }
-
-            let doc = SpdxDocument {
-                spdx_version: "SPDX-2.3".to_string(),
-                data_license: "CC0-1.0".to_string(),
-                spdx_id: "SPDXRef-DOCUMENT".to_string(),
-                name: format!("{root_name}@{root_version}"),
-                document_namespace: format!(
-                    "http://spdx.org/spdxdocs/{}-{}-{}",
-                    sanitize_spdx(&root_name),
-                    sanitize_spdx(&root_version),
-                    generate_uuid()
-                ),
-                creation_info: SpdxCreationInfo {
-                    creators: vec!["Tool: rnpm".to_string()],
-                    created: current_rfc3339_time(),
-                },
-                document_describes: vec![root_spdx_id],
-                packages,
-                relationships,
-            };
-
-            Ok(serde_json::to_value(doc)?)
-        }
-        "cyclonedx" => {
-            let root_purl = make_purl(&root_name, &root_version);
-            let root_bom_ref = root_purl.clone();
-
-            let mut components = Vec::new();
-            let mut path_to_bom_ref = BTreeMap::new();
-            let mut seen_bom_refs = BTreeSet::new();
-
-            path_to_bom_ref.insert("".to_string(), root_bom_ref.clone());
-            seen_bom_refs.insert(root_bom_ref.clone());
-
-            for path in &included_paths {
-                if path.is_empty() {
-                    continue;
-                }
-                let pkg = match lockfile.packages.get(path) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let name = pkg
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| derive_package_name(path));
-                let version = pkg.version.clone().unwrap_or_else(|| "0.0.0".to_string());
-                let purl = make_purl(&name, &version);
-
-                let bom_ref = if seen_bom_refs.insert(purl.clone()) {
-                    purl.clone()
-                } else {
-                    format!("{}#{}", purl, sanitize_spdx(path))
-                };
-                path_to_bom_ref.insert(path.clone(), bom_ref.clone());
-
-                let mut external_references = Vec::new();
-                if let Some(resolved) = &pkg.resolved {
-                    external_references.push(CycloneDxExternalReference {
-                        ref_type: "distribution".to_string(),
-                        url: resolved.clone(),
-                    });
-                }
-
-                let mut hashes = Vec::new();
-                if let Some(integrity) = &pkg.integrity {
-                    if let Some((algo, hex)) = integrity_to_hex(integrity) {
-                        let cdx_algo = match algo.as_str() {
-                            "sha512" => "SHA-512".to_string(),
-                            "sha1" => "SHA-1".to_string(),
-                            "sha256" => "SHA-256".to_string(),
-                            other => other.to_ascii_uppercase(),
-                        };
-                        hashes.push(CycloneDxHash {
-                            alg: cdx_algo,
-                            content: hex,
-                        });
-                    }
-                }
-
-                components.push(CycloneDxComponent {
-                    bom_ref,
-                    component_type: "library".to_string(),
-                    name,
-                    version,
-                    purl,
-                    external_references,
-                    hashes,
-                });
-            }
-
-            // Dependencies
-            let mut dependencies = Vec::new();
-            for (parent_path, children) in &parent_to_children {
-                let parent_ref = match path_to_bom_ref.get(parent_path) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let child_refs: Vec<String> = children
-                    .iter()
-                    .filter_map(|c| path_to_bom_ref.get(c).cloned())
-                    .collect();
-
-                dependencies.push(CycloneDxDependency {
-                    component_ref: parent_ref.clone(),
-                    depends_on: child_refs,
-                });
-            }
-
-            // Ensure every component is represented in dependencies
-            let registered_refs: BTreeSet<String> = dependencies
-                .iter()
-                .map(|d| d.component_ref.clone())
-                .collect();
-            for comp in &components {
-                if !registered_refs.contains(&comp.bom_ref) {
-                    dependencies.push(CycloneDxDependency {
-                        component_ref: comp.bom_ref.clone(),
-                        depends_on: Vec::new(),
-                    });
-                }
-            }
-
-            let doc = CycloneDxDocument {
-                schema: "http://cyclonedx.org/schema/bom-1.5.schema.json".to_string(),
-                bom_format: "CycloneDX".to_string(),
-                spec_version: "1.5".to_string(),
-                serial_number: format!("urn:uuid:{}", generate_uuid()),
-                version: 1,
-                metadata: CycloneDxMetadata {
-                    timestamp: current_rfc3339_time(),
-                    tools: vec![CycloneDxTool {
-                        vendor: "rnpm".to_string(),
-                        name: "rnpm".to_string(),
-                        version: "0.1.0".to_string(),
-                    }],
-                    lifecycles: vec![CycloneDxLifecycle {
-                        phase: "build".to_string(),
-                    }],
-                    component: CycloneDxRootComponent {
-                        bom_ref: root_bom_ref,
-                        component_type: options.sbom_type.clone(),
-                        name: root_name,
-                        version: root_version,
-                        purl: root_purl,
-                    },
-                },
-                components,
-                dependencies,
-            };
-
-            Ok(serde_json::to_value(doc)?)
-        }
-        other => Err(anyhow::anyhow!(
-            "Unsupported SBOM format '{}'. Supported formats: spdx, cyclonedx",
-            other
-        )),
+                "component": cyclonedx_item(root, package_type),
+            },
+            "components": components,
+            "dependencies": dependencies,
+        }));
     }
+
+    let rel = |from: &Node, to: &Node, kind: EdgeType| {
+        let t = match kind {
+            EdgeType::Peer => "PREREQUISITE_FOR",
+            EdgeType::Optional => "OPTIONAL_DEPENDENCY_OF",
+            EdgeType::Dev => "DEV_DEPENDENCY_OF",
+            _ => "DEPENDENCY_OF",
+        };
+        json!({
+            "spdxElementId": spdx_id(to),
+            "relatedSpdxElement": spdx_id(from),
+            "relationshipType": t,
+        })
+    };
+    let mut relationships = vec![json!({
+        "spdxElementId": "SPDXRef-DOCUMENT",
+        "relatedSpdxElement": spdx_id(root),
+        "relationshipType": "DESCRIBES",
+    })];
+    for &i in &items {
+        let mut seen = HashSet::new();
+        for edge in &nodes[i].edges {
+            let Some(t) = edge.to.filter(|t| in_items.contains(t)) else {
+                continue;
+            };
+            let r = rel(&nodes[i], &nodes[t], edge.kind);
+            if seen.insert(r.to_string()) {
+                relationships.push(r);
+            }
+        }
+    }
+    for &i in items.iter().filter(|&&i| i != 0 && nodes[i].extraneous) {
+        relationships.push(rel(root, &nodes[i], EdgeType::Optional));
+    }
+    let mut packages = vec![spdx_item(root, Some(package_type))];
+    packages.extend(unique_children.iter().map(|&i| spdx_item(&nodes[i], None)));
+    Ok(json!({
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": root.pkgid(),
+        "documentNamespace": format!(
+            "http://spdx.org/spdxdocs/{}-{}-{}",
+            root.package_name().replace('/', "%2f"),
+            root.version(),
+            generate_uuid()
+        ),
+        "creationInfo": {
+            "created": current_iso_time_millis(),
+            "creators": [format!("Tool: npm/cli-{}", crate::version::NPM_VERSION)],
+        },
+        "documentDescribes": [spdx_id(root)],
+        "packages": packages,
+        "relationships": relationships,
+    }))
 }
 
 /// Execute `rnpm sbom` workflow.
 pub async fn run_sbom(project_dir: &Path, options: SbomOptions) -> anyhow::Result<()> {
     let sbom_json = generate_sbom(project_dir, &options)?;
-    let rendered = serde_json::to_string_pretty(&sbom_json)?;
-    println!("{rendered}");
+    println!("{}", serde_json::to_string_pretty(&sbom_json)?);
     Ok(())
 }
 
@@ -689,6 +1213,26 @@ mod tests {
             make_purl("@types/node", "18.0.0"),
             "pkg:npm/%40types/node@18.0.0"
         );
+    }
+
+    #[test]
+    fn test_parse_license_matches_spdx_expression_parse() {
+        assert_eq!(parse_license("MIT"), Some(ParsedLicense::Single("MIT".into())));
+        assert_eq!(parse_license("(MIT)"), Some(ParsedLicense::Single("MIT".into())));
+        assert_eq!(parse_license("GPL-2.0+"), Some(ParsedLicense::Single("GPL-2.0".into())));
+        assert_eq!(
+            parse_license("GPL-2.0-only WITH Classpath-exception-2.0"),
+            Some(ParsedLicense::Single("GPL-2.0-only".into()))
+        );
+        assert_eq!(parse_license("MIT OR Apache-2.0"), Some(ParsedLicense::Conjunction));
+        assert_eq!(parse_license("(MIT AND ISC) OR 0BSD"), Some(ParsedLicense::Conjunction));
+        assert_eq!(
+            parse_license("LicenseRef-Proprietary"),
+            Some(ParsedLicense::Single("LicenseRef-Proprietary".into()))
+        );
+        assert_eq!(parse_license("UNLICENSED"), None);
+        assert_eq!(parse_license("SEE LICENSE IN LICENSE.md"), None);
+        assert_eq!(parse_license("MIT OR"), None);
     }
 
     #[test]

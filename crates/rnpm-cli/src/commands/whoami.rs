@@ -20,8 +20,9 @@ pub(crate) async fn run(
 
     let token = config.npmrc.get_auth_token(&registry_url);
     if token.is_none() {
+        // The CLI error handler prints the --json form of this error.
         return Err(anyhow::anyhow!(
-            "npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry_url}\nnpm error You need to authorize this machine using `npm adduser` or `npm login`"
+            "npm error code ENEEDAUTH\nnpm error need auth This command requires you to be logged in.\nnpm error need auth You need to authorize this machine using `npm adduser`"
         ));
     }
 
@@ -29,6 +30,7 @@ pub(crate) async fn run(
         default_registry: registry_url.clone(),
         scoped_registries: config.npmrc.scoped_registries.clone(),
         auth_tokens: config.npmrc.auth_tokens.clone(),
+        basic_auths: config.npmrc.basic_auths(),
         ..Default::default()
     };
     if let Some(tok) = token {

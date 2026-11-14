@@ -1,4 +1,3 @@
-use crate::client::encode_package_name;
 use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -46,88 +45,76 @@ pub struct PublishAttachment {
 /// - `versions`: `{ [version]: manifest_with_dist }`
 /// - `_attachments`: containing base64-encoded tarball with shasum and integrity
 /// - `access`: public or restricted (optional)
+///
+/// Build the publish document like libnpmpublish's `buildMetadata`: the
+/// manifest is stored as-is plus `_id` and `dist`, `access` is always
+/// present (null when unset), and the tarball URL and attachment key use the
+/// raw package name.
 pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value {
-    let base = opts.registry_url.as_str().trim_end_matches('/');
-    let encoded_pkg = encode_package_name(opts.name);
-    let tarball_url = format!(
-        "{base}/{encoded_pkg}/-/{filename}",
-        filename = opts.tarball.filename
-    );
-
-    let mut dist = serde_json::json!({
-        "shasum": opts.tarball.shasum,
-        "integrity": opts.tarball.integrity,
-        "tarball": tarball_url,
-    });
-
-    if let Some(attestation) = opts.provenance_attestation {
-        if let Some(dist_obj) = dist.as_object_mut() {
-            dist_obj.insert("attestations".to_string(), attestation.clone());
-        }
-    }
-
-    let mut manifest_version = match opts.manifest {
-        serde_json::Value::Object(map) => serde_json::Value::Object(map.clone()),
-        _ => serde_json::json!({}),
+    let tarball_name = format!("{}-{}.tgz", opts.name, opts.version);
+    let tarball_url = opts
+        .registry_url
+        .join(&format!("{}/-/{tarball_name}", opts.name))
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| {
+            format!(
+                "{}/{}/-/{tarball_name}",
+                opts.registry_url.as_str().trim_end_matches('/'),
+                opts.name
+            )
+        });
+    let tarball_url = match tarball_url.strip_prefix("https://") {
+        Some(rest) => format!("http://{rest}"),
+        None => tarball_url,
     };
 
-    if let Some(map) = manifest_version.as_object_mut() {
-        map.insert(
-            "_id".to_string(),
-            serde_json::json!(format!("{}@{}", opts.name, opts.version)),
-        );
-        map.insert("name".to_string(), serde_json::json!(opts.name));
-        map.insert("version".to_string(), serde_json::json!(opts.version));
-        if let Some(desc) = opts.description {
-            map.insert("description".to_string(), serde_json::json!(desc));
-        }
-        map.insert("dist".to_string(), dist);
-
-        if let Some(access) = opts.access {
-            let mut pub_cfg = match map.get("publishConfig") {
-                Some(serde_json::Value::Object(cfg)) => cfg.clone(),
-                _ => serde_json::Map::new(),
-            };
-            pub_cfg.insert("access".to_string(), serde_json::json!(access));
-            map.insert(
-                "publishConfig".to_string(),
-                serde_json::Value::Object(pub_cfg),
-            );
-        }
+    let mut dist = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(existing)) = opts.manifest.get("dist") {
+        dist.extend(existing.clone());
+    }
+    dist.insert("integrity".into(), serde_json::json!(opts.tarball.integrity));
+    dist.insert("shasum".into(), serde_json::json!(opts.tarball.shasum));
+    dist.insert("tarball".into(), serde_json::json!(tarball_url));
+    if let Some(attestation) = opts.provenance_attestation {
+        dist.insert("attestations".into(), attestation.clone());
     }
 
-    let encoded_tarball = BASE64.encode(opts.tarball.bytes);
+    let mut manifest = match opts.manifest {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    manifest.insert(
+        "_id".into(),
+        serde_json::json!(format!("{}@{}", opts.name, opts.version)),
+    );
+    manifest.insert("dist".into(), serde_json::Value::Object(dist));
 
-    let attachment = serde_json::json!({
-        "content_type": "application/octet-stream",
-        "data": encoded_tarball,
-        "length": opts.tarball.bytes.len(),
-        "shasum": opts.tarball.shasum,
-        "integrity": opts.tarball.integrity,
-    });
-
-    let mut doc = serde_json::json!({
-        "_id": opts.name,
-        "name": opts.name,
-        "description": opts.description.unwrap_or(""),
-        "dist-tags": {
-            opts.tag: opts.version,
-        },
-        "versions": {
-            opts.version: manifest_version,
-        },
-        "_attachments": {
-            opts.tarball.filename: attachment,
-        }
-    });
-
-    if let Some(access) = opts.access {
-        if let Some(doc_obj) = doc.as_object_mut() {
-            doc_obj.insert("access".to_string(), serde_json::json!(access));
-        }
+    let mut doc = serde_json::Map::new();
+    doc.insert("_id".into(), serde_json::json!(opts.name));
+    doc.insert("name".into(), serde_json::json!(opts.name));
+    if let Some(desc) = opts.description {
+        doc.insert("description".into(), serde_json::json!(desc));
     }
-
-    doc
+    doc.insert("dist-tags".into(), serde_json::json!({ opts.tag: opts.version }));
+    doc.insert(
+        "versions".into(),
+        serde_json::json!({ opts.version: serde_json::Value::Object(manifest) }),
+    );
+    doc.insert(
+        "access".into(),
+        opts.access.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+    );
+    doc.insert(
+        "_attachments".into(),
+        serde_json::json!({
+            tarball_name: {
+                "content_type": "application/octet-stream",
+                "data": BASE64.encode(opts.tarball.bytes),
+                "length": opts.tarball.bytes.len(),
+            }
+        }),
+    );
+    serde_json::Value::Object(doc)
 }
 
 #[cfg(test)]
@@ -182,20 +169,18 @@ mod tests {
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         );
         assert_eq!(version_doc["dist"]["integrity"], "sha512-dummy==");
+        // libnpmpublish rewrites https to http in dist.tarball.
         assert_eq!(
             version_doc["dist"]["tarball"],
-            "https://registry.npmjs.org/my-pkg/-/my-pkg-1.0.0.tgz"
+            "http://registry.npmjs.org/my-pkg/-/my-pkg-1.0.0.tgz"
         );
 
         // Verify attachments
         let attachment = &payload["_attachments"]["my-pkg-1.0.0.tgz"];
         assert_eq!(attachment["content_type"], "application/octet-stream");
         assert_eq!(attachment["length"], tarball_bytes.len());
-        assert_eq!(
-            attachment["shasum"],
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
-        assert_eq!(attachment["integrity"], "sha512-dummy==");
+        assert!(attachment.get("shasum").is_none());
+        assert!(attachment.get("integrity").is_none());
         assert_eq!(attachment["data"], BASE64.encode(tarball_bytes));
     }
 
@@ -231,14 +216,14 @@ mod tests {
 
         assert_eq!(payload["_id"], "@my-org/my-pkg");
         assert_eq!(payload["name"], "@my-org/my-pkg");
-        assert_eq!(payload["description"], "");
+        assert!(payload.get("description").is_none());
         assert_eq!(payload["dist-tags"]["next"], "2.1.0-beta.1");
         assert_eq!(payload["access"], "restricted");
 
         let version_doc = &payload["versions"]["2.1.0-beta.1"];
         assert_eq!(
             version_doc["dist"]["tarball"],
-            "https://registry.npmjs.org/@my-org%2fmy-pkg/-/my-org-my-pkg-2.1.0-beta.1.tgz"
+            "http://registry.npmjs.org/@my-org/my-pkg/-/@my-org/my-pkg-2.1.0-beta.1.tgz"
         );
     }
 }

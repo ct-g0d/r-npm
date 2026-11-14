@@ -90,12 +90,7 @@ fn installed_install_script_packages(
         Ok(())
     }
 
-    walk(
-        &node_modules,
-        &current_dir.join("node_modules"),
-        lock_value.as_ref(),
-        &mut found,
-    )?;
+    walk(&node_modules, current_dir, lock_value.as_ref(), &mut found)?;
     Ok(found)
 }
 
@@ -131,6 +126,9 @@ pub(crate) fn list_pending_install_scripts(current_dir: &Path, json: bool) -> Re
     if json {
         println!("{}", serde_json::json!({ "pending": pending }));
     } else {
+        if pending.is_empty() {
+            println!("No packages with unreviewed install scripts.");
+        }
         for item in pending {
             println!("{item}");
         }
@@ -144,6 +142,7 @@ pub(crate) fn prune_install_scripts_policy(
     dry_run: bool,
 ) -> Result<()> {
     let installed = installed_install_script_packages(current_dir)?;
+
     let path = current_dir.join("package.json");
     let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     let allow = document
@@ -216,6 +215,13 @@ fn apply_policy_changes(
 
     let installed = installed_install_script_packages(current_dir)?;
 
+    let lock: serde_json::Value = std::fs::read_to_string(current_dir.join("package-lock.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let pin = rnpm_config::Config::load(Some(current_dir))?
+        .get_bool("allow-scripts-pin")
+        .unwrap_or(true);
     let mut unmatched = Vec::new();
     let mut targets: Vec<(String, String)> = Vec::new(); // (group_name, pinned_key)
 
@@ -283,8 +289,25 @@ fn apply_policy_changes(
 
     for (group_name, keys) in groups {
         let mut changes = Vec::new();
-        for key in keys {
+        for mut key in keys {
             if approved {
+                let resolved = installed
+                    .get(&key)
+                    .and_then(|path| path.strip_prefix(current_dir).ok())
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .and_then(|rel| {
+                        lock.get("packages")?
+                            .get(&rel)?
+                            .get("resolved")?
+                            .as_str()
+                            .map(str::to_string)
+                    });
+                if !pin || resolved.as_deref().is_none_or(str::is_empty) {
+                    key = group_name.clone();
+                    if pin {
+                        eprintln!("npm warn approve-scripts {group_name}: approved by name (all versions) because its package-lock.json entry has no \"resolved\" URL, so npm can't pin a specific version. Run `npm install` to refresh the lockfile and enable pinning.");
+                    }
+                }
                 // Pin package: key is name@version
                 let current_val = allow.get(&key).and_then(|v| v.as_bool());
                 if current_val != Some(true) {

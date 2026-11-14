@@ -38,6 +38,7 @@ fn test_cli_list_clean_tree_and_depth() {
     // 1. Standard rnpm ls (depth 0 by default)
     let output = Command::new(rnpm_bin)
         .arg("ls")
+        .env("NPM_CONFIG_UNICODE", "false")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm ls");
@@ -57,6 +58,7 @@ fn test_cli_list_clean_tree_and_depth() {
     // 2. rnpm ls --all (shows sub-b)
     let output_all = Command::new(rnpm_bin)
         .args(["ls", "--all"])
+        .env("NPM_CONFIG_UNICODE", "false")
         .current_dir(project_dir)
         .output()
         .expect("Failed to execute rnpm ls --all");

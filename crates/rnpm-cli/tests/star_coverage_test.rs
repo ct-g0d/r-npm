@@ -392,5 +392,16 @@ async fn test_cli_star_unstar_stars_parity() {
         assert!(rnpm_stars.status.success());
     }
 
+    let requests = recorded.lock().await;
+    let puts: Vec<_> = requests.iter().filter(|r| r.method == "PUT").collect();
+    assert!(!puts.is_empty());
+    for request in puts {
+        assert_eq!(request.body["_id"], "sample-pkg");
+        assert!(
+            request.body.get("name").is_none(),
+            "star must not rewrite package metadata"
+        );
+        assert!(request.body["users"].is_object());
+    }
     let _ = tx.send(());
 }

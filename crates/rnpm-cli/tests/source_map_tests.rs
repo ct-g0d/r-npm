@@ -28,8 +28,9 @@ fn test_source_map_01_cli_dispatch() {
     // Test version
     let out = Command::new(rnpm_bin).arg("--version").output().unwrap();
     assert!(out.status.success());
+    // Like npm, --version prints the bare npm release that tools parse.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("rnpm"));
+    assert_eq!(stdout.trim(), "11.20.0");
 
     // Test help
     let out = Command::new(rnpm_bin).arg("--help").output().unwrap();
@@ -43,12 +44,12 @@ fn test_source_map_01_cli_dispatch() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ERR_UNSUPPORTED_COMMAND"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Unknown command: \"definitely-unknown-command\"\n\nTo see a list of supported npm commands, run:\n  npm help\n");
+    assert!(out.stderr.is_empty());
 
     // Test unsupported flag
     let out = Command::new(rnpm_bin)
-        .args(["install", "--save-bundle"])
+        .args(["pack", "--legacy-peer-deps"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));

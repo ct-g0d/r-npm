@@ -1,0 +1,8 @@
+{
+  "name": "scripts-argon2",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "argon2": "0.45.2"
+  }
+}

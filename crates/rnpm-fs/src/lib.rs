@@ -39,7 +39,7 @@ pub use path::{strip_verbatim_prefix, to_verbatim_path};
 pub use tarball::{
     bytes_written, collect_pack_files, compute_tarball_filename, extract_tar_gz, files_created,
     pack_directory, record_file_created, record_files_created_batch, reset_fs_counters,
-    strip_package_prefix, validate_entry_path, ExtractionSummary, PackSummary, PackedFileEntry,
+    strip_package_prefix, read_tarball_text, summarize_tarball, validate_entry_path, ExtractionSummary, PackSummary, PackedFileEntry,
     TarLimits, NPM_DEFAULT_FILE_MODE, NPM_EXECUTABLE_FILE_MODE, NPM_PACK_EPOCH_MTIME,
 };
 pub use writer::{

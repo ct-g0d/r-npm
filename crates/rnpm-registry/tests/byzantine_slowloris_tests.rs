@@ -213,7 +213,7 @@ async fn test_byzantine_duplicate_version_keys() {
 }
 
 #[tokio::test]
-async fn test_byzantine_spoofed_dist_tags() {
+async fn test_byzantine_dangling_dist_tags_are_tolerated() {
     let server = TestHttpServer::start(|mut stream, _, reqs| async move {
         let mut buf = [0u8; 2048];
         let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -248,17 +248,13 @@ async fn test_byzantine_spoofed_dist_tags() {
     };
     let client = RegistryClient::with_config(config).unwrap();
 
-    let err = client
+    // npm keeps the packument usable; only requesting the dangling tag fails.
+    let meta = client
         .get_package_metadata("spoofed-pkg")
         .await
-        .unwrap_err();
-    assert!(
-        err.is_malformed_metadata(),
-        "Expected MalformedMetadata for spoofed dist-tags, got: {err:?}"
-    );
-    assert!(err
-        .to_string()
-        .contains("points to non-existent version '9.9.9'"));
+        .expect("dangling dist-tags must not make the packument unusable");
+    assert!(meta.versions.contains_key("1.0.0"));
+    assert!(!meta.versions.contains_key("9.9.9"));
 }
 
 #[tokio::test]

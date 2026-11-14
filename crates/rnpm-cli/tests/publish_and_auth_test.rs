@@ -261,8 +261,20 @@ fn test_cli_publish_dry_run() {
     assert!(package["integrity"].is_string());
 }
 
-#[test]
-fn test_cli_login_persists_registry_token_without_echoing_secret() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cli_login_persists_registry_token_without_echoing_secret() {
+    let server = TestMockRegistry::start(|req| {
+        let body = if req.method == "POST" && req.path == "/-/v1/login" {
+            assert_eq!(req.json(), serde_json::json!({}));
+            let origin = format!("http://{}", req.header("host").unwrap());
+            serde_json::json!({"loginUrl":format!("{origin}/auth/login"),"doneUrl":format!("{origin}/auth/done")})
+        } else {
+            assert_eq!(req.path, "/auth/done");
+            serde_json::json!({"token":"mock-login-token"})
+        };
+        (200, vec![("Content-Type", "application/json".into())], serde_json::to_vec(&body).unwrap())
+    }).await;
+    let registry = server.url();
     let tmp = tempdir().unwrap();
     let home = tmp.path().join("home");
     let project = tmp.path().join("project");
@@ -273,14 +285,14 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
         .args([
             "login",
             "--registry",
-            "https://registry.example.test/",
+            &registry,
             "--scope",
             "@acme",
         ])
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
-        .env("NPM_TOKEN", "secret-login-token")
+        .env_remove("NPM_TOKEN")
         .output()
         .expect("failed to run rnpm login");
 
@@ -290,10 +302,11 @@ fn test_cli_login_persists_registry_token_without_echoing_secret() {
         String::from_utf8_lossy(&output.stderr)
     );
     let npmrc = std::fs::read_to_string(home.join(".npmrc")).unwrap();
-    assert!(npmrc.contains("//registry.example.test/:_authToken=secret-login-token"));
-    assert!(npmrc.contains("@acme:registry=https://registry.example.test/"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-login-token"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-login-token"));
+    assert!(npmrc.contains(&format!("//{}/:_authToken=mock-login-token",server.addr)));
+    assert!(npmrc.contains(&format!("@acme:registry={registry}")));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("mock-login-token"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("mock-login-token"));
+    server.stop();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -373,7 +386,9 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
     );
 
     // Verify PUT request reached mock server
-    let reqs = server.requests.lock().await;
+    // npm reads the packument (version check) before the PUT.
+    let all_reqs = server.requests.lock().await;
+    let reqs: Vec<_> = all_reqs.iter().filter(|r| r.method != "GET").collect();
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].method, "PUT");
     assert_eq!(reqs[0].path, "/lifecycle-test-pkg");
@@ -382,6 +397,7 @@ async fn test_cli_publish_lifecycle_hooks_sequence() {
         Some("Bearer secret-lifecycle-token")
     );
     drop(reqs);
+    drop(all_reqs);
 
     server.stop();
 }
@@ -519,7 +535,9 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let reqs = server.requests.lock().await;
+    // npm reads the packument (version check) before the PUT.
+    let all_reqs = server.requests.lock().await;
+    let reqs: Vec<_> = all_reqs.iter().filter(|r| r.method != "GET").collect();
     assert_eq!(reqs.len(), 1);
     let req = &reqs[0];
     assert_eq!(req.method, "PUT");
@@ -546,20 +564,18 @@ async fn test_cli_publish_http_put_payload_headers_and_auth() {
         .as_str()
         .unwrap()
         .starts_with("sha512-"));
+    // libnpmpublish builds these from the raw package name.
     assert_eq!(
         version_entry["dist"]["tarball"],
-        format!("{server_url}@cool%2fawesome-lib/-/cool-awesome-lib-3.5.0.tgz")
+        format!("{server_url}@cool/awesome-lib/-/@cool/awesome-lib-3.5.0.tgz")
     );
 
-    let attachment = &doc["_attachments"]["cool-awesome-lib-3.5.0.tgz"];
+    let attachment = &doc["_attachments"]["@cool/awesome-lib-3.5.0.tgz"];
     assert_eq!(attachment["content_type"], "application/octet-stream");
     assert!(attachment["data"].as_str().unwrap().len() > 10);
-    assert!(attachment["shasum"].is_string());
-    assert!(attachment["integrity"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha512-"));
+    assert!(attachment["length"].is_number());
     drop(reqs);
+    drop(all_reqs);
 
     server.stop();
 }
@@ -610,10 +626,12 @@ async fn test_cli_publish_error_codes_diagnostics() {
     assert!(!out1.status.success());
     let err1 = String::from_utf8_lossy(&out1.stderr);
     assert!(
-        err1.contains("npm error code EPUBLISHCONFLICT"),
-        "Expected EPUBLISHCONFLICT in: {err1}"
+        err1.contains("npm error code E409"),
+        "Expected E409 in: {err1}"
     );
-    assert!(err1.contains("Cannot publish over existing version."));
+    // npm-registry-fetch reports the HTTP status; npm 11 has no producer
+    // of EPUBLISHCONFLICT.
+    assert!(err1.contains("409 Conflict - PUT"));
 
     // 2. Unauthorized 401 -> ENEEDAUTH
     let tmp2 = tempdir().unwrap();
@@ -639,8 +657,8 @@ async fn test_cli_publish_error_codes_diagnostics() {
     assert!(!out2.status.success());
     let err2 = String::from_utf8_lossy(&out2.stderr);
     assert!(
-        err2.contains("npm error code ENEEDAUTH"),
-        "Expected ENEEDAUTH in: {err2}"
+        err2.contains("npm error code E401"),
+        "Expected E401 in: {err2}"
     );
 
     // 3. Forbidden 403 -> E403
@@ -793,9 +811,9 @@ async fn test_cli_auth_helpers_login_and_logout() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&project).unwrap();
 
-    let server = TestMockRegistry::start(|_req| {
+    let server = TestMockRegistry::start(|req| {
         (
-            200,
+            if req.path == "/-/v1/login" { 400 } else { 200 },
             vec![("Content-Type", "application/json".to_string())],
             b"{\"ok\":true}".to_vec(),
         )
@@ -803,9 +821,9 @@ async fn test_cli_auth_helpers_login_and_logout() {
     .await;
     let reg_url = server.url();
 
-    // 1. Non-interactive login requires an explicit credential source.
+    // 1. Unsupported web auth falls back to a legacy prompt; EOF exits 1.
     let login_out = isolated_rnpm(&project)
-        .arg("login")
+        .args(["login", "--registry", &reg_url])
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
@@ -814,7 +832,8 @@ async fn test_cli_auth_helpers_login_and_logout() {
 
     assert!(!login_out.status.success());
     let login_err = String::from_utf8_lossy(&login_out.stderr);
-    assert!(login_err.contains("npm error code ENEEDAUTH"));
+    assert_eq!(login_out.stdout, b"Username: ");
+    assert_eq!(login_err, format!("npm notice Log in on {reg_url}\n"));
 
     // 2. logout with existing token removes token from .npmrc and contacts mock registry
     let local_npmrc = project.join(".npmrc");
