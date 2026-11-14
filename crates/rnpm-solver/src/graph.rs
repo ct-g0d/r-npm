@@ -103,6 +103,27 @@ pub struct Node {
 }
 
 impl Node {
+    pub fn all_dependency_specs(&self) -> BTreeMap<String, String> {
+        let mut specs = BTreeMap::new();
+        for (k, v) in &self.dev_dependencies {
+            let spec = if v.is_empty() { "*" } else { v.as_str() };
+            specs.insert(k.clone(), spec.to_string());
+        }
+        for (k, v) in &self.optional_dependencies {
+            let spec = if v.is_empty() { "*" } else { v.as_str() };
+            specs.insert(k.clone(), spec.to_string());
+        }
+        for (k, v) in &self.dependencies {
+            let spec = if v.is_empty() { "*" } else { v.as_str() };
+            specs.insert(k.clone(), spec.to_string());
+        }
+        for (k, v) in &self.peer_dependencies {
+            let spec = if v.is_empty() { "*" } else { v.as_str() };
+            specs.insert(k.clone(), spec.to_string());
+        }
+        specs
+    }
+
     pub fn bundle_dependencies(&self) -> Option<rnpm_core::manifest::BundledDependencies> {
         self.extra
             .get("bundleDependencies")
