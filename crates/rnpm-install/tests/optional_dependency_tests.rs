@@ -125,6 +125,43 @@ impl TestRegistryServer {
 }
 
 #[tokio::test]
+async fn test_platform_skipped_scoped_optional_does_not_create_scope_directory() {
+    let server = TestRegistryServer::start(|request, base| {
+        if request.ends_with(".tgz") {
+            panic!("Platform-skipped optional tarball must never be downloaded");
+        }
+        let metadata = serde_json::json!({
+            "name": "@foreign/native", "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": {
+                "name": "@foreign/native", "version": "1.0.0", "os": ["never-platform"],
+                "dist": { "tarball": format!("{base}/native.tgz") }
+            } }
+        });
+        Some((200, vec![("Content-Type", "application/json".into())], metadata.to_string().into_bytes()))
+    }).await;
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("package.json"), serde_json::json!({
+        "name": "optional-scope", "version": "1.0.0",
+        "optionalDependencies": { "@foreign/native": "1.0.0" }
+    }).to_string()).unwrap();
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project.path().to_path_buf(),
+        cache_dir: Some(cache.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ignore_scripts: true,
+        ..Default::default()
+    }).unwrap();
+    installer.run().await.unwrap();
+    let lock = LockfileV3::load_from_file(&project.path().join("package-lock.json")).unwrap();
+    assert!(lock.packages.contains_key("node_modules/@foreign/native"));
+    assert!(
+        !project.path().join("node_modules/@foreign").exists(),
+        "Skipping every package in a scope must not leave an empty directory"
+    );
+}
+
+#[tokio::test]
 async fn test_platform_skipping_incompatible_os_or_cpu() {
     let normal_tarball = create_test_tarball(&[
         (

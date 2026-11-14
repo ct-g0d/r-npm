@@ -2852,7 +2852,25 @@ impl Installer {
         {
             let mut dirs_to_precreate = Vec::with_capacity(graph.nodes.len() * 2);
             for (loc, node) in &graph.nodes {
-                if loc.is_empty() {
+                if loc.is_empty() || node.flags.skipped || node.flags.bundled {
+                    continue;
+                }
+                // Match materialization below: merely reserving a parent for
+                // an incompatible optional node leaves an empty @scope behind.
+                if (node.flags.optional || node.flags.dev_optional)
+                    && !rnpm_solver::is_platform_compatible(
+                        &self.options.platform(),
+                        node.os.as_deref(),
+                        node.cpu.as_deref(),
+                        node.libc.as_deref(),
+                    )
+                {
+                    continue;
+                }
+                if reify_locations
+                    .as_ref()
+                    .is_some_and(|locations| !locations.contains(loc))
+                {
                     continue;
                 }
                 if let Some(ref diff) = tree_diff_opt {
