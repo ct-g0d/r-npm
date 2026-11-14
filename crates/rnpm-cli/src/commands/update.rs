@@ -43,7 +43,7 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
     }
 
     let options = InstallOptions {
-        project_dir: current_dir,
+        project_dir: current_dir.clone(),
         registry_url: opts.registry,
         cache_dir: opts.cache,
         offline: opts.offline,
@@ -58,41 +58,15 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         ..Default::default()
     };
 
+    let start_time = std::time::Instant::now();
     let mut installer = Installer::new(options)?;
     if dry_run {
         let summary = installer.run().await?;
-        if !opts.silent {
-            println!(
-                "rnpm: dry-run: would install {} package(s)",
-                summary.packages_installed
-            );
-        }
-        return Ok(());
+        let report = summary.reify.unwrap_or_default();
+        return crate::reify_output::finish(&current_dir, &report, opts.json, true, opts.silent, start_time.elapsed()).await;
     }
-    let start_time = std::time::Instant::now();
-    let summary = installer.update(&opts.packages).await?;
-    let elapsed_str = crate::format_duration(start_time.elapsed());
-
-    if opts.json {
-        let json_output = serde_json::json!({
-            "add": [],
-            "added": summary.packages_updated,
-            "audited": 0,
-            "change": [],
-            "changed": 0,
-            "funding": 0,
-            "remove": [],
-            "removed": 0
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else if opts.silent {
-        return Ok(());
-    } else if summary.packages_updated == 0 {
-        println!("\nup to date in {}", elapsed_str);
-    } else {
-        let pkg_str = if summary.packages_updated == 1 { "package" } else { "packages" };
-        println!("\nadded {} {} in {}", summary.packages_updated, pkg_str, elapsed_str);
-    }
-
-    Ok(())
+    let before = crate::reify_output::snapshot(&current_dir);
+    installer.update(&opts.packages).await?;
+    let report = crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
+    crate::reify_output::finish(&current_dir, &report, opts.json, false, opts.silent, start_time.elapsed()).await
 }

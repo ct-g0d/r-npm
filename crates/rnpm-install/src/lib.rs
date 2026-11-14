@@ -58,6 +58,9 @@ pub use timing::{Phase, PhaseGuard, TimingCollector, TimingMetrics, TimingPhase}
 pub mod diff;
 pub use diff::*;
 
+pub mod reify_report;
+pub use reify_report::{ReifyChange, ReifyEntry, ReifyReport};
+
 pub mod trash;
 pub use trash::*;
 
@@ -1254,6 +1257,7 @@ pub struct InstallOptions {
     pub save_peer: bool,
     pub save_bundle: bool,
     pub no_save: bool,
+    pub skip_manifest_save: bool,
     pub package_lock_only: bool,
     pub packages: Vec<String>,
     pub omit_dev: bool,
@@ -1335,6 +1339,7 @@ impl Default for InstallOptions {
             save_peer: false,
             save_bundle: false,
             no_save: false,
+            skip_manifest_save: false,
             package_lock_only: false,
             packages: Vec::new(),
             omit_dev: false,
@@ -1372,10 +1377,47 @@ impl Default for InstallOptions {
 #[derive(Debug, Clone)]
 pub struct InstallSummary {
     pub packages_installed: usize,
+    /// What npm reify-output reports; None when no reify diff was computed.
+    pub reify: Option<ReifyReport>,
     pub cache_hits: usize,
     pub cache_misses: usize,
     pub lockfile_path: PathBuf,
     pub timing: Option<TimingMetrics>,
+}
+
+/// npm's reify diff for an ideal lockfile, treating omitted and
+/// platform-incompatible optional nodes as inert, as arborist does.
+fn reify_report_for(
+    options: &InstallOptions,
+    ideal: &LockfileV3,
+    actual: &BTreeMap<String, LockfilePackage>,
+    include: Option<&HashSet<String>>,
+    ideal_rank: Option<&HashMap<String, usize>>,
+) -> ReifyReport {
+    let platform = options.platform();
+    reify_report::compute(
+        &ideal.packages,
+        actual,
+        ideal_rank,
+        |_, p| {
+            let dev = p.dev == Some(true);
+            let optional = p.optional == Some(true);
+            let dev_optional = p.dev_optional == Some(true);
+            let omitted = (dev && options.omit_dev)
+                || (optional && options.omit_optional)
+                || (dev_optional && options.omit_dev && options.omit_optional)
+                || (p.peer == Some(true) && options.omit_peer);
+            omitted
+                || ((optional || dev_optional)
+                    && !rnpm_solver::is_platform_compatible(
+                        &platform,
+                        p.os.as_deref(),
+                        p.cpu.as_deref(),
+                        p.libc.as_deref(),
+                    ))
+        },
+        |loc| include.is_none_or(|set| set.contains(loc)),
+    )
 }
 
 /// Node.shouldOmit from arborist, over lockfile flags.
@@ -1918,6 +1960,8 @@ impl Installer {
             && !self.options.force
             && !self.options.dry_run
             && !self.options.package_lock_only
+            && self.options.unlocked_packages.is_empty()
+            && self.options.vulnerability_constraints.is_empty()
         {
             if let Ok(current_fingerprint) =
                 compute_project_fingerprint(&self.options.project_dir, &self.options)
@@ -1948,7 +1992,11 @@ impl Installer {
                             let _life_guard = collector.enter_phase(Phase::Lifecycle);
                             rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts).await?;
                         }
+                        let inventory = LockfileV3::load_from_file(&self.options.project_dir.join("node_modules").join(".package-lock.json"))
+                            .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
+                            .unwrap_or(1);
                         return Ok(InstallSummary {
+                            reify: Some(ReifyReport { changes: Vec::new(), inventory }),
                             packages_installed: 0,
                             cache_hits: 0,
                             cache_misses: 0,
@@ -2006,7 +2054,7 @@ impl Installer {
                             info!(
                                 "Lockfile matches manifest: taking lockfile reification fast path"
                             );
-                            match self.run_ci_internal().await {
+                            match self.run_ci_internal(false).await {
                                 Ok(summary) => return Ok(summary),
                                 Err(err) => {
                                     let err_msg = err.to_string();
@@ -2456,8 +2504,8 @@ impl Installer {
                 }
             }
 
-            // Save package.json unless --no-save was passed or in global mode
-            if !self.options.is_global && !self.options.no_save && !self.options.dry_run {
+            // Save package.json unless --no-save was passed, in global mode, or skip_manifest_save is set
+            if !self.options.is_global && !self.options.no_save && !self.options.skip_manifest_save && !self.options.dry_run {
                 save::save_manifests(
                     &self.options.project_dir,
                     &manifest,
@@ -2607,6 +2655,7 @@ impl Installer {
             }
 
             return Ok(InstallSummary {
+                reify: None,
                 packages_installed: 0,
                 cache_hits: 0,
                 cache_misses: 0,
@@ -2651,6 +2700,18 @@ impl Installer {
             None
         };
 
+        // npm reify-output: diff the actual tree on disk against the ideal tree.
+        let reify_report = (!self.options.is_global).then(|| {
+            let hidden_valid = validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+            let actual = reify_report::load_actual(
+                &self.options.project_dir,
+                hidden_valid && !self.options.force,
+                existing_lockfile_for_merge.as_ref().map(|l| &l.packages),
+            );
+            let rank = reify_report::placement_rank(&lockfile.packages, existing_lockfile_for_merge.as_ref().map(|l| &l.packages));
+            reify_report_for(&self.options, &lockfile, &actual, reify_locations.as_ref(), Some(&rank))
+        });
+
         // 3b. For --dry-run, simulate installation and report what would be installed
         if self.options.dry_run {
             let mut packages_installed = 0;
@@ -2692,16 +2753,11 @@ impl Installer {
                         continue;
                     }
                 }
-                if !self.options.silent {
-                    println!(
-                        "rnpm: would install {}@{} at {}",
-                        node.name, node.version, loc
-                    );
-                }
                 packages_installed += 1;
             }
 
             return Ok(InstallSummary {
+                reify: reify_report,
                 packages_installed,
                 cache_hits: 0,
                 cache_misses: 0,
@@ -4079,6 +4135,7 @@ impl Installer {
         }
 
         Ok(InstallSummary {
+            reify: reify_report,
             packages_installed,
             cache_hits,
             cache_misses,
@@ -4090,7 +4147,7 @@ impl Installer {
     /// Run strict CI installation from committed package-lock.json.
     pub async fn run_ci(&mut self) -> Result<InstallSummary> {
         let t0 = std::time::Instant::now();
-        let res = self.run_ci_internal().await;
+        let res = self.run_ci_internal(true).await;
         let t_internal = t0.elapsed();
         rnpm_fs::writer::wait_all_handles_closed();
         let t_handles = t0.elapsed();
@@ -4114,7 +4171,9 @@ impl Installer {
         res
     }
 
-    async fn run_ci_internal(&mut self) -> Result<InstallSummary> {
+    /// `from_scratch` is true for `npm ci`, which removes node_modules first;
+    /// the install fast path reifies against the existing tree instead.
+    async fn run_ci_internal(&mut self, from_scratch: bool) -> Result<InstallSummary> {
         crate::trash::cleanup_leftover_trash(&self.options.project_dir);
         let collector = TimingCollector::new();
         let plan_start = std::time::Instant::now();
@@ -4349,6 +4408,16 @@ impl Installer {
         drop(_meta_span);
         collector.record_phase(Phase::Metadata, metadata_start.elapsed());
 
+        // npm ci removes node_modules first, so every placed node is added.
+        let reify_report = (!self.options.is_global).then(|| {
+            let actual = if from_scratch && !self.options.dry_run {
+                BTreeMap::new()
+            } else {
+                let hidden_valid = validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+                reify_report::load_actual(&self.options.project_dir, hidden_valid, Some(&lockfile.packages))
+            };
+            reify_report_for(&self.options, &lockfile, &actual, None, None)
+        });
         if self.options.dry_run {
             let host_platform = self.options.platform();
             let mut packages_installed = 0;
@@ -4379,12 +4448,10 @@ impl Installer {
                 if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
                     continue;
                 }
-                if !self.options.silent {
-                    println!("rnpm: would install {}", pkg_key);
-                }
                 packages_installed += 1;
             }
             return Ok(InstallSummary {
+                reify: reify_report.clone(),
                 packages_installed,
                 cache_hits: 0,
                 cache_misses: 0,
@@ -6146,6 +6213,7 @@ impl Installer {
         }
 
         Ok(InstallSummary {
+            reify: reify_report,
             packages_installed,
             cache_hits,
             cache_misses,

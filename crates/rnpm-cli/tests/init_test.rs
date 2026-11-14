@@ -397,7 +397,9 @@ fn test_init_initializer_delegation_to_create_pkg() {
     );
 
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
-    assert_eq!(marker_content.trim(), "my-app --template react");
+    // npm's nopt treats the unknown `--template` as a boolean config flag,
+    // so the initializer only receives the positional arguments.
+    assert_eq!(marker_content.trim(), "my-app react");
 }
 
 #[test]

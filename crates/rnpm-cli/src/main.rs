@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
+mod reify_output;
 mod explain;
 pub mod commands;
 pub mod diagnostics;
@@ -1010,7 +1011,7 @@ pub(crate) enum Commands {
         otp: Option<String>,
 
         /// Generate and include provenance attestations
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false")]
         provenance: bool,
 
         /// Custom npm registry URL
@@ -1523,12 +1524,13 @@ pub(crate) enum TokenAction {
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum OwnerAction {
     /// List package owners.
-    Ls { package: String },
+    #[command(alias = "list")]
+    Ls { package: Option<String> },
     /// Add an owner.
-    Add { user: String, package: String },
+    Add { user: String, package: Option<String> },
     /// Remove an owner.
     #[command(alias = "remove")]
-    Rm { user: String, package: String },
+    Rm { user: String, package: Option<String> },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -2431,6 +2433,7 @@ fn preprocess_exec_args(
 
         if token == "-y" || token == "--yes" {
             clap_flags.push(token.clone());
+            overrides.insert("yes".into(), "true".into());
             i += 1;
             continue;
         }
@@ -2572,14 +2575,14 @@ fn preprocess_init_args(
         let token = &tokens[i];
         let next_token = tokens.get(i + 1).map(|s| s.as_str());
 
-        if initializer.is_some() {
-            forwarded_args.push(token.clone());
-            i += 1;
-            continue;
+        if token == "--" {
+            forwarded_args.extend_from_slice(&tokens[i + 1..]);
+            break;
         }
 
         if token == "-y" || token == "--yes" || token == "-f" || token == "--force" {
             clap_flags.push(token.clone());
+            overrides.insert("yes".into(), "true".into());
             i += 1;
             continue;
         }
@@ -2608,7 +2611,11 @@ fn preprocess_init_args(
             }
         }
 
-        initializer = Some(token.clone());
+        if initializer.is_some() {
+            forwarded_args.push(token.clone());
+        } else {
+            initializer = Some(token.clone());
+        }
         i += 1;
     }
 
@@ -3053,7 +3060,10 @@ pub(crate) async fn ensure_npx_environment(
     cache: Option<PathBuf>,
     offline: bool,
 ) -> anyhow::Result<PathBuf> {
-    let cache_path = cache.unwrap_or_else(|| {
+    let cache_path = cache.or_else(|| {
+        let dir = std::env::current_dir().ok()?;
+        rnpm_config::Config::load(Some(&dir)).ok()?.get("cache").map(PathBuf::from)
+    }).unwrap_or_else(|| {
         std::env::var_os("LOCALAPPDATA")
             .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
             .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
@@ -3091,6 +3101,19 @@ pub(crate) async fn ensure_npx_environment(
     Ok(env_dir)
 }
 
+fn package_binary(env_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(env_dir.join("node_modules").join(name).join("package.json"))?)?;
+    let unscoped = name.rsplit('/').next().unwrap_or(name);
+    let selected = manifest["bin"].as_object().and_then(|bins| {
+        if bins.contains_key(unscoped) { Some(unscoped.to_string()) }
+        else if bins.values().next().is_some_and(|first| bins.values().all(|v| v == first)) { bins.keys().next().cloned() }
+        else { None }
+    }).or_else(|| manifest["bin"].as_str().map(|_| unscoped.to_string()));
+    selected.and_then(|bin| rnpm_lifecycle::find_local_binary(env_dir, &bin))
+        .ok_or_else(|| anyhow::anyhow!("npm error could not determine executable to run"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_exec(
     current_dir: &std::path::Path,
     command: &str,
@@ -3099,6 +3122,7 @@ pub(crate) async fn execute_exec(
     registry: Option<String>,
     cache: Option<PathBuf>,
     offline: bool,
+    banner: bool,
 ) -> anyhow::Result<()> {
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
@@ -3110,7 +3134,9 @@ pub(crate) async fn execute_exec(
         &cmd_pkg_name
     };
 
-    let cache_path = cache.clone().unwrap_or_else(|| {
+    let cache_path = cache.clone().or_else(|| {
+        rnpm_config::Config::load(Some(current_dir)).ok()?.get("cache").map(PathBuf::from)
+    }).unwrap_or_else(|| {
         if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
             PathBuf::from(appdata).join("rnpm").join("cache")
         } else {
@@ -3198,6 +3224,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                     cache_dir: Some(cache_path.clone()),
                     offline: false,
                     ignore_scripts: false,
+                    silent: true,
                     ..Default::default()
                 };
 
@@ -3217,26 +3244,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                 {
                     target
                 } else {
-                    // Scan .bin folder in npx_env_dir for any executable
-                    let bin_dir = npx_env_dir.join("node_modules").join(".bin");
-                    let mut found = None;
-                    if bin_dir.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_file() {
-                                    found = Some(p);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    found.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Could not determine binary to run for package '{}'",
-                            command
-                        )
-                    })?
+                    package_binary(&npx_env_dir, &pkg_name)?
                 }
             }
         }
@@ -3298,6 +3306,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                 cache_dir: Some(cache_path.clone()),
                 offline: false,
                 ignore_scripts: false,
+                silent: true,
                 ..Default::default()
             };
 
@@ -3337,6 +3346,14 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
             }
         }
     };
+
+    if banner && !is_loglevel_silent(current_dir) {
+        let manifest = Manifest::from_file(current_dir.join("package.json")).unwrap_or_default();
+        let id = manifest.name.map(|name| format!("{name}@{} ", manifest.version.unwrap_or_default())).unwrap_or_default();
+        let bin = binary_to_run.file_stem().unwrap_or_default().to_string_lossy();
+        let suffix = if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) };
+        println!("\n> {id}npx\n> {bin}{suffix}\n");
+    }
 
     // Execute the resolved binary with ancestor bin directories prepended to PATH
     let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(current_dir);
@@ -3570,14 +3587,19 @@ pub(crate) async fn execute_publish(
     registry: Option<String>,
     ignore_scripts: bool,
     json: bool,
+    stage: bool,
 ) -> anyhow::Result<()> {
+    if rnpm_core::semver::Range::parse(&tag).is_ok() {
+        anyhow::bail!("npm error Tag name must not be a valid SemVer range: {tag}");
+    }
+    let raw_target = target.to_string_lossy().to_string();
     let target_path = if target.is_absolute() {
         target
     } else {
         current_dir.join(target)
     };
     // `npm publish <tarball>` publishes the archive as-is and runs no scripts.
-    let tarball_spec = target_path.is_file();
+    let tarball_spec = !target_path.is_dir();
     let package_dir = if tarball_spec {
         current_dir.clone()
     } else {
@@ -3589,7 +3611,7 @@ pub(crate) async fn execute_publish(
     let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
     let (summary, tarball_bytes, manifest_json) = if tarball_spec {
-        let bytes = std::fs::read(&target_path)?;
+        let bytes = commands::pack::fetch_archive(&current_dir, &raw_target, registry.clone()).await?;
         let (summary, manifest_json) = rnpm_fs::summarize_tarball(&bytes).map_err(|e| {
             anyhow::anyhow!("npm error code ENOENT\nnpm error Could not read {}: {e}", target_path.display())
         })?;
@@ -3606,24 +3628,28 @@ pub(crate) async fn execute_publish(
         let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).map_err(|e| {
             anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}")
         })?;
-        if manifest_json.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
-            return Err(anyhow::anyhow!(
-                "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
-            ));
-        }
         let manifest = Manifest::from_file(&manifest_path)?;
-        if manifest.name.is_none() {
-            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field");
-        }
         if manifest.version.is_none() {
-            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field");
+            anyhow::bail!("npm error Cannot read properties of null (reading 'prerelease')");
+        }
+        if let Some(version) = &manifest.version {
+            if rnpm_core::semver::Version::parse(version).is_err() {
+                anyhow::bail!("npm error Invalid version: \"{version}\"");
+            }
+        }
+        if manifest.name.is_none() && !is_silent {
+            eprintln!("npm warn publish npm auto-corrected some errors in your package.json when publishing.  Please run \"npm pkg fix\" to address these errors.\nnpm warn publish errors corrected:\nnpm warn publish Missing \"name\" field was set to an empty string");
         }
         run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
         run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
         run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
-        let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
+        let (mut summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
             .map_err(|e| anyhow::anyhow!("npm error pack failed: {e}"))?;
         let updated = Manifest::from_file(&manifest_path).unwrap_or(manifest);
+        if updated.name.is_none() {
+            summary.name = String::new();
+            summary.filename = format!("-{}.tgz", summary.version);
+        }
         run_lifecycle_hook(&package_dir, &updated, "postpack", ignore_scripts, foreground, is_silent, json)?;
         // Re-read: hooks may have changed package.json (including publishConfig).
         let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -3644,6 +3670,7 @@ pub(crate) async fn execute_publish(
         }
     }
 
+    let mut stage_id: Option<String> = None;
     let pack_json = || {
         serde_json::json!({
             summary.name.clone(): {
@@ -3686,6 +3713,10 @@ pub(crate) async fn execute_publish(
         print_pack_notices(&summary);
     }
 
+    if pkg_name.is_empty() {
+        anyhow::bail!("npm error code EINVALIDTAGNAME\nnpm error Invalid tag name \"@{tag}\" of package \"@{tag}\": Tags may not have any characters that encodeURIComponent encodes.");
+    }
+
     let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
         Url::parse(reg_str).map_err(|e| {
@@ -3712,6 +3743,12 @@ pub(crate) async fn execute_publish(
     };
     if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
         client_config.auth_token = Some(token.to_string());
+    }
+    if let Some(token) = commands::oidc::exchange(&registry_url, &pkg_name).await {
+        let key = commands::logout::auth_key_for_registry(&registry_url);
+        // Exchange credentials are session-only; never write them to the user's npmrc.
+        client_config.auth_tokens.insert(key.trim_end_matches(":_authToken").to_string(), token.clone());
+        client_config.auth_token = Some(token);
     }
     let client = rnpm_registry::RegistryClient::with_config(client_config)?;
     let has_creds = client.auth_header_for_url(&registry_url).is_some();
@@ -3757,14 +3794,18 @@ pub(crate) async fn execute_publish(
     });
     if !is_silent {
         eprintln!(
-            "npm notice Publishing to {registry_url} with tag {tag} and {} access{}",
+            "npm notice {} to {registry_url} with tag {tag} and {} access{}",
+            if stage { "Staging" } else { "Publishing" },
             effective_access.unwrap_or("default"),
             if dry_run { " (dry-run)" } else { "" }
         );
     }
 
     if !dry_run {
-        if provenance {
+        if manifest_json.get("private").is_some_and(|v| v == true) {
+            anyhow::bail!("npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from the package.json to publish it.");
+        }
+        if provenance || config.get_bool("provenance").unwrap_or(false) {
             ensure_provenance_generation()?;
         }
         let mut publish_manifest = manifest_json.clone();
@@ -3792,11 +3833,32 @@ pub(crate) async fn execute_publish(
             shasum: &summary.shasum,
             integrity: &summary.integrity,
         };
+        if tarball_spec && !target_path.is_file() {
+            publish_manifest["_from"] = raw_target.clone().into();
+            publish_manifest["_integrity"] = summary.integrity.clone().into();
+            if raw_target.starts_with("http://") || raw_target.starts_with("https://") {
+                publish_manifest["_resolved"] = raw_target.clone().into();
+            } else {
+                let (_, fetch_client) = make_registry_client(&current_dir, registry.clone())?;
+                let url = fetch_client.registry_for_package(&pkg_name).join(&rnpm_config::encode_package_name(&pkg_name))?;
+                let (response, _permit) = fetch_client.execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None).await?;
+                let metadata: serde_json::Value = response.error_for_status()?.json().await?;
+                if let Some(source) = metadata["versions"].get(&pkg_version) {
+                    let node_version = publish_manifest["_nodeVersion"].clone();
+                    publish_manifest = source.clone();
+                    publish_manifest["_nodeVersion"] = node_version;
+                    publish_manifest["_npmVersion"] = version::NPM_VERSION.into();
+                    publish_manifest["_from"] = raw_target.clone().into();
+                    publish_manifest["_integrity"] = summary.integrity.clone().into();
+                    publish_manifest["_resolved"] = source["dist"]["tarball"].clone();
+                }
+            }
+        }
         let payload_opts = rnpm_registry::PublishPayloadOptions {
             name: &pkg_name,
             version: &pkg_version,
             description: manifest_json.get("description").and_then(|d| d.as_str()),
-            tag: &tag,
+            tag: if std::env::args().any(|a| a == "--tag" || a.starts_with("--tag=")) { &tag } else { manifest_json.get("publishConfig").and_then(|c| c.get("tag")).and_then(|t| t.as_str()).unwrap_or(&tag) },
             access: effective_access,
             manifest: &publish_manifest,
             tarball: tarball_data,
@@ -3805,54 +3867,28 @@ pub(crate) async fn execute_publish(
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url
-            .join(&rnpm_config::encode_package_name(&pkg_name))
+            .join(&if stage { format!("-/stage/package/{}", rnpm_config::encode_package_name(&pkg_name)) } else { rnpm_config::encode_package_name(&pkg_name) })
             .unwrap_or_else(|_| registry_url.clone());
-        let mut otp = otp;
-        let mut may_prompt = true;
-        loop {
-            let result = client
-                .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
-                .await
-                .map_err(|err| {
-                    use rnpm_registry::RegistryError as E;
-                    let status_error = |status: u16, www: Option<&str>, body: &str| {
-                        commands::client_helper::format_http_error_with_auth(
-                            "PUT",
-                            &put_url,
-                            reqwest::StatusCode::from_u16(status)
-                                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                            www,
-                            body,
-                        )
-                    };
-                    match err {
-                        E::Forbidden { status, message, .. }
-                        | E::Unauthorized { status, message, .. }
-                        | E::PublishConflict { status, message, .. } => status_error(status, None, &message),
-                        E::AuthChallenge { www_authenticate, body, .. } => {
-                            status_error(401, Some(&www_authenticate), &body)
-                        }
-                        E::ServerError { status, body } => status_error(status, None, &body),
-                        other => anyhow::anyhow!(other),
-                    }
-                });
-            match result {
-                // npm's otplease: on a terminal, prompt for the code and retry once.
-                Err(err) if may_prompt && http_errors::is_otp_error(&err) => {
-                    may_prompt = false;
-                    match http_errors::prompt_otp() {
-                        Some(code) => otp = Some(code),
-                        None => return Err(err),
-                    }
-                }
-                other => break other?,
-            }
+        if stage {
+            let command_client = commands::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
+            let response = command_client.request(reqwest::Method::POST, put_url.clone(), None).json(&payload).send().await?;
+            let status = response.status();
+            let text = response.text().await?;
+            if !status.is_success() { return Err(commands::client_helper::format_http_error("POST", &put_url, status, &text)); }
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            stage_id = value["stageId"].as_str().map(str::to_string);
+        } else {
+            commands::client_helper::with_registry_otp(&current_dir, "PUT", otp, async |code| {
+                client.publish_to(&registry_url, &pkg_name, &payload, code.as_deref()).await
+            }).await?;
         }
     }
 
     // JSON is only printed once the publish has completed.
     if json {
-        println!("{}", serde_json::to_string_pretty(&pack_json())?);
+        let mut details = pack_json();
+        if let Some(id) = &stage_id { details[&pkg_name]["stageId"] = id.clone().into(); }
+        println!("{}", serde_json::to_string_pretty(&details)?);
     }
 
     // `publish` and `postpublish` run only after a successful upload, and
@@ -3864,7 +3900,11 @@ pub(crate) async fn execute_publish(
     }
 
     if !json && !is_silent {
-        println!("+ {pkg_name}@{pkg_version}");
+        if stage {
+            let suffix = stage_id.map(|id| format!(" with id {id}")).unwrap_or_default();
+            println!("+ {pkg_name}@{pkg_version} (staged{suffix})");
+            eprintln!("npm notice stage package {pkg_name}@{pkg_version} has been staged with tag {tag}");
+        } else { println!("+ {pkg_name}@{pkg_version}"); }
     }
     Ok(())
 }
@@ -3958,43 +3998,94 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 
-fn print_fixed_summary(
-    fixed_vulns: usize,
-    fixed_counts: &audit::VulnerabilitiesCount,
-    pkg_count: usize,
-) {
-    let mut parts = Vec::new();
-    if fixed_counts.critical > 0 {
-        parts.push(format!("{} critical", fixed_counts.critical));
+/// Safely updates dependency versions in package.json preserving formatting, indentation,
+/// line endings (CRLF vs LF), and restricting edits exclusively to valid dependency sections.
+pub(crate) fn update_manifest_dependencies(
+    content: &str,
+    updates: &[(String, String)],
+) -> String {
+    if updates.is_empty() {
+        return content.to_string();
     }
-    if fixed_counts.high > 0 {
-        parts.push(format!("{} high", fixed_counts.high));
-    }
-    if fixed_counts.moderate > 0 {
-        parts.push(format!("{} moderate", fixed_counts.moderate));
-    }
-    if fixed_counts.low > 0 {
-        parts.push(format!("{} low", fixed_counts.low));
-    }
-    if fixed_counts.info > 0 {
-        parts.push(format!("{} info", fixed_counts.info));
-    }
-    let details = if parts.is_empty() {
-        String::new()
+    let has_crlf = content.contains("\r\n");
+    let lines: Vec<&str> = if has_crlf {
+        content.split("\r\n").collect()
     } else {
-        format!(" ({})", parts.join(", "))
+        content.split('\n').collect()
     };
-    let vuln_word = if fixed_vulns == 1 {
-        "vulnerability"
-    } else {
-        "vulnerabilities"
-    };
-    let pkg_word = if pkg_count == 1 {
-        "package"
-    } else {
-        "packages"
-    };
-    println!("fixed {fixed_vulns} {vuln_word}{details} in {pkg_count} {pkg_word}");
+
+    let mut in_dep_section = false;
+    let mut brace_depth = 0;
+    let mut updated_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    let dep_keys = [
+        "\"dependencies\"",
+        "\"devDependencies\"",
+        "\"optionalDependencies\"",
+        "\"peerDependencies\"",
+    ];
+
+    for line in lines {
+        let trimmed = line.trim();
+
+        if !in_dep_section {
+            if dep_keys.iter().any(|k| trimmed.starts_with(k)) {
+                in_dep_section = true;
+                let opens = line.chars().filter(|&c| c == '{').count();
+                let closes = line.chars().filter(|&c| c == '}').count();
+                brace_depth = opens.saturating_sub(closes);
+                if brace_depth == 0 && opens > 0 {
+                    in_dep_section = false;
+                }
+                updated_lines.push(line.to_string());
+                continue;
+            }
+            updated_lines.push(line.to_string());
+        } else {
+            let opens = line.chars().filter(|&c| c == '{').count();
+            let closes = line.chars().filter(|&c| c == '}').count();
+            brace_depth += opens;
+            brace_depth = brace_depth.saturating_sub(closes);
+
+            let mut modified_line = line.to_string();
+            for (pkg_name, new_range) in updates {
+                let key_str = format!("\"{pkg_name}\"");
+                if let Some(pos) = modified_line.find(&key_str) {
+                    if let Some(colon_pos) = modified_line[pos..].find(':') {
+                        let actual_colon = pos + colon_pos;
+                        if let Some(first_quote) = modified_line[actual_colon..].find('"') {
+                            let val_start = actual_colon + first_quote + 1;
+                            if let Some(second_quote) = modified_line[val_start..].find('"') {
+                                let val_end = val_start + second_quote;
+                                let mut new_l = modified_line[..val_start].to_string();
+                                new_l.push_str(new_range);
+                                new_l.push_str(&modified_line[val_end..]);
+                                modified_line = new_l;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if brace_depth == 0 {
+                in_dep_section = false;
+            }
+            updated_lines.push(modified_line);
+        }
+    }
+
+    let joiner = if has_crlf { "\r\n" } else { "\n" };
+    updated_lines.join(joiner)
+}
+
+/// The package name an `audit fix` target names (`a@1`, `node_modules/x/node_modules/a@1`).
+fn audit_fix_target_name(target: &str) -> String {
+    let spec = target.rsplit("node_modules/").next().unwrap_or(target);
+    match spec.get(1..).and_then(|rest| rest.find('@')) {
+        Some(at) => spec[..at + 1].to_string(),
+        None => spec.to_string(),
+    }
 }
 
 async fn run_audit_fix(
@@ -4020,18 +4111,57 @@ async fn run_audit_fix(
         ));
     }
 
-    if force {
-        eprintln!("npm warn audit --force installing breaking changes if necessary");
-    }
-
     // Run initial audit scan to retrieve list of vulnerability advisories
     let (initial_report, _, advisories) =
         audit::build_audit_report_with_advisories(project_dir, registry.clone()).await?;
     let initial_vulns = initial_report.metadata.vulnerabilities.total;
+    if force {
+        // arborist's fixVulnerabilities, for each fix outside the declared range.
+        let mut warned = std::collections::BTreeSet::new();
+        for vuln in initial_report.vulnerabilities.values() {
+            let fix = &vuln.fix_available;
+            if let (Some(name), Some(version)) = (fix["name"].as_str(), fix["version"].as_str()) {
+                if warned.insert(name.to_string()) {
+                    let breaking = if fix["isSemVerMajor"] == serde_json::Value::Bool(true) {
+                        "a SemVer major change"
+                    } else {
+                        "outside your stated dependency range"
+                    };
+                    eprintln!("npm warn audit Updating {name} to {version}, which is {breaking}.");
+                }
+            }
+        }
+    }
 
+    let started = std::time::Instant::now();
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     if initial_vulns == 0 {
-        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
+        let (post_report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        let tree = reify_output::snapshot(project_dir);
+        let inventory = tree.keys().filter(|k| !k.is_empty()).count() + 1;
+        let report = rnpm_install::ReifyReport {
+            changes: Vec::new(),
+            inventory,
+        };
+        let fund = config.get_bool("fund").unwrap_or(true);
+        let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+        opts.audit_command = true;
+        let funding = if fund && !dry_run {
+            audit::count_funding_packages(project_dir)
+        } else {
+            0
+        };
+        if !opts.silent {
+            reify_output::print(
+                project_dir,
+                &report,
+                Some(&post_report),
+                funding,
+                &opts,
+                started.elapsed(),
+            )?;
+        }
+        return audit::check_report_threshold(&post_report, audit_level);
     }
 
     // Parse package.json to identify declared dependency ranges
@@ -4172,89 +4302,44 @@ async fn run_audit_fix(
         }
     }
 
-    let mut fixed_counts = audit::VulnerabilitiesCount::default();
-    for (pkg_name, (target_ver, _old_ver)) in &packages_to_upgrade {
-        let mut highest_sev: Option<audit::Severity> = None;
-        if let Some(advs) = advs_by_pkg.get(pkg_name) {
-            for adv in advs {
-                let is_still_vuln = match rnpm_core::semver::Range::parse(&adv.vulnerable_versions)
-                {
-                    Ok(r) => r.satisfies(target_ver),
-                    Err(_) => false,
-                };
-                if !is_still_vuln {
-                    highest_sev = match highest_sev {
-                        Some(cur) => Some(cur.max(adv.severity)),
-                        None => Some(adv.severity),
-                    };
-                }
-            }
-        }
-        if let Some(sev) = highest_sev {
-            match sev {
-                audit::Severity::Info => fixed_counts.info += 1,
-                audit::Severity::Low => fixed_counts.low += 1,
-                audit::Severity::Moderate => fixed_counts.moderate += 1,
-                audit::Severity::High => fixed_counts.high += 1,
-                audit::Severity::Critical => fixed_counts.critical += 1,
-            }
-            fixed_counts.total += 1;
-        }
-    }
-
-    if targets_to_update.is_empty() {
-        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
-    }
-
-    if dry_run {
-        for (pkg_name, (target_ver, old_ver)) in &packages_to_upgrade {
-            println!("would update {pkg_name} from {old_ver} to {target_ver}");
-        }
-        print_fixed_summary(fixed_counts.total, &fixed_counts, packages_to_upgrade.len());
-        return Ok(());
-    }
-
-    // 1. If --force updated declared ranges, update package.json PRESERVING key order and formatting!
-    if !manifest_updates.is_empty() {
-        let content = std::fs::read_to_string(&manifest_path)?;
-        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-        for (pkg_name, new_range) in &manifest_updates {
-            let key_str = format!("\"{pkg_name}\"");
-            for line in lines.iter_mut() {
-                if let Some(pos) = line.find(&key_str) {
-                    if let Some(colon_pos) = line[pos..].find(':') {
-                        let actual_colon = pos + colon_pos;
-                        if let Some(first_quote) = line[actual_colon..].find('"') {
-                            let val_start = actual_colon + first_quote + 1;
-                            if let Some(second_quote) = line[val_start..].find('"') {
-                                let val_end = val_start + second_quote;
-                                let mut new_line = line[..val_start].to_string();
-                                new_line.push_str(new_range);
-                                new_line.push_str(&line[val_end..]);
-                                *line = new_line;
-                                break;
+    // Under --force, bump top-level dependents as Arborist's fixVulnerabilities does.
+    if force {
+        let mut top_force_fixes: BTreeMap<String, rnpm_core::semver::Version> = BTreeMap::new();
+        for vuln in initial_report.vulnerabilities.values() {
+            let fix = &vuln.fix_available;
+            if let (Some(fix_name), Some(fix_version)) = (fix["name"].as_str(), fix["version"].as_str()) {
+                if let Ok(ver) = rnpm_core::semver::Version::parse(fix_version) {
+                    top_force_fixes
+                        .entry(fix_name.to_string())
+                        .and_modify(|existing| {
+                            if ver > *existing {
+                                *existing = ver.clone();
                             }
-                        }
-                    }
+                        })
+                        .or_insert(ver);
                 }
             }
         }
-        let mut new_content = lines.join("\n");
-        if content.ends_with('\n') {
-            new_content.push('\n');
+        for (fix_name, fix_ver) in top_force_fixes {
+            let new_range = format!("^{fix_ver}");
+            if !manifest_updates.iter().any(|(n, _)| n == &fix_name) {
+                manifest_updates.push((fix_name.clone(), new_range.clone()));
+            }
+            let target_spec = format!("{fix_name}@{new_range}");
+            if !targets_to_update.contains(&target_spec) {
+                targets_to_update.push(target_spec);
+            }
         }
-        std::fs::write(&manifest_path, new_content)?;
     }
 
     // 2. Perform real package resolution, tarball extraction, and lockfile updates via Installer!
-    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
         registry_url: registry.clone(),
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
         strict_sandbox: config.get_bool("strict-sandbox").unwrap_or(false),
+        dry_run,
         ..Default::default()
     };
 
@@ -4273,31 +4358,71 @@ async fn run_audit_fix(
         }
     }
 
+    let mut options = options;
+    if !manifest_updates.is_empty() {
+        options.packages = manifest_updates
+            .iter()
+            .map(|(n, r)| format!("{n}@{r}"))
+            .collect();
+        options.skip_manifest_save = true;
+    }
+    options.unlocked_packages = targets_to_update
+        .iter()
+        .map(|t| audit_fix_target_name(t))
+        .chain(vulnerability_constraints.keys().cloned())
+        // arborist re-resolves every vulnerable node, including the
+        // dependents that are vulnerable only through a dependency.
+        .chain(initial_report.vulnerabilities.keys().cloned())
+        .collect();
+    options.vulnerability_constraints = vulnerability_constraints;
     let mut installer = Installer::new(options)?;
-    let _update_summary = installer
-        .update_with_constraints(&targets_to_update, &vulnerability_constraints)
-        .await?;
+    let summary = installer.install().await?;
+    let _ = packages_needing_force;
 
-    // 3. Re-run audit to count actual remaining vs fixed vulnerabilities
-    let (post_report, _, _) = audit::build_audit_report_with_advisories(project_dir, registry)
-        .await
-        .unwrap_or((initial_report.clone(), None, Vec::new()));
-    let remaining_vulns = post_report.metadata.vulnerabilities.total;
-    let actual_fixed = initial_vulns.saturating_sub(remaining_vulns);
-
-    if actual_fixed > 0 {
-        print_fixed_summary(actual_fixed, &fixed_counts, packages_to_upgrade.len());
+    // Safely update package.json only after a successful install!
+    if !manifest_updates.is_empty() && !dry_run {
+        let content = std::fs::read_to_string(&manifest_path)?;
+        let new_content = update_manifest_dependencies(&content, &manifest_updates);
+        std::fs::write(&manifest_path, new_content)?;
     }
 
-    if remaining_vulns > 0 {
-        audit::print_concise_audit_summary(&post_report);
-        if !force && packages_needing_force > 0 {
-            eprintln!("npm warn audit Semver-major updates or breaking changes require `rnpm audit fix --force`");
+    // npm reifies, then prints the detailed audit report of the new tree.
+    let report = summary.reify.unwrap_or_default();
+    let post_report = if dry_run {
+        // A dry run audits the old tree; nodes the plan replaces are detached
+        // from it, so npm prints them with an empty location.
+        let mut post = initial_report;
+        let replaced: std::collections::HashSet<&str> = report
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                rnpm_install::ReifyChange::Change { from, .. } | rnpm_install::ReifyChange::Remove(from) => {
+                    Some(from.location.as_str())
+                }
+                rnpm_install::ReifyChange::Add(_) => None,
+            })
+            .collect();
+        for vuln in post.vulnerabilities.values_mut() {
+            for node in &mut vuln.nodes {
+                if replaced.contains(node.as_str()) {
+                    node.clear();
+                }
+            }
         }
+        post
     } else {
-        println!("found 0 vulnerabilities");
+        audit::build_audit_report(project_dir, registry)
+            .await
+            .map(|(r, _)| r)
+            .unwrap_or(initial_report)
+    };
+    let fund = config.get_bool("fund").unwrap_or(true);
+    let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+    opts.audit_command = true;
+    let funding = if fund && !dry_run { audit::count_funding_packages(project_dir) } else { 0 };
+    if !opts.silent {
+        reify_output::print(project_dir, &report, Some(&post_report), funding, &opts, started.elapsed())?;
     }
-
     audit::check_report_threshold(&post_report, audit_level)
 }
 
@@ -4326,18 +4451,16 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
     }
 }
 
+/// npm's elapsed format: the `ms` package's short form (rounded units).
 pub(crate) fn format_duration(d: std::time::Duration) -> String {
-    let millis = d.as_millis();
-    if millis < 1000 {
-        format!("{millis}ms")
-    } else {
-        let secs = d.as_secs_f64();
-        if (secs * 10.0).round() % 10.0 == 0.0 {
-            format!("{:.0}s", secs)
-        } else {
-            format!("{:.1}s", secs)
+    let ms = d.as_millis() as f64;
+    let units = [(86_400_000.0, "d"), (3_600_000.0, "h"), (60_000.0, "m"), (1_000.0, "s")];
+    for (size, suffix) in units {
+        if ms >= size {
+            return format!("{}{suffix}", (ms / size).round());
         }
     }
+    format!("{ms}ms")
 }
 
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
@@ -4553,7 +4676,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let summary = installer.run().await?;
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(report) = summary.reify.as_ref() {
+                let audit_report = if audit_val && !dry_run {
+                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                } else {
+                    None
+                };
+                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
+                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                out.silent |= silent;
+                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": summary.packages_installed,
@@ -4583,7 +4716,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         let count = audit::count_funding_packages(&current_dir);
                         if count > 0 {
                             println!(
-                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                "\n{} packages are looking for funding\n  run `npm fund` for details",
                                 count
                             );
                         }
@@ -4726,7 +4859,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let summary = installer.run_ci().await?;
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(report) = summary.reify.as_ref() {
+                let audit_report = if audit_val && !dry_run {
+                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                } else {
+                    None
+                };
+                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
+                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                out.silent |= silent;
+                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": summary.packages_installed,
@@ -4756,7 +4899,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         let count = audit::count_funding_packages(&current_dir);
                         if count > 0 {
                             println!(
-                                "\n{} packages are looking for funding\n  run `rnpm fund`",
+                                "\n{} packages are looking for funding\n  run `npm fund` for details",
                                 count
                             );
                         }
@@ -4943,6 +5086,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     );
                     ctx.package_version = manifest.version;
                     ctx.extra_env = lifecycle_config_env(&target_dir);
+                    ctx.extra_env.insert("npm_command".into(), "exec".into());
                     // `exec --package=x -c cmd`: install the packages into an
                     // npx environment and put its bins first on PATH.
                     if !packages.is_empty() {
@@ -4990,6 +5134,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         registry.clone(),
                         cache.clone(),
                         offline,
+                        false,
                     )
                     .await?;
                 }
@@ -5063,6 +5208,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 current_dir
             };
+            let before = (!is_global).then(|| reify_output::snapshot(&target_dir));
+            let report_dir = target_dir.clone();
             let options = InstallOptions {
                 project_dir: target_dir,
                 is_global,
@@ -5092,7 +5239,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let total_removed = all_removed.len();
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(before) = before {
+                let report = reify_output::report_between(&before, &reify_output::snapshot(&report_dir));
+                reify_output::finish(&report_dir, &report, json, false, silent, start_time.elapsed()).await?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": 0,

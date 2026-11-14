@@ -3894,3 +3894,52 @@ process.exit(0);
         panic!("Expected ScriptExitError with exit code 7, got: {:?}", exit_err);
     }
 }
+
+#[test]
+fn test_update_manifest_dependencies_scoping_and_formatting() {
+    let manifest = r#"{
+  "name": "my-project",
+  "version": "1.0.0",
+  "scripts": {
+    "dep": "node -e 'process.exit(0)'",
+    "test": "run-test"
+  },
+  "dependencies": {
+    "dep": "^1.0.0",
+    "other": "1.2.3"
+  },
+  "devDependencies": {
+    "dev-dep": "~0.5.0"
+  }
+}
+"#;
+
+    let updates = vec![
+        ("dep".to_string(), "^2.0.0".to_string()),
+        ("dev-dep".to_string(), "^1.0.0".to_string()),
+    ];
+
+    let result = update_manifest_dependencies(manifest, &updates);
+    assert!(result.contains("\"dep\": \"node -e 'process.exit(0)'\""), "Scripts section must NOT be touched");
+    assert!(result.contains("\"dep\": \"^2.0.0\""), "dependencies section must be updated");
+    assert!(result.contains("\"dev-dep\": \"^1.0.0\""), "devDependencies section must be updated");
+    assert!(result.contains("\"other\": \"1.2.3\""), "Unmodified dependencies must be preserved");
+
+    // Test CRLF preservation
+    let crlf_manifest = "{\r\n  \"dependencies\": {\r\n    \"dep\": \"^1.0.0\"\r\n  }\r\n}\r\n";
+    let crlf_result = update_manifest_dependencies(crlf_manifest, &[("dep".to_string(), "^2.0.0".to_string())]);
+    assert!(crlf_result.contains("\r\n"), "CRLF line endings must be preserved");
+    assert!(crlf_result.contains("\"dep\": \"^2.0.0\""));
+}
+
+#[test]
+fn test_owner_action_list_alias() {
+    let cli = Cli::try_parse_from(["rnpm", "owner", "list", "my-pkg"]).unwrap();
+    match cli.command {
+        Commands::Owner { action, .. } => match action {
+            OwnerAction::Ls { package } => assert_eq!(package, Some("my-pkg".to_string())),
+            _ => panic!("Expected OwnerAction::Ls via 'list' alias"),
+        },
+        _ => panic!("Expected Commands::Owner"),
+    }
+}
