@@ -728,3 +728,10 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
         assert_eq!(fs::read(bin_dir.join(name)).unwrap(), expected, "{name}");
     }
 }
+
+#[test]
+fn test_direct_ps1_shim_escapes_powershell_specials() {
+    let (_, _, ps1) = generate_direct_shims("pkg/bin/$tool`x.exe");
+    assert!(ps1.contains("& \"$basedir/../pkg/bin/`$tool``x.exe\"   $args"), "{ps1}");
+    assert!(!ps1.contains("\$tool"));
+}

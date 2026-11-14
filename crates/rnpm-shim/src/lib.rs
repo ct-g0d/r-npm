@@ -254,6 +254,7 @@ fn target_has_shebang(target: &Path) -> bool {
 /// Shim trio (sh, cmd, ps1) for a target without a shebang, as cmd-shim writes it.
 pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, String, String) {
     let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
+    let ps1_target = format!("\"$basedir/../{}\"", escape_ps1_path(target_rel_from_node_modules));
     let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
     let sh = [
         "#!/bin/sh\n",
@@ -282,9 +283,9 @@ pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, Str
         "}\n",
         "# Support pipeline input\n",
         "if ($MyInvocation.ExpectingInput) {\n",
-        &format!("  $input | & {sh_target}   $args\n"),
+        &format!("  $input | & {ps1_target}   $args\n"),
         "} else {\n",
-        &format!("  & {sh_target}   $args\n"),
+        &format!("  & {ps1_target}   $args\n"),
         "}\n",
         "exit $LASTEXITCODE\n",
     ]
