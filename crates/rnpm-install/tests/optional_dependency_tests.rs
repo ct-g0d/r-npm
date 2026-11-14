@@ -165,7 +165,7 @@ async fn ci_omit_dev_fixture() -> tempfile::TempDir {
         let name = request.trim_start_matches('/').trim_end_matches(".tgz");
         served.get(name).map(|bytes| (200, vec![("Content-Type", "application/octet-stream".into())], bytes.clone()))
     }).await;
-    let parsed = rnpm_core::manifest::Manifest::from_file(&project.path().join("package.json")).unwrap();
+    let parsed = rnpm_core::manifest::Manifest::from_file(project.path().join("package.json")).unwrap();
     let mut lock = LockfileV3::from_manifest(&parsed);
     for (name, bytes) in archives {
         let mut entry = LockfilePackage {
