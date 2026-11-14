@@ -439,171 +439,20 @@ fn archive_summary(bytes: &[u8]) -> Result<rnpm_fs::PackSummary> {
 }
 
 async fn publish(args: &[String], registry: &str, json: bool, current_dir: &Path) -> Result<()> {
-    use rnpm_core::manifest::Manifest;
     let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
-    let package_dir = current_dir.join(args.first().map(String::as_str).unwrap_or("."));
-    let manifest = Manifest::from_file(package_dir.join("package.json"))?;
-    let ignore = config.get_bool("ignore-scripts").unwrap_or(false);
-    let foreground = config.get_bool("foreground-scripts").unwrap_or(true);
-    let silent = config.get("loglevel") == Some("silent");
-    let dry_run = config.get_bool("dry-run").unwrap_or(false);
-    for event in ["prepublishOnly", "prepack", "prepare"] {
-        crate::run_lifecycle_hook(
-            &package_dir,
-            &manifest,
-            event,
-            ignore,
-            foreground,
-            silent,
-            json,
-        )?;
-    }
-    let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)?;
-    crate::run_lifecycle_hook(
-        &package_dir,
-        &manifest,
-        "postpack",
-        ignore,
-        foreground,
-        silent,
+    crate::execute_publish(
+        current_dir.to_path_buf(),
+        args.first().map(std::path::PathBuf::from).unwrap_or_else(|| ".".into()),
+        config.get("tag").unwrap_or("latest").to_string(),
+        config.get("access").map(str::to_string),
+        config.get_bool("dry-run").unwrap_or(false),
+        None,
+        config.get_bool("provenance").unwrap_or(false),
+        Some(registry.to_string()),
+        config.get_bool("ignore-scripts").unwrap_or(false),
         json,
-    )?;
-    let mut manifest = crate::package_manifest_value(&package_dir)?;
-    let client = super::client_helper::CommandClient::new(current_dir, Some(registry))?;
-    let registry = &client.registry_url;
-    let tag = config
-        .get("tag")
-        .or_else(|| manifest.get("publishConfig")?.get("tag")?.as_str())
-        .unwrap_or("latest")
-        .to_string();
-    let access_value = config
-        .get("access")
-        .or_else(|| manifest.get("publishConfig")?.get("access")?.as_str())
-        .map(str::to_string);
-    let access = access_value.as_deref();
-    if !json && !silent {
-        crate::print_pack_notices(&summary);
-    }
-    if client.auth.is_none() {
-        if !dry_run {
-            anyhow::bail!("npm error code ENEEDAUTH\nnpm error This command requires you to be logged in to {registry}");
-        }
-        if !silent {
-            eprintln!(
-                "npm warn stage This command requires you to be logged in to {registry} (dry-run)"
-            );
-        }
-    }
-    if !silent {
-        eprintln!(
-            "npm notice Staging to {registry} with tag {tag} and {} access{}",
-            access.unwrap_or("default"),
-            if dry_run { " (dry-run)" } else { "" }
-        );
-    }
-    let mut details = summary_json(&summary);
-    let mut stage_id = None;
-    if !dry_run {
-        if manifest.get("readme").is_none() {
-            let readme = std::fs::read_dir(&package_dir)?
-                .flatten()
-                .find(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case("readme.md")
-                })
-                .and_then(|e| std::fs::read_to_string(e.path()).ok())
-                .unwrap_or_else(|| "ERROR: No README data found!".into());
-            manifest["readme"] = readme.into();
-        }
-        let node = std::process::Command::new("node")
-            .arg("--version")
-            .output()?;
-        manifest["_nodeVersion"] = String::from_utf8_lossy(&node.stdout)
-            .trim()
-            .trim_start_matches('v')
-            .into();
-        manifest["_npmVersion"] = crate::version::NPM_VERSION.into();
-        let options = rnpm_registry::PublishPayloadOptions {
-            name: &summary.name,
-            version: &summary.version,
-            description: manifest.get("description").and_then(Value::as_str),
-            tag: &tag,
-            access,
-            manifest: &manifest,
-            tarball: rnpm_registry::PublishTarballData {
-                filename: &summary.filename,
-                bytes: &bytes,
-                shasum: &summary.shasum,
-                integrity: &summary.integrity,
-            },
-            registry_url: registry,
-            provenance_attestation: None,
-        };
-        let mut payload = rnpm_registry::create_publish_payload(&options);
-        if manifest.get("description").is_none() {
-            payload.as_object_mut().unwrap().remove("description");
-        }
-        payload["access"] = access.map(Value::from).unwrap_or(Value::Null);
-        if let Some(attachments) = payload["_attachments"].as_object_mut() {
-            for attachment in attachments.values_mut() {
-                attachment.as_object_mut().unwrap().remove("shasum");
-                attachment.as_object_mut().unwrap().remove("integrity");
-            }
-        }
-        let target = registry.join(&format!(
-            "-/stage/package/{}",
-            rnpm_config::encode_package_name(&summary.name)
-        ))?;
-        let response = client
-            .request(reqwest::Method::POST, target, None)
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        stage_id = response
-            .get("stageId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if let Some(id) = &stage_id {
-            details["stageId"] = id.clone().into();
-        }
-    }
-    if json {
-        println!(
-            "{}",
-            pretty(&serde_json::json!({summary.name.clone():details}))?
-        );
-    }
-    let updated = Manifest::from_file(package_dir.join("package.json"))?;
-    for event in ["publish", "postpublish"] {
-        crate::run_lifecycle_hook(
-            &package_dir,
-            &updated,
-            event,
-            ignore,
-            foreground,
-            silent,
-            json,
-        )?;
-    }
-    if !json && !silent {
-        println!(
-            "+ {}@{} (staged{})",
-            summary.name,
-            summary.version,
-            stage_id
-                .map(|id| format!(" with id {id}"))
-                .unwrap_or_default()
-        );
-        eprintln!(
-            "npm notice stage package {}@{} has been staged with tag {tag}",
-            summary.name, summary.version
-        );
-    }
-    Ok(())
+        true,
+    ).await
 }
 
 /// Splits `name@spec` like npm-package-arg; a bare name has raw spec `*`.

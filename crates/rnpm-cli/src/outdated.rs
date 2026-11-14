@@ -195,6 +195,10 @@ pub async fn run_outdated_inner(
         }
         let disk = crate::inspect_tree::scan_disk_packages(project_dir);
         for member in members {
+            // loadActual only exposes workspace edges through installed links.
+            if !project_dir.join("node_modules").join(&member.name).is_dir() {
+                continue;
+            }
             let member_path = member.path;
             let member_loc = member_path
                 .strip_prefix(project_dir)
@@ -440,7 +444,12 @@ pub async fn run_outdated_inner(
         let json_val = ordered_json(&outdated_packages, options.long);
         format!("{}\n", serde_json::to_string_pretty(&json_val)?)
     } else if options.parseable {
-        let lines = format_parseable(&outdated_packages);
+        let mut lines = format_parseable(&outdated_packages);
+        if options.long {
+            for (line, pkg) in lines.iter_mut().zip(&outdated_packages) {
+                line.push_str(&format!(":{}:{}:{}", pkg.package_type, pkg.homepage.as_deref().unwrap_or(""), pkg.dependent_location));
+            }
+        }
         format!("{}\n", lines.join("\n"))
     } else if options.long {
         for pkg in &mut outdated_packages {
@@ -625,8 +634,9 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
         "Depended by",
         "Package Type",
         "Homepage",
+        "Depended By Location",
     ];
-    let is_right_aligned = [false, true, true, true, false, false, false, false];
+    let is_right_aligned = [false, true, true, true, false, false, false, false, false];
 
     let mut col_widths = [
         headers[0].len(),
@@ -637,6 +647,7 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
         headers[5].len(),
         headers[6].len(),
         headers[7].len(),
+        headers[8].len(),
     ];
 
     for pkg in packages {
@@ -653,6 +664,7 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
         col_widths[5] = col_widths[5].max(pkg.dependent.len());
         col_widths[6] = col_widths[6].max(pkg.package_type.len());
         col_widths[7] = col_widths[7].max(pkg.homepage.as_deref().unwrap_or("").len());
+        col_widths[8] = col_widths[8].max(pkg.dependent_location.len());
     }
 
     let mut lines = Vec::new();
@@ -691,6 +703,7 @@ pub fn format_long(packages: &[OutdatedPackage]) -> String {
             pkg.dependent.as_str(),
             pkg.package_type.as_str(),
             hp_str,
+            pkg.dependent_location.as_str(),
         ];
 
         let row_line = cols

@@ -2431,6 +2431,7 @@ fn preprocess_exec_args(
 
         if token == "-y" || token == "--yes" {
             clap_flags.push(token.clone());
+            overrides.insert("yes".into(), "true".into());
             i += 1;
             continue;
         }
@@ -2572,14 +2573,14 @@ fn preprocess_init_args(
         let token = &tokens[i];
         let next_token = tokens.get(i + 1).map(|s| s.as_str());
 
-        if initializer.is_some() {
-            forwarded_args.push(token.clone());
-            i += 1;
-            continue;
+        if token == "--" {
+            forwarded_args.extend_from_slice(&tokens[i + 1..]);
+            break;
         }
 
         if token == "-y" || token == "--yes" || token == "-f" || token == "--force" {
             clap_flags.push(token.clone());
+            overrides.insert("yes".into(), "true".into());
             i += 1;
             continue;
         }
@@ -2608,7 +2609,11 @@ fn preprocess_init_args(
             }
         }
 
-        initializer = Some(token.clone());
+        if initializer.is_some() {
+            forwarded_args.push(token.clone());
+        } else {
+            initializer = Some(token.clone());
+        }
         i += 1;
     }
 
@@ -3053,7 +3058,10 @@ pub(crate) async fn ensure_npx_environment(
     cache: Option<PathBuf>,
     offline: bool,
 ) -> anyhow::Result<PathBuf> {
-    let cache_path = cache.unwrap_or_else(|| {
+    let cache_path = cache.or_else(|| {
+        let dir = std::env::current_dir().ok()?;
+        rnpm_config::Config::load(Some(&dir)).ok()?.get("cache").map(PathBuf::from)
+    }).unwrap_or_else(|| {
         std::env::var_os("LOCALAPPDATA")
             .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
             .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
@@ -3091,6 +3099,19 @@ pub(crate) async fn ensure_npx_environment(
     Ok(env_dir)
 }
 
+fn package_binary(env_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(env_dir.join("node_modules").join(name).join("package.json"))?)?;
+    let unscoped = name.rsplit('/').next().unwrap_or(name);
+    let selected = manifest["bin"].as_object().and_then(|bins| {
+        if bins.contains_key(unscoped) { Some(unscoped.to_string()) }
+        else if bins.values().next().is_some_and(|first| bins.values().all(|v| v == first)) { bins.keys().next().cloned() }
+        else { None }
+    }).or_else(|| manifest["bin"].as_str().map(|_| unscoped.to_string()));
+    selected.and_then(|bin| rnpm_lifecycle::find_local_binary(env_dir, &bin))
+        .ok_or_else(|| anyhow::anyhow!("npm error could not determine executable to run"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_exec(
     current_dir: &std::path::Path,
     command: &str,
@@ -3099,6 +3120,7 @@ pub(crate) async fn execute_exec(
     registry: Option<String>,
     cache: Option<PathBuf>,
     offline: bool,
+    banner: bool,
 ) -> anyhow::Result<()> {
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
@@ -3110,7 +3132,9 @@ pub(crate) async fn execute_exec(
         &cmd_pkg_name
     };
 
-    let cache_path = cache.clone().unwrap_or_else(|| {
+    let cache_path = cache.clone().or_else(|| {
+        rnpm_config::Config::load(Some(current_dir)).ok()?.get("cache").map(PathBuf::from)
+    }).unwrap_or_else(|| {
         if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
             PathBuf::from(appdata).join("rnpm").join("cache")
         } else {
@@ -3198,6 +3222,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                     cache_dir: Some(cache_path.clone()),
                     offline: false,
                     ignore_scripts: false,
+                    silent: true,
                     ..Default::default()
                 };
 
@@ -3217,26 +3242,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                 {
                     target
                 } else {
-                    // Scan .bin folder in npx_env_dir for any executable
-                    let bin_dir = npx_env_dir.join("node_modules").join(".bin");
-                    let mut found = None;
-                    if bin_dir.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_file() {
-                                    found = Some(p);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    found.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Could not determine binary to run for package '{}'",
-                            command
-                        )
-                    })?
+                    package_binary(&npx_env_dir, &pkg_name)?
                 }
             }
         }
@@ -3298,6 +3304,7 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
                 cache_dir: Some(cache_path.clone()),
                 offline: false,
                 ignore_scripts: false,
+                silent: true,
                 ..Default::default()
             };
 
@@ -3337,6 +3344,14 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
             }
         }
     };
+
+    if banner && !is_loglevel_silent(current_dir) {
+        let manifest = Manifest::from_file(current_dir.join("package.json")).unwrap_or_default();
+        let id = manifest.name.map(|name| format!("{name}@{} ", manifest.version.unwrap_or_default())).unwrap_or_default();
+        let bin = binary_to_run.file_stem().unwrap_or_default().to_string_lossy();
+        let suffix = if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) };
+        println!("\n> {id}npx\n> {bin}{suffix}\n");
+    }
 
     // Execute the resolved binary with ancestor bin directories prepended to PATH
     let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(current_dir);
@@ -3570,14 +3585,19 @@ pub(crate) async fn execute_publish(
     registry: Option<String>,
     ignore_scripts: bool,
     json: bool,
+    stage: bool,
 ) -> anyhow::Result<()> {
+    if rnpm_core::semver::Range::parse(&tag).is_ok() {
+        anyhow::bail!("npm error Tag name must not be a valid SemVer range: {tag}");
+    }
+    let raw_target = target.to_string_lossy().to_string();
     let target_path = if target.is_absolute() {
         target
     } else {
         current_dir.join(target)
     };
     // `npm publish <tarball>` publishes the archive as-is and runs no scripts.
-    let tarball_spec = target_path.is_file();
+    let tarball_spec = !target_path.is_dir();
     let package_dir = if tarball_spec {
         current_dir.clone()
     } else {
@@ -3589,7 +3609,7 @@ pub(crate) async fn execute_publish(
     let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
     let (summary, tarball_bytes, manifest_json) = if tarball_spec {
-        let bytes = std::fs::read(&target_path)?;
+        let bytes = commands::pack::fetch_archive(&current_dir, &raw_target, registry.clone()).await?;
         let (summary, manifest_json) = rnpm_fs::summarize_tarball(&bytes).map_err(|e| {
             anyhow::anyhow!("npm error code ENOENT\nnpm error Could not read {}: {e}", target_path.display())
         })?;
@@ -3606,24 +3626,28 @@ pub(crate) async fn execute_publish(
         let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).map_err(|e| {
             anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}")
         })?;
-        if manifest_json.get("private").and_then(|v| v.as_bool()).unwrap_or(false) {
-            return Err(anyhow::anyhow!(
-                "npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from package.json to publish it."
-            ));
-        }
         let manifest = Manifest::from_file(&manifest_path)?;
-        if manifest.name.is_none() {
-            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"name\" field");
-        }
         if manifest.version.is_none() {
-            anyhow::bail!("npm error code ENEEDPACKAGE\nnpm error package.json must contain a \"version\" field");
+            anyhow::bail!("npm error Cannot read properties of null (reading 'prerelease')");
+        }
+        if let Some(version) = &manifest.version {
+            if rnpm_core::semver::Version::parse(version).is_err() {
+                anyhow::bail!("npm error Invalid version: \"{version}\"");
+            }
+        }
+        if manifest.name.is_none() && !is_silent {
+            eprintln!("npm warn publish npm auto-corrected some errors in your package.json when publishing.  Please run \"npm pkg fix\" to address these errors.\nnpm warn publish errors corrected:\nnpm warn publish Missing \"name\" field was set to an empty string");
         }
         run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
         run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
         run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
-        let (summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
+        let (mut summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
             .map_err(|e| anyhow::anyhow!("npm error pack failed: {e}"))?;
         let updated = Manifest::from_file(&manifest_path).unwrap_or(manifest);
+        if updated.name.is_none() {
+            summary.name = String::new();
+            summary.filename = format!("-{}.tgz", summary.version);
+        }
         run_lifecycle_hook(&package_dir, &updated, "postpack", ignore_scripts, foreground, is_silent, json)?;
         // Re-read: hooks may have changed package.json (including publishConfig).
         let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -3644,6 +3668,7 @@ pub(crate) async fn execute_publish(
         }
     }
 
+    let mut stage_id: Option<String> = None;
     let pack_json = || {
         serde_json::json!({
             summary.name.clone(): {
@@ -3684,6 +3709,10 @@ pub(crate) async fn execute_publish(
     // an OTP is pending.
     if !json && !is_silent {
         print_pack_notices(&summary);
+    }
+
+    if pkg_name.is_empty() {
+        anyhow::bail!("npm error code EINVALIDTAGNAME\nnpm error Invalid tag name \"@{tag}\" of package \"@{tag}\": Tags may not have any characters that encodeURIComponent encodes.");
     }
 
     let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
@@ -3757,14 +3786,18 @@ pub(crate) async fn execute_publish(
     });
     if !is_silent {
         eprintln!(
-            "npm notice Publishing to {registry_url} with tag {tag} and {} access{}",
+            "npm notice {} to {registry_url} with tag {tag} and {} access{}",
+            if stage { "Staging" } else { "Publishing" },
             effective_access.unwrap_or("default"),
             if dry_run { " (dry-run)" } else { "" }
         );
     }
 
     if !dry_run {
-        if provenance {
+        if manifest_json.get("private").is_some_and(|v| v == true) {
+            anyhow::bail!("npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from the package.json to publish it.");
+        }
+        if provenance || config.get_bool("provenance").unwrap_or(false) {
             ensure_provenance_generation()?;
         }
         let mut publish_manifest = manifest_json.clone();
@@ -3796,7 +3829,7 @@ pub(crate) async fn execute_publish(
             name: &pkg_name,
             version: &pkg_version,
             description: manifest_json.get("description").and_then(|d| d.as_str()),
-            tag: &tag,
+            tag: if std::env::args().any(|a| a == "--tag" || a.starts_with("--tag=")) { &tag } else { manifest_json.get("publishConfig").and_then(|c| c.get("tag")).and_then(|t| t.as_str()).unwrap_or(&tag) },
             access: effective_access,
             manifest: &publish_manifest,
             tarball: tarball_data,
@@ -3805,11 +3838,19 @@ pub(crate) async fn execute_publish(
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url
-            .join(&rnpm_config::encode_package_name(&pkg_name))
+            .join(&if stage { format!("-/stage/package/{}", rnpm_config::encode_package_name(&pkg_name)) } else { rnpm_config::encode_package_name(&pkg_name) })
             .unwrap_or_else(|_| registry_url.clone());
         let mut otp = otp;
         let mut may_prompt = true;
-        loop {
+        if stage {
+            let command_client = commands::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
+            let response = command_client.request(reqwest::Method::POST, put_url.clone(), None).json(&payload).send().await?;
+            let status = response.status();
+            let text = response.text().await?;
+            if !status.is_success() { return Err(commands::client_helper::format_http_error("POST", &put_url, status, &text)); }
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            stage_id = value["stageId"].as_str().map(str::to_string);
+        } else { loop {
             let result = client
                 .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
                 .await
@@ -3847,12 +3888,14 @@ pub(crate) async fn execute_publish(
                 }
                 other => break other?,
             }
-        }
+        }}
     }
 
     // JSON is only printed once the publish has completed.
     if json {
-        println!("{}", serde_json::to_string_pretty(&pack_json())?);
+        let mut details = pack_json();
+        if let Some(id) = &stage_id { details[&pkg_name]["stageId"] = id.clone().into(); }
+        println!("{}", serde_json::to_string_pretty(&details)?);
     }
 
     // `publish` and `postpublish` run only after a successful upload, and
@@ -3864,7 +3907,11 @@ pub(crate) async fn execute_publish(
     }
 
     if !json && !is_silent {
-        println!("+ {pkg_name}@{pkg_version}");
+        if stage {
+            let suffix = stage_id.map(|id| format!(" with id {id}")).unwrap_or_default();
+            println!("+ {pkg_name}@{pkg_version} (staged{suffix})");
+            eprintln!("npm notice stage package {pkg_name}@{pkg_version} has been staged with tag {tag}");
+        } else { println!("+ {pkg_name}@{pkg_version}"); }
     }
     Ok(())
 }
@@ -4943,6 +4990,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     );
                     ctx.package_version = manifest.version;
                     ctx.extra_env = lifecycle_config_env(&target_dir);
+                    ctx.extra_env.insert("npm_command".into(), "exec".into());
                     // `exec --package=x -c cmd`: install the packages into an
                     // npx environment and put its bins first on PATH.
                     if !packages.is_empty() {
@@ -4990,6 +5038,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         registry.clone(),
                         cache.clone(),
                         offline,
+                        false,
                     )
                     .await?;
                 }

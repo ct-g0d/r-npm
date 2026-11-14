@@ -305,12 +305,18 @@ pub(crate) async fn run(
     let response = if let Some(response) = response {
         response
     } else {
-        let username = prompt("Username:", None, false)?;
-        let password = prompt("Password:", None, true)?;
+        let key = super::logout::auth_key_for_registry(registry_url);
+        let prefix = key.trim_end_matches("_authToken");
+        let saved_user = config.npmrc.settings.get(&format!("{prefix}username"));
+        let saved_password = config.npmrc.settings.get(&format!("{prefix}_password"))
+            .and_then(|value| data_encoding::BASE64.decode(value.as_bytes()).ok())
+            .and_then(|value| String::from_utf8(value).ok());
+        let username = prompt("Username:", saved_user.map(String::as_str), false)?;
+        let password = prompt("Password:", saved_password.as_deref(), true)?;
         let email = if adduser {
             Some(prompt(
                 "Email (this will be public):",
-                config.get("email"),
+                config.npmrc.settings.get(&format!("{prefix}email")).map(String::as_str).or_else(|| config.get("email")),
                 false,
             )?)
         } else {

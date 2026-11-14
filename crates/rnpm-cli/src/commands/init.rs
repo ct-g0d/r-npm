@@ -28,6 +28,7 @@ pub(crate) async fn run(args: InitCommandArgs, current_dir: PathBuf) -> Result<(
             args.registry,
             args.cache,
             args.offline,
+            true,
         )
         .await?;
     } else {
