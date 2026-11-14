@@ -641,36 +641,6 @@ pub fn node_matches_peer_name(
         || node.install_name == package_name
 }
 
-/// Finds all immediate children in `scope`'s node_modules directory that match peer name.
-fn find_matching_node_in_scope<'a>(
-    graph: &'a DependencyGraph,
-    scope: &str,
-    install_name: &str,
-    package_name: &str,
-) -> Option<&'a crate::graph::Node> {
-    let prefix = if scope.is_empty() {
-        "node_modules/".to_string()
-    } else {
-        format!("{scope}/node_modules/")
-    };
-
-    for (loc, node) in graph.nodes.range(prefix.clone()..) {
-        if !loc.starts_with(&prefix) {
-            break;
-        }
-        let rest = &loc[prefix.len()..];
-        // Ensure this node is directly in `scope`, not inside a nested sub-node_modules
-        if rest.contains("/node_modules/") {
-            continue;
-        }
-        if node_matches_peer_name(node, install_name, package_name) {
-            return Some(node);
-        }
-    }
-
-    None
-}
-
 /// Finds the closest visible node for a peer requirement matching either its `install_name`
 /// OR its physical `package_name` (e.g. for aliased packages `install_name != package_name`).
 pub fn find_visible_peer_node<'a>(
@@ -708,11 +678,8 @@ pub fn find_visible_peer_node<'a>(
             }
         }
 
-        // 3. Aliased packages search in scope: e.g. <current>/node_modules/<alias> where node.name == package_name
-        if let Some(node) = find_matching_node_in_scope(graph, current, install_name, package_name)
-        {
-            return Some(node);
-        }
+        // Arborist resolves an edge by folder name only: an alias such as
+        // `@typescript/native` -> typescript is never `typescript`'s peer.
 
         // Ascend one directory level in node_modules hierarchy
         if let Some(idx) = current.rfind("/node_modules/") {
@@ -744,8 +711,7 @@ pub fn find_visible_peer_node<'a>(
         }
     }
 
-    // 3. Root scope scan for aliased packages
-    find_matching_node_in_scope(graph, "", install_name, package_name)
+    None
 }
 
 /// Finds the closest visible node for `install_name` starting from `from_location`
@@ -878,12 +844,11 @@ mod tests {
             make_test_node("node_modules/react-redux", "react-redux", "8.0.0"),
         );
 
-        // 1. Peer requirement asking for physical name "react"
+        // 1. A peer on "react" resolves by folder name, like arborist: the
+        //    "my-react" alias folder does not satisfy it.
         let found_by_pkg_name =
             find_visible_peer_node(&graph, "node_modules/react-redux", "react", "react");
-        assert!(found_by_pkg_name.is_some());
-        assert_eq!(found_by_pkg_name.unwrap().location, "node_modules/my-react");
-        assert_eq!(found_by_pkg_name.unwrap().name, "react");
+        assert!(found_by_pkg_name.is_none());
 
         // 2. Peer requirement asking for alias name "my-react"
         let found_by_alias =

@@ -323,7 +323,7 @@ fn test_extreme_shim_live_invocation_on_disk() {
         const args = process.argv.slice(2);\n\
         fs.writeFileSync('{escaped_out}', JSON.stringify(args));\n"
     );
-    fs::write(&script_file, script_code).unwrap();
+    fs::write(&script_file, format!("#!/usr/bin/env node\n{script_code}")).unwrap();
 
     // Create shims pointing to the tool across relative directories with spaces
     create_shims(&bin_dir, "spaced-tool", "spaced tool/bin/cli.js").unwrap();
@@ -410,7 +410,7 @@ fn test_shim_exit_code_fidelity() {
     fs::create_dir_all(&bin_dir).unwrap();
 
     let target_script = target_dir.join("cli.js");
-    fs::write(&target_script, b"process.exit(42);\n").unwrap();
+    fs::write(&target_script, b"#!/usr/bin/env node\nprocess.exit(42);\n").unwrap();
 
     create_shims(&bin_dir, "exit-pkg", "exit-pkg/cli.js").unwrap();
 
@@ -468,7 +468,7 @@ fn test_cmd_ps1_bash_shim_live_execution_all_shells() {
         const args = process.argv.slice(2);\n\
         fs.writeFileSync('{escaped_out}', JSON.stringify(args));\n"
     );
-    fs::write(&script_file, script_code).unwrap();
+    fs::write(&script_file, format!("#!/usr/bin/env node\n{script_code}")).unwrap();
 
     create_shims(&bin_dir, "multi-tool", "multi-tool/cli.js").unwrap();
 
@@ -609,7 +609,7 @@ fn test_shim_exit_code_fidelity_all_codes() {
     // Test exit codes 124 (timeout), 130 (SIGINT), 143 (SIGTERM), and 42
     for &code in &[124, 130, 143, 42] {
         let script_file = target_dir.join(format!("exit_{code}.js"));
-        fs::write(&script_file, format!("process.exit({code});\n")).unwrap();
+        fs::write(&script_file, format!("#!/usr/bin/env node\nprocess.exit({code});\n")).unwrap();
 
         let bin_name = format!("exit-{code}");
         create_shims(
@@ -710,4 +710,21 @@ fn test_compute_relative_path_case_insensitivity_windows() {
     let to_mixed = Path::new(r"d:\app\node_modules\PKG\cli.js");
     let rel_mixed = compute_relative_path(from_mixed, to_mixed).unwrap();
     assert_eq!(rel_mixed, "../PKG/cli.js");
+}
+
+#[test]
+fn test_direct_shims_match_npm_for_targets_without_shebang() {
+    let dir = tempdir().unwrap();
+    let pkg = dir.path().join("node_modules/untun/dist");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("cli.mjs"), "import { log } from \"./_chunks/log.mjs\";\n").unwrap();
+    let bin_dir = dir.path().join("node_modules/.bin");
+    create_shims(&bin_dir, "untun", "untun/dist/cli.mjs").unwrap();
+    for name in ["untun", "untun.cmd", "untun.ps1"] {
+        let expected = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct-fixtures").join(name),
+        )
+        .unwrap();
+        assert_eq!(fs::read(bin_dir.join(name)).unwrap(), expected, "{name}");
+    }
 }

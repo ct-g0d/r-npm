@@ -237,6 +237,61 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// cmd-shim runs a target with no `#!` line directly instead of through node.
+fn target_has_shebang(target: &Path) -> bool {
+    let Ok(data) = fs::read(target) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&data);
+    let line = text.trim().lines().next().unwrap_or("");
+    line.strip_prefix("#!").is_some_and(|rest| {
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("/usr/bin/env").map_or(rest, str::trim_start);
+        !rest.is_empty()
+    })
+}
+
+/// Shim trio (sh, cmd, ps1) for a target without a shebang, as cmd-shim writes it.
+pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, String, String) {
+    let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
+    let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
+    let sh = [
+        "#!/bin/sh\n",
+        r#"basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")"#,
+        "\n\ncase `uname` in\n",
+        "    *CYGWIN*|*MINGW*|*MSYS*)\n",
+        "        if command -v cygpath > /dev/null 2>&1; then\n",
+        "            basedir=`cygpath -w \"$basedir\"`\n",
+        "        fi\n",
+        "    ;;\n",
+        "esac\n\n",
+        &format!("exec {sh_target}   \"$@\"\n"),
+    ]
+    .concat();
+    let cmd = format!(
+        "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\..\\{win_target}\"   %*\r\n"
+    );
+    let ps1 = [
+        "#!/usr/bin/env pwsh\n",
+        "$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n\n",
+        "$exe=\"\"\n",
+        "if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {\n",
+        "  # Fix case when both the Windows and Linux builds of Node\n",
+        "  # are installed in the same directory\n",
+        "  $exe=\".exe\"\n",
+        "}\n",
+        "# Support pipeline input\n",
+        "if ($MyInvocation.ExpectingInput) {\n",
+        &format!("  $input | & {sh_target}   $args\n"),
+        "} else {\n",
+        &format!("  & {sh_target}   $args\n"),
+        "}\n",
+        "exit $LASTEXITCODE\n",
+    ]
+    .concat();
+    (sh, cmd, ps1)
+}
+
 /// Creates all three companion shims in `bin_dir`:
 /// - `<bin_name>` (POSIX shell script)
 /// - `<bin_name>.cmd` (Windows batch)
@@ -250,7 +305,26 @@ pub fn create_shims(
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
     let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
-    if is_dot_bin {
+    let target = bin_dir.parent().map(|nm| nm.join(target_rel_from_node_modules));
+    if is_dot_bin && target.is_some_and(|t| t.is_file() && !target_has_shebang(&t)) {
+        let (sh, cmd, ps1) = generate_direct_shims(target_rel_from_node_modules);
+        let posix_path = bin_dir.join(bin_name);
+        fs::write(&posix_path, sh)
+            .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&posix_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&posix_path, perms)?;
+        }
+        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
+        fs::write(&cmd_path, cmd)
+            .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
+        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
+        fs::write(&ps1_path, ps1)
+            .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
+    } else if is_dot_bin {
         // 1. POSIX shell script
         let posix_path = bin_dir.join(bin_name);
         let posix_content = generate_posix_shim(target_rel_from_node_modules);

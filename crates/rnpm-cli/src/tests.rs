@@ -530,7 +530,7 @@ async fn test_cli_exec_local_binary_success() {
     std::fs::create_dir_all(&tool_dir).unwrap();
     std::fs::write(
         tool_dir.join("index.js"),
-        format!("require('fs').writeFileSync('{escaped_marker}', 'local-exec-ok');\n"),
+        format!("#!/usr/bin/env node\nrequire('fs').writeFileSync('{escaped_marker}', 'local-exec-ok');\n"),
     )
     .unwrap();
 
@@ -575,7 +575,7 @@ async fn test_cli_exec_exit_code_fidelity() {
 
     let tool_dir = project_dir.join("node_modules").join("fail-tool");
     std::fs::create_dir_all(&tool_dir).unwrap();
-    std::fs::write(tool_dir.join("index.js"), "process.exit(53);\n").unwrap();
+    std::fs::write(tool_dir.join("index.js"), "#!/usr/bin/env node\nprocess.exit(53);\n").unwrap();
 
     let bin_dir = project_dir.join("node_modules").join(".bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -624,6 +624,12 @@ fn make_tarball_with_bin(
         }
     });
     let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+    // npm's cmd-shim only routes scripts through node when they carry a shebang.
+    let script_content = if script_content.starts_with("#!") {
+        script_content.to_string()
+    } else {
+        format!("#!/usr/bin/env node\n{script_content}")
+    };
     let script_bytes = script_content.as_bytes();
 
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
