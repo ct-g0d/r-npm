@@ -10,7 +10,7 @@ import { cleanPhase } from './corpus/clean-artifacts.mjs';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
-const corpus = path.join(repo, 'scripts/corpus');
+const corpus = path.resolve(option('--corpus', path.join(repo, 'scripts/corpus')));
 const root = path.resolve(option('--root', path.join(repo, 'target/real-corpus', new Date().toISOString().replaceAll(':', '-'))));
 const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
 const npmCli = path.resolve(option('--npm-cli', path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js')));
@@ -33,7 +33,7 @@ function envFor(isolation) {
     XDG_CONFIG_HOME: path.join(isolation, 'xdg-config'), XDG_CACHE_HOME: path.join(isolation, 'xdg-cache'), XDG_DATA_HOME: path.join(isolation, 'xdg-data'),
     NPM_CONFIG_USERCONFIG: path.join(isolation, 'user.npmrc'), NPM_CONFIG_GLOBALCONFIG: path.join(isolation, 'global.npmrc'),
     NPM_CONFIG_PREFIX: path.join(isolation, 'prefix'), NPM_CONFIG_CACHE: path.join(isolation, 'cache'),
-    RNPM_STORE_DIR: path.join(isolation, 'store'), NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    RNPM_STORE_DIR: path.join(isolation, 'store'), NPM_CONFIG_REGISTRY: option('--registry', 'https://registry.npmjs.org/'),
     NPM_CONFIG_AUDIT: 'false', NPM_CONFIG_FUND: 'false', NPM_CONFIG_UPDATE_NOTIFIER: 'false' };
 }
 async function run(tool, command, cwd, isolation, log) {
