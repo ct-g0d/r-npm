@@ -4066,6 +4066,13 @@ impl Installer {
         }
 
         clean_empty_bin_dirs(&node_modules_dir);
+        if node_modules_dir.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(&node_modules_dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(&node_modules_dir);
+                }
+            }
+        }
 
         Ok(InstallSummary {
             packages_installed,
@@ -6164,6 +6171,14 @@ impl Installer {
         if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
             if bin_entries.next().is_none() {
                 let _ = std::fs::remove_dir(&root_bin);
+            }
+        }
+        clean_empty_bin_dirs(&node_modules_dir);
+        if node_modules_dir.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(&node_modules_dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(&node_modules_dir);
+                }
             }
         }
 

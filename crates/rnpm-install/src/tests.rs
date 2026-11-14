@@ -4453,3 +4453,28 @@ async fn filtered_workspace_reify_keeps_unselected_members_only_in_public_lock()
     assert!(hidden["packages"].get("packages/second").is_none());
     assert!(hidden["packages"].get("node_modules/second").is_none());
 }
+
+#[tokio::test]
+async fn test_ci_empty_lockfile_leaves_no_node_modules() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"empty-app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let lock = LockfileV3::new("empty-app", Some("1.0.0".to_string()));
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.run_ci().await.unwrap();
+    assert_eq!(summary.packages_installed, 0);
+    assert!(!root.join("node_modules").exists(), "Empty lockfile CI must not leave empty node_modules on disk");
+}
+
