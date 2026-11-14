@@ -5638,3 +5638,39 @@ fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
         "the root edge is recorded once"
     );
 }
+
+#[test]
+fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
+    // webpack's dev tree: a transitive dependency peers on a version the root
+    // pins differently. npm's can-place-dep treats the root as a CONFLICT, so
+    // the dependency nests under the parent and npm overrides the peer with
+    // a warning instead of ERESOLVE.
+    use crate::overrides::Overrides;
+    use crate::solver::Solver;
+
+    let mut provider = InMemoryPackageProvider::new();
+    for version in ["17.0.0", "18.0.0"] {
+        provider.add_version("react", version, |_| {});
+    }
+    provider.add_version("lib", "1.0.0", |v| {
+        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+    });
+    provider.add_version("a", "1.0.0", |v| {
+        v.dependencies.insert("lib".to_string(), "^1.0.0".to_string());
+    });
+    let mut manifest = Manifest::default();
+    manifest.name = Some("webpack-like".to_string());
+    manifest.dependencies.insert("react".to_string(), "17.0.0".to_string());
+    manifest.dependencies.insert("a".to_string(), "^1.0.0".to_string());
+
+    let overrides = Overrides::from_manifest(&manifest).unwrap();
+    let graph = Solver::new(&provider, ResolverOptions::default(), overrides)
+        .resolve(&manifest)
+        .expect("npm resolves this tree without ERESOLVE");
+    assert_eq!(graph.nodes["node_modules/react"].version, "17.0.0");
+    assert!(!graph.nodes.contains_key("node_modules/lib"));
+    assert_eq!(graph.nodes["node_modules/a/node_modules/lib"].version, "1.0.0");
+    // Like webpack's babel-preset-current-node-syntax plugins: the peer is
+    // overridden by the visible root node, not duplicated beside the owner.
+    assert!(!graph.nodes.contains_key("node_modules/a/node_modules/react"));
+}

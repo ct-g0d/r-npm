@@ -196,6 +196,20 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.queue.insert(pos, task);
     }
 
+    /// arborist conflictOK: a peer conflict is fatal only for a package placed
+    /// directly in the project (under the root or a workspace), or with
+    /// --strict-peer-deps; deeper conflicts are overridden with a warning.
+    fn peer_conflict_is_fatal(&self, owner_location: &str) -> bool {
+        if self.options.legacy_peer_deps {
+            return false;
+        }
+        if self.options.strict_peer_deps {
+            return true;
+        }
+        let parent = owner_location.rsplit_once("/node_modules/").map(|(p, _)| p).unwrap_or("");
+        self.options.is_strict_peers() && !parent.contains("node_modules")
+    }
+
     /// Processes all queued dependency resolution tasks until completion.
     pub fn resolve_tasks(&mut self) -> Result<(), SolverError> {
         while let Some(task) = self.queue.pop_front() {
@@ -508,7 +522,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 ) {
                     if !crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         if task.dep_type == DependencyType::Peer {
-                            if self.options.is_strict_peers() {
+                            if self.peer_conflict_is_fatal(&task.parent_location) {
                                 return Err(SolverError::peer_conflict(
                                     &task.parent_package_name,
                                     &dep_spec.package_name,
@@ -575,7 +589,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         });
                         return Ok(());
                     } else if task.dep_type == DependencyType::Peer {
-                        if self.options.is_strict_peers() {
+                        if self.peer_conflict_is_fatal(&task.parent_location) {
                             return Err(SolverError::peer_conflict(
                                 &task.parent_package_name,
                                 &dep_spec.package_name,
@@ -596,6 +610,17 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
                                 task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
                             );
+                            // npm warns "ERESOLVE overriding peer dependency"
+                            // and keeps the visible node; the edge stays invalid.
+                            self.graph.edges.push(DependencyEdge {
+                                from_location: task.parent_location,
+                                to_location: existing.location.clone(),
+                                install_name: task.install_name,
+                                package_name: dep_spec.package_name,
+                                spec: effective_spec,
+                                dep_type: task.dep_type,
+                            });
+                            return Ok(());
                         }
                     } else if task.dep_type == DependencyType::PeerOptional {
                         // loadPeerSet resolves an incompatible optional peer
@@ -784,6 +809,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &chosen_version.peer_dependencies,
             &chosen_version.peer_dependencies_meta,
             Some(&chosen_version.version),
+            is_peer,
         );
 
         let is_unlocked = self
@@ -887,6 +913,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 &chosen_version.peer_dependencies,
                 &chosen_version.peer_dependencies_meta,
                 Some(&chosen_version.version),
+                is_peer,
             );
         }
         let parent_skipped = self
