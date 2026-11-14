@@ -1420,6 +1420,19 @@ fn reify_report_for(
     )
 }
 
+/// Node.shouldOmit from arborist, over lockfile flags.
+fn lockfile_entry_omitted(options: &InstallOptions, info: &LockfilePackage) -> bool {
+    let dev_optional = info.dev_optional.unwrap_or(false);
+    let is_dev = info.dev.unwrap_or(false);
+    let is_optional = info.is_effective_optional() || info.is_peer_optional();
+    let is_peer = info.peer.unwrap_or(false) || info.peer_optional.unwrap_or(false);
+
+    (options.omit_dev && is_dev && !dev_optional)
+        || (options.omit_optional && is_optional && !dev_optional)
+        || (options.omit_dev && options.omit_optional && dev_optional)
+        || (options.omit_peer && is_peer)
+}
+
 /// Result of an update run.
 #[derive(Debug, Clone)]
 pub struct UpdateSummary {
@@ -2908,7 +2921,25 @@ impl Installer {
         {
             let mut dirs_to_precreate = Vec::with_capacity(graph.nodes.len() * 2);
             for (loc, node) in &graph.nodes {
-                if loc.is_empty() {
+                if loc.is_empty() || node.flags.skipped || node.flags.bundled {
+                    continue;
+                }
+                // Match materialization below: merely reserving a parent for
+                // an incompatible optional node leaves an empty @scope behind.
+                if (node.flags.optional || node.flags.dev_optional)
+                    && !rnpm_solver::is_platform_compatible(
+                        &self.options.platform(),
+                        node.os.as_deref(),
+                        node.cpu.as_deref(),
+                        node.libc.as_deref(),
+                    )
+                {
+                    continue;
+                }
+                if reify_locations
+                    .as_ref()
+                    .is_some_and(|locations| !locations.contains(loc))
+                {
                     continue;
                 }
                 if let Some(ref diff) = tree_diff_opt {
@@ -4317,6 +4348,8 @@ impl Installer {
                             ancestors.push(clean_p.to_string());
                         }
                         ov.resolve_override_strings(dep_name, range_str, &ancestors)
+                            .ok()
+                            .flatten()
                             .unwrap_or_else(|| range_str.clone())
                     } else {
                         range_str.clone()
@@ -4385,28 +4418,12 @@ impl Installer {
                 if pkg_key.is_empty() || pkg_info.is_extraneous() {
                     continue;
                 }
-                let is_dev = pkg_info.dev.unwrap_or(false);
+                if lockfile_entry_omitted(&self.options, pkg_info) {
+                    continue;
+                }
                 let is_optional = pkg_info.optional.unwrap_or(false)
                     || pkg_info.is_effective_optional()
                     || pkg_info.is_peer_optional();
-                let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-                let is_peer =
-                    pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
-
-                // npm: devOptional packages are omitted only when both dev and
-                // optional are omitted.
-                if self.options.omit_dev && is_dev {
-                    continue;
-                }
-                if self.options.omit_optional && is_optional && !is_dev_optional {
-                    continue;
-                }
-                if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
-                    continue;
-                }
-                if self.options.omit_peer && is_peer {
-                    continue;
-                }
                 if platform_skipped_packages.contains(pkg_key) {
                     continue;
                 }
@@ -4589,56 +4606,9 @@ impl Installer {
                 continue;
             }
 
-            // Omit filtering
-            let is_dev = pkg_info.dev.unwrap_or(false);
-            let is_optional = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
-            let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-            let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
-
-            // devOptional packages are omitted only when dev and optional both are.
-            if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
+            // Omit filtering: match Arborist node.js shouldOmit
+            if lockfile_entry_omitted(&self.options, pkg_info) {
                 continue;
-            }
-            if self.options.omit_dev {
-                if is_dev {
-                    continue;
-                }
-                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !is_dev_optional
-                        && !clean_name.contains('/')
-                        && manifest.dev_dependencies.contains_key(clean_name)
-                        && !manifest.dependencies.contains_key(clean_name)
-                    {
-                        continue;
-                    }
-                }
-            }
-            if self.options.omit_optional {
-                if is_optional && !is_dev_optional {
-                    continue;
-                }
-                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !is_dev_optional
-                        && !clean_name.contains('/')
-                        && manifest.optional_dependencies.contains_key(clean_name)
-                        && !manifest.dependencies.contains_key(clean_name)
-                    {
-                        continue;
-                    }
-                }
-            }
-            if self.options.omit_peer || self.options.legacy_peer_deps {
-                if is_peer {
-                    continue;
-                }
-                if let Some(clean_name) = pkg_key.strip_prefix("node_modules/") {
-                    if !clean_name.contains('/')
-                        && manifest.peer_dependencies.contains_key(clean_name)
-                        && !manifest.dependencies.contains_key(clean_name)
-                    {
-                        continue;
-                    }
-                }
             }
 
             if platform_skipped_packages.contains(pkg_key) {
@@ -6128,6 +6098,10 @@ impl Installer {
                         return false;
                     }
                     if let Some(info) = lockfile.packages.get(*k) {
+                        // Omitted packages are not on disk; npm links no bins for them.
+                        if lockfile_entry_omitted(&self.options, info) {
+                            return false;
+                        }
                         if info.link == Some(true) {
                             return true;
                         }

@@ -2604,12 +2604,6 @@ fn preprocess_init_args(
             continue;
         }
 
-        if initializer.is_some() {
-            forwarded_args.push(token.clone());
-            i += 1;
-            continue;
-        }
-
         if token.starts_with('-') {
             if let Some(consumed) = extract_config_flag(token, next_token, is_silent, overrides) {
                 i += consumed;
@@ -2617,7 +2611,11 @@ fn preprocess_init_args(
             }
         }
 
-        initializer = Some(token.clone());
+        if initializer.is_some() {
+            forwarded_args.push(token.clone());
+        } else {
+            initializer = Some(token.clone());
+        }
         i += 1;
     }
 

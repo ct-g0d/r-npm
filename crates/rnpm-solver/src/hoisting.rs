@@ -226,6 +226,7 @@ pub fn determine_placement(
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
         None,
+        true,
     )
 }
 
@@ -245,6 +246,7 @@ pub fn determine_placement_with_peers(
         rnpm_core::manifest::PeerDependencyMeta,
     >,
     resolved_version: Option<&str>,
+    placing_peer: bool,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
@@ -255,6 +257,13 @@ pub fn determine_placement_with_peers(
         if let Some(existing) = graph.nodes.get(&root_target) {
             if existing.name == package_name
                 && node_satisfies_target(existing, target)
+                && (placing_peer
+                    || !target_peer_conflicts(
+                        graph,
+                        &root_target,
+                        peer_dependencies,
+                        peer_dependencies_meta,
+                    ))
                 && !candidate_has_incompatible_peer(
                     graph,
                     &root_target,
@@ -274,6 +283,13 @@ pub fn determine_placement_with_peers(
     if let Some(existing) = graph.nodes.get(&root_target) {
         if existing.name == package_name
             && node_satisfies_target(existing, target)
+            && (placing_peer
+                || !target_peer_conflicts(
+                    graph,
+                    &root_target,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                ))
             && !candidate_has_incompatible_peer(
                 graph,
                 &root_target,
@@ -298,6 +314,13 @@ pub fn determine_placement_with_peers(
     } else {
         // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
         if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target)
+            && (placing_peer
+                || !target_peer_conflicts(
+                    graph,
+                    &root_target,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                ))
             && !candidate_has_incompatible_peer(
                 graph,
                 &root_target,
@@ -330,6 +353,13 @@ pub fn determine_placement_with_peers(
         if let Some(existing) = graph.nodes.get(&candidate) {
             if existing.name == package_name
                 && node_satisfies_target(existing, target)
+                && (placing_peer
+                    || !target_peer_conflicts(
+                        graph,
+                        &candidate,
+                        peer_dependencies,
+                        peer_dependencies_meta,
+                    ))
                 && !candidate_has_incompatible_peer(
                     graph,
                     &candidate,
@@ -354,7 +384,14 @@ pub fn determine_placement_with_peers(
             ancestor,
             install_name,
             target,
-        ) && !candidate_has_incompatible_peer(
+        ) && (placing_peer
+            || !target_peer_conflicts(
+                graph,
+                &candidate,
+                peer_dependencies,
+                peer_dependencies_meta,
+            ))
+            && !candidate_has_incompatible_peer(
             graph,
             &candidate,
             parent_location,
@@ -534,6 +571,30 @@ fn candidate_has_incompatible_peer(
         }
 
         false
+    })
+}
+
+/// can-place-dep: a required peer that is visible but incompatible at the
+/// target location's scope is a CONFLICT there, so a regular dependency nests deeper,
+/// where npm overrides the peer with a warning instead of ERESOLVE.
+fn target_peer_conflicts(
+    graph: &DependencyGraph,
+    candidate_location: &str,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
+) -> bool {
+    peer_dependencies.iter().any(|(peer_name, peer_spec)| {
+        if peer_dependencies_meta.get(peer_name).is_some_and(|meta| meta.optional) {
+            return false;
+        }
+        let Ok(target) = PackageTarget::parse(peer_spec) else {
+            return false;
+        };
+        find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
+            .is_some_and(|existing| !node_satisfies_target(existing, &target))
     })
 }
 

@@ -1229,6 +1229,13 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
                             g.terminate(124);
                         }
                         let _ = child.kill();
+                        let _ = child.wait();
+                        if let Some(handle) = stdout_handle {
+                            let _ = handle.join();
+                        }
+                        if let Some(handle) = stderr_handle {
+                            let _ = handle.join();
+                        }
                         return Err(anyhow::Error::from(ScriptExitError {
                             exit_code: 124,
                             message: format!(
@@ -1249,6 +1256,12 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
             )
         })?
     };
+
+    // Descendants may inherit the pipe handles after the shell exits. Reap the
+    // process tree before waiting for EOF, just as the async executor does.
+    if let Some(ref g) = guard {
+        g.terminate(0);
+    }
 
     let stdout_str = stdout_handle
         .and_then(|h| h.join().ok())
@@ -1280,6 +1293,16 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     }
 
     Ok(status)
+}
+
+// Termination requests are asynchronous on Windows. Do not detach process waits
+// or pipe readers after an arbitrary 500ms; let the actual completion wake us.
+async fn await_terminated_task<T>(task: &mut tokio::task::JoinHandle<T>) {
+    match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("Terminated process cleanup task failed: {error}"),
+        Err(_) => warn!("Terminated process cleanup did not complete within 60 seconds"),
+    }
 }
 
 /// Spawns and executes a lifecycle script asynchronously, enforcing process-tree signal cleanup.
@@ -1363,7 +1386,7 @@ where
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let stdout_task = tokio::task::spawn_blocking(move || {
+    let mut stdout_task = tokio::task::spawn_blocking(move || {
         if let Some(mut r) = child_stdout {
             drain_and_scrub_reader(&mut r)
         } else {
@@ -1371,7 +1394,7 @@ where
         }
     });
 
-    let stderr_task = tokio::task::spawn_blocking(move || {
+    let mut stderr_task = tokio::task::spawn_blocking(move || {
         if let Some(mut r) = child_stderr {
             drain_and_scrub_reader(&mut r)
         } else {
@@ -1453,7 +1476,9 @@ where
                 g.terminate(124);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 124,
                 message: format!("Lifecycle script '{}' timed out after {:?}", ctx.event, ctx.timeout.unwrap_or_default()),
@@ -1466,7 +1491,9 @@ where
                 g.terminate(exit_code);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: exit_code as i32,
                 message: format!("Lifecycle execution for {pkg_name} terminated by {sig}"),
@@ -1478,7 +1505,9 @@ where
                 g.terminate(143);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
+            await_terminated_task(&mut stdout_task).await;
+            await_terminated_task(&mut stderr_task).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 143,
                 message: format!("Lifecycle execution for {pkg_name} aborted by signal"),

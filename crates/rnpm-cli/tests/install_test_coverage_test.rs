@@ -79,6 +79,10 @@ fn normalize_output(text: &str) -> String {
                 normalized.push_str("<TIME>");
                 rest = stripped;
                 continue;
+            } else if let Some(stripped) = suffix.strip_prefix('m') {
+                normalized.push_str("<TIME>");
+                rest = stripped;
+                continue;
             }
         }
         normalized.push_str(&rest[idx + 4..idx + 5]);
@@ -93,6 +97,16 @@ fn normalize_output(text: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+#[test]
+fn test_normalize_install_elapsed_minutes() {
+    for elapsed in ["123ms", "2s", "1.5s", "2m"] {
+        assert_eq!(
+            normalize_output(&format!("added 1 package in {elapsed}\n")),
+            "added 1 package in <TIME>"
+        );
+    }
 }
 
 #[test]

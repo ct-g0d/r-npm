@@ -1,0 +1,8 @@
+{
+  "name": "scripts-lmdb",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "lmdb": "3.5.10"
+  }
+}
