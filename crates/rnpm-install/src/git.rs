@@ -118,20 +118,25 @@ impl GitFetcher {
     }
 
     /// Computes the remote cache directory for a given clone URL:
-    /// `<cache_dir>/_git-remotes/<hash>`
+    /// `<cache_dir>/_git-remotes/<hash>` (using a short 16-hex-char hash to prevent Windows MAX_PATH issues).
     pub fn remote_repo_dir(&self, clone_url: &str) -> PathBuf {
         let hash = format!("{:x}", Sha256::digest(clone_url.as_bytes()));
-        self.cache_dir.join("_git-remotes").join(hash)
+        self.cache_dir.join("_git-remotes").join(&hash[..16])
     }
 
     /// Computes the checkout cache directory for a given clone URL and commit SHA:
-    /// `<cache_dir>/_git-checkouts/<hash>/<commit_sha>`
+    /// `<cache_dir>/_git-checkouts/<hash>/<commit_sha>` (using shortened keys to prevent Windows MAX_PATH issues).
     pub fn checkout_cache_dir(&self, clone_url: &str, commit_sha: &str) -> PathBuf {
         let hash = format!("{:x}", Sha256::digest(clone_url.as_bytes()));
+        let short_sha = if commit_sha.len() > 16 {
+            &commit_sha[..16]
+        } else {
+            commit_sha
+        };
         self.cache_dir
             .join("_git-checkouts")
-            .join(hash)
-            .join(commit_sha)
+            .join(&hash[..16])
+            .join(short_sha)
     }
 
     /// Fetches or clones the remote git repository into `<cache_dir>/_git-remotes/<hash>`.
@@ -217,11 +222,9 @@ impl GitFetcher {
         // 1. Try mirror clone
         let (mirror_ok, _, mirror_err) = run_git_cmd(
             &[
-                "-c",
-                "core.autocrlf=false",
-                "-c",
-                "core.eol=lf",
                 "clone",
+                "--config",
+                "core.longpaths=true",
                 "--mirror",
                 &normalized_url,
                 &remote_dir_str,
@@ -238,11 +241,9 @@ impl GitFetcher {
         let _ = safe_remove_dir_all(&remote_dir);
         let (bare_ok, _, bare_err) = run_git_cmd(
             &[
-                "-c",
-                "core.autocrlf=false",
-                "-c",
-                "core.eol=lf",
                 "clone",
+                "--config",
+                "core.longpaths=true",
                 "--bare",
                 &normalized_url,
                 &remote_dir_str,
@@ -426,6 +427,7 @@ impl GitFetcher {
         clone_url: &str,
     ) -> Result<PathBuf> {
         let checkout_dir = self.checkout_cache_dir(clone_url, commit_sha);
+
         if checkout_dir.join("package.json").exists() {
             debug!(
                 "Reusing existing checkout for commit {} at '{}'",
@@ -612,35 +614,12 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Safely removes a directory tree, clearing Windows read-only flags if necessary.
+/// Safely removes a directory tree, clearing Windows read-only flags and handling long paths if necessary.
 pub fn safe_remove_dir_all(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    if std::fs::remove_dir_all(path).is_err() {
-        clear_readonly_recursive(path);
-        std::fs::remove_dir_all(path)?;
-    }
-    Ok(())
-}
-
-fn clear_readonly_recursive(path: &Path) {
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Ok(meta) = p.symlink_metadata() {
-                let mut perms = meta.permissions();
-                if perms.readonly() {
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(&p, perms);
-                }
-            }
-            if p.is_dir() {
-                clear_readonly_recursive(&p);
-            }
-        }
-    }
+    rnpm_fs::remove_dir_all_safe(path).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Checks whether a string is a valid 40-char (SHA-1) or 64-char (SHA-256) git commit hash.
@@ -652,11 +631,18 @@ fn is_valid_hex_sha(s: &str) -> bool {
 /// Executes git command with sanitized environment variables (non-interactive).
 async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String, String)> {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "");
+    cmd.args([
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+        "-c",
+        "core.longpaths=true",
+    ])
+    .args(args)
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "")
+    .env("SSH_ASKPASS", "");
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -677,6 +663,8 @@ async fn run_git_archive(remote_dir: &Path, commit_sha: &str) -> Result<Vec<u8>>
     let remote_dir_str = remote_dir.to_string_lossy();
     let mut cmd = tokio::process::Command::new("git");
     cmd.args([
+        "-c",
+        "core.longpaths=true",
         "--git-dir",
         &remote_dir_str,
         "archive",
@@ -780,5 +768,24 @@ mod tests {
         let p2 = fetcher.remote_repo_dir("https://github.com/user/repo.git");
         assert_eq!(p1, p2);
         assert!(p1.to_str().unwrap().contains("_git-remotes"));
+    }
+
+    #[test]
+    fn test_git_cache_path_length_and_format() {
+        let fetcher = GitFetcher::new(Path::new("C:/fake/npm/cache"));
+        let url = "https://github.com/extremely-long-organization-name/extremely-long-repository-name-that-would-overflow-max-path.git";
+        let remote_p = fetcher.remote_repo_dir(url);
+        let key = remote_p.file_name().unwrap().to_str().unwrap();
+        // Sized to 16 hex chars (64 bits) to stay well under Windows MAX_PATH (260 chars)
+        assert_eq!(key.len(), 16);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(remote_p.starts_with("C:/fake/npm/cache/_git-remotes"));
+
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let checkout_p = fetcher.checkout_cache_dir(url, commit);
+        assert!(checkout_p.starts_with("C:/fake/npm/cache/_git-checkouts"));
+        let checkout_commit = checkout_p.file_name().unwrap().to_str().unwrap();
+        assert_eq!(checkout_commit.len(), 16);
+        assert_eq!(checkout_commit, &commit[..16]);
     }
 }
