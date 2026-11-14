@@ -291,6 +291,36 @@ for(const [name,args]of [['json',['audit','--json']],['text',['audit']],['fix-dr
   for(const [name,child]of [['audit-top','audit-middle'],['audit-middle','audit-branch'],['audit-branch','audit-leaf'],['audit-leaf',null]])packages['node_modules/'+name]={version:'1.0.0',...(child?{dependencies:{[child]:'^1.0.0'}}:{})};
   manifest(dir,{dependencies:{'audit-top':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages});
 },{advisories:{'audit-leaf':[{id:106,name:'audit-leaf',url:'https://example.invalid/advisory/106',title:'Deep chain advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+// reify-output under npm's default audit/fund settings, plus dry-run, --long and --json diffs.
+{
+  const defaults={NPM_CONFIG_AUDIT:'true',NPM_CONFIG_FUND:'true'};
+  const installed=async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);};
+  const tree=dir=>manifest(dir,{dependencies:{parent:'^1.0.0',dep:'^1.0.0'}});
+  const vulnerable={dep:[{id:301,name:'dep',url:'https://example.invalid/advisory/301',title:'Reify advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]};
+  for(const [name,args,before,extra] of [
+    ['install-default',['install','--ignore-scripts']],
+    ['install-json',['install','--ignore-scripts','--json']],
+    ['install-dry-run',['install','--ignore-scripts','--dry-run']],
+    ['install-dry-run-json',['install','--ignore-scripts','--dry-run','--json']],
+    ['install-dry-run-installed',['install','--ignore-scripts','--dry-run'],installed],
+    ['install-noop',['install','--ignore-scripts'],installed],
+    ['install-change',['install','--ignore-scripts','dep@1.0.0'],installed],
+    ['install-change-json',['install','--ignore-scripts','dep@1.0.0','--json'],installed],
+    ['install-change-long',['install','--ignore-scripts','dep@1.0.0','--long'],installed],
+    ['install-vulnerable',['install','--ignore-scripts'],undefined,{advisories:vulnerable}],
+    ['install-vulnerable-json',['install','--ignore-scripts','--json'],undefined,{advisories:vulnerable}],
+    ['install-silent',['install','--ignore-scripts','--silent']],
+    ['ci-default',['ci','--ignore-scripts'],installed],
+    ['ci-json',['ci','--ignore-scripts','--json'],installed],
+    ['ci-dry-run',['ci','--ignore-scripts','--dry-run'],installed],
+    ['uninstall-default',['uninstall','--ignore-scripts','parent'],installed],
+    ['uninstall-json',['uninstall','--ignore-scripts','parent','--json'],installed],
+    ['update-default',['update','--ignore-scripts'],installed],
+    ['update-dry-run',['update','--ignore-scripts','--dry-run'],installed],
+    ['dedupe-default',['dedupe','--ignore-scripts'],installed],
+    ['prune-default',['prune','--ignore-scripts'],installed],
+  ])add(`reify-${name}`,args[0],args,tree,{env:defaults,...(before?{before}:{}),...(extra||{})});
+}
 probePackages.set('audit-bundler',{name:'audit-bundler','dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name:'audit-bundler',version,dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'},bundleDependencies:['audit-leaf']}]))});
 for(const flags of [[],['--json']])add(`f1-audit-bundled${flags.length?'-json':''}`,'audit',['audit',...flags],dir=>{
   manifest(dir,{dependencies:{'audit-bundler':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-bundler':'^1.0.0'}},'node_modules/audit-bundler':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'},bundleDependencies:['audit-leaf']},'node_modules/audit-bundler/node_modules/audit-leaf':{version:'1.0.0',inBundle:true}}});

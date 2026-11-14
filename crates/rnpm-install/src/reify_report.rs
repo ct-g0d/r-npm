@@ -3,7 +3,7 @@
 //! npm's lib/utils/reify-output.js.
 
 use rnpm_lockfile::LockfilePackage;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 /// One package as reify-output reports it.
@@ -99,9 +99,13 @@ fn action(location: &str, actual: Option<&LockfilePackage>, ideal: Option<&Lockf
 /// Computes the reify diff. `inert` marks ideal nodes that will not be
 /// placed on disk (omitted or platform-incompatible), which arborist
 /// treats as absent from the ideal tree. `include` limits a filtered reify.
+/// `ideal_rank` gives the insertion order of ideal children (placement
+/// order for freshly resolved nodes); locations without a rank sort after
+/// ranked ones by location, as a lockfile-loaded tree is ordered.
 pub fn compute(
     ideal: &BTreeMap<String, LockfilePackage>,
     actual: &BTreeMap<String, LockfilePackage>,
+    ideal_rank: Option<&HashMap<String, usize>>,
     inert: impl Fn(&str, &LockfilePackage) -> bool,
     include: impl Fn(&str) -> bool,
 ) -> ReifyReport {
@@ -120,7 +124,11 @@ pub fn compute(
     // dependencies belong to the root (arborist's allChildren over fsChildren).
     let parent_of = |loc: &str| -> String {
         let (parent, _) = split_location(loc).unwrap_or(("", loc));
-        if split_location(parent).is_some() { parent.to_string() } else { String::new() }
+        if split_location(parent).is_some() {
+            parent.to_string()
+        } else {
+            String::new()
+        }
     };
     let mut actual_kids: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for loc in actual_live.keys() {
@@ -130,50 +138,136 @@ pub fn compute(
     for loc in ideal_live.keys() {
         ideal_kids.entry(parent_of(loc)).or_default().push(loc);
     }
+    for kids in ideal_kids.values_mut() {
+        kids.sort_by_key(|loc| {
+            (
+                ideal_rank.and_then(|r| r.get(*loc)).copied().unwrap_or(usize::MAX),
+                *loc,
+            )
+        });
+    }
 
-    let mut changes = Vec::new();
-    let mut order: Vec<&str> = Vec::new();
-    // Pre-order walk: actual children first, then ideal-only children.
-    fn walk<'a>(
+    let classify = |loc: &str| -> Option<&'static str> {
+        if !include(loc) {
+            return None;
+        }
+        action(loc, actual_live.get(loc).copied(), ideal_live.get(loc).copied())
+    };
+
+    // arborist diff.js getChildren: actual children first, then ideal-only
+    // ones; unchanged nodes contribute their own changed descendants.
+    fn diff_children<'a>(
         parent: &str,
         actual_kids: &BTreeMap<String, Vec<&'a str>>,
         ideal_kids: &BTreeMap<String, Vec<&'a str>>,
-        order: &mut Vec<&'a str>,
+        classify: &dyn Fn(&str) -> Option<&'static str>,
+        out: &mut Vec<(&'a str, &'static str)>,
     ) {
         let mut seen = BTreeSet::new();
-        let mut kids: Vec<&'a str> = Vec::new();
         for list in [actual_kids.get(parent), ideal_kids.get(parent)].into_iter().flatten() {
             for loc in list {
-                if seen.insert(*loc) {
-                    kids.push(loc);
+                if !seen.insert(*loc) {
+                    continue;
+                }
+                match classify(loc) {
+                    Some(action) => out.push((loc, action)),
+                    None => diff_children(loc, actual_kids, ideal_kids, classify, out),
                 }
             }
         }
-        for loc in kids {
-            order.push(loc);
-            walk(loc, actual_kids, ideal_kids, order);
-        }
     }
-    walk("", &actual_kids, &ideal_kids, &mut order);
 
-    for loc in order {
-        if !include(loc) {
-            continue;
-        }
+    // reify-output walks the diff with treeverse's stack-based descent, so
+    // later siblings are visited first.
+    let mut changes = Vec::new();
+    let mut stack = Vec::new();
+    diff_children("", &actual_kids, &ideal_kids, &classify, &mut stack);
+    while let Some((loc, act)) = stack.pop() {
         let actual_pkg = actual_live.get(loc).copied();
         let ideal_pkg = ideal_live.get(loc).copied();
-        match action(loc, actual_pkg, ideal_pkg) {
-            Some("ADD") => changes.push(ReifyChange::Add(entry(loc, ideal_pkg.unwrap(), ideal))),
-            Some("REMOVE") => changes.push(ReifyChange::Remove(entry(loc, actual_pkg.unwrap(), actual))),
-            Some(_) => changes.push(ReifyChange::Change {
+        match act {
+            "ADD" => changes.push(ReifyChange::Add(entry(loc, ideal_pkg.unwrap(), ideal))),
+            "REMOVE" => changes.push(ReifyChange::Remove(entry(loc, actual_pkg.unwrap(), actual))),
+            _ => changes.push(ReifyChange::Change {
                 from: entry(loc, actual_pkg.unwrap(), actual),
                 to: entry(loc, ideal_pkg.unwrap(), ideal),
             }),
-            None => {}
         }
+        diff_children(loc, &actual_kids, &ideal_kids, &classify, &mut stack);
     }
 
     ReifyReport { changes, inventory: ideal.len().max(1) }
+}
+
+/// Simulates arborist's placement order for a freshly built ideal tree:
+/// nodes are processed by depth then location, each placing its missing
+/// dependencies sorted by name, and a placed node is appended to its
+/// parent's children. Nodes already present in `previous` keep the
+/// lockfile order ahead of newly placed ones.
+pub fn placement_rank(
+    ideal: &BTreeMap<String, LockfilePackage>,
+    previous: Option<&BTreeMap<String, LockfilePackage>>,
+) -> HashMap<String, usize> {
+    let mut rank = HashMap::new();
+    if let Some(previous) = previous {
+        for loc in ideal.keys().filter(|l| previous.contains_key(*l)) {
+            let next = rank.len();
+            rank.insert(loc.clone(), next);
+        }
+    }
+    let resolve = |from: &str, name: &str| -> Option<String> {
+        let mut base = from.to_string();
+        loop {
+            let candidate = if base.is_empty() {
+                format!("node_modules/{name}")
+            } else {
+                format!("{base}/node_modules/{name}")
+            };
+            if ideal.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            if base.is_empty() {
+                return None;
+            }
+            base = match base.rfind("/node_modules/") {
+                Some(i) => base[..i].to_string(),
+                None => String::new(),
+            };
+        }
+    };
+    let depth = |loc: &str| loc.matches("node_modules/").count();
+    let mut queue: Vec<String> = vec![String::new()];
+    queue.extend(ideal.keys().filter(|l| !l.is_empty() && split_location(l).is_none()).cloned());
+    let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
+    while !queue.is_empty() {
+        queue.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
+        let node = queue.remove(0);
+        let Some(pkg) = ideal.get(&node) else { continue };
+        let mut names: BTreeSet<&String> = BTreeSet::new();
+        for deps in [&pkg.dependencies, &pkg.optional_dependencies, &pkg.peer_dependencies]
+            .into_iter()
+            .flatten()
+        {
+            names.extend(deps.keys());
+        }
+        if split_location(&node).is_none() {
+            if let Some(dev) = &pkg.dev_dependencies {
+                names.extend(dev.keys());
+            }
+        }
+        for name in names {
+            if let Some(loc) = resolve(&node, name) {
+                if !rank.contains_key(&loc) {
+                    let next = rank.len();
+                    rank.insert(loc.clone(), next);
+                }
+                if seen.insert(loc.clone()) {
+                    queue.push(loc);
+                }
+            }
+        }
+    }
+    rank
 }
 
 /// Loads the actual tree the way arborist's loadActual does for reporting:
@@ -287,7 +381,7 @@ mod tests {
         let mut actual = BTreeMap::new();
         actual.insert("node_modules/b".into(), pkg("1.0.0", "sha512-b1"));
         actual.insert("node_modules/c".into(), pkg("1.0.0", "sha512-c"));
-        let report = compute(&ideal, &actual, |_, _| false, |_| true);
+        let report = compute(&ideal, &actual, None, |_, _| false, |_| true);
         let kinds: Vec<String> = report
             .changes
             .iter()
@@ -300,10 +394,10 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "change node_modules/b",
-                "remove node_modules/c",
                 "add node_modules/a",
-                "add node_modules/a/node_modules/x"
+                "add node_modules/a/node_modules/x",
+                "remove node_modules/c",
+                "change node_modules/b"
             ]
         );
         assert_eq!(report.inventory, 4);
@@ -319,7 +413,7 @@ mod tests {
         ideal.insert("node_modules/same/node_modules/inner".into(), bundled);
         let mut actual = BTreeMap::new();
         actual.insert("node_modules/same".into(), pkg("1.0.0", "sha1-t"));
-        let report = compute(&ideal, &actual, |loc, _| loc == "node_modules/dev", |_| true);
+        let report = compute(&ideal, &actual, None, |loc, _| loc == "node_modules/dev", |_| true);
         assert!(report.changes.is_empty(), "{:?}", report.changes);
     }
 }

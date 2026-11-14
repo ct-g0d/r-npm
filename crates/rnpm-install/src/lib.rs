@@ -1390,11 +1390,13 @@ fn reify_report_for(
     ideal: &LockfileV3,
     actual: &BTreeMap<String, LockfilePackage>,
     include: Option<&HashSet<String>>,
+    ideal_rank: Option<&HashMap<String, usize>>,
 ) -> ReifyReport {
     let platform = options.platform();
     reify_report::compute(
         &ideal.packages,
         actual,
+        ideal_rank,
         |_, p| {
             let dev = p.dev == Some(true);
             let optional = p.optional == Some(true);
@@ -2689,7 +2691,8 @@ impl Installer {
                 hidden_valid && !self.options.force,
                 existing_lockfile_for_merge.as_ref().map(|l| &l.packages),
             );
-            reify_report_for(&self.options, &lockfile, &actual, reify_locations.as_ref())
+            let rank = reify_report::placement_rank(&lockfile.packages, existing_lockfile_for_merge.as_ref().map(|l| &l.packages));
+            reify_report_for(&self.options, &lockfile, &actual, reify_locations.as_ref(), Some(&rank))
         });
 
         // 3b. For --dry-run, simulate installation and report what would be installed
@@ -4369,7 +4372,7 @@ impl Installer {
                 let hidden_valid = validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
                 reify_report::load_actual(&self.options.project_dir, hidden_valid, Some(&lockfile.packages))
             };
-            reify_report_for(&self.options, &lockfile, &actual, None)
+            reify_report_for(&self.options, &lockfile, &actual, None, None)
         });
         if self.options.dry_run {
             let host_platform = self.options.platform();

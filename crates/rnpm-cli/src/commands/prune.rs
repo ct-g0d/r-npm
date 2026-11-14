@@ -29,6 +29,7 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
 
     let nm_dir = current_dir.join("node_modules");
     let had_nm = nm_dir.exists();
+    let before = crate::reify_output::snapshot(&current_dir);
 
     let install_options = InstallOptions {
         project_dir: current_dir.clone(),
@@ -49,48 +50,24 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         omit_peer,
     };
 
-    let removed = if args.dry_run {
+    let report = if args.dry_run {
         let analysis = installer.analyze_prune(&prune_options)?;
-        analysis.extraneous_packages.len()
+        let mut report = install_summary.reify.unwrap_or_default();
+        for pkg in analysis.extraneous_packages {
+            report.changes.push(rnpm_install::ReifyChange::Remove(rnpm_install::ReifyEntry {
+                name: pkg.path.rsplit("node_modules/").next().unwrap_or(&pkg.name).to_string(),
+                version: pkg.version.unwrap_or_default(),
+                location: pkg.path,
+            }));
+        }
+        report
     } else {
-        let summary = installer.prune(&prune_options)?;
-        summary.removed_packages.len()
+        installer.prune(&prune_options)?;
+        if !had_nm && install_summary.packages_installed == 0 && nm_dir.exists() {
+            let _ = std::fs::remove_dir_all(&nm_dir);
+        }
+        crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir))
     };
 
-    if !had_nm && install_summary.packages_installed == 0 && nm_dir.exists() {
-        let _ = std::fs::remove_dir_all(&nm_dir);
-    }
-
-    let total_added = install_summary.packages_installed;
-    let total_removed = removed;
-
-    if args.json {
-        let json_output = serde_json::json!({
-            "added": total_added,
-            "removed": total_removed,
-            "changed": 0,
-            "audited": 0,
-            "funding": 0
-        });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else if !args.silent {
-        let elapsed = start_time.elapsed();
-        let elapsed_sec = elapsed.as_secs_f64();
-        let time_str = if elapsed_sec < 1.0 {
-            format!("{}ms", elapsed.as_millis())
-        } else {
-            format!("{:.1}s", elapsed_sec)
-        };
-        if total_added > 0 {
-            let pkg_word = if total_added == 1 { "package" } else { "packages" };
-            println!("\nadded {total_added} {pkg_word} in {time_str}");
-        } else if total_removed > 0 {
-            let pkg_word = if total_removed == 1 { "package" } else { "packages" };
-            println!("\nremoved {total_removed} {pkg_word} in {time_str}");
-        } else {
-            println!("\nup to date in {time_str}");
-        }
-    }
-
-    Ok(())
+    crate::reify_output::finish(&current_dir, &report, args.json, args.dry_run, args.silent, start_time.elapsed()).await
 }

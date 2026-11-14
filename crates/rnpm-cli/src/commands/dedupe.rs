@@ -2,23 +2,27 @@ use anyhow::Result;
 use rnpm_install::{InstallOptions, Installer};
 use std::path::PathBuf;
 
+/// `npm dedupe`; `npm find-dupes` is the same reify in dry-run mode.
 pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir: PathBuf) -> Result<()> {
+    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+    let dry_run = dry_run || config.get_bool("dry-run").unwrap_or(false);
+    let json = config.get_bool("json").unwrap_or(false);
     let start_time = std::time::Instant::now();
+    let before = crate::reify_output::snapshot(&current_dir);
     let nm_dir = current_dir.join("node_modules");
     let needs_reify = !nm_dir.exists() && has_declared_dependencies(&current_dir)?;
 
-    let total_added = if needs_reify {
-        let install_options = InstallOptions {
+    let mut report = rnpm_install::ReifyReport::default();
+    if needs_reify {
+        let mut installer = Installer::new(InstallOptions {
             project_dir: current_dir.clone(),
             dry_run,
             ..Default::default()
-        };
-        let mut installer = Installer::new(install_options)?;
-        let summary = installer.run().await?;
-        summary.packages_installed
-    } else {
-        0
-    };
+        })?;
+        if let Some(r) = installer.run().await?.reify {
+            report = r;
+        }
+    }
 
     let dedupe_options = rnpm_install::DedupeOptions {
         project_dir: current_dir.clone(),
@@ -26,140 +30,33 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
         packages,
     };
     let installer = Installer::new(InstallOptions {
-        project_dir: current_dir,
+        project_dir: current_dir.clone(),
         dry_run,
         ..Default::default()
     })?;
     let summary = installer.dedupe(&dedupe_options)?;
 
-    let elapsed = start_time.elapsed();
-    let elapsed_sec = elapsed.as_secs_f64();
-    let time_str = if elapsed_sec < 1.0 {
-        format!("{}ms", elapsed.as_millis())
-    } else {
-        format!("{:.1}s", elapsed_sec)
-    };
-
     if dry_run {
-        if summary.actions.is_empty() {
-            if total_added > 0 {
-                let pkg_word = if total_added == 1 { "package" } else { "packages" };
-                println!("\nadded {total_added} {pkg_word} in {time_str}");
-            } else {
-                println!("\nup to date in {time_str}");
-            }
-        } else {
-            for action in &summary.actions {
-                match action.action_type {
-                    rnpm_install::DedupeActionType::DeleteDuplicate => {
-                        println!(
-                            "rnpm: dedupe: would remove {} ({})",
-                            action.original_path, action.reason
-                        );
-                    }
-                    rnpm_install::DedupeActionType::HoistAndDedupe => {
-                        println!(
-                            "rnpm: dedupe: would hoist {} -> {} ({})",
-                            action.original_path, action.target_path, action.reason
-                        );
-                    }
-                }
-            }
-            println!(
-                "rnpm: dedupe dry-run: {} action(s) would be performed",
-                summary.actions.len()
-            );
-        }
-    } else if summary.actions.is_empty() {
-        if total_added > 0 {
-            let pkg_word = if total_added == 1 { "package" } else { "packages" };
-            println!("\nadded {total_added} {pkg_word} in {time_str}");
-        } else {
-            println!("\nup to date in {time_str}");
-        }
-    } else {
         for action in &summary.actions {
-            match action.action_type {
-                rnpm_install::DedupeActionType::DeleteDuplicate => {
-                    println!("rnpm: dedupe: removed {}", action.original_path);
-                }
-                rnpm_install::DedupeActionType::HoistAndDedupe => {
-                    println!(
-                        "rnpm: dedupe: hoisted {} -> {}",
-                        action.original_path, action.target_path
-                    );
-                }
+            let entry = |location: &str| rnpm_install::ReifyEntry {
+                name: action.package_name.clone(),
+                version: action.version.clone(),
+                location: location.to_string(),
+            };
+            report.changes.push(rnpm_install::ReifyChange::Remove(entry(&action.original_path)));
+            if action.action_type == rnpm_install::DedupeActionType::HoistAndDedupe && !before.contains_key(&action.target_path) {
+                report.changes.push(rnpm_install::ReifyChange::Add(entry(&action.target_path)));
             }
         }
-        println!(
-            "rnpm: successfully deduplicated {} package(s)",
-            summary.actions.len()
-        );
-        let pkg_word = if summary.actions.len() == 1 { "package" } else { "packages" };
-        println!("\nremoved {} {pkg_word} in {time_str}", summary.actions.len());
+        report.inventory = before.len() + 1;
+    } else {
+        report = crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
     }
-
-    Ok(())
+    crate::reify_output::finish(&current_dir, &report, json, dry_run, false, start_time.elapsed()).await
 }
 
 pub(crate) async fn run_find_dupes(packages: Vec<String>, current_dir: PathBuf) -> Result<()> {
-    let start_time = std::time::Instant::now();
-    let nm_dir = current_dir.join("node_modules");
-    let needs_reify = !nm_dir.exists() && has_declared_dependencies(&current_dir)?;
-
-    let total_added = if needs_reify {
-        let install_options = InstallOptions {
-            project_dir: current_dir.clone(),
-            dry_run: true,
-            ..Default::default()
-        };
-        let mut installer = Installer::new(install_options)?;
-        let summary = installer.run().await?;
-        summary.packages_installed
-    } else {
-        0
-    };
-
-    let dedupe_options = rnpm_install::DedupeOptions {
-        project_dir: current_dir.clone(),
-        dry_run: true,
-        packages,
-    };
-    let installer = Installer::new(InstallOptions {
-        project_dir: current_dir,
-        ..Default::default()
-    })?;
-    let summary = installer.find_dupes(&dedupe_options)?;
-
-    let elapsed = start_time.elapsed();
-    let elapsed_sec = elapsed.as_secs_f64();
-    let time_str = if elapsed_sec < 1.0 {
-        format!("{}ms", elapsed.as_millis())
-    } else {
-        format!("{:.1}s", elapsed_sec)
-    };
-
-    if summary.actions.is_empty() {
-        if total_added > 0 {
-            let pkg_word = if total_added == 1 { "package" } else { "packages" };
-            println!("\nadded {total_added} {pkg_word} in {time_str}");
-        } else {
-            println!("\nup to date in {time_str}");
-        }
-    } else {
-        for action in &summary.actions {
-            println!(
-                "rnpm: find-dupes: duplicate found: {} ({})",
-                action.original_path, action.reason
-            );
-        }
-        println!(
-            "rnpm: find-dupes: {} duplicate package(s) detected",
-            summary.actions.len()
-        );
-    }
-
-    Ok(())
+    run_dedupe(packages, true, current_dir).await
 }
 
 fn has_declared_dependencies(dir: &std::path::Path) -> Result<bool> {

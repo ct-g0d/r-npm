@@ -206,3 +206,48 @@ pub(crate) fn print(
     }
     Ok(())
 }
+
+pub(crate) type Tree = std::collections::BTreeMap<String, rnpm_lockfile::LockfilePackage>;
+
+/// The tree on disk, as arborist's loadActual sees it.
+pub(crate) fn snapshot(project_dir: &Path) -> Tree {
+    let lock = rnpm_lockfile::load_and_migrate(&project_dir.join("package-lock.json"))
+        .ok()
+        .map(|l| l.packages);
+    rnpm_install::reify_report::load_actual(
+        project_dir,
+        rnpm_install::validate_hidden_lockfile_simple(project_dir),
+        lock.as_ref(),
+    )
+}
+
+/// The reify diff between two on-disk snapshots of a project.
+pub(crate) fn report_between(before: &Tree, after: &Tree) -> ReifyReport {
+    let mut report = rnpm_install::reify_report::compute(after, before, None, |_, _| false, |_| true);
+    report.inventory = after.keys().filter(|k| !k.is_empty()).count() + 1;
+    report
+}
+
+/// Prints reify output for a command that mutated (or, in a dry run,
+/// planned) the tree, auditing the result unless audit is disabled.
+pub(crate) async fn finish(
+    project_dir: &Path,
+    report: &ReifyReport,
+    json: bool,
+    dry_run: bool,
+    silent: bool,
+    elapsed: std::time::Duration,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    let audit_enabled = config.get_bool("audit").unwrap_or(true);
+    let fund_enabled = config.get_bool("fund").unwrap_or(true);
+    let mut opts = ReifyOutputOptions::from_config(project_dir, json, dry_run, fund_enabled);
+    opts.silent |= silent;
+    let audit = if audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists() {
+        crate::audit::build_audit_report(project_dir, None).await.ok().map(|(r, _)| r)
+    } else {
+        None
+    };
+    let funding = if fund_enabled && !opts.dry_run { crate::audit::count_funding_packages(project_dir) } else { 0 };
+    print(project_dir, report, audit.as_ref(), funding, &opts, elapsed)
+}

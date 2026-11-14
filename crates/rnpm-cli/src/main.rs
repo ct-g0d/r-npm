@@ -5122,6 +5122,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 current_dir
             };
+            let before = (!is_global).then(|| reify_output::snapshot(&target_dir));
+            let report_dir = target_dir.clone();
             let options = InstallOptions {
                 project_dir: target_dir,
                 is_global,
@@ -5151,7 +5153,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let total_removed = all_removed.len();
             let elapsed_str = format_duration(start_time.elapsed());
 
-            if json {
+            if let Some(before) = before {
+                let report = reify_output::report_between(&before, &reify_output::snapshot(&report_dir));
+                reify_output::finish(&report_dir, &report, json, false, silent, start_time.elapsed()).await?;
+            } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
                     "added": 0,
