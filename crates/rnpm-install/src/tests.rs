@@ -4300,6 +4300,64 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
     );
 }
 
+#[test]
+fn test_enrich_lockfile_vitefu_workspaces() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+    let nm_vitefu = project_dir.join("node_modules").join("vitefu");
+    std::fs::create_dir_all(&nm_vitefu).unwrap();
+    std::fs::write(
+        nm_vitefu.join("package.json"),
+        r#"{
+            "name": "vitefu",
+            "version": "1.1.3",
+            "license": "MIT",
+            "workspaces": ["tests/deps/*"]
+        }"#,
+    ).unwrap();
+
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/vitefu",
+        LockfilePackage {
+            version: Some("1.1.3".to_string()),
+            license: Some("MIT".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // A package whose license and engines are already known still gets
+    // `workspaces` from its cached manifest, as npm records it.
+    let cached: Manifest = serde_json::from_str(
+        r#"{"name":"es-toolkit","version":"1.0.0","license":"MIT","engines":{"node":">=18"},"workspaces":["docs"]}"#,
+    )
+    .unwrap();
+    let cache = std::collections::HashMap::from([("node_modules/es-toolkit".to_string(), cached)]);
+    lockfile.insert_package(
+        "node_modules/es-toolkit",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            license: Some("MIT".to_string()),
+            engines: Some(rnpm_lockfile::PackageEngines::Map(BTreeMap::from([(
+                "node".to_string(),
+                ">=18".to_string(),
+            )]))),
+            ..Default::default()
+        },
+    );
+
+    crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir, Some(&cache));
+
+    assert_eq!(
+        lockfile.packages["node_modules/vitefu"].extra.get("workspaces"),
+        Some(&serde_json::json!(["tests/deps/*"]))
+    );
+    assert_eq!(
+        lockfile.packages["node_modules/es-toolkit"].extra.get("workspaces"),
+        Some(&serde_json::json!(["docs"]))
+    );
+}
+
 #[tokio::test]
 async fn test_enrich_lockfile_from_cacache_packument() {
     let temp_project = tempfile::tempdir().unwrap();
