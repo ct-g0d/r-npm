@@ -1,7 +1,7 @@
 //! `npm dist-tag`, ported from npm's lib/commands/dist-tag.js.
 
 use super::client_helper::CommandClient;
-use crate::http_errors::{auth_error_block, e404_block, encode_uri_component, general_message, is_otp_error, prompt_otp};
+use crate::http_errors::{auth_error_block, e404_block, encode_uri_component, general_message, is_otp_error};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -205,7 +205,7 @@ async fn mutate(
         }
     };
     match send(otp).await {
-        Err(err) if is_otp_error(&err) => match prompt_otp() {
+        Err(err) if is_otp_error(&err) => match crate::http_errors::retry_otp(&std::env::current_dir()?, &err).await? {
             Some(code) => send(Some(code)).await,
             None => Err(err),
         },

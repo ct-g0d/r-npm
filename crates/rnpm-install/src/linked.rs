@@ -1351,6 +1351,7 @@ impl Installer {
         collector.record_phase(Phase::Plan, plan_start.elapsed());
 
         Ok(InstallSummary {
+            reify: None,
             packages_installed,
             cache_hits,
             cache_misses,
@@ -1687,6 +1688,7 @@ impl Installer {
         drop(_lock_guard);
 
         Ok(InstallSummary {
+            reify: None,
             packages_installed,
             cache_hits,
             cache_misses,

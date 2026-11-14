@@ -77,8 +77,8 @@ fn test_audit_fix_compatible_resolution() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("fixed 1 vulnerability (1 high) in 1 package"),
-        "stdout must contain fixed summary, got:\n{stdout}"
+        stdout.contains("audited 2 packages") && stdout.contains("found 0 vulnerabilities"),
+        "stdout must contain npm's reify summary and a clean audit, got:\n{stdout}"
     );
     assert!(
         stdout.contains("found 0 vulnerabilities"),
@@ -208,12 +208,12 @@ fn test_audit_fix_incompatible_requires_force() {
     let stdout_force = String::from_utf8_lossy(&output_force.stdout);
     let stderr_force = String::from_utf8_lossy(&output_force.stderr);
     assert!(
-        stderr_force.contains("npm warn audit --force installing breaking changes if necessary"),
+        stderr_force.contains("npm warn audit Updating minimist to "),
         "stderr must warn about breaking changes with --force, got:\n{stderr_force}"
     );
     assert!(
-        stdout_force.contains("fixed 1 vulnerability (1 critical) in 1 package"),
-        "stdout must report 1 critical fixed, got:\n{stdout_force}"
+        stdout_force.contains("changed 1 package") && stdout_force.contains("found 0 vulnerabilities"),
+        "stdout must report the forced change and a clean audit, got:\n{stdout_force}"
     );
 
     // Verify package.json was updated with --force
@@ -296,15 +296,12 @@ fn test_audit_fix_dry_run() {
         .output()
         .expect("Failed to execute rnpm audit fix --dry-run");
 
-    assert!(output.status.success());
+    // npm audits the unchanged tree after a dry run, so it still exits 1.
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("would update lodash from 4.17.15 to 4.17.21"),
-        "stdout must show what would be updated, got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("fixed 1 vulnerability (1 high) in 1 package"),
-        "stdout must show dry-run fixed summary, got:\n{stdout}"
+        stdout.contains("add lodash 4.") && stdout.contains("audited 2 packages"),
+        "stdout must show the planned reify, got:\n{stdout}"
     );
 
     // Files must be untouched on disk
@@ -395,10 +392,9 @@ fn test_audit_fix_multi_package_severities() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("fixed 2 vulnerabilities (1 high, 1 low) in 2 packages"),
-        "stdout must report exact multi-severity summary, got:\n{stdout}"
+        stdout.contains("added 3 packages, and audited 4 packages") && stdout.contains("found 0 vulnerabilities"),
+        "stdout must report the reify summary and a clean audit, got:\n{stdout}"
     );
-    assert!(stdout.contains("found 0 vulnerabilities"));
 }
 
 #[test]

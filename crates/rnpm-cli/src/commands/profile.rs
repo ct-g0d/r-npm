@@ -268,20 +268,7 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         }
     }
 
-    let post_req = client
-        .request(reqwest::Method::POST, target.clone(), args.otp.as_deref())
-        .header("content-type", "application/json")
-        .json(&serde_json::Value::Object(new_user));
-
-    let post_resp = post_req.send().await?;
-    if !post_resp.status().is_success() {
-        let status = post_resp.status();
-        let body = post_resp.text().await.unwrap_or_default();
-        return Err(format_http_error("POST", &target, status, &body));
-    }
-
-    let post_body = post_resp.text().await.unwrap_or_default();
-    let post_val = parse_json_response(&post_body, &target)?;
+    let post_val = client.send_json(current_dir, reqwest::Method::POST, target.clone(), Some(serde_json::Value::Object(new_user)), args.otp.clone()).await?;
     let result_obj = post_val.as_object().ok_or_else(|| {
         anyhow::anyhow!(
             "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"

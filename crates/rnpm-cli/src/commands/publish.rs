@@ -25,6 +25,7 @@ pub(crate) async fn run(args: PublishArgs, current_dir: PathBuf) -> Result<()> {
         args.registry,
         args.ignore_scripts,
         args.json,
+        false,
     )
     .await
 }

@@ -1635,13 +1635,28 @@ impl RegistryClient {
         url: Url,
         if_none_match: Option<&str>,
     ) -> Result<MetadataFetchResult, RegistryError> {
-        self.get_package_metadata_from_url_conditional_with_accept(
-            package_name,
-            url,
-            if_none_match,
-            NPM_INSTALL_V1_JSON,
-        )
-        .await
+        match self
+            .get_package_metadata_from_url_conditional_with_accept(
+                package_name,
+                url.clone(),
+                if_none_match,
+                NPM_INSTALL_V1_JSON,
+            )
+            .await
+        {
+            // pacote treats a corgi 404 as "abbreviated documents unsupported"
+            // and asks once more for the full packument before failing.
+            Err(RegistryError::PackageNotFound { .. }) => {
+                self.get_package_metadata_from_url_conditional_with_accept(
+                    package_name,
+                    url,
+                    if_none_match,
+                    "application/json",
+                )
+                .await
+            }
+            other => other,
+        }
     }
 
     /// Fetch the full npm packument when lockfile metadata omitted by the
@@ -3705,9 +3720,11 @@ impl RegistryClient {
         };
         let (response, _permit) = result;
         let status = response.status();
+        let www = response.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).map(str::to_string);
         let body_text = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(match status {
+                StatusCode::UNAUTHORIZED if www.is_some() => RegistryError::AuthChallenge { url: target.to_string(), www_authenticate: www.unwrap(), body: body_text },
                 StatusCode::UNAUTHORIZED => RegistryError::Unauthorized {
                     url: target.to_string(),
                     status: 401,

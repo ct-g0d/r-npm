@@ -2,6 +2,21 @@ use anyhow::{anyhow, Result};
 use rnpm_core::manifest::Manifest;
 use std::path::PathBuf;
 
+pub(crate) async fn fetch_archive(current_dir: &std::path::Path, raw: &str, registry: Option<String>) -> Result<Vec<u8>> {
+    use rnpm_core::spec::{PackageSpec, PackageTarget};
+    let local = current_dir.join(raw.strip_prefix("file:").unwrap_or(raw));
+    if local.is_file() { return Ok(std::fs::read(local)?); }
+    let spec = PackageSpec::parse(raw)?;
+    let (_, client) = crate::make_registry_client(current_dir, registry)?;
+    if let PackageTarget::Url(url) = &spec.target {
+        return Ok(client.download_tarball_bytes(url.as_str()).await?);
+    }
+    let (name, target) = if let PackageTarget::Alias { name, target } = &spec.target {
+        (name.clone(), target.as_ref().clone())
+    } else { (spec.name, spec.target) };
+    Ok(crate::commands::cache::download_registry_package(&client, raw, &name, &target).await?.0)
+}
+
 pub(crate) struct PackCommandArgs {
     pub target: PathBuf,
     pub dry_run: bool,

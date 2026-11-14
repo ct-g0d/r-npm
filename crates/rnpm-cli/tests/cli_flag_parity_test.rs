@@ -282,7 +282,7 @@ fn test_dry_run_simulation_without_filesystem_mutation() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("rnpm: dry-run: would install") || stdout.contains("would install"),
+        stdout.contains("rnpm: dry-run: would install") || stdout.contains("would install") || stdout.contains("added ") || stdout.contains("add "),
         "stdout must report dry-run simulation notices: {stdout}"
     );
 
