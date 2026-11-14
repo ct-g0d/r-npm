@@ -5605,3 +5605,36 @@ fn test_breadth_first_dependency_depth_prevents_premature_hoisting_from_deep_bra
     );
 }
 
+
+#[test]
+fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
+    // svelte's dev manifest: dts-buddy peers typescript ">=5.0.4 <5.8" while the
+    // root asks for typescript ^5.5.4. npm places dts-buddy first and resolves
+    // the root edge guided by the peer range, choosing 5.7.3 instead of 5.9.3.
+    use crate::overrides::Overrides;
+    use crate::solver::Solver;
+
+    let mut provider = InMemoryPackageProvider::new();
+    for version in ["5.5.4", "5.7.3", "5.9.3"] {
+        provider.add_version("typescript", version, |_| {});
+    }
+    provider.add_version("dts-buddy", "0.5.5", |v| {
+        v.peer_dependencies
+            .insert("typescript".to_string(), ">=5.0.4 <5.8".to_string());
+    });
+    let mut manifest = Manifest::default();
+    manifest.name = Some("svelte-like".to_string());
+    manifest.dev_dependencies.insert("dts-buddy".to_string(), "^0.5.5".to_string());
+    manifest.dev_dependencies.insert("typescript".to_string(), "^5.5.4".to_string());
+
+    let overrides = Overrides::from_manifest(&manifest).unwrap();
+    let graph = Solver::new(&provider, ResolverOptions::default(), overrides)
+        .resolve(&manifest)
+        .expect("npm resolves this tree without ERESOLVE");
+    assert_eq!(graph.nodes["node_modules/typescript"].version, "5.7.3");
+    assert_eq!(
+        graph.edges.iter().filter(|e| e.from_location.is_empty() && e.install_name == "typescript").count(),
+        1,
+        "the root edge is recorded once"
+    );
+}

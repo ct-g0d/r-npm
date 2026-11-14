@@ -67,6 +67,9 @@ struct ResolveTask {
     dep_type: DependencyType,
     parent_depth: usize,
     ancestors: std::sync::Arc<Vec<String>>,
+    /// A second edge whose range should guide version choice, as
+    /// arborist's nodeFromEdge(parentEdge, parent, secondEdge) does.
+    advisory: Option<String>,
 }
 
 /// Main solver coordinator for building the dependency graph.
@@ -77,6 +80,8 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     peer_ctx: PeerContext,
     graph: DependencyGraph,
     queue: VecDeque<ResolveTask>,
+    /// Root edges already resolved early for a peer set.
+    preplaced: std::collections::HashSet<String>,
 }
 
 /// Compares two strings using Arborist-compatible collation.
@@ -126,6 +131,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             peer_ctx: PeerContext::new(),
             graph: DependencyGraph::new(),
             queue: VecDeque::new(),
+            preplaced: std::collections::HashSet::new(),
         }
     }
 
@@ -172,6 +178,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             dep_type,
             parent_depth,
             ancestors,
+            advisory: None,
         });
     }
 
@@ -347,6 +354,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         dep_type,
                         parent_depth: 0,
                         ancestors: root_ancestors.clone(),
+                        advisory: None,
                     });
                 }
             };
@@ -384,6 +392,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn process_task(&mut self, task: ResolveTask) -> Result<(), SolverError> {
+        if task.advisory.is_none()
+            && task.parent_location.is_empty()
+            && self.preplaced.contains(&task.install_name)
+        {
+            return Ok(());
+        }
         if self.options.legacy_peer_deps
             && (task.dep_type == DependencyType::Peer
                 || task.dep_type == DependencyType::PeerOptional)
@@ -667,6 +681,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         if let Ok(target) = PackageTarget::parse(spec) { peer_advisories.push(target); }
                     }
                 }
+            }
+        }
+        if let Some(advisory) = task.advisory.as_deref() {
+            if let Ok(target) = PackageTarget::parse(advisory) {
+                peer_advisories.push(target);
             }
         }
         let matched_version_opt = self.select_version(
@@ -1090,6 +1109,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         dep_type: c_type,
                         parent_depth: child_depth,
                         ancestors: child_ancestors.clone(),
+                        advisory: None,
                     })
                     .collect::<Vec<_>>();
                 // Keep a package's direct dependencies ahead of their
@@ -1111,8 +1131,35 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             .iter().any(|deps| deps.contains_key(&child_task.install_name))
                             && !self.graph.nodes.contains_key(&if peer_scope.is_empty() { format!("node_modules/{}", child_task.install_name) } else { format!("{peer_scope}/node_modules/{}", child_task.install_name) })
                     });
-                    if matches!(child_task.dep_type, DependencyType::Peer | DependencyType::PeerOptional) && !provider_pending {
+                    let is_peer_child = matches!(child_task.dep_type, DependencyType::Peer | DependencyType::PeerOptional);
+                    if is_peer_child && !provider_pending {
                         peer_tasks.push(child_task);
+                    } else if is_peer_child && peer_scope.is_empty() && child_task.dep_type == DependencyType::Peer {
+                        // loadPeerSet: when the peer would land beside a root
+                        // edge for the same name, resolve that root edge now,
+                        // with the peer range as the advisory second edge.
+                        let root = &self.graph.nodes[""];
+                        let name = child_task.install_name.clone();
+                        let root_edge = root.optional_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Optional))
+                            .or_else(|| root.dependencies.get(&name).map(|s| (s.clone(), DependencyType::Prod)))
+                            .or_else(|| root.dev_dependencies.get(&name).map(|s| (s.clone(), DependencyType::Dev)));
+                        if let Some((raw_spec, dep_type)) = root_edge {
+                            let root_task = ResolveTask {
+                                parent_location: String::new(),
+                                parent_package_name: root.name.clone(),
+                                install_name: name.clone(),
+                                raw_spec,
+                                dep_type,
+                                parent_depth: 0,
+                                ancestors: std::sync::Arc::new(vec![root.name.clone()]),
+                                advisory: Some(child_task.raw_spec.clone()),
+                            };
+                            self.preplaced.insert(name);
+                            peer_tasks.push(root_task);
+                            peer_tasks.push(child_task);
+                        } else {
+                            self.push_task(child_task);
+                        }
                     } else {
                         self.push_task(child_task);
                     }
