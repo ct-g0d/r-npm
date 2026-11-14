@@ -1010,7 +1010,7 @@ pub(crate) enum Commands {
         otp: Option<String>,
 
         /// Generate and include provenance attestations
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", default_value = "false")]
         provenance: bool,
 
         /// Custom npm registry URL
@@ -3742,6 +3742,12 @@ pub(crate) async fn execute_publish(
     if let Some(token) = config.npmrc.get_auth_token(&registry_url) {
         client_config.auth_token = Some(token.to_string());
     }
+    if let Some(token) = commands::oidc::exchange(&registry_url, &pkg_name).await {
+        let key = commands::logout::auth_key_for_registry(&registry_url);
+        // Exchange credentials are session-only; never write them to the user's npmrc.
+        client_config.auth_tokens.insert(key.trim_end_matches(":_authToken").to_string(), token.clone());
+        client_config.auth_token = Some(token);
+    }
     let client = rnpm_registry::RegistryClient::with_config(client_config)?;
     let has_creds = client.auth_header_for_url(&registry_url).is_some();
     if !has_creds {
@@ -3825,6 +3831,27 @@ pub(crate) async fn execute_publish(
             shasum: &summary.shasum,
             integrity: &summary.integrity,
         };
+        if tarball_spec && !target_path.is_file() {
+            publish_manifest["_from"] = raw_target.clone().into();
+            publish_manifest["_integrity"] = summary.integrity.clone().into();
+            if raw_target.starts_with("http://") || raw_target.starts_with("https://") {
+                publish_manifest["_resolved"] = raw_target.clone().into();
+            } else {
+                let (_, fetch_client) = make_registry_client(&current_dir, registry.clone())?;
+                let url = fetch_client.registry_for_package(&pkg_name).join(&rnpm_config::encode_package_name(&pkg_name))?;
+                let (response, _permit) = fetch_client.execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None).await?;
+                let metadata: serde_json::Value = response.error_for_status()?.json().await?;
+                if let Some(source) = metadata["versions"].get(&pkg_version) {
+                    let node_version = publish_manifest["_nodeVersion"].clone();
+                    publish_manifest = source.clone();
+                    publish_manifest["_nodeVersion"] = node_version;
+                    publish_manifest["_npmVersion"] = version::NPM_VERSION.into();
+                    publish_manifest["_from"] = raw_target.clone().into();
+                    publish_manifest["_integrity"] = summary.integrity.clone().into();
+                    publish_manifest["_resolved"] = source["dist"]["tarball"].clone();
+                }
+            }
+        }
         let payload_opts = rnpm_registry::PublishPayloadOptions {
             name: &pkg_name,
             version: &pkg_version,
@@ -3840,8 +3867,6 @@ pub(crate) async fn execute_publish(
         let put_url = registry_url
             .join(&if stage { format!("-/stage/package/{}", rnpm_config::encode_package_name(&pkg_name)) } else { rnpm_config::encode_package_name(&pkg_name) })
             .unwrap_or_else(|_| registry_url.clone());
-        let mut otp = otp;
-        let mut may_prompt = true;
         if stage {
             let command_client = commands::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
             let response = command_client.request(reqwest::Method::POST, put_url.clone(), None).json(&payload).send().await?;
@@ -3850,45 +3875,11 @@ pub(crate) async fn execute_publish(
             if !status.is_success() { return Err(commands::client_helper::format_http_error("POST", &put_url, status, &text)); }
             let value: serde_json::Value = serde_json::from_str(&text)?;
             stage_id = value["stageId"].as_str().map(str::to_string);
-        } else { loop {
-            let result = client
-                .publish_to(&registry_url, &pkg_name, &payload, otp.as_deref())
-                .await
-                .map_err(|err| {
-                    use rnpm_registry::RegistryError as E;
-                    let status_error = |status: u16, www: Option<&str>, body: &str| {
-                        commands::client_helper::format_http_error_with_auth(
-                            "PUT",
-                            &put_url,
-                            reqwest::StatusCode::from_u16(status)
-                                .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                            www,
-                            body,
-                        )
-                    };
-                    match err {
-                        E::Forbidden { status, message, .. }
-                        | E::Unauthorized { status, message, .. }
-                        | E::PublishConflict { status, message, .. } => status_error(status, None, &message),
-                        E::AuthChallenge { www_authenticate, body, .. } => {
-                            status_error(401, Some(&www_authenticate), &body)
-                        }
-                        E::ServerError { status, body } => status_error(status, None, &body),
-                        other => anyhow::anyhow!(other),
-                    }
-                });
-            match result {
-                // npm's otplease: on a terminal, prompt for the code and retry once.
-                Err(err) if may_prompt && http_errors::is_otp_error(&err) => {
-                    may_prompt = false;
-                    match http_errors::prompt_otp() {
-                        Some(code) => otp = Some(code),
-                        None => return Err(err),
-                    }
-                }
-                other => break other?,
-            }
-        }}
+        } else {
+            commands::client_helper::with_registry_otp(&current_dir, "PUT", otp, async |code| {
+                client.publish_to(&registry_url, &pkg_name, &payload, code.as_deref()).await
+            }).await?;
+        }
     }
 
     // JSON is only printed once the publish has completed.

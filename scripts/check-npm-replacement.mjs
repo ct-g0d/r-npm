@@ -50,10 +50,11 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/whoami')return json({username:'mock-user'});
   if(url==='/oidc/id-token')return json({value:'mock-id-token'});
   if(url.startsWith('/-/npm/v1/oidc/token/exchange/package/'))return json({token:'mock-exchanged-token'});
-  if(authScenario==='mutation-otp'&&['PUT','POST','DELETE'].includes(req.method)&&!url.includes('/security/')){res.writeHead(401,{'content-type':'application/json','www-authenticate':'OTP'});res.end(JSON.stringify({error:'one-time pass required',authUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}));return;}
+  if(authScenario.startsWith('mutation-otp')&&['PUT','POST','DELETE'].includes(req.method)&&!url.includes('/security/')&&req.headers['npm-otp']!=='123456'){res.writeHead(401,{'content-type':'application/json','www-authenticate':'OTP'});res.end(JSON.stringify({error:'one-time pass required',authUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}));return;}
   if(url==='/-/v1/login')return authScenario==='web'?json({loginUrl:`${registry}auth/login`,doneUrl:`${registry}auth/done`}):json({error:'Mock registry does not provide browser login'},400);
   if(url==='/auth/done'){if(authPolls++===0){res.setHeader('retry-after','0.01');return json({},202);}return json({token:'mock-login-token'});}
   if(url.startsWith('/-/user/org.couchdb.user:')&&req.method==='PUT')return json({token:'mock-login-token'});
+  if(url==='/-/user/org.couchdb.user:mock-user'&&req.method==='GET')return json({name:'mock-user',email:'mock@example.invalid'});
   if(url.endsWith('/trust')&&req.method==='POST'){req.on('end',()=>json(request.body.map((item,i)=>({id:`created-${i+1}`,...item}))));return;}
   if(url.startsWith('/-/stage/package/')&&req.method==='POST')return json({stageId:STAGE_ID});
   if((req.method==='PUT'&&url==='/otp-pkg')||(url==='/-/package/otp-pkg/dist-tags/beta'))if(req.headers['npm-otp']!=='123456'){res.writeHead(401,{'content-type':'application/json','www-authenticate':'OTP'});res.end(JSON.stringify({error:'one-time pass required'}));return;}
@@ -66,7 +67,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/org/mock-org/user')return json({'mock-user':'developer'});
   if(url==='/-/org/mock-org/team')return json([]);
   if(url==='/-/npm/v1/user')return json({name:'mock-user',email:'mock@example.invalid',tfa:false});
-  if(url==='/-/npm/v1/tokens')return json({objects:[],total:0,urls:{}});
+  if(url==='/-/npm/v1/tokens')return json({objects:authScenario==='mutation-otp-valid-token'?[{key:'mock-key',token:'mock-token',created:'2026-11-13T00:00:00.000Z'}]:[],total:authScenario==='mutation-otp-valid-token'?1:0,urls:{}});
   if(url==='/-/_view/starredByUser')return json({rows:[]});
   const stageItem={id:STAGE_ID,packageName:'dep',version:'1.2.0',status:'pending',tag:'latest',createdAt:'2026-11-13T00:00:00.000Z',actor:'mock-user',actorType:'user',shasum:'0123456789abcdef',extra:'kept'};
   if(url==='/-/stage'){const pkg=new URL(req.url,'http://x').searchParams.get('package');return json(pkg==='empty-pkg'?{items:[],total:0}:{items:[stageItem],total:1});}
@@ -135,6 +136,7 @@ add('f1-publish-provenance-config','publish',['publish','--access','public','--i
 for(const command of ['publish','stage'])for(const [name,spec]of [['registry','dep@1.0.0'],['url',`${registry}dep-1.0.0.tgz`]])add(`f1-${command}-remote-${name}`,command,[command,...(command==='stage'?['publish']:[]),spec,'--force','--ignore-scripts'],undefined,{auth:true});
 for(const provider of ['github','gitlab'])add(`f1-publish-oidc-${provider}`,'publish',['publish','--provenance=false','--ignore-scripts'],dir=>manifest(dir,{name:'oidc-pkg'}),{env:provider==='github'?{GITHUB_ACTIONS:'true',ACTIONS_ID_TOKEN_REQUEST_URL:`${registry}oidc/id-token`,ACTIONS_ID_TOKEN_REQUEST_TOKEN:'mock-request-token'}:{GITLAB_CI:'true',NPM_ID_TOKEN:'mock-id-token'},observe:ctx=>ctx.requests.filter(r=>r.url.includes('oidc')).map(r=>({method:r.method,url:r.url,body:r.body}))});
 for(const [name,args]of [['publish',['publish','--ignore-scripts']],['dist-tag',['dist-tag','add','dep@1.0.0','beta']],['access',['access','set','status=public','dep']],['owner',['owner','add','other-user','dep']],['deprecate',['deprecate','dep@1.0.0','old']],['unpublish',['unpublish','dep@1.0.0','--force']],['token',['token','revoke','mock-id']],['profile',['profile','set','fullname','Mock User']]])add(`f1-otp-nontty-${name}`,args[0],args,dir=>manifest(dir,{name:'challenge-pkg'}),{auth:true,authScenario:'mutation-otp'});
+for(const [name,args,scenario]of [['access-scoped',['access','set','status=public','@auth/pkg'],'mutation-otp'],['owner-user',['owner','add','mock-user','parent'],'mutation-otp'],['token-valid',['token','revoke','mock-key'],'mutation-otp-valid-token']])add(`f1-otp-nontty-${name}`,args[0],args,undefined,{auth:true,authScenario:scenario});
 for(const command of ['login','adduser'])add(`f1-${command}-saved-defaults`,command,[command,'--auth-type=legacy'],undefined,{userconfig:`//127.0.0.1:${server.address().port}/:username=mock-user\n//127.0.0.1:${server.address().port}/:_password=${Buffer.from('mock-password').toString('base64')}\n//127.0.0.1:${server.address().port}/:email=mock@example.invalid\n`,input:[{prompt:'Username:',value:''},{prompt:'Password:',value:''},...(command==='adduser'?[{prompt:'Email (this will be public):',value:''}]:[])]});
 for(const [name,flags]of [['global',['-g']],['workspace',['-w','a']],['workspaces',['--workspaces']]])for(const [format,flags2]of [['long',['--long']],['json-long',['--json','--long']],['parseable',['--parseable']],['parseable-long',['--parseable','--long']]])add(`f1-outdated-${name}-${format}`,'outdated',['outdated',...flags,...flags2],dir=>{
   manifest(dir,{workspaces:['modules/*']});

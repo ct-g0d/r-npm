@@ -45,6 +45,9 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
             "public" | "restricted" => Some(action),
             _ => None,
         });
+    if level.is_some() && !package.starts_with('@') {
+        return Err(super::stage::usage_error(Some("This command is only available for scoped packages."), "Set access level on published packages\n\nUsage:\nnpm access list packages [<user>|<scope>|<scope:team>] [<package>]\nnpm access list collaborators [<package> [<user>]]\nnpm access get status [<package>]\nnpm access set status=public|private [<package>]\nnpm access set mfa=none|publish|automation [<package>]\nnpm access grant <read-only|read-write> <scope:team> [<package>]\nnpm access revoke <scope:team> [<package>]\n\nOptions:\n[--json] [--otp <otp>] [--registry <registry>]\n\n  --json\n    Whether or not to output JSON data, rather than the normal output.\n\n  --otp\n    This is a one-time password from a two-factor authenticator.  It's needed\n\n  --registry\n    The base URL of the npm registry.\n\n\nRun \"npm help access\" for more info"));
+    }
     let (registry_url, client) = crate::make_registry_client(&current_dir, args.registry)?;
     let value = match action {
         "public" | "restricted" => {

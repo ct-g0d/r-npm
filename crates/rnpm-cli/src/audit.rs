@@ -908,7 +908,7 @@ fn format_vulnerability(
     Some(
         lines
             .iter()
-            .map(|line| format!("{indent}{line}"))
+            .map(|line| format!("{indent}{}", line.replace('\n', &format!("\n{indent}"))))
             .collect::<Vec<_>>()
             .join("\n"),
     )

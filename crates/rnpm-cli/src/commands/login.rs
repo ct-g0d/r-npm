@@ -167,6 +167,32 @@ fn web_url(body: &Value, key: &str) -> Option<Url> {
         .filter(|u| matches!(u.scheme(), "http" | "https"))
 }
 
+pub(crate) fn open_auth_url(current_dir: &Path, title: &str, url: &Url) -> Result<()> {
+    use std::io::IsTerminal;
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    if config.get_bool("json").unwrap_or(false) {
+        println!("{}", serde_json::to_string_pretty(&json!({"title":title,"url":url.as_str()}))?);
+    } else { println!("{title}:\n{url}"); }
+    if config.get("browser") == Some("false") || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() { return Ok(()); }
+    print!("Press ENTER to open in the browser...");
+    std::io::stdout().flush()?;
+    let browser = config.get("browser").filter(|v| *v != "true").map(str::to_string);
+    let url = url.to_string();
+    // Polling must continue while the opener waits, as npm-profile does.
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() { return; }
+        let mut command = if let Some(browser) = browser {
+            std::process::Command::new(browser)
+        } else if cfg!(windows) {
+            let mut command = std::process::Command::new("rundll32.exe");
+            command.arg("url.dll,FileProtocolHandler"); command
+        } else { std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }) };
+        let _ = command.arg(url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    });
+    Ok(())
+}
+
 async fn web_login(
     client: &CommandClient,
     adduser: bool,
@@ -215,14 +241,13 @@ async fn web_login(
             done_url.set_path(&format!("{prefix}{}", done_url.path()));
         }
     }
-    println!(
-        "{}:\n{login_url}",
+    open_auth_url(current_dir,
         if adduser {
             "Create your account at"
         } else {
             "Login at"
-        }
-    );
+        }, &login_url
+    )?;
     // Resolve auth for the poll URI, rather than sending registry credentials to an unrelated host.
     let poll_client = CommandClient::new(current_dir, Some(done_url.as_str()))?;
     loop {
@@ -393,6 +418,9 @@ pub(crate) async fn run(
     let auth_key = super::logout::auth_key_for_registry(registry_url);
     let nerfed = auth_key.trim_end_matches("_authToken");
     if userconfig.exists() {
+        if let Some(email) = config.npmrc.settings.get(&format!("{nerfed}email")) {
+            rnpm_config::set_config_value_in_file(&userconfig, "email", email)?;
+        }
         for key in [
             "_token".to_string(),
             format!("{nerfed}always-auth"),

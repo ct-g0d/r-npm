@@ -16,6 +16,26 @@ pub(crate) struct CommandClient {
 }
 
 impl CommandClient {
+    pub async fn send_json(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, mut otp: Option<String>) -> Result<serde_json::Value> {
+        for attempt in 0..2 {
+            let mut request = self.request(method.clone(), url.clone(), otp.as_deref());
+            if let Some(body) = &body { request = request.json(body); }
+            let response = request.send().await?;
+            let status = response.status();
+            let www = response.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let text = response.text().await?;
+            if status.is_success() {
+                return if text.trim().is_empty() { Ok(serde_json::Value::Null) } else { parse_json_response(&text, &url) };
+            }
+            let err = format_http_error_with_auth(method.as_str(), &url, status, www.as_deref(), &text);
+            if attempt == 0 {
+                if let Some(code) = crate::http_errors::retry_otp(current_dir, &err).await? { otp = Some(code); continue; }
+            }
+            return Err(err);
+        }
+        unreachable!()
+    }
+
     pub fn new(current_dir: &Path, explicit_registry: Option<&str>) -> Result<Self> {
         let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
         let registry_url = if let Some(reg_str) = explicit_registry {
@@ -103,6 +123,28 @@ impl CommandClient {
             req = req.header("npm-otp", otp_val);
         }
         req
+    }
+}
+
+pub(crate) fn registry_error(method: &str, error: rnpm_registry::RegistryError) -> anyhow::Error {
+    use rnpm_registry::RegistryError as E;
+    match error {
+        E::AuthChallenge { url, www_authenticate, body } => Url::parse(&url).map(|url| format_http_error_with_auth(method, &url, reqwest::StatusCode::UNAUTHORIZED, Some(&www_authenticate), &body)).unwrap_or_else(anyhow::Error::from),
+        E::Unauthorized { url, status, message } | E::Forbidden { url, status, message } | E::PublishConflict { url, status, message } => Url::parse(&url).map(|url| format_http_error(method, &url, reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR), &message)).unwrap_or_else(anyhow::Error::from),
+        other => anyhow::Error::from(other),
+    }
+}
+
+pub(crate) async fn with_registry_otp<T>(current_dir: &Path, method: &str, otp: Option<String>, mut operation: impl AsyncFnMut(Option<String>) -> std::result::Result<T, rnpm_registry::RegistryError>) -> Result<T> {
+    match operation(otp).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let error = registry_error(method, error);
+            match crate::http_errors::retry_otp(current_dir, &error).await? {
+                Some(code) => operation(Some(code)).await.map_err(|e| registry_error(method, e)),
+                None => Err(error),
+            }
+        }
     }
 }
 

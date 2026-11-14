@@ -124,7 +124,7 @@ pub(crate) async fn run(
                         None
                     }
                 })
-                .unwrap_or(token_id.clone());
+                .ok_or_else(|| anyhow::anyhow!("npm error Unknown token id or value \"{token_id}\"."))?;
 
             client.token_revoke(Some(&registry_url), &key_to_remove).await?;
             if json {

@@ -219,6 +219,32 @@ pub(crate) fn is_otp_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("npm error code EOTP")
 }
 
+pub(crate) async fn retry_otp(current_dir: &std::path::Path, error: &anyhow::Error) -> anyhow::Result<Option<String>> {
+    use std::io::IsTerminal;
+    if !is_otp_error(error) || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() { return Ok(None); }
+    let message = error.to_string();
+    let urls: Vec<_> = message.lines().filter_map(|line| line.strip_prefix("npm error   ")).collect();
+    if message.contains("Open this URL in your browser") && urls.len() == 2 {
+        let auth = reqwest::Url::parse(urls[0])?;
+        let done = reqwest::Url::parse(urls[1])?;
+        anyhow::ensure!(matches!(auth.scheme(), "http" | "https") && matches!(done.scheme(), "http" | "https"), "Invalid web authentication URL");
+        crate::commands::login::open_auth_url(current_dir, "Authenticate your account at", &auth)?;
+        let client = crate::commands::client_helper::CommandClient::new(current_dir, Some(done.as_str()))?;
+        loop {
+            let response = client.request(reqwest::Method::GET, done.clone(), None).send().await?;
+            let status = response.status();
+            let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0);
+            let body: serde_json::Value = response.error_for_status()?.json().await?;
+            if status == reqwest::StatusCode::OK {
+                return body["token"].as_str().filter(|v| !v.is_empty()).map(|v| Some(v.to_string())).ok_or_else(|| anyhow::anyhow!("npm error Invalid response from web login endpoint"));
+            }
+            anyhow::ensure!(status == reqwest::StatusCode::ACCEPTED, "npm error Invalid response from web login endpoint");
+            if let Some(seconds) = retry { tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await; }
+        }
+    }
+    Ok(prompt_otp())
+}
+
 /// npm's `otplease` prompt: only on an interactive terminal, mirroring
 /// `read.otp('This operation requires a one-time password.\nEnter OTP:')`.
 pub(crate) fn prompt_otp() -> Option<String> {

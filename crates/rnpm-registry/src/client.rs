@@ -3705,9 +3705,11 @@ impl RegistryClient {
         };
         let (response, _permit) = result;
         let status = response.status();
+        let www = response.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).map(str::to_string);
         let body_text = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(match status {
+                StatusCode::UNAUTHORIZED if www.is_some() => RegistryError::AuthChallenge { url: target.to_string(), www_authenticate: www.unwrap(), body: body_text },
                 StatusCode::UNAUTHORIZED => RegistryError::Unauthorized {
                     url: target.to_string(),
                     status: 401,

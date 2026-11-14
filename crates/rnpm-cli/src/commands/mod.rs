@@ -25,6 +25,7 @@ pub mod owner;
 pub mod ping;
 pub mod whoami;
 pub mod publish;
+pub(crate) mod oidc;
 pub mod deprecate;
 pub mod access;
 pub mod token;
