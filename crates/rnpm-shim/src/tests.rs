@@ -735,3 +735,24 @@ fn test_direct_ps1_shim_escapes_powershell_specials() {
     assert!(ps1.contains("& \"$basedir/../pkg/bin/`$tool``x.exe\"   $args"), "{ps1}");
     assert!(!ps1.contains(r"\$tool"));
 }
+
+#[test]
+fn test_program_shims_match_npm_for_non_node_shebang() {
+    let dir = tempdir().unwrap();
+    let pkg = dir.path().join("node_modules/xyz");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("xyz"), "#!/usr/bin/env bash\nset -euf -o pipefail\n").unwrap();
+    let bin_dir = dir.path().join("node_modules/.bin");
+    create_shims(&bin_dir, "xyz", "xyz/xyz").unwrap();
+    for name in ["xyz", "xyz.cmd", "xyz.ps1"] {
+        let expected = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/program-fixtures").join(name),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&fs::read(bin_dir.join(name)).unwrap()),
+            String::from_utf8_lossy(&expected),
+            "{name}"
+        );
+    }
+}

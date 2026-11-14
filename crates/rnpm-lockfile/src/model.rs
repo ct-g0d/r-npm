@@ -359,7 +359,8 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
     pub dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    // npm-normalize-package-bin drops a bin map with no entries.
+    #[serde(skip_serializing_if = "bin_is_empty", default)]
     pub bin: Option<PackageBin>,
 
     #[serde(
@@ -2036,3 +2037,11 @@ pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
     !(os_ok && cpu_ok && libc_ok)
 }
 
+
+fn bin_is_empty(bin: &Option<PackageBin>) -> bool {
+    match bin {
+        None => true,
+        Some(PackageBin::Map(map)) => map.is_empty(),
+        Some(_) => false,
+    }
+}

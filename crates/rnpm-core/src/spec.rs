@@ -40,8 +40,14 @@ impl PackageTarget {
             return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
         }
 
-        // file: specifier
-        if s.starts_with("file:") {
+        // file: specifier, or a bare path (npa isFilespec: ^(?:[.]|~\/|[/\\]|[a-zA-Z]:))
+        let bytes = s.as_bytes();
+        let is_bare_path = s.starts_with('.')
+            || s.starts_with("~/")
+            || s.starts_with('/')
+            || s.starts_with('\\')
+            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+        if s.starts_with("file:") || is_bare_path {
             return Ok(PackageTarget::File(parse_file_path(s)));
         }
 

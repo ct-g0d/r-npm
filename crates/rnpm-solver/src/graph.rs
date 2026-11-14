@@ -18,6 +18,8 @@ fn normalize_bin_paths(bin: Option<PackageBin>, package_name: &str) -> Option<Pa
                 .collect(),
         ),
     })
+    // npm-normalize-package-bin drops a bin map with no entries.
+    .filter(|bin| !matches!(bin, PackageBin::Map(map) if map.is_empty()))
 }
 
 /// Type classification for dependency relationships.
@@ -516,7 +518,10 @@ impl DependencyGraph {
                         {
                             continue;
                         }
-                        if matches!(k.as_str(), "funding" | "deprecated") {
+                        if k == "funding" && v.is_string() {
+                            // npm normalizes a string funding to { url }.
+                            filtered_extra.insert(k.clone(), serde_json::json!({ "url": v }));
+                        } else if matches!(k.as_str(), "funding" | "deprecated") {
                             filtered_extra.insert(k.clone(), v.clone());
                         }
                     }
