@@ -1257,6 +1257,7 @@ pub struct InstallOptions {
     pub save_peer: bool,
     pub save_bundle: bool,
     pub no_save: bool,
+    pub skip_manifest_save: bool,
     pub package_lock_only: bool,
     pub packages: Vec<String>,
     pub omit_dev: bool,
@@ -1338,6 +1339,7 @@ impl Default for InstallOptions {
             save_peer: false,
             save_bundle: false,
             no_save: false,
+            skip_manifest_save: false,
             package_lock_only: false,
             packages: Vec::new(),
             omit_dev: false,
@@ -2489,8 +2491,8 @@ impl Installer {
                 }
             }
 
-            // Save package.json unless --no-save was passed or in global mode
-            if !self.options.is_global && !self.options.no_save && !self.options.dry_run {
+            // Save package.json unless --no-save was passed, in global mode, or skip_manifest_save is set
+            if !self.options.is_global && !self.options.no_save && !self.options.skip_manifest_save && !self.options.dry_run {
                 save::save_manifests(
                     &self.options.project_dir,
                     &manifest,

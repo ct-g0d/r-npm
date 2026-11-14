@@ -1524,6 +1524,7 @@ pub(crate) enum TokenAction {
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum OwnerAction {
     /// List package owners.
+    #[command(alias = "list")]
     Ls { package: Option<String> },
     /// Add an owner.
     Add { user: String, package: Option<String> },
@@ -2603,6 +2604,12 @@ fn preprocess_init_args(
             continue;
         }
 
+        if initializer.is_some() {
+            forwarded_args.push(token.clone());
+            i += 1;
+            continue;
+        }
+
         if token.starts_with('-') {
             if let Some(consumed) = extract_config_flag(token, next_token, is_silent, overrides) {
                 i += consumed;
@@ -2610,11 +2617,7 @@ fn preprocess_init_args(
             }
         }
 
-        if initializer.is_some() {
-            forwarded_args.push(token.clone());
-        } else {
-            initializer = Some(token.clone());
-        }
+        initializer = Some(token.clone());
         i += 1;
     }
 
@@ -3997,6 +4000,87 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 
+/// Safely updates dependency versions in package.json preserving formatting, indentation,
+/// line endings (CRLF vs LF), and restricting edits exclusively to valid dependency sections.
+pub(crate) fn update_manifest_dependencies(
+    content: &str,
+    updates: &[(String, String)],
+) -> String {
+    if updates.is_empty() {
+        return content.to_string();
+    }
+    let has_crlf = content.contains("\r\n");
+    let lines: Vec<&str> = if has_crlf {
+        content.split("\r\n").collect()
+    } else {
+        content.split('\n').collect()
+    };
+
+    let mut in_dep_section = false;
+    let mut brace_depth = 0;
+    let mut updated_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    let dep_keys = [
+        "\"dependencies\"",
+        "\"devDependencies\"",
+        "\"optionalDependencies\"",
+        "\"peerDependencies\"",
+    ];
+
+    for line in lines {
+        let trimmed = line.trim();
+
+        if !in_dep_section {
+            if dep_keys.iter().any(|k| trimmed.starts_with(k)) {
+                in_dep_section = true;
+                let opens = line.chars().filter(|&c| c == '{').count();
+                let closes = line.chars().filter(|&c| c == '}').count();
+                brace_depth = opens.saturating_sub(closes);
+                if brace_depth == 0 && opens > 0 {
+                    in_dep_section = false;
+                }
+                updated_lines.push(line.to_string());
+                continue;
+            }
+            updated_lines.push(line.to_string());
+        } else {
+            let opens = line.chars().filter(|&c| c == '{').count();
+            let closes = line.chars().filter(|&c| c == '}').count();
+            brace_depth += opens;
+            brace_depth = brace_depth.saturating_sub(closes);
+
+            let mut modified_line = line.to_string();
+            for (pkg_name, new_range) in updates {
+                let key_str = format!("\"{pkg_name}\"");
+                if let Some(pos) = modified_line.find(&key_str) {
+                    if let Some(colon_pos) = modified_line[pos..].find(':') {
+                        let actual_colon = pos + colon_pos;
+                        if let Some(first_quote) = modified_line[actual_colon..].find('"') {
+                            let val_start = actual_colon + first_quote + 1;
+                            if let Some(second_quote) = modified_line[val_start..].find('"') {
+                                let val_end = val_start + second_quote;
+                                let mut new_l = modified_line[..val_start].to_string();
+                                new_l.push_str(new_range);
+                                new_l.push_str(&modified_line[val_end..]);
+                                modified_line = new_l;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if brace_depth == 0 {
+                in_dep_section = false;
+            }
+            updated_lines.push(modified_line);
+        }
+    }
+
+    let joiner = if has_crlf { "\r\n" } else { "\n" };
+    updated_lines.join(joiner)
+}
+
 /// The package name an `audit fix` target names (`a@1`, `node_modules/x/node_modules/a@1`).
 fn audit_fix_target_name(target: &str) -> String {
     let spec = target.rsplit("node_modules/").next().unwrap_or(target);
@@ -4051,9 +4135,35 @@ async fn run_audit_fix(
         }
     }
 
+    let started = std::time::Instant::now();
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     if initial_vulns == 0 {
-        let (report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        return audit::finish_unchanged_fix(project_dir, &report, json, audit_level);
+        let (post_report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
+        let tree = reify_output::snapshot(project_dir);
+        let inventory = tree.keys().filter(|k| !k.is_empty()).count() + 1;
+        let report = rnpm_install::ReifyReport {
+            changes: Vec::new(),
+            inventory,
+        };
+        let fund = config.get_bool("fund").unwrap_or(true);
+        let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+        opts.audit_command = true;
+        let funding = if fund && !dry_run {
+            audit::count_funding_packages(project_dir)
+        } else {
+            0
+        };
+        if !opts.silent {
+            reify_output::print(
+                project_dir,
+                &report,
+                Some(&post_report),
+                funding,
+                &opts,
+                started.elapsed(),
+            )?;
+        }
+        return audit::check_report_threshold(&post_report, audit_level);
     }
 
     // Parse package.json to identify declared dependency ranges
@@ -4194,40 +4304,37 @@ async fn run_audit_fix(
         }
     }
 
-    // 1. If --force updated declared ranges, update package.json PRESERVING key order and formatting!
-    if !manifest_updates.is_empty() && !dry_run {
-        let content = std::fs::read_to_string(&manifest_path)?;
-        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-        for (pkg_name, new_range) in &manifest_updates {
-            let key_str = format!("\"{pkg_name}\"");
-            for line in lines.iter_mut() {
-                if let Some(pos) = line.find(&key_str) {
-                    if let Some(colon_pos) = line[pos..].find(':') {
-                        let actual_colon = pos + colon_pos;
-                        if let Some(first_quote) = line[actual_colon..].find('"') {
-                            let val_start = actual_colon + first_quote + 1;
-                            if let Some(second_quote) = line[val_start..].find('"') {
-                                let val_end = val_start + second_quote;
-                                let mut new_line = line[..val_start].to_string();
-                                new_line.push_str(new_range);
-                                new_line.push_str(&line[val_end..]);
-                                *line = new_line;
-                                break;
+    // Under --force, bump top-level dependents as Arborist's fixVulnerabilities does.
+    if force {
+        let mut top_force_fixes: BTreeMap<String, rnpm_core::semver::Version> = BTreeMap::new();
+        for vuln in initial_report.vulnerabilities.values() {
+            let fix = &vuln.fix_available;
+            if let (Some(fix_name), Some(fix_version)) = (fix["name"].as_str(), fix["version"].as_str()) {
+                if let Ok(ver) = rnpm_core::semver::Version::parse(fix_version) {
+                    top_force_fixes
+                        .entry(fix_name.to_string())
+                        .and_modify(|existing| {
+                            if ver > *existing {
+                                *existing = ver.clone();
                             }
-                        }
-                    }
+                        })
+                        .or_insert(ver);
                 }
             }
         }
-        let mut new_content = lines.join("\n");
-        if content.ends_with('\n') {
-            new_content.push('\n');
+        for (fix_name, fix_ver) in top_force_fixes {
+            let new_range = format!("^{fix_ver}");
+            if !manifest_updates.iter().any(|(n, _)| n == &fix_name) {
+                manifest_updates.push((fix_name.clone(), new_range.clone()));
+            }
+            let target_spec = format!("{fix_name}@{new_range}");
+            if !targets_to_update.contains(&target_spec) {
+                targets_to_update.push(target_spec);
+            }
         }
-        std::fs::write(&manifest_path, new_content)?;
     }
 
     // 2. Perform real package resolution, tarball extraction, and lockfile updates via Installer!
-    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
         registry_url: registry.clone(),
@@ -4253,8 +4360,14 @@ async fn run_audit_fix(
         }
     }
 
-    let started = std::time::Instant::now();
     let mut options = options;
+    if !manifest_updates.is_empty() {
+        options.packages = manifest_updates
+            .iter()
+            .map(|(n, r)| format!("{n}@{r}"))
+            .collect();
+        options.skip_manifest_save = true;
+    }
     options.unlocked_packages = targets_to_update
         .iter()
         .map(|t| audit_fix_target_name(t))
@@ -4267,6 +4380,13 @@ async fn run_audit_fix(
     let mut installer = Installer::new(options)?;
     let summary = installer.install().await?;
     let _ = packages_needing_force;
+
+    // Safely update package.json only after a successful install!
+    if !manifest_updates.is_empty() && !dry_run {
+        let content = std::fs::read_to_string(&manifest_path)?;
+        let new_content = update_manifest_dependencies(&content, &manifest_updates);
+        std::fs::write(&manifest_path, new_content)?;
+    }
 
     // npm reifies, then prints the detailed audit report of the new tree.
     let report = summary.reify.unwrap_or_default();

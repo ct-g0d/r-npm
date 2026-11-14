@@ -48,7 +48,7 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
                 report.changes.push(rnpm_install::ReifyChange::Add(entry(&action.target_path)));
             }
         }
-        report.inventory = before.len() + 1;
+        report.inventory = before.keys().filter(|k| !k.is_empty()).count() + 1;
     } else {
         report = crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
     }

@@ -6,21 +6,27 @@ pub(crate) async fn run(
     current_dir: PathBuf,
     action: crate::OwnerAction,
     registry: Option<String>,
-    json: bool,
+    _json: bool,
     otp: Option<String>,
 ) -> Result<()> {
-    let (registry_url, client) = crate::make_registry_client(&current_dir, registry.clone())?;
     let action = match action {
         crate::OwnerAction::Ls { package } => crate::OwnerAction::Ls { package: Some(get_pkg(&current_dir, package)?) },
         crate::OwnerAction::Add { user, package } => crate::OwnerAction::Add { user, package: Some(get_pkg(&current_dir, package)?) },
         crate::OwnerAction::Rm { user, package } => crate::OwnerAction::Rm { user, package: Some(get_pkg(&current_dir, package)?) },
     };
+    let pkg_name = match &action {
+        crate::OwnerAction::Ls { package: Some(p) } => p,
+        crate::OwnerAction::Add { package: Some(p), .. } => p,
+        crate::OwnerAction::Rm { package: Some(p), .. } => p,
+        _ => unreachable!("package resolved above"),
+    };
+    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+    let target_registry = registry.clone().unwrap_or_else(|| config.npmrc.registry_for_package(pkg_name).as_str().to_string());
+    let (registry_url, client) = crate::make_registry_client(&current_dir, Some(target_registry))?;
     match action {
         crate::OwnerAction::Ls { package: Some(package) } => {
             let value = client.package_owners(Some(&registry_url), &package).await?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else if let Some(maintainers) = value.get("maintainers").and_then(|v| v.as_array()) {
+            if let Some(maintainers) = value.get("maintainers").and_then(|v| v.as_array()) {
                 if maintainers.is_empty() {
                     println!("no admin found");
                 } else {
@@ -65,7 +71,7 @@ pub(crate) async fn run(
                     }
                 }
             } else {
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                println!("no admin found");
             }
         }
         crate::OwnerAction::Add { user, package: Some(package) } => {

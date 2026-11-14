@@ -33,10 +33,8 @@ pub struct ReifyReport {
 /// Splits a location into its parent location and child name. Returns None
 /// for locations that are not inside a node_modules folder.
 fn split_location(location: &str) -> Option<(&str, &str)> {
-    let (parent, name) = match location.rfind("node_modules/") {
-        Some(idx) => (&location[..idx], &location[idx + "node_modules/".len()..]),
-        None => return None,
-    };
+    let idx = location.rfind("node_modules/")?;
+    let (parent, name) = (&location[..idx], &location[idx + "node_modules/".len()..]);
     let parent = parent.strip_suffix('/').unwrap_or(parent);
     if name.is_empty() {
         return None;
@@ -196,7 +194,7 @@ pub fn compute(
         diff_children(loc, &actual_kids, &ideal_kids, &classify, &mut stack);
     }
 
-    ReifyReport { changes, inventory: ideal.len().max(1) }
+    ReifyReport { changes, inventory: ideal_live.len() + 1 }
 }
 
 /// Simulates arborist's placement order for a freshly built ideal tree:
@@ -326,17 +324,28 @@ fn scan(
             out.insert(location, LockfilePackage { link: Some(true), resolved: target, ..Default::default() });
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path.join("package.json")) else { continue };
-        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')) else { continue };
-        let version = manifest["version"].as_str().map(str::to_string);
-        let mut pkg = LockfilePackage { version: version.clone(), ..Default::default() };
-        if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
-            if locked.version == version {
-                pkg.resolved = locked.resolved.clone();
-                pkg.integrity = locked.integrity.clone();
-                pkg.in_bundle = locked.in_bundle;
+        let pkg = if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')) {
+                let version = manifest["version"].as_str().map(str::to_string);
+                let mut p = LockfilePackage { version: version.clone(), ..Default::default() };
+                if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
+                    if locked.version == version {
+                        p.resolved = locked.resolved.clone();
+                        p.integrity = locked.integrity.clone();
+                        p.in_bundle = locked.in_bundle;
+                    }
+                }
+                p
+            } else if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
+                locked.clone()
+            } else {
+                continue;
             }
-        }
+        } else if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
+            locked.clone()
+        } else {
+            continue;
+        };
         out.insert(location.clone(), pkg);
         let nested = path.join("node_modules");
         if nested.is_dir() {

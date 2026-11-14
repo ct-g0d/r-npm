@@ -125,15 +125,72 @@ impl Ctx<'_> {
     }
 }
 
+fn read_pkg_name(current_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(current_dir.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .and_then(|v| v["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string))
+}
+
+fn infer_target_for_registry(cmd: &str, subcmd: &str, rest: &[&str], current_dir: &Path) -> Option<String> {
+    match cmd {
+        "grant" => {
+            if let Some(pkg) = rest.get(1).filter(|p| !p.is_empty()) {
+                Some(pkg.to_string())
+            } else if let Some(scope_team) = rest.first() {
+                let s = scope_team.strip_prefix('@').unwrap_or(scope_team);
+                let scope = s.split(':').next().unwrap_or_default();
+                if !scope.is_empty() {
+                    Some(format!("@{scope}"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "revoke" => {
+            if let Some(pkg) = rest.first().filter(|p| !p.is_empty()) {
+                Some(pkg.to_string())
+            } else {
+                let s = subcmd.strip_prefix('@').unwrap_or(subcmd);
+                let scope = s.split(':').next().unwrap_or_default();
+                if !scope.is_empty() {
+                    Some(format!("@{scope}"))
+                } else {
+                    None
+                }
+            }
+        }
+        "list" => {
+            if subcmd == "packages" {
+                if let Some(owner) = rest.first() {
+                    let s = owner.strip_prefix('@').unwrap_or(owner);
+                    let scope = s.split(':').next().unwrap_or_default();
+                    if !scope.is_empty() {
+                        Some(format!("@{scope}"))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if subcmd == "collaborators" {
+                rest.first().map(|s| s.to_string()).or_else(|| read_pkg_name(current_dir))
+            } else {
+                None
+            }
+        }
+        "get" | "set" => {
+            rest.first().map(|s| s.to_string()).or_else(|| read_pkg_name(current_dir))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
     let json = args.json || config.get_bool("json").unwrap_or(false);
-    let base = match &args.registry {
-        Some(r) => Url::parse(r)?,
-        None => config.npmrc.registry.clone(),
-    };
-    let client = CommandClient::new(&current_dir, Some(base.as_str()))?;
-    let ctx = Ctx { dir: &current_dir, client, base, json, otp: args.otp.clone() };
 
     let mut it = args.args.iter().map(String::as_str);
     let cmd = it.next().ok_or_else(|| usage(None))?;
@@ -142,6 +199,17 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
     }
     let subcmd = it.next().ok_or_else(|| usage(None))?;
     let rest: Vec<&str> = it.collect();
+
+    let target = infer_target_for_registry(cmd, subcmd, &rest, &current_dir);
+    let base = match &args.registry {
+        Some(r) => Url::parse(r)?,
+        None => match target {
+            Some(ref t) => config.npmrc.registry_for_package(t).clone(),
+            None => config.npmrc.registry.clone(),
+        },
+    };
+    let client = CommandClient::new(&current_dir, Some(base.as_str()))?;
+    let ctx = Ctx { dir: &current_dir, client, base, json, otp: args.otp.clone() };
 
     match cmd {
         "grant" => {
@@ -164,9 +232,15 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
         "revoke" => {
             let pkg = rest.first().copied().unwrap_or_default();
             let (scope, team) = parse_team(subcmd);
+            if scope.is_empty() {
+                return Err(anyhow::anyhow!("npm error team must be in format `scope:team`"));
+            }
+            let team = team
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("npm error team must be in format `scope:team`"))?;
             ctx.mutate(
                 Method::DELETE,
-                &format!("/-/team/{scope}/{}/package", team.unwrap_or_default()),
+                &format!("/-/team/{scope}/{team}/package"),
                 serde_json::json!({ "package": pkg }),
             )
             .await
