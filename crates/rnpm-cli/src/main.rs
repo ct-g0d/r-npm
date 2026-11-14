@@ -2081,6 +2081,8 @@ pub(crate) async fn execute_run(
 
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
+        // Fail before any member runs, not as one member's script failure.
+        enforce_run_dev_engines_once()?;
         let mut filters = workspace;
         filters.extend(filter);
         filters.extend(scope);
@@ -4451,10 +4453,20 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
     }
 }
 
+/// The devEngines gate for `run`, applied once per process.
+fn enforce_run_dev_engines_once() -> anyhow::Result<()> {
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    enforce_dev_engines(&std::env::current_dir()?)
+}
+
 /// npm's devEngines gate for the current (non-global) project.
 fn enforce_dev_engines(current_dir: &std::path::Path) -> anyhow::Result<()> {
     let config = rnpm_config::Config::load(Some(current_dir))?;
-    let argv: Vec<String> = std::env::args().collect();
+    // Arguments after `--` belong to the script, not to npm.
+    let argv: Vec<String> = std::env::args().take_while(|a| a != "--").collect();
     let has = |flags: &[&str]| argv.iter().any(|a| flags.contains(&a.as_str()));
     let global = has(&["-g", "--global", "--location=global"])
         || config.get_bool("global").unwrap_or(false);
@@ -6401,10 +6413,7 @@ fn execute_run_sync(
 ) -> anyhow::Result<()> {
     // `npm run` (and test/start/stop/restart, which run through it) checks
     // devEngines once, at the project prefix, before any script.
-    static DEV_ENGINES_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !DEV_ENGINES_CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        enforce_dev_engines(&std::env::current_dir().unwrap_or_else(|_| current_dir.clone()))?;
-    }
+    enforce_run_dev_engines_once()?;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!("package.json not found in {}", current_dir.display()));

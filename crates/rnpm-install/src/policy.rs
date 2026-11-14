@@ -243,6 +243,18 @@ fn js_inspect_value(value: &serde_json::Value) -> String {
     }
 }
 
+/// npm-install-checks' libc family on Linux: read from `/usr/bin/ldd`.
+fn linux_libc_family() -> Option<String> {
+    let ldd = std::fs::read_to_string("/usr/bin/ldd").ok()?;
+    if ldd.contains("musl") {
+        Some("musl".into())
+    } else if ldd.contains("GNU C Library") {
+        Some("glibc".into())
+    } else {
+        None
+    }
+}
+
 /// node's `os.release()`: the kernel release, or `major.minor.build` on Windows.
 fn os_release() -> Option<String> {
     let out = if cfg!(windows) {
@@ -294,7 +306,7 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
             "runtime" => vec![("name", Some("node".into())), ("version", Some(node_version.clone()))],
             "os" => vec![("name", Some(os_name.into())), ("version", os_release())],
             "cpu" => vec![("name", Some(cpu_name.into()))],
-            _ => vec![("name", (os_name == "linux").then(|| "glibc".to_string()))],
+            _ => vec![("name", linux_libc_family().filter(|_| os_name == "linux"))],
         }
     };
 
