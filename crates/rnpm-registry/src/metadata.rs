@@ -252,6 +252,8 @@ pub struct AttestationProvenance {
 pub struct AbbreviatedVersion {
     pub name: String,
     pub version: String,
+    // npm resolves versions without `dist`; it only needs it to fetch a tarball.
+    #[serde(default)]
     pub dist: DistInfo,
     #[serde(default)]
     pub dependencies: IndexMap<String, String>,

@@ -5942,3 +5942,53 @@ fn test_alias_folder_is_not_a_peer_of_the_real_name() {
     assert_eq!(graph.nodes["node_modules/typescript"].version, "6.0.3");
     assert_eq!(graph.nodes["node_modules/@typescript/native"].version, "7.0.2");
 }
+
+#[test]
+fn test_audit_fix_reresolves_vulnerable_chain_in_range() {
+    use crate::solver::resolve_dependency_graph_with_lockfile;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+
+    let chain = ["audit-top", "audit-middle", "audit-branch", "audit-leaf"];
+    let mut provider = InMemoryPackageProvider::new();
+    for (i, name) in chain.iter().enumerate() {
+        for ver in ["1.0.0", "1.1.0", "2.0.0"] {
+            let next = chain.get(i + 1).map(|n| n.to_string());
+            let range = if ver == "2.0.0" { "^2.0.0" } else { "^1.0.0" };
+            provider.add_version(*name, ver, |v| {
+                if let Some(n) = next.clone() {
+                    v.dependencies.insert(n, range.to_string());
+                }
+            });
+        }
+    }
+    let mut manifest = Manifest::default();
+    manifest.name = Some("readiness-case".to_string());
+    manifest.dependencies.insert("audit-top".into(), "^1.0.0".into());
+
+    let mut lockfile = LockfileV3::new("readiness-case", Some("1.0.0".to_string()));
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([("audit-top".to_string(), "^1.0.0".to_string())]));
+    }
+    for (i, name) in chain.iter().enumerate() {
+        lockfile.insert_package(
+            &format!("node_modules/{name}"),
+            LockfilePackage {
+                version: Some("1.0.0".to_string()),
+                dependencies: chain.get(i + 1).map(|n| BTreeMap::from([(n.to_string(), "^1.0.0".to_string())])),
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut options = ResolverOptions::default();
+    options.unlocked_packages = chain.iter().map(|s| s.to_string()).collect();
+    options.vulnerability_constraints.insert(
+        "audit-leaf".into(),
+        vec![rnpm_core::semver::Range::parse("<2.0.0").unwrap()],
+    );
+    options.lockfile = Some(std::sync::Arc::new(lockfile.clone()));
+    let graph = resolve_dependency_graph_with_lockfile(&manifest, &provider, &options, Some(&lockfile)).unwrap();
+    for name in chain {
+        assert_eq!(graph.nodes[&format!("node_modules/{name}")].version, "1.1.0", "{name}");
+    }
+}
