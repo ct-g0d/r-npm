@@ -19,7 +19,8 @@ async fn test_cli_access_set_mock() {
                             let mut buf = [0u8; 4096];
                             let _ = stream.read(&mut buf).await;
                             let access_json = serde_json::json!({
-                                "access": "public"
+                                "access": "public",
+                                "public": true
                             });
                             let body = serde_json::to_vec(&access_json).unwrap();
                             let resp = format!(
@@ -43,8 +44,9 @@ async fn test_cli_access_set_mock() {
         .current_dir(tmp.path())
         .args([
             "access",
-            "public",
-            "sample-pkg",
+            "set",
+            "status=public",
+            "@scope/sample-pkg",
             "--registry",
             &format!("http://{addr}/"),
         ])
