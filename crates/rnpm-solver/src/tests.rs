@@ -1556,20 +1556,19 @@ fn test_optional_peer_when_present_and_incompatible() {
         .dependencies
         .insert("canvas".to_string(), "1.0.0".to_string());
 
-    // In strict mode (strict_peers: true), incompatible optional peer must NOT fail with ERESOLVE!
+    // npm 11: the root pins canvas, so the top-level owner's optional peer
+    // cannot be satisfied or replaced, and strict resolution is ERESOLVE.
     let options = ResolverOptions {
         strict_peers: true,
         ..Default::default()
     };
-    let graph = resolve_dependency_graph(&manifest, &provider, &options)
-        .expect("Incompatible optional peer must be omitted silently, not fail resolution");
+    let err = resolve_dependency_graph(&manifest, &provider, &options).unwrap_err();
+    assert!(err.is_peer_conflict(), "{err}");
 
-    assert!(graph.nodes.contains_key("node_modules/chart-pkg"));
-    assert!(graph.nodes.contains_key("node_modules/canvas"));
-    assert_eq!(
-        graph.nodes.get("node_modules/canvas").unwrap().version,
-        "1.0.0"
-    );
+    // --legacy-peer-deps ignores peers entirely.
+    let legacy = ResolverOptions { legacy_peer_deps: true, ..Default::default() };
+    let graph = resolve_dependency_graph(&manifest, &provider, &legacy).unwrap();
+    assert_eq!(graph.nodes["node_modules/canvas"].version, "1.0.0");
 }
 
 #[test]
@@ -4220,16 +4219,10 @@ fn test_adversarial_bipartite_peer_mesh_with_optional_and_strict() {
         .dependencies
         .insert("plugin-optional-conflict".to_string(), "1.0.0".to_string());
 
-    let opt_graph = resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts)
-        .expect("Incompatible optional peer must be omitted and not fail strict resolution");
-    let opt_edges = opt_graph.get_outgoing_edges("node_modules/plugin-optional-conflict");
-    assert!(opt_edges
-        .iter()
-        .any(|e| e.package_name == "core-renderer" && e.dep_type == DependencyType::Peer));
-    assert!(
-        !opt_edges.iter().any(|e| e.package_name == "core-engine"),
-        "Incompatible optional peer must be omitted"
-    );
+    // The root pins core-engine@2, so the top-level plugin's optional peer
+    // (^3) is an unresolvable conflict, as in npm 11.
+    let err = resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts).unwrap_err();
+    assert!(err.is_peer_conflict(), "{err}");
 }
 
 #[test]

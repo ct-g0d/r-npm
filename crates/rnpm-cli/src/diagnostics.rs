@@ -31,7 +31,9 @@ impl Diagnostic {
     /// npm error <message>
     /// npm error <detail>
     pub fn format_npm(&self) -> String {
-        if self.message.contains("npm error code ") {
+        // A pre-rendered block, with or without a code line (npm prints no
+        // code for plain errors).
+        if self.message.contains("npm error code ") || self.message.starts_with("npm error ") {
             return self.message.clone();
         }
         let mut out = format!("npm error code {}\nnpm error {}", self.code, self.message);

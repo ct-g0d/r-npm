@@ -1357,3 +1357,17 @@ fn test_manifest_compact_single_line_roundtrip() {
     assert_eq!(serialized, single_line);
 }
 
+
+#[test]
+fn test_hyphen_range_with_partial_upper_is_not_a_version() {
+    use crate::semver::Version;
+    use crate::spec::PackageTarget;
+    assert!(Version::parse("2.5.0 - 3").is_err());
+    match PackageTarget::parse("2.5.0 - 3").unwrap() {
+        PackageTarget::Range(range) => {
+            assert!(range.satisfies(&Version::parse("3.2.4").unwrap()));
+            assert!(!range.satisfies(&Version::parse("4.0.0").unwrap()));
+        }
+        other => panic!("expected a range, got {other:?}"),
+    }
+}

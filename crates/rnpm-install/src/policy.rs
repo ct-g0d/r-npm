@@ -216,6 +216,212 @@ fn js_inspect_map(map: &[(String, String)]) -> String {
     format!("{{ {body} }}")
 }
 
+fn js_inspect_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => js_inspect_str(s),
+        serde_json::Value::Array(items) if items.is_empty() => "[]".into(),
+        serde_json::Value::Array(items) => {
+            format!("[ {} ]", items.iter().map(js_inspect_value).collect::<Vec<_>>().join(", "))
+        }
+        serde_json::Value::Object(map) if map.is_empty() => "{}".into(),
+        serde_json::Value::Object(map) => {
+            let body = map
+                .iter()
+                .map(|(k, v)| {
+                    let key = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                        k.clone()
+                    } else {
+                        js_inspect_str(k)
+                    };
+                    format!("{key}: {}", js_inspect_value(v))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {body} }}")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// node's `os.release()`: the kernel release, or `major.minor.build` on Windows.
+fn os_release() -> Option<String> {
+    let out = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/c", "ver"]).output().ok()?
+    } else {
+        std::process::Command::new("uname").arg("-r").output().ok()?
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    if cfg!(windows) {
+        let start = text.find(|c: char| c.is_ascii_digit())?;
+        let ver: String = text[start..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        Some(ver.split('.').take(3).collect::<Vec<_>>().join("."))
+    } else {
+        Some(text.trim().to_string())
+    }
+}
+
+/// npm-install-checks `checkDevEngines`, as npm runs it before arborist
+/// commands and `run`: an unmatched `devEngines` entry fails with
+/// EBADDEVENGINES (or warns with `onFail: "warn"`, or under `--force`).
+pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
+    let Some(dev_engines) = std::fs::read_to_string(project_dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|pkg| pkg.get("devEngines").cloned())
+    else {
+        return Ok(());
+    };
+    let Some(wanted) = dev_engines.as_object() else {
+        return Err(anyhow!("npm error Invalid non-object value for \"devEngines\""));
+    };
+
+    let node_version = rnpm_lifecycle::node_version();
+    let node_version = if node_version.starts_with('v') { node_version } else { format!("v{node_version}") };
+    let os_name = match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        other => other,
+    };
+    let cpu_name = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let current_for = |engine: &str| -> Vec<(&'static str, Option<String>)> {
+        match engine {
+            "packageManager" => vec![("name", Some("npm".into())), ("version", Some(rnpm_lifecycle::NPM_VERSION.into()))],
+            "runtime" => vec![("name", Some("node".into())), ("version", Some(node_version.clone()))],
+            "os" => vec![("name", Some(os_name.into())), ("version", os_release())],
+            "cpu" => vec![("name", Some(cpu_name.into()))],
+            _ => vec![("name", (os_name == "linux").then(|| "glibc".to_string()))],
+        }
+    };
+
+    struct Failure {
+        message: String,
+        errors: Vec<String>,
+        is_warn: bool,
+        current: String,
+        required: String,
+    }
+    let mut failures = Vec::new();
+    for (engine, authored) in wanted {
+        if !["packageManager", "runtime", "cpu", "libc", "os"].contains(&engine.as_str()) {
+            return Err(anyhow!("npm error Invalid property \"devEngines.{engine}\""));
+        }
+        let deps: Vec<&serde_json::Value> = match authored {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        if deps.is_empty() {
+            continue;
+        }
+        let current = current_for(engine);
+        let current_name = current[0].1.clone();
+        let current_version = current.get(1).and_then(|(_, v)| v.clone());
+        let mut dep_errors = Vec::new();
+        for dep in &deps {
+            let Some(dep) = dep.as_object() else {
+                return Err(anyhow!("npm error Invalid non-object value for \"{engine}\""));
+            };
+            if let Some(prop) = dep.keys().find(|k| !["name", "version", "onFail"].contains(&k.as_str())) {
+                return Err(anyhow!("npm error Invalid property \"{prop}\" for \"{engine}\""));
+            }
+            let Some(name) = dep.get("name") else {
+                return Err(anyhow!("npm error Missing \"name\" property for \"{engine}\""));
+            };
+            let Some(name) = name.as_str() else {
+                return Err(anyhow!("npm error Invalid non-string value for \"name\" within \"{engine}\""));
+            };
+            let Some(current_name) = current_name.as_deref() else {
+                return Err(anyhow!("npm error Unable to determine \"name\" for \"{engine}\""));
+            };
+            if let Some(on_fail) = dep.get("onFail") {
+                match on_fail.as_str() {
+                    Some("ignore" | "warn" | "error" | "download") => {}
+                    Some(other) => return Err(anyhow!("npm error Invalid onFail value \"{other}\" for \"{engine}\"")),
+                    None => return Err(anyhow!("npm error Invalid non-string value for \"onFail\" within \"{engine}\"")),
+                }
+            }
+            if name != current_name {
+                dep_errors.push(format!("Invalid name \"{name}\" does not match \"{current_name}\" for \"{engine}\""));
+                continue;
+            }
+            if let Some(version) = dep.get("version") {
+                let Some(version) = version.as_str() else {
+                    return Err(anyhow!("npm error Invalid non-string value for \"version\" within \"{engine}\""));
+                };
+                // os.version is the kernel release, which rnpm does not read.
+                let Some(current_version) = current_version.as_deref() else { continue };
+                let parsed = rnpm_core::semver::Version::parse(current_version.trim_start_matches('v')).ok();
+                match rnpm_core::semver::Range::parse(version) {
+                    Ok(range) => {
+                        if !parsed.is_some_and(|v| range.satisfies(&v)) {
+                            dep_errors.push(format!("Invalid semver version \"{version}\" does not match \"{current_version}\" for \"{engine}\""));
+                        }
+                    }
+                    Err(_) if version != current_version => {
+                        dep_errors.push(format!("Invalid version \"{version}\" does not match \"{current_version}\" for \"{engine}\""));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        if dep_errors.len() == deps.len() {
+            let on_fail = deps
+                .last()
+                .and_then(|d| d.get("onFail"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
+            if on_fail == "ignore" {
+                continue;
+            }
+            let current = serde_json::Value::Object(
+                current
+                    .into_iter()
+                    .filter_map(|(k, v)| v.map(|v| (k.to_string(), serde_json::Value::String(v))))
+                    .collect(),
+            );
+            failures.push(Failure {
+                message: format!("Invalid devEngines.{engine}"),
+                errors: dep_errors,
+                is_warn: on_fail == "warn",
+                current: js_inspect_value(&current),
+                required: js_inspect_value(authored),
+            });
+        }
+    }
+
+    let render = |failure: &Failure, first: bool, prefix: &str| -> String {
+        let mut lines = Vec::new();
+        if first {
+            lines.push("The developer of this package has specified the following through devEngines".to_string());
+        }
+        lines.push(failure.message.clone());
+        lines.extend(failure.errors.iter().cloned());
+        lines.push("{".into());
+        lines.push(format!("  current: {},", failure.current));
+        lines.push(format!("  required: {}", failure.required));
+        lines.push("}".into());
+        lines.iter().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+    };
+    let (errors, warnings): (Vec<_>, Vec<_>) = failures.into_iter().partition(|f| !f.is_warn);
+    let shown: Vec<&Failure> = warnings.iter().chain(errors.iter().filter(|_| force)).collect();
+    for (i, failure) in shown.iter().enumerate() {
+        eprintln!("{}", render(failure, i == 0, "npm warn EBADDEVENGINES "));
+    }
+    if !force {
+        if let Some(failure) = errors.first() {
+            return Err(anyhow!(
+                "npm error code EBADDEVENGINES\n{}",
+                render(failure, true, "npm error EBADDEVENGINES ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check every resolved package's `engines` against the running node/npm.
 /// Mismatches warn like npm; with `engine-strict` (and no `--force`) the
 /// first one fails with EBADENGINE before anything is installed.

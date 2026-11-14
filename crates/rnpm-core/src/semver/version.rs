@@ -62,7 +62,8 @@ impl Version {
         // node-semver strips leading 'v', 'V', or '='
         let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
         let s = s.trim();
-        if s.is_empty() {
+        // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
+        if s.is_empty() || s.contains(char::is_whitespace) {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
 
@@ -138,7 +139,8 @@ impl Version {
         // node-semver loose mode strips leading 'v', 'V', '=', and whitespace
         let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
         let s = s.trim();
-        if s.is_empty() {
+        // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
+        if s.is_empty() || s.contains(char::is_whitespace) {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
 
