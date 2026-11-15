@@ -1498,7 +1498,10 @@ fn reify_report_for(
         &ideal.packages,
         actual,
         ideal_rank,
-        |_, p| {
+        |key, p| {
+            if lockfile_entry_omitted(options, ideal, key, p) {
+                return true;
+            }
             // A link is omitted with its target.
             let p = match p.resolved.as_deref() {
                 Some(target) if p.link == Some(true) && !target.is_empty() => {
@@ -1524,6 +1527,38 @@ fn reify_report_for(
         },
         |loc| include.is_none_or(|set| set.contains(loc)),
     )
+}
+
+/// The hidden lockfile describes the tree on disk: omitted packages are not
+/// part of it.
+fn without_omitted(options: &InstallOptions, lockfile: &LockfileV3) -> LockfileV3 {
+    let mut kept = lockfile.clone();
+    kept.packages.retain(|key, info| {
+        key.is_empty() || !lockfile_entry_omitted(options, lockfile, key, info)
+    });
+    kept
+}
+
+/// The lockfile location `name` resolves to from `from`, walking up the
+/// node_modules scopes as Node#resolve does.
+fn lockfile_resolves_to<'l>(lockfile: &'l LockfileV3, from: &str, name: &str) -> Option<&'l str> {
+    let mut scope = from;
+    loop {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{name}")
+        } else {
+            format!("{scope}/node_modules/{name}")
+        };
+        if let Some((location, _)) = lockfile.packages.get_key_value(&candidate) {
+            return Some(location.as_str());
+        }
+        if scope.is_empty() {
+            return None;
+        }
+        scope = scope
+            .rsplit_once("/node_modules/")
+            .map_or("", |(parent, _)| parent);
+    }
 }
 
 /// Node.shouldOmit from arborist, over lockfile flags.
@@ -1561,6 +1596,7 @@ fn lockfile_entry_omitted(
                     && (has(&entry.dependencies)
                         || has(&entry.optional_dependencies)
                         || has(&entry.peer_dependencies))
+                    && lockfile_resolves_to(lockfile, location, name) == Some(key)
             })
         });
     let is_dev = info.dev.unwrap_or(false) || self_link_dev;
@@ -6057,7 +6093,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         collector.record_phase(Phase::Bins, t_bins.elapsed());
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
-                            let _ = lockfile_ref.save_hidden(project_dir_ref);
+                            let _ = without_omitted(&self.options, lockfile_ref)
+                                .save_hidden(project_dir_ref);
                             collector.record_phase(Phase::Lockfile, t_lock.elapsed());
                         }
                     }
@@ -6544,6 +6581,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && has_packages
         {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
+            lockfile = without_omitted(&self.options, &lockfile);
             lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
                 .save_hidden(&self.options.project_dir)

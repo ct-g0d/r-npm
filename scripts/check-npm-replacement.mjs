@@ -577,6 +577,9 @@ for(const flags of [[],['--omit=dev']])add('ci-missing-link-target'+flags.join('
 // no optional-peer edges of its own, so the root's dev dependency stays dev.
 // A self link that a production package also reaches (through a peer) is
 // not dev, so ci --omit=dev keeps it.
+// A production dependency on another copy of the root's name resolves to its
+// nested copy, not the self link, which stays dev.
+add('ci-omit-dev-self-link-name-nested-elsewhere','ci',['ci','--ignore-scripts','--omit=dev'],dir=>manifest(dir,{name:'shared',dependencies:{'z-prod':'1.0.0'},devDependencies:{shared:'file:.'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 add('ci-omit-dev-self-link-reached-by-prod','ci',['ci','--ignore-scripts','--omit=dev'],dir=>manifest(dir,{name:'b-ws-peer-member',dependencies:{'a-ws-peer-owner':'1.0.0'},devDependencies:{'b-ws-peer-member':'file:.'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 for(const flags of [[],['--package-lock-only']])add(`install-root-self-link-optional-peer${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{name:'b-ws-peer-member',dependencies:{'a-ws-peer-owner':'1.0.0'},devDependencies:{'b-ws-peer-member':'file:.',dep:'^1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}));
 // A bundled link's target has no parent in npm's tree: nothing behind it is inBundle.
