@@ -2231,6 +2231,31 @@ impl Installer {
             ));
         };
 
+        // npm-package-arg rejects unknown spec protocols (yarn/pnpm's
+        // `workspace:`, `patch:`, `link:`...) while loading the root and
+        // workspace edges, before anything is resolved.
+        if !self.options.is_global {
+            let members = discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default();
+            let manifests = std::iter::once(&manifest).chain(members.iter().map(|m| &m.manifest));
+            for m in manifests {
+                let specs = m
+                    .dependencies
+                    .values()
+                    .chain(m.optional_dependencies.values())
+                    .chain(m.dev_dependencies.values())
+                    .chain(m.peer_dependencies.values());
+                for spec in specs {
+                    if let Some(protocol) = rnpm_core::spec::unsupported_protocol(spec) {
+                        return Err(anyhow!(
+                            "npm error code EUNSUPPORTEDPROTOCOL
+npm error Unsupported URL Type \"{protocol}\": {spec}"
+                        ));
+                    }
+                }
+            }
+        }
+
         // Fast path: if package.json matches existing committed lockfile and no package args were passed,
         // take the exact same reification fast path as `ci` without re-resolving through network metadata or calling solver!
         if self.options.packages.is_empty()

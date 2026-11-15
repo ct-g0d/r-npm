@@ -567,3 +567,75 @@ fn expand_github_shorthand(spec: &str) -> String {
         spec.to_string()
     }
 }
+
+/// npm-package-arg's `fromURL` check: a dependency spec that is not a file
+/// path, `npm:` alias or hosted-git shortcut, yet looks like `scheme:...`, is
+/// parsed as a URL, and any scheme other than git or http(s) is rejected.
+/// Returns the protocol (with its colon) npm reports as unsupported.
+pub fn unsupported_protocol(spec: &str) -> Option<String> {
+    let lower = spec.to_ascii_lowercase();
+    let scheme_len = lower.find(':')?;
+    let scheme = &lower[..scheme_len];
+    let plain = scheme.strip_prefix("git+").unwrap_or(scheme);
+    if plain.is_empty() || !plain.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    // A single letter is a Windows drive path, handled as a file spec.
+    if scheme.len() == 1 {
+        return None;
+    }
+    const ACCEPTED: &[&str] = &[
+        "file",
+        "npm",
+        "github",
+        "gitlab",
+        "bitbucket",
+        "gist",
+        "git",
+        "git+http",
+        "git+https",
+        "git+rsync",
+        "git+ftp",
+        "git+file",
+        "git+ssh",
+        "http",
+        "https",
+    ];
+    (!ACCEPTED.contains(&scheme)).then(|| format!("{scheme}:"))
+}
+
+#[cfg(test)]
+mod unsupported_protocol_tests {
+    use super::unsupported_protocol;
+
+    #[test]
+    fn matches_npa_from_url() {
+        for spec in [
+            "workspace:*",
+            "workspace:^",
+            "link:../x",
+            "catalog:",
+            "portal:../y",
+        ] {
+            assert!(unsupported_protocol(spec).is_some(), "{spec}");
+        }
+        assert_eq!(
+            unsupported_protocol("patch:a@npm%3A1.0.0#~/p.patch").as_deref(),
+            Some("patch:")
+        );
+        for spec in [
+            "^1.0.0",
+            "file:../x",
+            "npm:a@1",
+            "github:u/r",
+            "git+ssh://git@h:u/r.git",
+            "https://h/x.tgz",
+            r"C:\x",
+            "latest",
+            "u/r",
+            "git://h/r.git",
+        ] {
+            assert_eq!(unsupported_protocol(spec), None, "{spec}");
+        }
+    }
+}

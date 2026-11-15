@@ -119,8 +119,16 @@ impl WorkspaceDependencyGraph {
             dev_deps.insert(member.name.clone(), member_dev);
         }
 
-        // 2. Perform topological sorting and cycle detection
-        let topological_order = topological_sort_with_dev_deps(&member_map, &prod_deps, &dev_deps)?;
+        // 2. Topological order. npm installs cyclic workspaces, so a
+        // production cycle only loses its back-edges, as dev cycles do.
+        let topological_order = topological_sort_with_dev_deps(&member_map, &prod_deps, &dev_deps)
+            .or_else(|_| {
+                let mut merged = dev_deps.clone();
+                for (name, deps) in &prod_deps {
+                    merged.entry(name.clone()).or_default().extend(deps.clone());
+                }
+                topological_sort_with_dev_deps(&member_map, &BTreeMap::new(), &merged)
+            })?;
 
         Ok(Self {
             members: member_map,

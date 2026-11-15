@@ -812,8 +812,7 @@ fn test_workspace_protocol_dependencies_and_topo_sort() {
 }
 
 #[test]
-fn test_workspace_circular_dependencies_detected() {
-    use crate::error::SolverError;
+fn test_workspace_circular_dependencies_allowed() {
     use crate::workspace::WorkspaceDependencyGraph;
     use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
@@ -847,17 +846,10 @@ fn test_workspace_circular_dependencies_detected() {
         manifest: manifest_b,
     };
 
+    // npm installs cyclic workspaces; the cycle only loses a back-edge.
     let result = WorkspaceDependencyGraph::construct(&[member_a, member_b]);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    match err {
-        SolverError::CycleDetected(msg) => {
-            assert!(msg.contains("Circular workspace dependency detected"));
-            assert!(msg.contains("pkg-a"));
-            assert!(msg.contains("pkg-b"));
-        }
-        other => panic!("Expected CycleDetected error, got: {:?}", other),
-    }
+    let graph = result.expect("cyclic workspaces are allowed");
+    assert_eq!(graph.topological_order.len(), 2);
 
     // 3-node cycle: A -> B -> C -> A
     let mut m_a = Manifest::default();
@@ -896,12 +888,9 @@ fn test_workspace_circular_dependencies_detected() {
         manifest: m_c,
     };
 
-    let err3 = WorkspaceDependencyGraph::construct(&[member_a3, member_b3, member_c3]).unwrap_err();
-    if let SolverError::CycleDetected(msg) = err3 {
-        assert!(msg.contains("Circular workspace dependency detected"));
-    } else {
-        panic!("Expected CycleDetected error for 3-node cycle");
-    }
+    let graph3 = WorkspaceDependencyGraph::construct(&[member_a3, member_b3, member_c3])
+        .expect("3-node workspace cycle is allowed");
+    assert_eq!(graph3.topological_order.len(), 3);
 
     // Self cycle: A -> A
     let mut m_self = Manifest::default();
@@ -917,12 +906,9 @@ fn test_workspace_circular_dependencies_detected() {
         manifest: m_self,
     };
 
-    let err_self = WorkspaceDependencyGraph::construct(&[member_self]).unwrap_err();
-    if let SolverError::CycleDetected(msg) = err_self {
-        assert!(msg.contains("self-pkg -> self-pkg"));
-    } else {
-        panic!("Expected self cycle detection");
-    }
+    let graph_self = WorkspaceDependencyGraph::construct(&[member_self])
+        .expect("a self-dependent workspace is allowed");
+    assert_eq!(graph_self.topological_order, vec!["self-pkg".to_string()]);
 }
 
 #[test]
@@ -1961,7 +1947,6 @@ fn test_extreme_monorepo_50_fixture() {
 
 #[test]
 fn test_extreme_circular_monorepo_fixture() {
-    use crate::error::SolverError;
     use crate::workspace::WorkspaceDependencyGraph;
     use rnpm_core::workspace::discover_workspaces;
     use std::path::PathBuf;
@@ -1980,16 +1965,10 @@ fn test_extreme_circular_monorepo_fixture() {
         "Must discover exactly 2 workspace packages"
     );
 
-    let result = WorkspaceDependencyGraph::construct(&members);
-    assert!(result.is_err(), "Must detect circular dependency");
-    match result.unwrap_err() {
-        SolverError::CycleDetected(msg) => {
-            assert!(msg.contains("Circular workspace dependency detected"));
-            assert!(msg.contains("circ-a"));
-            assert!(msg.contains("circ-b"));
-        }
-        other => panic!("Expected CycleDetected error, got: {:?}", other),
-    }
+    // npm installs cyclic workspaces.
+    let graph =
+        WorkspaceDependencyGraph::construct(&members).expect("cyclic workspaces are allowed");
+    assert_eq!(graph.topological_order.len(), 2);
 }
 
 #[test]
@@ -3568,7 +3547,28 @@ fn test_dev_reachability_marks_transitive_lockfile_entries() {
 #[test]
 fn test_workspace_cycle_detection_clean_messages() {
     use crate::error::SolverError;
-    use crate::workspace::WorkspaceDependencyGraph;
+    // Cycle reports come from the strict topological sort; installing a
+    // cyclic workspace still succeeds (npm allows it).
+    fn strict_cycle(members: &[WorkspaceMember]) -> SolverError {
+        let map: std::collections::BTreeMap<String, WorkspaceMember> = members
+            .iter()
+            .map(|m| (m.name.clone(), m.clone()))
+            .collect();
+        let deps = members
+            .iter()
+            .map(|m| {
+                let sibling = m
+                    .manifest
+                    .dependencies
+                    .iter()
+                    .filter(|(k, _)| map.contains_key(*k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                (m.name.clone(), sibling)
+            })
+            .collect();
+        crate::workspace::topological_sort(&map, &deps).unwrap_err()
+    }
     use rnpm_core::workspace::WorkspaceMember;
     use std::path::PathBuf;
 
@@ -3599,7 +3599,7 @@ fn test_workspace_cycle_detection_clean_messages() {
         manifest: mb,
     };
 
-    let err2 = WorkspaceDependencyGraph::construct(&[mem_a, mem_b]).unwrap_err();
+    let err2 = strict_cycle(&[mem_a, mem_b]);
     match err2 {
         SolverError::CycleDetected(msg) => {
             assert_eq!(
@@ -3647,7 +3647,7 @@ fn test_workspace_cycle_detection_clean_messages() {
         manifest: m3,
     };
 
-    let err3 = WorkspaceDependencyGraph::construct(&[mem1, mem2, mem3]).unwrap_err();
+    let err3 = strict_cycle(&[mem1, mem2, mem3]);
     match err3 {
         SolverError::CycleDetected(msg) => {
             assert_eq!(
@@ -3671,7 +3671,7 @@ fn test_workspace_cycle_detection_clean_messages() {
         manifest: ms,
     };
 
-    let err_s = WorkspaceDependencyGraph::construct(&[mem_s]).unwrap_err();
+    let err_s = strict_cycle(&[mem_s]);
     match err_s {
         SolverError::CycleDetected(msg) => {
             assert_eq!(
@@ -3721,7 +3721,7 @@ fn test_workspace_cycle_detection_clean_messages() {
         manifest: my,
     };
 
-    let err_prefix = WorkspaceDependencyGraph::construct(&[mem_entry, mem_x, mem_y]).unwrap_err();
+    let err_prefix = strict_cycle(&[mem_entry, mem_x, mem_y]);
     match err_prefix {
         SolverError::CycleDetected(msg) => {
             assert_eq!(

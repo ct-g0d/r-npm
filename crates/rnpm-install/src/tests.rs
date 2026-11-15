@@ -1278,14 +1278,14 @@ async fn test_workspace_installation_linking_and_lockfile() {
     )
     .unwrap();
 
-    // 3. Member B: @mono/lib-b depends on @mono/lib-a via workspace:*
+    // 3. Member B: @mono/lib-b depends on @mono/lib-a by version range
     let lib_b_dir = root.join("packages").join("lib-b");
     fs::create_dir_all(&lib_b_dir).unwrap();
     let lib_b_json = r#"{
         "name": "@mono/lib-b",
         "version": "2.0.0",
         "dependencies": {
-            "@mono/lib-a": "workspace:*"
+            "@mono/lib-a": "^1.2.0"
         }
     }"#;
     fs::write(lib_b_dir.join("package.json"), lib_b_json).unwrap();
@@ -1295,15 +1295,15 @@ async fn test_workspace_installation_linking_and_lockfile() {
     )
     .unwrap();
 
-    // 4. Member C: app depends on @mono/lib-b via workspace:^ and @mono/lib-a via workspace:~
+    // 4. Member C: app depends on @mono/lib-b and @mono/lib-a by version range
     let app_dir = root.join("packages").join("app");
     fs::create_dir_all(&app_dir).unwrap();
     let app_json = r#"{
         "name": "my-app",
         "version": "0.1.0",
         "dependencies": {
-            "@mono/lib-b": "workspace:^",
-            "@mono/lib-a": "workspace:~"
+            "@mono/lib-b": "^2.0.0",
+            "@mono/lib-a": "~1.2.0"
         },
         "bin": {
             "run-app": "./app.js"
@@ -1427,7 +1427,7 @@ async fn test_workspace_installation_linking_and_lockfile() {
 }
 
 #[tokio::test]
-async fn test_workspace_installation_detects_cycles() {
+async fn test_workspace_installation_rejects_workspace_protocol() {
     let temp = tempdir().unwrap();
     let root = temp.path();
 
@@ -1461,11 +1461,12 @@ async fn test_workspace_installation_detects_cycles() {
     let mut installer = Installer::new(options).unwrap();
     let err = installer.run().await.unwrap_err();
     let err_msg = err.to_string();
+    // npm-package-arg has no `workspace:` protocol.
     assert!(
-        err_msg.contains("Circular workspace dependency detected"),
-        "Error message should clearly report circular dependency, got: {err_msg}"
+        err_msg.contains("EUNSUPPORTEDPROTOCOL")
+            && err_msg.contains(r#"Unsupported URL Type "workspace:": workspace:*"#),
+        "got: {err_msg}"
     );
-    assert!(err_msg.contains("pkg-1") && err_msg.contains("pkg-2"));
 }
 
 #[tokio::test]
@@ -1483,7 +1484,7 @@ async fn test_workspace_installation_missing_member_fails() {
     fs::create_dir_all(&p1_dir).unwrap();
     fs::write(
         p1_dir.join("package.json"),
-        r#"{"name": "pkg-1", "version": "1.0.0", "dependencies": {"missing-pkg": "workspace:*"}}"#,
+        r#"{"name": "pkg-1", "version": "1.0.0", "dependencies": {"missing-pkg": "*"}}"#,
     )
     .unwrap();
 
@@ -1494,7 +1495,7 @@ async fn test_workspace_installation_missing_member_fails() {
     };
     let mut installer = Installer::new(options).unwrap();
     let err = installer.run().await.unwrap_err();
-    let err_msg = err.to_string();
+    let err_msg = format!("{err:#}");
     assert!(
         err_msg.contains("missing-pkg"),
         "Should report missing package: {err_msg}"
@@ -1998,7 +1999,7 @@ async fn test_workspace_member_lifecycle_prepare_dev_deps_and_ci_topological_exe
         "name": "pkg-b",
         "version": "1.0.0",
         "devDependencies": {
-            "pkg-a": "workspace:*"
+            "pkg-a": "^1.0.0"
         },
         "scripts": {
             "postinstall": "node -e \"require('fs').appendFileSync(require('path').join(process.env.INIT_CWD, 'order.log'), 'pkg-b:postinstall' + String.fromCharCode(10))\""
