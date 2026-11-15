@@ -26,10 +26,17 @@ fn packument_freshness_honors_http_policy_and_age() {
         ("no-store, max-age=300", "0", false),
         ("max-age=300", "400", false),
     ] {
-        entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":control,"age":age}}}));
-        assert_eq!(crate::is_packument_fresh(&entry, false, false), expected, "{control}, age={age}");
+        entry.metadata =
+            Some(serde_json::json!({"response":{"headers":{"cache-control":control,"age":age}}}));
+        assert_eq!(
+            crate::is_packument_fresh(&entry, false, false),
+            expected,
+            "{control}, age={age}"
+        );
     }
-    entry.metadata = Some(serde_json::json!({"response":{"headers":{"cache-control":"max-age=300","date":"Thu, 01 Jan 1970 00:00:00 GMT"}}}));
+    entry.metadata = Some(
+        serde_json::json!({"response":{"headers":{"cache-control":"max-age=300","date":"Thu, 01 Jan 1970 00:00:00 GMT"}}}),
+    );
     assert!(!crate::is_packument_fresh(&entry, false, false));
     assert!(crate::is_packument_fresh(&entry, true, false));
     assert!(crate::is_packument_fresh(&entry, false, true));
@@ -4314,7 +4321,8 @@ fn test_enrich_lockfile_vitefu_workspaces() {
             "license": "MIT",
             "workspaces": ["tests/deps/*"]
         }"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
     lockfile.insert_package(
@@ -4346,14 +4354,22 @@ fn test_enrich_lockfile_vitefu_workspaces() {
         },
     );
 
-    crate::fast_path::enrich_lockfile_from_installed_manifests(&mut lockfile, project_dir, Some(&cache));
+    crate::fast_path::enrich_lockfile_from_installed_manifests(
+        &mut lockfile,
+        project_dir,
+        Some(&cache),
+    );
 
     assert_eq!(
-        lockfile.packages["node_modules/vitefu"].extra.get("workspaces"),
+        lockfile.packages["node_modules/vitefu"]
+            .extra
+            .get("workspaces"),
         Some(&serde_json::json!(["tests/deps/*"]))
     );
     assert_eq!(
-        lockfile.packages["node_modules/es-toolkit"].extra.get("workspaces"),
+        lockfile.packages["node_modules/es-toolkit"]
+            .extra
+            .get("workspaces"),
         Some(&serde_json::json!(["docs"]))
     );
 }
@@ -4533,6 +4549,8 @@ async fn test_ci_empty_lockfile_leaves_no_node_modules() {
     let mut installer = Installer::new(options).unwrap();
     let summary = installer.run_ci().await.unwrap();
     assert_eq!(summary.packages_installed, 0);
-    assert!(!root.join("node_modules").exists(), "Empty lockfile CI must not leave empty node_modules on disk");
+    assert!(
+        !root.join("node_modules").exists(),
+        "Empty lockfile CI must not leave empty node_modules on disk"
+    );
 }
-

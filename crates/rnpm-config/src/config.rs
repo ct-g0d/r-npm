@@ -16,7 +16,10 @@ pub fn set_process_cli_overrides(overrides: BTreeMap<String, String>) {
 }
 
 pub fn get_process_cli_overrides() -> Option<BTreeMap<String, String>> {
-    PROCESS_CLI_OVERRIDES.read().ok().and_then(|lock| lock.clone())
+    PROCESS_CLI_OVERRIDES
+        .read()
+        .ok()
+        .and_then(|lock| lock.clone())
 }
 
 pub fn set_process_userconfig(path: PathBuf) {
@@ -36,7 +39,10 @@ pub fn set_process_globalconfig(path: PathBuf) {
 }
 
 pub fn get_process_globalconfig() -> Option<PathBuf> {
-    PROCESS_GLOBALCONFIG.read().ok().and_then(|lock| lock.clone())
+    PROCESS_GLOBALCONFIG
+        .read()
+        .ok()
+        .and_then(|lock| lock.clone())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -566,7 +572,9 @@ where
     // Same prefix resolution as `config set --global` and global installs
     // (NPM_CONFIG_PREFIX, npm_config_prefix, PREFIX, then the platform default),
     // so global config is read from where it was written.
-    let path = find_global_prefix_with_env(&lookup).join("etc").join("npmrc");
+    let path = find_global_prefix_with_env(&lookup)
+        .join("etc")
+        .join("npmrc");
     if path.exists() {
         return Some(path);
     }

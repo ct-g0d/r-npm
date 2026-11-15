@@ -128,7 +128,10 @@ impl TestRegistryServer {
 async fn test_ci_omit_dev_retains_shared_production_dependency() {
     let project = ci_omit_dev_fixture().await;
     assert!(
-        project.path().join("node_modules/shared/package.json").is_file(),
+        project
+            .path()
+            .join("node_modules/shared/package.json")
+            .is_file(),
         "A direct dev dependency also reached from production must follow the lockfile flags"
     );
 }
@@ -139,7 +142,10 @@ async fn test_ci_omit_dev_does_not_link_omitted_package_bins() {
     let modules = project.path().join("node_modules");
     assert!(!modules.join("devtool").exists());
     for name in ["devtool", "devtool.cmd", "devtool.ps1"] {
-        assert!(!modules.join(".bin").join(name).exists(), "Omitted package must not create a dangling {name} shim");
+        assert!(
+            !modules.join(".bin").join(name).exists(),
+            "Omitted package must not create a dangling {name} shim"
+        );
     }
 }
 
@@ -155,37 +161,69 @@ async fn ci_omit_dev_fixture() -> tempfile::TempDir {
     let mut archives = std::collections::BTreeMap::new();
     for name in ["prod", "shared", "devtool"] {
         let mut package = serde_json::json!({ "name": name, "version": "1.0.0", "license": "MIT" });
-        if name == "prod" { package["dependencies"] = serde_json::json!({ "shared": "1.0.0" }); }
-        if name == "devtool" { package["bin"] = serde_json::json!({ "devtool": "cli.js" }); }
+        if name == "prod" {
+            package["dependencies"] = serde_json::json!({ "shared": "1.0.0" });
+        }
+        if name == "devtool" {
+            package["bin"] = serde_json::json!({ "devtool": "cli.js" });
+        }
         let bytes = package.to_string().into_bytes();
-        archives.insert(name.to_string(), create_test_tarball(&[("package.json", &bytes), ("cli.js", b"#!/usr/bin/env node\n")]));
+        archives.insert(
+            name.to_string(),
+            create_test_tarball(&[
+                ("package.json", &bytes),
+                ("cli.js", b"#!/usr/bin/env node\n"),
+            ]),
+        );
     }
     let served = archives.clone();
     let server = TestRegistryServer::start(move |request, _| {
         let name = request.trim_start_matches('/').trim_end_matches(".tgz");
-        served.get(name).map(|bytes| (200, vec![("Content-Type", "application/octet-stream".into())], bytes.clone()))
-    }).await;
-    let parsed = rnpm_core::manifest::Manifest::from_file(project.path().join("package.json")).unwrap();
+        served.get(name).map(|bytes| {
+            (
+                200,
+                vec![("Content-Type", "application/octet-stream".into())],
+                bytes.clone(),
+            )
+        })
+    })
+    .await;
+    let parsed =
+        rnpm_core::manifest::Manifest::from_file(project.path().join("package.json")).unwrap();
     let mut lock = LockfileV3::from_manifest(&parsed);
     for (name, bytes) in archives {
         let mut entry = LockfilePackage {
-            version: Some("1.0.0".into()), resolved: Some(format!("{}/{name}.tgz", server.url())),
-            integrity: Some(compute_ssri(&bytes)), license: Some("MIT".into()),
+            version: Some("1.0.0".into()),
+            resolved: Some(format!("{}/{name}.tgz", server.url())),
+            integrity: Some(compute_ssri(&bytes)),
+            license: Some("MIT".into()),
             ..Default::default()
         };
-        if name == "prod" { entry.dependencies = Some(std::collections::BTreeMap::from([("shared".into(), "1.0.0".into())])); }
+        if name == "prod" {
+            entry.dependencies = Some(std::collections::BTreeMap::from([(
+                "shared".into(),
+                "1.0.0".into(),
+            )]));
+        }
         if name == "devtool" {
             entry.dev = Some(true);
-            entry.bin = Some(rnpm_lockfile::PackageBin::Map(std::collections::BTreeMap::from([("devtool".into(), "cli.js".into())])));
+            entry.bin = Some(rnpm_lockfile::PackageBin::Map(
+                std::collections::BTreeMap::from([("devtool".into(), "cli.js".into())]),
+            ));
         }
         lock.insert_package(&format!("node_modules/{name}"), entry);
     }
-    lock.save_to_file(&project.path().join("package-lock.json")).unwrap();
+    lock.save_to_file(&project.path().join("package-lock.json"))
+        .unwrap();
     let mut installer = Installer::new(InstallOptions {
-        project_dir: project.path().to_path_buf(), cache_dir: Some(cache.path().to_path_buf()),
-        registry_url: Some(server.url()), omit_dev: true, ignore_scripts: true,
+        project_dir: project.path().to_path_buf(),
+        cache_dir: Some(cache.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        omit_dev: true,
+        ignore_scripts: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
     installer.run_ci().await.unwrap();
     project
 }
@@ -203,21 +241,32 @@ async fn test_platform_skipped_scoped_optional_does_not_create_scope_directory()
                 "dist": { "tarball": format!("{base}/native.tgz") }
             } }
         });
-        Some((200, vec![("Content-Type", "application/json".into())], metadata.to_string().into_bytes()))
-    }).await;
+        Some((
+            200,
+            vec![("Content-Type", "application/json".into())],
+            metadata.to_string().into_bytes(),
+        ))
+    })
+    .await;
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    std::fs::write(project.path().join("package.json"), serde_json::json!({
-        "name": "optional-scope", "version": "1.0.0",
-        "optionalDependencies": { "@foreign/native": "1.0.0" }
-    }).to_string()).unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        serde_json::json!({
+            "name": "optional-scope", "version": "1.0.0",
+            "optionalDependencies": { "@foreign/native": "1.0.0" }
+        })
+        .to_string(),
+    )
+    .unwrap();
     let mut installer = Installer::new(InstallOptions {
         project_dir: project.path().to_path_buf(),
         cache_dir: Some(cache.path().to_path_buf()),
         registry_url: Some(server.url()),
         ignore_scripts: true,
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
     installer.run().await.unwrap();
     let lock = LockfileV3::load_from_file(&project.path().join("package-lock.json")).unwrap();
     assert!(lock.packages.contains_key("node_modules/@foreign/native"));

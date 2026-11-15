@@ -2,10 +2,16 @@ use anyhow::{anyhow, Result};
 use rnpm_core::manifest::Manifest;
 use std::path::PathBuf;
 
-pub(crate) async fn fetch_archive(current_dir: &std::path::Path, raw: &str, registry: Option<String>) -> Result<Vec<u8>> {
+pub(crate) async fn fetch_archive(
+    current_dir: &std::path::Path,
+    raw: &str,
+    registry: Option<String>,
+) -> Result<Vec<u8>> {
     use rnpm_core::spec::{PackageSpec, PackageTarget};
     let local = current_dir.join(raw.strip_prefix("file:").unwrap_or(raw));
-    if local.is_file() { return Ok(std::fs::read(local)?); }
+    if local.is_file() {
+        return Ok(std::fs::read(local)?);
+    }
     let spec = PackageSpec::parse(raw)?;
     let (_, client) = crate::make_registry_client(current_dir, registry)?;
     if let PackageTarget::Url(url) = &spec.target {
@@ -13,8 +19,14 @@ pub(crate) async fn fetch_archive(current_dir: &std::path::Path, raw: &str, regi
     }
     let (name, target) = if let PackageTarget::Alias { name, target } = &spec.target {
         (name.clone(), target.as_ref().clone())
-    } else { (spec.name, spec.target) };
-    Ok(crate::commands::cache::download_registry_package(&client, raw, &name, &target).await?.0)
+    } else {
+        (spec.name, spec.target)
+    };
+    Ok(
+        crate::commands::cache::download_registry_package(&client, raw, &name, &target)
+            .await?
+            .0,
+    )
 }
 
 pub(crate) struct PackCommandArgs {
@@ -50,9 +62,14 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
                 } else {
                     (spec.name.clone(), spec.target.clone())
                 };
-                crate::commands::cache::download_registry_package(&client, &raw_target, &name, &target)
-                    .await?
-                    .0
+                crate::commands::cache::download_registry_package(
+                    &client,
+                    &raw_target,
+                    &name,
+                    &target,
+                )
+                .await?
+                .0
             }
         };
         let (summary, _) = rnpm_fs::summarize_tarball(&bytes)
@@ -76,21 +93,61 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
     let config = rnpm_config::Config::load(Some(&package_dir)).ok();
     let cli_overrides = rnpm_config::get_process_cli_overrides();
     let effective_ignore = args.ignore_scripts
-        || cli_overrides.as_ref().and_then(|o| o.get("ignore-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-        || config.as_ref().and_then(|c| c.get_bool("ignore-scripts")).unwrap_or(false);
+        || cli_overrides
+            .as_ref()
+            .and_then(|o| o.get("ignore-scripts"))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+        || config
+            .as_ref()
+            .and_then(|c| c.get_bool("ignore-scripts"))
+            .unwrap_or(false);
     let effective_foreground = args.foreground_scripts
-        || cli_overrides.as_ref().and_then(|o| o.get("foreground-scripts")).map(|v| v == "true" || v == "1").unwrap_or(false)
-        || config.as_ref().and_then(|c| c.get_bool("foreground-scripts")).unwrap_or(true);
-    let is_silent = cli_overrides.as_ref().and_then(|o| o.get("loglevel")).map(|s| s == "silent").unwrap_or(false)
-        || config.as_ref().and_then(|c| c.get("loglevel")).map(|s| s == "silent").unwrap_or(false);
+        || cli_overrides
+            .as_ref()
+            .and_then(|o| o.get("foreground-scripts"))
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+        || config
+            .as_ref()
+            .and_then(|c| c.get_bool("foreground-scripts"))
+            .unwrap_or(true);
+    let is_silent = cli_overrides
+        .as_ref()
+        .and_then(|o| o.get("loglevel"))
+        .map(|s| s == "silent")
+        .unwrap_or(false)
+        || config
+            .as_ref()
+            .and_then(|c| c.get("loglevel"))
+            .map(|s| s == "silent")
+            .unwrap_or(false);
 
-    if !package_dir.join(".npmignore").is_file() && package_dir.join(".gitignore").is_file()
-        && config.as_ref().and_then(|c| c.get("loglevel")) != Some("silent") {
+    if !package_dir.join(".npmignore").is_file()
+        && package_dir.join(".gitignore").is_file()
+        && config.as_ref().and_then(|c| c.get("loglevel")) != Some("silent")
+    {
         eprintln!("npm warn gitignore-fallback No .npmignore file found, using .gitignore for file exclusion. Consider creating a .npmignore file to explicitly control published files.");
     }
 
-    crate::run_lifecycle_hook(&package_dir, &manifest, "prepack", effective_ignore, effective_foreground, is_silent, args.json)?;
-    crate::run_lifecycle_hook(&package_dir, &manifest, "prepare", effective_ignore, effective_foreground, is_silent, args.json)?;
+    crate::run_lifecycle_hook(
+        &package_dir,
+        &manifest,
+        "prepack",
+        effective_ignore,
+        effective_foreground,
+        is_silent,
+        args.json,
+    )?;
+    crate::run_lifecycle_hook(
+        &package_dir,
+        &manifest,
+        "prepare",
+        effective_ignore,
+        effective_foreground,
+        is_silent,
+        args.json,
+    )?;
 
     let (summary, tarball_bytes) = match rnpm_fs::pack_directory(&package_dir, None) {
         Ok(res) => res,
@@ -99,7 +156,15 @@ pub(crate) async fn run(args: PackCommandArgs, current_dir: PathBuf) -> Result<(
         }
     };
 
-    crate::run_lifecycle_hook(&package_dir, &manifest, "postpack", effective_ignore, effective_foreground, is_silent, args.json)?;
+    crate::run_lifecycle_hook(
+        &package_dir,
+        &manifest,
+        "postpack",
+        effective_ignore,
+        effective_foreground,
+        is_silent,
+        args.json,
+    )?;
 
     let dest_dir = args.pack_destination.unwrap_or_else(|| current_dir.clone());
     let final_tarball_path = dest_dir.join(&summary.filename);

@@ -68,27 +68,30 @@ async fn test_cli_search() {
         .output()
         .expect("search --json failed");
 
-    assert!(json_out.status.success(), "stderr: {}", String::from_utf8_lossy(&json_out.stderr));
-    let json_val: serde_json::Value = serde_json::from_slice(&json_out.stdout)
-        .expect("must be valid JSON array");
+    assert!(
+        json_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("must be valid JSON array");
     assert!(json_val.is_array());
     assert_eq!(json_val[0]["name"], "foo-pkg");
 
     // 2. Test default text format (must match npm 11 block format)
     let text_out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args([
-            "search",
-            "foo",
-            "--registry",
-            &format!("http://{addr}/"),
-        ])
+        .args(["search", "foo", "--registry", &format!("http://{addr}/")])
         .output()
         .expect("search text failed");
 
     let _ = tx.send(());
 
-    assert!(text_out.status.success(), "stderr: {}", String::from_utf8_lossy(&text_out.stderr));
+    assert!(
+        text_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&text_out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&text_out.stdout);
     assert!(stdout.contains("foo-pkg\nA package for testing search\nVersion 1.0.0 published 2024-01-01 by alice\nMaintainers: alice bob\nKeywords: test search\nhttps://npm.im/foo-pkg"));
 }

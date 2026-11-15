@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use data_encoding::HEXLOWER;
-use rnpm_cache::{PackagePack, PackStore};
+use rnpm_cache::{PackStore, PackagePack};
 use rnpm_config::Config;
 use rnpm_core::manifest::Manifest;
 use rnpm_core::workspace::discover_workspaces_from_manifest;
@@ -553,18 +553,15 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
         };
 
         if package.license.is_none() {
-            package.license = manifest
-                .extra
-                .get("license")
-                .and_then(|value| {
-                    if let Some(s) = value.as_str() {
-                        Some(s.to_string())
-                    } else if let Some(obj) = value.as_object() {
-                        obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                });
+            package.license = manifest.extra.get("license").and_then(|value| {
+                if let Some(s) = value.as_str() {
+                    Some(s.to_string())
+                } else if let Some(obj) = value.as_object() {
+                    obj.get("type").and_then(|t| t.as_str()).map(str::to_owned)
+                } else {
+                    None
+                }
+            });
         }
 
         // arborist pkgMetaKeys: the abbreviated packument has no `workspaces`,
@@ -593,7 +590,9 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
             if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
                     if let Some(engines_val) = json.get("engines") {
-                        if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(engines_val.clone()) {
+                        if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(
+                            engines_val.clone(),
+                        ) {
                             if !engines.is_empty() {
                                 package.engines = Some(engines);
                             }
@@ -602,7 +601,8 @@ pub(crate) fn enrich_lockfile_from_installed_manifests(
                 }
             }
             if package.engines.is_none() && !manifest.engines.is_empty() {
-                package.engines = Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
+                package.engines =
+                    Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
             }
         }
         if package.bin.is_none() {

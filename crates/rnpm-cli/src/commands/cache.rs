@@ -204,7 +204,12 @@ pub(crate) async fn download_registry_package(
     package: &str,
     name: &str,
     target: &rnpm_core::spec::PackageTarget,
-) -> Result<(Vec<u8>, String, rnpm_registry::metadata::AbbreviatedPackageMetadata, String)> {
+) -> Result<(
+    Vec<u8>,
+    String,
+    rnpm_registry::metadata::AbbreviatedPackageMetadata,
+    String,
+)> {
     use rnpm_core::spec::PackageTarget;
     let metadata = client.get_package_metadata(name).await?;
     let version = match target {

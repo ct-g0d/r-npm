@@ -117,11 +117,13 @@ fn test_init_live_npm_comparison() {
     if let Ok(npm_out) = npm_res {
         if npm_out.status.success() {
             let rnpm_pkg: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(tmp_rnpm.path().join("package.json")).unwrap()
-            ).unwrap();
+                &fs::read_to_string(tmp_rnpm.path().join("package.json")).unwrap(),
+            )
+            .unwrap();
             let npm_pkg: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(tmp_npm.path().join("package.json")).unwrap()
-            ).unwrap();
+                &fs::read_to_string(tmp_npm.path().join("package.json")).unwrap(),
+            )
+            .unwrap();
 
             assert_eq!(rnpm_pkg.get("version"), npm_pkg.get("version"));
             assert_eq!(rnpm_pkg.get("main"), npm_pkg.get("main"));
@@ -135,4 +137,3 @@ fn test_init_live_npm_comparison() {
         }
     }
 }
-

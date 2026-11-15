@@ -16,24 +16,56 @@ pub(crate) struct CommandClient {
 }
 
 impl CommandClient {
-    pub async fn send_json(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, otp: Option<String>) -> Result<serde_json::Value> {
-        let text = self.send_text(current_dir, method, url.clone(), body, otp).await?;
-        if text.trim().is_empty() { Ok(serde_json::Value::Null) } else { parse_json_response(&text, &url) }
+    pub async fn send_json(
+        &self,
+        current_dir: &Path,
+        method: reqwest::Method,
+        url: Url,
+        body: Option<serde_json::Value>,
+        otp: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let text = self
+            .send_text(current_dir, method, url.clone(), body, otp)
+            .await?;
+        if text.trim().is_empty() {
+            Ok(serde_json::Value::Null)
+        } else {
+            parse_json_response(&text, &url)
+        }
     }
 
     /// One registry request wrapped in npm's otplease retry; returns the raw body.
-    pub async fn send_text(&self, current_dir: &Path, method: reqwest::Method, url: Url, body: Option<serde_json::Value>, mut otp: Option<String>) -> Result<String> {
+    pub async fn send_text(
+        &self,
+        current_dir: &Path,
+        method: reqwest::Method,
+        url: Url,
+        body: Option<serde_json::Value>,
+        mut otp: Option<String>,
+    ) -> Result<String> {
         for attempt in 0..2 {
             let mut request = self.request(method.clone(), url.clone(), otp.as_deref());
-            if let Some(body) = &body { request = request.json(body); }
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
             let response = request.send().await?;
             let status = response.status();
-            let www = response.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let www = response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let text = response.text().await?;
-            if status.is_success() { return Ok(text); }
-            let err = format_http_error_with_auth(method.as_str(), &url, status, www.as_deref(), &text);
+            if status.is_success() {
+                return Ok(text);
+            }
+            let err =
+                format_http_error_with_auth(method.as_str(), &url, status, www.as_deref(), &text);
             if attempt == 0 {
-                if let Some(code) = crate::http_errors::retry_otp(current_dir, &err).await? { otp = Some(code); continue; }
+                if let Some(code) = crate::http_errors::retry_otp(current_dir, &err).await? {
+                    otp = Some(code);
+                    continue;
+                }
             }
             return Err(err);
         }
@@ -55,10 +87,15 @@ impl CommandClient {
         let auth = resolve_auth(&config.npmrc, &registry_url);
 
         let cli_overrides = rnpm_config::get_process_cli_overrides();
-        let silent_override = cli_overrides.as_ref().map(|o| {
-            o.get("loglevel").map(|v| v == "silent").unwrap_or(false)
-                || o.get("silent").map(|v| v == "true" || v == "1").unwrap_or(false)
-        }).unwrap_or(false);
+        let silent_override = cli_overrides
+            .as_ref()
+            .map(|o| {
+                o.get("loglevel").map(|v| v == "silent").unwrap_or(false)
+                    || o.get("silent")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
         let silent = silent_override
             || config.get("loglevel") == Some("silent")
             || config.get_bool("silent").unwrap_or(false);
@@ -81,12 +118,18 @@ impl CommandClient {
             }
         }
 
-        if let Some(https_proxy) = config.get("https-proxy").or_else(|| config.get("https_proxy")) {
+        if let Some(https_proxy) = config
+            .get("https-proxy")
+            .or_else(|| config.get("https_proxy"))
+        {
             if let Ok(proxy) = reqwest::Proxy::https(https_proxy) {
                 builder = builder.proxy(proxy);
             }
         }
-        if let Some(http_proxy) = config.get("http-proxy").or_else(|| config.get("http_proxy")) {
+        if let Some(http_proxy) = config
+            .get("http-proxy")
+            .or_else(|| config.get("http_proxy"))
+        {
             if let Ok(proxy) = reqwest::Proxy::http(http_proxy) {
                 builder = builder.proxy(proxy);
             }
@@ -133,19 +176,66 @@ impl CommandClient {
 pub(crate) fn registry_error(method: &str, error: rnpm_registry::RegistryError) -> anyhow::Error {
     use rnpm_registry::RegistryError as E;
     match error {
-        E::AuthChallenge { url, www_authenticate, body } => Url::parse(&url).map(|url| format_http_error_with_auth(method, &url, reqwest::StatusCode::UNAUTHORIZED, Some(&www_authenticate), &body)).unwrap_or_else(anyhow::Error::from),
-        E::Unauthorized { url, status, message } | E::Forbidden { url, status, message } | E::PublishConflict { url, status, message } => Url::parse(&url).map(|url| format_http_error(method, &url, reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR), &message)).unwrap_or_else(anyhow::Error::from),
+        E::AuthChallenge {
+            url,
+            www_authenticate,
+            body,
+        } => Url::parse(&url)
+            .map(|url| {
+                format_http_error_with_auth(
+                    method,
+                    &url,
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    Some(&www_authenticate),
+                    &body,
+                )
+            })
+            .unwrap_or_else(anyhow::Error::from),
+        E::Unauthorized {
+            url,
+            status,
+            message,
+        }
+        | E::Forbidden {
+            url,
+            status,
+            message,
+        }
+        | E::PublishConflict {
+            url,
+            status,
+            message,
+        } => Url::parse(&url)
+            .map(|url| {
+                format_http_error(
+                    method,
+                    &url,
+                    reqwest::StatusCode::from_u16(status)
+                        .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                    &message,
+                )
+            })
+            .unwrap_or_else(anyhow::Error::from),
         other => anyhow::Error::from(other),
     }
 }
 
-pub(crate) async fn with_registry_otp<T>(current_dir: &Path, method: &str, otp: Option<String>, mut operation: impl AsyncFnMut(Option<String>) -> std::result::Result<T, rnpm_registry::RegistryError>) -> Result<T> {
+pub(crate) async fn with_registry_otp<T>(
+    current_dir: &Path,
+    method: &str,
+    otp: Option<String>,
+    mut operation: impl AsyncFnMut(
+        Option<String>,
+    ) -> std::result::Result<T, rnpm_registry::RegistryError>,
+) -> Result<T> {
     match operation(otp).await {
         Ok(value) => Ok(value),
         Err(error) => {
             let error = registry_error(method, error);
             match crate::http_errors::retry_otp(current_dir, &error).await? {
-                Some(code) => operation(Some(code)).await.map_err(|e| registry_error(method, e)),
+                Some(code) => operation(Some(code))
+                    .await
+                    .map_err(|e| registry_error(method, e)),
                 None => Err(error),
             }
         }
@@ -186,12 +276,19 @@ pub(crate) fn resolve_auth(npmrc: &rnpm_config::Npmrc, registry_url: &Url) -> Op
         let pass_key = format!("{reg_key}:_password");
         let pass_key2 = format!("{reg_key}:password");
         if let Some(user) = npmrc.settings.get(&user_key) {
-            if let Some(pass) = npmrc.settings.get(&pass_key).or_else(|| npmrc.settings.get(&pass_key2)) {
+            if let Some(pass) = npmrc
+                .settings
+                .get(&pass_key)
+                .or_else(|| npmrc.settings.get(&pass_key2))
+            {
                 let decoded_pass = match data_encoding::BASE64.decode(pass.trim().as_bytes()) {
-                    Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| pass.trim().to_string()),
+                    Ok(bytes) => {
+                        String::from_utf8(bytes).unwrap_or_else(|_| pass.trim().to_string())
+                    }
                     Err(_) => pass.trim().to_string(),
                 };
-                let encoded = data_encoding::BASE64.encode(format!("{user}:{decoded_pass}").as_bytes());
+                let encoded =
+                    data_encoding::BASE64.encode(format!("{user}:{decoded_pass}").as_bytes());
                 return Some(RegistryAuth::Basic(encoded));
             }
         }
@@ -227,8 +324,12 @@ pub(crate) fn format_http_error_with_auth(
     www_authenticate: Option<&str>,
     body: &str,
 ) -> anyhow::Error {
-    use crate::http_errors::{auth_error_block, e404_block, general_message, package_name_from_url};
-    if let Some(block) = auth_error_block(method, target_url.as_str(), status, www_authenticate, body) {
+    use crate::http_errors::{
+        auth_error_block, e404_block, general_message, package_name_from_url,
+    };
+    if let Some(block) =
+        auth_error_block(method, target_url.as_str(), status, www_authenticate, body)
+    {
         return anyhow::anyhow!(block);
     }
     let message = general_message(method, target_url.as_str(), status, body);
@@ -241,10 +342,7 @@ pub(crate) fn format_http_error_with_auth(
     }
 }
 
-pub(crate) fn parse_json_response(
-    body: &str,
-    target_url: &Url,
-) -> Result<serde_json::Value> {
+pub(crate) fn parse_json_response(body: &str, target_url: &Url) -> Result<serde_json::Value> {
     serde_json::from_str(body).map_err(|e| {
         anyhow::anyhow!(
             "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target_url} reason: {e}"

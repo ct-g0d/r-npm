@@ -13,10 +13,19 @@ fn test_config_lifecycle() {
     // 1. Config set in project .npmrc
     let set_out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args(["config", "set", "coverage_test_key=coverage_val", "--location=project"])
+        .args([
+            "config",
+            "set",
+            "coverage_test_key=coverage_val",
+            "--location=project",
+        ])
         .output()
         .expect("config set failed");
-    assert!(set_out.status.success(), "stderr: {}", String::from_utf8_lossy(&set_out.stderr));
+    assert!(
+        set_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
 
     // 2. Config get
     let get_out = Command::new(rnpm_bin)
@@ -24,7 +33,11 @@ fn test_config_lifecycle() {
         .args(["config", "get", "coverage_test_key"])
         .output()
         .expect("config get failed");
-    assert!(get_out.status.success(), "stderr: {}", String::from_utf8_lossy(&get_out.stderr));
+    assert!(
+        get_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&get_out.stderr)
+    );
     let get_val = String::from_utf8_lossy(&get_out.stdout);
     assert_eq!(get_val.trim(), "coverage_val");
 
@@ -34,7 +47,11 @@ fn test_config_lifecycle() {
         .args(["config", "list", "--json"])
         .output()
         .expect("config list failed");
-    assert!(list_out.status.success(), "stderr: {}", String::from_utf8_lossy(&list_out.stderr));
+    assert!(
+        list_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
     let list_json = String::from_utf8_lossy(&list_out.stdout);
     assert!(list_json.contains("coverage_test_key"));
 
@@ -44,15 +61,28 @@ fn test_config_lifecycle() {
         .args(["config", "edit"])
         .output()
         .expect("config edit failed");
-    assert!(edit_out.status.success(), "stderr: {}", String::from_utf8_lossy(&edit_out.stderr));
+    assert!(
+        edit_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&edit_out.stderr)
+    );
 
     // 5. Config delete
     let del_out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args(["config", "delete", "coverage_test_key", "--location=project"])
+        .args([
+            "config",
+            "delete",
+            "coverage_test_key",
+            "--location=project",
+        ])
         .output()
         .expect("config delete failed");
-    assert!(del_out.status.success(), "stderr: {}", String::from_utf8_lossy(&del_out.stderr));
+    assert!(
+        del_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&del_out.stderr)
+    );
 
     // Verify key deleted
     let verify_get = Command::new(rnpm_bin)
@@ -60,7 +90,10 @@ fn test_config_lifecycle() {
         .args(["config", "get", "coverage_test_key"])
         .output()
         .expect("verify get failed");
-    assert_eq!(String::from_utf8_lossy(&verify_get.stdout).trim(), "undefined");
+    assert_eq!(
+        String::from_utf8_lossy(&verify_get.stdout).trim(),
+        "undefined"
+    );
 }
 
 fn normalize_output(text: &str) -> String {
@@ -149,7 +182,13 @@ fn test_config_get_set_delete_live_npm_parity() {
         .env("CACHE", iso_rnpm.join("cache"))
         .env("APPDATA", iso_rnpm.join("appdata"))
         .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
-        .args(["config", "set", "init-author-name=TestAuthor", "--userconfig", userconfig_rnpm.to_str().unwrap()])
+        .args([
+            "config",
+            "set",
+            "init-author-name=TestAuthor",
+            "--userconfig",
+            userconfig_rnpm.to_str().unwrap(),
+        ])
         .output()
         .expect("rnpm config set failed");
 
@@ -199,7 +238,13 @@ fn test_config_get_set_delete_live_npm_parity() {
         .env("CACHE", iso_rnpm.join("cache"))
         .env("APPDATA", iso_rnpm.join("appdata"))
         .env("LOCALAPPDATA", iso_rnpm.join("localappdata"))
-        .args(["config", "get", "init-author-name", "--userconfig", userconfig_rnpm.to_str().unwrap()])
+        .args([
+            "config",
+            "get",
+            "init-author-name",
+            "--userconfig",
+            userconfig_rnpm.to_str().unwrap(),
+        ])
         .output()
         .expect("rnpm config get init-author-name failed");
 
@@ -236,4 +281,3 @@ fn test_config_get_set_delete_live_npm_parity() {
         }
     }
 }
-

@@ -420,7 +420,9 @@ mod tests {
         });
         let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
 
-        let res = overrides.resolve_override("semver", "^6.3.0", &["foo", "bar"]).unwrap();
+        let res = overrides
+            .resolve_override("semver", "^6.3.0", &["foo", "bar"])
+            .unwrap();
         assert_eq!(res, Some("7.5.4".to_string()));
     }
 
@@ -434,11 +436,15 @@ mod tests {
         let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
 
         // Under foo: overridden to 2.0.0
-        let under_foo = overrides.resolve_override("bar", "^1.0.0", &["foo"]).unwrap();
+        let under_foo = overrides
+            .resolve_override("bar", "^1.0.0", &["foo"])
+            .unwrap();
         assert_eq!(under_foo, Some("2.0.0".to_string()));
 
         // Under qux: not overridden
-        let under_qux = overrides.resolve_override("bar", "^1.0.0", &["qux"]).unwrap();
+        let under_qux = overrides
+            .resolve_override("bar", "^1.0.0", &["qux"])
+            .unwrap();
         assert_eq!(under_qux, None);
     }
 
@@ -454,8 +460,18 @@ mod tests {
         }))
         .unwrap();
         let overrides = Overrides::from_manifest(&manifest).unwrap();
-        assert_eq!(overrides.resolve_override("vite", "^5.0.0", &["plugin"]).unwrap(), Some("^7.0.0".into()));
-        assert_eq!(overrides.resolve_override("shared", "^1.0.0", &["plugin"]).unwrap(), Some("^2.0.0".into()));
+        assert_eq!(
+            overrides
+                .resolve_override("vite", "^5.0.0", &["plugin"])
+                .unwrap(),
+            Some("^7.0.0".into())
+        );
+        assert_eq!(
+            overrides
+                .resolve_override("shared", "^1.0.0", &["plugin"])
+                .unwrap(),
+            Some("^2.0.0".into())
+        );
     }
 
     #[test]
@@ -482,7 +498,9 @@ mod tests {
 
         let overrides = Overrides::from_json_value(Some(&json), root_deps);
 
-        let res = overrides.resolve_override("foo", "^2.0.0", &["parent"]).unwrap();
+        let res = overrides
+            .resolve_override("foo", "^2.0.0", &["parent"])
+            .unwrap();
         assert_eq!(res, Some("1.2.3".to_string()));
     }
 
@@ -492,8 +510,12 @@ mod tests {
             "foo": "$missing"
         });
         let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
-        let err = overrides.resolve_override("foo", "^2.0.0", &["parent"]).unwrap_err();
-        assert!(err.to_string().contains("Unable to resolve reference $missing"));
+        let err = overrides
+            .resolve_override("foo", "^2.0.0", &["parent"])
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Unable to resolve reference $missing"));
     }
 
     #[test]
@@ -506,7 +528,12 @@ mod tests {
         caller_specs.insert("typescript".to_string(), ">=5.0.4 <5.8".to_string());
 
         let res = overrides
-            .resolve_override_with_caller("typescript", "^5.5.4", &["dts-buddy"], Some(&caller_specs))
+            .resolve_override_with_caller(
+                "typescript",
+                "^5.5.4",
+                &["dts-buddy"],
+                Some(&caller_specs),
+            )
             .unwrap();
         assert_eq!(res, Some(">=5.0.4 <5.8".to_string()));
     }
@@ -526,35 +553,48 @@ mod tests {
 
         // Under foo: bar is 2.0.0
         assert_eq!(
-            overrides.resolve_override("bar", "^1.0.0", &["foo"]).unwrap(),
+            overrides
+                .resolve_override("bar", "^1.0.0", &["foo"])
+                .unwrap(),
             Some("2.0.0".to_string())
         );
 
         // Under foo: baz is 3.0.0
         assert_eq!(
-            overrides.resolve_override("baz", "^1.0.0", &["foo"]).unwrap(),
+            overrides
+                .resolve_override("baz", "^1.0.0", &["foo"])
+                .unwrap(),
             Some("3.0.0".to_string())
         );
 
         // Under @scope/a: @scope/b is 1.0.0
         assert_eq!(
-            overrides.resolve_override("@scope/b", "*", &["@scope/a"]).unwrap(),
+            overrides
+                .resolve_override("@scope/b", "*", &["@scope/a"])
+                .unwrap(),
             Some("1.0.0".to_string())
         );
 
         // Under a > b: c is 4.0.0
         assert_eq!(
-            overrides.resolve_override("c", "^1.0.0", &["a", "b"]).unwrap(),
+            overrides
+                .resolve_override("c", "^1.0.0", &["a", "b"])
+                .unwrap(),
             Some("4.0.0".to_string())
         );
 
         // Under nested > x: y is 5.0.0
         assert_eq!(
-            overrides.resolve_override("y", "^1.0.0", &["nested", "x"]).unwrap(),
+            overrides
+                .resolve_override("y", "^1.0.0", &["nested", "x"])
+                .unwrap(),
             Some("5.0.0".to_string())
         );
 
         // Top level lookup for bar should be None
-        assert_eq!(overrides.resolve_override("bar", "^1.0.0", &[]).unwrap(), None);
+        assert_eq!(
+            overrides.resolve_override("bar", "^1.0.0", &[]).unwrap(),
+            None
+        );
     }
 }

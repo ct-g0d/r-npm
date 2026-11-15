@@ -183,7 +183,10 @@ fn isolated_rnpm(dir: &std::path::Path) -> Command {
     cmd.env("PREFIX", &fake_global);
     cmd.env("NPM_CONFIG_PREFIX", &fake_global);
     cmd.env("NPM_CONFIG_USERCONFIG", fake_home.join(".npmrc"));
-    cmd.env("NPM_CONFIG_GLOBALCONFIG", fake_global.join("etc").join("npmrc"));
+    cmd.env(
+        "NPM_CONFIG_GLOBALCONFIG",
+        fake_global.join("etc").join("npmrc"),
+    );
     cmd.env("NPM_CONFIG_CACHE", fake_home.join(".npm-cache"));
     cmd.env("NPM_CONFIG_UNICODE", "true");
     cmd
@@ -282,13 +285,7 @@ async fn test_cli_login_persists_registry_token_without_echoing_secret() {
     std::fs::create_dir_all(&project).unwrap();
 
     let output = isolated_rnpm(&project)
-        .args([
-            "login",
-            "--registry",
-            &registry,
-            "--scope",
-            "@acme",
-        ])
+        .args(["login", "--registry", &registry, "--scope", "@acme"])
         .env("USERPROFILE", &home)
         .env("HOME", &home)
         .env("NPM_CONFIG_USERCONFIG", home.join(".npmrc"))
@@ -302,7 +299,7 @@ async fn test_cli_login_persists_registry_token_without_echoing_secret() {
         String::from_utf8_lossy(&output.stderr)
     );
     let npmrc = std::fs::read_to_string(home.join(".npmrc")).unwrap();
-    assert!(npmrc.contains(&format!("//{}/:_authToken=mock-login-token",server.addr)));
+    assert!(npmrc.contains(&format!("//{}/:_authToken=mock-login-token", server.addr)));
     assert!(npmrc.contains(&format!("@acme:registry={registry}")));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("mock-login-token"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("mock-login-token"));

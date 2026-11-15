@@ -609,7 +609,11 @@ fn test_shim_exit_code_fidelity_all_codes() {
     // Test exit codes 124 (timeout), 130 (SIGINT), 143 (SIGTERM), and 42
     for &code in &[124, 130, 143, 42] {
         let script_file = target_dir.join(format!("exit_{code}.js"));
-        fs::write(&script_file, format!("#!/usr/bin/env node\nprocess.exit({code});\n")).unwrap();
+        fs::write(
+            &script_file,
+            format!("#!/usr/bin/env node\nprocess.exit({code});\n"),
+        )
+        .unwrap();
 
         let bin_name = format!("exit-{code}");
         create_shims(
@@ -717,12 +721,18 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
     let dir = tempdir().unwrap();
     let pkg = dir.path().join("node_modules/untun/dist");
     fs::create_dir_all(&pkg).unwrap();
-    fs::write(pkg.join("cli.mjs"), "import { log } from \"./_chunks/log.mjs\";\n").unwrap();
+    fs::write(
+        pkg.join("cli.mjs"),
+        "import { log } from \"./_chunks/log.mjs\";\n",
+    )
+    .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "untun", "untun/dist/cli.mjs").unwrap();
     for name in ["untun", "untun.cmd", "untun.ps1"] {
         let expected = fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/direct-fixtures").join(name),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/direct-fixtures")
+                .join(name),
         )
         .unwrap();
         assert_eq!(fs::read(bin_dir.join(name)).unwrap(), expected, "{name}");
@@ -732,7 +742,10 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
 #[test]
 fn test_direct_ps1_shim_escapes_powershell_specials() {
     let (_, _, ps1) = generate_direct_shims("pkg/bin/$tool`x.exe");
-    assert!(ps1.contains("& \"$basedir/../pkg/bin/`$tool``x.exe\"   $args"), "{ps1}");
+    assert!(
+        ps1.contains("& \"$basedir/../pkg/bin/`$tool``x.exe\"   $args"),
+        "{ps1}"
+    );
     assert!(!ps1.contains(r"\$tool"));
 }
 
@@ -741,12 +754,18 @@ fn test_program_shims_match_npm_for_non_node_shebang() {
     let dir = tempdir().unwrap();
     let pkg = dir.path().join("node_modules/xyz");
     fs::create_dir_all(&pkg).unwrap();
-    fs::write(pkg.join("xyz"), "#!/usr/bin/env bash\nset -euf -o pipefail\n").unwrap();
+    fs::write(
+        pkg.join("xyz"),
+        "#!/usr/bin/env bash\nset -euf -o pipefail\n",
+    )
+    .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "xyz", "xyz/xyz").unwrap();
     for name in ["xyz", "xyz.cmd", "xyz.ps1"] {
         let expected = fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/program-fixtures").join(name),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/program-fixtures")
+                .join(name),
         )
         .unwrap();
         assert_eq!(

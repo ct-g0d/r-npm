@@ -55,12 +55,7 @@ pub(crate) fn run(
                 let matches: Vec<_> = discovered
                     .iter()
                     .filter(|m| {
-                        rnpm_lifecycle::matches_filter(
-                            ws_filter,
-                            &m.name,
-                            &m.path,
-                            &project_root,
-                        )
+                        rnpm_lifecycle::matches_filter(ws_filter, &m.name, &m.path, &project_root)
                     })
                     .cloned()
                     .collect();
@@ -70,9 +65,12 @@ pub(crate) fn run(
                     ));
                 }
                 for m in matches {
-                    if !matched.iter().any(|existing: &rnpm_core::workspace::WorkspaceMember| {
-                        existing.name == m.name
-                    }) {
+                    if !matched
+                        .iter()
+                        .any(|existing: &rnpm_core::workspace::WorkspaceMember| {
+                            existing.name == m.name
+                        })
+                    {
                         matched.push(m);
                     }
                 }

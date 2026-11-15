@@ -2,11 +2,7 @@ use anyhow::Result;
 use reqwest::Url;
 use std::path::PathBuf;
 
-pub(crate) async fn run(
-    registry: Option<String>,
-    json: bool,
-    current_dir: PathBuf,
-) -> Result<()> {
+pub(crate) async fn run(registry: Option<String>, json: bool, current_dir: PathBuf) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
         Url::parse(reg_str).map_err(|e| {

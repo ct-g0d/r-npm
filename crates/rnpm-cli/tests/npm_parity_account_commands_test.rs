@@ -17,7 +17,9 @@ struct RecordedReq {
 
 impl RecordedReq {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(|s| s.as_str())
     }
 }
 
@@ -172,7 +174,10 @@ fn isolated_rnpm(dir: &std::path::Path) -> Command {
     cmd.env("PREFIX", &fake_global);
     cmd.env("NPM_CONFIG_PREFIX", &fake_global);
     cmd.env("NPM_CONFIG_USERCONFIG", fake_home.join(".npmrc"));
-    cmd.env("NPM_CONFIG_GLOBALCONFIG", fake_global.join("etc").join("npmrc"));
+    cmd.env(
+        "NPM_CONFIG_GLOBALCONFIG",
+        fake_global.join("etc").join("npmrc"),
+    );
     cmd.env("NPM_CONFIG_CACHE", fake_home.join(".npm-cache"));
     cmd.env("NPM_CONFIG_UNICODE", "true");
     cmd.env("npm_config_audit", "false");
@@ -184,18 +189,28 @@ fn isolated_rnpm(dir: &std::path::Path) -> Command {
 async fn test_profile_set_malformed_get_fails_with_fetch_error_and_zero_post() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/-/npm/v1/user") {
-            (200, vec![("content-type", "application/json".to_string())], b"not-json-data".to_vec())
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                b"not-json-data".to_vec(),
+            )
         } else {
             (500, vec![], b"unexpected request".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
     std::fs::write(
         &npmrc_path,
-        format!("registry = {}\n//{}/:_authToken = dummy-token\n", server.url(), server.addr),
-    ).unwrap();
+        format!(
+            "registry = {}\n//{}/:_authToken = dummy-token\n",
+            server.url(),
+            server.addr
+        ),
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -203,9 +218,14 @@ async fn test_profile_set_malformed_get_fails_with_fetch_error_and_zero_post() {
             .args(["profile", "set", "fullname", "Alice"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(!output.status.success(), "profile set must fail on malformed GET");
+    assert!(
+        !output.status.success(),
+        "profile set must fail on malformed GET"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("npm error code FETCH_ERROR"),
@@ -219,7 +239,11 @@ async fn test_profile_set_malformed_get_fails_with_fetch_error_and_zero_post() {
     // Verify zero POST requests were made
     let reqs = server.requests.lock().await;
     let post_requests: Vec<_> = reqs.iter().filter(|r| r.method == "POST").collect();
-    assert_eq!(post_requests.len(), 0, "No POST requests must be issued when GET fails");
+    assert_eq!(
+        post_requests.len(),
+        0,
+        "No POST requests must be issued when GET fails"
+    );
     assert_eq!(reqs.len(), 1, "Exactly one GET request must have occurred");
 }
 
@@ -228,11 +252,16 @@ async fn test_org_ls_unauthenticated_public_roster() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -245,11 +274,20 @@ async fn test_org_ls_unauthenticated_public_roster() {
             .args(["org", "ls", "acme"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "org ls without credentials must succeed against public roster: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "org ls without credentials must succeed against public roster: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("alice - owner"), "stdout must contain alice - owner: {stdout}");
+    assert!(
+        stdout.contains("alice - owner"),
+        "stdout must contain alice - owner: {stdout}"
+    );
 
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);
@@ -264,11 +302,16 @@ async fn test_org_ls_encoded_password_sends_decoded_basic_auth() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -281,7 +324,8 @@ async fn test_org_ls_encoded_password_sends_decoded_basic_auth() {
             server.addr,
             server.addr,
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -289,9 +333,15 @@ async fn test_org_ls_encoded_password_sends_decoded_basic_auth() {
             .args(["org", "ls", "acme"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "org ls must succeed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "org ls must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("alice - owner"));
 
@@ -309,11 +359,16 @@ async fn test_auth_scoping_path_basic_over_root_bearer() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/nested/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -334,9 +389,15 @@ async fn test_auth_scoping_path_basic_over_root_bearer() {
             .args(["org", "ls", "acme"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "org ls must succeed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "org ls must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);
     assert_eq!(
@@ -351,11 +412,16 @@ async fn test_auth_scoping_parent_path_walk() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/nested/deeper/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -367,7 +433,8 @@ async fn test_auth_scoping_parent_path_walk() {
             server.url(),
             server.addr,
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -375,9 +442,15 @@ async fn test_auth_scoping_parent_path_walk() {
             .args(["org", "ls", "acme"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "org ls must succeed with parent path auth: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "org ls must succeed with parent path auth: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);
     assert_eq!(
@@ -392,11 +465,16 @@ async fn test_auth_scoping_port_isolation_no_leak() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -407,7 +485,8 @@ async fn test_auth_scoping_port_isolation_no_leak() {
             "registry = {}\n//127.0.0.1/:_authToken = portless-dummy\n",
             server.url(),
         ),
-    ).unwrap();
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -415,9 +494,15 @@ async fn test_auth_scoping_port_isolation_no_leak() {
             .args(["org", "ls", "acme"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "org ls must succeed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "org ls must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);
     assert!(
@@ -431,11 +516,16 @@ async fn test_org_ls_silent_and_output_formats() {
     let server = TestMockServer::start(|req| {
         if req.method == "GET" && req.path.contains("/-/org/acme/user") {
             let body = b"{\"alice\":\"owner\",\"bob\":\"developer\"}".to_vec();
-            (200, vec![("content-type", "application/json".to_string())], body)
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                body,
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
@@ -448,7 +538,9 @@ async fn test_org_ls_silent_and_output_formats() {
             .args(["org", "ls", "acme", "--silent"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(out_silent.status.success());
     assert!(
         out_silent.stdout.is_empty(),
@@ -463,7 +555,9 @@ async fn test_org_ls_silent_and_output_formats() {
             .args(["org", "ls", "acme", "--json"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(out_json.status.success());
     let json_val: serde_json::Value = serde_json::from_slice(&out_json.stdout).unwrap();
     assert_eq!(json_val["alice"], "owner");
@@ -476,31 +570,53 @@ async fn test_org_ls_silent_and_output_formats() {
             .args(["org", "ls", "acme", "--parseable"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(out_parse.status.success());
     let parse_str = String::from_utf8_lossy(&out_parse.stdout);
-    assert!(parse_str.contains("alice\towner"), "Must contain tab delimiter: {parse_str}");
-    assert!(parse_str.contains("bob\tdeveloper"), "Must contain tab delimiter: {parse_str}");
+    assert!(
+        parse_str.contains("alice\towner"),
+        "Must contain tab delimiter: {parse_str}"
+    );
+    assert!(
+        parse_str.contains("bob\tdeveloper"),
+        "Must contain tab delimiter: {parse_str}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_org_rm_delete200_then_get403_fails_with_no_success() {
     let server = TestMockServer::start(|req| {
         if req.method == "DELETE" && req.path.contains("/-/org/acme/user") {
-            (200, vec![("content-type", "application/json".to_string())], b"{\"user\":\"alice\"}".to_vec())
+            (
+                200,
+                vec![("content-type", "application/json".to_string())],
+                b"{\"user\":\"alice\"}".to_vec(),
+            )
         } else if req.method == "GET" && req.path.contains("/-/org/acme/user") {
-            (403, vec![("content-type", "application/json".to_string())], b"{\"message\":\"forbidden roster\"}".to_vec())
+            (
+                403,
+                vec![("content-type", "application/json".to_string())],
+                b"{\"message\":\"forbidden roster\"}".to_vec(),
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
     std::fs::write(
         &npmrc_path,
-        format!("registry = {}\n//{}/:_authToken = dummy\n", server.url(), server.addr),
-    ).unwrap();
+        format!(
+            "registry = {}\n//{}/:_authToken = dummy\n",
+            server.url(),
+            server.addr
+        ),
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -508,13 +624,24 @@ async fn test_org_rm_delete200_then_get403_fails_with_no_success() {
             .args(["org", "rm", "acme", "alice"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(!output.status.success(), "org rm must fail when follow-up GET is 403");
+    assert!(
+        !output.status.success(),
+        "org rm must fail when follow-up GET is 403"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.is_empty(), "stdout must not contain false success, got: {stdout}");
-    assert!(stderr.contains("npm error code E403"), "stderr must contain E403, got: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "stdout must not contain false success, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("npm error code E403"),
+        "stderr must contain E403, got: {stderr}"
+    );
 
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 2);
@@ -526,18 +653,28 @@ async fn test_org_rm_delete200_then_get403_fails_with_no_success() {
 async fn test_team_create_body_and_stdout() {
     let server = TestMockServer::start(|req| {
         if req.method == "PUT" && req.path.contains("/-/org/acme/team") {
-            (201, vec![("content-type", "application/json".to_string())], b"{\"team\":\"dev\"}".to_vec())
+            (
+                201,
+                vec![("content-type", "application/json".to_string())],
+                b"{\"team\":\"dev\"}".to_vec(),
+            )
         } else {
             (404, vec![], b"not found".to_vec())
         }
-    }).await;
+    })
+    .await;
 
     let tmp = tempdir().unwrap();
     let npmrc_path = tmp.path().join(".npmrc");
     std::fs::write(
         &npmrc_path,
-        format!("registry = {}\n//{}/:_authToken = dummy\n", server.url(), server.addr),
-    ).unwrap();
+        format!(
+            "registry = {}\n//{}/:_authToken = dummy\n",
+            server.url(),
+            server.addr
+        ),
+    )
+    .unwrap();
 
     let work_dir = tmp.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
@@ -545,11 +682,20 @@ async fn test_team_create_body_and_stdout() {
             .args(["team", "create", "@acme:dev"])
             .output()
             .unwrap()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    assert!(output.status.success(), "team create must succeed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "team create must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("+@acme:dev"), "stdout must match npm format +@acme:dev: {stdout}");
+    assert!(
+        stdout.contains("+@acme:dev"),
+        "stdout must match npm format +@acme:dev: {stdout}"
+    );
 
     let reqs = server.requests.lock().await;
     assert_eq!(reqs.len(), 1);

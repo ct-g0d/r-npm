@@ -371,14 +371,25 @@ fn test_uninstall_live_npm_parity() {
     if let Ok(npm_out) = npm_res {
         if npm_out.status.success() {
             assert_eq!(rnpm_out.status.code(), npm_out.status.code());
-            let rnpm_norm_stdout = normalize_output(&String::from_utf8_lossy(&rnpm_out.stdout), tmp_rnpm.path());
-            let npm_norm_stdout = normalize_output(&String::from_utf8_lossy(&npm_out.stdout), tmp_npm.path());
-            assert_eq!(rnpm_norm_stdout, npm_norm_stdout, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_norm_stdout, npm_norm_stdout);
+            let rnpm_norm_stdout =
+                normalize_output(&String::from_utf8_lossy(&rnpm_out.stdout), tmp_rnpm.path());
+            let npm_norm_stdout =
+                normalize_output(&String::from_utf8_lossy(&npm_out.stdout), tmp_npm.path());
+            assert_eq!(
+                rnpm_norm_stdout, npm_norm_stdout,
+                "stdout mismatch: rnpm={:?} vs npm={:?}",
+                rnpm_norm_stdout, npm_norm_stdout
+            );
 
-            let rnpm_norm_stderr = normalize_output(&String::from_utf8_lossy(&rnpm_out.stderr), tmp_rnpm.path());
-            let npm_norm_stderr = normalize_output(&String::from_utf8_lossy(&npm_out.stderr), tmp_npm.path());
-            assert_eq!(rnpm_norm_stderr, npm_norm_stderr, "stderr mismatch: rnpm={:?} vs npm={:?}", rnpm_norm_stderr, npm_norm_stderr);
+            let rnpm_norm_stderr =
+                normalize_output(&String::from_utf8_lossy(&rnpm_out.stderr), tmp_rnpm.path());
+            let npm_norm_stderr =
+                normalize_output(&String::from_utf8_lossy(&npm_out.stderr), tmp_npm.path());
+            assert_eq!(
+                rnpm_norm_stderr, npm_norm_stderr,
+                "stderr mismatch: rnpm={:?} vs npm={:?}",
+                rnpm_norm_stderr, npm_norm_stderr
+            );
         }
     }
 }
-

@@ -59,7 +59,6 @@ pub fn create_directory_link(link: &Path, target: &Path) -> Result<(), FsError> 
     create_junction(link, target)
 }
 
-
 /// Create a directory junction (if target is a directory) or a file symlink/copy (if target is a file).
 pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
     if let Some(parent) = link.parent() {
@@ -610,6 +609,9 @@ mod directory_link_tests {
         std::fs::write(target.join("value"), "kept").unwrap();
         assert_eq!(std::fs::read_to_string(link.join("value")).unwrap(), "kept");
         super::remove_junction(&link).unwrap();
-        assert_eq!(std::fs::read_to_string(target.join("value")).unwrap(), "kept");
+        assert_eq!(
+            std::fs::read_to_string(target.join("value")).unwrap(),
+            "kept"
+        );
     }
 }

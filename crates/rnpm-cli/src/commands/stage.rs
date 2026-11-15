@@ -442,7 +442,9 @@ async fn publish(args: &[String], registry: &str, json: bool, current_dir: &Path
     let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
     crate::execute_publish(
         current_dir.to_path_buf(),
-        args.first().map(std::path::PathBuf::from).unwrap_or_else(|| ".".into()),
+        args.first()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ".".into()),
         config.get("tag").unwrap_or("latest").to_string(),
         config.get("access").map(str::to_string),
         config.get_bool("dry-run").unwrap_or(false),
@@ -452,7 +454,8 @@ async fn publish(args: &[String], registry: &str, json: bool, current_dir: &Path
         config.get_bool("ignore-scripts").unwrap_or(false),
         json,
         true,
-    ).await
+    )
+    .await
 }
 
 /// Splits `name@spec` like npm-package-arg; a bare name has raw spec `*`.

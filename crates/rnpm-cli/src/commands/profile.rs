@@ -27,13 +27,7 @@ const KNOWN_PROFILE_KEYS: &[&str] = &[
 ];
 
 const WRITABLE_PROFILE_KEYS: &[&str] = &[
-    "email",
-    "password",
-    "fullname",
-    "homepage",
-    "freenode",
-    "twitter",
-    "github",
+    "email", "password", "fullname", "homepage", "freenode", "twitter", "github",
 ];
 
 pub(crate) async fn run(args: ProfileArgs, current_dir: &Path) -> Result<()> {
@@ -268,7 +262,15 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         }
     }
 
-    let post_val = client.send_json(current_dir, reqwest::Method::POST, target.clone(), Some(serde_json::Value::Object(new_user)), args.otp.clone()).await?;
+    let post_val = client
+        .send_json(
+            current_dir,
+            reqwest::Method::POST,
+            target.clone(),
+            Some(serde_json::Value::Object(new_user)),
+            args.otp.clone(),
+        )
+        .await?;
     let result_obj = post_val.as_object().ok_or_else(|| {
         anyhow::anyhow!(
             "npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error invalid json response body at {target} reason: expected json object"
@@ -285,10 +287,7 @@ async fn run_set(args: &ProfileArgs, current_dir: &Path) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if args.parseable {
-        let prop_str = result_obj
-            .get(&prop)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let prop_str = result_obj.get(&prop).and_then(|v| v.as_str()).unwrap_or("");
         println!("{prop}\t{prop_str}");
     } else if !client.silent {
         if let Some(prop_str) = result_obj.get(&prop).and_then(|v| v.as_str()) {

@@ -3,7 +3,11 @@ use rnpm_install::{InstallOptions, Installer};
 use std::path::PathBuf;
 
 /// `npm dedupe`; `npm find-dupes` is the same reify in dry-run mode.
-pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir: PathBuf) -> Result<()> {
+pub(crate) async fn run_dedupe(
+    packages: Vec<String>,
+    dry_run: bool,
+    current_dir: PathBuf,
+) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
     let dry_run = dry_run || config.get_bool("dry-run").unwrap_or(false);
     let json = config.get_bool("json").unwrap_or(false);
@@ -43,16 +47,33 @@ pub(crate) async fn run_dedupe(packages: Vec<String>, dry_run: bool, current_dir
                 version: action.version.clone(),
                 location: location.to_string(),
             };
-            report.changes.push(rnpm_install::ReifyChange::Remove(entry(&action.original_path)));
-            if action.action_type == rnpm_install::DedupeActionType::HoistAndDedupe && !before.contains_key(&action.target_path) {
-                report.changes.push(rnpm_install::ReifyChange::Add(entry(&action.target_path)));
+            report.changes.push(rnpm_install::ReifyChange::Remove(entry(
+                &action.original_path,
+            )));
+            if action.action_type == rnpm_install::DedupeActionType::HoistAndDedupe
+                && !before.contains_key(&action.target_path)
+            {
+                report
+                    .changes
+                    .push(rnpm_install::ReifyChange::Add(entry(&action.target_path)));
             }
         }
         report.inventory = before.keys().filter(|k| !k.is_empty()).count() + 1;
     } else {
-        report = crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
+        report = crate::reify_output::report_between(
+            &before,
+            &crate::reify_output::snapshot(&current_dir),
+        );
     }
-    crate::reify_output::finish(&current_dir, &report, json, dry_run, false, start_time.elapsed()).await
+    crate::reify_output::finish(
+        &current_dir,
+        &report,
+        json,
+        dry_run,
+        false,
+        start_time.elapsed(),
+    )
+    .await
 }
 
 pub(crate) async fn run_find_dupes(packages: Vec<String>, current_dir: PathBuf) -> Result<()> {

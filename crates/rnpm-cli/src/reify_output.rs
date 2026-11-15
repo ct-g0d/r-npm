@@ -22,7 +22,8 @@ impl ReifyOutputOptions {
         let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
         Self {
             json: json || config.get_bool("json").unwrap_or(false),
-            silent: config.get("loglevel") == Some("silent") || config.get_bool("silent").unwrap_or(false),
+            silent: config.get("loglevel") == Some("silent")
+                || config.get_bool("silent").unwrap_or(false),
             dry_run: dry_run || config.get_bool("dry-run").unwrap_or(false),
             long: config.get_bool("long").unwrap_or(false),
             fund,
@@ -56,21 +57,37 @@ pub(crate) fn install_audit_report(report: &AuditReport) -> String {
             major |= vuln.fix_available["isSemVerMajor"] == Value::Bool(true);
         }
     }
-    let sevs: Vec<(&str, usize)> = [("low", counts.low), ("moderate", counts.moderate), ("high", counts.high), ("critical", counts.critical)]
-        .into_iter()
-        .filter(|(_, c)| *c > 0)
-        .collect();
+    let sevs: Vec<(&str, usize)> = [
+        ("low", counts.low),
+        ("moderate", counts.moderate),
+        ("high", counts.high),
+        ("critical", counts.critical),
+    ]
+    .into_iter()
+    .filter(|(_, c)| *c > 0)
+    .collect();
     if sevs.len() > 1 {
-        let list = sevs.iter().map(|(s, c)| format!("{c} {s}")).collect::<Vec<_>>().join(", ");
+        let list = sevs
+            .iter()
+            .map(|(s, c)| format!("{c} {s}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push(format!("{} vulnerabilities ({list})", counts.total));
     } else if let Some((sev, count)) = sevs.first() {
-        out.push(format!("{count} {sev} severity vulnerabilit{}", if *count == 1 { "y" } else { "ies" }));
+        out.push(format!(
+            "{count} {sev} severity vulnerabilit{}",
+            if *count == 1 { "y" } else { "ies" }
+        ));
     }
     if fixable {
         out.push(String::new());
         out.push(format!(
             "To address {}, run:\n  npm audit fix",
-            if force || unfixable { "issues that do not require attention" } else { "all issues" }
+            if force || unfixable {
+                "issues that do not require attention"
+            } else {
+                "all issues"
+            }
         ));
     }
     if force {
@@ -78,7 +95,11 @@ pub(crate) fn install_audit_report(report: &AuditReport) -> String {
         out.push(format!(
             "To address all issues{}{}, run:\n  npm audit fix --force",
             if unfixable { " possible" } else { "" },
-            if major { " (including breaking changes)" } else { "" }
+            if major {
+                " (including breaking changes)"
+            } else {
+                ""
+            }
         ));
     }
     if unfixable {
@@ -141,7 +162,11 @@ pub(crate) fn print(
         if let Some(audit) = audit {
             summary.insert(
                 "audit".into(),
-                if opts.audit_command { serde_json::to_value(audit)? } else { serde_json::to_value(&audit.metadata)? },
+                if opts.audit_command {
+                    serde_json::to_value(audit)?
+                } else {
+                    serde_json::to_value(&audit.metadata)?
+                },
             );
         }
         println!("{}", serde_json::to_string_pretty(&Value::Object(summary))?);
@@ -191,7 +216,11 @@ pub(crate) fn print(
         println!();
         println!(
             "{funding} {} looking for funding",
-            if funding == 1 { "package is" } else { "packages are" }
+            if funding == 1 {
+                "package is"
+            } else {
+                "packages are"
+            }
         );
         println!("  run `npm fund` for details");
     }
@@ -223,7 +252,8 @@ pub(crate) fn snapshot(project_dir: &Path) -> Tree {
 
 /// The reify diff between two on-disk snapshots of a project.
 pub(crate) fn report_between(before: &Tree, after: &Tree) -> ReifyReport {
-    let mut report = rnpm_install::reify_report::compute(after, before, None, |_, _| false, |_| true);
+    let mut report =
+        rnpm_install::reify_report::compute(after, before, None, |_, _| false, |_| true);
     report.inventory = after.keys().filter(|k| !k.is_empty()).count() + 1;
     report
 }
@@ -243,11 +273,19 @@ pub(crate) async fn finish(
     let fund_enabled = config.get_bool("fund").unwrap_or(true);
     let mut opts = ReifyOutputOptions::from_config(project_dir, json, dry_run, fund_enabled);
     opts.silent |= silent;
-    let audit = if audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists() {
-        crate::audit::build_audit_report(project_dir, None).await.ok().map(|(r, _)| r)
+    let audit = if audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists()
+    {
+        crate::audit::build_audit_report(project_dir, None)
+            .await
+            .ok()
+            .map(|(r, _)| r)
     } else {
         None
     };
-    let funding = if fund_enabled && !opts.dry_run { crate::audit::count_funding_packages(project_dir) } else { 0 };
+    let funding = if fund_enabled && !opts.dry_run {
+        crate::audit::count_funding_packages(project_dir)
+    } else {
+        0
+    };
     print(project_dir, report, audit.as_ref(), funding, &opts, elapsed)
 }

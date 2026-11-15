@@ -242,7 +242,12 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
 fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
     let data = fs::read(target).ok()?;
     let text = String::from_utf8_lossy(&data);
-    let line = text.trim().split('\n').next().unwrap_or("").trim_end_matches('\r');
+    let line = text
+        .trim()
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r');
     let mut rest = line.strip_prefix("#!")?.trim_start();
     let mut vars = String::new();
     // /^#!\s*(?:\/usr\/bin\/env\s+(?:-S\s+)?((?:[^ \t=]+=[^ \t=]+\s+)*))?([^ \t]+)(.*)$/
@@ -257,9 +262,9 @@ fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
             loop {
                 let end = after.find(char::is_whitespace).unwrap_or(after.len());
                 let token = &after[..end];
-                let is_var = token.split_once('=').is_some_and(|(k, v)| {
-                    !k.is_empty() && !v.is_empty() && !v.contains('=')
-                });
+                let is_var = token
+                    .split_once('=')
+                    .is_some_and(|(k, v)| !k.is_empty() && !v.is_empty() && !v.contains('='));
                 if !is_var || end == after.len() {
                     break;
                 }
@@ -274,7 +279,11 @@ fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
     if end == 0 {
         return None;
     }
-    Some((vars, rest[..end].to_string(), rest[end..].trim().to_string()))
+    Some((
+        vars,
+        rest[..end].to_string(),
+        rest[end..].trim().to_string(),
+    ))
 }
 
 const SH_HEAD: &str = concat!(
@@ -310,8 +319,14 @@ pub fn generate_program_shims(
     prog: &str,
     args: &str,
 ) -> (String, String, String) {
-    let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
-    let ps1_target = format!("\"$basedir/../{}\"", escape_ps1_path(target_rel_from_node_modules));
+    let sh_target = format!(
+        "\"$basedir/../{}\"",
+        escape_posix_path(target_rel_from_node_modules)
+    );
+    let ps1_target = format!(
+        "\"$basedir/../{}\"",
+        escape_ps1_path(target_rel_from_node_modules)
+    );
     let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
     let sh_prog = prog.replace('\\', "/");
     let sh = format!(
@@ -330,8 +345,14 @@ pub fn generate_program_shims(
 
 /// Shim trio (sh, cmd, ps1) for a target without a shebang, as cmd-shim writes it.
 pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, String, String) {
-    let sh_target = format!("\"$basedir/../{}\"", escape_posix_path(target_rel_from_node_modules));
-    let ps1_target = format!("\"$basedir/../{}\"", escape_ps1_path(target_rel_from_node_modules));
+    let sh_target = format!(
+        "\"$basedir/../{}\"",
+        escape_posix_path(target_rel_from_node_modules)
+    );
+    let ps1_target = format!(
+        "\"$basedir/../{}\"",
+        escape_ps1_path(target_rel_from_node_modules)
+    );
     let win_target = escape_cmd_path(&target_rel_from_node_modules.replace('/', "\\"));
     let sh = format!("{SH_HEAD}exec {sh_target}   \"$@\"\n");
     let cmd = format!("{CMD_HEAD}\"%dp0%\\..\\{win_target}\"   %*\r\n");
@@ -367,13 +388,19 @@ pub fn create_shims(
         .map(|nm| nm.join(target_rel_from_node_modules))
         .filter(|t| is_dot_bin && t.is_file());
     // Plain `node` (and env-var shebangs, not modelled here) keep the node shim.
-    let custom = target.map(|t| cmd_shim_shebang(&t)).and_then(|shebang| match shebang {
-        None => Some(generate_direct_shims(target_rel_from_node_modules)),
-        Some((vars, prog, args)) if vars.is_empty() && (prog != "node" || !args.is_empty()) => {
-            Some(generate_program_shims(target_rel_from_node_modules, &prog, &args))
-        }
-        Some(_) => None,
-    });
+    let custom = target
+        .map(|t| cmd_shim_shebang(&t))
+        .and_then(|shebang| match shebang {
+            None => Some(generate_direct_shims(target_rel_from_node_modules)),
+            Some((vars, prog, args)) if vars.is_empty() && (prog != "node" || !args.is_empty()) => {
+                Some(generate_program_shims(
+                    target_rel_from_node_modules,
+                    &prog,
+                    &args,
+                ))
+            }
+            Some(_) => None,
+        });
     if let Some((sh, cmd, ps1)) = custom {
         let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, sh)

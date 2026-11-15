@@ -244,10 +244,7 @@ async fn test_stale_cached_packument_resolves_to_newer_version_from_registry() {
         time: stale_time_ms,
         metadata: Some(serde_json::json!({ "etag": "\"etag-v100\"" })),
     };
-    let index_content = format!(
-        "\t{}\n",
-        serde_json::to_string(&stale_index_entry).unwrap()
-    );
+    let index_content = format!("\t{}\n", serde_json::to_string(&stale_index_entry).unwrap());
     std::fs::write(&index_path, index_content).unwrap();
 
     // 2. Setup project manifest with ^1.0.0 dependency and no lockfile
@@ -258,11 +255,7 @@ async fn test_stale_cached_packument_resolves_to_newer_version_from_registry() {
             pkg_name: "^1.0.0"
         }
     });
-    std::fs::write(
-        project_dir.join("package.json"),
-        manifest_json.to_string(),
-    )
-    .unwrap();
+    std::fs::write(project_dir.join("package.json"), manifest_json.to_string()).unwrap();
 
     // 3. Configure Installer pointing to mock registry and custom cache
     let options = InstallOptions {
@@ -275,7 +268,10 @@ async fn test_stale_cached_packument_resolves_to_newer_version_from_registry() {
     };
 
     let mut installer = Installer::new(options).unwrap();
-    let summary = installer.install().await.expect("Installation must succeed");
+    let summary = installer
+        .install()
+        .await
+        .expect("Installation must succeed");
 
     // 4. Verify that 1.0.1 was resolved and installed, NOT stale 1.0.0
     let installed_pkg_json = project_dir

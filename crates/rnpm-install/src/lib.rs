@@ -46,8 +46,8 @@ pub use dedupe::{
     DedupeSummary,
 };
 
-pub mod fast_path;
 mod bundled;
+pub mod fast_path;
 pub use fast_path::{
     compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
 };
@@ -189,7 +189,9 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
                     .collect(),
                 has_install_script: ver_info.has_install_script
                     || ver_info.extra.get("scripts").is_some_and(|scripts| {
-                        ["preinstall", "install", "postinstall"].iter().any(|name| scripts.get(*name).is_some_and(|v| v.is_string()))
+                        ["preinstall", "install", "postinstall"]
+                            .iter()
+                            .any(|name| scripts.get(*name).is_some_and(|v| v.is_string()))
                     }),
                 deprecated: ver_info.deprecated.clone(),
                 extra: {
@@ -240,7 +242,9 @@ pub struct RegistryPackageProvider {
 /// npm never creates node_modules when nothing is reified, so drop one that
 /// holds nothing but the hidden lockfile.
 fn remove_node_modules_if_empty(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
     if names.iter().all(|n| n == ".package-lock.json") {
         let _ = std::fs::remove_file(dir.join(".package-lock.json"));
@@ -566,8 +570,14 @@ pub fn is_packument_fresh(
     if offline || prefer_offline {
         return true;
     }
-    let headers = entry.metadata.as_ref().and_then(|m| m.pointer("/response/headers"));
-    let Some(control) = headers.and_then(|h| h.get("cache-control")).and_then(|v| v.as_str()) else {
+    let headers = entry
+        .metadata
+        .as_ref()
+        .and_then(|m| m.pointer("/response/headers"));
+    let Some(control) = headers
+        .and_then(|h| h.get("cache-control"))
+        .and_then(|v| v.as_str())
+    else {
         return false;
     };
     let mut max_age = None;
@@ -580,32 +590,77 @@ pub fn is_packument_fresh(
             max_age = value.trim().trim_matches('"').parse::<u64>().ok();
         }
     }
-    let Some(max_age) = max_age else { return false; };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let Some(max_age) = max_age else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     let headers = headers.unwrap();
-    let age = headers.get("age").and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).saturating_mul(1000);
-    let apparent_age = headers.get("date").and_then(|v| v.as_str()).and_then(|v| httpdate::parse_http_date(v).ok())
-        .and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok()).map(|date| entry.time.saturating_sub(date.as_millis() as u64)).unwrap_or(0);
-    age.max(apparent_age).saturating_add(now.saturating_sub(entry.time)) < max_age.saturating_mul(1000)
+    let age = headers
+        .get("age")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_mul(1000);
+    let apparent_age = headers
+        .get("date")
+        .and_then(|v| v.as_str())
+        .and_then(|v| httpdate::parse_http_date(v).ok())
+        .and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|date| entry.time.saturating_sub(date.as_millis() as u64))
+        .unwrap_or(0);
+    age.max(apparent_age)
+        .saturating_add(now.saturating_sub(entry.time))
+        < max_age.saturating_mul(1000)
 }
 
-fn merge_packument_cache_metadata(mut response: serde_json::Value, etag: Option<String>, previous: Option<&serde_json::Value>) -> Option<serde_json::Value> {
-    if response.pointer("/response/headers/cache-control").is_none() {
+fn merge_packument_cache_metadata(
+    mut response: serde_json::Value,
+    etag: Option<String>,
+    previous: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if response
+        .pointer("/response/headers/cache-control")
+        .is_none()
+    {
         if let Some(control) = previous.and_then(|m| m.pointer("/response/headers/cache-control")) {
             response["response"]["headers"]["cache-control"] = control.clone();
         }
     }
-    if let Some(etag) = etag { response["etag"] = etag.into(); }
+    if let Some(etag) = etag {
+        response["etag"] = etag.into();
+    }
     Some(response)
 }
 
-fn store_install_packument(cache: &Cache, registry: &str, name: &str, data: &[u8], metadata: Option<serde_json::Value>) {
-    let no_store = metadata.as_ref().and_then(|m| m.pointer("/response/headers/cache-control")).and_then(|v| v.as_str())
-        .is_some_and(|control| control.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-store")));
+fn store_install_packument(
+    cache: &Cache,
+    registry: &str,
+    name: &str,
+    data: &[u8],
+    metadata: Option<serde_json::Value>,
+) {
+    let no_store = metadata
+        .as_ref()
+        .and_then(|m| m.pointer("/response/headers/cache-control"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|control| {
+            control
+                .split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("no-store"))
+        });
     if no_store {
         let _ = cache.purge_packument(registry, name, Some(INSTALL_PACKUMENT_ACCEPT));
     } else {
-        let _ = cache.put_packument_with_accept(registry, name, Some(INSTALL_PACKUMENT_ACCEPT), data, metadata);
+        let _ = cache.put_packument_with_accept(
+            registry,
+            name,
+            Some(INSTALL_PACKUMENT_ACCEPT),
+            data,
+            metadata,
+        );
     }
 }
 
@@ -690,15 +745,17 @@ impl RegistryPackageProvider {
             });
 
             match res {
-                Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
+                Ok(rnpm_registry::client::MetadataFetchResult::NotModified {
+                    etag,
+                    cache_metadata,
+                }) => {
                     let new_etag = etag.or(stored_etag);
-                    let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, entry.metadata.as_ref());
-                    store_install_packument(&self.cache,
-                        &registry_url,
-                        name,
-                        &data,
-                        cache_meta,
+                    let cache_meta = merge_packument_cache_metadata(
+                        cache_metadata,
+                        new_etag,
+                        entry.metadata.as_ref(),
                     );
+                    store_install_packument(&self.cache, &registry_url, name, &data, cache_meta);
                     if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data)
                     {
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
@@ -713,7 +770,8 @@ impl RegistryPackageProvider {
                 }) => {
                     if let Ok(bytes) = serde_json::to_vec(&abbrev) {
                         let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
-                        store_install_packument(&self.cache,
+                        store_install_packument(
+                            &self.cache,
                             &registry_url,
                             name,
                             &bytes,
@@ -767,12 +825,7 @@ impl RegistryPackageProvider {
             }) => {
                 if let Ok(bytes) = serde_json::to_vec(&abbrev) {
                     let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
-                    store_install_packument(&self.cache,
-                        &registry_url,
-                        name,
-                        &bytes,
-                        cache_meta,
-                    );
+                    store_install_packument(&self.cache, &registry_url, name, &bytes, cache_meta);
                 }
                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                 self.merge_lockfile_metadata(name, &mut meta);
@@ -1005,16 +1058,20 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
                 let reg_url = client_c.registry_for_package(&name).as_str().to_string();
                 match res {
-                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { etag, cache_metadata }) => {
+                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified {
+                        etag,
+                        cache_metadata,
+                    }) => {
                         let new_etag = etag.or(stored_etag);
-                        let cache_meta = merge_packument_cache_metadata(cache_metadata, new_etag, cached_info.as_ref().and_then(|(entry, _)| entry.metadata.as_ref()));
+                        let cache_meta = merge_packument_cache_metadata(
+                            cache_metadata,
+                            new_etag,
+                            cached_info
+                                .as_ref()
+                                .and_then(|(entry, _)| entry.metadata.as_ref()),
+                        );
                         if let Some((_, ref data)) = cached_info {
-                            store_install_packument(&cache_c,
-                                &reg_url,
-                                &name,
-                                data,
-                                cache_meta,
-                            );
+                            store_install_packument(&cache_c, &reg_url, &name, data, cache_meta);
                             if let Ok(abbrev) =
                                 serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
                             {
@@ -1039,13 +1096,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                         cache_metadata,
                     }) => {
                         if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                            let cache_meta = merge_packument_cache_metadata(cache_metadata, etag, None);
-                            store_install_packument(&cache_c,
-                                &reg_url,
-                                &name,
-                                &bytes,
-                                cache_meta,
-                            );
+                            let cache_meta =
+                                merge_packument_cache_metadata(cache_metadata, etag, None);
+                            store_install_packument(&cache_c, &reg_url, &name, &bytes, cache_meta);
                         }
                         let mut meta = abbreviated_to_package_metadata(&abbrev);
                         if let Some(ref lf) = lockfile_c {
@@ -1158,7 +1211,8 @@ pub fn apply_npmrc_to_client_config(
     }
     // make-fetch-happen only gives up on a stalled body after fetch-timeout
     // (default 5 minutes); a short idle cutoff fails large tarballs under load.
-    client_config.chunk_idle_timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
+    client_config.chunk_idle_timeout =
+        std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
 
     let connect_timeout_ms = npmrc
         .settings
@@ -1500,14 +1554,23 @@ pub struct ResolvedNode {
 /// Helper to compute normalized POSIX relative path from one directory to another.
 fn is_directory_dependency(path: &Path) -> bool {
     let spec = path.to_string_lossy();
-    !path.is_file() && ![".tgz", ".tar.gz", ".tar"].iter().any(|suffix| spec.ends_with(suffix))
+    !path.is_file()
+        && ![".tgz", ".tar.gz", ".tar"]
+            .iter()
+            .any(|suffix| spec.ends_with(suffix))
 }
 
 /// The lockfile location a `file:` directory link points at, as npm writes it:
 /// relative, forward slashes, and `""` for the project root itself.
 fn link_target_rel(rel_file: &str) -> String {
-    let cleaned = path_clean::clean(rel_file).to_string_lossy().replace('\\', "/");
-    if cleaned == "." { String::new() } else { cleaned }
+    let cleaned = path_clean::clean(rel_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if cleaned == "." {
+        String::new()
+    } else {
+        cleaned
+    }
 }
 
 /// Lockfile entry for the target of a `file:` directory link, shaped like
@@ -1544,7 +1607,13 @@ pub const CI_NO_LOCKFILE_USAGE: &str = "\nThe `npm ci` command can only install 
 fn npm_error_lines(message: &str) -> String {
     message
         .lines()
-        .map(|l| if l.is_empty() { "npm error".to_string() } else { format!("npm error {l}") })
+        .map(|l| {
+            if l.is_empty() {
+                "npm error".to_string()
+            } else {
+                format!("npm error {l}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1565,7 +1634,10 @@ fn assert_root_overrides(manifest: &Manifest) -> Result<()> {
     for (name, raw_spec) in direct {
         for (key, value) in overrides {
             let key_name = match key.strip_prefix('@') {
-                Some(rest) => rest.split_once('@').map(|(n, _)| format!("@{n}")).unwrap_or_else(|| key.clone()),
+                Some(rest) => rest
+                    .split_once('@')
+                    .map(|(n, _)| format!("@{n}"))
+                    .unwrap_or_else(|| key.clone()),
                 None => key.split('@').next().unwrap_or(key).to_string(),
             };
             if &key_name != name {
@@ -1840,7 +1912,9 @@ impl Installer {
             collect(&member.manifest);
         }
         declared.extend(self.options.packages.iter().filter_map(|spec| {
-            rnpm_core::spec::PackageSpec::parse(spec).ok().map(|s| s.name.clone())
+            rnpm_core::spec::PackageSpec::parse(spec)
+                .ok()
+                .map(|s| s.name.clone())
         }));
         let workspace_paths: HashSet<String> = workspace_members
             .iter()
@@ -1866,7 +1940,13 @@ impl Installer {
         if self.options.force {
             return Ok(());
         }
-        policy::check_engines(lockfile, &base_dir, self.engine_strict, self.options.silent, &self.options.platform())
+        policy::check_engines(
+            lockfile,
+            &base_dir,
+            self.engine_strict,
+            self.options.silent,
+            &self.options.platform(),
+        )
     }
 
     /// Lifecycle options shared by dependency and root hooks.
@@ -2032,11 +2112,20 @@ impl Installer {
                             let _life_guard = collector.enter_phase(Phase::Lifecycle);
                             rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts).await?;
                         }
-                        let inventory = LockfileV3::load_from_file(&self.options.project_dir.join("node_modules").join(".package-lock.json"))
-                            .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
-                            .unwrap_or(1);
+                        let inventory = LockfileV3::load_from_file(
+                            &self
+                                .options
+                                .project_dir
+                                .join("node_modules")
+                                .join(".package-lock.json"),
+                        )
+                        .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
+                        .unwrap_or(1);
                         return Ok(InstallSummary {
-                            reify: Some(ReifyReport { changes: Vec::new(), inventory }),
+                            reify: Some(ReifyReport {
+                                changes: Vec::new(),
+                                inventory,
+                            }),
                             packages_installed: 0,
                             cache_hits: 0,
                             cache_misses: 0,
@@ -2545,7 +2634,11 @@ impl Installer {
             }
 
             // Save package.json unless --no-save was passed, in global mode, or skip_manifest_save is set
-            if !self.options.is_global && !self.options.no_save && !self.options.skip_manifest_save && !self.options.dry_run {
+            if !self.options.is_global
+                && !self.options.no_save
+                && !self.options.skip_manifest_save
+                && !self.options.dry_run
+            {
                 save::save_manifests(
                     &self.options.project_dir,
                     &manifest,
@@ -2613,7 +2706,8 @@ impl Installer {
                 if self.options.save_optional {
                     for added in &added_pkgs {
                         root_pkg.dependencies.get_or_insert_default().insert(
-                            added.name.clone(), added.user_spec.clone().unwrap_or_else(|| "*".into())
+                            added.name.clone(),
+                            added.user_spec.clone().unwrap_or_else(|| "*".into()),
                         );
                     }
                 }
@@ -2655,7 +2749,14 @@ impl Installer {
             }
         }
 
-        bundled::inflate(&mut lockfile, &self.cache, &self.registry_client, self.options.offline, &self.options.project_dir).await?;
+        bundled::inflate(
+            &mut lockfile,
+            &self.cache,
+            &self.registry_client,
+            self.options.offline,
+            &self.options.project_dir,
+        )
+        .await?;
 
         // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
         if self.options.package_lock_only {
@@ -2677,9 +2778,10 @@ impl Installer {
                             // A self link (`"."`) targets the root, which already has an entry.
 
                             if !clean_rel.is_empty() {
-
-                                lockfile.insert_package(clean_rel, directory_target_entry(&abs_file, clean_rel, node));
-
+                                lockfile.insert_package(
+                                    clean_rel,
+                                    directory_target_entry(&abs_file, clean_rel, node),
+                                );
                             }
                         }
                     }
@@ -2746,14 +2848,24 @@ impl Installer {
 
         // npm reify-output: diff the actual tree on disk against the ideal tree.
         let reify_report = (!self.options.is_global).then(|| {
-            let hidden_valid = validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+            let hidden_valid =
+                validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
             let actual = reify_report::load_actual(
                 &self.options.project_dir,
                 hidden_valid && !self.options.force,
                 existing_lockfile_for_merge.as_ref().map(|l| &l.packages),
             );
-            let rank = reify_report::placement_rank(&lockfile.packages, existing_lockfile_for_merge.as_ref().map(|l| &l.packages));
-            reify_report_for(&self.options, &lockfile, &actual, reify_locations.as_ref(), Some(&rank))
+            let rank = reify_report::placement_rank(
+                &lockfile.packages,
+                existing_lockfile_for_merge.as_ref().map(|l| &l.packages),
+            );
+            reify_report_for(
+                &self.options,
+                &lockfile,
+                &actual,
+                reify_locations.as_ref(),
+                Some(&rank),
+            )
         });
 
         // 3b. For --dry-run, simulate installation and report what would be installed
@@ -3312,7 +3424,7 @@ impl Installer {
                         }
 
                         let clean_rel = link_target_rel(rel_file);
-                            let clean_rel = clean_rel.as_str();
+                        let clean_rel = clean_rel.as_str();
                         let link_entry = LockfilePackage {
                             resolved: Some(clean_rel.to_string()),
                             link: Some(true),
@@ -3323,9 +3435,10 @@ impl Installer {
                         // A self link (`"."`) targets the root, which already has an entry.
 
                         if !clean_rel.is_empty() {
-
-                            lockfile.insert_package(clean_rel, directory_target_entry(&abs_file, clean_rel, node));
-
+                            lockfile.insert_package(
+                                clean_rel,
+                                directory_target_entry(&abs_file, clean_rel, node),
+                            );
                         }
                         continue;
                     }
@@ -4108,8 +4221,11 @@ impl Installer {
                 let mut actual_lockfile = lockfile.clone();
                 // The hidden lockfile describes the tree on disk: omitted
                 // dev/optional/peer packages are not part of it.
-                let (omit_dev, omit_optional, omit_peer) =
-                    (self.options.omit_dev, self.options.omit_optional, self.options.omit_peer);
+                let (omit_dev, omit_optional, omit_peer) = (
+                    self.options.omit_dev,
+                    self.options.omit_optional,
+                    self.options.omit_peer,
+                );
                 actual_lockfile.packages.retain(|location, pkg| {
                     location.is_empty()
                         || !((omit_dev && pkg.is_dev())
@@ -4449,8 +4565,13 @@ impl Installer {
             let actual = if from_scratch && !self.options.dry_run {
                 BTreeMap::new()
             } else {
-                let hidden_valid = validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
-                reify_report::load_actual(&self.options.project_dir, hidden_valid, Some(&lockfile.packages))
+                let hidden_valid =
+                    validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+                reify_report::load_actual(
+                    &self.options.project_dir,
+                    hidden_valid,
+                    Some(&lockfile.packages),
+                )
             };
             reify_report_for(&self.options, &lockfile, &actual, None, None)
         });
@@ -4812,10 +4933,18 @@ impl Installer {
             let derived_resolved = if pkg_info.resolved.is_none() && pkg_info.link != Some(true) {
                 pkg_info.version.as_ref().map(|version| {
                     let name = pkg_info.name.clone().unwrap_or_else(|| {
-                        pkg_key.rsplit_once("node_modules/").map(|(_, n)| n.to_string()).unwrap_or_default()
+                        pkg_key
+                            .rsplit_once("node_modules/")
+                            .map(|(_, n)| n.to_string())
+                            .unwrap_or_default()
                     });
                     let unscoped = name.rsplit('/').next().unwrap_or(&name).to_string();
-                    let base = self.registry_client.registry_for_package(&name).as_str().trim_end_matches('/').to_string();
+                    let base = self
+                        .registry_client
+                        .registry_for_package(&name)
+                        .as_str()
+                        .trim_end_matches('/')
+                        .to_string();
                     format!("{base}/{name}/-/{unscoped}-{version}.tgz")
                 })
             } else {
@@ -6335,7 +6464,11 @@ impl Installer {
                 })
                 .or_else(|| {
                     self.cache
-                        .get_packument_with_accept(registry_url, name, Some(INSTALL_PACKUMENT_ACCEPT))
+                        .get_packument_with_accept(
+                            registry_url,
+                            name,
+                            Some(INSTALL_PACKUMENT_ACCEPT),
+                        )
                         .ok()
                         .flatten()
                         .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
@@ -6392,7 +6525,10 @@ impl Installer {
                     // arborist pkgMetaKeys records a non-empty `workspaces`.
                     if !package.extra.contains_key("workspaces") {
                         if let Some(ws) = ver_val.get("workspaces").filter(|ws| {
-                            ws.as_array().map_or(ws.is_object() && ws.as_object().is_some_and(|o| !o.is_empty()), |a| !a.is_empty())
+                            ws.as_array().map_or(
+                                ws.is_object() && ws.as_object().is_some_and(|o| !o.is_empty()),
+                                |a| !a.is_empty(),
+                            )
                         }) {
                             package.extra.insert("workspaces".to_string(), ws.clone());
                         }

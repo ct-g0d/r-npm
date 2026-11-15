@@ -713,7 +713,11 @@ impl Cache {
 
         // Put blob in content-addressable storage
         let sha512_hex = if let Some(expected) = expected_integrity {
-            if let Some(sha_entry) = expected.entries.iter().find(|e| e.algorithm == Algorithm::Sha512) {
+            if let Some(sha_entry) = expected
+                .entries
+                .iter()
+                .find(|e| e.algorithm == Algorithm::Sha512)
+            {
                 let hex = HEXLOWER.encode(&sha_entry.digest);
                 self.put_blob_direct(data, &hex)?;
                 hex

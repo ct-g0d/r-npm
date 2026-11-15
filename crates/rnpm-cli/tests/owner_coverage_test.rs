@@ -114,7 +114,11 @@ async fn test_cli_owner_ls() {
 
     let _ = tx.send(());
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("alice <alice@example.com>"));
     assert!(stdout.contains("bob <bob@example.com>"));

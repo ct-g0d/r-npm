@@ -105,7 +105,11 @@ pub async fn run(
     let manifest_path = pkg_dir.join("package.json");
 
     if !manifest_path.is_file() {
-        let errno_str = if cfg!(windows) { "errno -4058\n" } else { "errno -2\n" };
+        let errno_str = if cfg!(windows) {
+            "errno -4058\n"
+        } else {
+            "errno -2\n"
+        };
         return Err(anyhow::anyhow!(
             "npm error explore It doesn't look like {pkgname} is installed.\n\
              npm error code ENOENT\n\
@@ -140,7 +144,10 @@ pub async fn run(
     // Determine command to run
     let is_interactive = args.is_empty();
     let (program, cmd_args, script_str, full_cmd_display) = if is_interactive {
-        println!("\nExploring {}\nType 'exit' or ^D when finished\n", pkg_dir.display());
+        println!(
+            "\nExploring {}\nType 'exit' or ^D when finished\n",
+            pkg_dir.display()
+        );
 
         #[cfg(windows)]
         {
@@ -166,7 +173,12 @@ pub async fn run(
         {
             let sh = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
             let display = format!("{sh} /d /s /c {script}");
-            (sh, vec!["/d".into(), "/s".into(), "/c".into(), script.clone()], script, display)
+            (
+                sh,
+                vec!["/d".into(), "/s".into(), "/c".into(), script.clone()],
+                script,
+                display,
+            )
         }
 
         #[cfg(not(windows))]
@@ -186,7 +198,10 @@ pub async fn run(
         .env("npm_lifecycle_script", &script_str)
         .env("npm_package_name", &pkg_real_name)
         .env("npm_package_version", &pkg_version)
-        .env("npm_package_json", manifest_path.to_string_lossy().to_string())
+        .env(
+            "npm_package_json",
+            manifest_path.to_string_lossy().to_string(),
+        )
         .env("npm_command", "explore")
         .status()
         .map_err(|e| anyhow::anyhow!("npm error failed to run explore command: {e}"))?;
@@ -263,13 +278,22 @@ mod tests {
     #[test]
     fn test_build_explore_path_ancestors() {
         let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path().join("node_modules").join("a").join("node_modules").join("b");
+        let pkg_dir = tmp
+            .path()
+            .join("node_modules")
+            .join("a")
+            .join("node_modules")
+            .join("b");
         let path = build_explore_path(&pkg_dir);
         assert!(!path.is_empty());
         // Verify both package's node_modules/.bin and ancestor node_modules/.bin are present
         let sep = if cfg!(windows) { ';' } else { ':' };
         let entries: Vec<&str> = path.split(sep).collect();
-        assert!(entries.iter().any(|e| e.contains("b") && e.contains(".bin")));
-        assert!(entries.iter().any(|e| e.contains("a") && e.contains(".bin")));
+        assert!(entries
+            .iter()
+            .any(|e| e.contains("b") && e.contains(".bin")));
+        assert!(entries
+            .iter()
+            .any(|e| e.contains("a") && e.contains(".bin")));
     }
 }

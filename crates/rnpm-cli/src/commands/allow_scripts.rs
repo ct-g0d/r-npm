@@ -2,9 +2,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-fn installed_install_script_packages(
-    current_dir: &Path,
-) -> Result<BTreeMap<String, PathBuf>> {
+fn installed_install_script_packages(current_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     let node_modules = current_dir.join("node_modules");
     let lock = current_dir.join("package-lock.json");
     let lock_value = std::fs::read_to_string(lock)
@@ -207,10 +205,12 @@ fn apply_policy_changes(
         } else {
             "Deny install scripts for specific dependencies\n\nUsage:\nnpm deny-scripts <pkg> [<pkg> ...]\nnpm deny-scripts --all\n\nOptions:\n[-a|--all] [--allow-scripts-pending] [--no-allow-scripts-pin] [--json]\n\n  -a|--all\n    Show or act on all packages, not just the ones your project directly\n\n  --allow-scripts-pending\n    List packages with install scripts that are not yet covered by the\n\n  --allow-scripts-pin\n    Write pinned (`pkg@version`) entries when approving install scripts.\n\n  --json\n    Whether or not to output JSON data, rather than the normal output.\n\n\nRun \"npm help deny-scripts\" for more info"
         };
-        let err_lines = usage.lines().map(|l| format!("npm error {l}")).collect::<Vec<_>>().join("\n");
-        return Err(anyhow::anyhow!(
-            "npm error code EUSAGE\n{err_lines}"
-        ));
+        let err_lines = usage
+            .lines()
+            .map(|l| format!("npm error {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow::anyhow!("npm error code EUSAGE\n{err_lines}"));
     }
 
     let installed = installed_install_script_packages(current_dir)?;
@@ -251,7 +251,11 @@ fn apply_policy_changes(
                 unmatched.push(requested.clone());
             } else {
                 for m in matches.drain(..) {
-                    let group_name = requested.rsplit_once('@').map(|(n, _)| n).unwrap_or(requested).to_string();
+                    let group_name = requested
+                        .rsplit_once('@')
+                        .map(|(n, _)| n)
+                        .unwrap_or(requested)
+                        .to_string();
                     targets.push((group_name, m));
                 }
             }
@@ -274,7 +278,9 @@ fn apply_policy_changes(
         .entry("allowScripts")
         .or_insert_with(|| serde_json::json!({}));
     let allow = allow.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("npm error code EJSONPARSE\nnpm error package.json allowScripts must be an object")
+        anyhow::anyhow!(
+            "npm error code EJSONPARSE\nnpm error package.json allowScripts must be an object"
+        )
     })?;
 
     // Apply changes grouped by package name
@@ -407,16 +413,20 @@ pub(crate) fn run_install_scripts(
     dry_run: bool,
 ) -> Result<()> {
     match action.unwrap_or("") {
-        "approve" => apply_policy_changes(current_dir, packages, true, all, json, "install-scripts"),
+        "approve" => {
+            apply_policy_changes(current_dir, packages, true, all, json, "install-scripts")
+        }
         "deny" => apply_policy_changes(current_dir, packages, false, all, json, "install-scripts"),
         "ls" | "list" => list_pending_install_scripts(current_dir, json),
         "prune" => prune_install_scripts_policy(current_dir, json, dry_run),
         _ => {
             let usage = "Manage install-script approvals for dependencies\n\nUsage:\nnpm install-scripts approve <pkg> [<pkg> ...]\nnpm install-scripts approve --all\nnpm install-scripts deny <pkg> [<pkg> ...]\nnpm install-scripts deny --all\nnpm install-scripts ls\nnpm install-scripts prune\n\nOptions:\n[-a|--all] [--no-allow-scripts-pin] [--dry-run] [--json]\n\n  -a|--all\n    Show or act on all packages, not just the ones your project directly\n\n  --allow-scripts-pin\n    Write pinned (`pkg@version`) entries when approving install scripts.\n\n  --dry-run\n    Indicates that you don't want npm to make any changes and that it should\n\n  --json\n    Whether or not to output JSON data, rather than the normal output.\n\n\nRun \"npm help install-scripts\" for more info";
-            let err_lines = usage.lines().map(|l| format!("npm error {l}")).collect::<Vec<_>>().join("\n");
-            Err(anyhow::anyhow!(
-                "npm error code EUSAGE\n{err_lines}"
-            ))
+            let err_lines = usage
+                .lines()
+                .map(|l| format!("npm error {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(anyhow::anyhow!("npm error code EUSAGE\n{err_lines}"))
         }
     }
 }

@@ -65,7 +65,9 @@ pub fn search_documents(terms: &[String], docs: &[(String, String)]) -> Vec<Sear
         let lower_content = content.to_lowercase();
 
         // Skip if no terms match at all
-        let any_match = terms.iter().any(|t| lower_content.contains(&t.to_lowercase()));
+        let any_match = terms
+            .iter()
+            .any(|t| lower_content.contains(&t.to_lowercase()));
         if !any_match {
             continue;
         }
@@ -265,8 +267,8 @@ pub fn load_documentation(custom_dir: Option<&Path>) -> Result<Vec<(String, Stri
     }
 
     // 2. Environment variable override
-    if let Ok(env_path) = std::env::var("RNPM_DOCS_PATH")
-        .or_else(|_| std::env::var("npm_config_docs_path"))
+    if let Ok(env_path) =
+        std::env::var("RNPM_DOCS_PATH").or_else(|_| std::env::var("npm_config_docs_path"))
     {
         let p = PathBuf::from(env_path);
         if p.is_dir() {
@@ -316,11 +318,7 @@ fn load_embedded_docs() -> Result<Vec<(String, String)>> {
 }
 
 /// Execute help-search command.
-pub async fn run(
-    terms: Vec<String>,
-    long: bool,
-    custom_docs_dir: Option<&Path>,
-) -> Result<()> {
+pub async fn run(terms: Vec<String>, long: bool, custom_docs_dir: Option<&Path>) -> Result<()> {
     if terms.is_empty() {
         return Err(anyhow::anyhow!(
             "npm error code EUSAGE\n\
@@ -373,8 +371,12 @@ mod tests {
     fn test_help_search_format_no_match() {
         let docs = load_embedded_docs().expect("Embedded docs must decompress");
         let results = search_documents(&["nonexistenttopicxyz999".to_string()], &docs);
-        let formatted = format_search_results(&["nonexistenttopicxyz999".to_string()], &results, false);
-        assert_eq!(formatted, "No matches in help for: nonexistenttopicxyz999\n");
+        let formatted =
+            format_search_results(&["nonexistenttopicxyz999".to_string()], &results, false);
+        assert_eq!(
+            formatted,
+            "No matches in help for: nonexistenttopicxyz999\n"
+        );
     }
 
     #[test]
@@ -433,10 +435,16 @@ mod tests {
         // No matches with terms (short mode)
         let terms = vec!["nonexistent_term_123".to_string()];
         let formatted_no_match = format_search_results(&terms, &[], false);
-        assert_eq!(formatted_no_match, "No matches in help for: nonexistent_term_123\n");
+        assert_eq!(
+            formatted_no_match,
+            "No matches in help for: nonexistent_term_123\n"
+        );
 
         // No matches with terms (long mode)
         let formatted_long_no_match = format_search_results(&terms, &[], true);
-        assert_eq!(formatted_long_no_match, "No matches in help for: nonexistent_term_123\n");
+        assert_eq!(
+            formatted_long_no_match,
+            "No matches in help for: nonexistent_term_123\n"
+        );
     }
 }

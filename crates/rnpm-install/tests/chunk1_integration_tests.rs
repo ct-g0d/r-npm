@@ -505,7 +505,11 @@ async fn test_root_overrides_applied_and_copied_to_lockfile() {
         err.to_string().contains("npm error code EOVERRIDE"),
         "unexpected error: {err:#}"
     );
-    assert!(!temp_proj.path().join("node_modules").join("dep-pkg").exists());
+    assert!(!temp_proj
+        .path()
+        .join("node_modules")
+        .join("dep-pkg")
+        .exists());
 }
 
 #[tokio::test]

@@ -488,7 +488,10 @@ async fn wait_for_grandchild_pid(
                 }
             }
             if task.is_finished() {
-                panic!("Lifecycle exited before grandchild readiness: {:?}", (&mut *task).await);
+                panic!(
+                    "Lifecycle exited before grandchild readiness: {:?}",
+                    (&mut *task).await
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -497,7 +500,10 @@ async fn wait_for_grandchild_pid(
         Ok(pid) => pid,
         Err(_) => {
             task.abort();
-            panic!("Grandchild did not record its PID within 90 seconds: {}", file.display());
+            panic!(
+                "Grandchild did not record its PID within 90 seconds: {}",
+                file.display()
+            );
         }
     }
 }
@@ -507,7 +513,9 @@ async fn wait_for_process_exit(pid: u32) {
         while process_guard::is_process_running(pid) {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-    }).await.expect("Terminated grandchild must actually exit, without orphaned processes");
+    })
+    .await
+    .expect("Terminated grandchild must actually exit, without orphaned processes");
 }
 
 #[tokio::test]
@@ -1072,7 +1080,11 @@ async fn test_execute_binary_with_abort_cancellation() {
     let root = temp.path();
 
     let script = root.join("long_running.js");
-    std::fs::write(&script, "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n").unwrap();
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1089,7 +1101,15 @@ async fn test_execute_binary_with_abort_cancellation() {
     let script_clone = script.clone();
     let root_buf = root.to_path_buf();
     let exec_task = tokio::spawn(async move {
-        execute_binary_with_abort(&script_clone, &[], &root_buf, &[], &HashMap::new(), abort_fut).await
+        execute_binary_with_abort(
+            &script_clone,
+            &[],
+            &root_buf,
+            &[],
+            &HashMap::new(),
+            abort_fut,
+        )
+        .await
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1579,13 +1599,25 @@ fn test_sync_reaps_descendants_before_waiting_for_pipe_eof() {
     let script_file = temp.path().join("parent.cjs");
     std::fs::write(&script_file, script).unwrap();
     let ctx = LifecycleContext::new(
-        temp.path(), temp.path(), "inherited-pipes", "install",
+        temp.path(),
+        temp.path(),
+        "inherited-pipes",
+        "install",
         format!("node \"{}\"", script_file.display()),
-    ).with_capture_output(true).with_timeout(std::time::Duration::from_secs(180));
+    )
+    .with_capture_output(true)
+    .with_timeout(std::time::Duration::from_secs(180));
     let status = execute_lifecycle_script(&ctx).unwrap();
     assert!(status.success());
-    assert!(ctx.get_captured_output().unwrap().stdout.contains("grandchild-ready"));
-    assert!(!marker.exists(), "An inherited output pipe must not keep an orphan alive until natural exit");
+    assert!(ctx
+        .get_captured_output()
+        .unwrap()
+        .stdout
+        .contains("grandchild-ready"));
+    assert!(
+        !marker.exists(),
+        "An inherited output pipe must not keep an orphan alive until natural exit"
+    );
 }
 
 #[test]

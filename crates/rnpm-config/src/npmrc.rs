@@ -74,19 +74,16 @@ impl Npmrc {
                     }
                 }
             } else if let Some(prefix) = key.strip_suffix(":username") {
-                let password = self
-                    .settings
-                    .get(&format!("{prefix}:_password"))
-                    .map(|p| {
-                        data_encoding::BASE64
-                            .decode(p.trim().as_bytes())
-                            .ok()
-                            .and_then(|b| String::from_utf8(b).ok())
-                            .unwrap_or_else(|| p.trim().to_string())
-                    });
+                let password = self.settings.get(&format!("{prefix}:_password")).map(|p| {
+                    data_encoding::BASE64
+                        .decode(p.trim().as_bytes())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_else(|| p.trim().to_string())
+                });
                 if let Some(password) = password {
-                    let encoded =
-                        data_encoding::BASE64.encode(format!("{}:{password}", value.trim()).as_bytes());
+                    let encoded = data_encoding::BASE64
+                        .encode(format!("{}:{password}", value.trim()).as_bytes());
                     out.entry(normalize_uri_prefix(prefix)).or_insert(encoded);
                 }
             }

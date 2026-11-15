@@ -54,9 +54,15 @@ impl SourcePolicy {
     }
 
     fn is_unrestricted(&self) -> bool {
-        [self.git, self.remote, self.registry, self.file, self.directory]
-            .iter()
-            .all(|m| *m == AllowMode::All)
+        [
+            self.git,
+            self.remote,
+            self.registry,
+            self.file,
+            self.directory,
+        ]
+        .iter()
+        .all(|m| *m == AllowMode::All)
     }
 }
 
@@ -100,14 +106,26 @@ fn is_registry_tarball(resolved: &str) -> bool {
     }
     let file = &path[idx + 3..];
     file.char_indices().any(|(i, c)| {
-        c == '-' && file[i + 1..].chars().next().is_some_and(|d| d.is_ascii_digit())
+        c == '-'
+            && file[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(|d| d.is_ascii_digit())
     })
 }
 
 fn is_git_spec(spec: &str) -> bool {
-    ["git+", "git://", "git@", "github:", "gitlab:", "bitbucket:", "gist:"]
-        .iter()
-        .any(|p| spec.starts_with(p))
+    [
+        "git+",
+        "git://",
+        "git@",
+        "github:",
+        "gitlab:",
+        "bitbucket:",
+        "gist:",
+    ]
+    .iter()
+    .any(|p| spec.starts_with(p))
 }
 
 fn classify(pkg: &LockfilePackage) -> SourceKind {
@@ -177,7 +195,11 @@ pub fn check_sources(
             AllowMode::None => false,
         };
         if !allowed {
-            let qualifier = if mode == AllowMode::Root { " non-root" } else { "" };
+            let qualifier = if mode == AllowMode::Root {
+                " non-root"
+            } else {
+                ""
+            };
             return Err(anyhow!(
                 "npm error code EALLOW{}\nnpm error Fetching{qualifier} packages of type \"{}\" have been disabled",
                 kind.label().to_ascii_uppercase(),
@@ -204,7 +226,10 @@ fn js_inspect_map(map: &[(String, String)]) -> String {
     let body = map
         .iter()
         .map(|(k, v)| {
-            let key = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+            let key = if k
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            {
                 k.clone()
             } else {
                 js_inspect_str(k)
@@ -221,14 +246,24 @@ fn js_inspect_value(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => js_inspect_str(s),
         serde_json::Value::Array(items) if items.is_empty() => "[]".into(),
         serde_json::Value::Array(items) => {
-            format!("[ {} ]", items.iter().map(js_inspect_value).collect::<Vec<_>>().join(", "))
+            format!(
+                "[ {} ]",
+                items
+                    .iter()
+                    .map(js_inspect_value)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         serde_json::Value::Object(map) if map.is_empty() => "{}".into(),
         serde_json::Value::Object(map) => {
             let body = map
                 .iter()
                 .map(|(k, v)| {
-                    let key = if k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                    let key = if k
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                    {
                         k.clone()
                     } else {
                         js_inspect_str(k)
@@ -258,14 +293,23 @@ fn linux_libc_family() -> Option<String> {
 /// node's `os.release()`: the kernel release, or `major.minor.build` on Windows.
 fn os_release() -> Option<String> {
     let out = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/c", "ver"]).output().ok()?
+        std::process::Command::new("cmd")
+            .args(["/c", "ver"])
+            .output()
+            .ok()?
     } else {
-        std::process::Command::new("uname").arg("-r").output().ok()?
+        std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()?
     };
     let text = String::from_utf8_lossy(&out.stdout);
     if cfg!(windows) {
         let start = text.find(|c: char| c.is_ascii_digit())?;
-        let ver: String = text[start..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let ver: String = text[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
         Some(ver.split('.').take(3).collect::<Vec<_>>().join("."))
     } else {
         Some(text.trim().to_string())
@@ -284,11 +328,17 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
         return Ok(());
     };
     let Some(wanted) = dev_engines.as_object() else {
-        return Err(anyhow!("npm error Invalid non-object value for \"devEngines\""));
+        return Err(anyhow!(
+            "npm error Invalid non-object value for \"devEngines\""
+        ));
     };
 
     let node_version = rnpm_lifecycle::node_version();
-    let node_version = if node_version.starts_with('v') { node_version } else { format!("v{node_version}") };
+    let node_version = if node_version.starts_with('v') {
+        node_version
+    } else {
+        format!("v{node_version}")
+    };
     let os_name = match std::env::consts::OS {
         "windows" => "win32",
         "macos" => "darwin",
@@ -302,8 +352,14 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
     };
     let current_for = |engine: &str| -> Vec<(&'static str, Option<String>)> {
         match engine {
-            "packageManager" => vec![("name", Some("npm".into())), ("version", Some(rnpm_lifecycle::NPM_VERSION.into()))],
-            "runtime" => vec![("name", Some("node".into())), ("version", Some(node_version.clone()))],
+            "packageManager" => vec![
+                ("name", Some("npm".into())),
+                ("version", Some(rnpm_lifecycle::NPM_VERSION.into())),
+            ],
+            "runtime" => vec![
+                ("name", Some("node".into())),
+                ("version", Some(node_version.clone())),
+            ],
             "os" => vec![("name", Some(os_name.into())), ("version", os_release())],
             "cpu" => vec![("name", Some(cpu_name.into()))],
             _ => vec![("name", linux_libc_family().filter(|_| os_name == "linux"))],
@@ -320,7 +376,9 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
     let mut failures = Vec::new();
     for (engine, authored) in wanted {
         if !["packageManager", "runtime", "cpu", "libc", "os"].contains(&engine.as_str()) {
-            return Err(anyhow!("npm error Invalid property \"devEngines.{engine}\""));
+            return Err(anyhow!(
+                "npm error Invalid property \"devEngines.{engine}\""
+            ));
         }
         let deps: Vec<&serde_json::Value> = match authored {
             serde_json::Value::Array(items) => items.iter().collect(),
@@ -335,38 +393,66 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
         let mut dep_errors = Vec::new();
         for dep in &deps {
             let Some(dep) = dep.as_object() else {
-                return Err(anyhow!("npm error Invalid non-object value for \"{engine}\""));
+                return Err(anyhow!(
+                    "npm error Invalid non-object value for \"{engine}\""
+                ));
             };
-            if let Some(prop) = dep.keys().find(|k| !["name", "version", "onFail"].contains(&k.as_str())) {
-                return Err(anyhow!("npm error Invalid property \"{prop}\" for \"{engine}\""));
+            if let Some(prop) = dep
+                .keys()
+                .find(|k| !["name", "version", "onFail"].contains(&k.as_str()))
+            {
+                return Err(anyhow!(
+                    "npm error Invalid property \"{prop}\" for \"{engine}\""
+                ));
             }
             let Some(name) = dep.get("name") else {
-                return Err(anyhow!("npm error Missing \"name\" property for \"{engine}\""));
+                return Err(anyhow!(
+                    "npm error Missing \"name\" property for \"{engine}\""
+                ));
             };
             let Some(name) = name.as_str() else {
-                return Err(anyhow!("npm error Invalid non-string value for \"name\" within \"{engine}\""));
+                return Err(anyhow!(
+                    "npm error Invalid non-string value for \"name\" within \"{engine}\""
+                ));
             };
             let Some(current_name) = current_name.as_deref() else {
-                return Err(anyhow!("npm error Unable to determine \"name\" for \"{engine}\""));
+                return Err(anyhow!(
+                    "npm error Unable to determine \"name\" for \"{engine}\""
+                ));
             };
             if let Some(on_fail) = dep.get("onFail") {
                 match on_fail.as_str() {
                     Some("ignore" | "warn" | "error" | "download") => {}
-                    Some(other) => return Err(anyhow!("npm error Invalid onFail value \"{other}\" for \"{engine}\"")),
-                    None => return Err(anyhow!("npm error Invalid non-string value for \"onFail\" within \"{engine}\"")),
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "npm error Invalid onFail value \"{other}\" for \"{engine}\""
+                        ))
+                    }
+                    None => {
+                        return Err(anyhow!(
+                            "npm error Invalid non-string value for \"onFail\" within \"{engine}\""
+                        ))
+                    }
                 }
             }
             if name != current_name {
-                dep_errors.push(format!("Invalid name \"{name}\" does not match \"{current_name}\" for \"{engine}\""));
+                dep_errors.push(format!(
+                    "Invalid name \"{name}\" does not match \"{current_name}\" for \"{engine}\""
+                ));
                 continue;
             }
             if let Some(version) = dep.get("version") {
                 let Some(version) = version.as_str() else {
-                    return Err(anyhow!("npm error Invalid non-string value for \"version\" within \"{engine}\""));
+                    return Err(anyhow!(
+                        "npm error Invalid non-string value for \"version\" within \"{engine}\""
+                    ));
                 };
                 // os.version is the kernel release, which rnpm does not read.
-                let Some(current_version) = current_version.as_deref() else { continue };
-                let parsed = rnpm_core::semver::Version::parse(current_version.trim_start_matches('v')).ok();
+                let Some(current_version) = current_version.as_deref() else {
+                    continue;
+                };
+                let parsed =
+                    rnpm_core::semver::Version::parse(current_version.trim_start_matches('v')).ok();
                 match rnpm_core::semver::Range::parse(version) {
                     Ok(range) => {
                         if !parsed.is_some_and(|v| range.satisfies(&v)) {
@@ -408,7 +494,10 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
     let render = |failure: &Failure, first: bool, prefix: &str| -> String {
         let mut lines = Vec::new();
         if first {
-            lines.push("The developer of this package has specified the following through devEngines".to_string());
+            lines.push(
+                "The developer of this package has specified the following through devEngines"
+                    .to_string(),
+            );
         }
         lines.push(failure.message.clone());
         lines.extend(failure.errors.iter().cloned());
@@ -416,10 +505,17 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
         lines.push(format!("  current: {},", failure.current));
         lines.push(format!("  required: {}", failure.required));
         lines.push("}".into());
-        lines.iter().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+        lines
+            .iter()
+            .map(|l| format!("{prefix}{l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     let (errors, warnings): (Vec<_>, Vec<_>) = failures.into_iter().partition(|f| !f.is_warn);
-    let shown: Vec<&Failure> = warnings.iter().chain(errors.iter().filter(|_| force)).collect();
+    let shown: Vec<&Failure> = warnings
+        .iter()
+        .chain(errors.iter().filter(|_| force))
+        .collect();
     for (i, failure) in shown.iter().enumerate() {
         eprintln!("{}", render(failure, i == 0, "npm warn EBADDEVENGINES "));
     }
@@ -448,13 +544,13 @@ pub fn check_engines(
     let npm_version = rnpm_lifecycle::NPM_VERSION;
     let node_semver = rnpm_core::semver::Version::parse(node_version.trim_start_matches('v')).ok();
     let npm_semver = rnpm_core::semver::Version::parse(npm_version).ok();
-    let fails = |range: Option<&String>, version: Option<&rnpm_core::semver::Version>| {
-        match (range, version) {
-            (Some(range), Some(version)) => rnpm_core::semver::Range::parse(range)
-                .map(|r| !r.satisfies(version))
-                .unwrap_or(false),
-            _ => false,
-        }
+    let fails = |range: Option<&String>, version: Option<&rnpm_core::semver::Version>| match (
+        range, version,
+    ) {
+        (Some(range), Some(version)) => rnpm_core::semver::Range::parse(range)
+            .map(|r| !r.satisfies(version))
+            .unwrap_or(false),
+        _ => false,
     };
     // npm never checks engines on optional packages skipped for platform.
     let skipped = crate::lockfile_platform_skipped_packages(lockfile, platform);
@@ -472,7 +568,11 @@ pub fn check_engines(
         };
         let disk = disk_dir.and_then(|d| Manifest::from_file(d.join("package.json")).ok());
         let engines: Vec<(String, String)> = match &disk {
-            Some(m) => m.engines.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Some(m) => m
+                .engines
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             None => pkg
                 .engines
                 .as_ref()
@@ -521,17 +621,18 @@ pub fn check_engines(
         // a link and its target, so npm reports it twice.
         let is_directory_dep = pkg.link == Some(true)
             || pkg.resolved.as_deref().is_some_and(|r| {
-                r.strip_prefix("file:").is_some_and(|p| base_dir.join(p).is_dir())
+                r.strip_prefix("file:")
+                    .is_some_and(|p| base_dir.join(p).is_dir())
             });
         for _ in 0..if is_directory_dep { 2 } else { 1 } {
-        if !silent {
-            eprintln!(
+            if !silent {
+                eprintln!(
                 "npm warn EBADENGINE Unsupported engine {{\nnpm warn EBADENGINE   package: {},\nnpm warn EBADENGINE   required: {},\nnpm warn EBADENGINE   current: {}\nnpm warn EBADENGINE }}",
                 js_inspect_str(&pkgid),
                 js_inspect_map(&engines),
                 js_inspect_map(&current)
             );
-        }
+            }
         }
     }
     Ok(())
@@ -588,12 +689,15 @@ impl ScriptPolicy {
     pub fn load(project_dir: &Path, config: &rnpm_config::Config, is_global: bool) -> Self {
         let mut policy = ScriptPolicy {
             strict: config.get_bool("strict-allow-scripts").unwrap_or(false),
-            allow_all: config.get_bool("dangerously-allow-all-scripts").unwrap_or(false),
+            allow_all: config
+                .get_bool("dangerously-allow-all-scripts")
+                .unwrap_or(false),
             ..Default::default()
         };
         let mut pkg_entries = None;
         if !is_global {
-            let text = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
+            let text =
+                std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
             if let Ok(value) =
                 serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
             {
@@ -633,7 +737,11 @@ impl ScriptPolicy {
         policy
     }
 
-    fn validate(&mut self, entries: Vec<(String, bool)>, label: &str) -> Option<Vec<(String, bool)>> {
+    fn validate(
+        &mut self,
+        entries: Vec<(String, bool)>,
+        label: &str,
+    ) -> Option<Vec<(String, bool)>> {
         let mut kept = Vec::new();
         for (key, value) in entries {
             let registry_like = !is_path_spec(&key)
@@ -731,7 +839,10 @@ fn git_identity(spec: &str) -> Option<(String, String)> {
     } else {
         body.replacen(':', "/", 1)
     };
-    let body = body.trim_end_matches('/').trim_end_matches(".git").to_ascii_lowercase();
+    let body = body
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
     (!body.is_empty()).then(|| (body, committish.to_string()))
 }
 
@@ -845,13 +956,15 @@ pub fn install_scripts(
             out.push(("prepare".to_string(), body.clone()));
         }
     }
-    let explicit_gate = manifest.scripts.contains_key("preinstall")
-        || manifest.scripts.contains_key("install");
+    let explicit_gate =
+        manifest.scripts.contains_key("preinstall") || manifest.scripts.contains_key("install");
     let gyp_disabled = manifest.extra.get("gypfile") == Some(&serde_json::Value::Bool(false));
     if !explicit_gate && !gyp_disabled && disk_path.join("binding.gyp").is_file() {
         out.retain(|(e, _)| e != "install");
         out.insert(
-            out.iter().position(|(e, _)| e == "postinstall").unwrap_or(out.len()),
+            out.iter()
+                .position(|(e, _)| e == "postinstall")
+                .unwrap_or(out.len()),
             ("install".to_string(), "node-gyp rebuild".to_string()),
         );
     }
@@ -1002,7 +1115,11 @@ pub fn apply_script_policy(
             None => {
                 let scripts = install_scripts(&node.manifest, &node.disk_path, ident.is_registry());
                 if policy.strict && !scripts.is_empty() && !ident.in_bundle {
-                    unreviewed.push((node.package_path.clone(), label(&node.manifest, &node.package_path), scripts));
+                    unreviewed.push((
+                        node.package_path.clone(),
+                        label(&node.manifest, &node.package_path),
+                        scripts,
+                    ));
                 }
                 kept.push(node);
             }
@@ -1058,20 +1175,32 @@ pub fn unreviewed_scripts_warning(
             .map(|(n, v)| (n, v.or_else(|| manifest.version.clone())))
             .unwrap_or_else(|| {
                 (
-                    manifest.name.clone().unwrap_or_else(|| location.to_string()),
+                    manifest
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| location.to_string()),
                     manifest.version.clone(),
                 )
             });
         names.push(name.clone());
         let ver = version.map(|v| format!("@{v}")).unwrap_or_default();
-        found.push((location.clone(), format!("  {name}{ver} ({})", describe(&scripts))));
+        found.push((
+            location.clone(),
+            format!("  {name}{ver} ({})", describe(&scripts)),
+        ));
     }
     if found.is_empty() {
         return None;
     }
     let count = found.len();
-    let noun = if count == 1 { "package has" } else { "packages have" };
-    let mut lines = vec![format!("{count} {noun} install scripts not yet covered by allowScripts:")];
+    let noun = if count == 1 {
+        "package has"
+    } else {
+        "packages have"
+    };
+    let mut lines = vec![format!(
+        "{count} {noun} install scripts not yet covered by allowScripts:"
+    )];
     lines.extend(found.into_iter().map(|(_, l)| l));
     lines.push(String::new());
     if is_global {
@@ -1139,8 +1268,14 @@ mod tests {
         let dir = Path::new(".");
         let node = registry_node("https://registry.npmjs.org/dep/-/dep-1.0.0.tgz", dir);
         assert_eq!(policy(&[("dep", true)]).verdict(&node), Some(true));
-        assert_eq!(policy(&[("dep", true), ("dep@1.0.0", false)]).verdict(&node), Some(false));
-        assert_eq!(policy(&[("dep@1.0.0 || 2.0.0", true)]).verdict(&node), Some(true));
+        assert_eq!(
+            policy(&[("dep", true), ("dep@1.0.0", false)]).verdict(&node),
+            Some(false)
+        );
+        assert_eq!(
+            policy(&[("dep@1.0.0 || 2.0.0", true)]).verdict(&node),
+            Some(true)
+        );
         assert_eq!(policy(&[("dep@2.0.0", true)]).verdict(&node), None);
         assert_eq!(policy(&[("other", true)]).verdict(&node), None);
     }
@@ -1157,13 +1292,18 @@ mod tests {
         let dir = Path::new(".");
         let node = registry_node("https://registry.npmjs.org/dep/-/dep-1.0.0.tgz", dir);
         assert_eq!(policy(&[("dep@npm:dep@1.0.0", true)]).verdict(&node), None);
-        let bundled = ScriptNode { in_bundle: true, ..node };
+        let bundled = ScriptNode {
+            in_bundle: true,
+            ..node
+        };
         assert_eq!(policy(&[("dep", true)]).verdict(&bundled), None);
     }
 
     #[test]
     fn registry_url_shape_matches_arborist() {
-        assert!(is_registry_tarball("https://registry.npmjs.org/a/-/a-1.0.0.tgz"));
+        assert!(is_registry_tarball(
+            "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
         assert!(!is_registry_tarball("https://evil.com/-/a-1.0.0.tgz"));
         assert!(!is_registry_tarball("https://example.com/a.tgz"));
     }

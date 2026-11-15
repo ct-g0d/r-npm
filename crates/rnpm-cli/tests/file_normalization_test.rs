@@ -85,8 +85,14 @@ fn test_file_spec_normalization_parity() {
     let deps = pkg_json.get("dependencies").unwrap();
 
     assert_eq!(deps.get("subpkg").unwrap().as_str().unwrap(), "file:subpkg");
-    assert_eq!(deps.get("sibling").unwrap().as_str().unwrap(), "file:../sibling");
-    assert_eq!(deps.get("abspkg").unwrap().as_str().unwrap(), "file:../abspkg");
+    assert_eq!(
+        deps.get("sibling").unwrap().as_str().unwrap(),
+        "file:../sibling"
+    );
+    assert_eq!(
+        deps.get("abspkg").unwrap().as_str().unwrap(),
+        "file:../abspkg"
+    );
 
     // Verify package-lock.json
     let lock_str = fs::read_to_string(app_dir.join("package-lock.json")).unwrap();
@@ -94,28 +100,70 @@ fn test_file_spec_normalization_parity() {
     let packages = lock_json.get("packages").unwrap();
 
     assert_eq!(
-        packages.get("").unwrap().get("dependencies").unwrap().get("subpkg").unwrap().as_str().unwrap(),
+        packages
+            .get("")
+            .unwrap()
+            .get("dependencies")
+            .unwrap()
+            .get("subpkg")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "file:subpkg"
     );
     assert_eq!(
-        packages.get("").unwrap().get("dependencies").unwrap().get("sibling").unwrap().as_str().unwrap(),
+        packages
+            .get("")
+            .unwrap()
+            .get("dependencies")
+            .unwrap()
+            .get("sibling")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "file:../sibling"
     );
     assert_eq!(
-        packages.get("").unwrap().get("dependencies").unwrap().get("abspkg").unwrap().as_str().unwrap(),
+        packages
+            .get("")
+            .unwrap()
+            .get("dependencies")
+            .unwrap()
+            .get("abspkg")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "file:../abspkg"
     );
 
     assert_eq!(
-        packages.get("node_modules/subpkg").unwrap().get("resolved").unwrap().as_str().unwrap(),
+        packages
+            .get("node_modules/subpkg")
+            .unwrap()
+            .get("resolved")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "subpkg"
     );
     assert_eq!(
-        packages.get("node_modules/sibling").unwrap().get("resolved").unwrap().as_str().unwrap(),
+        packages
+            .get("node_modules/sibling")
+            .unwrap()
+            .get("resolved")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "../sibling"
     );
     assert_eq!(
-        packages.get("node_modules/abspkg").unwrap().get("resolved").unwrap().as_str().unwrap(),
+        packages
+            .get("node_modules/abspkg")
+            .unwrap()
+            .get("resolved")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "../abspkg"
     );
 }

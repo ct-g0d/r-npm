@@ -54,7 +54,11 @@ async fn test_cli_dist_tag_ls() {
 
     let _ = tx.send(());
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("latest: 1.0.0"), "got stdout: {stdout}");
     assert!(stdout.contains("next: 1.1.0-alpha.1"));

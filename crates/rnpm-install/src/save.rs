@@ -130,9 +130,8 @@ pub fn member_relative_file_spec(spec: &str, member_relative_path: &str) -> Stri
     let Some(path) = spec.strip_prefix("file:") else {
         return spec.to_string();
     };
-    let is_absolute = path.starts_with('/')
-        || path.starts_with('\\')
-        || path.as_bytes().get(1) == Some(&b':');
+    let is_absolute =
+        path.starts_with('/') || path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':');
     if is_absolute {
         return spec.to_string();
     }
@@ -187,14 +186,18 @@ pub fn bundle_manifest_dep(manifest: &mut Manifest, name: &str) {
     names.push(name.to_string());
     // npm uses an English collator. These are the punctuation characters
     // permitted in npm names, in their English collation order.
-    names.sort_by_cached_key(|name| name.bytes().map(|byte| match byte {
-        b'_' => 0,
-        b'-' => 1,
-        b'.' => 2,
-        b'@' => 3,
-        b'/' => 4,
-        other => other.to_ascii_lowercase(),
-    }).collect::<Vec<_>>());
+    names.sort_by_cached_key(|name| {
+        name.bytes()
+            .map(|byte| match byte {
+                b'_' => 0,
+                b'-' => 1,
+                b'.' => 2,
+                b'@' => 3,
+                b'/' => 4,
+                other => other.to_ascii_lowercase(),
+            })
+            .collect::<Vec<_>>()
+    });
     names.dedup();
     manifest.bundled_dependencies = Some(rnpm_core::BundledDependencies::List(names));
 }
@@ -206,16 +209,26 @@ pub fn mark_root_bundles(
     manifest: &Manifest,
 ) {
     let names = manifest.bundled_package_names();
-    let mut queue: Vec<_> = graph.get_outgoing_edges("").iter()
+    let mut queue: Vec<_> = graph
+        .get_outgoing_edges("")
+        .iter()
         .filter(|edge| names.contains(&edge.install_name))
-        .map(|edge| edge.to_location.clone()).collect();
+        .map(|edge| edge.to_location.clone())
+        .collect();
     let mut seen = std::collections::HashSet::new();
     while let Some(location) = queue.pop() {
-        if !seen.insert(location.clone()) { continue; }
+        if !seen.insert(location.clone()) {
+            continue;
+        }
         if let Some(package) = lockfile.packages.get_mut(&location) {
             package.in_bundle = Some(true);
         }
-        queue.extend(graph.get_outgoing_edges(&location).iter().map(|edge| edge.to_location.clone()));
+        queue.extend(
+            graph
+                .get_outgoing_edges(&location)
+                .iter()
+                .map(|edge| edge.to_location.clone()),
+        );
     }
 }
 

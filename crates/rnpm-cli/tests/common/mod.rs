@@ -25,24 +25,49 @@ impl IsolatedNpmEnv {
         let userconfig = root.join(".npmrc");
         let globalconfig = root.join("global.npmrc");
 
-        fs::create_dir_all(&cache_dir)
-            .unwrap_or_else(|e| panic!("Failed to create isolated cache_dir at {:?}: {}", cache_dir, e));
-        fs::create_dir_all(&prefix_dir)
-            .unwrap_or_else(|e| panic!("Failed to create isolated prefix_dir at {:?}: {}", prefix_dir, e));
-        fs::create_dir_all(&appdata)
-            .unwrap_or_else(|e| panic!("Failed to create isolated appdata at {:?}: {}", appdata, e));
-        fs::create_dir_all(&localappdata)
-            .unwrap_or_else(|e| panic!("Failed to create isolated localappdata at {:?}: {}", localappdata, e));
-        fs::create_dir_all(&logs_dir)
-            .unwrap_or_else(|e| panic!("Failed to create isolated logs_dir at {:?}: {}", logs_dir, e));
+        fs::create_dir_all(&cache_dir).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create isolated cache_dir at {:?}: {}",
+                cache_dir, e
+            )
+        });
+        fs::create_dir_all(&prefix_dir).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create isolated prefix_dir at {:?}: {}",
+                prefix_dir, e
+            )
+        });
+        fs::create_dir_all(&appdata).unwrap_or_else(|e| {
+            panic!("Failed to create isolated appdata at {:?}: {}", appdata, e)
+        });
+        fs::create_dir_all(&localappdata).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create isolated localappdata at {:?}: {}",
+                localappdata, e
+            )
+        });
+        fs::create_dir_all(&logs_dir).unwrap_or_else(|e| {
+            panic!(
+                "Failed to create isolated logs_dir at {:?}: {}",
+                logs_dir, e
+            )
+        });
 
         if !userconfig.exists() {
-            fs::write(&userconfig, "")
-                .unwrap_or_else(|e| panic!("Failed to initialize isolated userconfig at {:?}: {}", userconfig, e));
+            fs::write(&userconfig, "").unwrap_or_else(|e| {
+                panic!(
+                    "Failed to initialize isolated userconfig at {:?}: {}",
+                    userconfig, e
+                )
+            });
         }
         if !globalconfig.exists() {
-            fs::write(&globalconfig, "")
-                .unwrap_or_else(|e| panic!("Failed to initialize isolated globalconfig at {:?}: {}", globalconfig, e));
+            fs::write(&globalconfig, "").unwrap_or_else(|e| {
+                panic!(
+                    "Failed to initialize isolated globalconfig at {:?}: {}",
+                    globalconfig, e
+                )
+            });
         }
 
         Self {

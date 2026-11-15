@@ -155,8 +155,8 @@ fn test_ls_and_ll_live_npm_parity() {
         .output()
         .expect("rnpm ls --json failed");
     assert_eq!(rnpm_json.status.code(), Some(1));
-    let rnpm_val: serde_json::Value = serde_json::from_slice(&rnpm_json.stdout)
-        .expect("rnpm ls --json must be valid JSON");
+    let rnpm_val: serde_json::Value =
+        serde_json::from_slice(&rnpm_json.stdout).expect("rnpm ls --json must be valid JSON");
     assert_eq!(rnpm_val["name"], "test-pkg");
     assert_eq!(rnpm_val["dependencies"]["is-number"]["required"], "7.0.0");
     assert_eq!(rnpm_val["dependencies"]["is-number"]["missing"], true);
@@ -195,8 +195,8 @@ fn test_ls_and_ll_live_npm_parity() {
         .output();
     if let Ok(npm_out) = npm_res {
         assert_eq!(npm_out.status.code(), Some(1));
-        let npm_val: serde_json::Value = serde_json::from_slice(&npm_out.stdout)
-            .expect("npm ls --json must be valid JSON");
+        let npm_val: serde_json::Value =
+            serde_json::from_slice(&npm_out.stdout).expect("npm ls --json must be valid JSON");
         assert_eq!(rnpm_val["name"], npm_val["name"]);
         assert_eq!(rnpm_val["version"], npm_val["version"]);
         assert_eq!(
@@ -220,7 +220,6 @@ fn test_ls_and_ll_live_npm_parity() {
     assert!(rnpm_ll_stdout.contains("test-pkg@1.0.0"));
     assert!(rnpm_ll_stdout.contains("UNMET DEPENDENCY is-number@7.0.0"));
 }
-
 
 #[test]
 fn test_tree_bom_package_json() {

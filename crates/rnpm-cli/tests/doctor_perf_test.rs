@@ -26,7 +26,10 @@ fn test_cli_doctor_standard_text_output() {
     assert!(output.status.success(), "rnpm doctor should exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // npm doctor renders each selected check, without the former custom report.
-    assert_eq!(stdout.replace("\r\n", "\n"), "Connecting to the registry\nOk\n\n");
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "Connecting to the registry\nOk\n\n"
+    );
     server.join().unwrap();
 }
 

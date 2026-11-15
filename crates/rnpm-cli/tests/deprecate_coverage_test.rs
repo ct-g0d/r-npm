@@ -127,9 +127,7 @@ async fn test_cli_deprecate_mock() {
     std::fs::create_dir_all(&localappdata).unwrap();
     std::fs::write(
         &userconfig,
-        format!(
-            "//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"
-        ),
+        format!("//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"),
     )
     .unwrap();
 

@@ -1566,7 +1566,10 @@ fn test_optional_peer_when_present_and_incompatible() {
     assert!(err.is_peer_conflict(), "{err}");
 
     // --legacy-peer-deps ignores peers entirely.
-    let legacy = ResolverOptions { legacy_peer_deps: true, ..Default::default() };
+    let legacy = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
     let graph = resolve_dependency_graph(&manifest, &provider, &legacy).unwrap();
     assert_eq!(graph.nodes["node_modules/canvas"].version, "1.0.0");
 }
@@ -4221,7 +4224,8 @@ fn test_adversarial_bipartite_peer_mesh_with_optional_and_strict() {
 
     // The root pins core-engine@2, so the top-level plugin's optional peer
     // (^3) is an unresolvable conflict, as in npm 11.
-    let err = resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts).unwrap_err();
+    let err =
+        resolve_dependency_graph(&opt_conflict_manifest, &provider, &strict_opts).unwrap_err();
     assert!(err.is_peer_conflict(), "{err}");
 }
 
@@ -5428,11 +5432,15 @@ fn test_workspace_lockfile_package_names_and_prune_reachability() {
     };
 
     let options = ResolverOptions::default();
-    let mut graph = resolve_workspace_graph(&root_manifest, &[member_a], &provider, &options).unwrap();
+    let mut graph =
+        resolve_workspace_graph(&root_manifest, &[member_a], &provider, &options).unwrap();
 
     // Verify lockfile generation has "name" for non-standard location packages/pkg-a
     let lockfile = graph.to_lockfile_v3("ws-prune-root", Some("1.0.0"));
-    let pkg_a_lock = lockfile.packages.get("packages/pkg-a").expect("packages/pkg-a in lockfile");
+    let pkg_a_lock = lockfile
+        .packages
+        .get("packages/pkg-a")
+        .expect("packages/pkg-a in lockfile");
     assert_eq!(pkg_a_lock.name.as_deref(), Some("@scope/pkg-a"));
 
     // Verify prune_unreferenced after removing root dependency extra-dep
@@ -5454,7 +5462,9 @@ fn test_workspace_lockfile_package_names_and_prune_reachability() {
 fn test_lockfile_normalizes_single_bin_string_to_map() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("@scope/parser", "1.0.0", |version| {
-        version.bin = Some(rnpm_lockfile::PackageBin::Single("./bin/parser.js".to_string()));
+        version.bin = Some(rnpm_lockfile::PackageBin::Single(
+            "./bin/parser.js".to_string(),
+        ));
     });
     provider.add_version("single-tool", "1.0.0", |version| {
         version.bin = Some(rnpm_lockfile::PackageBin::Single("bin/tool.js".to_string()));
@@ -5469,7 +5479,8 @@ fn test_lockfile_normalizes_single_bin_string_to_map() {
         .dependencies
         .insert("single-tool".to_string(), "1.0.0".to_string());
 
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
     let lockfile = graph.to_lockfile_v3("single-bin-app", Some("1.0.0"));
 
     let scoped_pkg = lockfile.packages.get("node_modules/@scope/parser").unwrap();
@@ -5581,7 +5592,8 @@ fn test_breadth_first_dependency_depth_prevents_premature_hoisting_from_deep_bra
         .dependencies
         .insert("pkg-b".to_string(), "1.0.0".to_string());
 
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
 
     // Shallower branch (pkg-b -> shared@1.0.0 at depth 2) must claim root node_modules/shared
     let root_shared = graph
@@ -5595,12 +5607,17 @@ fn test_breadth_first_dependency_depth_prevents_premature_hoisting_from_deep_bra
 
     // Deeper branch (pkg-a -> sub-a -> shared@2.0.0 at depth 3) must be nested
     assert!(
-        graph.nodes.contains_key("node_modules/sub-a/node_modules/shared")
-            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/sub-a/node_modules/shared")
-            || graph.nodes.contains_key("node_modules/pkg-a/node_modules/shared")
+        graph
+            .nodes
+            .contains_key("node_modules/sub-a/node_modules/shared")
+            || graph
+                .nodes
+                .contains_key("node_modules/pkg-a/node_modules/sub-a/node_modules/shared")
+            || graph
+                .nodes
+                .contains_key("node_modules/pkg-a/node_modules/shared")
     );
 }
-
 
 #[test]
 fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
@@ -5620,8 +5637,12 @@ fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
     });
     let mut manifest = Manifest::default();
     manifest.name = Some("svelte-like".to_string());
-    manifest.dev_dependencies.insert("dts-buddy".to_string(), "^0.5.5".to_string());
-    manifest.dev_dependencies.insert("typescript".to_string(), "^5.5.4".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dts-buddy".to_string(), "^0.5.5".to_string());
+    manifest
+        .dev_dependencies
+        .insert("typescript".to_string(), "^5.5.4".to_string());
 
     let overrides = Overrides::from_manifest(&manifest).unwrap();
     let graph = Solver::new(&provider, ResolverOptions::default(), overrides)
@@ -5629,7 +5650,11 @@ fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
         .expect("npm resolves this tree without ERESOLVE");
     assert_eq!(graph.nodes["node_modules/typescript"].version, "5.7.3");
     assert_eq!(
-        graph.edges.iter().filter(|e| e.from_location.is_empty() && e.install_name == "typescript").count(),
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.from_location.is_empty() && e.install_name == "typescript")
+            .count(),
         1,
         "the root edge is recorded once"
     );
@@ -5649,15 +5674,21 @@ fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
         provider.add_version("react", version, |_| {});
     }
     provider.add_version("lib", "1.0.0", |v| {
-        v.peer_dependencies.insert("react".to_string(), "^18.0.0".to_string());
+        v.peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
     });
     provider.add_version("a", "1.0.0", |v| {
-        v.dependencies.insert("lib".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("lib".to_string(), "^1.0.0".to_string());
     });
     let mut manifest = Manifest::default();
     manifest.name = Some("webpack-like".to_string());
-    manifest.dependencies.insert("react".to_string(), "17.0.0".to_string());
-    manifest.dependencies.insert("a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("react".to_string(), "17.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("a".to_string(), "^1.0.0".to_string());
 
     let overrides = Overrides::from_manifest(&manifest).unwrap();
     let graph = Solver::new(&provider, ResolverOptions::default(), overrides)
@@ -5665,10 +5696,15 @@ fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
         .expect("npm resolves this tree without ERESOLVE");
     assert_eq!(graph.nodes["node_modules/react"].version, "17.0.0");
     assert!(!graph.nodes.contains_key("node_modules/lib"));
-    assert_eq!(graph.nodes["node_modules/a/node_modules/lib"].version, "1.0.0");
+    assert_eq!(
+        graph.nodes["node_modules/a/node_modules/lib"].version,
+        "1.0.0"
+    );
     // Like webpack's babel-preset-current-node-syntax plugins: the peer is
     // overridden by the visible root node, not duplicated beside the owner.
-    assert!(!graph.nodes.contains_key("node_modules/a/node_modules/react"));
+    assert!(!graph
+        .nodes
+        .contains_key("node_modules/a/node_modules/react"));
 }
 
 #[test]
@@ -5679,16 +5715,22 @@ fn test_peer_conflict_fatality_depends_on_requester_is_mine() {
     provider.add_version("peer-pkg", "1.0.0", |_| {});
     provider.add_version("peer-pkg", "2.0.0", |_| {});
     provider.add_version("parent-pkg", "1.0.0", |v| {
-        v.dependencies.insert("transitive".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("transitive".to_string(), "1.0.0".to_string());
     });
     provider.add_version("transitive", "1.0.0", |v| {
-        v.peer_dependencies.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("peer-pkg".to_string(), "^2.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("root-pkg".to_string());
-    manifest.dependencies.insert("peer-pkg".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("parent-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("peer-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("parent-pkg".to_string(), "1.0.0".to_string());
 
     // Transitive requester is NOT root (is_mine = false) -> non-fatal, keeps visible node
     let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
@@ -5698,12 +5740,18 @@ fn test_peer_conflict_fatality_depends_on_requester_is_mine() {
 
     // But when root directly requests a package with a conflicting peer, is_mine = true -> fatal ERESOLVE
     provider.add_version("direct-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("peer-pkg".to_string(), "^2.0.0".to_string());
+        v.peer_dependencies
+            .insert("peer-pkg".to_string(), "^2.0.0".to_string());
     });
-    manifest.dependencies.insert("direct-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("direct-pkg".to_string(), "1.0.0".to_string());
     let err = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
         .expect_err("Direct root peer conflict must be fatal");
-    assert!(matches!(err, crate::error::SolverError::PeerConflict { .. }));
+    assert!(matches!(
+        err,
+        crate::error::SolverError::PeerConflict { .. }
+    ));
 }
 
 #[test]
@@ -5713,34 +5761,54 @@ fn test_target_peer_conflicts_intermediate_ancestor_scopes() {
     provider.add_version("peer-dep", "1.0.0", |_| {});
     provider.add_version("peer-dep", "2.0.0", |_| {});
     provider.add_version("leaf", "1.0.0", |v| {
-        v.peer_dependencies.insert("peer-dep".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("peer-dep".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("leaf", "2.0.0", |_| {});
     provider.add_version("sub", "1.0.0", |v| {
-        v.dependencies.insert("leaf".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("leaf".to_string(), "1.0.0".to_string());
     });
     provider.add_version("sub", "2.0.0", |_| {});
     provider.add_version("tool", "1.0.0", |v| {
-        v.dependencies.insert("sub".to_string(), "1.0.0".to_string());
-        v.dependencies.insert("peer-dep".to_string(), "2.0.0".to_string());
+        v.dependencies
+            .insert("sub".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("peer-dep".to_string(), "2.0.0".to_string());
     });
 
     let mut manifest = Manifest::default();
     manifest.name = Some("app".to_string());
-    manifest.dependencies.insert("peer-dep".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("leaf".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("sub".to_string(), "2.0.0".to_string());
-    manifest.dependencies.insert("tool".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("peer-dep".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("leaf".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("sub".to_string(), "2.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("tool".to_string(), "1.0.0".to_string());
 
     let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
         .expect("Resolution should succeed by nesting leaf under sub");
     assert_eq!(graph.nodes["node_modules/leaf"].version, "2.0.0");
-    assert_eq!(graph.nodes["node_modules/tool/node_modules/sub"].version, "1.0.0");
-    assert_eq!(graph.nodes["node_modules/tool/node_modules/peer-dep"].version, "2.0.0");
+    assert_eq!(
+        graph.nodes["node_modules/tool/node_modules/sub"].version,
+        "1.0.0"
+    );
+    assert_eq!(
+        graph.nodes["node_modules/tool/node_modules/peer-dep"].version,
+        "2.0.0"
+    );
     // leaf@1.0.0 requires peer-dep ^1.0.0. Visible peer at intermediate scope 'tool' is 2.0.0 (incompatible).
     // Because target_peer_conflicts checks intermediate ancestor scopes, leaf@1.0.0 is not placed at
     // tool/node_modules/leaf, but correctly nests under tool/node_modules/sub/node_modules/leaf:
-    assert!(graph.nodes.contains_key("node_modules/tool/node_modules/sub/node_modules/leaf"));
+    assert!(graph
+        .nodes
+        .contains_key("node_modules/tool/node_modules/sub/node_modules/leaf"));
 }
 
 #[test]
@@ -5755,7 +5823,8 @@ fn test_load_peer_set_workspace_and_omit_dev() {
         provider.add_version("shared-pkg", v, |_| {});
     }
     provider.add_version("plugin-pkg", "1.0.0", |v| {
-        v.peer_dependencies.insert("shared-pkg".to_string(), "1.1.0".to_string());
+        v.peer_dependencies
+            .insert("shared-pkg".to_string(), "1.1.0".to_string());
     });
 
     let mut root_manifest = Manifest::default();
@@ -5765,8 +5834,12 @@ fn test_load_peer_set_workspace_and_omit_dev() {
     let mut member_manifest = Manifest::default();
     member_manifest.name = Some("member-a".to_string());
     member_manifest.version = Some("1.0.0".to_string());
-    member_manifest.dependencies.insert("shared-pkg".to_string(), "^1.0.0".to_string());
-    member_manifest.dependencies.insert("plugin-pkg".to_string(), "1.0.0".to_string());
+    member_manifest
+        .dependencies
+        .insert("shared-pkg".to_string(), "^1.0.0".to_string());
+    member_manifest
+        .dependencies
+        .insert("plugin-pkg".to_string(), "1.0.0".to_string());
 
     let members = vec![WorkspaceMember {
         name: "member-a".to_string(),
@@ -5797,15 +5870,19 @@ fn test_override_reference_unresolvable_fails_and_caller_fallback_succeeds() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("shared-dep", "2.0.0", |_| {});
     provider.add_version("caller-pkg", "1.0.0", |v| {
-        v.dependencies.insert("callee".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies.insert("shared-dep".to_string(), "2.0.0".to_string());
+        v.dependencies
+            .insert("callee".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies
+            .insert("shared-dep".to_string(), "2.0.0".to_string());
     });
     provider.add_version("callee", "1.0.0", |_| {});
     provider.add_version("callee", "2.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("test-overrides".to_string());
-    manifest.dependencies.insert("caller-pkg".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("caller-pkg".to_string(), "1.0.0".to_string());
 
     // 1. Unresolvable reference override errors with SolverError::InvalidOverride
     let bad_overrides = Overrides::from_json_value(
@@ -5815,7 +5892,9 @@ fn test_override_reference_unresolvable_fails_and_caller_fallback_succeeds() {
     let err = Solver::new(&provider, ResolverOptions::default(), bad_overrides)
         .resolve(&manifest)
         .expect_err("Unresolvable override reference must error");
-    assert!(err.to_string().contains("Unable to resolve reference $nonexistent"));
+    assert!(err
+        .to_string()
+        .contains("Unable to resolve reference $nonexistent"));
 
     // 2. Reference override falls back to caller dependencies when missing from root
     let caller_overrides = Overrides::from_json_value(
@@ -5834,13 +5913,16 @@ fn test_ci_omit_peer_and_legacy_peer_deps() {
     // whereas standard resolution marks peer dependencies with peer flags.
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("pkg-with-peer", "1.0.0", |v| {
-        v.peer_dependencies.insert("peer-lib".to_string(), "1.0.0".to_string());
+        v.peer_dependencies
+            .insert("peer-lib".to_string(), "1.0.0".to_string());
     });
     provider.add_version("peer-lib", "1.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("app".to_string());
-    manifest.dependencies.insert("pkg-with-peer".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-with-peer".to_string(), "1.0.0".to_string());
 
     // Standard mode resolves peer-lib and marks it as peer
     let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
@@ -5863,21 +5945,28 @@ fn test_rehome_transitive_root_node_migrates_nested_children_and_edges() {
     // #6: rehome_transitive_root_node migrates nested child nodes and updates all edges
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("parent-a", "1.0.0", |v| {
-        v.dependencies.insert("shared-sub".to_string(), "^1.0.0".to_string());
+        v.dependencies
+            .insert("shared-sub".to_string(), "^1.0.0".to_string());
     });
     provider.add_version("shared-sub", "1.0.0", |v| {
-        v.dependencies.insert("leaf-child".to_string(), "1.0.0".to_string());
+        v.dependencies
+            .insert("leaf-child".to_string(), "1.0.0".to_string());
     });
     provider.add_version("leaf-child", "1.0.0", |_| {});
     provider.add_version("parent-b", "1.0.0", |v| {
-        v.dependencies.insert("shared-sub".to_string(), "^2.0.0".to_string());
+        v.dependencies
+            .insert("shared-sub".to_string(), "^2.0.0".to_string());
     });
     provider.add_version("shared-sub", "2.0.0", |_| {});
 
     let mut manifest = Manifest::default();
     manifest.name = Some("rehome-test".to_string());
-    manifest.dependencies.insert("parent-a".to_string(), "1.0.0".to_string());
-    manifest.dependencies.insert("parent-b".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("parent-a".to_string(), "1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("parent-b".to_string(), "1.0.0".to_string());
 
     let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
         .expect("Tree resolution should succeed");
@@ -5925,15 +6014,24 @@ fn test_alias_folder_is_not_a_peer_of_the_real_name() {
     provider.add_version("typescript", "7.0.2", |_| {});
     let mut manifest = Manifest::default();
     manifest.name = Some("kit".to_string());
+    manifest.dev_dependencies.insert(
+        "@typescript/native".to_string(),
+        "npm:typescript@^7.0.2".to_string(),
+    );
     manifest
         .dev_dependencies
-        .insert("@typescript/native".to_string(), "npm:typescript@^7.0.2".to_string());
-    manifest.dev_dependencies.insert("typescript".to_string(), "~6.0.3".to_string());
-    manifest.peer_dependencies.insert("typescript".to_string(), "^6.0.0".to_string());
+        .insert("typescript".to_string(), "~6.0.3".to_string());
+    manifest
+        .peer_dependencies
+        .insert("typescript".to_string(), "^6.0.0".to_string());
 
-    let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
     assert_eq!(graph.nodes["node_modules/typescript"].version, "6.0.3");
-    assert_eq!(graph.nodes["node_modules/@typescript/native"].version, "7.0.2");
+    assert_eq!(
+        graph.nodes["node_modules/@typescript/native"].version,
+        "7.0.2"
+    );
 }
 
 #[test]
@@ -5956,18 +6054,25 @@ fn test_audit_fix_reresolves_vulnerable_chain_in_range() {
     }
     let mut manifest = Manifest::default();
     manifest.name = Some("readiness-case".to_string());
-    manifest.dependencies.insert("audit-top".into(), "^1.0.0".into());
+    manifest
+        .dependencies
+        .insert("audit-top".into(), "^1.0.0".into());
 
     let mut lockfile = LockfileV3::new("readiness-case", Some("1.0.0".to_string()));
     if let Some(root) = lockfile.root_package_mut() {
-        root.dependencies = Some(BTreeMap::from([("audit-top".to_string(), "^1.0.0".to_string())]));
+        root.dependencies = Some(BTreeMap::from([(
+            "audit-top".to_string(),
+            "^1.0.0".to_string(),
+        )]));
     }
     for (i, name) in chain.iter().enumerate() {
         lockfile.insert_package(
             &format!("node_modules/{name}"),
             LockfilePackage {
                 version: Some("1.0.0".to_string()),
-                dependencies: chain.get(i + 1).map(|n| BTreeMap::from([(n.to_string(), "^1.0.0".to_string())])),
+                dependencies: chain
+                    .get(i + 1)
+                    .map(|n| BTreeMap::from([(n.to_string(), "^1.0.0".to_string())])),
                 ..Default::default()
             },
         );
@@ -5980,9 +6085,15 @@ fn test_audit_fix_reresolves_vulnerable_chain_in_range() {
         vec![rnpm_core::semver::Range::parse("<2.0.0").unwrap()],
     );
     options.lockfile = Some(std::sync::Arc::new(lockfile.clone()));
-    let graph = resolve_dependency_graph_with_lockfile(&manifest, &provider, &options, Some(&lockfile)).unwrap();
+    let graph =
+        resolve_dependency_graph_with_lockfile(&manifest, &provider, &options, Some(&lockfile))
+            .unwrap();
     for name in chain {
-        assert_eq!(graph.nodes[&format!("node_modules/{name}")].version, "1.1.0", "{name}");
+        assert_eq!(
+            graph.nodes[&format!("node_modules/{name}")].version,
+            "1.1.0",
+            "{name}"
+        );
     }
 }
 
@@ -5990,17 +6101,27 @@ fn test_audit_fix_reresolves_vulnerable_chain_in_range() {
 fn test_legacy_peer_deps_adds_no_late_optional_peer_edges() {
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("owner", "1.0.0", |v| {
-        v.peer_dependencies.insert("provider".to_string(), "^1.0.0".to_string());
-        v.peer_dependencies_meta
-            .insert("provider".to_string(), PeerDependencyMeta { optional: true });
+        v.peer_dependencies
+            .insert("provider".to_string(), "^1.0.0".to_string());
+        v.peer_dependencies_meta.insert(
+            "provider".to_string(),
+            PeerDependencyMeta { optional: true },
+        );
     });
     provider.add_version("provider", "1.0.0", |_| {});
     let mut manifest = Manifest::default();
     manifest.name = Some("app".to_string());
-    manifest.dependencies.insert("owner".into(), "^1.0.0".into());
-    manifest.dev_dependencies.insert("provider".into(), "^1.0.0".into());
+    manifest
+        .dependencies
+        .insert("owner".into(), "^1.0.0".into());
+    manifest
+        .dev_dependencies
+        .insert("provider".into(), "^1.0.0".into());
 
-    let options = ResolverOptions { legacy_peer_deps: true, ..Default::default() };
+    let options = ResolverOptions {
+        legacy_peer_deps: true,
+        ..Default::default()
+    };
     let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
     assert!(graph
         .get_outgoing_edges("node_modules/owner")

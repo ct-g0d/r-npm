@@ -27,7 +27,11 @@ fn test_cache_add_and_ls_and_verify() {
         .output()
         .expect("Failed to run rnpm cache add");
 
-    assert!(add_output.status.success(), "cache add failed: {}", String::from_utf8_lossy(&add_output.stderr));
+    assert!(
+        add_output.status.success(),
+        "cache add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&add_output.stdout);
     assert!(stdout.is_empty(), "npm cache add is silent");
     let key = format!(
@@ -44,32 +48,30 @@ fn test_cache_add_and_ls_and_verify() {
     // Test cache ls
     let ls_output = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args([
-            "cache",
-            "ls",
-            "--cache",
-            cache_dir.to_str().unwrap(),
-        ])
+        .args(["cache", "ls", "--cache", cache_dir.to_str().unwrap()])
         .output()
         .expect("Failed to run rnpm cache ls");
 
-    assert!(ls_output.status.success(), "cache ls failed: {}", String::from_utf8_lossy(&ls_output.stderr));
+    assert!(
+        ls_output.status.success(),
+        "cache ls failed: {}",
+        String::from_utf8_lossy(&ls_output.stderr)
+    );
     let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
     assert_eq!(ls_stdout.trim(), key);
 
     // Test cache verify
     let verify_output = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args([
-            "cache",
-            "verify",
-            "--cache",
-            cache_dir.to_str().unwrap(),
-        ])
+        .args(["cache", "verify", "--cache", cache_dir.to_str().unwrap()])
         .output()
         .expect("Failed to run rnpm cache verify");
 
-    assert!(verify_output.status.success(), "cache verify failed: {}", String::from_utf8_lossy(&verify_output.stderr));
+    assert!(
+        verify_output.status.success(),
+        "cache verify failed: {}",
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
     let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
     assert!(verify_stdout.contains("Cache verified"));
 }
@@ -166,7 +168,10 @@ fn test_cache_clean_eusage_live_npm_parity() {
 
         let rnpm_stderr = normalize_output(&String::from_utf8_lossy(&rnpm_res.stderr), tmp.path());
         let npm_stderr = normalize_output(&String::from_utf8_lossy(&npm_out.stderr), tmp.path());
-        assert_eq!(rnpm_stderr, npm_stderr, "stderr mismatch: rnpm={:?} vs npm={:?}", rnpm_stderr, npm_stderr);
+        assert_eq!(
+            rnpm_stderr, npm_stderr,
+            "stderr mismatch: rnpm={:?} vs npm={:?}",
+            rnpm_stderr, npm_stderr
+        );
     }
 }
-

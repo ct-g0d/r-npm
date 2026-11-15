@@ -115,17 +115,35 @@ fn compare(dir: &std::path::Path, args: &[&str], expected_exit: i32) -> Value {
     let oracle = isolated_npm(iso.path());
     let mut candidate = Command::new(env!("CARGO_BIN_EXE_rnpm"));
     for (key, value) in oracle.get_envs() {
-        if let Some(value) = value { candidate.env(key, value); }
-        else { candidate.env_remove(key); }
+        if let Some(value) = value {
+            candidate.env(key, value);
+        } else {
+            candidate.env_remove(key);
+        }
     }
-    let run = |mut cmd: Command| cmd.current_dir(dir).args(args)
-        .env("NPM_CONFIG_REGISTRY", "http://127.0.0.1:9/")
-        .env("NPM_CONFIG_UPDATE_NOTIFIER", "false").env("NO_COLOR", "1")
-        .output().unwrap();
+    let run = |mut cmd: Command| {
+        cmd.current_dir(dir)
+            .args(args)
+            .env("NPM_CONFIG_REGISTRY", "http://127.0.0.1:9/")
+            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
+    };
     let npm = run(oracle);
     let rnpm = run(candidate);
-    assert_eq!(npm.status.code(), Some(expected_exit), "{}", String::from_utf8_lossy(&npm.stderr));
-    assert_eq!(rnpm.status.code(), npm.status.code(), "{}", String::from_utf8_lossy(&rnpm.stderr));
+    assert_eq!(
+        npm.status.code(),
+        Some(expected_exit),
+        "{}",
+        String::from_utf8_lossy(&npm.stderr)
+    );
+    assert_eq!(
+        rnpm.status.code(),
+        npm.status.code(),
+        "{}",
+        String::from_utf8_lossy(&rnpm.stderr)
+    );
     if expected_exit == 0 {
         assert_eq!(rnpm.stderr, npm.stderr);
         let expected = normalize_document(serde_json::from_slice(&npm.stdout).unwrap());
@@ -137,8 +155,12 @@ fn compare(dir: &std::path::Path, args: &[&str], expected_exit: i32) -> Value {
         // Both footers point to different generated diagnostic logs. Compare all
         // preceding error text and verify both include a diagnostic log path.
         let error = |bytes: &[u8]| {
-            let text = String::from_utf8(bytes.to_vec()).unwrap().replace("\r\n", "\n");
-            let (error, log) = text.split_once("npm error A complete log of this run can be found in: ").unwrap();
+            let text = String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .replace("\r\n", "\n");
+            let (error, log) = text
+                .split_once("npm error A complete log of this run can be found in: ")
+                .unwrap();
             assert!(std::path::Path::new(log.trim()).is_file());
             error.to_string()
         };
@@ -151,17 +173,34 @@ fn compare(dir: &std::path::Path, args: &[&str], expected_exit: i32) -> Value {
 fn test_sbom_spdx_explicit_format() {
     let tmp = tempdir().unwrap();
     setup_test_project(tmp.path());
-    let doc = compare(tmp.path(), &["sbom", "--sbom-format=spdx", "--package-lock-only"], 0);
+    let doc = compare(
+        tmp.path(),
+        &["sbom", "--sbom-format=spdx", "--package-lock-only"],
+        0,
+    );
     assert_eq!(doc["spdxVersion"], "SPDX-2.3");
     assert_eq!(doc["packages"].as_array().unwrap().len(), 5);
-    assert!(doc["relationships"].as_array().unwrap().iter().any(|r| r["relationshipType"] == "DESCRIBES"));
+    assert!(doc["relationships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["relationshipType"] == "DESCRIBES"));
 }
 
 #[test]
 fn test_sbom_cyclonedx_format() {
     let tmp = tempdir().unwrap();
     setup_test_project(tmp.path());
-    let doc = compare(tmp.path(), &["sbom", "--sbom-format=cyclonedx", "--sbom-type=application", "--package-lock-only"], 0);
+    let doc = compare(
+        tmp.path(),
+        &[
+            "sbom",
+            "--sbom-format=cyclonedx",
+            "--sbom-type=application",
+            "--package-lock-only",
+        ],
+        0,
+    );
     assert_eq!(doc["components"].as_array().unwrap().len(), 4);
     assert_eq!(doc["metadata"]["component"]["type"], "application");
 }
@@ -170,7 +209,16 @@ fn test_sbom_cyclonedx_format() {
 fn test_sbom_sbom_type_flag() {
     let tmp = tempdir().unwrap();
     setup_test_project(tmp.path());
-    let doc = compare(tmp.path(), &["sbom", "--sbom-format=cyclonedx", "--sbom-type=framework", "--package-lock-only"], 0);
+    let doc = compare(
+        tmp.path(),
+        &[
+            "sbom",
+            "--sbom-format=cyclonedx",
+            "--sbom-type=framework",
+            "--package-lock-only",
+        ],
+        0,
+    );
     assert_eq!(doc["metadata"]["component"]["type"], "framework");
 }
 
@@ -178,7 +226,11 @@ fn test_sbom_sbom_type_flag() {
 fn test_sbom_omit_flags() {
     let tmp = tempdir().unwrap();
     setup_test_project(tmp.path());
-    for (omits, count) in [(vec!["--omit=dev"], 3), (vec!["--omit=optional"], 3), (vec!["--omit=dev", "--omit=optional"], 2)] {
+    for (omits, count) in [
+        (vec!["--omit=dev"], 3),
+        (vec!["--omit=optional"], 3),
+        (vec!["--omit=dev", "--omit=optional"], 2),
+    ] {
         let mut args = vec!["sbom", "--sbom-format=cyclonedx", "--package-lock-only"];
         args.extend(&omits);
         let doc = compare(tmp.path(), &args, 0);
@@ -191,7 +243,11 @@ fn test_sbom_package_lock_only_without_node_modules() {
     let tmp = tempdir().unwrap();
     setup_test_project(tmp.path());
     assert!(!tmp.path().join("node_modules").exists());
-    compare(tmp.path(), &["sbom", "--sbom-format=spdx", "--package-lock-only"], 0);
+    compare(
+        tmp.path(),
+        &["sbom", "--sbom-format=spdx", "--package-lock-only"],
+        0,
+    );
 }
 
 #[test]
@@ -199,7 +255,11 @@ fn test_sbom_missing_files_error() {
     let tmp = tempdir().unwrap();
     // npm requires a format even when package.json is absent.
     compare(tmp.path(), &["sbom"], 1);
-    compare(tmp.path(), &["sbom", "--sbom-format=spdx", "--package-lock-only"], 1);
+    compare(
+        tmp.path(),
+        &["sbom", "--sbom-format=spdx", "--package-lock-only"],
+        1,
+    );
 }
 
 #[test]

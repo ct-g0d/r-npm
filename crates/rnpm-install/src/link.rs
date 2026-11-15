@@ -565,7 +565,13 @@ pub(crate) fn link_tree_bins(
             }
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
-                shims_to_link.push((target_path.clone(), pkg_bin_dir.clone(), bin_name.clone(), script_rel, script_path));
+                shims_to_link.push((
+                    target_path.clone(),
+                    pkg_bin_dir.clone(),
+                    bin_name.clone(),
+                    script_rel,
+                    script_path,
+                ));
 
                 wanted_set.insert(bin_name.clone());
                 wanted_set.insert(format!("{bin_name}.cmd"));
@@ -590,7 +596,13 @@ pub(crate) fn link_tree_bins(
             for chunk in shims_to_link.chunks(chunk_size) {
                 scope.spawn(move || {
                     for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
-                        link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
+                        link_single_pkg_bin(
+                            target_path,
+                            pkg_bin_dir,
+                            bin_name,
+                            script_rel,
+                            script_path,
+                        );
                     }
                 });
             }

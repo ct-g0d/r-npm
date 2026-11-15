@@ -1320,13 +1320,28 @@ fn test_semver_zero_version_cascades() {
 #[test]
 fn file_specs_normalize_relative_current_directory_components() {
     use crate::spec::{PackageSpec, PackageTarget};
-    for input in ["file:./realname-1.0.0.tgz", "alias@file:./realname-1.0.0.tgz"] {
+    for input in [
+        "file:./realname-1.0.0.tgz",
+        "alias@file:./realname-1.0.0.tgz",
+    ] {
         let spec = PackageSpec::parse(input).unwrap();
-        assert_eq!(spec.target, PackageTarget::File("realname-1.0.0.tgz".into()));
+        assert_eq!(
+            spec.target,
+            PackageTarget::File("realname-1.0.0.tgz".into())
+        );
     }
-    assert_eq!(PackageTarget::parse("file:../sibling.tgz").unwrap(), PackageTarget::File("../sibling.tgz".into()));
-    assert_eq!(PackageTarget::parse("file:x").unwrap(), PackageTarget::File("x".into()));
-    assert_eq!(PackageTarget::parse("file:./x").unwrap(), PackageTarget::File("x".into()));
+    assert_eq!(
+        PackageTarget::parse("file:../sibling.tgz").unwrap(),
+        PackageTarget::File("../sibling.tgz".into())
+    );
+    assert_eq!(
+        PackageTarget::parse("file:x").unwrap(),
+        PackageTarget::File("x".into())
+    );
+    assert_eq!(
+        PackageTarget::parse("file:./x").unwrap(),
+        PackageTarget::File("x".into())
+    );
     #[cfg(windows)]
     {
         assert_eq!(
@@ -1349,14 +1364,14 @@ fn file_specs_normalize_relative_current_directory_components() {
 
 #[test]
 fn test_manifest_compact_single_line_roundtrip() {
-    let single_line = r#"{"name":"compact-pkg","version":"1.0.0","dependencies":{"react":"^18.2.0"}}"#;
+    let single_line =
+        r#"{"name":"compact-pkg","version":"1.0.0","dependencies":{"react":"^18.2.0"}}"#;
     let manifest = Manifest::from_str(single_line).unwrap();
     assert_eq!(manifest.format.indent, "");
     assert_eq!(manifest.format.newline, "");
     let serialized = manifest.to_json_string().unwrap();
     assert_eq!(serialized, single_line);
 }
-
 
 #[test]
 fn test_hyphen_range_with_partial_upper_is_not_a_version() {

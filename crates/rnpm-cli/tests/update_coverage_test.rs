@@ -25,5 +25,9 @@ fn test_update_dry_run_and_execution() {
         .output()
         .expect("update failed");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

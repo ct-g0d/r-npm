@@ -134,9 +134,7 @@ pub fn git_target_matches_resolved(
     let expected = format!(
         "{}{}",
         target_url,
-        committish
-            .map(|c| format!("#{c}"))
-            .unwrap_or_default()
+        committish.map(|c| format!("#{c}")).unwrap_or_default()
     );
     if resolved == expected || resolved.starts_with(target_url) {
         return true;
@@ -162,9 +160,10 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
             return node.resolved.as_deref() == Some(u.as_str());
         }
         PackageTarget::File(p) => {
-            return node.resolved.as_deref().is_some_and(|resolved| {
-                file_target_matches_resolved(p, resolved)
-            });
+            return node
+                .resolved
+                .as_deref()
+                .is_some_and(|resolved| file_target_matches_resolved(p, resolved));
         }
         PackageTarget::Git { url, committish } => {
             return node
@@ -385,29 +384,25 @@ pub fn determine_placement_with_peers(
             install_name,
             target,
         ) && (placing_peer
-            || !target_peer_conflicts(
+            || !target_peer_conflicts(graph, &candidate, peer_dependencies, peer_dependencies_meta))
+            && !candidate_has_incompatible_peer(
                 graph,
                 &candidate,
+                parent_location,
+                dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
-            ))
-            && !candidate_has_incompatible_peer(
-            graph,
-            &candidate,
-            parent_location,
-            dependencies,
-            peer_dependencies,
-            peer_dependencies_meta,
-        ) && !candidate_shadows_ancestor_dep(
-            graph,
-            ancestor,
-            install_name,
-            package_name,
-            target,
-            resolved_version,
-        ) && !candidate_shadows_descendant_dep(
-            graph, ancestor, install_name, resolved_version,
-        ) {
+            )
+            && !candidate_shadows_ancestor_dep(
+                graph,
+                ancestor,
+                install_name,
+                package_name,
+                target,
+                resolved_version,
+            )
+            && !candidate_shadows_descendant_dep(graph, ancestor, install_name, resolved_version)
+        {
             return PlacementDecision::PlaceNew(candidate);
         }
     }
@@ -488,28 +483,52 @@ fn candidate_shadows_descendant_dep(
     install_name: &str,
     resolved_version: Option<&str>,
 ) -> bool {
-    let Some(version) = resolved_version else { return false; };
+    let Some(version) = resolved_version else {
+        return false;
+    };
     let prefix = format!("{scope}/node_modules/");
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
-    if graph.nodes.values().filter(|node| node.location.starts_with(&prefix)).any(|node| {
-        let Some(spec) = node.optional_dependencies.get(install_name)
-            .or_else(|| node.dependencies.get(install_name))
-            .or_else(|| node.peer_dependencies.get(install_name)) else { return false; };
-        let Ok(target) = PackageTarget::parse(spec) else { return false; };
-        find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
-            !current.location.starts_with(&prefix) && node_satisfies_target(current, &target)
-                && !version_satisfies_target(version, &target)
+    if graph
+        .nodes
+        .values()
+        .filter(|node| node.location.starts_with(&prefix))
+        .any(|node| {
+            let Some(spec) = node
+                .optional_dependencies
+                .get(install_name)
+                .or_else(|| node.dependencies.get(install_name))
+                .or_else(|| node.peer_dependencies.get(install_name))
+            else {
+                return false;
+            };
+            let Ok(target) = PackageTarget::parse(spec) else {
+                return false;
+            };
+            find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
+                !current.location.starts_with(&prefix)
+                    && node_satisfies_target(current, &target)
+                    && !version_satisfies_target(version, &target)
+            })
         })
-    }) { return true; }
+    {
+        return true;
+    }
     graph.edges.iter().any(|edge| {
-        if edge.install_name != install_name || !edge.from_location.starts_with(&prefix)
-            || edge.to_location.starts_with(&prefix) {
+        if edge.install_name != install_name
+            || !edge.from_location.starts_with(&prefix)
+            || edge.to_location.starts_with(&prefix)
+        {
             return false;
         }
-        let Ok(target) = PackageTarget::parse(&edge.spec) else { return false; };
-        graph.nodes.get(&edge.to_location).is_some_and(|current| node_satisfies_target(current, &target))
+        let Ok(target) = PackageTarget::parse(&edge.spec) else {
+            return false;
+        };
+        graph
+            .nodes
+            .get(&edge.to_location)
+            .is_some_and(|current| node_satisfies_target(current, &target))
             && !version_satisfies_target(version, &target)
     })
 }
@@ -587,7 +606,10 @@ fn target_peer_conflicts(
     >,
 ) -> bool {
     peer_dependencies.iter().any(|(peer_name, peer_spec)| {
-        if peer_dependencies_meta.get(peer_name).is_some_and(|meta| meta.optional) {
+        if peer_dependencies_meta
+            .get(peer_name)
+            .is_some_and(|meta| meta.optional)
+        {
             return false;
         }
         let Ok(target) = PackageTarget::parse(peer_spec) else {

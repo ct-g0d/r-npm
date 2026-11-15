@@ -1,7 +1,9 @@
 //! `npm dist-tag`, ported from npm's lib/commands/dist-tag.js.
 
 use super::client_helper::CommandClient;
-use crate::http_errors::{auth_error_block, e404_block, encode_uri_component, general_message, is_otp_error};
+use crate::http_errors::{
+    auth_error_block, e404_block, encode_uri_component, general_message, is_otp_error,
+};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -53,7 +55,11 @@ impl Spec {
         let spec = spec.trim();
         Spec {
             name: name.to_string(),
-            raw_spec: if spec.is_empty() { "*".to_string() } else { spec.to_string() },
+            raw_spec: if spec.is_empty() {
+                "*".to_string()
+            } else {
+                spec.to_string()
+            },
         }
     }
 
@@ -92,7 +98,11 @@ impl Spec {
         } else {
             self.raw_spec.clone()
         };
-        let raw = if self.raw_spec == "*" { self.name.clone() } else { self.pkgid() };
+        let raw = if self.raw_spec == "*" {
+            self.name.clone()
+        } else {
+            self.pkgid()
+        };
         [
             "Result {".to_string(),
             format!("  type: {},", q(self.spec_type())),
@@ -136,14 +146,23 @@ pub(crate) async fn run(
             });
             add(&client, pkg.unwrap_or(""), &default_tag, otp).await
         }
-        Some("rm" | "r" | "del" | "d" | "remove") => remove(&client, pkg.unwrap_or(""), tag_arg, otp).await,
+        Some("rm" | "r" | "del" | "d" | "remove") => {
+            remove(&client, pkg.unwrap_or(""), tag_arg, otp).await
+        }
         Some("ls" | "l" | "sl" | "list") => list(&client, &current_dir, pkg).await,
         _ if pkg.is_none() => list(&client, &current_dir, cmd).await,
         _ => Err(usage_error(None)),
     }
 }
 
-fn request_error(method: &str, url: &reqwest::Url, status: reqwest::StatusCode, www: Option<&str>, body: &str, spec: &Spec) -> anyhow::Error {
+fn request_error(
+    method: &str,
+    url: &reqwest::Url,
+    status: reqwest::StatusCode,
+    www: Option<&str>,
+    body: &str,
+    spec: &Spec,
+) -> anyhow::Error {
     if let Some(block) = auth_error_block(method, url.as_str(), status, www, body) {
         return anyhow::anyhow!(block);
     }
@@ -154,16 +173,33 @@ fn request_error(method: &str, url: &reqwest::Url, status: reqwest::StatusCode, 
     }
 }
 
-async fn fetch_tags(client: &CommandClient, spec: &Spec) -> Result<serde_json::Map<String, serde_json::Value>> {
+async fn fetch_tags(
+    client: &CommandClient,
+    spec: &Spec,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
     let url = client
         .registry_url
         .join(&format!("-/package/{}/dist-tags", spec.escaped_name()))?;
-    let resp = client.request(reqwest::Method::GET, url.clone(), None).send().await?;
+    let resp = client
+        .request(reqwest::Method::GET, url.clone(), None)
+        .send()
+        .await?;
     let status = resp.status();
-    let www = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let www = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(request_error("GET", &url, status, www.as_deref(), &body, spec));
+        return Err(request_error(
+            "GET",
+            &url,
+            status,
+            www.as_deref(),
+            &body,
+            spec,
+        ));
     }
     let mut tags = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -199,25 +235,45 @@ async fn mutate(
             if status.is_success() {
                 return Ok(());
             }
-            let www = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let www = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let text = resp.text().await.unwrap_or_default();
-            Err(request_error(method.as_str(), url, status, www.as_deref(), &text, spec))
+            Err(request_error(
+                method.as_str(),
+                url,
+                status,
+                www.as_deref(),
+                &text,
+                spec,
+            ))
         }
     };
     match send(otp).await {
-        Err(err) if is_otp_error(&err) => match crate::http_errors::retry_otp(&std::env::current_dir()?, &err).await? {
-            Some(code) => send(Some(code)).await,
-            None => Err(err),
-        },
+        Err(err) if is_otp_error(&err) => {
+            match crate::http_errors::retry_otp(&std::env::current_dir()?, &err).await? {
+                Some(code) => send(Some(code)).await,
+                None => Err(err),
+            }
+        }
         other => other,
     }
 }
 
-async fn add(client: &CommandClient, raw: &str, default_tag: &str, otp: Option<String>) -> Result<()> {
+async fn add(
+    client: &CommandClient,
+    raw: &str,
+    default_tag: &str,
+    otp: Option<String>,
+) -> Result<()> {
     let spec = Spec::parse(raw);
     let version = spec.raw_spec.clone();
     if spec.name.is_empty() || default_tag.is_empty() {
-        return Err(usage_error(Some("must provide a spec with a name and version, and a tag to add")));
+        return Err(usage_error(Some(
+            "must provide a spec with a name and version, and a tag to add",
+        )));
     }
     let t = default_tag.trim();
     if rnpm_core::semver::Range::parse(t).is_ok() {
@@ -233,22 +289,41 @@ async fn add(client: &CommandClient, raw: &str, default_tag: &str, otp: Option<S
         spec.escaped_name(),
         encode_uri_component(t)
     ))?;
-    mutate(client, reqwest::Method::PUT, &url, Some(serde_json::to_string(&version)?), otp, &spec).await?;
+    mutate(
+        client,
+        reqwest::Method::PUT,
+        &url,
+        Some(serde_json::to_string(&version)?),
+        otp,
+        &spec,
+    )
+    .await?;
     println!("+{t}: {}@{version}", spec.name);
     Ok(())
 }
 
-async fn remove(client: &CommandClient, raw: &str, tag: Option<&str>, otp: Option<String>) -> Result<()> {
+async fn remove(
+    client: &CommandClient,
+    raw: &str,
+    tag: Option<&str>,
+    otp: Option<String>,
+) -> Result<()> {
     let spec = Spec::parse(raw);
     if spec.name.is_empty() {
         return Err(usage_error(None));
     }
     let tag = tag.unwrap_or("undefined");
     let tags = fetch_tags(client, &spec).await?;
-    let Some(version) = tags.get(tag).filter(|v| !v.is_null() && v.as_str() != Some("")) else {
+    let Some(version) = tags
+        .get(tag)
+        .filter(|v| !v.is_null() && v.as_str() != Some(""))
+    else {
         anyhow::bail!("npm error {tag} is not a dist-tag on {}", spec.name);
     };
-    let version = version.as_str().map(str::to_string).unwrap_or_else(|| version.to_string());
+    let version = version
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| version.to_string());
     let url = client.registry_url.join(&format!(
         "-/package/{}/dist-tags/{}",
         spec.escaped_name(),
@@ -259,7 +334,11 @@ async fn remove(client: &CommandClient, raw: &str, tag: Option<&str>, otp: Optio
     Ok(())
 }
 
-async fn list(client: &CommandClient, current_dir: &std::path::Path, raw: Option<&str>) -> Result<()> {
+async fn list(
+    client: &CommandClient,
+    current_dir: &std::path::Path,
+    raw: Option<&str>,
+) -> Result<()> {
     let raw = match raw {
         Some(raw) => raw.to_string(),
         None => {
@@ -285,7 +364,14 @@ async fn list(client: &CommandClient, current_dir: &std::path::Path, raw: Option
         Ok(tags) => {
             let mut lines: Vec<String> = tags
                 .iter()
-                .map(|(k, v)| format!("{k}: {}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+                .map(|(k, v)| {
+                    format!(
+                        "{k}: {}",
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string())
+                    )
+                })
                 .collect();
             lines.sort();
             println!("{}", lines.join("\n"));

@@ -454,7 +454,11 @@ fn test_global_install_and_uninstall_cli() {
     assert!(!global_bin.join("glob-runner").exists());
 }
 
-fn normalize_link_output(text: &str, global_prefix: &std::path::Path, pkg_dir: &std::path::Path) -> String {
+fn normalize_link_output(
+    text: &str,
+    global_prefix: &std::path::Path,
+    pkg_dir: &std::path::Path,
+) -> String {
     let mut s = text.replace("\r\n", "\n");
     let gp_str = global_prefix.to_string_lossy();
     s = s.replace(&gp_str.to_string(), "<PREFIX>");
@@ -587,10 +591,21 @@ fn test_link_live_npm_parity() {
     if let Ok(npm_out) = npm_res {
         if npm_out.status.success() {
             assert_eq!(rnpm_out.status.code(), npm_out.status.code());
-            let rnpm_norm = normalize_link_output(&String::from_utf8_lossy(&rnpm_out.stdout), &rnpm_prefix, &rnpm_pkg);
-            let npm_norm = normalize_link_output(&String::from_utf8_lossy(&npm_out.stdout), &npm_prefix, &npm_pkg);
-            assert_eq!(rnpm_norm, npm_norm, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_norm, npm_norm);
+            let rnpm_norm = normalize_link_output(
+                &String::from_utf8_lossy(&rnpm_out.stdout),
+                &rnpm_prefix,
+                &rnpm_pkg,
+            );
+            let npm_norm = normalize_link_output(
+                &String::from_utf8_lossy(&npm_out.stdout),
+                &npm_prefix,
+                &npm_pkg,
+            );
+            assert_eq!(
+                rnpm_norm, npm_norm,
+                "stdout mismatch: rnpm={:?} vs npm={:?}",
+                rnpm_norm, npm_norm
+            );
         }
     }
 }
-

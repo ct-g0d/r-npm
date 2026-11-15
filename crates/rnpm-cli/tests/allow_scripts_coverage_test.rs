@@ -42,7 +42,11 @@ fn setup_fixture(dir: &std::path::Path) {
             "my-pkg": "1.0.0"
         }
     });
-    std::fs::write(dir.join("package.json"), serde_json::to_string_pretty(&pkg_json).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
 
     let lock_json = serde_json::json!({
         "name": "test-app",
@@ -62,7 +66,11 @@ fn setup_fixture(dir: &std::path::Path) {
             }
         }
     });
-    std::fs::write(dir.join("package-lock.json"), serde_json::to_string_pretty(&lock_json).unwrap()).unwrap();
+    std::fs::write(
+        dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock_json).unwrap(),
+    )
+    .unwrap();
 
     let my_pkg_json = serde_json::json!({
         "name": "my-pkg",
@@ -71,7 +79,11 @@ fn setup_fixture(dir: &std::path::Path) {
             "install": "echo 1"
         }
     });
-    std::fs::write(pkg_dir.join("package.json"), serde_json::to_string_pretty(&my_pkg_json).unwrap()).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::to_string_pretty(&my_pkg_json).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -120,11 +132,7 @@ fn test_cli_approve_scripts_parity() {
         .expect("rnpm approve-scripts failed");
 
     let npm_res = isolated_npm(&iso)
-        .args([
-            "approve-scripts",
-            "my-pkg",
-            "--no-update-notifier",
-        ])
+        .args(["approve-scripts", "my-pkg", "--no-update-notifier"])
         .current_dir(&dir_npm)
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
@@ -156,7 +164,9 @@ fn test_cli_approve_scripts_parity() {
     }
 
     // Verify package.json updated with allowScripts
-    let pkg_rnpm: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir_rnpm.join("package.json")).unwrap()).unwrap();
+    let pkg_rnpm: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir_rnpm.join("package.json")).unwrap())
+            .unwrap();
     assert_eq!(pkg_rnpm["allowScripts"]["my-pkg@1.0.0"], true);
 }
 
@@ -206,11 +216,7 @@ fn test_cli_deny_scripts_parity() {
         .expect("rnpm deny-scripts failed");
 
     let npm_res = isolated_npm(&iso)
-        .args([
-            "deny-scripts",
-            "my-pkg",
-            "--no-update-notifier",
-        ])
+        .args(["deny-scripts", "my-pkg", "--no-update-notifier"])
         .current_dir(&dir_npm)
         .env("HOME", &iso)
         .env("USERPROFILE", &iso)
@@ -241,7 +247,9 @@ fn test_cli_deny_scripts_parity() {
         assert!(rnpm_res.status.success());
     }
 
-    let pkg_rnpm: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir_rnpm.join("package.json")).unwrap()).unwrap();
+    let pkg_rnpm: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir_rnpm.join("package.json")).unwrap())
+            .unwrap();
     assert_eq!(pkg_rnpm["allowScripts"]["my-pkg"], false);
 }
 

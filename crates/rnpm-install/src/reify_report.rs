@@ -43,7 +43,11 @@ fn split_location(location: &str) -> Option<(&str, &str)> {
     Some((parent, name))
 }
 
-fn entry(location: &str, pkg: &LockfilePackage, all: &BTreeMap<String, LockfilePackage>) -> ReifyEntry {
+fn entry(
+    location: &str,
+    pkg: &LockfilePackage,
+    all: &BTreeMap<String, LockfilePackage>,
+) -> ReifyEntry {
     let folder = split_location(location).map(|(_, n)| n).unwrap_or(location);
     let version = if pkg.link == Some(true) {
         pkg.resolved
@@ -55,7 +59,11 @@ fn entry(location: &str, pkg: &LockfilePackage, all: &BTreeMap<String, LockfileP
         pkg.version.clone().unwrap_or_default()
     };
     // Node.name is the folder name; aliases keep their alias as the name.
-    ReifyEntry { name: folder.to_string(), version, location: location.to_string() }
+    ReifyEntry {
+        name: folder.to_string(),
+        version,
+        location: location.to_string(),
+    }
 }
 
 /// ssri's `match`: the integrities share at least one identical hash.
@@ -70,7 +78,11 @@ fn is_dep_bundled(location: &str, pkg: &LockfilePackage) -> bool {
 }
 
 /// arborist diff.js getAction.
-fn action(location: &str, actual: Option<&LockfilePackage>, ideal: Option<&LockfilePackage>) -> Option<&'static str> {
+fn action(
+    location: &str,
+    actual: Option<&LockfilePackage>,
+    ideal: Option<&LockfilePackage>,
+) -> Option<&'static str> {
     let Some(ideal) = ideal else {
         return actual.map(|_| "REMOVE");
     };
@@ -78,7 +90,8 @@ fn action(location: &str, actual: Option<&LockfilePackage>, ideal: Option<&Lockf
         return (!is_dep_bundled(location, ideal)).then_some("ADD");
     };
     if ideal.link == Some(true) || actual.link == Some(true) {
-        return (ideal.link != actual.link || ideal.resolved != actual.resolved).then_some("CHANGE");
+        return (ideal.link != actual.link || ideal.resolved != actual.resolved)
+            .then_some("CHANGE");
     }
     if ideal.version != actual.version {
         return Some("CHANGE");
@@ -139,7 +152,10 @@ pub fn compute(
     for kids in ideal_kids.values_mut() {
         kids.sort_by_key(|loc| {
             (
-                ideal_rank.and_then(|r| r.get(*loc)).copied().unwrap_or(usize::MAX),
+                ideal_rank
+                    .and_then(|r| r.get(*loc))
+                    .copied()
+                    .unwrap_or(usize::MAX),
                 *loc,
             )
         });
@@ -149,7 +165,11 @@ pub fn compute(
         if !include(loc) {
             return None;
         }
-        action(loc, actual_live.get(loc).copied(), ideal_live.get(loc).copied())
+        action(
+            loc,
+            actual_live.get(loc).copied(),
+            ideal_live.get(loc).copied(),
+        )
     };
 
     // arborist diff.js getChildren: actual children first, then ideal-only
@@ -162,7 +182,10 @@ pub fn compute(
         out: &mut Vec<(&'a str, &'static str)>,
     ) {
         let mut seen = BTreeSet::new();
-        for list in [actual_kids.get(parent), ideal_kids.get(parent)].into_iter().flatten() {
+        for list in [actual_kids.get(parent), ideal_kids.get(parent)]
+            .into_iter()
+            .flatten()
+        {
             for loc in list {
                 if !seen.insert(*loc) {
                     continue;
@@ -194,7 +217,10 @@ pub fn compute(
         diff_children(loc, &actual_kids, &ideal_kids, &classify, &mut stack);
     }
 
-    ReifyReport { changes, inventory: ideal_live.len() + 1 }
+    ReifyReport {
+        changes,
+        inventory: ideal_live.len() + 1,
+    }
 }
 
 /// Simulates arborist's placement order for a freshly built ideal tree:
@@ -235,16 +261,27 @@ pub fn placement_rank(
     };
     let depth = |loc: &str| loc.matches("node_modules/").count();
     let mut queue: Vec<String> = vec![String::new()];
-    queue.extend(ideal.keys().filter(|l| !l.is_empty() && split_location(l).is_none()).cloned());
+    queue.extend(
+        ideal
+            .keys()
+            .filter(|l| !l.is_empty() && split_location(l).is_none())
+            .cloned(),
+    );
     let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
     while !queue.is_empty() {
         queue.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
         let node = queue.remove(0);
-        let Some(pkg) = ideal.get(&node) else { continue };
+        let Some(pkg) = ideal.get(&node) else {
+            continue;
+        };
         let mut names: BTreeSet<&String> = BTreeSet::new();
-        for deps in [&pkg.dependencies, &pkg.optional_dependencies, &pkg.peer_dependencies]
-            .into_iter()
-            .flatten()
+        for deps in [
+            &pkg.dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
         {
             names.extend(deps.keys());
         }
@@ -282,12 +319,20 @@ pub fn load_actual(
         return BTreeMap::new();
     }
     if hidden_valid {
-        if let Ok(hidden) = rnpm_lockfile::LockfileV3::load_from_file(&node_modules.join(".package-lock.json")) {
+        if let Ok(hidden) =
+            rnpm_lockfile::LockfileV3::load_from_file(&node_modules.join(".package-lock.json"))
+        {
             return hidden.packages;
         }
     }
     let mut out = BTreeMap::new();
-    scan(project_dir, &node_modules, "node_modules", project_lock, &mut out);
+    scan(
+        project_dir,
+        &node_modules,
+        "node_modules",
+        project_lock,
+        &mut out,
+    );
     out
 }
 
@@ -298,8 +343,13 @@ fn scan(
     project_lock: Option<&BTreeMap<String, LockfilePackage>>,
     out: &mut BTreeMap<String, LockfilePackage>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut names: Vec<_> = entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<_> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
     names.sort();
     for name in names {
         if name.starts_with('.') {
@@ -307,27 +357,47 @@ fn scan(
         }
         let path = dir.join(&name);
         if name.starts_with('@') {
-            scan(project_dir, &path, &format!("{prefix}/{name}"), project_lock, out);
+            scan(
+                project_dir,
+                &path,
+                &format!("{prefix}/{name}"),
+                project_lock,
+                out,
+            );
             continue;
         }
         // Scoped packages arrive here as prefix ".../@scope".
         let location = format!("{prefix}/{name}");
-        let is_link = std::fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+        let is_link = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
             || junction_target(&path).is_some();
         if is_link {
-            let target = std::fs::canonicalize(&path)
-                .ok()
-                .and_then(|t| {
-                    let base = std::fs::canonicalize(project_dir).ok()?;
-                    t.strip_prefix(&base).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
-                });
-            out.insert(location, LockfilePackage { link: Some(true), resolved: target, ..Default::default() });
+            let target = std::fs::canonicalize(&path).ok().and_then(|t| {
+                let base = std::fs::canonicalize(project_dir).ok()?;
+                t.strip_prefix(&base)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+            });
+            out.insert(
+                location,
+                LockfilePackage {
+                    link: Some(true),
+                    resolved: target,
+                    ..Default::default()
+                },
+            );
             continue;
         }
         let pkg = if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')) {
+            if let Ok(manifest) =
+                serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+            {
                 let version = manifest["version"].as_str().map(str::to_string);
-                let mut p = LockfilePackage { version: version.clone(), ..Default::default() };
+                let mut p = LockfilePackage {
+                    version: version.clone(),
+                    ..Default::default()
+                };
                 if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
                     if locked.version == version {
                         p.resolved = locked.resolved.clone();
@@ -349,7 +419,13 @@ fn scan(
         out.insert(location.clone(), pkg);
         let nested = path.join("node_modules");
         if nested.is_dir() {
-            scan(project_dir, &nested, &format!("{location}/node_modules"), project_lock, out);
+            scan(
+                project_dir,
+                &nested,
+                &format!("{location}/node_modules"),
+                project_lock,
+                out,
+            );
         }
     }
 }
@@ -385,7 +461,10 @@ mod tests {
         let mut ideal = BTreeMap::new();
         ideal.insert(String::new(), LockfilePackage::default());
         ideal.insert("node_modules/a".into(), pkg("1.0.0", "sha512-a"));
-        ideal.insert("node_modules/a/node_modules/x".into(), pkg("1.0.0", "sha512-x"));
+        ideal.insert(
+            "node_modules/a/node_modules/x".into(),
+            pkg("1.0.0", "sha512-x"),
+        );
         ideal.insert("node_modules/b".into(), pkg("2.0.0", "sha512-b2"));
         let mut actual = BTreeMap::new();
         actual.insert("node_modules/b".into(), pkg("1.0.0", "sha512-b1"));
@@ -422,7 +501,13 @@ mod tests {
         ideal.insert("node_modules/same/node_modules/inner".into(), bundled);
         let mut actual = BTreeMap::new();
         actual.insert("node_modules/same".into(), pkg("1.0.0", "sha1-t"));
-        let report = compute(&ideal, &actual, None, |loc, _| loc == "node_modules/dev", |_| true);
+        let report = compute(
+            &ideal,
+            &actual,
+            None,
+            |loc, _| loc == "node_modules/dev",
+            |_| true,
+        );
         assert!(report.changes.is_empty(), "{:?}", report.changes);
     }
 }

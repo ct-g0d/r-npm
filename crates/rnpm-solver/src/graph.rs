@@ -213,7 +213,10 @@ impl DependencyGraph {
         let mut late = Vec::new();
         for (location, node) in &self.nodes {
             for (name, spec) in &node.peer_dependencies {
-                let optional = node.peer_dependencies_meta.get(name).is_some_and(|m| m.optional);
+                let optional = node
+                    .peer_dependencies_meta
+                    .get(name)
+                    .is_some_and(|m| m.optional);
                 if !optional || existing.contains(&(location.clone(), name.clone())) {
                     continue;
                 }
@@ -274,16 +277,23 @@ impl DependencyGraph {
             if !node.flags.link {
                 continue;
             }
-            if let Some(target) = node.resolved.as_ref().filter(|t| self.nodes.contains_key(*t)) {
+            if let Some(target) = node
+                .resolved
+                .as_ref()
+                .filter(|t| self.nodes.contains_key(*t))
+            {
                 if target != location {
-                    outgoing.entry(location.clone()).or_default().push(DependencyEdge {
-                        from_location: location.clone(),
-                        to_location: target.clone(),
-                        install_name: node.install_name.clone(),
-                        package_name: node.name.clone(),
-                        spec: String::new(),
-                        dep_type: DependencyType::Prod,
-                    });
+                    outgoing
+                        .entry(location.clone())
+                        .or_default()
+                        .push(DependencyEdge {
+                            from_location: location.clone(),
+                            to_location: target.clone(),
+                            install_name: node.install_name.clone(),
+                            package_name: node.name.clone(),
+                            spec: String::new(),
+                            dep_type: DependencyType::Prod,
+                        });
                 }
             }
         }
@@ -314,7 +324,10 @@ impl DependencyGraph {
                     next_optional |= OPTIONAL_ONLY;
                 }
                 if optional_state & NON_OPTIONAL != 0 {
-                    next_optional |= if matches!(edge.dep_type, DependencyType::Optional | DependencyType::PeerOptional) {
+                    next_optional |= if matches!(
+                        edge.dep_type,
+                        DependencyType::Optional | DependencyType::PeerOptional
+                    ) {
                         OPTIONAL_ONLY
                     } else {
                         NON_OPTIONAL
@@ -323,7 +336,14 @@ impl DependencyGraph {
 
                 let mut next_peer = peer_state & DEV_ONLY;
                 if peer_state & NON_DEV != 0 {
-                    next_peer |= if matches!(edge.dep_type, DependencyType::Peer | DependencyType::PeerOptional) { DEV_ONLY } else { NON_DEV };
+                    next_peer |= if matches!(
+                        edge.dep_type,
+                        DependencyType::Peer | DependencyType::PeerOptional
+                    ) {
+                        DEV_ONLY
+                    } else {
+                        NON_DEV
+                    };
                 }
 
                 let next_skipped = if skipped_state & DEV_ONLY != 0
@@ -404,7 +424,8 @@ impl DependencyGraph {
             let optional_state = optional_states.get(location).copied().unwrap_or(0);
             let skipped_state = skipped_states.get(location).copied().unwrap_or(0);
             if dev_state != 0 && !non_extraneous.contains(location) {
-                node.extra.insert("extraneous".to_string(), serde_json::Value::Bool(true));
+                node.extra
+                    .insert("extraneous".to_string(), serde_json::Value::Bool(true));
             } else {
                 node.extra.remove("extraneous");
             }
@@ -623,7 +644,8 @@ impl DependencyGraph {
                 //   but is neither exclusively dev nor exclusively optional (`dev_optional && !dev && !optional`),
                 //   emit `devOptional: true`.
                 // - When neither applies, omit `devOptional`.
-                let extraneous = node.extra.get("extraneous") == Some(&serde_json::Value::Bool(true));
+                let extraneous =
+                    node.extra.get("extraneous") == Some(&serde_json::Value::Bool(true));
                 let (dev, optional, dev_optional) = if extraneous {
                     (None, None, None)
                 } else if node.flags.dev && node.flags.optional {
@@ -713,7 +735,11 @@ impl DependencyGraph {
                     dev,
                     optional,
                     dev_optional,
-                    peer: if node.flags.peer && !extraneous { Some(true) } else { None },
+                    peer: if node.flags.peer && !extraneous {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     in_bundle: if node.flags.bundled { Some(true) } else { None },
                     has_install_script: if node.flags.has_install_script {
                         Some(true)
@@ -867,9 +893,28 @@ impl DependencyGraph {
                         .map(|(n, s)| (n, s, DependencyType::Optional)),
                 )
                 .chain(
-                    node.peer_dependencies.iter()
-                        .filter(|(name, _)| !node.dependencies.contains_key(*name) && !node.optional_dependencies.contains_key(*name) && !node.dev_dependencies.contains_key(*name))
-                        .map(|(name, spec)| (name, spec, if node.peer_dependencies_meta.get(name).is_some_and(|meta| meta.optional) { DependencyType::PeerOptional } else { DependencyType::Peer })),
+                    node.peer_dependencies
+                        .iter()
+                        .filter(|(name, _)| {
+                            !node.dependencies.contains_key(*name)
+                                && !node.optional_dependencies.contains_key(*name)
+                                && !node.dev_dependencies.contains_key(*name)
+                        })
+                        .map(|(name, spec)| {
+                            (
+                                name,
+                                spec,
+                                if node
+                                    .peer_dependencies_meta
+                                    .get(name)
+                                    .is_some_and(|meta| meta.optional)
+                                {
+                                    DependencyType::PeerOptional
+                                } else {
+                                    DependencyType::Peer
+                                },
+                            )
+                        }),
                 );
 
             for (dep_name, dep_spec, dep_type) in all_deps {
