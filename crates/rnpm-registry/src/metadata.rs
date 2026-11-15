@@ -1,5 +1,6 @@
 use crate::error::RegistryError;
 use indexmap::IndexMap;
+use rnpm_core::PlatformList;
 use serde::{
     de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
@@ -112,10 +113,17 @@ pub fn deserialize_vec_or_string<'de, D>(deserializer: D) -> Result<Vec<String>,
 where
     D: Deserializer<'de>,
 {
+    deserialize_platform_list(deserializer).map(PlatformList::into_vec)
+}
+
+pub fn deserialize_platform_list<'de, D>(deserializer: D) -> Result<PlatformList, D::Error>
+where
+    D: Deserializer<'de>,
+{
     struct VecOrStringVisitor;
 
     impl<'de> Visitor<'de> for VecOrStringVisitor {
-        type Value = Vec<String>;
+        type Value = PlatformList;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a string or array of strings")
@@ -125,14 +133,14 @@ where
         where
             E: de::Error,
         {
-            Ok(vec![value.to_string()])
+            Ok(value.to_string().into())
         }
 
         fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
         where
             E: de::Error,
         {
-            Ok(vec![value])
+            Ok(value.into())
         }
 
         fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
@@ -148,14 +156,14 @@ where
                     list.push(s);
                 }
             }
-            Ok(list)
+            Ok(list.into())
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
         where
             E: de::Error,
         {
-            Ok(Vec::new())
+            Ok(PlatformList::default())
         }
 
         fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
@@ -169,7 +177,7 @@ where
         where
             E: de::Error,
         {
-            Ok(Vec::new())
+            Ok(PlatformList::default())
         }
     }
 
@@ -290,12 +298,12 @@ pub struct AbbreviatedVersion {
     /// Retain legacy engine shapes across the typed packument disk cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engines_raw: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
-    pub os: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
-    pub cpu: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
-    pub libc: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_platform_list")]
+    pub os: PlatformList,
+    #[serde(default, deserialize_with = "deserialize_platform_list")]
+    pub cpu: PlatformList,
+    #[serde(default, deserialize_with = "deserialize_platform_list")]
+    pub libc: PlatformList,
     #[serde(rename = "hasInstallScript", default)]
     pub has_install_script: bool,
     #[serde(default)]
@@ -448,8 +456,24 @@ mod tests {
             "os": ["win32"], "cpu": ["arm64"], "libc": [null]
         }"#;
         let version: AbbreviatedVersion = serde_json::from_str(json).unwrap();
-        assert_eq!(version.os, ["win32"]);
+        assert_eq!(version.os.as_slice(), ["win32"]);
         assert!(version.libc.is_empty());
+    }
+
+    #[test]
+    fn platform_forms_survive_metadata_cache_roundtrip() {
+        let version: AbbreviatedVersion = serde_json::from_value(serde_json::json!({
+            "name": "binding", "version": "1.0.0",
+            "dist": { "tarball": "https://r/b.tgz" },
+            "os": "linux", "cpu": ["x64"], "libc": "glibc"
+        }))
+        .unwrap();
+        let cached = serde_json::to_vec(&version).unwrap();
+        let restored: AbbreviatedVersion = serde_json::from_slice(&cached).unwrap();
+        let json = serde_json::to_value(restored).unwrap();
+        assert_eq!(json["os"], "linux");
+        assert_eq!(json["cpu"], serde_json::json!(["x64"]));
+        assert_eq!(json["libc"], "glibc");
     }
 
     #[test]
@@ -486,7 +510,7 @@ mod tests {
         assert_eq!(v.version, "1.0.0");
         assert!(v.has_install_script);
         assert_eq!(v.license.as_deref(), Some("MIT"));
-        assert_eq!(v.libc, vec!["glibc"]);
+        assert_eq!(v.libc.as_slice(), ["glibc"]);
         assert!(v.extra.contains_key("funding"));
         assert_eq!(v.dependencies.get("dep-a"), Some(&"^1.0.0".to_string()));
 

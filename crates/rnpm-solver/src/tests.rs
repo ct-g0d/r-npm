@@ -240,17 +240,17 @@ fn test_platform_filters_optional_dependencies() {
 
     // Package for darwin only
     provider.add_version("darwin-native", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
     });
 
     // Package for windows (win32) only
     provider.add_version("win32-native", "1.0.0", |v| {
-        v.os = Some(vec!["win32".to_string()]);
+        v.os = Some(vec!["win32".to_string()].into());
     });
 
     // Package for x64 cpu only
     provider.add_version("x64-native", "1.0.0", |v| {
-        v.cpu = Some(vec!["x64".to_string()]);
+        v.cpu = Some(vec!["x64".to_string()].into());
     });
 
     let mut manifest = Manifest::default();
@@ -393,19 +393,19 @@ fn test_platform_libc_filtering_optional_dependencies() {
 
     // Package for glibc only
     provider.add_version("glibc-pkg", "1.0.0", |v| {
-        v.os = Some(vec!["linux".to_string()]);
-        v.libc = Some(vec!["glibc".to_string()]);
+        v.os = Some(vec!["linux".to_string()].into());
+        v.libc = Some(vec!["glibc".to_string()].into());
     });
 
     // Package for musl only
     provider.add_version("musl-pkg", "1.0.0", |v| {
-        v.os = Some(vec!["linux".to_string()]);
-        v.libc = Some(vec!["musl".to_string()]);
+        v.os = Some(vec!["linux".to_string()].into());
+        v.libc = Some(vec!["musl".to_string()].into());
     });
 
     // Package for non-musl (!musl)
     provider.add_version("not-musl-pkg", "1.0.0", |v| {
-        v.libc = Some(vec!["!musl".to_string()]);
+        v.libc = Some(vec!["!musl".to_string()].into());
     });
 
     let mut manifest = Manifest::default();
@@ -462,7 +462,7 @@ fn test_transitive_optional_dependency_platform_skipping() {
 
     // Incompatible optional parent depends on child-pkg
     provider.add_version("darwin-parent", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
         v.dependencies
             .insert("child-pkg".to_string(), "1.0.0".to_string());
     });
@@ -1897,8 +1897,8 @@ fn test_platform_filtering_isolation_before_download() {
 
     // Incompatible platform package with transitive dependencies
     provider.add_version("linux-bundle", "1.0.0", |v| {
-        v.os = Some(vec!["linux".to_string()]);
-        v.libc = Some(vec!["glibc".to_string()]);
+        v.os = Some(vec!["linux".to_string()].into());
+        v.libc = Some(vec!["glibc".to_string()].into());
         v.dependencies
             .insert("cuda-driver".to_string(), "1.0.0".to_string());
         v.dependencies
@@ -2935,9 +2935,9 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
 
     // Linux glibc optional addon + heavy subdependencies
     provider.add_version("addon-linux-glibc", "1.0.0", |v| {
-        v.os = Some(vec!["linux".to_string()]);
-        v.cpu = Some(vec!["x64".to_string()]);
-        v.libc = Some(vec!["glibc".to_string()]);
+        v.os = Some(vec!["linux".to_string()].into());
+        v.cpu = Some(vec!["x64".to_string()].into());
+        v.libc = Some(vec!["glibc".to_string()].into());
         v.dependencies
             .insert("cuda-core".to_string(), "1.0.0".to_string());
         v.dependencies
@@ -2948,9 +2948,9 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
 
     // Linux musl optional addon + subdependency
     provider.add_version("addon-linux-musl", "1.0.0", |v| {
-        v.os = Some(vec!["linux".to_string()]);
-        v.cpu = Some(vec!["x64".to_string()]);
-        v.libc = Some(vec!["musl".to_string()]);
+        v.os = Some(vec!["linux".to_string()].into());
+        v.cpu = Some(vec!["x64".to_string()].into());
+        v.libc = Some(vec!["musl".to_string()].into());
         v.dependencies
             .insert("musl-shim".to_string(), "1.0.0".to_string());
     });
@@ -2958,16 +2958,16 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
 
     // macOS arm64 optional addon + subdependency
     provider.add_version("addon-darwin-arm64", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
-        v.cpu = Some(vec!["arm64".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
+        v.cpu = Some(vec!["arm64".to_string()].into());
         v.dependencies
             .insert("metal-framework".to_string(), "1.0.0".to_string());
     });
 
     // macOS x64 optional addon + subdependency
     provider.add_version("addon-darwin-x64", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
-        v.cpu = Some(vec!["x64".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
+        v.cpu = Some(vec!["x64".to_string()].into());
         v.dependencies
             .insert("metal-framework".to_string(), "1.0.0".to_string());
     });
@@ -2975,8 +2975,8 @@ fn test_stress_platform_filters_matrix_glibc_musl_darwin_win32() {
 
     // Windows x64 optional addon + subdependency
     provider.add_version("addon-win32-x64", "1.0.0", |v| {
-        v.os = Some(vec!["win32".to_string()]);
-        v.cpu = Some(vec!["x64".to_string()]);
+        v.os = Some(vec!["win32".to_string()].into());
+        v.cpu = Some(vec!["x64".to_string()].into());
         v.dependencies
             .insert("directx-helper".to_string(), "1.0.0".to_string());
     });
@@ -4799,8 +4799,8 @@ fn test_required_platform_incompatibility_fails_ebadplatform() {
     use crate::solver::Solver;
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("darwin-only", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
-        v.cpu = Some(vec!["arm64".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
+        v.cpu = Some(vec!["arm64".to_string()].into());
     });
 
     let mut manifest = Manifest::default();
@@ -4839,7 +4839,7 @@ fn test_optional_platform_incompatibility_is_skipped() {
     use crate::solver::Solver;
     let mut provider = InMemoryPackageProvider::new();
     provider.add_version("darwin-opt", "1.0.0", |v| {
-        v.os = Some(vec!["darwin".to_string()]);
+        v.os = Some(vec!["darwin".to_string()].into());
     });
 
     let mut manifest = Manifest::default();
@@ -4952,7 +4952,7 @@ fn test_arborist_lockfile_metadata_alignment() {
     // Package 1: Dev + optional combined dependency (e.g. dev tool optional addon)
     provider.add_version("dev-opt-addon", "1.0.0", |v| {
         v.license = Some("Apache-2.0".to_string());
-        v.libc = Some(vec!["glibc".to_string()]);
+        v.libc = Some(vec!["glibc".to_string()].into());
         v.extra.insert(
             "directories".to_string(),
             serde_json::json!({ "doc": "docs" }),

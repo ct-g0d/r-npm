@@ -35,24 +35,27 @@ Oracle: npm 11.20.0, Node 26.13.0, Windows x64. Starting revision:
 
 The Lerna fixture was copied from the corpus twice and both tools ran
 `install --package-lock-only --ignore-scripts --no-audit --no-fund`.
-After the workspace activation and peer-context corrections, the complete
-Lerna lockfile matches npm with zero parsed-JSON differences. This includes
+After the workspace activation, peer-context, and collation corrections,
+the complete Lerna lockfile is byte-identical to npm's lockfile. This includes
 top-level semver 7.8.6, got 15.1.0, lru-cache 11.5.3, and react 19.3.0,
-without extra nested @nx/vitest or React entries. This checks the fresh
-lockfile-only reproduction; it does not substitute for the full install/ci
-corpus phases on this workspace or the other workspace projects.
+without extra nested @nx/vitest or React entries. Full install/ci corpus
+phases remain for this workspace and the other workspace projects.
 
 The final diagnostic binary uses release optimization with LTO disabled
 and 16 codegen units. CI also builds the repository's default release profile.
 Timings from this diagnostic run are not a controlled performance benchmark.
-Re-serializing the resolved tree with the collation correction produces a
-byte-identical copy of npm's reference lockfile.
+The pinned `28def49` reproduction is retained in
+`target/lock-pr36-lerna-fresh/workspace-lerna-lerna`; both lockfiles have SHA-256
+`115fd2c0fcd017daf3276185229324c0a9757075c93357f823ef6a68fd5bd8d5`.
 
-An intermediate `npm-check-updates` corpus run matched `ci` and
-`ci --omit=dev`; fresh install still differed in ESLint peer placement.
-After correcting conflicted virtual peer handling, its fresh lockfile-only
-resolution has zero parsed-JSON differences from npm. The full corpus
-phases remain part of the final validation.
+After correcting conflicted virtual peer handling, `npm-check-updates`
+matches the full corpus checks for fresh install, `ci`, and `ci --omit=dev`.
+The evidence is retained in `target/corpus-ncu-pr36`.
+
+The complete comparison run on the pinned `28def49` binary matches 489/491
+cases (`target/npm-parity-pr36.json`). Only the two audit dry-run report-node
+and isDirect differences remain. PR #36 merged as `ae409e2` after all eight
+CI checks passed.
 
 The cosmiconfig placement was reduced to lockfile-lint plus TypeScript and
 the root `$typescript` override. npm's virtual candidate evaluates that
@@ -65,14 +68,80 @@ peer edge conflicted when a non-project parent's provider wins. Those
 conflicted virtual edges do not block hoisting. The matching mock probe and
 the real two-dependency ESLint reproduction both verify this behavior.
 
+## Platform metadata
+
+Preserve string versus array forms for `os`, `cpu`, and `libc` through
+manifest parsing, registry metadata caching, solver nodes, and lockfile
+serialization. The shared `PlatformList` exposes the constraint values for
+matching and retains the original form for serialization. Full-packument
+enrichment also keeps a scalar libc value scalar. Registry parsing retains
+its existing tolerance for published arrays containing null entries.
+
+Differential fixtures cover scalar and array constraints in install,
+lockfile-only install, and ci, including a scalar libc value omitted from
+the abbreviated packument. Unit checks also exercise the metadata cache
+roundtrip and lockfile serialization.
+
+Validation: all 1,099 workspace tests, strict all-target workspace clippy,
+and the all-target compile check pass. The five focused comparison cases
+match (`target/npm-parity-platform-optional.json`). The fresh Vite
+lockfile-only reproduction is byte-identical: both files are 181,164 bytes
+(`target/lock-platform-final/vite`). The fixtures use optional native
+dependencies so unsupported libc packages remain locked on Windows while
+supported hosts also check their installed contents.
+
+The initial required-dependency fixtures also exposed a separate force
+gap: npm accepts incompatible platform packages under `--force`, while
+rnpm still rejects them in the solver. The failed reproduction is retained
+in `target/npm-parity-platform-final.json` for the next fix.
+
+## Next native-project reproduction
+
+The PR #36 binary fails fresh better-sqlite3 installation because sqlite3
+declares node-gyp in both `optionalDependencies` and optional
+`peerDependencies`. The solver's child dependency pass currently replaces
+the optional dependency with a peer edge. npm's `Node._loadDeps` loads peers
+first, then production and optional edges, so the optional dependency wins.
+npm keeps root node-gyp 13.1.0 and installs 8.4.1 beneath sqlite3. The ci and
+omit-dev phases already match when starting with npm's lockfile.
+
+The fresh five-case native/script rerun uses the frozen PR #36 binary and
+retains evidence in `target/corpus-native-pr36`. It includes better-sqlite3,
+pacote, cacache, scripts-sqlite3, and scripts-sharp.
+The completed fresh-install phases for pacote and cacache report 76 and 79
+differences respectively. Their first lockfile difference is the same:
+npm retains conventional-commits-filter 3.0.0 under conventional-changelog-writer,
+while rnpm has no entry at that nested location. Their full per-case reports
+and stderr logs are retained in the same evidence directory.
+Both projects match ci and ci-omit-dev. Scripts-sqlite3 reports 524
+differences in fresh install and scripts, with both ci phases matching.
+Scripts-sharp matches fresh install, both ci phases, scripts, and lockfile
+v2/v3 upgrades; its v1 upgrade reports 356 differences, including extra
+license and dependency metadata in rnpm's lockfile.
+
+## Audit dry-run diagnosis
+
+The remaining two comparison failures concern node identities and
+isDirect, rather than add order. npm's audit report initially tracks the
+old lockfile nodes. Replacing them detaches those objects, leaving empty
+locations in the report. `Vuln.isVulnerable` adds replacement objects only
+when the ideal-tree walk examines them. In the chain reproduction, leaf
+and branch have detached old nodes plus visible replacements; middle and
+top retain only detached old nodes, and top becomes non-direct. rnpm
+currently retains the old visible locations and direct flag.
+
+The existing reify-order simulation in `reify_report.rs` may supply the
+walk events needed to retain and replay these identities. Avoid deriving
+the report solely from the final resolved graph. The local instrumented
+npm source and `target/trace-audit-nodes.cjs` provide the reproduction.
+
 ## Remaining work
 
 - Full install/ci corpus phases for Lerna and the other workspace fixtures.
-- Preserve scalar/array platform metadata forms, including libc.
-- Final full npm-check-updates corpus rerun and the remaining native/script cases.
+- Remaining native/script cases, including better-sqlite3, pacote, cacache,
+  scripts-sqlite3, and scripts-sharp.
 - Audit dry-run report node identities and isDirect fields (add order matches).
 - Complete ERESOLVE text and package-lock-only audit counts.
+- Match --force behavior for required packages with platform constraints.
 - Real-registry publish, 2FA, and web login using a supplied test account.
 - Controlled performance measurements after correctness work.
-
-Passing comparison probes do not establish universal npm replacement parity.

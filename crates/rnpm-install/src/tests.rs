@@ -4439,7 +4439,7 @@ async fn test_enrich_lockfile_with_scoped_package_license_and_libc() {
         "node_modules/@next/swc-linux-x64-musl",
         LockfilePackage {
             version: Some("14.2.5".to_string()),
-            os: Some(vec!["linux".to_string()]),
+            os: Some(vec!["linux".to_string()].into()),
             ..Default::default()
         },
     );

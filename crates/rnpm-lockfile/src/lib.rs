@@ -514,7 +514,7 @@ mod tests {
         let mut skipped_pkg = LockfilePackage {
             version: Some("2.3.2".to_string()),
             resolved: Some("https://registry.npmjs.org/skipped/-/skipped-2.3.2.tgz".to_string()),
-            os: Some(vec!["non_existent_os_xyz_123".to_string()]),
+            os: Some(vec!["non_existent_os_xyz_123".to_string()].into()),
             ..Default::default()
         };
         skipped_pkg.set_optional(true);
@@ -1757,7 +1757,7 @@ mod tests {
             dev: Some(true),
             optional: Some(true),
             license: Some("MIT".to_string()),
-            libc: Some(vec!["glibc".to_string()]),
+            libc: Some(vec!["glibc".to_string()].into()),
             ..Default::default()
         };
         pkg.extra.insert(

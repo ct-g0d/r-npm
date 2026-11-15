@@ -6545,14 +6545,14 @@ impl Installer {
                     if package.libc.is_none() {
                         if let Some(libc_val) = ver_val.get("libc") {
                             if let Some(s) = libc_val.as_str() {
-                                package.libc = Some(vec![s.to_string()]);
+                                package.libc = Some(s.to_string().into());
                             } else if let Some(arr) = libc_val.as_array() {
                                 let list: Vec<String> = arr
                                     .iter()
                                     .filter_map(|x| x.as_str().map(str::to_string))
                                     .collect();
                                 if !list.is_empty() {
-                                    package.libc = Some(list);
+                                    package.libc = Some(list.into());
                                 }
                             }
                         }
@@ -7065,9 +7065,9 @@ impl Installer {
                         optional_dependencies: manifest.optional_dependencies,
                         optional: is_optional,
                         skipped: false,
-                        os: manifest.os.unwrap_or_default(),
-                        cpu: manifest.cpu.unwrap_or_default(),
-                        libc: manifest.libc.unwrap_or_default(),
+                        os: manifest.os.unwrap_or_default().into_vec(),
+                        cpu: manifest.cpu.unwrap_or_default().into_vec(),
+                        libc: manifest.libc.unwrap_or_default().into_vec(),
                         is_file_dir: false,
                         is_file_archive: true,
                         local_path: Some(abs_path),
@@ -7104,9 +7104,9 @@ impl Installer {
                         optional_dependencies: manifest.optional_dependencies,
                         optional: is_optional,
                         skipped: false,
-                        os: manifest.os.unwrap_or_default(),
-                        cpu: manifest.cpu.unwrap_or_default(),
-                        libc: manifest.libc.unwrap_or_default(),
+                        os: manifest.os.unwrap_or_default().into_vec(),
+                        cpu: manifest.cpu.unwrap_or_default().into_vec(),
+                        libc: manifest.libc.unwrap_or_default().into_vec(),
                         is_file_dir: true,
                         is_file_archive: false,
                         local_path: Some(abs_path),
@@ -7284,9 +7284,9 @@ impl Installer {
             optional_dependencies: opt_deps,
             optional: is_optional,
             skipped,
-            os: ver_info.os.clone(),
-            cpu: ver_info.cpu.clone(),
-            libc: ver_info.libc.clone(),
+            os: ver_info.os.to_vec(),
+            cpu: ver_info.cpu.to_vec(),
+            libc: ver_info.libc.to_vec(),
             is_file_dir: false,
             is_file_archive: false,
             local_path: None,

@@ -1,4 +1,5 @@
 use crate::error::ManifestError;
+use crate::PlatformList;
 use serde::{
     de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
@@ -13,63 +14,7 @@ pub fn deserialize_opt_vec_or_string<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    struct OptVecOrStringVisitor;
-
-    impl<'de> Visitor<'de> for OptVecOrStringVisitor {
-        type Value = Option<Vec<String>>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string, array of strings, or null")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(Some(vec![value.to_string()]))
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(Some(vec![value]))
-        }
-
-        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            let mut list = Vec::new();
-            while let Some(item) = seq.next_element::<String>()? {
-                list.push(item);
-            }
-            Ok(Some(list))
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
-        where
-            D2: Deserializer<'de>,
-        {
-            deserializer.deserialize_any(self)
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(None)
-        }
-    }
-
-    deserializer.deserialize_any(OptVecOrStringVisitor)
+    Option::<PlatformList>::deserialize(deserializer).map(|list| list.map(PlatformList::into_vec))
 }
 
 fn parse_engine_entry_str(entry: &str) -> Option<(&str, &str)> {
@@ -411,26 +356,14 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<PackageWorkspaces>,
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_opt_vec_or_string",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub os: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<PlatformList>,
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_opt_vec_or_string",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cpu: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<PlatformList>,
 
-    #[serde(
-        default,
-        deserialize_with = "deserialize_opt_vec_or_string",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub libc: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub libc: Option<PlatformList>,
 
     #[serde(
         default,

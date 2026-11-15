@@ -805,7 +805,7 @@ mod tests {
         let mut darwin_pkg = LockfilePackage::default();
         darwin_pkg.version = Some("1.0.0".to_string());
         darwin_pkg.optional = Some(true);
-        darwin_pkg.os = Some(vec!["darwin".to_string()]); // incompatible on Windows
+        darwin_pkg.os = Some(vec!["darwin".to_string()].into()); // incompatible on Windows
         lockfile
             .packages
             .insert("node_modules/darwin-native".to_string(), darwin_pkg);
