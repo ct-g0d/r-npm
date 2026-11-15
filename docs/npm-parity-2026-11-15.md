@@ -142,6 +142,25 @@ The regression covers the error exit and absence of installation mutations.
 It also exposed unconditional fatal-error output under --silent; suppress
 the terminal diagnostic and log-path notice while retaining the debug log.
 
+## Installed tree materialization
+
+Include bundled package bins from the inflated lockfile when fresh install
+links commands. These children are discovered after solving and are absent
+from the original solver graph. Cached ci now finishes files and symlinks
+before linking commands so interpreter detection reads complete scripts.
+
+Track a package's own platform skip condition separately from inherited
+skip state. A shared optional native package can remain installable through
+one parent even when another parent is unsupported. A focused regression
+first failed with the native package incorrectly skipped, then passed with
+the separate intrinsic flag.
+
+The combined branch passes 132 solver tests, 103 installer tests, strict
+all-target workspace clippy, and 13 focused differential cases covering
+bundled commands, ci shims, shared native packages, and peer constraints.
+Evidence: `target/npm-materialization-combined.json`. A fresh pacote/cacache
+rerun is retained in `target/corpus-materialization-final`.
+
 ## Native-project baseline
 
 The PR #36 binary fails fresh better-sqlite3 installation because sqlite3
