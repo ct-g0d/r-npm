@@ -95,7 +95,23 @@ gap: npm accepts incompatible platform packages under `--force`, while
 rnpm still rejects them in the solver. The failed reproduction is retained
 in `target/npm-parity-platform-final.json` for the next fix.
 
-## Next native-project reproduction
+## Optional dependency and peer overlap
+
+Resolve a package's own production and optional dependencies before its
+peer declarations for the same name. Exclude the shadowed peer during
+placement, child-edge creation, late optional-peer linking, and fast-path
+validation. Keep the original peer metadata in the public lockfile.
+
+All 129 solver tests and strict solver clippy pass. Four differential
+cases match npm, including direct and transitive overlap, an unavailable
+optional version, and the existing nested optional-peer conflict case
+(`target/npm-parity-optional-peer-final.json`). A fresh two-project corpus
+rerun is retained in `target/corpus-optional-peer-final`; scripts-sqlite3
+now matches install, ci, and ci-omit-dev, clearing the prior 524 fresh-install
+differences. Its script phase and the complete better-sqlite3 check are
+part of the ongoing verification.
+
+## Native-project baseline
 
 The PR #36 binary fails fresh better-sqlite3 installation because sqlite3
 declares node-gyp in both `optionalDependencies` and optional

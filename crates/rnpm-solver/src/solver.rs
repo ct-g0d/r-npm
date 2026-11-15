@@ -997,8 +997,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
         // Check peers as edges of the candidate's virtual tree. Overrides
         // affect those edges, while the lockfile keeps the manifest's ranges.
-        let placement_peers = if self.overrides.rules.is_empty()
-            || chosen_version.peer_dependencies.is_empty()
+        let has_shadowed_peers = chosen_version.peer_dependencies.keys().any(|name| {
+            chosen_version.dependencies.contains_key(name)
+                || chosen_version.optional_dependencies.contains_key(name)
+        });
+        let placement_peers = if chosen_version.peer_dependencies.is_empty()
+            || (self.overrides.rules.is_empty() && !has_shadowed_peers)
         {
             None
         } else {
@@ -1025,6 +1029,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             ancestors.push(dep_spec.package_name.clone());
             let mut peers = BTreeMap::new();
             for (name, spec) in &chosen_version.peer_dependencies {
+                // Arborist loads prod and optional edges after peers, replacing
+                // a peer declaration for the same name before placement.
+                if chosen_version.dependencies.contains_key(name)
+                    || chosen_version.optional_dependencies.contains_key(name)
+                {
+                    continue;
+                }
                 let virtual_override = self.overrides.resolve_override_in_context(
                     name,
                     spec,
@@ -1316,8 +1327,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // Peer dependencies
                 if !self.options.legacy_peer_deps {
                     for (k, v) in &chosen_version.peer_dependencies {
-                        if let Some((_, DependencyType::Prod)) = child_deps.get(k) {
-                            // Direct production dependency already present; do not overwrite with Peer or PeerOptional
+                        if let Some((_, DependencyType::Prod | DependencyType::Optional)) =
+                            child_deps.get(k)
+                        {
+                            // Production and optional dependencies replace peer edges.
                             continue;
                         }
                         let is_opt_peer = chosen_version
@@ -2050,6 +2063,11 @@ fn validate_fast_path_graph(
         // peerDependencies (if !options.legacy_peer_deps)
         if !options.legacy_peer_deps {
             for (dep_name, dep_spec) in &node.peer_dependencies {
+                if node.dependencies.contains_key(dep_name)
+                    || node.optional_dependencies.contains_key(dep_name)
+                {
+                    continue;
+                }
                 if !validate_fast_path_dep(
                     graph,
                     loc,

@@ -6,6 +6,68 @@ use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use std::collections::BTreeMap;
 
 #[test]
+fn optional_dependency_replaces_peer_before_placement() {
+    for optional_peer in [false, true] {
+        for transitive in [false, true] {
+            let mut provider = InMemoryPackageProvider::new();
+            provider.add_version("shared", "1.0.0", |_| {});
+            provider.add_version("shared", "2.0.0", |_| {});
+            provider.add_version("owner", "1.0.0", |v| {
+                v.optional_dependencies
+                    .insert("shared".into(), "1.0.0".into());
+                v.peer_dependencies.insert("shared".into(), "1.0.0".into());
+                if optional_peer {
+                    v.peer_dependencies_meta
+                        .insert("shared".into(), PeerDependencyMeta { optional: true });
+                }
+            });
+            provider.add_version("wrapper", "1.0.0", |v| {
+                v.dependencies.insert("owner".into(), "1.0.0".into());
+            });
+            let mut manifest = Manifest::default();
+            manifest
+                .dependencies
+                .insert("shared".into(), "2.0.0".into());
+            manifest.dependencies.insert(
+                if transitive { "wrapper" } else { "owner" }.into(),
+                "1.0.0".into(),
+            );
+            let graph = resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default())
+                .unwrap();
+            assert_eq!(graph.nodes["node_modules/shared"].version, "2.0.0");
+            assert_eq!(
+                graph.nodes["node_modules/owner/node_modules/shared"].version,
+                "1.0.0"
+            );
+            let edges = graph.get_outgoing_edges("node_modules/owner");
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0].dep_type, DependencyType::Optional);
+        }
+    }
+}
+
+#[test]
+fn missing_optional_dependency_does_not_become_a_late_peer() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("shared", "2.0.0", |_| {});
+    provider.add_version("owner", "1.0.0", |v| {
+        v.optional_dependencies
+            .insert("shared".into(), "9.0.0".into());
+        v.peer_dependencies.insert("shared".into(), "2.0.0".into());
+        v.peer_dependencies_meta
+            .insert("shared".into(), PeerDependencyMeta { optional: true });
+    });
+    let mut manifest = Manifest::default();
+    manifest
+        .dependencies
+        .insert("shared".into(), "2.0.0".into());
+    manifest.dependencies.insert("owner".into(), "1.0.0".into());
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert!(graph.get_outgoing_edges("node_modules/owner").is_empty());
+}
+
+#[test]
 fn test_hoisting_and_deduplication() {
     let mut provider = InMemoryPackageProvider::new();
 
