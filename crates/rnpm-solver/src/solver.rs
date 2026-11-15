@@ -474,7 +474,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
 
-        if self.options.lockfile.is_none() && self.options.is_strict_peers() {
+        // Overrides rewrite peer specs per path; leave those to placement.
+        if self.options.lockfile.is_none()
+            && self.options.is_strict_peers()
+            && self.overrides.rules.is_empty()
+        {
             self.precheck_root_peer_sets(root_manifest, &root_deps)?;
         }
 
@@ -1917,10 +1921,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
         for name in order {
             let (spec, dep_type) = &root_deps[name];
+            // An absent optional peer is never fetched.
+            if *dep_type == DependencyType::PeerOptional {
+                continue;
+            }
             let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
                 continue;
             };
-            if !registry_target(&dep_spec.target) {
+            // Aliases resolve another package's metadata; placement handles them.
+            if dep_spec.package_name != *name || !registry_target(&dep_spec.target) {
                 continue;
             }
             let Some(meta) = self.provider.get_package(&dep_spec.package_name)? else {
@@ -1938,20 +1947,26 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     .is_some_and(|meta| meta.optional)
                     || chosen.dependencies.contains_key(peer)
                     || chosen.optional_dependencies.contains_key(peer)
-                    || self.overrides.rules.contains_key(peer)
                 {
                     continue;
                 }
                 let Some((root_spec, root_type)) = root_deps.get(peer) else {
                     continue;
                 };
-                let (Ok(root_target), Ok(peer_target)) = (
-                    DependencySpec::parse(peer, root_spec).map(|s| s.target),
+                if *root_type == DependencyType::PeerOptional {
+                    continue;
+                }
+                let (Ok(root_dep), Ok(peer_target)) = (
+                    DependencySpec::parse(peer, root_spec),
                     PackageTarget::parse(peer_spec),
                 ) else {
                     continue;
                 };
-                if !registry_target(&root_target) || !registry_target(&peer_target) {
+                let root_target = root_dep.target;
+                if root_dep.package_name != *peer
+                    || !registry_target(&root_target)
+                    || !registry_target(&peer_target)
+                {
                     continue;
                 }
                 let Some(peer_meta) = self.provider.get_package(peer)? else {

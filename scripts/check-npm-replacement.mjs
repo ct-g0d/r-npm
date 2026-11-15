@@ -444,6 +444,9 @@ for(const [name,versions] of Object.entries({
   'aa-shared-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'alias-held':{'1.0.0':{}},
+  'alias-held-real':{'2.0.0':{}},
+  'alias-held-peer-two':{'1.0.0':{peerDependencies:{'alias-held':'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'a-ws-trigger':{'1.0.0':{dependencies:{dep:'^1.0.0'}}},
@@ -589,6 +592,11 @@ for(const [name,fields,flags=[]] of [
   // conflict wins over an earlier placement conflict.
   ['root-holds-before-placement',{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'},devDependencies:{dep:'1.0.0','virtual-peer-parent':'1.0.0'}}],
   ['placed-peer',{dependencies:{'eresolve-peer-two':'1.0.0','eresolve-z-peer-one':'1.0.0'}}],
+  // Root-held checks that npm settles elsewhere: an absent optional root peer,
+  // an alias to another package, and a scoped override of the peer.
+  ['root-optional-peer-absent',{dependencies:{shared:'1.0.0'},peerDependencies:{'eresolve-peer-two':'1.0.0'},peerDependenciesMeta:{'eresolve-peer-two':{optional:true}}}],
+  ['root-alias-holds',{dependencies:{'alias-held':'npm:alias-held-real@*','alias-held-peer-two':'1.0.0'}}],
+  ['root-holds-scoped-override',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'},overrides:{'eresolve-peer-two':{shared:'1.0.0'}}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
 ])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});
 // A link target whose folder is missing still carries the linking node's flags.
