@@ -2552,6 +2552,10 @@ impl Installer {
             legacy_peer_deps: self.options.legacy_peer_deps,
             strict_peers: !self.options.legacy_peer_deps,
             strict_peer_deps: self.options.strict_peer_deps,
+            repair_optional_peers: !self.options.no_save
+                || !self.options.packages.is_empty()
+                || !self.options.unlocked_packages.is_empty()
+                || !self.options.vulnerability_constraints.is_empty(),
             lockfile: existing_lockfile,
             unlocked_packages: self.options.unlocked_packages.clone(),
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),

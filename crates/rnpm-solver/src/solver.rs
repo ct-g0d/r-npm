@@ -26,6 +26,8 @@ pub struct ResolverOptions {
     pub strict_peers: bool,
     /// When true, fail immediately with npm-compatible ERESOLVE error on any peer dependency conflict/mismatch.
     pub strict_peer_deps: bool,
+    /// Revisit newly invalid optional peers during lockfile-mutating operations.
+    pub repair_optional_peers: bool,
     /// Optional lockfile v3 to enable fast-path resolution when matching package.json specs.
     pub lockfile: Option<std::sync::Arc<rnpm_lockfile::LockfileV3>>,
     /// Unlocked packages that must be re-resolved to newer versions rather than locked to lockfile.
@@ -42,6 +44,7 @@ impl Default for ResolverOptions {
             legacy_peer_deps: false,
             strict_peers: true,
             strict_peer_deps: false,
+            repair_optional_peers: true,
             lockfile: None,
             unlocked_packages: std::collections::HashSet::new(),
             vulnerability_constraints: std::collections::HashMap::new(),
@@ -84,6 +87,8 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     /// Link targets normally wait for resolveLinks, but an invalidated edge
     /// can put a workspace into the node queue before that pass.
     deferred_workspaces: BTreeMap<String, Vec<ResolveTask>>,
+    /// Missing optional peers become problem edges when a provider arrives.
+    deferred_optional_peers: BTreeMap<String, Vec<ResolveTask>>,
     /// Root edges already resolved early for a peer set.
     preplaced: std::collections::HashSet<String>,
 }
@@ -140,6 +145,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             graph,
             queue: VecDeque::new(),
             deferred_workspaces: BTreeMap::new(),
+            deferred_optional_peers: BTreeMap::new(),
             preplaced: std::collections::HashSet::new(),
         }
     }
@@ -192,6 +198,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             advisory: None,
             is_mine,
         });
+    }
+
+    fn activate_deferred_optional_peers(&mut self, provider_location: &str) {
+        let name = self.graph.nodes[provider_location].install_name.clone();
+        let Some(tasks) = self.deferred_optional_peers.remove(&name) else {
+            return;
+        };
+        for task in tasks {
+            let visible = crate::hoisting::find_visible_peer_node(
+                &self.graph,
+                &task.parent_location,
+                &name,
+                &name,
+            );
+            if visible.is_some_and(|node| node.location == provider_location) {
+                self.push_task(task);
+            } else {
+                self.deferred_optional_peers
+                    .entry(name.clone())
+                    .or_default()
+                    .push(task);
+            }
+        }
     }
 
     fn push_task(&mut self, task: ResolveTask) {
@@ -585,6 +614,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // 3. Check for cyclic peer dependencies and existing peer instances
         let is_peer =
             task.dep_type == DependencyType::Peer || task.dep_type == DependencyType::PeerOptional;
+        let mut replace_transitive_root_peer = false;
         if is_peer
             && self.queue.iter().any(|queued| {
                 queued.parent_location.is_empty()
@@ -768,9 +798,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 ),
                             ));
                         }
-                        if sibling
-                            .as_ref()
-                            .is_none_or(|location| self.graph.nodes.contains_key(location))
+                        replace_transitive_root_peer = sibling.is_none() && !root_pins_provider;
+                        if !replace_transitive_root_peer
+                            && sibling
+                                .as_ref()
+                                .is_none_or(|location| self.graph.nodes.contains_key(location))
                         {
                             return Ok(());
                         }
@@ -782,6 +814,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     "Optional peer dependency '{}@{}' for '{}' is not present in scope; skipping auto-install",
                     dep_spec.package_name, effective_spec, task.parent_package_name
                 );
+                if self.options.repair_optional_peers {
+                    self.deferred_optional_peers
+                        .entry(task.install_name.clone())
+                        .or_default()
+                        .push(task);
+                }
                 return Ok(());
             }
         }
@@ -1164,6 +1202,34 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
+        if replace_transitive_root_peer {
+            let existing = &self.graph.nodes[&root_slot];
+            let pinned_by_peer = self.graph.edges.iter().any(|edge| {
+                edge.to_location == root_slot
+                    && matches!(
+                        edge.dep_type,
+                        DependencyType::Peer | DependencyType::PeerOptional
+                    )
+                    && PackageTarget::parse(&edge.spec).is_ok_and(|target| {
+                        crate::hoisting::node_satisfies_target(existing, &target)
+                    })
+            });
+            if pinned_by_peer && self.peer_conflict_is_fatal(task.is_mine) {
+                return Err(SolverError::peer_conflict(
+                    &task.parent_package_name,
+                    &dep_spec.package_name,
+                    &effective_spec,
+                    Some(existing.version.clone()),
+                    Some(existing.location.clone()),
+                    (*task.ancestors).clone(),
+                    "Cannot move a peer provider beneath its consumer".to_string(),
+                ));
+            }
+            if !self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name) {
+                return Ok(());
+            }
+            placement = PlacementDecision::PlaceNew(root_slot.clone());
+        }
         let parent_skipped = self
             .graph
             .nodes
@@ -1282,6 +1348,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
                 self.graph.nodes.insert(target_loc.clone(), node);
                 self.activate_invalidated_workspaces(&target_loc);
+                self.activate_deferred_optional_peers(&target_loc);
                 if target_loc == root_slot {
                     self.dedupe_nested_compatible_nodes(
                         &root_slot,
@@ -1574,6 +1641,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         if compatible_edges.is_empty() {
             return false;
         }
+        if compatible_edges.iter().any(|edge| {
+            matches!(
+                edge.dep_type,
+                DependencyType::Peer | DependencyType::PeerOptional
+            )
+        }) {
+            return false;
+        }
         let parent = compatible_edges[0].from_location.clone();
         if compatible_edges
             .iter()
@@ -1628,6 +1703,27 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             } else if edge.to_location.starts_with(&prefix) {
                 let suffix = &edge.to_location[root_location.len()..];
                 edge.to_location = format!("{nested}{suffix}");
+            }
+        }
+        // Children waiting to expand still belong to the moved package.
+        // Reinsert them because depth and path determine queue ordering.
+        for mut task in std::mem::take(&mut self.queue) {
+            if task.parent_location == root_location || task.parent_location.starts_with(&prefix) {
+                task.parent_location =
+                    format!("{nested}{}", &task.parent_location[root_location.len()..]);
+                task.parent_depth = task.parent_location.matches("node_modules").count();
+            }
+            self.push_task(task);
+        }
+        for tasks in self.deferred_optional_peers.values_mut() {
+            for task in tasks {
+                if task.parent_location == root_location
+                    || task.parent_location.starts_with(&prefix)
+                {
+                    task.parent_location =
+                        format!("{nested}{}", &task.parent_location[root_location.len()..]);
+                    task.parent_depth = task.parent_location.matches("node_modules").count();
+                }
             }
         }
         true

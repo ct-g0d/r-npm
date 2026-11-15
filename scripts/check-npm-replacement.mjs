@@ -429,6 +429,12 @@ for(const [name,versions] of Object.entries({
   'overlap-owner':{'1.0.0':{optionalDependencies:{shared:'1.0.0'},peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'overlap-wrapper':{'1.0.0':{dependencies:{'overlap-owner':'1.0.0'}}},
   'overlap-missing':{'1.0.0':{optionalDependencies:{shared:'9.0.0'},peerDependencies:{shared:'2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'a-late-peer':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'b-late-writer':{'1.0.0':{dependencies:{shared:'^1.0.0'}}},
+  'b-late-required':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
+  'a-late-peer-children':{'1.0.0':{peerDependencies:{'late-provider':'2.0.0'},peerDependenciesMeta:{'late-provider':{optional:true}}}},
+  'b-late-writer-children':{'1.0.0':{dependencies:{'late-provider':'1.0.0'}}},
+  'late-provider':{'1.0.0':{dependencies:{shared:'1.0.0'}},'2.0.0':{dependencies:{shared:'2.0.0'}}},
   'platform-scalar':{'1.0.0':{os:process.platform,cpu:process.arch,libc:hostLibc}},
   'platform-array':{'1.0.0':{os:[process.platform],cpu:[process.arch],libc:[hostLibc]}},
   'platform-full':{'1.0.0':{license:'MIT',libc:hostLibc}},
@@ -468,6 +474,11 @@ for(const [name,versions] of Object.entries({
   probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
+add('resolver-late-optional-peer-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
+add('resolver-late-optional-peer-required-provider','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-required':'1.0.0'}}));
+add('cli-silent-registry-error','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'silent-missing':'1.0.0'}}));
+add('resolver-late-optional-peer-children','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer-children':'1.0.0','b-late-writer-children':'1.0.0'}}));
+add('resolver-late-optional-peer-no-save','install',['install','--ignore-scripts','--no-save'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
 for(const owner of ['overlap-owner','overlap-wrapper','overlap-missing'])add(`resolver-optional-peer-overlap-${owner}`,'install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{[owner]:'1.0.0',shared:'2.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
 add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
