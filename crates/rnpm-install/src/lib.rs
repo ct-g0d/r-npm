@@ -1627,6 +1627,11 @@ fn directory_target_entry(
         version: Some(node.version.clone()),
         has_install_script: has_install_script.then_some(true),
         dependencies: (!node.dependencies.is_empty()).then(|| node.dependencies.clone()),
+        // The target carries the flags of the node that links to it.
+        dev: node.flags.dev.then_some(true),
+        optional: node.flags.optional.then_some(true),
+        dev_optional: (node.flags.dev_optional && !node.flags.dev && !node.flags.optional)
+            .then_some(true),
         ..Default::default()
     }
 }
@@ -2230,6 +2235,36 @@ impl Installer {
                 self.options.project_dir.display()
             ));
         };
+
+        // npm-package-arg rejects unknown spec protocols (yarn/pnpm's
+        // `workspace:`, `patch:`, `link:`...) while loading the root and
+        // workspace edges, before anything is resolved.
+        if !self.options.is_global {
+            let members = discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default();
+            let manifests = std::iter::once(&manifest).chain(members.iter().map(|m| &m.manifest));
+            for m in manifests {
+                // Node#loadDeps: one edge per name, later types replacing
+                // earlier ones (peer, unless legacy, then prod, optional, dev).
+                let mut effective: BTreeMap<&String, &String> = BTreeMap::new();
+                let peers = (!self.options.legacy_peer_deps).then_some(&m.peer_dependencies);
+                for deps in peers.into_iter().chain([
+                    &m.dependencies,
+                    &m.optional_dependencies,
+                    &m.dev_dependencies,
+                ]) {
+                    effective.extend(deps.iter());
+                }
+                for spec in effective.into_values() {
+                    if let Some(protocol) = rnpm_core::spec::unsupported_protocol(spec) {
+                        return Err(anyhow!(
+                            "npm error code EUNSUPPORTEDPROTOCOL
+npm error Unsupported URL Type \"{protocol}\": {spec}"
+                        ));
+                    }
+                }
+            }
+        }
 
         // Fast path: if package.json matches existing committed lockfile and no package args were passed,
         // take the exact same reification fast path as `ci` without re-resolving through network metadata or calling solver!
@@ -4969,7 +5004,7 @@ impl Installer {
                         let _ = std::fs::remove_dir_all(&link_path);
                     }
                 }
-                rnpm_fs::create_junction(&link_path, &target_dir).map_err(|e| {
+                rnpm_fs::junction::create_directory_link(&link_path, &target_dir).map_err(|e| {
                     anyhow!(
                         "Failed to link workspace package at '{}': {e}",
                         link_path.display()

@@ -605,7 +605,7 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
             "name": "pkg-a",
             "version": "1.0.0",
             "devDependencies": {
-                "pkg-b": "workspace:*"
+                "pkg-b": "^1.0.0"
             }
         }"#,
     )
@@ -618,7 +618,7 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
             "name": "pkg-b",
             "version": "1.0.0",
             "devDependencies": {
-                "pkg-a": "workspace:*"
+                "pkg-a": "^1.0.0"
             }
         }"#,
     )
@@ -642,7 +642,7 @@ async fn test_workspace_cyclic_dev_dependencies_install_succeeds() {
 }
 
 #[tokio::test]
-async fn test_workspace_cyclic_production_dependencies_fails() {
+async fn test_workspace_cyclic_production_dependencies_install_succeeds() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
 
@@ -668,7 +668,7 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
             "name": "pkg-a",
             "version": "1.0.0",
             "dependencies": {
-                "pkg-b": "workspace:*"
+                "pkg-b": "^1.0.0"
             }
         }"#,
     )
@@ -681,7 +681,7 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
             "name": "pkg-b",
             "version": "1.0.0",
             "dependencies": {
-                "pkg-a": "workspace:*"
+                "pkg-a": "^1.0.0"
             }
         }"#,
     )
@@ -693,12 +693,13 @@ async fn test_workspace_cyclic_production_dependencies_fails() {
         ..Default::default()
     };
 
+    // npm links cyclic workspace siblings like any other workspace edge.
     let mut installer = Installer::new(options).unwrap();
-    let res = installer.run().await;
-    assert!(res.is_err(), "Cyclic production dependencies must fail");
-    let err_str = res.unwrap_err().to_string();
-    assert!(
-        err_str.contains("Circular workspace dependency detected"),
-        "Error must mention circular workspace dependency, got: {err_str}"
-    );
+    let summary = installer
+        .run()
+        .await
+        .expect("Cyclic workspace production dependencies must install");
+    assert_eq!(summary.packages_installed, 2);
+    assert!(root.join("node_modules").join("pkg-a").exists());
+    assert!(root.join("node_modules").join("pkg-b").exists());
 }

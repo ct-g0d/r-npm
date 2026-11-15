@@ -254,11 +254,15 @@ pub fn mark_root_bundles(
 pub fn sync_lockfile_package_entry(pkg_entry: &mut LockfilePackage, manifest: &Manifest) {
     pkg_entry.raw_value = None;
     pkg_entry.bundle_dependencies = manifest.bundled_dependencies.clone();
-    if manifest.dependencies.is_empty() {
-        pkg_entry.dependencies = None;
-    } else {
-        pkg_entry.dependencies = Some(manifest.dependencies.clone());
-    }
+    // @npmcli/package-json normalize (optionalDedupe): an optional
+    // dependency is removed from `dependencies`.
+    let dependencies: std::collections::BTreeMap<String, String> = manifest
+        .dependencies
+        .iter()
+        .filter(|(name, _)| !manifest.optional_dependencies.contains_key(*name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pkg_entry.dependencies = (!dependencies.is_empty()).then_some(dependencies);
     if manifest.dev_dependencies.is_empty() {
         pkg_entry.dev_dependencies = None;
     } else {
