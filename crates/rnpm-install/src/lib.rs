@@ -1561,6 +1561,27 @@ fn lockfile_resolves_to<'l>(lockfile: &'l LockfileV3, from: &str, name: &str) ->
     }
 }
 
+/// Whether a lockfile entry arrives inside another package's tarball. Its
+/// bundler is the nearest ancestor that is not itself bundled (Node#getBundler);
+/// when that is the root or a workspace folder, npm installs it normally.
+fn bundled_in_tarball(lockfile: &LockfileV3, key: &str, info: &LockfilePackage) -> bool {
+    if info.in_bundle != Some(true) {
+        return false;
+    }
+    let mut location = key;
+    while let Some((parent, _)) = location.rsplit_once("/node_modules/") {
+        if !parent.contains("node_modules/") {
+            return false;
+        }
+        match lockfile.packages.get(parent) {
+            Some(owner) if owner.in_bundle == Some(true) => location = parent,
+            Some(_) => return true,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Node.shouldOmit from arborist, over lockfile flags.
 fn lockfile_entry_omitted(
     options: &InstallOptions,
@@ -5128,7 +5149,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // Bundled packages are materialized with their owner's tarball.
             // Entries nested under a workspace member (`packages/a/node_modules/x`)
             // are installed like root ones.
-            if pkg_info.in_bundle == Some(true) || !pkg_key.contains("node_modules/") {
+            if bundled_in_tarball(&lockfile, pkg_key, pkg_info)
+                || !pkg_key.contains("node_modules/")
+            {
                 continue;
             }
 
