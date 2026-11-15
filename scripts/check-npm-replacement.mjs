@@ -177,6 +177,20 @@ add('workspace-without-version-lockfile','install',['install','--package-lock-on
   manifest(path.join(dir,'packages/a'),{name:'a'});
   edit(path.join(dir,'packages/a'),p=>{delete p.version;});
 });
+for (const [name,overrides] of [['invalidated',undefined],['overridden',{dep:'1.1.0'}]]) add(`workspace-${name}-edge-activates-target`,'install',['install','--package-lock-only','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*'],dependencies:{'a-ws-trigger':'1.0.0','z-ws-late':'1.0.0'},...(overrides?{overrides}:{})});
+  manifest(path.join(dir,'packages/a'),{name:'a',dependencies:{'b-ws-early':'1.0.0',dep:'1.0.0'}});
+});
+add('workspace-peer-set-shares-original-parent','install',['install','--package-lock-only','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*']});
+  manifest(path.join(dir,'packages/a'),{name:'a',dependencies:{'a-ws-peer-owner':'1.0.0',shared:'1.0.0'}});
+});
+for (const direct of [false,true]) add(`resolver-virtual-peer-reference-${direct?'direct':'nested'}`,'install',['install','--package-lock-only','--ignore-scripts'],dir=>manifest(dir,{
+  dependencies:{dep:'2.0.0','virtual-peer-owner':'1.0.0',...(direct?{'virtual-peer-plugin':'1.0.0'}:{})},overrides:{dep:'$dep'},
+}));
+add('resolver-virtual-peer-parent-provider-wins','install',['install','--package-lock-only','--ignore-scripts'],dir=>manifest(dir,{
+  dependencies:{dep:'2.0.0','virtual-peer-parent':'1.0.0'},overrides:{dep:'$dep'},
+}));
 for(const [name,flags]of [['name',['-w','a']],['long-equals',['--workspace=a']],['short-attached',['-wa']],['path',['-w','./packages/a']],['bare-directory',['-w','packages/a']],['parent-directory',['-w','packages']],['multiple',['-w','a','--workspace','b']]]){
   add(`workspace-run-${name}`,'run',['run','probe',...flags],workspace);
   add(`workspace-install-${name}`,'install',['install','dep@1.0.0','--ignore-scripts',...flags],workspace);
@@ -401,6 +415,15 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
+  'a-ws-trigger':{'1.0.0':{dependencies:{dep:'^1.0.0'}}},
+  'b-ws-early':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
+  'z-ws-late':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
+  'a-ws-peer-owner':{'1.0.0':{peerDependencies:{'b-ws-peer-member':'1.0.0',shared:'*'}}},
+  'b-ws-peer-member':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'virtual-peer-owner':{'1.0.0':{dependencies:{'virtual-peer-plugin':'1.0.0'}}},
+  'virtual-peer-plugin':{'1.0.0':{devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=1.0.0'},peerDependenciesMeta:{dep:{optional:true}}}},
+  'virtual-peer-parent':{'1.0.0':{dependencies:{'virtual-peer-required':'1.0.0'},devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=2.0.0'}}},
+  'virtual-peer-required':{'1.0.0':{devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=1.0.0'}}},
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding',workspaces:['packages/*']}},
   'fresh-packument':{'1.0.0':{}},
   'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},

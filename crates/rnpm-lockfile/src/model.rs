@@ -1900,13 +1900,22 @@ pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let b_bytes = b.as_bytes();
     let n = a_bytes.len().min(b_bytes.len());
     for i in 0..n {
-        let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
-        let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
+        let ra = NPM_CHAR_RANK[a_bytes[i].to_ascii_lowercase() as usize];
+        let rb = NPM_CHAR_RANK[b_bytes[i].to_ascii_lowercase() as usize];
         if ra != rb {
             return ra.cmp(&rb);
         }
     }
-    a_bytes.len().cmp(&b_bytes.len())
+    a_bytes.len().cmp(&b_bytes.len()).then_with(|| {
+        for i in 0..n {
+            let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
+            let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
+            if ra != rb {
+                return ra.cmp(&rb);
+            }
+        }
+        std::cmp::Ordering::Equal
+    })
 }
 
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
@@ -2090,6 +2099,15 @@ fn bin_is_empty(bin: &Option<PackageBin>) -> bool {
 #[cfg(test)]
 mod platform_field_tests {
     use super::LockfilePackage;
+
+    #[test]
+    fn npm_collation_compares_complete_names_before_case_tiebreaks() {
+        assert!(
+            super::npm_key_compare("node_modules/JSONStream", "node_modules/jsonwebtoken").is_lt()
+        );
+        assert!(super::npm_key_compare("aB", "Ab").is_lt());
+        assert!(super::npm_key_compare("ab", "aB").is_lt());
+    }
 
     #[test]
     fn libc_accepts_npm_string_form() {
