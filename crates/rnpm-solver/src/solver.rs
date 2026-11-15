@@ -963,54 +963,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
-        let potential_consumers = self
-            .graph
-            .nodes
-            .values()
-            .filter(|node| {
-                [
-                    &node.dependencies,
-                    &node.optional_dependencies,
-                    &node.peer_dependencies,
-                ]
-                .iter()
-                .filter_map(|deps| deps.get(&dep_spec.install_name))
-                .filter_map(|spec| PackageTarget::parse(spec).ok())
-                .any(|target| {
-                    crate::hoisting::node_satisfies_target(
-                        &Node {
-                            version: chosen_version.version.clone(),
-                            parsed_version: Version::parse(&chosen_version.version).ok(),
-                            ..Node::default()
-                        },
-                        &target,
-                    )
-                })
-            })
-            .count();
-        // Note: Arborist maintains FIFO root slot ownership based on (depth, path)
-        if false
-            && !task.parent_location.is_empty()
-            && self.graph.nodes.get(&root_slot).is_some_and(|existing| {
-                existing.name == dep_spec.package_name
-                    && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
-            })
-            && potential_consumers > 1
-            && self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name)
-        {
-            placement = determine_placement_with_peers(
-                &self.graph,
-                &task.parent_location,
-                &dep_spec.install_name,
-                &dep_spec.package_name,
-                &dep_spec.target,
-                &chosen_version.dependencies,
-                &chosen_version.peer_dependencies,
-                &chosen_version.peer_dependencies_meta,
-                Some(&chosen_version.version),
-                is_peer,
-            );
-        }
         let parent_skipped = self
             .graph
             .nodes

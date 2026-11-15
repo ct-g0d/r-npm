@@ -10,6 +10,8 @@ import { execFileSync, spawn } from 'node:child_process';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = process.argv.slice(2);
 const option = (name, fallback) => cli.includes(name) ? cli[cli.indexOf(name) + 1] : fallback;
+const caseFilters = cli.flatMap((arg, index) => arg === '--case' ? [cli[index + 1]] : []);
+const matchesCase = name => !caseFilters.length || caseFilters.some(filter => name.includes(filter));
 const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
 const output = path.resolve(option('--output', path.join(repo, 'target/npm-replacement-smoke.json')));
 // Long real path: npm compares realpaths, so an 8.3 short temp path would
@@ -166,6 +168,15 @@ add('failing-lifecycle-public-lock','install',['install'],dir=>manifest(dir,{scr
 add('explicit-install-skips-root-hooks','install',['install','dep@1.0.0'],dir=>manifest(dir,{scripts:{postinstall:'node -e "process.exit(7)"'}}));
 add('failing-ci-preserves-hidden-lock','ci',['ci'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},scripts:{postinstall:'node -e "process.exit(7)"'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true});}});
 const workspace=dir=>{manifest(dir,{workspaces:['packages/*']});for(const name of ['a','b'])manifest(path.join(dir,'packages',name),{name,scripts:{probe:'node -p process.env.npm_package_name'}});};
+add('workspace-root-transitives-before-member-deps','install',['install','--package-lock-only','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*'],dependencies:{parent:'1.0.0'}});
+  manifest(path.join(dir,'packages/a'),{name:'a',dependencies:{dep:'1.0.0'}});
+});
+add('workspace-without-version-lockfile','install',['install','--package-lock-only','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*']});
+  manifest(path.join(dir,'packages/a'),{name:'a'});
+  edit(path.join(dir,'packages/a'),p=>{delete p.version;});
+});
 for(const [name,flags]of [['name',['-w','a']],['long-equals',['--workspace=a']],['short-attached',['-wa']],['path',['-w','./packages/a']],['bare-directory',['-w','packages/a']],['parent-directory',['-w','packages']],['multiple',['-w','a','--workspace','b']]]){
   add(`workspace-run-${name}`,'run',['run','probe',...flags],workspace);
   add(`workspace-install-${name}`,'install',['install','dep@1.0.0','--ignore-scripts',...flags],workspace);
@@ -390,7 +401,7 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
-  'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding'}},
+  'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding',workspaces:['packages/*']}},
   'fresh-packument':{'1.0.0':{}},
   'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
   'bundle-owner':{'1.0.0':{dependencies:{'bundled-leaf':'1.0.0'},bundleDependencies:['bundled-leaf']}},
@@ -515,7 +526,7 @@ const stable=v=>JSON.stringify(v,(_,value)=>value&&typeof value==='object'&&!Arr
 const results=[];
 try{
 for(const c of cases){
-  if(option('--case','')&&!c.name.includes(option('--case','')))continue;
+  if(!matchesCase(c.name))continue;
   const result={name:c.name,command:c.command,args:c.args};
   for(const tool of ['npm','rnpm']){
     const dir=path.join(root,c.name,tool,'project'),config=path.join(root,'config',c.name,tool);fs.mkdirSync(dir,{recursive:true});write(config,'user.npmrc',c.auth==='basic'?`//127.0.0.1:${server.address().port}/:_auth=${Buffer.from('mock-user:mock-pass').toString('base64')}\n`:c.auth?`//127.0.0.1:${server.address().port}/:_authToken=mock-token\n`:'');write(config,'global.npmrc','');c.setup(dir);
@@ -548,7 +559,7 @@ for(const c of cases){
 }
 }catch(error){results.push({name:'harness-error',match:false,error:String(error.stack||error)});console.error(error);}finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 const git=(...args)=>execFileSync('git',args,{cwd:repo,encoding:'utf8'}).trim();
-const expectedCases=cases.filter(c=>!option('--case','')||c.name.includes(option('--case',''))).length;
+const expectedCases=cases.filter(c=>matchesCase(c.name)).length;
 write(path.dirname(output),path.basename(output),{head:git('rev-parse','HEAD'),binary_revision:option('--binary-revision',null),source_dirty:git('status','--porcelain','--untracked-files=no')!=='',binary_sha256:createHash('sha256').update(fs.readFileSync(binary)).digest('hex'),node:process.version,npm:execFileSync(process.execPath,[npmCli,'--version'],{env:oracleEnv,encoding:'utf8'}).trim(),platform:process.platform,root,expected_cases:expectedCases,normalization:'Fixture/config paths (including JSON escaping), loopback registry origin, CRLF, elapsed summary/ping times, and diagnostic log timestamps. JSON file key order ignored; all fields retained. Full normalized stream hashes retained; streams over 16KB truncated in this report, with complete raw streams in root/logs. Only npm/Node internal JavaScript stack frames removed; error messages and properties retained.',results});
 console.log(`Evidence: ${output}; ${results.filter(r=>r.match).length}/${results.length} match`);
 process.exitCode=results.length>0&&results.length===expectedCases&&results.every(r=>r.match)?0:1;

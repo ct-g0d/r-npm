@@ -837,6 +837,37 @@ fn test_workspace_protocol_edge_cases() {
 }
 
 #[test]
+fn test_workspace_dependencies_follow_root_transitive_resolution() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("parent", "1.0.0", |v| {
+        v.dependencies.insert("dep".into(), "^1.0.0".into());
+    });
+    provider.add_version("dep", "1.0.0", |_| {});
+    provider.add_version("dep", "1.1.0", |_| {});
+    let root: Manifest =
+        serde_json::from_str(r#"{"name":"root","dependencies":{"parent":"1.0.0"}}"#).unwrap();
+    let member = rnpm_core::workspace::WorkspaceMember {
+        name: "a".into(),
+        version: Some("1.0.0".into()),
+        path: "packages/a".into(),
+        relative_path: "packages/a".into(),
+        manifest: serde_json::from_str(
+            r#"{"name":"a","version":"1.0.0","dependencies":{"dep":"1.0.0"}}"#,
+        )
+        .unwrap(),
+    };
+    let graph = crate::workspace::resolve_workspace_graph(
+        &root,
+        &[member],
+        &provider,
+        &ResolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.nodes["node_modules/dep"].version, "1.1.0");
+    assert_eq!(graph.nodes["packages/a/node_modules/dep"].version, "1.0.0");
+}
+
+#[test]
 fn test_workspace_graph_resolution_with_hoisting() {
     use crate::workspace::resolve_workspace_graph;
     use rnpm_core::workspace::WorkspaceMember;

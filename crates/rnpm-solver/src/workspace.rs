@@ -771,6 +771,11 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         );
     }
 
+    // Arborist drains the root's dependency queue before resolveLinks adds
+    // workspace targets. Their depth is zero, but their dependencies must not
+    // claim hoisted slots ahead of the root's transitive dependencies.
+    solver.resolve_tasks()?;
+
     // Enqueue member external dependencies
     for member in members {
         let member_ancestors = std::sync::Arc::new(vec![root_name.clone(), member.name.clone()]);

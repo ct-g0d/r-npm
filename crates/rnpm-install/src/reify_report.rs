@@ -226,15 +226,22 @@ pub fn compute(
 /// Simulates arborist's placement order for a freshly built ideal tree:
 /// nodes are processed by depth then location, each placing its missing
 /// dependencies sorted by name, and a placed node is appended to its
-/// parent's children. Nodes already present in `previous` keep the
-/// lockfile order ahead of newly placed ones.
+/// parent's children. Unchanged nodes keep their lockfile order. Replaced
+/// nodes are detached and appended again when their incoming edge is placed.
 pub fn placement_rank(
     ideal: &BTreeMap<String, LockfilePackage>,
     previous: Option<&BTreeMap<String, LockfilePackage>>,
 ) -> HashMap<String, usize> {
     let mut rank = HashMap::new();
+    let same_package = |old: &LockfilePackage, new: &LockfilePackage| {
+        old.version == new.version && old.resolved == new.resolved && old.integrity == new.integrity
+    };
     if let Some(previous) = previous {
-        for loc in ideal.keys().filter(|l| previous.contains_key(*l)) {
+        for loc in ideal.keys().filter(|l| {
+            previous
+                .get(*l)
+                .is_some_and(|old| same_package(old, &ideal[*l]))
+        }) {
             let next = rank.len();
             rank.insert(loc.clone(), next);
         }
@@ -260,18 +267,56 @@ pub fn placement_rank(
         }
     };
     let depth = |loc: &str| loc.matches("node_modules/").count();
-    let mut queue: Vec<String> = vec![String::new()];
+    // Named updates and audit fixes also queue the old nodes whose outgoing
+    // edges need replacements. They may run before the newly placed parents.
+    let replaced: BTreeSet<&str> = previous
+        .into_iter()
+        .flat_map(|packages| packages.iter())
+        .filter(|(loc, old)| ideal.get(*loc).is_some_and(|new| !same_package(old, new)))
+        .map(|(loc, _)| loc.as_str())
+        .collect();
+    let mut queue: Vec<(String, bool)> = vec![(String::new(), false)];
+    if let Some(previous) = previous {
+        queue.extend(
+            previous
+                .iter()
+                .filter(|(loc, pkg)| {
+                    !loc.is_empty()
+                        && [
+                            &pkg.dependencies,
+                            &pkg.optional_dependencies,
+                            &pkg.peer_dependencies,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|deps| deps.keys())
+                        .any(|name| {
+                            resolve(loc, name)
+                                .is_some_and(|target| replaced.contains(target.as_str()))
+                        })
+                })
+                .map(|(loc, _)| (loc.clone(), true)),
+        );
+    }
     queue.extend(
         ideal
             .keys()
             .filter(|l| !l.is_empty() && split_location(l).is_none())
-            .cloned(),
+            .map(|loc| (loc.clone(), false)),
     );
-    let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
+    let mut seen: BTreeSet<String> = queue
+        .iter()
+        .filter(|(_, old)| !old)
+        .map(|(loc, _)| loc.clone())
+        .collect();
     while !queue.is_empty() {
-        queue.sort_by(|a, b| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
-        let node = queue.remove(0);
-        let Some(pkg) = ideal.get(&node) else {
+        queue.sort_by(|(a, _), (b, _)| depth(a).cmp(&depth(b)).then_with(|| a.cmp(b)));
+        let (node, old) = queue.remove(0);
+        if old && replaced.contains(node.as_str()) && rank.contains_key(&node) {
+            continue;
+        }
+        let packages = if old { previous.unwrap() } else { ideal };
+        let Some(pkg) = packages.get(&node) else {
             continue;
         };
         let mut names: BTreeSet<&String> = BTreeSet::new();
@@ -297,7 +342,7 @@ pub fn placement_rank(
                     rank.insert(loc.clone(), next);
                 }
                 if seen.insert(loc.clone()) {
-                    queue.push(loc);
+                    queue.push((loc, false));
                 }
             }
         }
@@ -454,6 +499,55 @@ mod tests {
             resolved: Some(format!("https://r/{version}.tgz")),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn replaced_chain_nodes_are_appended_in_update_queue_order() {
+        let mut previous = BTreeMap::new();
+        let mut ideal = BTreeMap::new();
+        for (name, child) in [
+            ("", Some("audit-top")),
+            ("audit-top", Some("audit-middle")),
+            ("audit-middle", Some("audit-branch")),
+            ("audit-branch", Some("audit-leaf")),
+            ("audit-leaf", None),
+        ] {
+            let loc = if name.is_empty() {
+                String::new()
+            } else {
+                format!("node_modules/{name}")
+            };
+            let mut old = LockfilePackage {
+                version: Some("1.0.0".into()),
+                dependencies: child.map(|n| BTreeMap::from([(n.into(), "^1.0.0".into())])),
+                ..Default::default()
+            };
+            previous.insert(loc.clone(), old.clone());
+            if !name.is_empty() {
+                old.version = Some("1.1.0".into());
+            }
+            ideal.insert(loc, old);
+        }
+        let rank = placement_rank(&ideal, Some(&previous));
+        let report = compute(
+            &ideal,
+            &BTreeMap::new(),
+            Some(&rank),
+            |_, _| false,
+            |_| true,
+        );
+        let names: Vec<_> = report
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                ReifyChange::Add(entry) => Some(entry.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["audit-middle", "audit-branch", "audit-leaf", "audit-top"]
+        );
     }
 
     #[test]
