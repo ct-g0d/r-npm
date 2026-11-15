@@ -564,14 +564,23 @@ for(const [name,fields,flags=[]] of [
   ['placed-peer',{dependencies:{'eresolve-peer-two':'1.0.0','eresolve-z-peer-one':'1.0.0'}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
 ])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});
-// npm ci links a workspace whose folder is missing, leaving a dangling link.
-add('ci-missing-link-target','ci',['ci','--ignore-scripts'],dir=>{
+// A link target whose folder is missing still carries the linking node's flags.
+add('install-missing-link-target-dev','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{devDependencies:{cfg:'file:packages/cfg'}}));
+// npm ci links a workspace whose folder is missing, leaving a dangling link;
+// with --omit=dev the link follows its dev target and is left out.
+for(const flags of [[],['--omit=dev']])add('ci-missing-link-target'+flags.join(''),'ci',['ci','--ignore-scripts',...flags],dir=>{
   const root={name:'root',version:'1.0.0',workspaces:['packages/*'],devDependencies:{cfg:'file:packages/cfg'}};
   manifest(dir,root);
   write(dir,'package-lock.json',{name:'root',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':root,'node_modules/cfg':{resolved:'packages/cfg',link:true},'packages/cfg':{dev:true}}});
 });
 // A root that depends on itself (file:.) gets a link to the root. The link adds
 // no optional-peer edges of its own, so the root's dev dependency stays dev.
+// A self link that a production package also reaches (through a peer) is
+// not dev, so ci --omit=dev keeps it.
+// A production dependency on another copy of the root's name resolves to its
+// nested copy, not the self link, which stays dev.
+add('ci-omit-dev-self-link-name-nested-elsewhere','ci',['ci','--ignore-scripts','--omit=dev'],dir=>manifest(dir,{name:'shared',dependencies:{'z-prod':'1.0.0'},devDependencies:{shared:'file:.'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+add('ci-omit-dev-self-link-reached-by-prod','ci',['ci','--ignore-scripts','--omit=dev'],dir=>manifest(dir,{name:'b-ws-peer-member',dependencies:{'a-ws-peer-owner':'1.0.0'},devDependencies:{'b-ws-peer-member':'file:.'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 for(const flags of [[],['--package-lock-only']])add(`install-root-self-link-optional-peer${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{name:'b-ws-peer-member',dependencies:{'a-ws-peer-owner':'1.0.0'},devDependencies:{'b-ws-peer-member':'file:.',dep:'^1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}));
 // A bundled link's target has no parent in npm's tree: nothing behind it is inBundle.
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-link-target${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>{

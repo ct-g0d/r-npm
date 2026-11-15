@@ -1498,7 +1498,17 @@ fn reify_report_for(
         &ideal.packages,
         actual,
         ideal_rank,
-        |_, p| {
+        |key, p| {
+            if lockfile_entry_omitted(options, ideal, key, p) {
+                return true;
+            }
+            // A link is omitted with its target.
+            let p = match p.resolved.as_deref() {
+                Some(target) if p.link == Some(true) && !target.is_empty() => {
+                    ideal.packages.get(target).unwrap_or(p)
+                }
+                _ => p,
+            };
             let dev = p.dev == Some(true);
             let optional = p.optional == Some(true);
             let dev_optional = p.dev_optional == Some(true);
@@ -1519,6 +1529,38 @@ fn reify_report_for(
     )
 }
 
+/// The hidden lockfile describes the tree on disk: omitted packages are not
+/// part of it.
+fn without_omitted(options: &InstallOptions, lockfile: &LockfileV3) -> LockfileV3 {
+    let mut kept = lockfile.clone();
+    kept.packages.retain(|key, info| {
+        key.is_empty() || !lockfile_entry_omitted(options, lockfile, key, info)
+    });
+    kept
+}
+
+/// The lockfile location `name` resolves to from `from`, walking up the
+/// node_modules scopes as Node#resolve does.
+fn lockfile_resolves_to<'l>(lockfile: &'l LockfileV3, from: &str, name: &str) -> Option<&'l str> {
+    let mut scope = from;
+    loop {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{name}")
+        } else {
+            format!("{scope}/node_modules/{name}")
+        };
+        if let Some((location, _)) = lockfile.packages.get_key_value(&candidate) {
+            return Some(location.as_str());
+        }
+        if scope.is_empty() {
+            return None;
+        }
+        scope = scope
+            .rsplit_once("/node_modules/")
+            .map_or("", |(parent, _)| parent);
+    }
+}
+
 /// Node.shouldOmit from arborist, over lockfile flags.
 fn lockfile_entry_omitted(
     options: &InstallOptions,
@@ -1526,19 +1568,35 @@ fn lockfile_entry_omitted(
     key: &str,
     info: &LockfilePackage,
 ) -> bool {
+    // A link entry carries no flags: a link and its target are one node to
+    // calc-dep-flags, so the target's entry decides.
+    let info = match info.resolved.as_deref() {
+        Some(target) if info.link == Some(true) && !target.is_empty() => {
+            lockfile.packages.get(target).unwrap_or(info)
+        }
+        _ => info,
+    };
     let dev_optional = info.dev_optional.unwrap_or(false);
-    // A package's link to itself (`"name": "."`) targets the root, so the
-    // lockfile has no flags for it; npm derives them from the root's edge.
+    // A package's link to itself (`"name": "."`) targets the root, which has
+    // no flags; npm derives them from the edges reaching the link. It is dev
+    // only when the root's devDependency is the only way in.
     let self_link_dev = info.link == Some(true)
         && info.resolved.as_deref() == Some("")
         && key.strip_prefix("node_modules/").is_some_and(|name| {
+            let has = |deps: &Option<BTreeMap<String, String>>| {
+                deps.as_ref().is_some_and(|d| d.contains_key(name))
+            };
             lockfile.packages.get("").is_some_and(|root| {
-                let has = |deps: &Option<BTreeMap<String, String>>| {
-                    deps.as_ref().is_some_and(|d| d.contains_key(name))
-                };
                 has(&root.dev_dependencies)
                     && !has(&root.dependencies)
                     && !has(&root.optional_dependencies)
+            }) && !lockfile.packages.iter().any(|(location, entry)| {
+                !location.is_empty()
+                    && entry.dev != Some(true)
+                    && (has(&entry.dependencies)
+                        || has(&entry.optional_dependencies)
+                        || has(&entry.peer_dependencies))
+                    && lockfile_resolves_to(lockfile, location, name) == Some(key)
             })
         });
     let is_dev = info.dev.unwrap_or(false) || self_link_dev;
@@ -1613,9 +1671,18 @@ fn directory_target_entry(
     node: &rnpm_solver::graph::Node,
 ) -> LockfilePackage {
     let folder = location.rsplit('/').next().unwrap_or(location);
+    // The target carries the flags of the node that links to it, even when
+    // its folder (and so its package.json) is missing.
+    let flags = LockfilePackage {
+        dev: node.flags.dev.then_some(true),
+        optional: node.flags.optional.then_some(true),
+        dev_optional: (node.flags.dev_optional && !node.flags.dev && !node.flags.optional)
+            .then_some(true),
+        ..Default::default()
+    };
     let manifest = Manifest::from_file(dir.join("package.json")).ok();
     if manifest.is_none() {
-        return LockfilePackage::default();
+        return flags;
     }
     let has_install_script = manifest.as_ref().is_some_and(|m| {
         ["preinstall", "install", "postinstall"]
@@ -1627,12 +1694,7 @@ fn directory_target_entry(
         version: Some(node.version.clone()),
         has_install_script: has_install_script.then_some(true),
         dependencies: (!node.dependencies.is_empty()).then(|| node.dependencies.clone()),
-        // The target carries the flags of the node that links to it.
-        dev: node.flags.dev.then_some(true),
-        optional: node.flags.optional.then_some(true),
-        dev_optional: (node.flags.dev_optional && !node.flags.dev && !node.flags.optional)
-            .then_some(true),
-        ..Default::default()
+        ..flags
     }
 }
 
@@ -4993,7 +5055,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let target_rel = pkg_info.resolved.as_ref().ok_or_else(|| {
                     anyhow!("Workspace link {pkg_key} missing resolved target in lockfile")
                 })?;
-                let target_dir = self.options.project_dir.join(target_rel);
+                // A self link's target is the root itself; joining "" would
+                // leave a trailing separator in the junction.
+                let target_dir = if target_rel.is_empty() {
+                    self.options.project_dir.clone()
+                } else {
+                    self.options.project_dir.join(target_rel)
+                };
                 let link_path = self.options.project_dir.join(pkg_key);
                 if let Some(parent) = link_path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -6025,7 +6093,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         collector.record_phase(Phase::Bins, t_bins.elapsed());
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
-                            let _ = lockfile_ref.save_hidden(project_dir_ref);
+                            let _ = without_omitted(&self.options, lockfile_ref)
+                                .save_hidden(project_dir_ref);
                             collector.record_phase(Phase::Lockfile, t_lock.elapsed());
                         }
                     }
@@ -6512,6 +6581,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && has_packages
         {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
+            lockfile = without_omitted(&self.options, &lockfile);
             lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
                 .save_hidden(&self.options.project_dir)
