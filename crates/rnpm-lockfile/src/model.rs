@@ -3,6 +3,7 @@ use rnpm_core::manifest::BundledDependencies;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
+use rnpm_core::PlatformList;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -33,31 +34,8 @@ fn is_none_or_empty_engines(v: &Option<PackageEngines>) -> bool {
     v.as_ref().map(|e| e.is_empty()).unwrap_or(true)
 }
 
-/// Helper function to omit empty vectors or None during serialization.
-/// npm copies `os`/`cpu`/`libc` from the manifest as written, so a lockfile
-/// may hold a single string (`"libc": "glibc"`) as well as a list.
-fn string_or_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(vec![s])),
-        Some(serde_json::Value::Array(items)) => items
-            .into_iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| D::Error::custom("expected a string"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Some(_) => Err(D::Error::custom("expected a string or an array of strings")),
-    }
-}
-
-fn is_none_or_empty_vec<T>(v: &Option<Vec<T>>) -> bool {
+/// npm copies platform constraints in their original string or array form.
+fn is_none_or_empty_platform(v: &Option<PlatformList>) -> bool {
     v.as_ref().map(|l| l.is_empty()).unwrap_or(true)
 }
 
@@ -370,26 +348,14 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub license: Option<String>,
 
-    #[serde(
-        skip_serializing_if = "is_none_or_empty_vec",
-        default,
-        deserialize_with = "string_or_list"
-    )]
-    pub os: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    pub os: Option<PlatformList>,
 
-    #[serde(
-        skip_serializing_if = "is_none_or_empty_vec",
-        default,
-        deserialize_with = "string_or_list"
-    )]
-    pub cpu: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    pub cpu: Option<PlatformList>,
 
-    #[serde(
-        skip_serializing_if = "is_none_or_empty_vec",
-        default,
-        deserialize_with = "string_or_list"
-    )]
-    pub libc: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    pub libc: Option<PlatformList>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
     pub dependencies: Option<BTreeMap<String, String>>,
@@ -2115,8 +2081,12 @@ mod platform_field_tests {
             r#"{"version":"1.0.0","os":"linux","cpu":["arm"],"libc":"glibc"}"#,
         )
         .unwrap();
-        assert_eq!(pkg.libc, Some(vec!["glibc".to_string()]));
-        assert_eq!(pkg.os, Some(vec!["linux".to_string()]));
-        assert_eq!(pkg.cpu, Some(vec!["arm".to_string()]));
+        assert_eq!(pkg.libc.as_deref(), Some(&["glibc".to_string()][..]));
+        assert_eq!(pkg.os.as_deref(), Some(&["linux".to_string()][..]));
+        assert_eq!(pkg.cpu.as_deref(), Some(&["arm".to_string()][..]));
+        let json = serde_json::to_value(&pkg).unwrap();
+        assert_eq!(json["libc"], "glibc");
+        assert_eq!(json["os"], "linux");
+        assert_eq!(json["cpu"], serde_json::json!(["arm"]));
     }
 }

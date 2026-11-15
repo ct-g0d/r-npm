@@ -90,7 +90,7 @@ const server=http.createServer((req,res)=>{
   if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
   if(probePackages.has(name)){
     const metadata=probePackages.get(name);
-    if(name==='metadata-probe'&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,...abbreviated}=m;return [v,abbreviated];}))});
+    if(['metadata-probe','platform-full'].includes(name)&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,libc,...abbreviated}=m;return [v,abbreviated];}))});
     return json(metadata);
   }
   if(['dep','parent','changing'].includes(name)){
@@ -409,6 +409,7 @@ for(const flags of [[],['--json']])add(`cli-audit-multiple-severities${flags.joi
 for(const flags of [[],['--json']])add(`cli-audit-authenticated${flags.join('')}`,'audit',['audit',...flags],auditTree,{auth:true,advisoryAuth:true,advisories:{'audit-leaf':[{id:105,name:'audit-leaf',url:'https://example.invalid/advisory/105',title:'Authenticated advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 add('cli-query-workspace-with-file-link','query',['query','.workspace'],dir=>{cliWorkspaceTree(dir);edit(dir,p=>{p.dependencies={local:'file:./local'};});manifest(path.join(dir,'local'),{name:'local'});fs.symlinkSync(path.join(dir,'local'),path.join(dir,'node_modules/local'),'junction');});
 // Small registry graphs isolate Arborist's placement order from network state.
+const hostLibc=process.platform==='linux'&&!process.report.getReport().header.glibcVersionRuntime?'musl':'glibc';
 for(const [name,versions] of Object.entries({
   branch:{'1.0.0':{dependencies:{'alpha-parent':'1.0.0',shared:'2.0.0'}}},
   'alpha-parent':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
@@ -425,6 +426,9 @@ for(const [name,versions] of Object.entries({
   'virtual-peer-parent':{'1.0.0':{dependencies:{'virtual-peer-required':'1.0.0'},devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=2.0.0'}}},
   'virtual-peer-required':{'1.0.0':{devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=1.0.0'}}},
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding',workspaces:['packages/*']}},
+  'platform-scalar':{'1.0.0':{os:process.platform,cpu:process.arch,libc:hostLibc}},
+  'platform-array':{'1.0.0':{os:[process.platform],cpu:[process.arch],libc:[hostLibc]}},
+  'platform-full':{'1.0.0':{license:'MIT',libc:hostLibc}},
   'fresh-packument':{'1.0.0':{}},
   'historic-metadata':{'1.0.0':{deprecated:false,license:{type:'MIT'},bundleDependencies:[],bundledDependencies:[],scripts:{postinstall:'node -p 123'}}},
   'bundle-owner':{'1.0.0':{dependencies:{'bundled-leaf':'1.0.0'},bundleDependencies:['bundled-leaf']}},
@@ -469,6 +473,10 @@ add('resolver-peer-set-uses-parent-advisory','install',['install','--ignore-scri
 add('resolver-peer-set-waits-for-sibling-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'1.0.0','z-peer-source':'1.0.0'}}));
 add('install-preserves-legacy-engines-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'legacy-engines':'1.0.0'}}));
 add('install-full-packument-metadata-lock-only','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}}));
+// Native bindings remain in the lockfile on hosts with no matching libc.
+const platformForms=dir=>manifest(dir,{optionalDependencies:{'platform-scalar':'1.0.0','platform-array':'1.0.0','platform-full':'1.0.0'}});
+for(const flags of [[],['--package-lock-only']])add(`install-platform-forms${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],platformForms);
+add('ci-platform-forms','ci',['ci','--ignore-scripts'],platformForms,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
 add('ci-bundled-lock-entries','ci',['ci','--ignore-scripts'],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});

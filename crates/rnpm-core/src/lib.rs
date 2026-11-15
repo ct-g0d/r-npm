@@ -9,6 +9,7 @@ pub mod integrity;
 pub mod manifest;
 pub mod ordered_json;
 pub mod pkg;
+pub mod platform_list;
 pub mod semver;
 pub mod spec;
 pub mod workspace;
@@ -24,6 +25,7 @@ pub use pkg::{
     coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_get_value,
     pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
 };
+pub use platform_list::PlatformList;
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};
 pub use spec::{PackageSpec, PackageTarget};
 pub use workspace::{

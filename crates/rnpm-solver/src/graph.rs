@@ -1,3 +1,4 @@
+use rnpm_core::PlatformList;
 use rnpm_lockfile::{LockfilePackage, LockfileV3, PackageBin};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -85,11 +86,11 @@ pub struct Node {
     /// Declared optional dependencies.
     pub optional_dependencies: BTreeMap<String, String>,
     /// Platform OS constraints.
-    pub os: Option<Vec<String>>,
+    pub os: Option<PlatformList>,
     /// Platform CPU architecture constraints.
-    pub cpu: Option<Vec<String>>,
+    pub cpu: Option<PlatformList>,
     /// Platform libc constraints.
-    pub libc: Option<Vec<String>>,
+    pub libc: Option<PlatformList>,
     /// Executable binaries.
     pub bin: Option<PackageBin>,
     /// Package license copied into lockfile metadata.
@@ -684,7 +685,7 @@ impl DependencyGraph {
                     .or_else(|| {
                         node.extra.get("libc").and_then(|v| {
                             if let Some(s) = v.as_str() {
-                                Some(vec![s.to_string()])
+                                Some(PlatformList::from(s.to_string()))
                             } else if let Some(arr) = v.as_array() {
                                 let list: Vec<String> = arr
                                     .iter()
@@ -693,7 +694,7 @@ impl DependencyGraph {
                                 if list.is_empty() {
                                     None
                                 } else {
-                                    Some(list)
+                                    Some(list.into())
                                 }
                             } else {
                                 None

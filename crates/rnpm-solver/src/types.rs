@@ -1,6 +1,7 @@
 use crate::error::SolverError;
 use rnpm_core::manifest::PeerDependencyMeta;
 use rnpm_core::semver::Version;
+use rnpm_core::PlatformList;
 use rnpm_lockfile::PackageBin;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,11 +26,11 @@ pub struct PackageVersionMetadata {
     #[serde(default)]
     pub optional_dependencies: BTreeMap<String, String>,
     #[serde(default)]
-    pub os: Option<Vec<String>>,
+    pub os: Option<PlatformList>,
     #[serde(default)]
-    pub cpu: Option<Vec<String>>,
+    pub cpu: Option<PlatformList>,
     #[serde(default)]
-    pub libc: Option<Vec<String>>,
+    pub libc: Option<PlatformList>,
     #[serde(default)]
     pub bin: Option<PackageBin>,
     #[serde(default)]

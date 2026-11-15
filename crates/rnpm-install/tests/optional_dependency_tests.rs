@@ -944,8 +944,8 @@ async fn test_ci_optional_platform_skipping_and_isolation() {
             resolved: Some("http://invalid-url-should-never-be-called.local/other.tgz".to_string()),
             integrity: Some("sha512-dummy".to_string()),
             optional: Some(true),
-            os: Some(vec!["non_existent_os_xyz".to_string()]),
-            cpu: Some(vec!["non_existent_cpu_xyz".to_string()]),
+            os: Some(vec!["non_existent_os_xyz".to_string()].into()),
+            cpu: Some(vec!["non_existent_cpu_xyz".to_string()].into()),
             dependencies: Some(skipped_child_deps),
             ..Default::default()
         },
@@ -1264,8 +1264,8 @@ async fn test_ci_optional_wasm32_package_and_transitive_deps_skipped_on_win32_x6
             version: Some("0.33.5".to_string()),
             resolved: Some(format!("{}/sharp-win32-x64-0.33.5.tgz", reg_url)),
             integrity: Some(win64_integrity),
-            os: Some(vec!["win32".to_string()]),
-            cpu: Some(vec!["x64".to_string()]),
+            os: Some(vec!["win32".to_string()].into()),
+            cpu: Some(vec!["x64".to_string()].into()),
             optional: Some(true),
             ..Default::default()
         },
@@ -1280,7 +1280,7 @@ async fn test_ci_optional_wasm32_package_and_transitive_deps_skipped_on_win32_x6
             version: Some("0.33.5".to_string()),
             resolved: Some(format!("{}/sharp-wasm32-0.33.5.tgz", reg_url)),
             integrity: Some(wasm_integrity),
-            cpu: Some(vec!["wasm32".to_string()]),
+            cpu: Some(vec!["wasm32".to_string()].into()),
             optional: Some(true),
             dependencies: Some(wasm_deps),
             ..Default::default()
