@@ -27,8 +27,8 @@ pub use graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags
 pub use overrides::Overrides;
 pub use platform::{is_platform_compatible, Platform};
 pub use solver::{
-    resolve_dependency_graph, resolve_dependency_graph_with_lockfile, resolve_fast_path,
-    ResolverOptions, Solver,
+    arborist_compare, resolve_dependency_graph, resolve_dependency_graph_with_lockfile,
+    resolve_fast_path, ResolverOptions, Solver,
 };
 pub use types::{
     InMemoryPackageProvider, PackageMetadata, PackageMetadataProvider, PackageVersionMetadata,

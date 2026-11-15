@@ -1759,6 +1759,8 @@ pub struct Installer {
     source_policy: policy::SourcePolicy,
     script_policy: policy::ScriptPolicy,
     engine_strict: bool,
+    /// The ideal lockfile a --dry-run install planned but did not write.
+    dry_run_ideal: Option<LockfileV3>,
 }
 
 impl Installer {
@@ -1916,6 +1918,7 @@ impl Installer {
             source_policy,
             script_policy,
             engine_strict: config.get_bool("engine-strict").unwrap_or(false),
+            dry_run_ideal: None,
         })
     }
 
@@ -2073,6 +2076,11 @@ impl Installer {
     }
 
     /// Access the underlying registry client.
+    /// The ideal lockfile planned by the last --dry-run install, if any.
+    pub fn dry_run_ideal(&self) -> Option<&LockfileV3> {
+        self.dry_run_ideal.as_ref()
+    }
+
     pub fn registry_client(&self) -> &RegistryClient {
         &self.registry_client
     }
@@ -2928,6 +2936,7 @@ impl Installer {
 
         // 3b. For --dry-run, simulate installation and report what would be installed
         if self.options.dry_run {
+            self.dry_run_ideal = Some(lockfile.clone());
             let mut packages_installed = 0;
             for (loc, node) in &graph.nodes {
                 if reify_locations
