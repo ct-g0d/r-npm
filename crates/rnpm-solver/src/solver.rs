@@ -1203,6 +1203,28 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
         if replace_transitive_root_peer {
+            let existing = &self.graph.nodes[&root_slot];
+            let pinned_by_peer = self.graph.edges.iter().any(|edge| {
+                edge.to_location == root_slot
+                    && matches!(
+                        edge.dep_type,
+                        DependencyType::Peer | DependencyType::PeerOptional
+                    )
+                    && PackageTarget::parse(&edge.spec).is_ok_and(|target| {
+                        crate::hoisting::node_satisfies_target(existing, &target)
+                    })
+            });
+            if pinned_by_peer && self.peer_conflict_is_fatal(task.is_mine) {
+                return Err(SolverError::peer_conflict(
+                    &task.parent_package_name,
+                    &dep_spec.package_name,
+                    &effective_spec,
+                    Some(existing.version.clone()),
+                    Some(existing.location.clone()),
+                    (*task.ancestors).clone(),
+                    "Cannot move a peer provider beneath its consumer".to_string(),
+                ));
+            }
             if !self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name) {
                 return Ok(());
             }
@@ -1617,6 +1639,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             })
             .collect();
         if compatible_edges.is_empty() {
+            return false;
+        }
+        if compatible_edges.iter().any(|edge| {
+            matches!(
+                edge.dep_type,
+                DependencyType::Peer | DependencyType::PeerOptional
+            )
+        }) {
             return false;
         }
         let parent = compatible_edges[0].from_location.clone();

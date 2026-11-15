@@ -131,8 +131,16 @@ including provider children and --no-save (`target/npm-late-peer-final.json`).
 The fresh real-project results are retained in `target/corpus-late-peer`.
 Both pacote and cacache lockfiles now match npm exactly. Their remaining
 36 and 154 fresh-install differences concern the installed tree, including
-a TypeScript native package and nested command shims. The other corpus
-phases remain under verification.
+a TypeScript native package and nested command shims. Both projects match
+ci and ci-omit-dev. The complete pre-review binary matched 498/500 cases,
+with only the two audit dry-run differences (`target/npm-late-peer-full.json`).
+
+Review also identified a required-peer constraint: a provider cannot be
+moved beneath its peer consumer. Preserve compatible incoming peer edges
+and return a peer conflict when the project cannot place both providers.
+The regression covers the error exit and absence of installation mutations.
+It also exposed unconditional fatal-error output under --silent; suppress
+the terminal diagnostic and log-path notice while retaining the debug log.
 
 ## Native-project baseline
 
