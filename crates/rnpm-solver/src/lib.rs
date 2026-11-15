@@ -9,6 +9,7 @@
 
 pub mod aliases;
 pub mod error;
+pub mod explain;
 pub mod graph;
 pub mod hoisting;
 pub mod overrides;

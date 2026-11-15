@@ -7356,6 +7356,18 @@ fn write_error_log(err: &anyhow::Error) {
             .open(&log)
         {
             Ok(mut file) => {
+                // npm.js #getError: extra report files sit beside the debug
+                // log and are announced before it.
+                if let Some(report) = diagnostics::eresolve_report(err) {
+                    let path = log_dir.join(format!("{timestamp}-eresolve-report.txt"));
+                    let body = format!("'Log files:\n{}\n\n{}\n", log.display(), report.trim());
+                    if std::fs::write(&path, body).is_ok() && !silent {
+                        eprintln!(
+                            "npm error\nnpm error\nnpm error For a full report see:\nnpm error {}",
+                            path.display()
+                        );
+                    }
+                }
                 if writeln!(file, "0 verbose cwd {}\n1 error {err:#}", cwd.display()).is_ok()
                     && !silent
                 {

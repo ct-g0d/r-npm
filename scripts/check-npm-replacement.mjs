@@ -428,6 +428,9 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
+  'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
+  'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'a-ws-trigger':{'1.0.0':{dependencies:{dep:'^1.0.0'}}},
   'b-ws-early':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   'z-ws-late':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
@@ -551,6 +554,16 @@ add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
   manifest(path.join(dir,'packages/a'),{name:'a',version:'1.0.0',dependencies:{b:'^1.0.0'}});
   manifest(path.join(dir,'packages/b'),{name:'b',version:'1.0.0',dependencies:{a:'^1.0.0'}});
 });
+// The full report npm writes beside the debug log, with its paths normalized.
+const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs');const files=fs.existsSync(logs)?fs.readdirSync(logs).filter(f=>f.endsWith('-eresolve-report.txt')):[];return files.map(f=>fs.readFileSync(path.join(logs,f),'utf8').replaceAll(logs,'<logs>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-/g,'<timestamp>-'));};
+// npm's ERESOLVE explanation: a root-held node, a peer set placed beside
+// another package's peer, and an optional peer the root pins.
+for(const [name,fields,flags=[]] of [
+  ['root-holds',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}],
+  ['root-holds-strict',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}},['--strict-peer-deps']],
+  ['placed-peer',{dependencies:{'eresolve-peer-two':'1.0.0','eresolve-z-peer-one':'1.0.0'}}],
+  ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
+])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});
 // npm ci links a workspace whose folder is missing, leaving a dangling link.
 add('ci-missing-link-target','ci',['ci','--ignore-scripts'],dir=>{
   const root={name:'root',version:'1.0.0',workspaces:['packages/*'],devDependencies:{cfg:'file:packages/cfg'}};
@@ -631,7 +644,7 @@ add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:asy
 // Only stack frames inside npm's JavaScript dependencies or Node internals differ
 // by runtime. Preserve the inspected error properties, including its brace.
 const normalizeJsFrames=str=>str.replace(/^npm error {5}at .*?(?:node:|[\\/]node_modules[\\/]npm[\\/]node_modules[\\/]).*\r?\n/gm,line=>line.trimEnd().endsWith('{')?'npm error {\n':'');
-const normalize=(str,dir,config)=>normalizeJsFrames(str).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
+const normalize=(str,dir,config)=>normalizeJsFrames(str).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
 function snapshot(dir,config){
   if(!fs.existsSync(dir))return {};
   const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){
