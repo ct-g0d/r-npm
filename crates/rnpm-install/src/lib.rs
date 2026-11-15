@@ -4101,7 +4101,7 @@ impl Installer {
 
         // Link all package bins across the tree in shallowest-first order with first-writer-wins
         // per .bin directory in this run, overwriting shims and cleaning up stale ones.
-        let tree_packages: Vec<String> = graph
+        let mut tree_packages: Vec<String> = graph
             .nodes
             .keys()
             .filter(|loc| {
@@ -4149,6 +4149,30 @@ impl Installer {
                 if !entries.is_empty() {
                     known_bins.insert(loc.clone(), entries);
                 }
+            }
+        }
+        // Bundled children are discovered from their owner's tarball after
+        // solving. Their bins belong to the physical tree too.
+        for (loc, package) in &lockfile.packages {
+            if package.in_bundle != Some(true)
+                || (self.options.omit_dev && package.dev == Some(true))
+                || (self.options.omit_optional && package.optional == Some(true))
+                || (self.options.omit_peer && package.peer == Some(true))
+            {
+                continue;
+            }
+            let Some(bin) = &package.bin else { continue };
+            if !loc_base_dir.join(loc).is_dir() {
+                continue;
+            }
+            let name = package.name.as_deref().unwrap_or_else(|| {
+                loc.rsplit_once("/node_modules/")
+                    .map_or(loc.as_str(), |(_, name)| name)
+            });
+            let entries = extract_bin_entries_from_lockfile(name, bin);
+            if !entries.is_empty() {
+                tree_packages.push(loc.clone());
+                known_bins.insert(loc.clone(), entries);
             }
         }
         for member in &workspace_members {
@@ -5814,40 +5838,11 @@ impl Installer {
                         let bin_dir_ref = &bin_dir;
                         let nm_dir_ref = &node_modules_dir;
 
-                        // Overlap materialize tail with bin link phase
-                        let (bin_time, mat_res) = std::thread::scope(|s| {
-                            let bin_handle = s.spawn(|| {
-                                let t_start = std::time::Instant::now();
-                                link_tree_bins(
-                                    ci_tree_packages,
-                                    Some(&known_bins),
-                                    loc_base_ref,
-                                    bin_dir_ref,
-                                    nm_dir_ref,
-                                    true,
-                                    None,
-                                );
-                                t_start.elapsed()
-                            });
-
-                            let mat_res = rnpm_fs::materialize_files_parallel_refs(
-                                all_file_refs,
-                                &ci_writer_cfg,
-                            );
-                            let bin_time = bin_handle.join().unwrap_or_default();
-
-                            (bin_time, mat_res)
-                        });
-
-                        mat_res.map_err(|e| anyhow!("{e}"))?;
+                        // Bin shims read script headers, so complete the files
+                        // and symlinks before selecting their interpreter.
+                        rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
+                            .map_err(|e| anyhow!("{e}"))?;
                         collector.record_phase(Phase::Materialize, t_mat.elapsed());
-                        collector.record_phase(Phase::Bins, bin_time);
-
-                        if save_hidden_needed {
-                            let t_lock = std::time::Instant::now();
-                            let _ = lockfile_ref.save_hidden(project_dir_ref);
-                            collector.record_phase(Phase::Lockfile, t_lock.elapsed());
-                        }
 
                         // 3. Recreate symlinks (directories via junctions, files via symlink or copy)
                         for (link_path, target_path) in all_symlinks {
@@ -5860,6 +5855,22 @@ impl Installer {
                                     )
                                 },
                             )?;
+                        }
+                        let t_bins = std::time::Instant::now();
+                        link_tree_bins(
+                            ci_tree_packages,
+                            Some(&known_bins),
+                            loc_base_ref,
+                            bin_dir_ref,
+                            nm_dir_ref,
+                            true,
+                            None,
+                        );
+                        collector.record_phase(Phase::Bins, t_bins.elapsed());
+                        if save_hidden_needed {
+                            let t_lock = std::time::Instant::now();
+                            let _ = lockfile_ref.save_hidden(project_dir_ref);
+                            collector.record_phase(Phase::Lockfile, t_lock.elapsed());
                         }
                     }
 

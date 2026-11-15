@@ -1221,6 +1221,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     "Deduplicated '{}': reusing existing node at '{}'",
                     dep_spec.install_name, existing_loc
                 );
+                if let Some(existing) = self.graph.nodes.get_mut(&existing_loc) {
+                    existing.flags.platform_skipped = Some(platform_skipped);
+                }
                 if parent_skipped {
                     if let Some(existing) = self.graph.nodes.get_mut(&existing_loc) {
                         existing.flags.skipped = true;
@@ -1288,6 +1291,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     bundled: is_bundled,
                     has_install_script: chosen_version.has_install_script,
                     skipped: platform_skipped || parent_skipped,
+                    platform_skipped: Some(platform_skipped),
                     link: false,
                 };
 
