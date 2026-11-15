@@ -834,6 +834,10 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         }
     }
 
+    // Link targets are deferred unless an earlier placement invalidates an
+    // edge from a workspace, in which case Arborist queues it immediately.
+    solver.defer_workspace_tasks();
+
     // Process external dependency queue
     solver.resolve_tasks()?;
 

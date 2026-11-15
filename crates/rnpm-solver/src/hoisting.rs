@@ -225,6 +225,8 @@ pub fn determine_placement(
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
         None,
+        None,
+        None,
         true,
     )
 }
@@ -245,32 +247,49 @@ pub fn determine_placement_with_peers(
         rnpm_core::manifest::PeerDependencyMeta,
     >,
     resolved_version: Option<&str>,
+    resolved: Option<&str>,
+    integrity: Option<&str>,
     placing_peer: bool,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
     root_target.push_str(install_name);
 
+    let reuse_peer_set = |existing: &crate::graph::Node, location: &str| {
+        // CanPlaceDep checks dep.matches(current) before checking candidate
+        // peers. A matching installed node keeps its attached peer context;
+        // the incoming candidate's virtual overrides must not force a copy.
+        let same_package = if let (Some(a), Some(b)) = (integrity, existing.integrity.as_deref()) {
+            a == b
+        } else if let (Some(a), Some(b)) = (resolved, existing.resolved.as_deref()) {
+            a == b
+        } else {
+            resolved_version == Some(existing.version.as_str())
+        };
+        same_package
+            || ((placing_peer
+                || !target_peer_conflicts(
+                    graph,
+                    location,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                ))
+                && !candidate_has_incompatible_peer(
+                    graph,
+                    location,
+                    parent_location,
+                    dependencies,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                ))
+    };
+
     // If parent is root (""), location is directly under root
     if parent_location.is_empty() {
         if let Some(existing) = graph.nodes.get(&root_target) {
             if existing.name == package_name
                 && node_satisfies_target(existing, target)
-                && (placing_peer
-                    || !target_peer_conflicts(
-                        graph,
-                        &root_target,
-                        peer_dependencies,
-                        peer_dependencies_meta,
-                    ))
-                && !candidate_has_incompatible_peer(
-                    graph,
-                    &root_target,
-                    parent_location,
-                    dependencies,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                )
+                && reuse_peer_set(existing, &root_target)
             {
                 return PlacementDecision::Reuse(root_target);
             }
@@ -282,21 +301,7 @@ pub fn determine_placement_with_peers(
     if let Some(existing) = graph.nodes.get(&root_target) {
         if existing.name == package_name
             && node_satisfies_target(existing, target)
-            && (placing_peer
-                || !target_peer_conflicts(
-                    graph,
-                    &root_target,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                ))
-            && !candidate_has_incompatible_peer(
-                graph,
-                &root_target,
-                parent_location,
-                dependencies,
-                peer_dependencies,
-                peer_dependencies_meta,
-            )
+            && reuse_peer_set(existing, &root_target)
         {
             // Check if there is an intermediate shadowing conflict between parent and root
             if !is_shadowed_by_incompatible_between(
@@ -352,21 +357,7 @@ pub fn determine_placement_with_peers(
         if let Some(existing) = graph.nodes.get(&candidate) {
             if existing.name == package_name
                 && node_satisfies_target(existing, target)
-                && (placing_peer
-                    || !target_peer_conflicts(
-                        graph,
-                        &candidate,
-                        peer_dependencies,
-                        peer_dependencies_meta,
-                    ))
-                && !candidate_has_incompatible_peer(
-                    graph,
-                    &candidate,
-                    parent_location,
-                    dependencies,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                )
+                && reuse_peer_set(existing, &candidate)
                 && !is_shadowed_by_incompatible_between(
                     graph,
                     parent_location,

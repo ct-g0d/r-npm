@@ -81,6 +81,9 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     peer_ctx: PeerContext,
     graph: DependencyGraph,
     queue: VecDeque<ResolveTask>,
+    /// Link targets normally wait for resolveLinks, but an invalidated edge
+    /// can put a workspace into the node queue before that pass.
+    deferred_workspaces: BTreeMap<String, Vec<ResolveTask>>,
     /// Root edges already resolved early for a peer set.
     preplaced: std::collections::HashSet<String>,
 }
@@ -136,6 +139,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             peer_ctx: PeerContext::new(),
             graph,
             queue: VecDeque::new(),
+            deferred_workspaces: BTreeMap::new(),
             preplaced: std::collections::HashSet::new(),
         }
     }
@@ -204,6 +208,77 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.queue.insert(pos, task);
     }
 
+    /// Hold workspace targets for Arborist's resolveLinks pass. A newly
+    /// placed provider may activate one earlier by invalidating its edge.
+    pub fn defer_workspace_tasks(&mut self) {
+        let mut root_tasks = VecDeque::new();
+        for task in std::mem::take(&mut self.queue) {
+            if !task.parent_location.is_empty() && !task.parent_location.contains("node_modules") {
+                self.deferred_workspaces
+                    .entry(task.parent_location.clone())
+                    .or_default()
+                    .push(task);
+            } else {
+                root_tasks.push_back(task);
+            }
+        }
+        self.queue = root_tasks;
+    }
+
+    fn activate_invalidated_workspaces(&mut self, provider_location: &str) {
+        let provider = &self.graph.nodes[provider_location];
+        let mut scope_buffer = String::new();
+        let locations: Vec<_> = self
+            .deferred_workspaces
+            .iter()
+            .filter(|(location, tasks)| {
+                tasks
+                    .iter()
+                    .filter(|task| task.install_name == provider.install_name)
+                    .any(|task| {
+                        let visible = DependencyGraph::find_in_scope_hierarchy(
+                            &self.graph.nodes,
+                            location,
+                            &task.install_name,
+                            &mut scope_buffer,
+                        );
+                        let overridden = if self.overrides.rules.is_empty() {
+                            None
+                        } else {
+                            let caller = self.graph.nodes[*location].all_dependency_specs();
+                            self.overrides
+                                .resolve_override_with_caller(
+                                    &task.install_name,
+                                    &task.raw_spec,
+                                    &task.ancestors,
+                                    Some(&caller),
+                                )
+                                .ok()
+                                .flatten()
+                        };
+                        visible == Some(provider_location)
+                            && DependencySpec::parse(
+                                &task.install_name,
+                                overridden.as_deref().unwrap_or(&task.raw_spec),
+                            )
+                            .is_ok_and(|spec| {
+                                provider.name != spec.package_name
+                                    || !crate::hoisting::node_satisfies_target(
+                                        provider,
+                                        &spec.target,
+                                    )
+                            })
+                    })
+            })
+            .map(|(location, _)| location.clone())
+            .collect();
+        for location in locations {
+            for task in self.deferred_workspaces.remove(&location).unwrap() {
+                self.push_task(task);
+            }
+        }
+    }
+
     /// arborist conflictOK: a peer conflict is fatal only for a package placed
     /// directly in the project (under the root or a workspace), or with
     /// --strict-peer-deps; deeper conflicts are overridden with a warning.
@@ -219,7 +294,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
     /// Processes all queued dependency resolution tasks until completion.
     pub fn resolve_tasks(&mut self) -> Result<(), SolverError> {
-        while let Some(task) = self.queue.pop_front() {
+        loop {
+            if self.queue.is_empty() {
+                if self.deferred_workspaces.is_empty() {
+                    break;
+                }
+                for tasks in std::mem::take(&mut self.deferred_workspaces).into_values() {
+                    for task in tasks {
+                        self.push_task(task);
+                    }
+                }
+            }
+            let task = self.queue.pop_front().unwrap();
             // Arborist queues nodes, then places all of a node's problem
             // edges before visiting another node. A newly hoisted child can
             // sort ahead of its parent, so freeze this batch before placing
@@ -774,20 +860,36 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // peer edge as an advisory constraint. The incoming dependency
         // identifies that source even when the plugin itself was hoisted.
         if is_peer {
-            for incoming in self
-                .graph
-                .edges
-                .iter()
-                .filter(|edge| edge.to_location == task.parent_location)
-            {
-                if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
-                    if let Some(spec) = source
-                        .optional_dependencies
-                        .get(&task.install_name)
-                        .or_else(|| source.dependencies.get(&task.install_name))
-                    {
-                        if let Ok(target) = PackageTarget::parse(spec) {
-                            peer_advisories.push(target);
+            let mut sources = VecDeque::from([task.parent_location.clone()]);
+            let mut seen = std::collections::HashSet::new();
+            while let Some(location) = sources.pop_front() {
+                if !seen.insert(location.clone()) {
+                    continue;
+                }
+                for incoming in self
+                    .graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to_location == location)
+                {
+                    if matches!(
+                        incoming.dep_type,
+                        DependencyType::Peer | DependencyType::PeerOptional
+                    ) {
+                        // All members loaded by loadPeerSet share the original
+                        // virtual parent, including peers of peers.
+                        sources.push_back(incoming.from_location.clone());
+                    } else if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
+                        let dev = (!source.location.contains("node_modules") && self.options.dev)
+                            .then(|| source.dev_dependencies.get(&task.install_name))
+                            .flatten();
+                        if let Some(spec) = dev
+                            .or_else(|| source.optional_dependencies.get(&task.install_name))
+                            .or_else(|| source.dependencies.get(&task.install_name))
+                        {
+                            if let Ok(target) = PackageTarget::parse(spec) {
+                                peer_advisories.push(target);
+                            }
                         }
                     }
                 }
@@ -893,6 +995,90 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             );
         }
 
+        // Check peers as edges of the candidate's virtual tree. Overrides
+        // affect those edges, while the lockfile keeps the manifest's ranges.
+        let placement_peers = if self.overrides.rules.is_empty()
+            || chosen_version.peer_dependencies.is_empty()
+        {
+            None
+        } else {
+            let reference_root = self
+                .graph
+                .nodes
+                .get(&task.parent_location)
+                .map(Node::all_dependency_specs)
+                .unwrap_or_default();
+            let mut caller_specs = BTreeMap::new();
+            for section in [
+                &chosen_version.peer_dependencies,
+                &chosen_version.dependencies,
+                &chosen_version.optional_dependencies,
+                &chosen_version.dev_dependencies,
+            ] {
+                for (name, spec) in section {
+                    if !spec.is_empty() {
+                        caller_specs.insert(name.clone(), spec.clone());
+                    }
+                }
+            }
+            let mut ancestors = (*task.ancestors).clone();
+            ancestors.push(dep_spec.package_name.clone());
+            let mut peers = BTreeMap::new();
+            for (name, spec) in &chosen_version.peer_dependencies {
+                let virtual_override = self.overrides.resolve_override_in_context(
+                    name,
+                    spec,
+                    &ancestors,
+                    &reference_root,
+                    Some(&caller_specs),
+                )?;
+                let uses_override = virtual_override.is_some();
+                let effective_peer = virtual_override.unwrap_or_else(|| spec.clone());
+                if uses_override && !self.peer_conflict_is_fatal(task.is_mine) {
+                    if let Some(source) = self.graph.nodes.get(&task.parent_location) {
+                        let parent_spec = source
+                            .optional_dependencies
+                            .get(name)
+                            .or_else(|| source.dependencies.get(name))
+                            .or_else(|| source.peer_dependencies.get(name));
+                        if let Some(parent_spec) = parent_spec {
+                            let parent_spec = self
+                                .overrides
+                                .resolve_override_with_caller(
+                                    name,
+                                    parent_spec,
+                                    &task.ancestors,
+                                    Some(&reference_root),
+                                )?
+                                .unwrap_or_else(|| parent_spec.clone());
+                            if let Some(provider) = crate::hoisting::find_visible_peer_node(
+                                &self.graph,
+                                &task.parent_location,
+                                name,
+                                name,
+                            ) {
+                                let parent_target = PackageTarget::parse(&parent_spec)?;
+                                let peer_target = PackageTarget::parse(&effective_peer)?;
+                                if crate::hoisting::node_satisfies_target(provider, &parent_target)
+                                    && !crate::hoisting::node_satisfies_target(
+                                        provider,
+                                        &peer_target,
+                                    )
+                                {
+                                    // loadPeerSet keeps the parent's provider and marks
+                                    // this virtual edge peerConflicted. CanPlaceDep
+                                    // excludes such edges from the candidate's peer set.
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                peers.insert(name.clone(), effective_peer);
+            }
+            Some(peers)
+        };
+
         // 6. Hoisting & Tree Placement
         let mut placement = determine_placement_with_peers(
             &self.graph,
@@ -901,9 +1087,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             &dep_spec.package_name,
             &dep_spec.target,
             &chosen_version.dependencies,
-            &chosen_version.peer_dependencies,
+            placement_peers
+                .as_ref()
+                .unwrap_or(&chosen_version.peer_dependencies),
             &chosen_version.peer_dependencies_meta,
             Some(&chosen_version.version),
+            chosen_version.dist_tarball.as_deref(),
+            chosen_version.dist_integrity.as_deref(),
             is_peer,
         );
 
@@ -963,54 +1153,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
-        let potential_consumers = self
-            .graph
-            .nodes
-            .values()
-            .filter(|node| {
-                [
-                    &node.dependencies,
-                    &node.optional_dependencies,
-                    &node.peer_dependencies,
-                ]
-                .iter()
-                .filter_map(|deps| deps.get(&dep_spec.install_name))
-                .filter_map(|spec| PackageTarget::parse(spec).ok())
-                .any(|target| {
-                    crate::hoisting::node_satisfies_target(
-                        &Node {
-                            version: chosen_version.version.clone(),
-                            parsed_version: Version::parse(&chosen_version.version).ok(),
-                            ..Node::default()
-                        },
-                        &target,
-                    )
-                })
-            })
-            .count();
-        // Note: Arborist maintains FIFO root slot ownership based on (depth, path)
-        if false
-            && !task.parent_location.is_empty()
-            && self.graph.nodes.get(&root_slot).is_some_and(|existing| {
-                existing.name == dep_spec.package_name
-                    && !crate::hoisting::node_satisfies_target(existing, &dep_spec.target)
-            })
-            && potential_consumers > 1
-            && self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name)
-        {
-            placement = determine_placement_with_peers(
-                &self.graph,
-                &task.parent_location,
-                &dep_spec.install_name,
-                &dep_spec.package_name,
-                &dep_spec.target,
-                &chosen_version.dependencies,
-                &chosen_version.peer_dependencies,
-                &chosen_version.peer_dependencies_meta,
-                Some(&chosen_version.version),
-                is_peer,
-            );
-        }
         let parent_skipped = self
             .graph
             .nodes
@@ -1128,6 +1270,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 };
 
                 self.graph.nodes.insert(target_loc.clone(), node);
+                self.activate_invalidated_workspaces(&target_loc);
                 if target_loc == root_slot {
                     self.dedupe_nested_compatible_nodes(
                         &root_slot,

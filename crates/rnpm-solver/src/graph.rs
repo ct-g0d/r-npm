@@ -705,7 +705,7 @@ impl DependencyGraph {
                 let cpu = node.cpu.as_ref().filter(|v| !v.is_empty()).cloned();
 
                 let mut extra = BTreeMap::new();
-                for key in ["funding", "deprecated", "extraneous"] {
+                for key in ["funding", "deprecated", "extraneous", "workspaces"] {
                     if let Some(v) = node.extra.get(key) {
                         if key == "deprecated"
                             && (v == &serde_json::Value::Bool(false) || v.is_null() || v == "")

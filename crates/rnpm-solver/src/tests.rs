@@ -837,6 +837,168 @@ fn test_workspace_protocol_edge_cases() {
 }
 
 #[test]
+fn test_workspace_dependencies_follow_root_transitive_resolution() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("parent", "1.0.0", |v| {
+        v.dependencies.insert("dep".into(), "^1.0.0".into());
+    });
+    provider.add_version("dep", "1.0.0", |_| {});
+    provider.add_version("dep", "1.1.0", |_| {});
+    let root: Manifest =
+        serde_json::from_str(r#"{"name":"root","dependencies":{"parent":"1.0.0"}}"#).unwrap();
+    let member = rnpm_core::workspace::WorkspaceMember {
+        name: "a".into(),
+        version: Some("1.0.0".into()),
+        path: "packages/a".into(),
+        relative_path: "packages/a".into(),
+        manifest: serde_json::from_str(
+            r#"{"name":"a","version":"1.0.0","dependencies":{"dep":"1.0.0"}}"#,
+        )
+        .unwrap(),
+    };
+    let graph = crate::workspace::resolve_workspace_graph(
+        &root,
+        &[member],
+        &provider,
+        &ResolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.nodes["node_modules/dep"].version, "1.1.0");
+    assert_eq!(graph.nodes["packages/a/node_modules/dep"].version, "1.0.0");
+}
+
+#[test]
+fn test_workspace_invalidated_edge_activates_before_remaining_root_nodes() {
+    let mut provider = InMemoryPackageProvider::new();
+    for (name, dependency, version) in [
+        ("a-ws-trigger", "dep", "^1.0.0"),
+        ("b-ws-early", "shared", "2.0.0"),
+        ("z-ws-late", "shared", "1.0.0"),
+    ] {
+        provider.add_version(name, "1.0.0", |v| {
+            v.dependencies.insert(dependency.into(), version.into());
+        });
+    }
+    for name in ["dep", "shared"] {
+        provider.add_version(name, "1.0.0", |_| {});
+        provider.add_version(name, if name == "dep" { "1.1.0" } else { "2.0.0" }, |_| {});
+    }
+    let root: Manifest = serde_json::from_str(
+        r#"{"name":"root","dependencies":{"a-ws-trigger":"1.0.0","z-ws-late":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let member = rnpm_core::workspace::WorkspaceMember {
+        name: "a".into(),
+        version: Some("1.0.0".into()),
+        path: "packages/a".into(),
+        relative_path: "packages/a".into(),
+        manifest: serde_json::from_str(
+            r#"{"name":"a","version":"1.0.0","dependencies":{"b-ws-early":"1.0.0","dep":"1.0.0"}}"#,
+        )
+        .unwrap(),
+    };
+    let graph = crate::workspace::resolve_workspace_graph(
+        &root,
+        &[member],
+        &provider,
+        &ResolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.nodes["node_modules/dep"].version, "1.1.0");
+    assert_eq!(graph.nodes["node_modules/shared"].version, "2.0.0");
+    assert_eq!(
+        graph.nodes["node_modules/z-ws-late/node_modules/shared"].version,
+        "1.0.0"
+    );
+}
+
+#[test]
+fn test_virtual_peer_override_context_nests_and_reuses_attached_candidates() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("dep", "1.0.0", |_| {});
+    provider.add_version("dep", "2.0.0", |_| {});
+    provider.add_version("owner", "1.0.0", |v| {
+        v.dependencies.insert("plugin".into(), "1.0.0".into());
+    });
+    provider.add_version("plugin", "1.0.0", |v| {
+        v.dev_dependencies.insert("dep".into(), "^1.0.0".into());
+        v.peer_dependencies.insert("dep".into(), ">=1.0.0".into());
+        v.peer_dependencies_meta
+            .insert("dep".into(), PeerDependencyMeta { optional: true });
+    });
+    for direct in [false, true] {
+        let mut manifest: Manifest = serde_json::from_str(
+            r#"{"name":"root","dependencies":{"dep":"2.0.0","owner":"1.0.0"},"overrides":{"dep":"$dep"}}"#,
+        ).unwrap();
+        if direct {
+            manifest
+                .dependencies
+                .insert("plugin".into(), "1.0.0".into());
+        }
+        let graph =
+            resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+        assert_eq!(graph.nodes.contains_key("node_modules/plugin"), direct);
+        assert_eq!(
+            graph
+                .nodes
+                .contains_key("node_modules/owner/node_modules/plugin"),
+            !direct
+        );
+        assert_eq!(graph.nodes["node_modules/dep"].version, "2.0.0");
+    }
+    provider.add_version("parent", "1.0.0", |v| {
+        v.dependencies
+            .insert("required-plugin".into(), "1.0.0".into());
+        v.peer_dependencies.insert("dep".into(), ">=2.0.0".into());
+        v.dev_dependencies.insert("dep".into(), "^1.0.0".into());
+    });
+    provider.add_version("required-plugin", "1.0.0", |v| {
+        v.peer_dependencies.insert("dep".into(), ">=1.0.0".into());
+        v.dev_dependencies.insert("dep".into(), "^1.0.0".into());
+    });
+    let manifest: Manifest = serde_json::from_str(
+        r#"{"name":"root","dependencies":{"dep":"2.0.0","parent":"1.0.0"},"overrides":{"dep":"$dep"}}"#,
+    ).unwrap();
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert!(graph.nodes.contains_key("node_modules/required-plugin"));
+    assert!(!graph
+        .nodes
+        .contains_key("node_modules/parent/node_modules/required-plugin"));
+}
+
+#[test]
+fn test_workspace_peer_of_peer_uses_original_source_pin() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("a-peer-owner", "1.0.0", |v| {
+        v.peer_dependencies
+            .insert("b-peer-member".into(), "1.0.0".into());
+        v.peer_dependencies.insert("shared".into(), "*".into());
+    });
+    provider.add_version("b-peer-member", "1.0.0", |v| {
+        v.peer_dependencies.insert("shared".into(), "*".into());
+    });
+    provider.add_version("shared", "1.0.0", |_| {});
+    provider.add_version("shared", "2.0.0", |_| {});
+    let member = rnpm_core::workspace::WorkspaceMember {
+        name: "a".into(), version: Some("1.0.0".into()), path: "packages/a".into(), relative_path: "packages/a".into(),
+        manifest: serde_json::from_str(
+            r#"{"name":"a","version":"1.0.0","dependencies":{"a-peer-owner":"1.0.0","shared":"1.0.0"}}"#,
+        ).unwrap(),
+    };
+    let graph = crate::workspace::resolve_workspace_graph(
+        &Manifest::default(),
+        &[member],
+        &provider,
+        &ResolverOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(graph.nodes["node_modules/shared"].version, "1.0.0");
+    assert!(!graph.nodes.contains_key("packages/a/node_modules/shared"));
+    assert!(!graph.nodes["node_modules/shared"].flags.peer);
+}
+
+#[test]
 fn test_workspace_graph_resolution_with_hoisting() {
     use crate::workspace::resolve_workspace_graph;
     use rnpm_core::workspace::WorkspaceMember;

@@ -109,6 +109,26 @@ impl Overrides {
         ancestors: &[T],
         caller_specs: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<String>, crate::error::SolverError> {
+        self.resolve_override_in_context(
+            dep_name,
+            requested_spec,
+            ancestors,
+            &self.root_dependencies,
+            caller_specs,
+        )
+    }
+
+    /// A candidate's virtual tree has the incoming parent's package as its
+    /// root. `$name` references there can differ from the attached tree's
+    /// project-root references while Arborist checks peer placement.
+    pub fn resolve_override_in_context<T: AsRef<str>>(
+        &self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        reference_root: &BTreeMap<String, String>,
+        caller_specs: Option<&BTreeMap<String, String>>,
+    ) -> Result<Option<String>, crate::error::SolverError> {
         if self.rules.is_empty() {
             return Ok(None);
         }
@@ -146,7 +166,7 @@ impl Overrides {
 
         // 4. Resolve reference override ($pkg) if present
         if let Some(ref_name) = raw_override.strip_prefix('$') {
-            if let Some(ref_spec) = self.root_dependencies.get(ref_name) {
+            if let Some(ref_spec) = reference_root.get(ref_name) {
                 Ok(Some(ref_spec.clone()))
             } else if let Some(caller_spec) = caller_specs.and_then(|specs| specs.get(ref_name)) {
                 Ok(Some(caller_spec.clone()))

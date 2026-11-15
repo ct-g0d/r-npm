@@ -2724,9 +2724,7 @@ impl Installer {
                 .packages
                 .entry(member.relative_path.clone())
                 .or_default();
-            if pkg.version.is_none() {
-                pkg.version = member.manifest.version.clone();
-            }
+            pkg.version = member.manifest.version.clone();
             save::sync_lockfile_package_entry(pkg, &member.manifest);
             let folder_name = member.relative_path.rsplit('/').next().unwrap_or("");
             pkg.name = (folder_name != member.name).then(|| member.name.clone());
