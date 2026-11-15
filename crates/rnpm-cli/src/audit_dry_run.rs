@@ -172,6 +172,27 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
         }
     }
 
+    // The finished ideal tree prunes every old node it no longer holds (for
+    // example a dependency a replaced parent dropped); those are detached too.
+    let pruned: Vec<String> =
+        tree.iter()
+            .filter(|(loc, (new, pkg))| {
+                !loc.is_empty()
+                    && !*new
+                    && ideal.packages.get(*loc).is_none_or(|next| {
+                        next.version != pkg.version || next.resolved != pkg.resolved
+                    })
+            })
+            .map(|(loc, _)| loc.clone())
+            .collect();
+    for loc in pruned {
+        tree.remove(&loc);
+        detached.insert(loc);
+    }
+
+    // npm counts the inventory of the (now ideal) tree it audited.
+    report.metadata.dependencies = crate::audit::dependency_counts(ideal);
+
     let root = &tree[""];
     let direct: HashSet<&str> = edge_names("", root.1)
         .iter()

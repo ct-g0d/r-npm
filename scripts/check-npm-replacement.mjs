@@ -316,6 +316,13 @@ for(const [name,args]of [['json',['audit','--json']],['text',['audit']],['fix-dr
   for(const [name,child]of [['audit-top','audit-middle'],['audit-middle','audit-branch'],['audit-branch','audit-leaf'],['audit-leaf',null]])packages['node_modules/'+name]={version:'1.0.0',...(child?{dependencies:{[child]:'^1.0.0'}}:{})};
   manifest(dir,{dependencies:{'audit-top':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages});
 },{advisories:{'audit-leaf':[{id:106,name:'audit-leaf',url:'https://example.invalid/advisory/106',title:'Deep chain advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+// A fixed parent that drops its vulnerable dependency: npm prunes (detaches) both old nodes.
+probePackages.set('audit-prune-parent',{name:'audit-prune-parent','dist-tags':{latest:'1.1.0'},versions:{'1.0.0':{name:'audit-prune-parent',version:'1.0.0',dependencies:{'audit-prune-leaf':'^1.0.0'}},'1.1.0':{name:'audit-prune-parent',version:'1.1.0'}}});
+probePackages.set('audit-prune-leaf',{name:'audit-prune-leaf','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name:'audit-prune-leaf',version:'1.0.0'}}});
+for(const [name,args]of [['json',['audit','fix','--dry-run','--json']],['text',['audit','fix','--dry-run']]])add(`audit-fix-dry-pruned-dependency-${name}`,'audit',args,dir=>{
+  manifest(dir,{dependencies:{'audit-prune-parent':'^1.0.0'}});
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-prune-parent':'^1.0.0'}},'node_modules/audit-prune-parent':{version:'1.0.0',dependencies:{'audit-prune-leaf':'^1.0.0'}},'node_modules/audit-prune-leaf':{version:'1.0.0'}}});
+},{advisories:{'audit-prune-leaf':[{id:107,name:'audit-prune-leaf',url:'https://example.invalid/advisory/107',title:'Pruned advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 // reify-output under npm's default audit/fund settings, plus dry-run, --long and --json diffs.
 {
   const defaults={NPM_CONFIG_AUDIT:'true',NPM_CONFIG_FUND:'true'};
