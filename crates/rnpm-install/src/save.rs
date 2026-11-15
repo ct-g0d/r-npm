@@ -220,14 +220,26 @@ pub fn mark_root_bundles(
         if !seen.insert(location.clone()) {
             continue;
         }
-        // npm records only `resolved` and `link` for a link entry.
-        if let Some(package) = lockfile
-            .packages
-            .get_mut(&location)
-            .filter(|p| p.link != Some(true))
-        {
-            package.in_bundle = Some(true);
+        let Some(package) = lockfile.packages.get_mut(&location) else {
+            continue;
+        };
+        // A link target has no parent in npm's tree, so nothing behind a
+        // link is bundled, and the link entry itself carries only
+        // `resolved` and `link`.
+        // A directory `file:` dependency becomes a link entry later on.
+        let directory_link = graph.nodes.get(&location).is_some_and(|node| {
+            node.flags.link
+                || node.resolved.as_deref().is_some_and(|r| {
+                    r.starts_with("file:")
+                        && ![".tgz", ".tar.gz", ".tar"]
+                            .iter()
+                            .any(|ext| r.ends_with(ext))
+                })
+        });
+        if package.link == Some(true) || directory_link {
+            continue;
         }
+        package.in_bundle = Some(true);
         queue.extend(
             graph
                 .get_outgoing_edges(&location)

@@ -525,6 +525,17 @@ const legacyLock=dir=>{
 for(const flags of [[],['--package-lock-only']])add(`install-v1-lockfile-hydration${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],legacyLock);
 add('ci-v1-lockfile-hydration','ci',['ci','--ignore-scripts'],legacyLock);
 // Naming a hydrated package re-resolves it from full metadata (license included).
+// The named package is the lock's only entry: nothing else refetches its full packument.
+add('install-v1-lockfile-named-sole-lock-only','install',['install','metadata-probe@1.0.0','--ignore-scripts','--package-lock-only'],dir=>{
+  manifest(dir,{dependencies:{'metadata-probe':'1.0.0'}});
+  const {tarball,integrity}=probePackages.get('metadata-probe').versions['1.0.0'].dist;
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:1,requires:true,dependencies:{'metadata-probe':{version:'1.0.0',resolved:tarball,integrity}}});
+});
+// A bundled link's target has no parent in npm's tree: nothing behind it is inBundle.
+for(const flags of [[],['--package-lock-only']])add(`install-bundled-link-target${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>{
+  manifest(dir,{dependencies:{x:'file:x'},bundleDependencies:['x']});
+  manifest(path.join(dir,'x'),{name:'x',version:'1.0.0',dependencies:{shared:'1.0.0'}});
+});
 add('install-v1-lockfile-named-lock-only','install',['install','legacy-owner@1.0.0','--ignore-scripts','--package-lock-only'],legacyLock);
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));

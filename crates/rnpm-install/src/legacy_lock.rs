@@ -19,7 +19,7 @@ struct Header {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: Option<u64>,
     #[serde(default)]
-    requires: Option<bool>,
+    requires: Option<serde_json::Value>,
 }
 
 fn header(raw: &str) -> Option<Header> {
@@ -33,10 +33,24 @@ pub(crate) fn is_old_lockfile(raw: &str) -> bool {
         .is_some_and(|v| v < 2)
 }
 
+/// Shrinkwrap's `ancientLockfile`: a pre-v2 lock whose `requires` is falsy.
+pub(crate) fn is_ancient_lockfile(raw: &str) -> bool {
+    header(raw).is_some_and(|h| {
+        let truthy = match h.requires {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => b,
+            Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
+            Some(serde_json::Value::String(s)) => !s.is_empty(),
+            Some(_) => true,
+        };
+        h.lockfile_version.is_some_and(|v| v < 2) && !truthy
+    })
+}
+
 /// npm's warning before inflating an old lock. Shrinkwrap's
 /// `ancientLockfile` (a pre-v2 lock without `requires`) changes the heading.
 pub(crate) fn old_lockfile_warning(raw: &str, file_name: &str) -> String {
-    let ancient = header(raw).is_some_and(|h| h.requires != Some(true));
+    let ancient = is_ancient_lockfile(raw);
     let heading = if ancient {
         "ancient lockfile"
     } else {
@@ -81,11 +95,13 @@ fn registry_entry_name(location: &str, pkg: &LockfilePackage) -> Option<String> 
 pub(crate) async fn hydrate_old_lockfile(
     client: &RegistryClient,
     lockfile: &mut LockfileV3,
+    skip_names: &HashSet<String>,
 ) -> HashSet<String> {
     let mut names: Vec<String> = lockfile
         .packages
         .iter()
         .filter_map(|(loc, pkg)| registry_entry_name(loc, pkg))
+        .filter(|name| !skip_names.contains(name))
         .collect();
     names.sort();
     names.dedup();
@@ -244,6 +260,12 @@ mod tests {
         assert!(!is_old_lockfile(r#"{"lockfileVersion":2}"#));
         assert!(!is_old_lockfile(r#"{"lockfileVersion":3}"#));
         assert!(!is_old_lockfile("not json"));
+        // JavaScript truthiness for `requires`, not a strict bool.
+        assert!(is_old_lockfile(r#"{"lockfileVersion":1,"requires":1}"#));
+        assert!(!is_ancient_lockfile(
+            r#"{"lockfileVersion":1,"requires":1}"#
+        ));
+        assert!(is_ancient_lockfile(r#"{"lockfileVersion":1,"requires":0}"#));
     }
 
     #[test]
