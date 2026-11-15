@@ -5798,7 +5798,7 @@ impl Installer {
                                         return true;
                                     }
                                 }
-                                k.starts_with("node_modules/")
+                                k.contains("node_modules/")
                             })
                             .cloned()
                             .collect();
