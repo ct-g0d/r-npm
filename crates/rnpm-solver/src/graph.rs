@@ -214,6 +214,11 @@ impl DependencyGraph {
         let mut late = Vec::new();
         for (location, node) in &self.nodes {
             for (name, spec) in &node.peer_dependencies {
+                if node.dependencies.contains_key(name)
+                    || node.optional_dependencies.contains_key(name)
+                {
+                    continue;
+                }
                 let optional = node
                     .peer_dependencies_meta
                     .get(name)

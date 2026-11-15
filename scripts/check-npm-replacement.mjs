@@ -426,6 +426,9 @@ for(const [name,versions] of Object.entries({
   'virtual-peer-parent':{'1.0.0':{dependencies:{'virtual-peer-required':'1.0.0'},devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=2.0.0'}}},
   'virtual-peer-required':{'1.0.0':{devDependencies:{dep:'^1.0.0'},peerDependencies:{dep:'>=1.0.0'}}},
   'metadata-probe':{'1.0.0':{license:'MIT',funding:'https://example.invalid/funding',workspaces:['packages/*']}},
+  'overlap-owner':{'1.0.0':{optionalDependencies:{shared:'1.0.0'},peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'overlap-wrapper':{'1.0.0':{dependencies:{'overlap-owner':'1.0.0'}}},
+  'overlap-missing':{'1.0.0':{optionalDependencies:{shared:'9.0.0'},peerDependencies:{shared:'2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'platform-scalar':{'1.0.0':{os:process.platform,cpu:process.arch,libc:hostLibc}},
   'platform-array':{'1.0.0':{os:[process.platform],cpu:[process.arch],libc:[hostLibc]}},
   'platform-full':{'1.0.0':{license:'MIT',libc:hostLibc}},
@@ -465,6 +468,7 @@ for(const [name,versions] of Object.entries({
   probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
+for(const owner of ['overlap-owner','overlap-wrapper','overlap-missing'])add(`resolver-optional-peer-overlap-${owner}`,'install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{[owner]:'1.0.0',shared:'2.0.0'}}));
 add('resolver-depth-path-before-dev-class','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'z-prod':'1.0.0'},devDependencies:{'a-dev':'1.0.0'}}));
 add('resolver-peer-flags-reach-transitives','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-entry':'1.0.0'}}));
 add('resolver-places-peer-set-before-expansion','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'b-regular':'1.0.0','z-peer-entry':'1.0.0'}}));
