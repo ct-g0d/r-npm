@@ -6,6 +6,32 @@ use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use std::collections::BTreeMap;
 
 #[test]
+fn shared_native_is_not_skipped_by_an_unsupported_parent() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("native", "1.0.0", |v| {
+        v.os = Some(vec!["win32".into()].into());
+    });
+    provider.add_version("a-unsupported", "1.0.0", |v| {
+        v.os = Some(vec!["darwin".into()].into());
+        v.dependencies.insert("native".into(), "1.0.0".into());
+    });
+    let mut manifest = Manifest::default();
+    manifest
+        .optional_dependencies
+        .insert("a-unsupported".into(), "1.0.0".into());
+    manifest
+        .optional_dependencies
+        .insert("native".into(), "1.0.0".into());
+    let options = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+    assert!(graph.nodes["node_modules/a-unsupported"].flags.skipped);
+    assert!(!graph.nodes["node_modules/native"].flags.skipped);
+}
+
+#[test]
 fn late_optional_peer_rehomes_provider_and_pending_children() {
     let mut provider = InMemoryPackageProvider::new();
     for version in ["1.0.0", "2.0.0"] {

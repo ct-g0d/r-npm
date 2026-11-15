@@ -435,6 +435,8 @@ for(const [name,versions] of Object.entries({
   'a-late-peer-children':{'1.0.0':{peerDependencies:{'late-provider':'2.0.0'},peerDependenciesMeta:{'late-provider':{optional:true}}}},
   'b-late-writer-children':{'1.0.0':{dependencies:{'late-provider':'1.0.0'}}},
   'late-provider':{'1.0.0':{dependencies:{shared:'1.0.0'}},'2.0.0':{dependencies:{shared:'2.0.0'}}},
+  'a-unsupported-parent':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32'],dependencies:{'shared-native':'1.0.0'}}},
+  'shared-native':{'1.0.0':{os:[process.platform],cpu:[process.arch]}},
   'platform-scalar':{'1.0.0':{os:process.platform,cpu:process.arch,libc:hostLibc}},
   'platform-array':{'1.0.0':{os:[process.platform],cpu:[process.arch],libc:[hostLibc]}},
   'platform-full':{'1.0.0':{license:'MIT',libc:hostLibc}},
@@ -464,8 +466,10 @@ for(const [name,versions] of Object.entries({
   for(const [version,fields]of Object.entries(versions)){
     const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
     if(name==='bundle-owner'){
-      manifest(path.join(dir,'node_modules/bundled-leaf'),{name:'bundled-leaf',license:'MIT',dependencies:{'bundled-transitive':'1.0.0'}});
-      manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC'});
+      manifest(path.join(dir,'node_modules/bundled-leaf'),{name:'bundled-leaf',license:'MIT',bin:{'bundled-leaf-cli':'bin/leaf.js'},dependencies:{'bundled-transitive':'1.0.0'}});
+      write(path.join(dir,'node_modules/bundled-leaf'),'bin/leaf.js','#!/usr/bin/env node\nconsole.log("bundled leaf");\n');
+      manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC',bin:'bin/transitive.js'});
+      write(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),'bin/transitive.js','#!/usr/bin/env node\nconsole.log("bundled transitive");\n');
     }
     const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
     const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
@@ -475,6 +479,7 @@ for(const [name,versions] of Object.entries({
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-late-optional-peer-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
+add('materialization-shared-optional-native','install',['install','--ignore-scripts'],dir=>manifest(dir,{optionalDependencies:{'a-unsupported-parent':'1.0.0','shared-native':'1.0.0'}}));
 add('resolver-late-optional-peer-required-provider','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-required':'1.0.0'}}));
 add('cli-silent-registry-error','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'silent-missing':'1.0.0'}}));
 add('resolver-late-optional-peer-children','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer-children':'1.0.0','b-late-writer-children':'1.0.0'}}));

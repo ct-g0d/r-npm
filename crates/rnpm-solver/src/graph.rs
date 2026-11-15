@@ -44,6 +44,10 @@ pub struct NodeFlags {
     pub bundled: bool,
     pub has_install_script: bool,
     pub skipped: bool,
+    /// Own platform constraint, separate from skip state inherited from parents.
+    /// Unspecified values preserve flags supplied by existing graph callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_skipped: Option<bool>,
     pub link: bool,
 }
 
@@ -261,7 +265,12 @@ impl DependencyGraph {
         let initially_skipped: HashSet<String> = self
             .nodes
             .iter()
-            .filter_map(|(location, node)| node.flags.skipped.then_some(location.clone()))
+            .filter_map(|(location, node)| {
+                node.flags
+                    .platform_skipped
+                    .unwrap_or(node.flags.skipped)
+                    .then_some(location.clone())
+            })
             .collect();
         dev_states.insert(self.root_location.clone(), NON_DEV);
         optional_states.insert(self.root_location.clone(), NON_OPTIONAL);
@@ -853,6 +862,7 @@ impl DependencyGraph {
                     bundled: pkg.in_bundle.unwrap_or(false),
                     has_install_script: pkg.has_install_script.unwrap_or(false),
                     skipped: false,
+                    platform_skipped: None,
                     link: pkg.link.unwrap_or(false),
                 },
                 dependencies: pkg.dependencies.clone().unwrap_or_default(),
