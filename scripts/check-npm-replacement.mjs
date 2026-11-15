@@ -441,6 +441,8 @@ for(const [name,versions] of Object.entries({
   'replaced-provider-child':{'1.0.0':{}},
   'a-star-replaced-consumer':{'1.0.0':{peerDependencies:{'replaced-provider':'*'}}},
   'b-replaced-pinner':{'1.0.0':{peerDependencies:{'replaced-provider':'1.0.0'},peerDependenciesMeta:{'replaced-provider':{optional:true}}}},
+  'aa-shared-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
+  'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
@@ -583,6 +585,9 @@ add('install-optional-peer-replace-drops-old-deps','install',['install','--ignor
 for(const [name,fields,flags=[]] of [
   ['root-holds',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}],
   ['root-holds-strict',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}},['--strict-peer-deps']],
+  // npm loads every root edge's peer set before placing any, so the root-held
+  // conflict wins over an earlier placement conflict.
+  ['root-holds-before-placement',{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'},devDependencies:{dep:'1.0.0','virtual-peer-parent':'1.0.0'}}],
   ['placed-peer',{dependencies:{'eresolve-peer-two':'1.0.0','eresolve-z-peer-one':'1.0.0'}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
 ])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});

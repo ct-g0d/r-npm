@@ -474,6 +474,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
 
+        if self.options.lockfile.is_none() && self.options.is_strict_peers() {
+            self.precheck_root_peer_sets(root_manifest, &root_deps)?;
+        }
+
         let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
         let mut queued = std::collections::HashSet::new();
         let enqueue_root =
@@ -1880,6 +1884,144 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
+    /// buildIdealTree loads every root edge's peer set (nodeFromEdge) before
+    /// placing any of them, so a root dependency whose required peer cannot
+    /// agree with the root's own edge to that peer fails first, as "unable to
+    /// resolve dependency tree", whatever placement conflicts come later.
+    fn precheck_root_peer_sets(
+        &self,
+        root_manifest: &Manifest,
+        root_deps: &BTreeMap<String, (String, DependencyType)>,
+    ) -> Result<(), SolverError> {
+        use crate::explain::{EdgeFrom, EdgeView, Explanation, Subject};
+        // Node#loadDeps inserts peer, prod, optional, then dev edges; a name
+        // keeps the position of its first appearance.
+        let mut order: Vec<&String> = Vec::new();
+        for deps in [
+            &root_manifest.peer_dependencies,
+            &root_manifest.dependencies,
+            &root_manifest.optional_dependencies,
+            &root_manifest.dev_dependencies,
+        ] {
+            for name in deps.keys() {
+                if root_deps.contains_key(name) && !order.contains(&name) {
+                    order.push(name);
+                }
+            }
+        }
+        let registry_target = |target: &PackageTarget| {
+            matches!(
+                target,
+                PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+            )
+        };
+        for name in order {
+            let (spec, dep_type) = &root_deps[name];
+            let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
+                continue;
+            };
+            if !registry_target(&dep_spec.target) {
+                continue;
+            }
+            let Some(meta) = self.provider.get_package(&dep_spec.package_name)? else {
+                continue;
+            };
+            let Some(chosen) =
+                self.select_version("", &dep_spec.package_name, &meta, &dep_spec.target, &[])
+            else {
+                continue;
+            };
+            for (peer, peer_spec) in &chosen.peer_dependencies {
+                if chosen
+                    .peer_dependencies_meta
+                    .get(peer)
+                    .is_some_and(|meta| meta.optional)
+                    || chosen.dependencies.contains_key(peer)
+                    || chosen.optional_dependencies.contains_key(peer)
+                    || self.overrides.rules.contains_key(peer)
+                {
+                    continue;
+                }
+                let Some((root_spec, root_type)) = root_deps.get(peer) else {
+                    continue;
+                };
+                let (Ok(root_target), Ok(peer_target)) = (
+                    DependencySpec::parse(peer, root_spec).map(|s| s.target),
+                    PackageTarget::parse(peer_spec),
+                ) else {
+                    continue;
+                };
+                if !registry_target(&root_target) || !registry_target(&peer_target) {
+                    continue;
+                }
+                let Some(peer_meta) = self.provider.get_package(peer)? else {
+                    continue;
+                };
+                // nodeFromEdge(parentEdge, ..., peerEdge): the root's choice,
+                // steered by the peer edge, must also satisfy the peer edge.
+                let root_choice = self
+                    .select_version(
+                        "",
+                        peer,
+                        &peer_meta,
+                        &root_target,
+                        std::slice::from_ref(&peer_target),
+                    )
+                    .or_else(|| self.select_version("", peer, &peer_meta, &root_target, &[]));
+                let Some(root_choice) = root_choice else {
+                    continue;
+                };
+                let satisfies =
+                    crate::hoisting::version_satisfies_target(&root_choice.version, &peer_target);
+                if satisfies {
+                    continue;
+                }
+                let root_edge_to = |dep_type: DependencyType, name: &str, spec: &str| EdgeView {
+                    dep_type,
+                    name: name.to_string(),
+                    spec: spec.to_string(),
+                    from: EdgeFrom::Root,
+                };
+                let explanation = Explanation {
+                    heading: "unable to resolve dependency tree",
+                    while_resolving: self.source_id(&EdgeFrom::Root),
+                    found: Subject::Candidate {
+                        name: peer.clone(),
+                        version: root_choice.version.clone(),
+                        location: format!("node_modules/{peer}"),
+                        dependents: vec![root_edge_to(*root_type, peer, root_spec)],
+                    },
+                    edge: EdgeView {
+                        dep_type: DependencyType::Peer,
+                        name: peer.clone(),
+                        spec: peer_spec.clone(),
+                        from: EdgeFrom::Virtual {
+                            name: name.clone(),
+                            version: chosen.version.clone(),
+                            incoming: Some(Box::new(root_edge_to(*dep_type, name, spec))),
+                        },
+                    },
+                    conflict: None,
+                }
+                .render(&self.graph, self.options.strict_peer_deps);
+                return Err(SolverError::peer_conflict(
+                    name,
+                    peer,
+                    peer_spec,
+                    Some(root_choice.version.clone()),
+                    Some(format!("node_modules/{peer}")),
+                    vec![self.graph.nodes[""].name.clone(), name.clone()],
+                    format!(
+                        "Root dependency {peer}@{} does not satisfy peer constraint '{peer_spec}'",
+                        root_choice.version
+                    ),
+                )
+                .with_eresolve(explanation));
+            }
+        }
+        Ok(())
+    }
+
     /// `name@version` as printNode shows a virtual tree's source; npm prints
     /// a missing root version as `undefined`.
     fn source_id(&self, from: &crate::explain::EdgeFrom) -> Option<String> {
