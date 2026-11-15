@@ -442,6 +442,7 @@ pub fn check_engines(
     base_dir: &Path,
     strict: bool,
     silent: bool,
+    platform: &rnpm_solver::Platform,
 ) -> Result<()> {
     let node_version = rnpm_lifecycle::node_version();
     let npm_version = rnpm_lifecycle::NPM_VERSION;
@@ -455,8 +456,10 @@ pub fn check_engines(
             _ => false,
         }
     };
+    // npm never checks engines on optional packages skipped for platform.
+    let skipped = crate::lockfile_platform_skipped_packages(lockfile, platform);
     for (location, pkg) in &lockfile.packages {
-        if location.is_empty() {
+        if location.is_empty() || skipped.contains(location) {
             continue;
         }
         // Links and directory targets carry their engines on disk.

@@ -515,6 +515,7 @@ pub(crate) fn link_tree_bins(
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut shims_to_link = Vec::new();
+    let nm_real = node_modules_dir.canonicalize().ok();
 
     for loc in &package_locs {
         let target_path = loc_base_dir.join(loc);
@@ -549,10 +550,21 @@ pub(crate) fn link_tree_bins(
         let claimed_set = claimed_bins.entry(clean_bin_dir.clone()).or_default();
         let wanted_set = wanted_shims.entry(clean_bin_dir.clone()).or_default();
 
+        let outside_node_modules = match (target_path.canonicalize(), &nm_real) {
+            (Ok(real), Some(nm)) => !real.starts_with(nm),
+            _ => false,
+        };
         for (bin_name, script_rel) in bin_entries {
+            let script_path = target_path.join(&script_rel);
+            // cmd-shim's cmdShimIfExists: a bin whose target is missing (e.g. an
+            // unbuilt workspace) gets no shim and claims no name. Only checked for
+            // packages living outside node_modules: registry packages may still be
+            // materializing in parallel with this pass.
+            if outside_node_modules && !script_path.is_file() {
+                continue;
+            }
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
-                let script_path = target_path.join(&script_rel);
                 shims_to_link.push((target_path.clone(), pkg_bin_dir.clone(), bin_name.clone(), script_rel, script_path));
 
                 wanted_set.insert(bin_name.clone());

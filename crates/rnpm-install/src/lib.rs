@@ -1156,6 +1156,9 @@ pub fn apply_npmrc_to_client_config(
     if let Some(ms) = timeout_ms {
         client_config.timeout = std::time::Duration::from_millis(ms);
     }
+    // make-fetch-happen only gives up on a stalled body after fetch-timeout
+    // (default 5 minutes); a short idle cutoff fails large tarballs under load.
+    client_config.chunk_idle_timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
 
     let connect_timeout_ms = npmrc
         .settings
@@ -1863,7 +1866,7 @@ impl Installer {
         if self.options.force {
             return Ok(());
         }
-        policy::check_engines(lockfile, &base_dir, self.engine_strict, self.options.silent)
+        policy::check_engines(lockfile, &base_dir, self.engine_strict, self.options.silent, &self.options.platform())
     }
 
     /// Lifecycle options shared by dependency and root hooks.
@@ -4478,7 +4481,7 @@ impl Installer {
                         continue;
                     }
                 }
-                if !pkg_key.starts_with("node_modules/") && pkg_info.link != Some(true) {
+                if !pkg_key.contains("node_modules/") && pkg_info.link != Some(true) {
                     continue;
                 }
                 packages_installed += 1;
@@ -4752,7 +4755,9 @@ impl Installer {
             }
 
             // Bundled packages are materialized with their owner's tarball.
-            if pkg_info.in_bundle == Some(true) || !pkg_key.starts_with("node_modules/") {
+            // Entries nested under a workspace member (`packages/a/node_modules/x`)
+            // are installed like root ones.
+            if pkg_info.in_bundle == Some(true) || !pkg_key.contains("node_modules/") {
                 continue;
             }
 
@@ -4776,7 +4781,7 @@ impl Installer {
                     "Package path '{cleaned:?}' escapes project boundary"
                 ));
             }
-            if !cleaned.starts_with(&node_modules_dir) {
+            if pkg_key.starts_with("node_modules/") && !cleaned.starts_with(&node_modules_dir) {
                 return Err(anyhow!(
                     "Package path '{cleaned:?}' escapes node_modules boundary"
                 ));
@@ -6146,7 +6151,8 @@ impl Installer {
                             return true;
                         }
                     }
-                    k.starts_with("node_modules/")
+                    // Includes packages nested under a workspace member.
+                    k.contains("node_modules/")
                 })
                 .cloned()
                 .collect();

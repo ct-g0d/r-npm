@@ -267,6 +267,26 @@ impl DependencyGraph {
                 .or_default()
                 .push(edge.clone());
         }
+        // A link and its target are one node to calc-dep-flags: whatever
+        // reaches the link reaches the target (e.g. a workspace member) and its
+        // dependencies. A prod pass-through edge carries every state unchanged.
+        for (location, node) in &self.nodes {
+            if !node.flags.link {
+                continue;
+            }
+            if let Some(target) = node.resolved.as_ref().filter(|t| self.nodes.contains_key(*t)) {
+                if target != location {
+                    outgoing.entry(location.clone()).or_default().push(DependencyEdge {
+                        from_location: location.clone(),
+                        to_location: target.clone(),
+                        install_name: node.install_name.clone(),
+                        package_name: node.name.clone(),
+                        spec: String::new(),
+                        dep_type: DependencyType::Prod,
+                    });
+                }
+            }
+        }
         while let Some(location) = queue.pop_front() {
             let dev_state = dev_states.get(&location).copied().unwrap_or(0);
             let optional_state = optional_states.get(&location).copied().unwrap_or(0);
