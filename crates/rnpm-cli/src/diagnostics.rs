@@ -203,6 +203,9 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     return missing_package_diagnostic(name, spec);
                 }
                 SolverError::PeerConflict { .. } => {
+                    if let Some(eresolve) = solver_err.eresolve() {
+                        return Diagnostic::new("ERESOLVE", eresolve_block(eresolve));
+                    }
                     return Diagnostic::new("ERESOLVE", solver_err.to_string());
                 }
                 SolverError::Spec(SpecError::UnsupportedProtocol { protocol, spec }) => {
@@ -549,6 +552,42 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     } else {
         Diagnostic::new("EUNKNOWN", err_str)
     }
+}
+
+/// npm's ERESOLVE block (utils/error-message.js with explain-eresolve's
+/// report): summary, a blank line, then the depth-4 explanation and fix.
+fn eresolve_block(eresolve: &rnpm_solver::explain::Eresolve) -> String {
+    let detail = format!(
+        "\n{}\n\n{}",
+        eresolve.explanation,
+        rnpm_solver::explain::fix_line(eresolve.strict_peer_deps)
+    );
+    let mut out = format!(
+        "npm error code ERESOLVE\nnpm error ERESOLVE {}",
+        eresolve.heading
+    );
+    for line in detail.split('\n') {
+        out.push_str(if line.is_empty() {
+            "\nnpm error"
+        } else {
+            "\nnpm error "
+        });
+        out.push_str(line);
+    }
+    out
+}
+
+/// The eresolve-report.txt body npm writes beside the debug log.
+pub fn eresolve_report(err: &anyhow::Error) -> Option<String> {
+    let eresolve = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SolverError>())?
+        .eresolve()?;
+    Some(format!(
+        "# npm resolution error report\n\n{}\n\n{}",
+        eresolve.report,
+        rnpm_solver::explain::fix_line(eresolve.strict_peer_deps)
+    ))
 }
 
 #[cfg(test)]

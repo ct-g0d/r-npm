@@ -673,7 +673,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                         "Installed {}@{} at '{}' does not satisfy peer constraint '{}'",
                                         existing.name, existing.version, existing.location, effective_spec
                                     ),
-                                ));
+                                ).with_eresolve(self.explain_peer_set_conflict(&task, &dep_spec, &effective_spec, &existing.location)));
                             } else {
                                 warn!(
                                     "Peer dependency conflict in cycle: {} requires {}@{}, but found {}@{} (non-strict mode)",
@@ -743,6 +743,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     existing.location,
                                     effective_spec
                                 ),
+                            )
+                            .with_eresolve(
+                                self.explain_peer_set_conflict(
+                                    &task,
+                                    &dep_spec,
+                                    &effective_spec,
+                                    &existing.location,
+                                ),
                             ));
                         } else {
                             warn!(
@@ -796,7 +804,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     "Installed {}@{} at '{}' does not satisfy optional peer constraint '{}'",
                                     existing.name, existing.version, existing.location, effective_spec
                                 ),
-                            ));
+                            ).with_eresolve(self.explain_placed_peer_conflict(&task, &dep_spec, &effective_spec, &existing.location)));
                         }
                         replace_transitive_root_peer = sibling.is_none() && !root_pins_provider;
                         if !replace_transitive_root_peer
@@ -1223,7 +1231,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     Some(existing.location.clone()),
                     (*task.ancestors).clone(),
                     "Cannot move a peer provider beneath its consumer".to_string(),
-                ));
+                )
+                .with_eresolve(self.explain_placed_peer_conflict(
+                    &task,
+                    &dep_spec,
+                    &effective_spec,
+                    &existing.location,
+                )));
             }
             if !self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name) {
                 return Ok(());
@@ -1768,6 +1782,172 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
+    /// `name@version` as printNode shows a virtual tree's source; npm prints
+    /// a missing root version as `undefined`.
+    fn source_id(&self, from: &crate::explain::EdgeFrom) -> Option<String> {
+        use crate::explain::EdgeFrom;
+        let location = match from {
+            EdgeFrom::Root => self.graph.root_location.as_str(),
+            EdgeFrom::Node(location) => location.as_str(),
+            EdgeFrom::Virtual { name, version, .. } => return Some(format!("{name}@{version}")),
+        };
+        let node = self.graph.nodes.get(location)?;
+        let or_undefined = |s: &str| {
+            if s.is_empty() {
+                "undefined".to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        Some(format!(
+            "{}@{}",
+            or_undefined(&node.name),
+            or_undefined(&node.version)
+        ))
+    }
+
+    /// The edge that first placed `location`: the source of Arborist's
+    /// virtual peer-set tree.
+    fn placing_edge(&self, location: &str) -> Option<crate::explain::EdgeView> {
+        self.graph
+            .edges
+            .iter()
+            .find(|edge| edge.to_location == location)
+            .map(|edge| {
+                crate::explain::graph_edge(
+                    &self.graph,
+                    &edge.from_location,
+                    edge.dep_type,
+                    &edge.install_name,
+                    &edge.spec,
+                )
+            })
+    }
+
+    /// The version npm would pick for the conflicting peer.
+    fn candidate_version(&self, parent_location: &str, dep_spec: &DependencySpec) -> String {
+        self.provider
+            .get_package(&dep_spec.package_name)
+            .ok()
+            .flatten()
+            .and_then(|meta| {
+                self.select_version(
+                    parent_location,
+                    &dep_spec.package_name,
+                    &meta,
+                    &dep_spec.target,
+                    &[],
+                )
+                .map(|v| v.version.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// A required peer of a newly placed package conflicts with a visible node.
+    /// Arborist's loadPeerSet reports "unable to resolve dependency tree" when
+    /// the root itself holds that node; otherwise place-dep fails placing the
+    /// owner ("could not resolve") and names the peer it would have needed.
+    fn explain_peer_set_conflict(
+        &self,
+        task: &ResolveTask,
+        dep_spec: &DependencySpec,
+        effective_spec: &str,
+        existing_location: &str,
+    ) -> crate::explain::Eresolve {
+        use crate::explain::{EdgeFrom, EdgeView, Explanation, Subject};
+        let owner = self.graph.nodes.get(&task.parent_location);
+        let placing = self.placing_edge(&task.parent_location);
+        let peer_edge = EdgeView {
+            dep_type: task.dep_type,
+            name: task.install_name.clone(),
+            spec: effective_spec.to_string(),
+            from: EdgeFrom::Virtual {
+                name: owner
+                    .map(|o| o.install_name.clone())
+                    .unwrap_or_else(|| task.parent_package_name.clone()),
+                version: owner.map(|o| o.version.clone()).unwrap_or_default(),
+                incoming: placing.clone().map(Box::new),
+            },
+        };
+        let while_resolving = placing.as_ref().and_then(|edge| self.source_id(&edge.from));
+        let root_holds = self.graph.edges.iter().any(|edge| {
+            edge.from_location == self.graph.root_location && edge.to_location == existing_location
+        });
+        let explanation = match placing {
+            Some(placing) if !root_holds => Explanation {
+                heading: "could not resolve",
+                while_resolving,
+                found: Subject::Graph(existing_location.to_string()),
+                edge: placing,
+                conflict: Some(Subject::Candidate {
+                    name: task.install_name.clone(),
+                    version: self.candidate_version(&task.parent_location, dep_spec),
+                    location: format!("node_modules/{}", task.install_name),
+                    dependents: vec![peer_edge],
+                }),
+            },
+            _ => {
+                // Arborist resolves the peer inside the virtual tree, where the
+                // root's copy of the node has only the root's edges.
+                let found = match self.graph.nodes.get(existing_location) {
+                    Some(existing) if root_holds => Subject::Candidate {
+                        name: existing.install_name.clone(),
+                        version: existing.version.clone(),
+                        location: existing_location.to_string(),
+                        dependents: crate::explain::graph_dependents(
+                            &self.graph,
+                            existing_location,
+                        )
+                        .into_iter()
+                        .filter(|edge| matches!(edge.from, EdgeFrom::Root))
+                        .collect(),
+                    },
+                    _ => Subject::Graph(existing_location.to_string()),
+                };
+                Explanation {
+                    heading: "unable to resolve dependency tree",
+                    while_resolving,
+                    found,
+                    edge: peer_edge,
+                    conflict: None,
+                }
+            }
+        };
+        explanation.render(&self.graph, self.options.strict_peer_deps)
+    }
+
+    /// A peer edge of an already placed package is invalid and cannot be
+    /// fixed: place-dep fails on that edge ("could not resolve").
+    fn explain_placed_peer_conflict(
+        &self,
+        task: &ResolveTask,
+        dep_spec: &DependencySpec,
+        effective_spec: &str,
+        existing_location: &str,
+    ) -> crate::explain::Eresolve {
+        use crate::explain::{graph_edge, Explanation, Subject};
+        let peer_edge = graph_edge(
+            &self.graph,
+            &task.parent_location,
+            task.dep_type,
+            &task.install_name,
+            effective_spec,
+        );
+        Explanation {
+            heading: "could not resolve",
+            while_resolving: self.source_id(&peer_edge.from),
+            found: Subject::Graph(existing_location.to_string()),
+            edge: peer_edge.clone(),
+            conflict: Some(Subject::Candidate {
+                name: task.install_name.clone(),
+                version: self.candidate_version(&task.parent_location, dep_spec),
+                location: format!("node_modules/{}", task.install_name),
+                dependents: vec![peer_edge],
+            }),
+        }
+        .render(&self.graph, self.options.strict_peer_deps)
+    }
+
     fn select_version<'b>(
         &self,
         parent_location: &str,

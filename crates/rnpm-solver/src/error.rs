@@ -18,6 +18,8 @@ pub enum SolverError {
         found_location: Option<String>,
         required_by: Vec<String>,
         message: String,
+        /// npm's explanation, when the conflict maps onto one Arborist reports.
+        eresolve: Option<Box<crate::explain::Eresolve>>,
     },
 
     #[error("EBADPLATFORM: Unsupported platform for {package}@{version}: wanted {wanted} (current: {current})\n{message}")]
@@ -126,6 +128,23 @@ impl SolverError {
             found_location,
             required_by,
             message: message.into(),
+            eresolve: None,
+        }
+    }
+
+    /// Attaches npm's ERESOLVE explanation to a peer conflict.
+    pub fn with_eresolve(mut self, explained: crate::explain::Eresolve) -> Self {
+        if let SolverError::PeerConflict { eresolve, .. } = &mut self {
+            *eresolve = Some(Box::new(explained));
+        }
+        self
+    }
+
+    /// npm's ERESOLVE explanation, if one was attached.
+    pub fn eresolve(&self) -> Option<&crate::explain::Eresolve> {
+        match self {
+            SolverError::PeerConflict { eresolve, .. } => eresolve.as_deref(),
+            _ => None,
         }
     }
 
@@ -179,6 +198,7 @@ impl SolverError {
                 found_location,
                 required_by,
                 message,
+                ..
             } => Some((
                 parent.as_str(),
                 peer.as_str(),
