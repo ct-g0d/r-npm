@@ -1210,7 +1210,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
-        if replace_transitive_root_peer {
+        if replace_transitive_root_peer
+            && crate::hoisting::provider_accepts_version(
+                &self.graph,
+                &root_slot,
+                &chosen_version.version,
+            )
+        {
+            // Node#canReplace: every dependent accepts the new version, so it
+            // takes the old node's place instead of nesting around it.
+            self.detach_subtree(&root_slot);
+            placement = PlacementDecision::PlaceNew(root_slot.clone());
+        } else if replace_transitive_root_peer {
             let existing = &self.graph.nodes[&root_slot];
             let pinned_by_peer = self.graph.edges.iter().any(|edge| {
                 edge.to_location == root_slot
@@ -1624,6 +1635,46 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// requires its version. Direct root dependencies are never moved, and
     /// ambiguous multi-parent occupants are left untouched for the normal
     /// conflict-nesting path.
+    /// Removes a node, the nodes nested under it and its outgoing edges, then
+    /// any hoisted node left with no incoming edge (Arborist prunes them).
+    fn detach_subtree(&mut self, location: &str) {
+        let nested = format!("{location}/node_modules/");
+        let mut removed: Vec<String> = self
+            .graph
+            .nodes
+            .keys()
+            .filter(|key| key.as_str() == location || key.starts_with(&nested))
+            .cloned()
+            .collect();
+        while let Some(gone) = removed.pop() {
+            if gone != location {
+                self.graph.nodes.remove(&gone);
+            }
+            let orphans: Vec<String> = self
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from_location == gone)
+                .map(|edge| edge.to_location.clone())
+                .collect();
+            self.graph.edges.retain(|edge| edge.from_location != gone);
+            for orphan in orphans {
+                if orphan != location
+                    && orphan.contains("node_modules/")
+                    && self.graph.nodes.contains_key(&orphan)
+                    && !self
+                        .graph
+                        .edges
+                        .iter()
+                        .any(|edge| edge.to_location == orphan)
+                {
+                    removed.push(orphan);
+                }
+            }
+        }
+        self.graph.nodes.remove(location);
+    }
+
     fn rehome_transitive_root_node(&mut self, root_location: &str, install_name: &str) -> bool {
         if let Some(ref lockfile) = self.options.lockfile {
             if lockfile.packages.contains_key(root_location)

@@ -428,6 +428,9 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
+  'a-star-peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'pinning-optional-owner':{'1.0.0':{peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'z-pinning-parent':{'1.0.0':{dependencies:{'pinning-optional-owner':'1.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
@@ -556,6 +559,9 @@ add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
 });
 // The full report npm writes beside the debug log, with its paths normalized.
 const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs');const files=fs.existsSync(logs)?fs.readdirSync(logs).filter(f=>f.endsWith('-eresolve-report.txt')):[];return files.map(f=>fs.readFileSync(path.join(logs,f),'utf8').replaceAll(logs,'<logs>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-/g,'<timestamp>-'));};
+// A provider placed for a `*` peer is replaced, not nested around, when a later
+// package's optional peer pins a version every existing dependent accepts.
+for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
 // npm's ERESOLVE explanation: a root-held node, a peer set placed beside
 // another package's peer, and an optional peer the root pins.
 for(const [name,fields,flags=[]] of [
