@@ -221,10 +221,8 @@ impl DependencyGraph {
                 continue;
             }
             for (name, spec) in &node.peer_dependencies {
-                // Node#loadDeps: a later dependency type replaces the peer edge.
                 if node.dependencies.contains_key(name)
                     || node.optional_dependencies.contains_key(name)
-                    || node.dev_dependencies.contains_key(name)
                 {
                     continue;
                 }
