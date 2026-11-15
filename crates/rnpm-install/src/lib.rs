@@ -48,6 +48,7 @@ pub use dedupe::{
 
 mod bundled;
 pub mod fast_path;
+mod legacy_lock;
 pub use fast_path::{
     compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
 };
@@ -284,7 +285,16 @@ fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<Package
                     .unwrap_or_default(),
                 dev_dependencies: pkg.dev_dependencies.clone().unwrap_or_default(),
                 peer_dependencies: pkg.peer_dependencies.clone().unwrap_or_default(),
-                peer_dependencies_meta: BTreeMap::new(),
+                peer_dependencies_meta: pkg
+                    .peer_dependencies_meta
+                    .iter()
+                    .flatten()
+                    .filter_map(|(k, v)| {
+                        serde_json::from_value(v.clone())
+                            .ok()
+                            .map(|meta| (k.clone(), meta))
+                    })
+                    .collect(),
                 optional_dependencies: pkg.optional_dependencies.clone().unwrap_or_default(),
                 os: pkg.os.clone(),
                 cpu: pkg.cpu.clone(),
@@ -296,8 +306,25 @@ fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<Package
                     _ => BTreeMap::new(),
                 },
                 has_install_script: pkg.has_install_script == Some(true),
-                deprecated: None,
-                extra: BTreeMap::new(),
+                deprecated: pkg
+                    .extra
+                    .get("deprecated")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_owned),
+                extra: pkg
+                    .extra
+                    .iter()
+                    .filter(|(k, _)| matches!(k.as_str(), "funding" | "deprecated"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    // Bundled children ship in the owner's tarball; the solver
+                    // must not resolve them from the registry.
+                    .chain(
+                        pkg.bundle_dependencies
+                            .as_ref()
+                            .and_then(|b| serde_json::to_value(b).ok())
+                            .map(|b| ("bundleDependencies".to_string(), b)),
+                    )
+                    .collect(),
             };
             versions.insert(ver_str.clone(), ver_meta);
         }
@@ -1967,6 +1994,20 @@ impl Installer {
         }
     }
 
+    /// npm's `#inflateAncientLockfile` for a lockfileVersion 1 lock: warn,
+    /// then hydrate its entries from abbreviated registry manifests. Offline
+    /// installs keep the migrated entries.
+    async fn hydrate_old_lockfile(&self, lockfile: &mut LockfileV3) -> HashSet<String> {
+        // npm stays quiet when the lock will not be written back as v3.
+        if !self.options.silent && self.options.lockfile_version >= 3 {
+            eprintln!("{}", legacy_lock::OLD_LOCKFILE_WARNING);
+        }
+        if self.options.offline {
+            return HashSet::new();
+        }
+        legacy_lock::hydrate_old_lockfile(&self.registry_client, lockfile).await
+    }
+
     /// npm's post-reify advisory about install scripts the allowScripts
     /// policy does not cover.
     fn warn_unreviewed_scripts(&self, lockfile: &LockfileV3, base_dir: &Path) {
@@ -2177,7 +2218,11 @@ impl Installer {
         {
             let (lockfile_path, _) = resolve_lockfile_path(&self.options.project_dir);
             if lockfile_path.exists() {
-                if let Ok(lockfile_str) = std::fs::read_to_string(&lockfile_path) {
+                // An old lock is always rebuilt and rewritten, as npm does.
+                if let Some(lockfile_str) = std::fs::read_to_string(&lockfile_path)
+                    .ok()
+                    .filter(|s| !legacy_lock::is_old_lockfile(s))
+                {
                     if let Ok(existing_lockfile) = rnpm_lockfile::parse_and_migrate(&lockfile_str) {
                         if existing_lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
                             info!(
@@ -2515,13 +2560,21 @@ impl Installer {
         }
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
+        let mut hydrated_locations = HashSet::new();
         let existing_lockfile = if !self.options.package_lock_enabled() {
             None
         } else if lockfile_path.exists() {
-            std::fs::read_to_string(&lockfile_path)
-                .ok()
-                .and_then(|s| rnpm_lockfile::parse_and_migrate(&s).ok())
-                .map(Arc::new)
+            let raw = std::fs::read_to_string(&lockfile_path).ok();
+            let mut lock = raw
+                .as_deref()
+                .and_then(|s| rnpm_lockfile::parse_and_migrate(s).ok());
+            if let Some(lock) = lock
+                .as_mut()
+                .filter(|_| raw.as_deref().is_some_and(legacy_lock::is_old_lockfile))
+            {
+                hydrated_locations = self.hydrate_old_lockfile(lock).await;
+            }
+            lock.map(Arc::new)
         } else if self.options.is_global {
             LockfileV3::load_hidden(&loc_base_dir).ok().map(Arc::new)
         } else {
@@ -2763,6 +2816,9 @@ impl Installer {
         // 3. For --package-lock-only, write package-lock.json and skip disk reification & lifecycle scripts
         if self.options.package_lock_only {
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
+            if let Some(ref existing) = existing_lockfile_for_merge {
+                legacy_lock::restore_hydrated_entries(&mut lockfile, existing, &hydrated_locations);
+            }
             for (loc, node) in &graph.nodes {
                 if let Some(ref res) = node.resolved {
                     if let Some(rel_file) = res.strip_prefix("file:") {
@@ -4234,6 +4290,9 @@ impl Installer {
                 Some(&in_memory_manifests),
             );
             self.enrich_lockfile_from_registry(&mut lockfile).await?;
+            if let Some(ref existing) = existing_lockfile_for_merge {
+                legacy_lock::restore_hydrated_entries(&mut lockfile, existing, &hydrated_locations);
+            }
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if package_lock_enabled && !self.options.is_global && !self.options.no_save {
                 lockfile
@@ -4389,6 +4448,10 @@ impl Installer {
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
         let mut lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
             .with_context(|| format!("Failed to parse {lockfile_name}"))?;
+        // npm ci inflates an old lock internally; the public lock is untouched.
+        if legacy_lock::is_old_lockfile(&lockfile_str) {
+            self.hydrate_old_lockfile(&mut lockfile).await;
+        }
         let platform_skipped_packages =
             lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
 

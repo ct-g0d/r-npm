@@ -90,7 +90,7 @@ const server=http.createServer((req,res)=>{
   if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
   if(probePackages.has(name)){
     const metadata=probePackages.get(name);
-    if(['metadata-probe','platform-full'].includes(name)&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,libc,...abbreviated}=m;return [v,abbreviated];}))});
+    if(['metadata-probe','platform-full','legacy-owner','legacy-native'].includes(name)&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,libc,...abbreviated}=m;return [v,abbreviated];}))});
     return json(metadata);
   }
   if(['dep','parent','changing'].includes(name)){
@@ -461,6 +461,8 @@ for(const [name,versions] of Object.entries({
   'a-broad-peer-plugin':{'1.0.0':{peerDependencies:{shared:'*'}}},
   'nested-optional-owner':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'}}},
   'nested-optional-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'legacy-owner':{'1.0.0':{license:'MIT',bin:'index.js',dependencies:{shared:'>=1.0.0'},optionalDependencies:{'legacy-native':'1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}},
+  'legacy-native':{'1.0.0':{license:'MIT',os:[process.platform==='win32'?'darwin':'win32']}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -497,6 +499,19 @@ add('install-full-packument-metadata-lock-only','install',['install','--ignore-s
 const platformForms=dir=>manifest(dir,{optionalDependencies:{'platform-scalar':'1.0.0','platform-array':'1.0.0','platform-full':'1.0.0'}});
 for(const flags of [[],['--package-lock-only']])add(`install-platform-forms${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],platformForms);
 add('ci-platform-forms','ci',['ci','--ignore-scripts'],platformForms,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+// lockfileVersion 1 carries no package metadata: npm inflates every entry from
+// the abbreviated manifest (requires -> optional deps, os, bin; no license).
+const legacyLock=dir=>{
+  manifest(dir,{dependencies:{'legacy-owner':'1.0.0'}});
+  const entry=(name,version,fields={})=>{const {tarball,integrity}=probePackages.get(name).versions[version].dist;return {version,resolved:tarball,integrity,...fields};};
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:1,requires:true,dependencies:{
+    'legacy-native':entry('legacy-native','1.0.0',{optional:true}),
+    'legacy-owner':entry('legacy-owner','1.0.0',{requires:{'legacy-native':'1.0.0',shared:'>=1.0.0'}}),
+    shared:entry('shared','1.0.0'),
+  }});
+};
+for(const flags of [[],['--package-lock-only']])add(`install-v1-lockfile-hydration${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],legacyLock);
+add('ci-v1-lockfile-hydration','ci',['ci','--ignore-scripts'],legacyLock);
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
 add('ci-bundled-lock-entries','ci',['ci','--ignore-scripts'],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
