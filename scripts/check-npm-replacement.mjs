@@ -431,6 +431,7 @@ for(const [name,versions] of Object.entries({
   'overlap-missing':{'1.0.0':{optionalDependencies:{shared:'9.0.0'},peerDependencies:{shared:'2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'a-late-peer':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'b-late-writer':{'1.0.0':{dependencies:{shared:'^1.0.0'}}},
+  'b-late-required':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'a-late-peer-children':{'1.0.0':{peerDependencies:{'late-provider':'2.0.0'},peerDependenciesMeta:{'late-provider':{optional:true}}}},
   'b-late-writer-children':{'1.0.0':{dependencies:{'late-provider':'1.0.0'}}},
   'late-provider':{'1.0.0':{dependencies:{shared:'1.0.0'}},'2.0.0':{dependencies:{shared:'2.0.0'}}},
@@ -479,6 +480,8 @@ for(const [name,versions] of Object.entries({
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-late-optional-peer-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
 add('materialization-shared-optional-native','install',['install','--ignore-scripts'],dir=>manifest(dir,{optionalDependencies:{'a-unsupported-parent':'1.0.0','shared-native':'1.0.0'}}));
+add('resolver-late-optional-peer-required-provider','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-required':'1.0.0'}}));
+add('cli-silent-registry-error','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'silent-missing':'1.0.0'}}));
 add('resolver-late-optional-peer-children','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer-children':'1.0.0','b-late-writer-children':'1.0.0'}}));
 add('resolver-late-optional-peer-no-save','install',['install','--ignore-scripts','--no-save'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
 for(const owner of ['overlap-owner','overlap-wrapper','overlap-missing'])add(`resolver-optional-peer-overlap-${owner}`,'install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{[owner]:'1.0.0',shared:'2.0.0'}}));

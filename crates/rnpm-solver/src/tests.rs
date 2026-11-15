@@ -6434,3 +6434,28 @@ fn test_legacy_peer_deps_adds_no_late_optional_peer_edges() {
         .all(|e| e.install_name != "provider"));
     assert!(graph.nodes["node_modules/provider"].flags.dev);
 }
+
+#[test]
+fn required_peer_provider_cannot_move_beneath_its_owner() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("shared", "1.0.0", |_| {});
+    provider.add_version("shared", "2.0.0", |_| {});
+    provider.add_version("a-owner", "1.0.0", |v| {
+        v.peer_dependencies.insert("shared".into(), "2.0.0".into());
+        v.peer_dependencies_meta
+            .insert("shared".into(), PeerDependencyMeta { optional: true });
+    });
+    provider.add_version("b-owner", "1.0.0", |v| {
+        v.peer_dependencies.insert("shared".into(), "1.0.0".into());
+    });
+    let mut manifest = Manifest::default();
+    manifest
+        .dependencies
+        .insert("a-owner".into(), "1.0.0".into());
+    manifest
+        .dependencies
+        .insert("b-owner".into(), "1.0.0".into());
+    let error =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap_err();
+    assert!(matches!(error, crate::SolverError::PeerConflict { .. }));
+}

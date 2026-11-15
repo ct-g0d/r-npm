@@ -7257,6 +7257,7 @@ fn npm_json_error(block: &str) -> String {
 }
 
 fn finish_cli_error(err: &anyhow::Error) -> ! {
+    let silent = is_loglevel_silent(&std::env::current_dir().unwrap_or_default());
     if err.is::<commands::login::InputClosed>() {
         std::process::exit(1);
     }
@@ -7264,7 +7265,7 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         std::process::exit(1);
     }
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
-        if exit.message.starts_with("npm error ") {
+        if !silent && exit.message.starts_with("npm error ") {
             eprintln!("{}", exit.message);
         }
         write_error_log(err);
@@ -7279,10 +7280,10 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         };
         println!("{}", npm_json_error(&block));
     }
-    if rendered.starts_with("npm error ") {
+    if !silent && rendered.starts_with("npm error ") {
         // Already a complete npm error block: keep its code and blank lines.
         eprintln!("{}", rendered.trim_end());
-    } else {
+    } else if !silent {
         let diagnostic = diagnostics::classify_error(err);
         if diagnostic.message.starts_with("npm error ") {
             eprintln!("{}", diagnostic.message);
@@ -7312,12 +7313,15 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
 fn write_error_log(err: &anyhow::Error) {
     use std::io::Write;
     let cwd = std::env::current_dir().unwrap_or_default();
+    let silent = is_loglevel_silent(&cwd);
     let config = rnpm_config::Config::load(Some(&cwd)).unwrap_or_default();
     if let Some(max) = config
         .get("logs-max")
         .filter(|v| v.parse::<i64>().is_ok_and(|n| n <= 0))
     {
-        eprintln!("npm error Log files were not written due to the config logs-max={max}");
+        if !silent {
+            eprintln!("npm error Log files were not written due to the config logs-max={max}");
+        }
         return;
     }
     let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
@@ -7348,10 +7352,12 @@ fn write_error_log(err: &anyhow::Error) {
         .find(|a| !a.starts_with('-'))
         .is_some_and(|c| c == "completion");
     if !dir_created || is_completion {
-        eprintln!(
+        if !silent {
+            eprintln!(
             "npm error Log files were not written due to an error writing to the directory: {}\nnpm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal",
             log_dir.display()
         );
+        }
         return;
     }
     for index in 0..10 {
@@ -7362,7 +7368,9 @@ fn write_error_log(err: &anyhow::Error) {
             .open(&log)
         {
             Ok(mut file) => {
-                if writeln!(file, "0 verbose cwd {}\n1 error {err:#}", cwd.display()).is_ok() {
+                if writeln!(file, "0 verbose cwd {}\n1 error {err:#}", cwd.display()).is_ok()
+                    && !silent
+                {
                     eprintln!(
                         "npm error A complete log of this run can be found in: {}",
                         log.display()
