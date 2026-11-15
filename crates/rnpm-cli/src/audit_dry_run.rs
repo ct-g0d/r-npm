@@ -15,6 +15,7 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_solver::arborist_compare;
 
 use crate::audit::AuditReport;
+use rnpm_install::reify_report::same_node;
 
 /// A tree node: its location and whether it comes from the ideal tree.
 type NodeId = (String, bool);
@@ -157,8 +158,7 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
             // A vulnerable old node the ideal tree replaces: detach it and
             // queue the replacement.
             match ideal.packages.get(&to) {
-                Some(next)
-                    if next.version == to_pkg.version && next.resolved == to_pkg.resolved => {}
+                Some(next) if same_node(next, to_pkg) => {}
                 Some(next) => {
                     detached.insert(to.clone());
                     tree.insert(to.clone(), (true, next));
@@ -174,17 +174,18 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
 
     // The finished ideal tree prunes every old node it no longer holds (for
     // example a dependency a replaced parent dropped); those are detached too.
-    let pruned: Vec<String> =
-        tree.iter()
-            .filter(|(loc, (new, pkg))| {
-                !loc.is_empty()
-                    && !*new
-                    && ideal.packages.get(*loc).is_none_or(|next| {
-                        next.version != pkg.version || next.resolved != pkg.resolved
-                    })
-            })
-            .map(|(loc, _)| loc.clone())
-            .collect();
+    let pruned: Vec<String> = tree
+        .iter()
+        .filter(|(loc, (new, pkg))| {
+            !loc.is_empty()
+                && !*new
+                && ideal
+                    .packages
+                    .get(*loc)
+                    .is_none_or(|next| !same_node(next, pkg))
+        })
+        .map(|(loc, _)| loc.clone())
+        .collect();
     for loc in pruned {
         tree.remove(&loc);
         detached.insert(loc);

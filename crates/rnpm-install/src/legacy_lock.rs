@@ -14,24 +14,49 @@ use rnpm_registry::metadata::AbbreviatedVersion;
 use rnpm_registry::RegistryClient;
 use serde::Deserialize;
 
-pub(crate) const OLD_LOCKFILE_WARNING: &str = "npm warn old lockfile
-npm warn old lockfile The package-lock.json file was created with an old version of npm,
-npm warn old lockfile so supplemental metadata must be fetched from the registry.
-npm warn old lockfile
-npm warn old lockfile This is a one-time fix-up, please be patient...
-npm warn old lockfile";
+#[derive(Deserialize)]
+struct Header {
+    #[serde(rename = "lockfileVersion")]
+    lockfile_version: Option<u64>,
+    #[serde(default)]
+    requires: Option<bool>,
+}
+
+fn header(raw: &str) -> Option<Header> {
+    serde_json::from_str(raw).ok()
+}
 
 /// True when the raw lockfile text predates lockfileVersion 2.
 pub(crate) fn is_old_lockfile(raw: &str) -> bool {
-    #[derive(Deserialize)]
-    struct Version {
-        #[serde(rename = "lockfileVersion")]
-        lockfile_version: Option<u64>,
-    }
-    serde_json::from_str::<Version>(raw)
-        .ok()
-        .and_then(|v| v.lockfile_version)
+    header(raw)
+        .and_then(|h| h.lockfile_version)
         .is_some_and(|v| v < 2)
+}
+
+/// npm's warning before inflating an old lock. Shrinkwrap's
+/// `ancientLockfile` (a pre-v2 lock without `requires`) changes the heading.
+pub(crate) fn old_lockfile_warning(raw: &str, file_name: &str) -> String {
+    let ancient = header(raw).is_some_and(|h| h.requires != Some(true));
+    let heading = if ancient {
+        "ancient lockfile"
+    } else {
+        "old lockfile"
+    };
+    [
+        String::new(),
+        format!("The {file_name} file was created with an old version of npm,"),
+        "so supplemental metadata must be fetched from the registry.".into(),
+        String::new(),
+        "This is a one-time fix-up, please be patient...".into(),
+        String::new(),
+    ]
+    .iter()
+    .map(|line| format!("npm warn {heading} {line}").trim_end().to_string())
+    .collect::<Vec<_>>()
+    .join(
+        "
+",
+    )
 }
 
 /// Package name for a hydratable registry entry, or `None` for the root,
@@ -219,6 +244,27 @@ mod tests {
         assert!(!is_old_lockfile(r#"{"lockfileVersion":2}"#));
         assert!(!is_old_lockfile(r#"{"lockfileVersion":3}"#));
         assert!(!is_old_lockfile("not json"));
+    }
+
+    #[test]
+    fn warning_names_the_file_and_ancient_heading() {
+        let old = old_lockfile_warning(
+            r#"{"lockfileVersion":1,"requires":true}"#,
+            "npm-shrinkwrap.json",
+        );
+        assert!(old.starts_with(
+            "npm warn old lockfile
+npm warn old lockfile The npm-shrinkwrap.json file"
+        ));
+        assert!(old.ends_with(
+            "patient...
+npm warn old lockfile"
+        ));
+        let ancient = old_lockfile_warning(r#"{"lockfileVersion":1}"#, "package-lock.json");
+        assert!(ancient.starts_with(
+            "npm warn ancient lockfile
+"
+        ));
     }
 
     #[test]

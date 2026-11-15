@@ -316,6 +316,11 @@ for(const [name,args]of [['json',['audit','--json']],['text',['audit']],['fix-dr
   for(const [name,child]of [['audit-top','audit-middle'],['audit-middle','audit-branch'],['audit-branch','audit-leaf'],['audit-leaf',null]])packages['node_modules/'+name]={version:'1.0.0',...(child?{dependencies:{[child]:'^1.0.0'}}:{})};
   manifest(dir,{dependencies:{'audit-top':'^1.0.0'}});write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages});
 },{advisories:{'audit-leaf':[{id:106,name:'audit-leaf',url:'https://example.invalid/advisory/106',title:'Deep chain advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
+// A root-pinned vulnerable node stays in place; a lock entry without resolved is still the same node.
+for(const [name,args]of [['json',['audit','fix','--dry-run','--json']],['text',['audit','fix','--dry-run']]])add(`audit-fix-dry-pinned-kept-${name}`,'audit',args,dir=>{
+  manifest(dir,{dependencies:{'audit-branch':'^1.0.0','audit-leaf':'1.0.0'}});
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':{name:'readiness-case',version:'1.0.0',dependencies:{'audit-branch':'^1.0.0','audit-leaf':'1.0.0'}},'node_modules/audit-branch':{version:'1.0.0',dependencies:{'audit-leaf':'^1.0.0'}},'node_modules/audit-leaf':{version:'1.0.0'}}});
+},{advisories:{'audit-leaf':[{id:108,name:'audit-leaf',url:'https://example.invalid/advisory/108',title:'Pinned advisory',severity:'high',vulnerable_versions:'<2.0.0',cwe:[],cvss:{score:7.5,vectorString:null}}]}});
 // A fixed parent that drops its vulnerable dependency: npm prunes (detaches) both old nodes.
 probePackages.set('audit-prune-parent',{name:'audit-prune-parent','dist-tags':{latest:'1.1.0'},versions:{'1.0.0':{name:'audit-prune-parent',version:'1.0.0',dependencies:{'audit-prune-leaf':'^1.0.0'}},'1.1.0':{name:'audit-prune-parent',version:'1.1.0'}}});
 probePackages.set('audit-prune-leaf',{name:'audit-prune-leaf','dist-tags':{latest:'1.0.0'},versions:{'1.0.0':{name:'audit-prune-leaf',version:'1.0.0'}}});
@@ -519,6 +524,8 @@ const legacyLock=dir=>{
 };
 for(const flags of [[],['--package-lock-only']])add(`install-v1-lockfile-hydration${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],legacyLock);
 add('ci-v1-lockfile-hydration','ci',['ci','--ignore-scripts'],legacyLock);
+// Naming a hydrated package re-resolves it from full metadata (license included).
+add('install-v1-lockfile-named-lock-only','install',['install','legacy-owner@1.0.0','--ignore-scripts','--package-lock-only'],legacyLock);
 add('install-normalizes-historical-full-metadata','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{dependencies:{'historic-metadata':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-lock-entries${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}));
 add('ci-bundled-lock-entries','ci',['ci','--ignore-scripts'],dir=>manifest(dir,{devDependencies:{'bundle-owner':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});

@@ -220,7 +220,12 @@ pub fn mark_root_bundles(
         if !seen.insert(location.clone()) {
             continue;
         }
-        if let Some(package) = lockfile.packages.get_mut(&location) {
+        // npm records only `resolved` and `link` for a link entry.
+        if let Some(package) = lockfile
+            .packages
+            .get_mut(&location)
+            .filter(|p| p.link != Some(true))
+        {
             package.in_bundle = Some(true);
         }
         queue.extend(
