@@ -531,6 +531,26 @@ add('install-v1-lockfile-named-sole-lock-only','install',['install','metadata-pr
   const {tarball,integrity}=probePackages.get('metadata-probe').versions['1.0.0'].dist;
   write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:1,requires:true,dependencies:{'metadata-probe':{version:'1.0.0',resolved:tarball,integrity}}});
 });
+// npm-package-arg rejects protocols it does not know (yarn/pnpm workspace:, patch:, link:).
+for(const [name,spec] of [['workspace','workspace:*'],['patch','patch:dep@npm%3A1.0.0#~/.yarn/patches/dep.patch'],['link','link:../elsewhere']])add(`install-unsupported-protocol-${name}`,'install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{dep:'^1.0.0'},devDependencies:{tool:spec}}));
+add('install-unsupported-protocol-workspace-member','install',['install','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*']});
+  manifest(path.join(dir,'packages/a'),{name:'a',version:'1.0.0'});
+  manifest(path.join(dir,'packages/b'),{name:'b',version:'1.0.0',dependencies:{a:'workspace:^'}});
+});
+// Only each name's effective edge is parsed: optional overrides prod, and
+// legacy peer handling loads no peer edges.
+add('install-unsupported-protocol-overridden-by-optional','install',['install','--ignore-scripts'],dir=>{
+  manifest(dir,{dependencies:{local:'workspace:*'},optionalDependencies:{local:'file:./local'}});
+  manifest(path.join(dir,'local'),{name:'local',version:'1.0.0'});
+});
+add('install-unsupported-protocol-legacy-peer','install',['install','--ignore-scripts','--legacy-peer-deps'],dir=>manifest(dir,{dependencies:{dep:'^1.0.0'},peerDependencies:{tool:'workspace:*'}}));
+// npm links cyclic workspace siblings without complaint.
+add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
+  manifest(dir,{workspaces:['packages/*']});
+  manifest(path.join(dir,'packages/a'),{name:'a',version:'1.0.0',dependencies:{b:'^1.0.0'}});
+  manifest(path.join(dir,'packages/b'),{name:'b',version:'1.0.0',dependencies:{a:'^1.0.0'}});
+});
 // A bundled link's target has no parent in npm's tree: nothing behind it is inBundle.
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-link-target${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>{
   manifest(dir,{dependencies:{x:'file:x'},bundleDependencies:['x']});
