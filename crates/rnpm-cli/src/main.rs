@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
+mod audit_dry_run;
 pub mod commands;
 pub mod diagnostics;
 pub mod diff;
@@ -4677,24 +4678,11 @@ async fn run_audit_fix(
     // npm reifies, then prints the detailed audit report of the new tree.
     let report = summary.reify.unwrap_or_default();
     let post_report = if dry_run {
-        // A dry run audits the old tree; nodes the plan replaces are detached
-        // from it, so npm prints them with an empty location.
+        // A dry run prints the old tree's report as building the ideal tree
+        // left it.
         let mut post = initial_report;
-        let replaced: std::collections::HashSet<&str> = report
-            .changes
-            .iter()
-            .filter_map(|c| match c {
-                rnpm_install::ReifyChange::Change { from, .. }
-                | rnpm_install::ReifyChange::Remove(from) => Some(from.location.as_str()),
-                rnpm_install::ReifyChange::Add(_) => None,
-            })
-            .collect();
-        for vuln in post.vulnerabilities.values_mut() {
-            for node in &mut vuln.nodes {
-                if replaced.contains(node.as_str()) {
-                    node.clear();
-                }
-            }
+        if let Some(ideal) = installer.dry_run_ideal() {
+            audit_dry_run::apply(&mut post, &existing_lockfile, ideal);
         }
         post
     } else {

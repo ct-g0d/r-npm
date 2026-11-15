@@ -263,6 +263,101 @@ pub struct AuditReport {
 }
 
 /// Helper to parse package name from lockfile package key.
+/// Arborist inventory counts for an audit report's `metadata.dependencies`.
+pub(crate) fn dependency_counts(lockfile: &rnpm_lockfile::LockfileV3) -> DependenciesCount {
+    let root_pkg = lockfile.packages.get("");
+    let root_peer_deps: BTreeSet<String> = root_pkg
+        .and_then(|root| root.peer_dependencies.as_ref())
+        .map(|deps| deps.keys().cloned().collect())
+        .unwrap_or_default();
+    let root_peer_meta = root_pkg.and_then(|root| root.peer_dependencies_meta.as_ref());
+
+    // Arborist's inventory includes the project root in prod, while total
+    // excludes it. This also applies to an otherwise empty project.
+    let mut dep_counts = DependenciesCount {
+        prod: 1,
+        ..Default::default()
+    };
+
+    for (key, pkg) in &lockfile.packages {
+        if key.is_empty() {
+            continue;
+        }
+        if !key.starts_with("node_modules/") || pkg.link.unwrap_or(false) {
+            continue;
+        }
+
+        let name = extract_pkg_name(key, pkg.name.as_deref());
+
+        dep_counts.total += 1;
+        let is_dev = pkg.dev.unwrap_or(false)
+            || pkg
+                .extra
+                .get("dev")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let is_optional = pkg.optional.unwrap_or(false)
+            || pkg
+                .extra
+                .get("optional")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let is_dev_optional = pkg.dev_optional.unwrap_or(false)
+            || pkg
+                .extra
+                .get("devOptional")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            || (is_dev && is_optional);
+
+        let is_declared_peer = root_peer_deps.contains(&name)
+            || pkg.peer.unwrap_or(false)
+            || pkg
+                .extra
+                .get("peer")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+        let is_declared_peer_optional = pkg.peer_optional.unwrap_or(false)
+            || pkg
+                .extra
+                .get("peerOptional")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            || (root_peer_deps.contains(&name)
+                && root_peer_meta
+                    .and_then(|m| m.get(&name))
+                    .and_then(|v| v.get("optional"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false));
+
+        if is_declared_peer_optional {
+            dep_counts.peer_optional += 1;
+        }
+        if is_declared_peer {
+            dep_counts.peer += 1;
+        }
+        if is_dev {
+            dep_counts.dev += 1;
+        }
+        if is_optional {
+            dep_counts.optional += 1;
+        }
+        if is_dev_optional {
+            dep_counts.dev_optional += 1;
+        }
+        if !is_dev
+            && !is_optional
+            && !is_dev_optional
+            && !is_declared_peer
+            && !is_declared_peer_optional
+        {
+            dep_counts.prod += 1;
+        }
+    }
+    dep_counts
+}
+
 fn extract_pkg_name(key: &str, declared_name: Option<&str>) -> String {
     if let Some(n) = declared_name {
         return n.to_string();
@@ -442,23 +537,11 @@ pub async fn build_audit_report_with_advisories(
         }
     }
 
-    let root_peer_deps: BTreeSet<String> = root_pkg
-        .and_then(|root| root.peer_dependencies.as_ref())
-        .map(|deps| deps.keys().cloned().collect())
-        .unwrap_or_default();
-
-    let root_peer_meta = root_pkg.and_then(|root| root.peer_dependencies_meta.as_ref());
-
     // Map: package name -> list of installed versions
     let mut bulk_request: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut installed_packages: Vec<(String, String, String, bool)> = Vec::new(); // (key, name, version, is_direct)
 
-    // Arborist's inventory includes the project root in prod, while total
-    // excludes it. This also applies to an otherwise empty project.
-    let mut dep_counts = DependenciesCount {
-        prod: 1,
-        ..Default::default()
-    };
+    let dep_counts = dependency_counts(&lockfile);
 
     for (key, pkg) in &lockfile.packages {
         if key.is_empty() {
@@ -471,72 +554,6 @@ pub async fn build_audit_report_with_advisories(
         }
 
         let name = extract_pkg_name(key, pkg.name.as_deref());
-
-        dep_counts.total += 1;
-        let is_dev = pkg.dev.unwrap_or(false)
-            || pkg
-                .extra
-                .get("dev")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        let is_optional = pkg.optional.unwrap_or(false)
-            || pkg
-                .extra
-                .get("optional")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-        let is_dev_optional = pkg.dev_optional.unwrap_or(false)
-            || pkg
-                .extra
-                .get("devOptional")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            || (is_dev && is_optional);
-
-        let is_declared_peer = root_peer_deps.contains(&name)
-            || pkg.peer.unwrap_or(false)
-            || pkg
-                .extra
-                .get("peer")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-        let is_declared_peer_optional = pkg.peer_optional.unwrap_or(false)
-            || pkg
-                .extra
-                .get("peerOptional")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            || (root_peer_deps.contains(&name)
-                && root_peer_meta
-                    .and_then(|m| m.get(&name))
-                    .and_then(|v| v.get("optional"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false));
-
-        if is_declared_peer_optional {
-            dep_counts.peer_optional += 1;
-        }
-        if is_declared_peer {
-            dep_counts.peer += 1;
-        }
-        if is_dev {
-            dep_counts.dev += 1;
-        }
-        if is_optional {
-            dep_counts.optional += 1;
-        }
-        if is_dev_optional {
-            dep_counts.dev_optional += 1;
-        }
-        if !is_dev
-            && !is_optional
-            && !is_dev_optional
-            && !is_declared_peer
-            && !is_declared_peer_optional
-        {
-            dep_counts.prod += 1;
-        }
 
         let version_str = match &pkg.version {
             Some(v) => v.clone(),

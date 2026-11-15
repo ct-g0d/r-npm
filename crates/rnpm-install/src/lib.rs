@@ -821,8 +821,12 @@ impl RegistryPackageProvider {
             }
         }
 
-        // Cache miss: check lockfile first
-        if let Some(ref lf) = self.lockfile {
+        // Cache miss: check lockfile first (an unlocked package re-resolves)
+        if let Some(lf) = self
+            .lockfile
+            .as_ref()
+            .filter(|_| !self.unlocked_packages.contains(name))
+        {
             if let Some(meta) = package_metadata_from_lockfile(name, lf) {
                 return Ok(meta);
             }
@@ -1759,6 +1763,8 @@ pub struct Installer {
     source_policy: policy::SourcePolicy,
     script_policy: policy::ScriptPolicy,
     engine_strict: bool,
+    /// The ideal lockfile a --dry-run install planned but did not write.
+    dry_run_ideal: Option<LockfileV3>,
 }
 
 impl Installer {
@@ -1916,6 +1922,7 @@ impl Installer {
             source_policy,
             script_policy,
             engine_strict: config.get_bool("engine-strict").unwrap_or(false),
+            dry_run_ideal: None,
         })
     }
 
@@ -1997,15 +2004,28 @@ impl Installer {
     /// npm's `#inflateAncientLockfile` for a lockfileVersion 1 lock: warn,
     /// then hydrate its entries from abbreviated registry manifests. Offline
     /// installs keep the migrated entries.
-    async fn hydrate_old_lockfile(&self, lockfile: &mut LockfileV3) -> HashSet<String> {
+    async fn hydrate_old_lockfile(
+        &self,
+        lockfile: &mut LockfileV3,
+        raw: &str,
+        skip_names: &HashSet<String>,
+    ) -> HashSet<String> {
         // npm stays quiet when the lock will not be written back as v3.
-        if !self.options.silent && self.options.lockfile_version >= 3 {
-            eprintln!("{}", legacy_lock::OLD_LOCKFILE_WARNING);
+        // build-ideal-tree warns for an ancient lock regardless.
+        if !self.options.silent
+            && (legacy_lock::is_ancient_lockfile(raw) || self.options.lockfile_version >= 3)
+        {
+            let (path, _) = resolve_lockfile_path(&self.options.project_dir);
+            let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            eprintln!(
+                "{}",
+                legacy_lock::old_lockfile_warning(raw, file_name.as_deref().unwrap_or_default())
+            );
         }
         if self.options.offline {
             return HashSet::new();
         }
-        legacy_lock::hydrate_old_lockfile(&self.registry_client, lockfile).await
+        legacy_lock::hydrate_old_lockfile(&self.registry_client, lockfile, skip_names).await
     }
 
     /// npm's post-reify advisory about install scripts the allowScripts
@@ -2073,6 +2093,11 @@ impl Installer {
     }
 
     /// Access the underlying registry client.
+    /// The ideal lockfile planned by the last --dry-run install, if any.
+    pub fn dry_run_ideal(&self) -> Option<&LockfileV3> {
+        self.dry_run_ideal.as_ref()
+    }
+
     pub fn registry_client(&self) -> &RegistryClient {
         &self.registry_client
     }
@@ -2561,6 +2586,7 @@ impl Installer {
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut hydrated_locations = HashSet::new();
+        let mut old_lockfile = false;
         let existing_lockfile = if !self.options.package_lock_enabled() {
             None
         } else if lockfile_path.exists() {
@@ -2572,7 +2598,18 @@ impl Installer {
                 .as_mut()
                 .filter(|_| raw.as_deref().is_some_and(legacy_lock::is_old_lockfile))
             {
-                hydrated_locations = self.hydrate_old_lockfile(lock).await;
+                old_lockfile = true;
+                // A package named on the command line (install or update) is
+                // re-resolved from full metadata, so npm writes a fresh entry;
+                // its trimmed manifest must never shadow that.
+                let named: HashSet<String> = added_pkgs
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .chain(self.options.unlocked_packages.iter().cloned())
+                    .collect();
+                hydrated_locations = self
+                    .hydrate_old_lockfile(lock, raw.as_deref().unwrap_or_default(), &named)
+                    .await;
             }
             lock.map(Arc::new)
         } else if self.options.is_global {
@@ -2587,6 +2624,20 @@ impl Installer {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
 
+        // A named package in an old lock is re-resolved from registry
+        // metadata, never from its migrated or trimmed hydrated entry.
+        let unlocked_packages: HashSet<String> = self
+            .options
+            .unlocked_packages
+            .iter()
+            .cloned()
+            .chain(
+                added_pkgs
+                    .iter()
+                    .filter(|_| old_lockfile)
+                    .map(|a| a.name.clone()),
+            )
+            .collect();
         let provider = RegistryPackageProvider {
             client: self.registry_client.clone(),
             handle,
@@ -2596,7 +2647,7 @@ impl Installer {
             prefer_offline,
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
-            unlocked_packages: self.options.unlocked_packages.clone(),
+            unlocked_packages: unlocked_packages.clone(),
         };
 
         let resolver_options = ResolverOptions {
@@ -2610,7 +2661,7 @@ impl Installer {
                 || !self.options.unlocked_packages.is_empty()
                 || !self.options.vulnerability_constraints.is_empty(),
             lockfile: existing_lockfile,
-            unlocked_packages: self.options.unlocked_packages.clone(),
+            unlocked_packages,
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),
         };
 
@@ -2744,6 +2795,11 @@ impl Installer {
                         loc == &format!("node_modules/{}", a.name)
                             || loc.starts_with(&format!("node_modules/{}/", a.name))
                     });
+                    // A named package's v1 entry is only the trimmed hydration;
+                    // npm writes the re-resolved node.
+                    if old_lockfile && is_added_pkg {
+                        continue;
+                    }
                     if (self.options.is_global && !is_added_pkg)
                         || (pkg.version == old_pkg.version
                             && pkg.resolved == old_pkg.resolved
@@ -2928,6 +2984,7 @@ impl Installer {
 
         // 3b. For --dry-run, simulate installation and report what would be installed
         if self.options.dry_run {
+            self.dry_run_ideal = Some(lockfile.clone());
             let mut packages_installed = 0;
             for (loc, node) in &graph.nodes {
                 if reify_locations
@@ -4450,7 +4507,8 @@ impl Installer {
             .with_context(|| format!("Failed to parse {lockfile_name}"))?;
         // npm ci inflates an old lock internally; the public lock is untouched.
         if legacy_lock::is_old_lockfile(&lockfile_str) {
-            self.hydrate_old_lockfile(&mut lockfile).await;
+            self.hydrate_old_lockfile(&mut lockfile, &lockfile_str, &HashSet::new())
+                .await;
         }
         let platform_skipped_packages =
             lockfile_platform_skipped_packages(&lockfile, &self.options.platform());

@@ -223,6 +223,22 @@ pub fn compute(
     }
 }
 
+/// Arborist's `Node.matches` over two entries at the same location: integrity
+/// decides when both record one, then resolved, then name and version.
+pub fn same_node(a: &LockfilePackage, b: &LockfilePackage) -> bool {
+    if a.name != b.name || a.link != b.link {
+        return false;
+    }
+    if a.link == Some(true) {
+        return a.resolved == b.resolved;
+    }
+    match (&a.integrity, &b.integrity, &a.resolved, &b.resolved) {
+        (Some(x), Some(y), _, _) => x == y,
+        (_, _, Some(x), Some(y)) => x == y,
+        _ => a.version == b.version,
+    }
+}
+
 /// Simulates arborist's placement order for a freshly built ideal tree:
 /// nodes are processed by depth then location, each placing its missing
 /// dependencies sorted by name, and a placed node is appended to its
@@ -233,9 +249,7 @@ pub fn placement_rank(
     previous: Option<&BTreeMap<String, LockfilePackage>>,
 ) -> HashMap<String, usize> {
     let mut rank = HashMap::new();
-    let same_package = |old: &LockfilePackage, new: &LockfilePackage| {
-        old.version == new.version && old.resolved == new.resolved && old.integrity == new.integrity
-    };
+    let same_package = |old: &LockfilePackage, new: &LockfilePackage| same_node(old, new);
     if let Some(previous) = previous {
         for loc in ideal.keys().filter(|l| {
             previous
