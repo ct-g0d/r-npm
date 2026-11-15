@@ -1673,9 +1673,7 @@ fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
         Some(&"**") => {
             // `**` never matches dot-entries, mirroring minimatch's default.
             match_segments(&pat[1..], txt)
-                || (!txt.is_empty()
-                    && !txt[0].starts_with('.')
-                    && match_segments(pat, &txt[1..]))
+                || (!txt.is_empty() && !txt[0].starts_with('.') && match_segments(pat, &txt[1..]))
         }
         Some(seg) => {
             !txt.is_empty() && match_segment(seg, txt[0]) && match_segments(&pat[1..], &txt[1..])
@@ -1755,12 +1753,19 @@ pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value
     let mut manifest: Option<serde_json::Value> = None;
     for entry in archive.entries().map_err(FsError::Io)? {
         let mut entry = entry.map_err(FsError::Io)?;
-        let raw = entry.path().map_err(FsError::Io)?.to_string_lossy().replace('\\', "/");
+        let raw = entry
+            .path()
+            .map_err(FsError::Io)?
+            .to_string_lossy()
+            .replace('\\', "/");
         let size = entry.header().size().map_err(FsError::Io)?;
         let mode = entry.header().mode().map_err(FsError::Io)?;
         entry_count += 1;
         unpacked_size += size;
-        if let Some(rest) = raw.strip_prefix("package/node_modules/").filter(|r| !r.is_empty()) {
+        if let Some(rest) = raw
+            .strip_prefix("package/node_modules/")
+            .filter(|r| !r.is_empty())
+        {
             let mut parts = rest.split('/');
             let first = parts.next().unwrap_or("");
             let name = if first.starts_with('@') {
@@ -1787,8 +1792,16 @@ pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value
         ))
     })?;
     files.sort_by(|a, b| sort_pack_file_paths(&a.path, &b.path));
-    let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = manifest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let summary = PackSummary {
         filename: compute_tarball_filename(&name, &version),
         name,
@@ -2063,6 +2076,9 @@ mod glob_tests {
     #[test]
     fn matched_directories_cover_their_contents() {
         assert!(match_glob_or_parent("secrets/prod", "secrets/prod/key.pem"));
-        assert!(!match_glob_or_parent("secrets/prod", "secrets/production/key.pem"));
+        assert!(!match_glob_or_parent(
+            "secrets/prod",
+            "secrets/production/key.pem"
+        ));
     }
 }

@@ -174,9 +174,7 @@ async fn test_cli_star_unstar_stars_parity() {
     std::fs::create_dir_all(&localappdata).unwrap();
     std::fs::write(
         &userconfig,
-        format!(
-            "//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"
-        ),
+        format!("//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"),
     )
     .unwrap();
 
@@ -200,7 +198,12 @@ async fn test_cli_star_unstar_stars_parity() {
         .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["star", "sample-pkg", "--registry", &format!("http://{addr}/")])
+        .args([
+            "star",
+            "sample-pkg",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm star failed");
 
@@ -270,7 +273,12 @@ async fn test_cli_star_unstar_stars_parity() {
         .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["unstar", "sample-pkg", "--registry", &format!("http://{addr}/")])
+        .args([
+            "unstar",
+            "sample-pkg",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm unstar failed");
 
@@ -340,7 +348,12 @@ async fn test_cli_star_unstar_stars_parity() {
         .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["stars", "testuser", "--registry", &format!("http://{addr}/")])
+        .args([
+            "stars",
+            "testuser",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm stars failed");
 

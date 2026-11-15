@@ -404,10 +404,18 @@ impl Node {
 
     /// Arborist `node.pkgid`.
     fn pkgid(&self) -> String {
-        let pkg_name = self.package.get("name").and_then(Value::as_str).unwrap_or("");
+        let pkg_name = self
+            .package
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let version = self.version();
         if self.is_root() {
-            let name = if pkg_name.is_empty() { &self.name } else { pkg_name };
+            let name = if pkg_name.is_empty() {
+                &self.name
+            } else {
+                pkg_name
+            };
             return format!("{name}@{version}");
         }
         if !pkg_name.is_empty() && pkg_name != self.name {
@@ -557,9 +565,18 @@ fn load_virtual_nodes(project_dir: &Path, root_pkg: Value, lock: &Value) -> Vec<
                 .or_insert_with(|| Value::String(folder_name(loc)));
         }
         let mut node = new_node(project_dir, loc.clone(), pkg);
-        node.resolved = entry.get("resolved").and_then(Value::as_str).map(str::to_string);
-        node.integrity = entry.get("integrity").and_then(Value::as_str).map(str::to_string);
-        node.in_bundle = entry.get("inBundle").and_then(Value::as_bool).unwrap_or(false);
+        node.resolved = entry
+            .get("resolved")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        node.integrity = entry
+            .get("integrity")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        node.in_bundle = entry
+            .get("inBundle")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let flag = |k: &str| entry.get(k).and_then(Value::as_bool).unwrap_or(false);
         node.dev = flag("dev");
         node.optional = flag("optional");
@@ -585,7 +602,12 @@ fn link_edges(nodes: &mut [Node]) {
                 let to = crate::inspect_tree::candidate_locations(&loc, &name)
                     .iter()
                     .find_map(|c| index.get(c).copied());
-                Edge { name, spec, kind, to }
+                Edge {
+                    name,
+                    spec,
+                    kind,
+                    to,
+                }
             })
             .collect();
     }
@@ -776,9 +798,7 @@ fn normalize_package(pkg: &mut Value) {
 fn declared_license(pkg: &Value) -> Option<String> {
     match pkg.get("license") {
         Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
-        Some(Value::Object(o)) => {
-            return o.get("type").and_then(Value::as_str).map(str::to_string)
-        }
+        Some(Value::Object(o)) => return o.get("type").and_then(Value::as_str).map(str::to_string),
         _ => {}
     }
     let list = pkg.get("licenses")?.as_array()?;
@@ -818,7 +838,9 @@ fn encode_uri_component(s: &str) -> String {
 fn purl(node: &Node) -> String {
     let base = make_purl(&node.package_name(), &node.version());
     match node.resolved.as_deref() {
-        Some(r) if is_git_resolved(Some(r)) => format!("{base}?vcs_url={}", encode_uri_component(r)),
+        Some(r) if is_git_resolved(Some(r)) => {
+            format!("{base}?vcs_url={}", encode_uri_component(r))
+        }
         _ => base,
     }
 }
@@ -830,7 +852,9 @@ fn spdx_id(node: &Node) -> String {
 }
 
 fn non_empty_str<'a>(pkg: &'a Value, key: &str) -> Option<&'a str> {
-    pkg.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    pkg.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn cyclonedx_item(node: &Node, package_type: &str) -> Value {
@@ -888,13 +912,21 @@ fn cyclonedx_item(node: &Node, package_type: &str) -> Value {
     if let Some(r) = &node.resolved {
         refs.push(ext("distribution", r));
     }
-    if let Some(u) = pkg.get("repository").and_then(|r| r.get("url")).and_then(Value::as_str) {
+    if let Some(u) = pkg
+        .get("repository")
+        .and_then(|r| r.get("url"))
+        .and_then(Value::as_str)
+    {
         refs.push(ext("vcs", u));
     }
     if let Some(h) = non_empty_str(pkg, "homepage") {
         refs.push(ext("website", h));
     }
-    if let Some(u) = pkg.get("bugs").and_then(|b| b.get("url")).and_then(Value::as_str) {
+    if let Some(u) = pkg
+        .get("bugs")
+        .and_then(|b| b.get("url"))
+        .and_then(Value::as_str)
+    {
         refs.push(ext("issue-tracker", u));
     }
     c.insert("properties".into(), Value::Array(properties));
@@ -918,14 +950,23 @@ fn spdx_item(node: &Node, package_type: Option<&str>) -> Value {
     p.insert("name".into(), Value::String(node.package_name()));
     p.insert("SPDXID".into(), Value::String(spdx_id(node)));
     p.insert("versionInfo".into(), Value::String(node.version()));
-    p.insert("packageFileName".into(), Value::String(node.location.clone()));
+    p.insert(
+        "packageFileName".into(),
+        Value::String(node.location.clone()),
+    );
     if let Some(d) = non_empty_str(pkg, "description") {
         p.insert("description".into(), Value::String(d.to_string()));
     }
     if let Some(t) = package_type {
-        p.insert("primaryPackagePurpose".into(), Value::String(t.to_uppercase()));
+        p.insert(
+            "primaryPackagePurpose".into(),
+            Value::String(t.to_uppercase()),
+        );
     }
-    let download = node.resolved.clone().unwrap_or_else(|| "NOASSERTION".into());
+    let download = node
+        .resolved
+        .clone()
+        .unwrap_or_else(|| "NOASSERTION".into());
     p.insert("downloadLocation".into(), Value::String(download));
     p.insert("filesAnalyzed".into(), Value::Bool(false));
     let homepage = non_empty_str(pkg, "homepage").unwrap_or("NOASSERTION");
@@ -969,7 +1010,11 @@ fn detect_errors(nodes: &[Node], items: &[usize]) -> Vec<String> {
                     from.pkgid()
                 )),
                 Some(t) if !edge_valid(edge, &nodes[t]) => {
-                    let spec = if edge.spec.is_empty() { "*" } else { &edge.spec };
+                    let spec = if edge.spec.is_empty() {
+                        "*"
+                    } else {
+                        &edge.spec
+                    };
                     push(format!(
                         "invalid: {}, {spec} required by {}",
                         nodes[t].pkgid(),
@@ -1217,15 +1262,30 @@ mod tests {
 
     #[test]
     fn test_parse_license_matches_spdx_expression_parse() {
-        assert_eq!(parse_license("MIT"), Some(ParsedLicense::Single("MIT".into())));
-        assert_eq!(parse_license("(MIT)"), Some(ParsedLicense::Single("MIT".into())));
-        assert_eq!(parse_license("GPL-2.0+"), Some(ParsedLicense::Single("GPL-2.0".into())));
+        assert_eq!(
+            parse_license("MIT"),
+            Some(ParsedLicense::Single("MIT".into()))
+        );
+        assert_eq!(
+            parse_license("(MIT)"),
+            Some(ParsedLicense::Single("MIT".into()))
+        );
+        assert_eq!(
+            parse_license("GPL-2.0+"),
+            Some(ParsedLicense::Single("GPL-2.0".into()))
+        );
         assert_eq!(
             parse_license("GPL-2.0-only WITH Classpath-exception-2.0"),
             Some(ParsedLicense::Single("GPL-2.0-only".into()))
         );
-        assert_eq!(parse_license("MIT OR Apache-2.0"), Some(ParsedLicense::Conjunction));
-        assert_eq!(parse_license("(MIT AND ISC) OR 0BSD"), Some(ParsedLicense::Conjunction));
+        assert_eq!(
+            parse_license("MIT OR Apache-2.0"),
+            Some(ParsedLicense::Conjunction)
+        );
+        assert_eq!(
+            parse_license("(MIT AND ISC) OR 0BSD"),
+            Some(ParsedLicense::Conjunction)
+        );
         assert_eq!(
             parse_license("LicenseRef-Proprietary"),
             Some(ParsedLicense::Single("LicenseRef-Proprietary".into()))

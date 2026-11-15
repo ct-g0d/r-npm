@@ -48,12 +48,12 @@ pub(crate) async fn run(args: TeamArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_create(args: &TeamArgs, current_dir: &Path) -> Result<()> {
-    let raw_entity = args
-        .args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>"))?;
-    let (scope, team) = split_entity(raw_entity)
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>"))?;
+    let raw_entity = args.args.first().ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>")
+    })?;
+    let (scope, team) = split_entity(raw_entity).ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team create <scope:team>")
+    })?;
     let entity = format!("{scope}:{team}");
 
     let client = CommandClient::new(current_dir, args.registry.as_deref())?;
@@ -99,12 +99,12 @@ async fn run_create(args: &TeamArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_destroy(args: &TeamArgs, current_dir: &Path) -> Result<()> {
-    let raw_entity = args
-        .args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>"))?;
-    let (scope, team) = split_entity(raw_entity)
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>"))?;
+    let raw_entity = args.args.first().ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>")
+    })?;
+    let (scope, team) = split_entity(raw_entity).ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team destroy <scope:team>")
+    })?;
     let entity = format!("{scope}:{team}");
 
     let client = CommandClient::new(current_dir, args.registry.as_deref())?;
@@ -116,11 +116,7 @@ async fn run_destroy(args: &TeamArgs, current_dir: &Path) -> Result<()> {
     ))
     .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
-    let req = client.request(
-        reqwest::Method::DELETE,
-        target.clone(),
-        args.otp.as_deref(),
-    );
+    let req = client.request(reqwest::Method::DELETE, target.clone(), args.otp.as_deref());
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -144,17 +140,19 @@ async fn run_destroy(args: &TeamArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_add(args: &TeamArgs, current_dir: &Path) -> Result<()> {
-    let raw_entity = args
-        .args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>"))?;
-    let (scope, team) = split_entity(raw_entity)
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>"))?;
+    let raw_entity = args.args.first().ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>")
+    })?;
+    let (scope, team) = split_entity(raw_entity).ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>")
+    })?;
     let user = args
         .args
         .get(1)
         .map(|u| u.trim_start_matches('@'))
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("npm error code EUSAGE\nnpm error team add <scope:team> <user>")
+        })?;
     let entity = format!("{scope}:{team}");
 
     let client = CommandClient::new(current_dir, args.registry.as_deref())?;
@@ -199,17 +197,19 @@ async fn run_add(args: &TeamArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_rm(args: &TeamArgs, current_dir: &Path) -> Result<()> {
-    let raw_entity = args
-        .args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>"))?;
-    let (scope, team) = split_entity(raw_entity)
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>"))?;
+    let raw_entity = args.args.first().ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>")
+    })?;
+    let (scope, team) = split_entity(raw_entity).ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>")
+    })?;
     let user = args
         .args
         .get(1)
         .map(|u| u.trim_start_matches('@'))
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("npm error code EUSAGE\nnpm error team rm <scope:team> <user>")
+        })?;
     let entity = format!("{scope}:{team}");
 
     let client = CommandClient::new(current_dir, args.registry.as_deref())?;
@@ -254,18 +254,18 @@ async fn run_rm(args: &TeamArgs, current_dir: &Path) -> Result<()> {
 }
 
 async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
-    let raw_entity = args
-        .args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>"))?;
+    let raw_entity = args.args.first().ok_or_else(|| {
+        anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>")
+    })?;
     let entity = raw_entity.trim_start_matches('@');
 
     let client = CommandClient::new(current_dir, args.registry.as_deref())?;
     let base = client.registry_url.as_str().trim_end_matches('/');
 
     if entity.contains(':') {
-        let (scope, team) = split_entity(entity)
-            .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>"))?;
+        let (scope, team) = split_entity(entity).ok_or_else(|| {
+            anyhow::anyhow!("npm error code EUSAGE\nnpm error team ls <scope>|<scope:team>")
+        })?;
         let target = Url::parse(&format!(
             "{base}/-/team/{}/{}/user?format=cli",
             url_encode(&scope),
@@ -310,8 +310,11 @@ async fn run_ls(args: &TeamArgs, current_dir: &Path) -> Result<()> {
         }
     } else {
         let scope = entity;
-        let target = Url::parse(&format!("{base}/-/org/{}/team?format=cli", url_encode(scope)))
-            .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
+        let target = Url::parse(&format!(
+            "{base}/-/org/{}/team?format=cli",
+            url_encode(scope)
+        ))
+        .map_err(|e| anyhow::anyhow!("npm error code EINVALIDURL\nnpm error {e}"))?;
 
         let req = client.request(reqwest::Method::GET, target.clone(), args.otp.as_deref());
         let resp = req.send().await?;

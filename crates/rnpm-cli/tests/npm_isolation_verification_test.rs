@@ -9,7 +9,10 @@ fn normalize_path(path: &Path) -> PathBuf {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     {
-        let s = canonical.to_string_lossy().replace('\\', "/").to_lowercase();
+        let s = canonical
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
         let s = s.strip_prefix("//?/").unwrap_or(&s);
         let s = s.strip_prefix(r"\\?\").unwrap_or(s);
         PathBuf::from(s.trim_end_matches('/'))
@@ -60,7 +63,9 @@ fn test_isolated_npm_child_sees_temporary_paths() {
 
     // 1. Verify child npm cache: must spawn successfully and exit 0
     let mut cache_cmd = isolated_npm(&iso_root);
-    cache_cmd.args(["config", "get", "cache"]).current_dir(tmp.path());
+    cache_cmd
+        .args(["config", "get", "cache"])
+        .current_dir(tmp.path());
     let cache_output = cache_cmd
         .output()
         .expect("Failed to spawn isolated npm for cache query");
@@ -73,8 +78,13 @@ fn test_isolated_npm_child_sees_temporary_paths() {
         String::from_utf8_lossy(&cache_output.stderr)
     );
 
-    let cache_out_str = String::from_utf8_lossy(&cache_output.stdout).trim().to_string();
-    assert!(!cache_out_str.is_empty(), "npm cache query returned empty output");
+    let cache_out_str = String::from_utf8_lossy(&cache_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !cache_out_str.is_empty(),
+        "npm cache query returned empty output"
+    );
 
     let child_cache = normalize_path(Path::new(&cache_out_str));
     let expected_cache = normalize_path(&env.cache_dir);
@@ -86,7 +96,9 @@ fn test_isolated_npm_child_sees_temporary_paths() {
 
     // 2. Verify child npm prefix: must spawn successfully and exit 0
     let mut prefix_cmd = isolated_npm(&iso_root);
-    prefix_cmd.args(["config", "get", "prefix"]).current_dir(tmp.path());
+    prefix_cmd
+        .args(["config", "get", "prefix"])
+        .current_dir(tmp.path());
     let prefix_output = prefix_cmd
         .output()
         .expect("Failed to spawn isolated npm for prefix query");
@@ -99,8 +111,13 @@ fn test_isolated_npm_child_sees_temporary_paths() {
         String::from_utf8_lossy(&prefix_output.stderr)
     );
 
-    let prefix_out_str = String::from_utf8_lossy(&prefix_output.stdout).trim().to_string();
-    assert!(!prefix_out_str.is_empty(), "npm prefix query returned empty output");
+    let prefix_out_str = String::from_utf8_lossy(&prefix_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !prefix_out_str.is_empty(),
+        "npm prefix query returned empty output"
+    );
 
     let child_prefix = normalize_path(Path::new(&prefix_out_str));
     let expected_prefix = normalize_path(&env.prefix_dir);
@@ -112,7 +129,9 @@ fn test_isolated_npm_child_sees_temporary_paths() {
 
     // 3. Verify child npm userconfig: must spawn successfully and exit 0
     let mut userconfig_cmd = isolated_npm(&iso_root);
-    userconfig_cmd.args(["config", "get", "userconfig"]).current_dir(tmp.path());
+    userconfig_cmd
+        .args(["config", "get", "userconfig"])
+        .current_dir(tmp.path());
     let userconfig_output = userconfig_cmd
         .output()
         .expect("Failed to spawn isolated npm for userconfig query");
@@ -125,8 +144,13 @@ fn test_isolated_npm_child_sees_temporary_paths() {
         String::from_utf8_lossy(&userconfig_output.stderr)
     );
 
-    let userconfig_out_str = String::from_utf8_lossy(&userconfig_output.stdout).trim().to_string();
-    assert!(!userconfig_out_str.is_empty(), "npm userconfig query returned empty output");
+    let userconfig_out_str = String::from_utf8_lossy(&userconfig_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !userconfig_out_str.is_empty(),
+        "npm userconfig query returned empty output"
+    );
 
     let child_userconfig = normalize_path(Path::new(&userconfig_out_str));
     let expected_userconfig = normalize_path(&env.userconfig);

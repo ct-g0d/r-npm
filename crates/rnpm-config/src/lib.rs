@@ -20,8 +20,8 @@ pub use npm_keys::{
     NPM_BOOLEAN_CONFIG_KEYS, NPM_CONFIG_KEYS,
 };
 mod npm_defaults;
-pub use npm_defaults::npm_default;
 pub use error::ConfigError;
+pub use npm_defaults::npm_default;
 pub use npmrc::{
     encode_package_name, interpolate_env, is_sensitive_credential_key, mask_credential,
     scrub_credentials, validate_package_name, Npmrc, DEFAULT_REGISTRY,

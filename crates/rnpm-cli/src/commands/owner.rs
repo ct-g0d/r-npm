@@ -10,21 +10,41 @@ pub(crate) async fn run(
     otp: Option<String>,
 ) -> Result<()> {
     let action = match action {
-        crate::OwnerAction::Ls { package } => crate::OwnerAction::Ls { package: Some(get_pkg(&current_dir, package)?) },
-        crate::OwnerAction::Add { user, package } => crate::OwnerAction::Add { user, package: Some(get_pkg(&current_dir, package)?) },
-        crate::OwnerAction::Rm { user, package } => crate::OwnerAction::Rm { user, package: Some(get_pkg(&current_dir, package)?) },
+        crate::OwnerAction::Ls { package } => crate::OwnerAction::Ls {
+            package: Some(get_pkg(&current_dir, package)?),
+        },
+        crate::OwnerAction::Add { user, package } => crate::OwnerAction::Add {
+            user,
+            package: Some(get_pkg(&current_dir, package)?),
+        },
+        crate::OwnerAction::Rm { user, package } => crate::OwnerAction::Rm {
+            user,
+            package: Some(get_pkg(&current_dir, package)?),
+        },
     };
     let pkg_name = match &action {
         crate::OwnerAction::Ls { package: Some(p) } => p,
-        crate::OwnerAction::Add { package: Some(p), .. } => p,
-        crate::OwnerAction::Rm { package: Some(p), .. } => p,
+        crate::OwnerAction::Add {
+            package: Some(p), ..
+        } => p,
+        crate::OwnerAction::Rm {
+            package: Some(p), ..
+        } => p,
         _ => unreachable!("package resolved above"),
     };
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-    let target_registry = registry.clone().unwrap_or_else(|| config.npmrc.registry_for_package(pkg_name).as_str().to_string());
+    let target_registry = registry.clone().unwrap_or_else(|| {
+        config
+            .npmrc
+            .registry_for_package(pkg_name)
+            .as_str()
+            .to_string()
+    });
     let (registry_url, client) = crate::make_registry_client(&current_dir, Some(target_registry))?;
     match action {
-        crate::OwnerAction::Ls { package: Some(package) } => {
+        crate::OwnerAction::Ls {
+            package: Some(package),
+        } => {
             let value = client.package_owners(Some(&registry_url), &package).await?;
             if let Some(maintainers) = value.get("maintainers").and_then(|v| v.as_array()) {
                 if maintainers.is_empty() {
@@ -74,11 +94,33 @@ pub(crate) async fn run(
                 println!("no admin found");
             }
         }
-        crate::OwnerAction::Add { user, package: Some(package) } => {
-            change_owners(&current_dir, registry.as_deref(), &user, &package, true, otp).await?;
+        crate::OwnerAction::Add {
+            user,
+            package: Some(package),
+        } => {
+            change_owners(
+                &current_dir,
+                registry.as_deref(),
+                &user,
+                &package,
+                true,
+                otp,
+            )
+            .await?;
         }
-        crate::OwnerAction::Rm { user, package: Some(package) } => {
-            change_owners(&current_dir, registry.as_deref(), &user, &package, false, otp).await?;
+        crate::OwnerAction::Rm {
+            user,
+            package: Some(package),
+        } => {
+            change_owners(
+                &current_dir,
+                registry.as_deref(),
+                &user,
+                &package,
+                false,
+                otp,
+            )
+            .await?;
         }
         _ => unreachable!("package resolved above"),
     }
@@ -98,14 +140,29 @@ fn get_pkg(current_dir: &Path, package: Option<String>) -> Result<String> {
     }
     std::fs::read_to_string(current_dir.join("package.json"))
         .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')).ok())
-        .and_then(|v| v["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string))
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|v| {
+            v["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| super::stage::usage_error(None, USAGE))
 }
 
 /// The message npm-registry-fetch gives a failed response; EOWNERMUTATE wraps it.
-fn fetch_error_message(method: &str, url: &Url, status: reqwest::StatusCode, www: Option<&str>, body: &str) -> String {
-    let has = |scheme: &str| www.is_some_and(|w| w.split(',').any(|s| s.trim().eq_ignore_ascii_case(scheme)));
+fn fetch_error_message(
+    method: &str,
+    url: &Url,
+    status: reqwest::StatusCode,
+    www: Option<&str>,
+    body: &str,
+) -> String {
+    let has = |scheme: &str| {
+        www.is_some_and(|w| w.split(',').any(|s| s.trim().eq_ignore_ascii_case(scheme)))
+    };
     if status != reqwest::StatusCode::UNAUTHORIZED {
         return crate::http_errors::general_message(method, url.as_str(), status, body);
     }
@@ -120,20 +177,40 @@ fn fetch_error_message(method: &str, url: &Url, status: reqwest::StatusCode, www
     }
 }
 
-async fn get_json(client: &crate::commands::client_helper::CommandClient, url: &Url) -> Result<std::result::Result<serde_json::Value, (reqwest::StatusCode, Option<String>, String)>> {
-    let response = client.request(reqwest::Method::GET, url.clone(), None).header("accept", "application/json").send().await?;
+async fn get_json(
+    client: &crate::commands::client_helper::CommandClient,
+    url: &Url,
+) -> Result<std::result::Result<serde_json::Value, (reqwest::StatusCode, Option<String>, String)>> {
+    let response = client
+        .request(reqwest::Method::GET, url.clone(), None)
+        .header("accept", "application/json")
+        .send()
+        .await?;
     let status = response.status();
-    let www = response.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let www = response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let text = response.text().await?;
     if !status.is_success() {
         return Ok(Err((status, www, text)));
     }
-    Ok(Ok(crate::commands::client_helper::parse_json_response(&text, url)?))
+    Ok(Ok(crate::commands::client_helper::parse_json_response(
+        &text, url,
+    )?))
 }
 
 /// `npm owner add|rm`, ported from npm's lib/commands/owner.js changeOwners:
 /// read the user document, then PUT the packument's maintainers at its revision.
-async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, package: &str, add: bool, otp: Option<String>) -> Result<()> {
+async fn change_owners(
+    current_dir: &Path,
+    registry: Option<&str>,
+    user: &str,
+    package: &str,
+    add: bool,
+    otp: Option<String>,
+) -> Result<()> {
     use crate::commands::client_helper::{format_http_error_with_auth, CommandClient};
     let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
     let (name, pkgid) = match crate::split_package_version(package) {
@@ -145,7 +222,9 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
         None => config.npmrc.registry_for_package(&name).clone(),
     };
     let client = CommandClient::new(current_dir, Some(base.as_str()))?;
-    let fail = |method: &str, url: &Url, (status, www, body): (reqwest::StatusCode, Option<String>, String)| {
+    let fail = |method: &str,
+                url: &Url,
+                (status, www, body): (reqwest::StatusCode, Option<String>, String)| {
         if status.as_u16() == 404 {
             let message = crate::http_errors::general_message(method, url.as_str(), status, &body);
             anyhow::anyhow!(crate::http_errors::e404_block(&message, Some(&pkgid)))
@@ -154,7 +233,10 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
         }
     };
 
-    let user_url = base.join(&format!("-/user/org.couchdb.user:{}", crate::http_errors::encode_uri_component(user)))?;
+    let user_url = base.join(&format!(
+        "-/user/org.couchdb.user:{}",
+        crate::http_errors::encode_uri_component(user)
+    ))?;
     let u = match get_json(&client, &user_url).await? {
         Ok(u) => u,
         Err(e) => {
@@ -165,7 +247,9 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
     let u = serde_json::json!({ "name": u["name"], "email": u["email"] });
 
     let pkg_url = base.join(&rnpm_config::encode_package_name(&name))?;
-    let data = get_json(&client, &pkg_url).await?.map_err(|e| fail("GET", &pkg_url, e))?;
+    let data = get_json(&client, &pkg_url)
+        .await?
+        .map_err(|e| fail("GET", &pkg_url, e))?;
     let owners = data["maintainers"].as_array().cloned().unwrap_or_default();
     let maintainers: Vec<serde_json::Value> = if add {
         if owners.iter().any(|o| o["name"] == u["name"]) {
@@ -173,7 +257,11 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
         }
         owners.iter().cloned().chain(std::iter::once(u)).collect()
     } else {
-        let kept: Vec<_> = owners.iter().filter(|o| o["name"] != u["name"]).cloned().collect();
+        let kept: Vec<_> = owners
+            .iter()
+            .filter(|o| o["name"] != u["name"])
+            .cloned()
+            .collect();
         if kept.len() == owners.len() {
             return Ok(());
         }
@@ -189,12 +277,21 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
         rnpm_config::encode_package_name(&name),
         crate::http_errors::encode_uri_component(rev)
     ))?;
-    let body = serde_json::json!({ "_id": data["_id"], "_rev": data["_rev"], "maintainers": maintainers });
+    let body =
+        serde_json::json!({ "_id": data["_id"], "_rev": data["_rev"], "maintainers": maintainers });
     let mut otp = otp;
     for attempt in 0..2 {
-        let response = client.request(reqwest::Method::PUT, put_url.clone(), otp.as_deref()).json(&body).send().await?;
+        let response = client
+            .request(reqwest::Method::PUT, put_url.clone(), otp.as_deref())
+            .json(&body)
+            .send()
+            .await?;
         let status = response.status();
-        let www = response.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let www = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let text = response.text().await?;
         if status.is_success() {
             println!("{} {user} ({name})", if add { "+" } else { "-" });
@@ -208,7 +305,10 @@ async fn change_owners(current_dir: &Path, registry: Option<&str>, user: &str, p
             }
         }
         let message = fetch_error_message("PUT", &put_url, status, www.as_deref(), &text);
-        anyhow::bail!("npm error code EOWNERMUTATE\nnpm error Failed to update package: {}", serde_json::to_string(&message)?);
+        anyhow::bail!(
+            "npm error code EOWNERMUTATE\nnpm error Failed to update package: {}",
+            serde_json::to_string(&message)?
+        );
     }
     unreachable!()
 }

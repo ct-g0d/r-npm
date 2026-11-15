@@ -54,11 +54,18 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         let analysis = installer.analyze_prune(&prune_options)?;
         let mut report = install_summary.reify.unwrap_or_default();
         for pkg in analysis.extraneous_packages {
-            report.changes.push(rnpm_install::ReifyChange::Remove(rnpm_install::ReifyEntry {
-                name: pkg.path.rsplit("node_modules/").next().unwrap_or(&pkg.name).to_string(),
-                version: pkg.version.unwrap_or_default(),
-                location: pkg.path,
-            }));
+            report.changes.push(rnpm_install::ReifyChange::Remove(
+                rnpm_install::ReifyEntry {
+                    name: pkg
+                        .path
+                        .rsplit("node_modules/")
+                        .next()
+                        .unwrap_or(&pkg.name)
+                        .to_string(),
+                    version: pkg.version.unwrap_or_default(),
+                    location: pkg.path,
+                },
+            ));
         }
         report
     } else {
@@ -69,5 +76,13 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir))
     };
 
-    crate::reify_output::finish(&current_dir, &report, args.json, args.dry_run, args.silent, start_time.elapsed()).await
+    crate::reify_output::finish(
+        &current_dir,
+        &report,
+        args.json,
+        args.dry_run,
+        args.silent,
+        start_time.elapsed(),
+    )
+    .await
 }

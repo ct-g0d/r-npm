@@ -23,16 +23,32 @@ fn test_prune_reification_and_lockfile_generation() {
         .output()
         .expect("rnpm prune failed");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("added 1 package in "),
         "Expected prune to reify tree and report 'added 1 package in ...', got: {}",
         stdout
     );
-    assert!(tmp.path().join("package-lock.json").exists(), "package-lock.json must be written");
-    assert!(tmp.path().join("node_modules").join("is-number").exists(), "node_modules/is-number must exist");
-    assert!(tmp.path().join("node_modules").join(".package-lock.json").exists(), "hidden lockfile must exist");
+    assert!(
+        tmp.path().join("package-lock.json").exists(),
+        "package-lock.json must be written"
+    );
+    assert!(
+        tmp.path().join("node_modules").join("is-number").exists(),
+        "node_modules/is-number must exist"
+    );
+    assert!(
+        tmp.path()
+            .join("node_modules")
+            .join(".package-lock.json")
+            .exists(),
+        "hidden lockfile must exist"
+    );
 }
 
 #[test]
@@ -56,7 +72,11 @@ fn test_dedupe_reification_and_find_dupes() {
         .output()
         .expect("rnpm dedupe failed");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("added 1 package in "),
@@ -64,7 +84,11 @@ fn test_dedupe_reification_and_find_dupes() {
         stdout
     );
     assert!(tmp.path().join("node_modules").join("is-number").exists());
-    assert!(tmp.path().join("node_modules").join(".package-lock.json").exists());
+    assert!(tmp
+        .path()
+        .join("node_modules")
+        .join(".package-lock.json")
+        .exists());
 
     // Once installed, find-dupes should report 'up to date in '
     let find_out = Command::new(rnpm_bin)
@@ -103,7 +127,11 @@ fn test_rebuild_output_parity() {
         .output()
         .expect("rnpm rebuild failed");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("rebuilt dependencies successfully"),

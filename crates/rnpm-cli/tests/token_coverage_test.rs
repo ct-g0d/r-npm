@@ -251,7 +251,13 @@ async fn test_cli_token_parity() {
         .env("npm_config_cache", &cache_dir)
         .env("APPDATA", &appdata)
         .env("LOCALAPPDATA", &localappdata)
-        .args(["token", "revoke", "123456", "--registry", &format!("http://{addr}/")])
+        .args([
+            "token",
+            "revoke",
+            "123456",
+            "--registry",
+            &format!("http://{addr}/"),
+        ])
         .output()
         .expect("rnpm token revoke failed");
 

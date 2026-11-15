@@ -697,7 +697,14 @@ impl PackStore {
         }
         match fs::remove_dir(root) {
             Ok(()) => Ok(()),
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(())
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -2720,8 +2727,12 @@ mod tests {
         fs::write(&pack_path, &pack_bytes).unwrap();
         // Same-tick writes keep the mtime, which would hit the verified-mtime
         // shortcut; real corruption is detected once the mtime differs.
-        fs::File::options().write(true).open(&pack_path).unwrap()
-            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&pack_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
 
         // Attempting to materialize should detect hash mismatch, return CorruptedPack, and purge files
         let target = tempdir().unwrap();
@@ -2762,8 +2773,12 @@ mod tests {
         fs::write(&pack_path, &zero_bytes).unwrap();
         // Same-tick writes keep the mtime, which would hit the verified-mtime
         // shortcut; real corruption is detected once the mtime differs.
-        fs::File::options().write(true).open(&pack_path).unwrap()
-            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&pack_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
 
         // Materialize should detect zero-filled corruption and purge
         let target = tempdir().unwrap();
@@ -3279,6 +3294,9 @@ mod tests {
         drop(store);
         PackStore::clean_at(&root).unwrap();
         assert!(!root.exists());
-        assert_eq!(fs::read_to_string(external.join("keep.txt")).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(external.join("keep.txt")).unwrap(),
+            "keep"
+        );
     }
 }

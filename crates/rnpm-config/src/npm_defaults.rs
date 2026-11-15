@@ -177,15 +177,13 @@ pub fn npm_default(key: &str) -> Option<String> {
     let home = || env(if windows { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from);
     let prefix = || crate::find_global_prefix();
     let value = match key {
-        "cache" => {
-            if windows {
-                std::path::PathBuf::from(env("LOCALAPPDATA")?).join("npm-cache")
-            } else {
-                home()?.join(".npm")
-            }
-            .display()
-            .to_string()
+        "cache" => if windows {
+            std::path::PathBuf::from(env("LOCALAPPDATA")?).join("npm-cache")
+        } else {
+            home()?.join(".npm")
         }
+        .display()
+        .to_string(),
         "prefix" => prefix().display().to_string(),
         "globalconfig" => prefix().join("etc").join("npmrc").display().to_string(),
         "userconfig" => crate::find_user_npmrc()?.display().to_string(),
@@ -205,7 +203,12 @@ pub fn npm_default(key: &str) -> Option<String> {
                 .iter()
                 .find_map(|k| env(k))
                 .is_some_and(|v| v.to_ascii_lowercase().contains("utf"));
-            (if windows { env("WT_SESSION").is_some() } else { utf8 }).to_string()
+            (if windows {
+                env("WT_SESSION").is_some()
+            } else {
+                utf8
+            })
+            .to_string()
         }
         "shell" => {
             if windows {
@@ -216,12 +219,20 @@ pub fn npm_default(key: &str) -> Option<String> {
         }
         "editor" => env("EDITOR").or_else(|| env("VISUAL")).unwrap_or_else(|| {
             if windows {
-                format!(r"{}\notepad.exe", env("SYSTEMROOT").unwrap_or_else(|| r"C:\WINDOWS".into()))
+                format!(
+                    r"{}\notepad.exe",
+                    env("SYSTEMROOT").unwrap_or_else(|| r"C:\WINDOWS".into())
+                )
             } else {
                 "vi".into()
             }
         }),
-        _ => return NPM_DEFAULTS.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string()),
+        _ => {
+            return NPM_DEFAULTS
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
     };
     Some(value)
 }

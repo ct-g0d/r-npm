@@ -16,7 +16,16 @@ pub(crate) async fn run(args: DeprecateArgs, current_dir: PathBuf) -> Result<()>
         args.message
     );
     super::client_helper::with_registry_otp(&current_dir, "PUT", args.otp, async |otp| {
-        client.deprecate(Some(&registry_url), name, version, &args.message, otp.as_deref()).await
-    }).await?;
+        client
+            .deprecate(
+                Some(&registry_url),
+                name,
+                version,
+                &args.message,
+                otp.as_deref(),
+            )
+            .await
+    })
+    .await?;
     Ok(())
 }

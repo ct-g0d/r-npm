@@ -18,9 +18,20 @@ pub(crate) fn body_error(body: &str) -> Option<String> {
 }
 
 /// `HttpErrorGeneral.message`: `<status> <statusText> - <METHOD> <url>[ - <body.error>]`.
-pub(crate) fn general_message(method: &str, url: &str, status: reqwest::StatusCode, body: &str) -> String {
+pub(crate) fn general_message(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
     let reason = status.canonical_reason().unwrap_or("");
-    let mut msg = format!("{} {} - {} {}", status.as_u16(), reason, method.to_ascii_uppercase(), url);
+    let mut msg = format!(
+        "{} {} - {} {}",
+        status.as_u16(),
+        reason,
+        method.to_ascii_uppercase(),
+        url
+    );
     if let Some(err) = body_error(body) {
         msg.push_str(" - ");
         msg.push_str(&err);
@@ -101,7 +112,10 @@ pub(crate) fn encode_uri_component(s: &str) -> String {
 
 /// npm's E404 block for a failed request on `pkgid` (`name@rawSpec`).
 pub(crate) fn e404_block(message: &str, pkgid: Option<&str>) -> String {
-    let summary = message.strip_prefix("404").map(str::trim_start).unwrap_or(message);
+    let summary = message
+        .strip_prefix("404")
+        .map(str::trim_start)
+        .unwrap_or(message);
     let mut out = format!("npm error code E404\nnpm error 404 {summary}");
     if let Some(pkgid) = pkgid.filter(|p| *p != "-") {
         let name = match pkgid.char_indices().skip(1).find(|(_, c)| *c == '@') {
@@ -145,7 +159,10 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(v) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            if let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 out.push(v);
                 i += 3;
                 continue;
@@ -171,16 +188,29 @@ pub(crate) fn auth_error_block(
     }
     let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
     let challenge: Vec<String> = www_authenticate
-        .map(|h| h.split(',').map(|s| s.trim_start().to_ascii_lowercase()).collect())
+        .map(|h| {
+            h.split(',')
+                .map(|s| s.trim_start().to_ascii_lowercase())
+                .collect()
+        })
         .unwrap_or_default();
     let general = general_message(method, url, status, body);
     let (code, message) = if www_authenticate.is_some() {
         if challenge.iter().any(|s| s == "ipaddress") {
-            ("EAUTHIP", "Login is not allowed from your IP address".to_string())
+            (
+                "EAUTHIP",
+                "Login is not allowed from your IP address".to_string(),
+            )
         } else if challenge.iter().any(|s| s == "otp") {
             ("EOTP", "OTP required for authentication".to_string())
         } else {
-            ("E401", format!("Unable to authenticate, need: {}", www_authenticate.unwrap_or_default()))
+            (
+                "E401",
+                format!(
+                    "Unable to authenticate, need: {}",
+                    www_authenticate.unwrap_or_default()
+                ),
+            )
         }
     } else if body.contains("one-time pass") {
         ("EOTP", "OTP required for authentication".to_string())
@@ -191,8 +221,14 @@ pub(crate) fn auth_error_block(
         return Some(format!("npm error code EAUTHIP\nnpm error {message}"));
     }
     if code == "EOTP" || message.contains("one-time pass") {
-        let auth_url = parsed.as_ref().and_then(|v| v.get("authUrl")).and_then(|v| v.as_str());
-        let done_url = parsed.as_ref().and_then(|v| v.get("doneUrl")).and_then(|v| v.as_str());
+        let auth_url = parsed
+            .as_ref()
+            .and_then(|v| v.get("authUrl"))
+            .and_then(|v| v.as_str());
+        let done_url = parsed
+            .as_ref()
+            .and_then(|v| v.get("doneUrl"))
+            .and_then(|v| v.as_str());
         return Some(match (auth_url, done_url) {
             (Some(auth), Some(done)) => format!(
                 "npm error code {code}\nnpm error This operation requires a one-time password.\nnpm error Open this URL in your browser to authenticate:\nnpm error   {auth}\nnpm error\nnpm error After authenticating, your token can be retrieved from:\nnpm error   {done}"
@@ -203,7 +239,11 @@ pub(crate) fn auth_error_block(
         });
     }
     let scheme: Vec<&str> = www_authenticate
-        .map(|h| h.split([',', ' ', '\t']).filter(|s| !s.is_empty()).collect())
+        .map(|h| {
+            h.split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     Some(if scheme.contains(&"Bearer") {
         "npm error code E401\nnpm error Unable to authenticate, your authentication token seems to be invalid.\nnpm error To correct this please try logging in again with:\nnpm error   npm login".to_string()
@@ -219,27 +259,58 @@ pub(crate) fn is_otp_error(err: &anyhow::Error) -> bool {
     err.to_string().starts_with("npm error code EOTP")
 }
 
-pub(crate) async fn retry_otp(current_dir: &std::path::Path, error: &anyhow::Error) -> anyhow::Result<Option<String>> {
+pub(crate) async fn retry_otp(
+    current_dir: &std::path::Path,
+    error: &anyhow::Error,
+) -> anyhow::Result<Option<String>> {
     use std::io::IsTerminal;
-    if !is_otp_error(error) || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() { return Ok(None); }
+    if !is_otp_error(error) || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
     let message = error.to_string();
-    let urls: Vec<_> = message.lines().filter_map(|line| line.strip_prefix("npm error   ")).collect();
+    let urls: Vec<_> = message
+        .lines()
+        .filter_map(|line| line.strip_prefix("npm error   "))
+        .collect();
     if message.contains("Open this URL in your browser") && urls.len() == 2 {
         let auth = reqwest::Url::parse(urls[0])?;
         let done = reqwest::Url::parse(urls[1])?;
-        anyhow::ensure!(matches!(auth.scheme(), "http" | "https") && matches!(done.scheme(), "http" | "https"), "Invalid web authentication URL");
+        anyhow::ensure!(
+            matches!(auth.scheme(), "http" | "https") && matches!(done.scheme(), "http" | "https"),
+            "Invalid web authentication URL"
+        );
         crate::commands::login::open_auth_url(current_dir, "Authenticate your account at", &auth)?;
-        let client = crate::commands::client_helper::CommandClient::new(current_dir, Some(done.as_str()))?;
+        let client =
+            crate::commands::client_helper::CommandClient::new(current_dir, Some(done.as_str()))?;
         loop {
-            let response = client.request(reqwest::Method::GET, done.clone(), None).send().await?;
+            let response = client
+                .request(reqwest::Method::GET, done.clone(), None)
+                .send()
+                .await?;
             let status = response.status();
-            let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0);
+            let retry = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0);
             let body: serde_json::Value = response.error_for_status()?.json().await?;
             if status == reqwest::StatusCode::OK {
-                return body["token"].as_str().filter(|v| !v.is_empty()).map(|v| Some(v.to_string())).ok_or_else(|| anyhow::anyhow!("npm error Invalid response from web login endpoint"));
+                return body["token"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| Some(v.to_string()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("npm error Invalid response from web login endpoint")
+                    });
             }
-            anyhow::ensure!(status == reqwest::StatusCode::ACCEPTED, "npm error Invalid response from web login endpoint");
-            if let Some(seconds) = retry { tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await; }
+            anyhow::ensure!(
+                status == reqwest::StatusCode::ACCEPTED,
+                "npm error Invalid response from web login endpoint"
+            );
+            if let Some(seconds) = retry {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
+            }
         }
     }
     Ok(prompt_otp())
@@ -253,7 +324,10 @@ pub(crate) fn prompt_otp() -> Option<String> {
         return None;
     }
     let mut stdout = std::io::stdout();
-    let _ = write!(stdout, "This operation requires a one-time password.\nEnter OTP: ");
+    let _ = write!(
+        stdout,
+        "This operation requires a one-time password.\nEnter OTP: "
+    );
     let _ = stdout.flush();
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
@@ -269,11 +343,20 @@ mod tests {
     fn name_problems_match_validate_npm_package_name() {
         assert!(package_name_problems("express").is_empty());
         assert!(package_name_problems("@scope/pkg").is_empty());
-        assert_eq!(package_name_problems("BadName"), vec!["name can no longer contain capital letters"]);
-        assert_eq!(package_name_problems("http"), vec!["http is a core module name"]);
+        assert_eq!(
+            package_name_problems("BadName"),
+            vec!["name can no longer contain capital letters"]
+        );
+        assert_eq!(
+            package_name_problems("http"),
+            vec!["http is a core module name"]
+        );
         assert_eq!(
             package_name_problems("_x y"),
-            vec!["name cannot start with an underscore", "name can only contain URL-friendly characters"]
+            vec![
+                "name cannot start with an underscore",
+                "name can only contain URL-friendly characters"
+            ]
         );
     }
 
@@ -282,12 +365,22 @@ mod tests {
         let s = reqwest::StatusCode::UNAUTHORIZED;
         let block = auth_error_block("PUT", "u", s, Some("OTP"), "{}").unwrap();
         assert!(block.starts_with("npm error code EOTP\n"));
-        let block = auth_error_block("PUT", "u", s, None, "{\"error\":\"one-time pass required\"}").unwrap();
+        let block = auth_error_block(
+            "PUT",
+            "u",
+            s,
+            None,
+            "{\"error\":\"one-time pass required\"}",
+        )
+        .unwrap();
         assert!(block.starts_with("npm error code EOTP\n"));
         let block = auth_error_block("PUT", "u", s, Some("Bearer realm=\"x\""), "{}").unwrap();
         assert!(block.contains("token seems to be invalid"));
         let block = auth_error_block("PUT", "u", s, None, "{\"error\":\"nope\"}").unwrap();
-        assert_eq!(block, "npm error code E401\nnpm error 401 Unauthorized - PUT u - nope");
+        assert_eq!(
+            block,
+            "npm error code E401\nnpm error 401 Unauthorized - PUT u - nope"
+        );
     }
 
     #[test]

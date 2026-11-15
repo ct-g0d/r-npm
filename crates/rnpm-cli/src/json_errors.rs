@@ -38,7 +38,10 @@ impl Parser<'_> {
                 col += 1;
             }
         }
-        format!("{what} in JSON at position {} (line {line} column {col})", self.i)
+        format!(
+            "{what} in JSON at position {} (line {line} column {col})",
+            self.i
+        )
     }
 
     fn unexpected(&self) -> String {
@@ -237,7 +240,10 @@ pub fn json_parse_error_message(text: &str) -> Option<String> {
         .nth(1)
         .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
         .and_then(|d| d.parse::<usize>().ok())
-        .or_else(|| msg.starts_with("Unexpected end of JSON").then(|| chars.len() - 1));
+        .or_else(|| {
+            msg.starts_with("Unexpected end of JSON")
+                .then(|| chars.len() - 1)
+        });
     const CONTEXT: usize = 20;
     let Some(err_idx) = err_idx else {
         let head: String = chars.iter().take(CONTEXT * 2).collect();
@@ -245,7 +251,11 @@ pub fn json_parse_error_message(text: &str) -> Option<String> {
     };
     let start = err_idx.saturating_sub(CONTEXT);
     let start = if err_idx <= CONTEXT { 0 } else { start };
-    let end = if err_idx + CONTEXT >= chars.len() { chars.len() } else { err_idx + CONTEXT };
+    let end = if err_idx + CONTEXT >= chars.len() {
+        chars.len()
+    } else {
+        err_idx + CONTEXT
+    };
     let slice = format!(
         "{}{}{}",
         if start > 0 { "..." } else { "" },
@@ -289,7 +299,10 @@ mod tests {
             m("{\"name\":\"a\"").unwrap(),
             "Expected ',' or '}' after property value in JSON at position 11 (line 1 column 12) while parsing \"{\\\"name\\\":\\\"a\\\"\""
         );
-        assert_eq!(m("").unwrap(), "Unexpected end of JSON input while parsing empty string");
+        assert_eq!(
+            m("").unwrap(),
+            "Unexpected end of JSON input while parsing empty string"
+        );
         assert_eq!(
             m("{\"name\":\"a\",\"version\":\"1.0.0\",\"description\":\"a long description here\", oops}").unwrap(),
             "Expected double-quoted property name in JSON at position 71 (line 1 column 72) while parsing near \"... description here\\\", oops}\""

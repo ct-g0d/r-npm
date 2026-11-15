@@ -405,7 +405,9 @@ fn matches_simple(
                 node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
             }
             "link" => node.is_link,
-            "attr" => arg.as_deref().zip(node.raw_manifest.as_ref())
+            "attr" => arg
+                .as_deref()
+                .zip(node.raw_manifest.as_ref())
                 .is_some_and(|(arg, package)| attributes::pseudo(arg, package)),
             "private" => node
                 .raw_manifest
@@ -461,11 +463,13 @@ fn matches_simple(
             }
             _ => false,
         },
-        SimpleSelector::Attribute { name, op, val, insensitive } => {
-            let actual = node
-                .raw_manifest
-                .as_ref()
-                .and_then(|m| m.get(name));
+        SimpleSelector::Attribute {
+            name,
+            op,
+            val,
+            insensitive,
+        } => {
+            let actual = node.raw_manifest.as_ref().and_then(|m| m.get(name));
             let fallback = match name.as_str() {
                 "name" => Some(Value::String(node.name.clone())),
                 "version" => node.version.clone().map(Value::String),

@@ -212,7 +212,8 @@ fn test_audit_fix_incompatible_requires_force() {
         "stderr must warn about breaking changes with --force, got:\n{stderr_force}"
     );
     assert!(
-        stdout_force.contains("changed 1 package") && stdout_force.contains("found 0 vulnerabilities"),
+        stdout_force.contains("changed 1 package")
+            && stdout_force.contains("found 0 vulnerabilities"),
         "stdout must report the forced change and a clean audit, got:\n{stdout_force}"
     );
 
@@ -392,7 +393,8 @@ fn test_audit_fix_multi_package_severities() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("added 3 packages, and audited 4 packages") && stdout.contains("found 0 vulnerabilities"),
+        stdout.contains("added 3 packages, and audited 4 packages")
+            && stdout.contains("found 0 vulnerabilities"),
         "stdout must report the reify summary and a clean audit, got:\n{stdout}"
     );
 }

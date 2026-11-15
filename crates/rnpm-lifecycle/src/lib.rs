@@ -868,7 +868,10 @@ fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
         if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
             continue;
         }
-        out.push((format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()), value.clone()));
+        out.push((
+            format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
+            value.clone(),
+        ));
     }
     let global_prefix = config
         .get("prefix")
@@ -894,9 +897,15 @@ fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
                 .join(".npm")
         }
     });
-    out.push(("npm_config_cache".into(), cache.to_string_lossy().to_string()));
+    out.push((
+        "npm_config_cache".into(),
+        cache.to_string_lossy().to_string(),
+    ));
     if let Some(user) = rnpm_config::find_user_npmrc() {
-        out.push(("npm_config_userconfig".into(), user.to_string_lossy().to_string()));
+        out.push((
+            "npm_config_userconfig".into(),
+            user.to_string_lossy().to_string(),
+        ));
     }
     if let Some(gyp) = node_executable()
         .and_then(|n| n.parent().map(Path::to_path_buf))
@@ -907,10 +916,19 @@ fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
                 d.join("..").join("lib").join("node_modules")
             }
         })
-        .map(|d| d.join("npm").join("node_modules").join("node-gyp").join("bin").join("node-gyp.js"))
+        .map(|d| {
+            d.join("npm")
+                .join("node_modules")
+                .join("node-gyp")
+                .join("bin")
+                .join("node-gyp.js")
+        })
         .filter(|p| p.is_file())
     {
-        out.push(("npm_config_node_gyp".into(), gyp.to_string_lossy().to_string()));
+        out.push((
+            "npm_config_node_gyp".into(),
+            gyp.to_string_lossy().to_string(),
+        ));
     }
     out.push(("npm_config_npm_version".into(), NPM_VERSION.into()));
     out
@@ -1082,26 +1100,42 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
 /// build_lifecycle_env's full manifest expansion available to existing callers.
 fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     let mut env = build_lifecycle_env(ctx);
-    env.retain(|key, _| !key.starts_with("npm_package_") || matches!(
-        key.as_str(), "npm_package_name" | "npm_package_version" | "npm_package_json"
-    ));
+    env.retain(|key, _| {
+        !key.starts_with("npm_package_")
+            || matches!(
+                key.as_str(),
+                "npm_package_name" | "npm_package_version" | "npm_package_json"
+            )
+    });
     fn package_env(prefix: &str, value: &serde_json::Value, env: &mut HashMap<String, String>) {
         match value {
             serde_json::Value::Object(map) => {
-                for (key, value) in map { package_env(&format!("{prefix}_{key}"), value, env); }
+                for (key, value) in map {
+                    package_env(&format!("{prefix}_{key}"), value, env);
+                }
             }
             serde_json::Value::Array(items) => {
-                for (index, value) in items.iter().enumerate() { package_env(&format!("{prefix}_{index}"), value, env); }
+                for (index, value) in items.iter().enumerate() {
+                    package_env(&format!("{prefix}_{index}"), value, env);
+                }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(false) => { env.insert(prefix.into(), String::new()); }
-            serde_json::Value::String(value) => { env.insert(prefix.into(), value.clone()); }
-            value => { env.insert(prefix.into(), value.to_string()); }
+            serde_json::Value::Null | serde_json::Value::Bool(false) => {
+                env.insert(prefix.into(), String::new());
+            }
+            serde_json::Value::String(value) => {
+                env.insert(prefix.into(), value.clone());
+            }
+            value => {
+                env.insert(prefix.into(), value.to_string());
+            }
         }
     }
     if let Ok(bytes) = std::fs::read(ctx.package_dir.join("package.json")) {
         if let Ok(package) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             for key in ["config", "engines", "bin"] {
-                if let Some(value) = package.get(key) { package_env(&format!("npm_package_{key}"), value, &mut env); }
+                if let Some(value) = package.get(key) {
+                    package_env(&format!("npm_package_{key}"), value, &mut env);
+                }
             }
         }
     }
@@ -1118,9 +1152,14 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         env.insert("INIT_CWD".into(), cwd.clone());
     }
     // npm inserts every ancestor's .bin directory, even before it exists.
-    let mut bins: Vec<PathBuf> = ctx.package_dir.ancestors()
-        .map(|dir| dir.join("node_modules").join(".bin")).collect();
-    let inherited = std::env::var_os("PATH").or_else(|| std::env::var_os("Path")).unwrap_or_default();
+    let mut bins: Vec<PathBuf> = ctx
+        .package_dir
+        .ancestors()
+        .map(|dir| dir.join("node_modules").join(".bin"))
+        .collect();
+    let inherited = std::env::var_os("PATH")
+        .or_else(|| std::env::var_os("Path"))
+        .unwrap_or_default();
     bins.extend(std::env::split_paths(&inherited));
     if let Ok(path) = std::env::join_paths(bins) {
         env.remove("Path");
@@ -1620,8 +1659,13 @@ impl ScriptExitError {
     pub fn lifecycle_failure(ctx: &LifecycleContext, status: &ExitStatus) -> Self {
         let code = extract_exit_status_code(status);
         let shell = if cfg!(windows) {
-            format!("{} /d /s /c", std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()))
-        } else { "sh -c".into() };
+            format!(
+                "{} /d /s /c",
+                std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into())
+            )
+        } else {
+            "sh -c".into()
+        };
         Self {
             exit_code: code,
             message: format!("npm error code {code}\nnpm error path {}\nnpm error command failed\nnpm error command {shell} {}", ctx.package_dir.display(), ctx.script_cmd),
@@ -1887,7 +1931,10 @@ pub fn execute_binary(
 
     env.insert(
         "INIT_CWD".to_string(),
-        extra_env.get("INIT_CWD").cloned().unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
+        extra_env
+            .get("INIT_CWD")
+            .cloned()
+            .unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
     );
 
     #[cfg(windows)]
@@ -2038,7 +2085,10 @@ where
 
     env.insert(
         "INIT_CWD".to_string(),
-        extra_env.get("INIT_CWD").cloned().unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
+        extra_env
+            .get("INIT_CWD")
+            .cloned()
+            .unwrap_or_else(|| current_dir.to_string_lossy().to_string()),
     );
 
     #[cfg(windows)]
@@ -2394,10 +2444,14 @@ async fn execute_dependency_hooks_with_abort(
                         } else {
                             // npm: exit with the script's code and replay its output.
                             let mut failure = ScriptExitError::lifecycle_failure(&ctx, &status);
-                            if let Some(out) = ctx.captured_output.lock().ok().and_then(|o| o.clone()) {
+                            if let Some(out) =
+                                ctx.captured_output.lock().ok().and_then(|o| o.clone())
+                            {
                                 for line in out.stdout.lines().chain(out.stderr.lines()) {
-                                    failure.message.push_str("
-npm error ");
+                                    failure.message.push_str(
+                                        "
+npm error ",
+                                    );
                                     failure.message.push_str(line);
                                 }
                             }
@@ -2449,7 +2503,13 @@ async fn execute_root_hooks_with_abort(
         return Ok(());
     }
     let root_hooks = [
-        "preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
+        "preinstall",
+        "install",
+        "postinstall",
+        "prepublish",
+        "preprepare",
+        "prepare",
+        "postprepare",
     ];
     for hook in root_hooks {
         if let Some(script_cmd) = root_manifest.scripts.get(hook) {
@@ -2471,8 +2531,17 @@ async fn execute_root_hooks_with_abort(
             ctx.package_version = root_manifest.version.clone();
             if rnpm_config::Config::load(Some(&opts.root_dir))?.get("loglevel") != Some("silent") {
                 let name = root_manifest.name.as_deref().unwrap_or("");
-                let id = root_manifest.version.as_ref().map(|v| format!("{name}@{v} "))
-                    .unwrap_or_else(|| if name.is_empty() { String::new() } else { format!("{name} ") });
+                let id = root_manifest
+                    .version
+                    .as_ref()
+                    .map(|v| format!("{name}@{v} "))
+                    .unwrap_or_else(|| {
+                        if name.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{name} ")
+                        }
+                    });
                 // npm routes lifecycle banners to stderr in JSON mode so stdout stays parseable.
                 let json_mode = rnpm_config::get_process_cli_overrides()
                     .and_then(|o| o.get("json").cloned())
@@ -2503,7 +2572,9 @@ async fn execute_root_hooks_with_abort(
 
             let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
             if !status.success() {
-                return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(&ctx, &status)));
+                return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(
+                    &ctx, &status,
+                )));
             }
         }
     }

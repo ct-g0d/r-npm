@@ -1,5 +1,9 @@
-use std::{fs, path::Path, process::{Command, Output}};
 use serde_json::{json, Value};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 use tempfile::tempdir;
 
 fn run(dir: &Path, args: &[&str]) -> Output {
@@ -7,21 +11,36 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
-        .args(args).output().unwrap()
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn fixture(dir: &Path, name: &str, hooks: &[&str]) {
     fs::create_dir_all(dir).unwrap();
-    let scripts: serde_json::Map<String, Value> = hooks.iter()
-        .map(|hook| (hook.to_string(), json!("node probe.cjs"))).collect();
-    fs::write(dir.join("package.json"), serde_json::to_string_pretty(&json!({
-        "name": name, "version": "1.0.0", "scripts": scripts
-    })).unwrap() + "\n").unwrap();
+    let scripts: serde_json::Map<String, Value> = hooks
+        .iter()
+        .map(|hook| (hook.to_string(), json!("node probe.cjs")))
+        .collect();
+    fs::write(
+        dir.join("package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": name, "version": "1.0.0", "scripts": scripts
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
     fs::write(dir.join("probe.cjs"), "require('fs').appendFileSync('events.txt', process.env.npm_lifecycle_event + '\\n'); console.log(process.env.npm_lifecycle_event);").unwrap();
 }
 
 fn success(out: &Output) {
-    assert!(out.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn events(dir: &Path) -> String {
@@ -33,7 +52,11 @@ fn workspace(dir: &Path) {
     let path = dir.join("package.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     manifest["workspaces"] = json!(["packages/*"]);
-    fs::write(path, serde_json::to_string_pretty(&manifest).unwrap() + "\n").unwrap();
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+    )
+    .unwrap();
     fixture(&dir.join("packages/a"), "a", &["prex", "x", "postx"]);
     fixture(&dir.join("packages/b"), "b", &["prex", "x", "postx"]);
 }
@@ -63,7 +86,10 @@ fn run_hook_failure_preserves_exit_code_and_stops_later_hooks() {
     assert_eq!(out.status.code(), Some(7));
     assert_eq!(events(temp.path()), "prex\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let log = stderr.trim().strip_prefix("npm error A complete log of this run can be found in: ").expect("npm's failed root script writes a diagnostic log footer");
+    let log = stderr
+        .trim()
+        .strip_prefix("npm error A complete log of this run can be found in: ")
+        .expect("npm's failed root script writes a diagnostic log footer");
     assert!(Path::new(log).is_file());
 }
 
@@ -71,13 +97,34 @@ fn run_hook_failure_preserves_exit_code_and_stops_later_hooks() {
 fn install_and_ci_run_all_root_hooks_in_npm_order() {
     for command in ["install", "ci"] {
         let temp = tempdir().unwrap();
-        fixture(temp.path(), "fixture", &["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"]);
-        fs::write(temp.path().join("package-lock.json"), serde_json::to_string_pretty(&json!({
-            "name":"fixture", "version":"1.0.0", "lockfileVersion":3, "requires":true,
-            "packages":{"":{"name":"fixture","version":"1.0.0","hasInstallScript":true}}
-        })).unwrap() + "\n").unwrap();
+        fixture(
+            temp.path(),
+            "fixture",
+            &[
+                "preinstall",
+                "install",
+                "postinstall",
+                "prepublish",
+                "preprepare",
+                "prepare",
+                "postprepare",
+            ],
+        );
+        fs::write(
+            temp.path().join("package-lock.json"),
+            serde_json::to_string_pretty(&json!({
+                "name":"fixture", "version":"1.0.0", "lockfileVersion":3, "requires":true,
+                "packages":{"":{"name":"fixture","version":"1.0.0","hasInstallScript":true}}
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
         success(&run(temp.path(), &[command, "--silent"]));
-        assert_eq!(events(temp.path()), "preinstall\ninstall\npostinstall\nprepublish\npreprepare\nprepare\npostprepare\n");
+        assert_eq!(
+            events(temp.path()),
+            "preinstall\ninstall\npostinstall\nprepublish\npreprepare\nprepare\npostprepare\n"
+        );
     }
 }
 
@@ -87,15 +134,27 @@ fn pack_runs_hooks_even_in_dry_run_and_honors_ignore_scripts() {
         let temp = tempdir().unwrap();
         fixture(temp.path(), "fixture", &["prepack", "prepare", "postpack"]);
         let mut args = vec!["pack", "--dry-run", "--silent"];
-        if ignore { args.push("--ignore-scripts"); }
+        if ignore {
+            args.push("--ignore-scripts");
+        }
         let out = run(temp.path(), &args);
         success(&out);
-        assert_eq!(events(temp.path()), if ignore { "" } else { "prepack\nprepare\npostpack\n" });
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), if ignore {
-            "fixture-1.0.0.tgz\n"
-        } else {
-            "prepack\nprepare\npostpack\nfixture-1.0.0.tgz\n"
-        });
+        assert_eq!(
+            events(temp.path()),
+            if ignore {
+                ""
+            } else {
+                "prepack\nprepare\npostpack\n"
+            }
+        );
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            if ignore {
+                "fixture-1.0.0.tgz\n"
+            } else {
+                "prepack\nprepare\npostpack\nfixture-1.0.0.tgz\n"
+            }
+        );
         assert!(!temp.path().join("fixture-1.0.0.tgz").exists());
     }
 }
@@ -104,12 +163,28 @@ fn pack_runs_hooks_even_in_dry_run_and_honors_ignore_scripts() {
 fn workspace_run_selection_and_root_hook_order() {
     let temp = tempdir().unwrap();
     workspace(temp.path());
-    let out = run(temp.path(), &["run", "x", "--workspaces", "--include-workspace-root", "--silent"]);
+    let out = run(
+        temp.path(),
+        &[
+            "run",
+            "x",
+            "--workspaces",
+            "--include-workspace-root",
+            "--silent",
+        ],
+    );
     success(&out);
-    for dir in [temp.path().to_path_buf(), temp.path().join("packages/a"), temp.path().join("packages/b")] {
+    for dir in [
+        temp.path().to_path_buf(),
+        temp.path().join("packages/a"),
+        temp.path().join("packages/b"),
+    ] {
         assert_eq!(events(&dir), "prex\nx\npostx\n");
     }
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "prex\nx\npostx\nprex\nx\npostx\nprex\nx\npostx\n");
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "prex\nx\npostx\nprex\nx\npostx\nprex\nx\npostx\n"
+    );
 }
 
 #[test]
@@ -118,15 +193,22 @@ fn workspace_missing_script_requires_if_present_and_never_runs_orphan_hooks() {
     workspace(temp.path());
     let out = run(temp.path(), &["run", "absent", "--workspaces"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).starts_with("npm error Lifecycle script `absent` failed with error:"));
-    let out = run(temp.path(), &["run", "absent", "--workspaces", "--if-present"]);
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .starts_with("npm error Lifecycle script `absent` failed with error:"));
+    let out = run(
+        temp.path(),
+        &["run", "absent", "--workspaces", "--if-present"],
+    );
     success(&out);
     assert!(out.stdout.is_empty());
     let manifest_path = temp.path().join("packages/a/package.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest["scripts"].as_object_mut().unwrap().remove("x");
     fs::write(manifest_path, manifest.to_string()).unwrap();
-    success(&run(temp.path(), &["run", "x", "--workspaces", "--if-present", "--silent"]));
+    success(&run(
+        temp.path(),
+        &["run", "x", "--workspaces", "--if-present", "--silent"],
+    ));
     assert_eq!(events(&temp.path().join("packages/a")), "");
     assert_eq!(events(&temp.path().join("packages/b")), "prex\nx\npostx\n");
 }
@@ -135,11 +217,28 @@ fn workspace_missing_script_requires_if_present_and_never_runs_orphan_hooks() {
 fn workspace_version_bumps_only_members() {
     let temp = tempdir().unwrap();
     workspace(temp.path());
-    let out = run(temp.path(), &["version", "patch", "--workspaces", "--no-git-tag-version", "--silent"]);
+    let out = run(
+        temp.path(),
+        &[
+            "version",
+            "patch",
+            "--workspaces",
+            "--no-git-tag-version",
+            "--silent",
+        ],
+    );
     success(&out);
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "a\nv1.0.1\nb\nv1.0.1\n");
-    for (relative, version) in [("package.json", "1.0.0"), ("packages/a/package.json", "1.0.1"), ("packages/b/package.json", "1.0.1")] {
-        let manifest: Value = serde_json::from_slice(&fs::read(temp.path().join(relative)).unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "a\nv1.0.1\nb\nv1.0.1\n"
+    );
+    for (relative, version) in [
+        ("package.json", "1.0.0"),
+        ("packages/a/package.json", "1.0.1"),
+        ("packages/b/package.json", "1.0.1"),
+    ] {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(temp.path().join(relative)).unwrap()).unwrap();
         assert_eq!(manifest["version"], version);
     }
 }
@@ -149,9 +248,16 @@ fn workspace_exec_runs_in_each_member() {
     let temp = tempdir().unwrap();
     workspace(temp.path());
     for name in ["a", "b"] {
-        fs::write(temp.path().join(format!("packages/{name}/exec.cjs")), "console.log(require('./package.json').name)").unwrap();
+        fs::write(
+            temp.path().join(format!("packages/{name}/exec.cjs")),
+            "console.log(require('./package.json').name)",
+        )
+        .unwrap();
     }
-    let out = run(temp.path(), &["exec", "--workspaces", "--", "node", "exec.cjs"]);
+    let out = run(
+        temp.path(),
+        &["exec", "--workspaces", "--", "node", "exec.cjs"],
+    );
     success(&out);
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "a\nb\n");
 }
@@ -160,7 +266,11 @@ fn workspace_exec_runs_in_each_member() {
 fn run_manifest_errors_have_npm_first_line() {
     let temp = tempdir().unwrap();
     let out = run(temp.path(), &["run", "x"]);
-    let expected_code = if cfg!(windows) { -4058 } else { (-2i32 as u8) as i32 };
+    let expected_code = if cfg!(windows) {
+        -4058
+    } else {
+        (-2i32 as u8) as i32
+    };
     assert_eq!(out.status.code(), Some(expected_code));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("npm error code ENOENT\n"));
     fs::write(temp.path().join("package.json"), "{invalid").unwrap();

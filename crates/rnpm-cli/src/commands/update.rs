@@ -63,10 +63,27 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
     if dry_run {
         let summary = installer.run().await?;
         let report = summary.reify.unwrap_or_default();
-        return crate::reify_output::finish(&current_dir, &report, opts.json, true, opts.silent, start_time.elapsed()).await;
+        return crate::reify_output::finish(
+            &current_dir,
+            &report,
+            opts.json,
+            true,
+            opts.silent,
+            start_time.elapsed(),
+        )
+        .await;
     }
     let before = crate::reify_output::snapshot(&current_dir);
     installer.update(&opts.packages).await?;
-    let report = crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
-    crate::reify_output::finish(&current_dir, &report, opts.json, false, opts.silent, start_time.elapsed()).await
+    let report =
+        crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
+    crate::reify_output::finish(
+        &current_dir,
+        &report,
+        opts.json,
+        false,
+        opts.silent,
+        start_time.elapsed(),
+    )
+    .await
 }

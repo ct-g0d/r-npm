@@ -140,7 +140,11 @@ pub async fn run(
 
     // Verify package directory exists (equivalent to npm's `await lstat(dir)`)
     if std::fs::symlink_metadata(&dir).is_err() {
-        let errno_str = if cfg!(windows) { "errno -4058\n" } else { "errno -2\n" };
+        let errno_str = if cfg!(windows) {
+            "errno -4058\n"
+        } else {
+            "errno -2\n"
+        };
         return Err(anyhow::anyhow!(
             "npm error code ENOENT\n\
              npm error syscall lstat\n\
@@ -172,9 +176,7 @@ pub async fn run(
         .args(&spawn_args)
         .current_dir(&current_dir)
         .status()
-        .map_err(|e| {
-            anyhow::anyhow!("npm error failed to spawn editor '{}': {e}", bin)
-        })?;
+        .map_err(|e| anyhow::anyhow!("npm error failed to spawn editor '{}': {e}", bin))?;
 
     if !status.success() {
         let code = status.code().unwrap_or(1);
@@ -207,7 +209,10 @@ mod tests {
         assert_eq!(split_package_names("pkg"), "pkg");
         assert_eq!(split_package_names("@scope/pkg"), "@scope/pkg");
         assert_eq!(split_package_names("pkg/sub"), "pkg/node_modules/sub");
-        assert_eq!(split_package_names("@scope/pkg/sub"), "@scope/pkg/node_modules/sub");
+        assert_eq!(
+            split_package_names("@scope/pkg/sub"),
+            "@scope/pkg/node_modules/sub"
+        );
         assert_eq!(
             split_package_names("@s1/p1/@s2/p2"),
             "@s1/p1/node_modules/@s2/p2"
@@ -222,11 +227,14 @@ mod tests {
     fn test_parse_editor_command_quoting() {
         let cmd = r#"node "C:\My Path\script.js" --arg 'foo bar'"#;
         let tokens = parse_editor_command(cmd);
-        assert_eq!(tokens, vec![
-            "node".to_string(),
-            r#"C:\My Path\script.js"#.to_string(),
-            "--arg".to_string(),
-            "foo bar".to_string()
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                "node".to_string(),
+                r#"C:\My Path\script.js"#.to_string(),
+                "--arg".to_string(),
+                "foo bar".to_string()
+            ]
+        );
     }
 }

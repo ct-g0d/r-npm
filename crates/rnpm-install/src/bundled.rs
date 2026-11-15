@@ -52,9 +52,11 @@ pub(crate) async fn inflate(
         });
         let bytes = match cached {
             Some(bytes) => bytes,
-            None if offline => return Err(anyhow!(
+            None if offline => {
+                return Err(anyhow!(
                 "npm error code ENOTCACHED\nnpm error Bundled package tarball is not cached: {url}"
-            )),
+            ))
+            }
             None => {
                 let bytes = if let Some(file) = url.strip_prefix("file:") {
                     std::fs::read(project_dir.join(file))?

@@ -14,7 +14,9 @@ async fn test_outdated_column_layout_and_json_parity() {
             let (mut stream, _) = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let mut request = [0; 8192];
-                if stream.read(&mut request).await.unwrap() == 0 { return; }
+                if stream.read(&mut request).await.unwrap() == 0 {
+                    return;
+                }
                 let body = serde_json::json!({"name":"is-number","dist-tags":{"latest":"7.0.0"},"versions":{
                     "6.0.0":{"name":"is-number","version":"6.0.0","dist":{"tarball":format!("http://{address}/6.tgz")}},
                     "7.0.0":{"name":"is-number","version":"7.0.0","dist":{"tarball":format!("http://{address}/7.tgz")}}

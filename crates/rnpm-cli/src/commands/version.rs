@@ -34,7 +34,11 @@ pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Resul
 
     let has_ws = args.workspaces || !args.workspace.is_empty();
     if has_ws {
-        let members = crate::select_workspace_members(&current_dir, &args.workspace, args.include_workspace_root)?;
+        let members = crate::select_workspace_members(
+            &current_dir,
+            &args.workspace,
+            args.include_workspace_root,
+        )?;
         let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
         for member in members {
             println!("{}", member.name);
@@ -46,19 +50,34 @@ pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Resul
             let silent = config.get("loglevel") == Some("silent");
             let start = std::time::Instant::now();
             let mut installer = rnpm_install::Installer::new(rnpm_install::InstallOptions {
-                project_dir: current_dir.clone(), workspace: names.clone(),
+                project_dir: current_dir.clone(),
+                workspace: names.clone(),
                 unlocked_packages: names.into_iter().collect(),
                 // Reification after a version bump must not repeat root install hooks.
-                ignore_scripts: true, audit: false, fund: false, silent,
+                ignore_scripts: true,
+                audit: false,
+                fund: false,
+                silent,
                 ..Default::default()
             })?;
             let summary = installer.run().await?;
             if !silent {
                 if summary.packages_installed == 0 {
-                    println!("\nup to date in {}", crate::format_duration(start.elapsed()));
+                    println!(
+                        "\nup to date in {}",
+                        crate::format_duration(start.elapsed())
+                    );
                 } else {
-                    println!("\nadded {} package{} in {}", summary.packages_installed,
-                        if summary.packages_installed == 1 { "" } else { "s" }, crate::format_duration(start.elapsed()));
+                    println!(
+                        "\nadded {} package{} in {}",
+                        summary.packages_installed,
+                        if summary.packages_installed == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        crate::format_duration(start.elapsed())
+                    );
                 }
             }
         }

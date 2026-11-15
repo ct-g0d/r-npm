@@ -324,9 +324,7 @@ async fn test_cli_unpublish_mock_registry() {
     std::fs::create_dir_all(&localappdata).unwrap();
     std::fs::write(
         &userconfig,
-        format!(
-            "//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"
-        ),
+        format!("//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"),
     )
     .unwrap();
 

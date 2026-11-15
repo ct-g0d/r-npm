@@ -22,7 +22,11 @@ fn test_pack_dry_run_and_tarball() {
         .output()
         .expect("pack dry-run failed");
 
-    assert!(dry_out.status.success(), "stderr: {}", String::from_utf8_lossy(&dry_out.stderr));
+    assert!(
+        dry_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
     let dry_stdout = String::from_utf8_lossy(&dry_out.stdout);
     assert!(dry_stdout.contains("pack-coverage-pkg-1.0.0.tgz"));
     assert!(!tmp.path().join("pack-coverage-pkg-1.0.0.tgz").exists());
@@ -34,6 +38,10 @@ fn test_pack_dry_run_and_tarball() {
         .output()
         .expect("pack failed");
 
-    assert!(real_out.status.success(), "stderr: {}", String::from_utf8_lossy(&real_out.stderr));
+    assert!(
+        real_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&real_out.stderr)
+    );
     assert!(tmp.path().join("pack-coverage-pkg-1.0.0.tgz").exists());
 }

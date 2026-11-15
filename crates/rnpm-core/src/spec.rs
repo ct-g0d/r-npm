@@ -550,9 +550,13 @@ fn expand_github_shorthand(spec: &str) -> String {
         .chars()
         .next()
         .is_some_and(|c| !matches!(c, '@' | '%' | '/' | '.' | '-') && !c.is_whitespace())
-        && !user.chars().any(|c| matches!(c, ':' | '@' | '%' | '/') || c.is_whitespace());
+        && !user
+            .chars()
+            .any(|c| matches!(c, ':' | '@' | '%' | '/') || c.is_whitespace());
     let repo_ok = !repo.is_empty()
-        && !repo.chars().any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
+        && !repo
+            .chars()
+            .any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
     if user_ok && repo_ok {
         if committish.is_empty() && !spec.contains('#') {
             format!("github:{body}")

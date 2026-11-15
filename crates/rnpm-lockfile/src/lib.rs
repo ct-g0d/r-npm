@@ -20,7 +20,9 @@ pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrit
 pub use migration::{
     load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
 };
-pub use model::{set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines};
+pub use model::{
+    set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines,
+};
 pub use rnpm_core::manifest::BundledDependencies;
 
 #[cfg(test)]
@@ -420,7 +422,11 @@ mod tests {
     fn hidden_lockfile_preserves_indent_and_newlines() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
-        std::fs::write(project.join("package.json"), "\u{feff}{\r\n\t\"name\": \"app\"\r\n}\r\n").unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            "\u{feff}{\r\n\t\"name\": \"app\"\r\n}\r\n",
+        )
+        .unwrap();
         let lock = LockfileV3::new("app", None);
         lock.save_hidden(project).unwrap();
         let hidden = project.join(LockfileV3::HIDDEN_LOCKFILE_PATH);

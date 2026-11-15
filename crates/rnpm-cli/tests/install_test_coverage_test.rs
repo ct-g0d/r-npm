@@ -55,7 +55,11 @@ fn test_install_test_execution() {
         .output()
         .expect("install-test failed");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("install-test-ran"));
 }
@@ -203,7 +207,11 @@ fn test_install_test_live_npm_parity() {
             assert_eq!(rnpm_res.status.code(), npm_out.status.code());
             let rnpm_stdout = normalize_output(&String::from_utf8_lossy(&rnpm_res.stdout));
             let npm_stdout = normalize_output(&String::from_utf8_lossy(&npm_out.stdout));
-            assert_eq!(rnpm_stdout, npm_stdout, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_stdout, npm_stdout);
+            assert_eq!(
+                rnpm_stdout, npm_stdout,
+                "stdout mismatch: rnpm={:?} vs npm={:?}",
+                rnpm_stdout, npm_stdout
+            );
         }
     }
 }
@@ -302,8 +310,11 @@ fn test_install_ci_test_live_npm_parity() {
             assert_eq!(rnpm_res.status.code(), npm_out.status.code());
             let rnpm_stdout = normalize_output(&String::from_utf8_lossy(&rnpm_res.stdout));
             let npm_stdout = normalize_output(&String::from_utf8_lossy(&npm_out.stdout));
-            assert_eq!(rnpm_stdout, npm_stdout, "stdout mismatch: rnpm={:?} vs npm={:?}", rnpm_stdout, npm_stdout);
+            assert_eq!(
+                rnpm_stdout, npm_stdout,
+                "stdout mismatch: rnpm={:?} vs npm={:?}",
+                rnpm_stdout, npm_stdout
+            );
         }
     }
 }
-

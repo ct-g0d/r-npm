@@ -222,9 +222,16 @@ pub(super) async fn complete_graph(
                 .filter(|v| {
                     let mani = &packument["versions"][*v];
                     dep_spec(mani, &cause.name).is_some_and(|spec| {
-                        if mani["bundleDependencies"].as_array().is_some_and(|deps| deps.iter().any(|d| d == &cause.name)) {
-                            source_versions.iter().any(|version| satisfies(version, spec) && satisfies(version, &cause.range))
-                        } else { test_spec(spec) }
+                        if mani["bundleDependencies"]
+                            .as_array()
+                            .is_some_and(|deps| deps.iter().any(|d| d == &cause.name))
+                        {
+                            source_versions.iter().any(|version| {
+                                satisfies(version, spec) && satisfies(version, &cause.range)
+                            })
+                        } else {
+                            test_spec(spec)
+                        }
                     })
                 })
                 .cloned()

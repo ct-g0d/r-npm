@@ -108,9 +108,7 @@ fn parse_engine_entries_from_str(s: &str) -> Vec<(&str, &str)> {
     res
 }
 
-pub fn deserialize_engines<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, String>, D::Error>
+pub fn deserialize_engines<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
 {

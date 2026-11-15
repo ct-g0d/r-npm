@@ -377,7 +377,8 @@ fn run_lifecycle_step(
     ctx.extra_env
         .insert("npm_new_version".to_string(), new_version.to_string());
     if let Ok(cwd) = std::env::current_dir() {
-        ctx.extra_env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
+        ctx.extra_env
+            .insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
     }
 
     if rnpm_config::Config::load(Some(project_dir))?.get("loglevel") != Some("silent") {

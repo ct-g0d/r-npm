@@ -128,9 +128,7 @@ async fn test_cli_undeprecate_mock() {
     std::fs::create_dir_all(&localappdata).unwrap();
     std::fs::write(
         &userconfig,
-        format!(
-            "//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"
-        ),
+        format!("//{addr}/:_authToken=fake-token\nregistry=http://{addr}/\n"),
     )
     .unwrap();
 
@@ -212,8 +210,7 @@ async fn test_cli_undeprecate_mock() {
     assert_eq!(rnpm_reqs[1].method, "PUT");
     assert_eq!(rnpm_reqs[1].path.split('?').next().unwrap(), "/sample-pkg");
     assert_eq!(
-        rnpm_reqs[1].body["versions"]["1.0.0"]["deprecated"],
-        "",
+        rnpm_reqs[1].body["versions"]["1.0.0"]["deprecated"], "",
         "deprecated key should be empty string"
     );
 
@@ -224,8 +221,7 @@ async fn test_cli_undeprecate_mock() {
         assert_eq!(npm_reqs[1].method, "PUT");
         assert_eq!(npm_reqs[1].path.split('?').next().unwrap(), "/sample-pkg");
         assert_eq!(
-            npm_reqs[1].body["versions"]["1.0.0"]["deprecated"],
-            "",
+            npm_reqs[1].body["versions"]["1.0.0"]["deprecated"], "",
             "deprecated key should be empty string"
         );
 

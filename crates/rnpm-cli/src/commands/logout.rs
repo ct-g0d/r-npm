@@ -72,7 +72,9 @@ pub(crate) async fn run(
     let user_npmrc = rnpm_config::get_default_user_npmrc();
     if user_npmrc.is_file() {
         rnpm_config::delete_config_value_from_file(&user_npmrc, &auth_key)?;
-        if std::fs::read_to_string(&user_npmrc)?.trim().is_empty() { std::fs::remove_file(&user_npmrc)?; }
+        if std::fs::read_to_string(&user_npmrc)?.trim().is_empty() {
+            std::fs::remove_file(&user_npmrc)?;
+        }
     }
     let local_npmrc = current_dir.join(".npmrc");
     if local_npmrc.is_file() {

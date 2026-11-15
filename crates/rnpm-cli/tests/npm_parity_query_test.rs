@@ -115,7 +115,9 @@ fn test_query_root_npm_parity() {
                 .expect("npm output should be valid JSON array");
             let npm_arr = npm_val.as_array().expect("npm query should be array");
             assert_eq!(npm_arr.len(), 1);
-            let npm_obj = npm_arr[0].as_object().expect("npm root node should be object");
+            let npm_obj = npm_arr[0]
+                .as_object()
+                .expect("npm root node should be object");
 
             let npm_keys: Vec<&str> = npm_obj.keys().map(|k| k.as_str()).collect();
             assert_eq!(keys, npm_keys, "Field set and order must match npm exactly");

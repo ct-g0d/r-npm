@@ -11,7 +11,11 @@ fn test_prefix_root_live_npm_parity() {
     let tmp = tempdir().unwrap();
     let proj_dir = tmp.path().join("my-project");
     fs::create_dir_all(&proj_dir).unwrap();
-    fs::write(proj_dir.join("package.json"), r#"{"name":"my-project","version":"1.0.0"}"#).unwrap();
+    fs::write(
+        proj_dir.join("package.json"),
+        r#"{"name":"my-project","version":"1.0.0"}"#,
+    )
+    .unwrap();
 
     let isolated_env = tmp.path().join("isolated");
     let isolated_cache = isolated_env.join("cache");
@@ -49,7 +53,9 @@ fn test_prefix_root_live_npm_parity() {
         .output()
         .expect("rnpm prefix failed");
     assert!(rnpm_prefix.status.success());
-    let rnpm_prefix_out = String::from_utf8_lossy(&rnpm_prefix.stdout).trim().to_string();
+    let rnpm_prefix_out = String::from_utf8_lossy(&rnpm_prefix.stdout)
+        .trim()
+        .to_string();
 
     // 2. Local root
     let rnpm_root = Command::new(rnpm_bin)
@@ -71,7 +77,9 @@ fn test_prefix_root_live_npm_parity() {
         .output()
         .expect("rnpm root failed");
     assert!(rnpm_root.status.success());
-    let rnpm_root_out = String::from_utf8_lossy(&rnpm_root.stdout).trim().to_string();
+    let rnpm_root_out = String::from_utf8_lossy(&rnpm_root.stdout)
+        .trim()
+        .to_string();
 
     // 3. Global prefix
     let rnpm_gprefix = Command::new(rnpm_bin)
@@ -93,7 +101,9 @@ fn test_prefix_root_live_npm_parity() {
         .output()
         .expect("rnpm prefix -g failed");
     assert!(rnpm_gprefix.status.success());
-    let rnpm_gprefix_out = String::from_utf8_lossy(&rnpm_gprefix.stdout).trim().to_string();
+    let rnpm_gprefix_out = String::from_utf8_lossy(&rnpm_gprefix.stdout)
+        .trim()
+        .to_string();
 
     // 4. Global root
     let rnpm_groot = Command::new(rnpm_bin)
@@ -115,7 +125,9 @@ fn test_prefix_root_live_npm_parity() {
         .output()
         .expect("rnpm root -g failed");
     assert!(rnpm_groot.status.success());
-    let rnpm_groot_out = String::from_utf8_lossy(&rnpm_groot.stdout).trim().to_string();
+    let rnpm_groot_out = String::from_utf8_lossy(&rnpm_groot.stdout)
+        .trim()
+        .to_string();
 
     // Now compare with live npm.cmd
     let npm_prefix = isolated_npm(&isolated_env)
@@ -141,8 +153,12 @@ fn test_prefix_root_live_npm_parity() {
             let npm_p_out = String::from_utf8_lossy(&npm_p.stdout).trim().to_string();
             // Paths should represent the same path
             assert_eq!(
-                PathBuf::from(&rnpm_prefix_out).canonicalize().unwrap_or(PathBuf::from(&rnpm_prefix_out)),
-                PathBuf::from(&npm_p_out).canonicalize().unwrap_or(PathBuf::from(&npm_p_out)),
+                PathBuf::from(&rnpm_prefix_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&rnpm_prefix_out)),
+                PathBuf::from(&npm_p_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&npm_p_out)),
                 "Prefix output mismatch: rnpm={} vs npm={}",
                 rnpm_prefix_out,
                 npm_p_out
@@ -172,8 +188,12 @@ fn test_prefix_root_live_npm_parity() {
         if npm_r.status.success() {
             let npm_r_out = String::from_utf8_lossy(&npm_r.stdout).trim().to_string();
             assert_eq!(
-                PathBuf::from(&rnpm_root_out).canonicalize().unwrap_or(PathBuf::from(&rnpm_root_out)),
-                PathBuf::from(&npm_r_out).canonicalize().unwrap_or(PathBuf::from(&npm_r_out)),
+                PathBuf::from(&rnpm_root_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&rnpm_root_out)),
+                PathBuf::from(&npm_r_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&npm_r_out)),
                 "Root output mismatch: rnpm={} vs npm={}",
                 rnpm_root_out,
                 npm_r_out
@@ -203,8 +223,12 @@ fn test_prefix_root_live_npm_parity() {
         if npm_gp.status.success() {
             let npm_gp_out = String::from_utf8_lossy(&npm_gp.stdout).trim().to_string();
             assert_eq!(
-                PathBuf::from(&rnpm_gprefix_out).canonicalize().unwrap_or(PathBuf::from(&rnpm_gprefix_out)),
-                PathBuf::from(&npm_gp_out).canonicalize().unwrap_or(PathBuf::from(&npm_gp_out)),
+                PathBuf::from(&rnpm_gprefix_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&rnpm_gprefix_out)),
+                PathBuf::from(&npm_gp_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&npm_gp_out)),
                 "Global prefix output mismatch: rnpm={} vs npm={}",
                 rnpm_gprefix_out,
                 npm_gp_out
@@ -234,8 +258,12 @@ fn test_prefix_root_live_npm_parity() {
         if npm_gr.status.success() {
             let npm_gr_out = String::from_utf8_lossy(&npm_gr.stdout).trim().to_string();
             assert_eq!(
-                PathBuf::from(&rnpm_groot_out).canonicalize().unwrap_or(PathBuf::from(&rnpm_groot_out)),
-                PathBuf::from(&npm_gr_out).canonicalize().unwrap_or(PathBuf::from(&npm_gr_out)),
+                PathBuf::from(&rnpm_groot_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&rnpm_groot_out)),
+                PathBuf::from(&npm_gr_out)
+                    .canonicalize()
+                    .unwrap_or(PathBuf::from(&npm_gr_out)),
                 "Global root output mismatch: rnpm={} vs npm={}",
                 rnpm_groot_out,
                 npm_gr_out

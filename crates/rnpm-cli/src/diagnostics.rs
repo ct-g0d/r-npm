@@ -48,7 +48,8 @@ impl Diagnostic {
 /// 404 response the registry client recorded for it.
 fn missing_package_diagnostic(name: &str, spec: &str) -> Diagnostic {
     let (url, body) = rnpm_registry::not_found::lookup(name).unwrap_or_else(|| {
-        let config = rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
+        let config =
+            rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
         let registry = config.npmrc.registry_for_package(name).clone();
         let url = format!(
             "{}/{}",
@@ -60,8 +61,15 @@ fn missing_package_diagnostic(name: &str, spec: &str) -> Diagnostic {
     let status = reqwest::StatusCode::NOT_FOUND;
     let message = crate::http_errors::general_message("GET", &url, status, &body);
     // npm-package-arg reports an empty spec as `*`; rnpm's default is `latest`.
-    let raw_spec = if spec.is_empty() || spec == "latest" { "*" } else { spec };
-    Diagnostic::new("E404", crate::http_errors::e404_block(&message, Some(&format!("{name}@{raw_spec}"))))
+    let raw_spec = if spec.is_empty() || spec == "latest" {
+        "*"
+    } else {
+        spec
+    };
+    Diagnostic::new(
+        "E404",
+        crate::http_errors::e404_block(&message, Some(&format!("{name}@{raw_spec}"))),
+    )
 }
 
 /// npm's EJSONPARSE block for the current project's package.json.
@@ -121,14 +129,25 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "128" => "128",
                 _ => "EUNKNOWN",
             };
-            if matches!(code, "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR" | "128") {
+            if matches!(
+                code,
+                "ECONNREFUSED" | "ENOTFOUND" | "ECONNRESET" | "ETIMEDOUT" | "FETCH_ERROR" | "128"
+            ) {
                 let mut block = err_str[idx..].to_string();
-                if code == "ECONNREFUSED" && err.chain().any(|cause| {
-                    matches!(cause.downcast_ref::<SolverError>(), Some(SolverError::PackageMetadata(..)))
-                }) {
+                if code == "ECONNREFUSED"
+                    && err.chain().any(|cause| {
+                        matches!(
+                            cause.downcast_ref::<SolverError>(),
+                            Some(SolverError::PackageMetadata(..))
+                        )
+                    })
+                {
                     // Arborist failureNode uses '.' when no parent edge is
                     // attached to a package metadata failure.
-                    block = block.replace("npm error   type: 'system'\n", "npm error   type: 'system',\nnpm error   requiredBy: '.'\n");
+                    block = block.replace(
+                        "npm error   type: 'system'\n",
+                        "npm error   type: 'system',\nnpm error   requiredBy: '.'\n",
+                    );
                 }
                 return Diagnostic::new(code, block);
             }
@@ -168,13 +187,19 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
     for cause in err.chain() {
         if let Some(solver_err) = cause.downcast_ref::<SolverError>() {
             match solver_err {
-                SolverError::UnresolvedDependency { name, spec, message }
-                    if message == "No matching version found satisfying constraint" => {
+                SolverError::UnresolvedDependency {
+                    name,
+                    spec,
+                    message,
+                } if message == "No matching version found satisfying constraint" => {
                     return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
-                SolverError::UnresolvedDependency { name, spec, message }
-                    if message == "Package not found in metadata provider" => {
+                SolverError::UnresolvedDependency {
+                    name,
+                    spec,
+                    message,
+                } if message == "Package not found in metadata provider" => {
                     return missing_package_diagnostic(name, spec);
                 }
                 SolverError::PeerConflict { .. } => {
@@ -441,7 +466,10 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                         .map(|(i, _)| i)
                         .unwrap_or(package_spec.len());
                     let (name, spec) = package_spec.split_at(at);
-                    return missing_package_diagnostic(name, spec.strip_prefix('@').unwrap_or(spec));
+                    return missing_package_diagnostic(
+                        name,
+                        spec.strip_prefix('@').unwrap_or(spec),
+                    );
                 }
                 _ => {}
             }
@@ -534,12 +562,16 @@ mod wave2_tests {
             ("Package not found in metadata provider", "E404"),
         ] {
             let error = anyhow::Error::from(SolverError::UnresolvedDependency {
-                name: "fixture".into(), spec: "999.0.0".into(), message: message.into(),
+                name: "fixture".into(),
+                spec: "999.0.0".into(),
+                message: message.into(),
             });
             assert_eq!(classify_error(&error).code, code);
         }
         let error = anyhow::Error::from(SolverError::UnresolvedDependency {
-            name: "fixture".into(), spec: "999.0.0".into(), message: "network unavailable".into(),
+            name: "fixture".into(),
+            spec: "999.0.0".into(),
+            message: "network unavailable".into(),
         });
         assert_eq!(classify_error(&error).code, "EUNKNOWN");
     }

@@ -2,19 +2,19 @@
 #![allow(clippy::too_many_arguments)]
 
 mod audit;
-mod reify_output;
-mod explain;
 pub mod commands;
 pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
+mod explain;
+pub(crate) mod http_errors;
 pub mod init;
 pub mod inspect_tree;
 pub mod json_errors;
-pub(crate) mod http_errors;
 pub mod list;
 pub mod outdated;
 pub mod query;
+mod reify_output;
 pub mod sbom;
 pub mod version;
 pub mod view;
@@ -1527,10 +1527,16 @@ pub(crate) enum OwnerAction {
     #[command(alias = "list")]
     Ls { package: Option<String> },
     /// Add an owner.
-    Add { user: String, package: Option<String> },
+    Add {
+        user: String,
+        package: Option<String>,
+    },
     /// Remove an owner.
     #[command(alias = "remove")]
-    Rm { user: String, package: Option<String> },
+    Rm {
+        user: String,
+        package: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1721,10 +1727,7 @@ where
         args_to_scan.extend_from_slice(pre_dash_dash);
     }
 
-    let unsupported_flags = [
-        "--legacy-peer-deps",
-        "--strict-peer-deps",
-    ];
+    let unsupported_flags = ["--legacy-peer-deps", "--strict-peer-deps"];
 
     let mut i = 0;
     while i < args_to_scan.len() {
@@ -1755,19 +1758,16 @@ where
             continue;
         }
 
-        if matches!(
-            first.as_str(),
-            "pkg" | "ls" | "list" | "la" | "ll"
-        ) {
+        if matches!(first.as_str(), "pkg" | "ls" | "list" | "la" | "ll") {
             i += 1;
             continue;
         }
         // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, update (and their aliases)
         let is_global = args_to_scan.iter().any(|a| a == "-g" || a == "--global");
-        if matches!(
-            first.as_str(),
-            "install" | "i" | "add" | "isntall"
-        ) && !is_global && (arg == "--allow-scripts" || arg == "--no-allow-scripts") {
+        if matches!(first.as_str(), "install" | "i" | "add" | "isntall")
+            && !is_global
+            && (arg == "--allow-scripts" || arg == "--no-allow-scripts")
+        {
             return Some((
                 "EALLOWSCRIPTS".to_string(),
                 "npm error code EALLOWSCRIPTS\nnpm error --allow-scripts is not allowed in project-scoped installs. Add the entries to the \"allowScripts\" field in package.json, or to .npmrc, instead.".to_string(),
@@ -2090,18 +2090,29 @@ pub(crate) async fn execute_run(
         let mut failed = false;
         for member in members {
             let result = execute_run_sync(
-                member.path.clone(), script.clone(), args.clone(), if_present,
-                ignore_scripts, foreground_scripts, strict_sandbox,
+                member.path.clone(),
+                script.clone(),
+                args.clone(),
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
             );
             if let Err(err) = result {
-                if failed { eprintln!(); }
+                if failed {
+                    eprintln!();
+                }
                 failed = true;
                 eprintln!("npm error Lifecycle script \x60{script}\x60 failed with error:");
                 if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
                     eprintln!("npm error code {}", exit.exit_code);
                 }
-                let id = member.manifest.version.as_ref()
-                    .map(|v| format!("{}@{v}", member.name)).unwrap_or_else(|| member.name.clone());
+                let id = member
+                    .manifest
+                    .version
+                    .as_ref()
+                    .map(|v| format!("{}@{v}", member.name))
+                    .unwrap_or_else(|| member.name.clone());
                 eprintln!("npm error workspace {id}");
                 eprintln!("npm error location {}", member.path.display());
                 if !member.manifest.scripts.contains_key(&script) {
@@ -2114,13 +2125,21 @@ pub(crate) async fn execute_run(
         }
         if failed {
             return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                exit_code: 1, message: format!("Workspace script '{script}' failed"),
+                exit_code: 1,
+                message: format!("Workspace script '{script}' failed"),
             }));
         }
         Ok(())
     } else {
-        execute_run_sync(current_dir, script, args, if_present, ignore_scripts,
-            foreground_scripts, strict_sandbox)
+        execute_run_sync(
+            current_dir,
+            script,
+            args,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+        )
     }
 }
 
@@ -2134,41 +2153,75 @@ fn select_workspace_members(
         anyhow::bail!("npm error code ENOWORKSPACES\nnpm error No workspaces found!");
     }
     for filter in filters {
-        if !members.iter().any(|m| rnpm_lifecycle::matches_filter(filter, &m.name, &m.path, root)) {
+        if !members
+            .iter()
+            .any(|m| rnpm_lifecycle::matches_filter(filter, &m.name, &m.path, root))
+        {
             anyhow::bail!("npm error No workspaces found:\nnpm error   --workspace={filter}");
         }
     }
     // Preserve the existing topological extension for workspace: specs, which
     // npm does not accept. npm-compatible manifests use declaration order.
-    let uses_workspace_protocol = members.iter().any(|m| m.manifest.dependencies.values()
-        .chain(m.manifest.dev_dependencies.values()).any(|spec| spec.starts_with("workspace:")));
+    let uses_workspace_protocol = members.iter().any(|m| {
+        m.manifest
+            .dependencies
+            .values()
+            .chain(m.manifest.dev_dependencies.values())
+            .any(|spec| spec.starts_with("workspace:"))
+    });
     if uses_workspace_protocol {
         if let Ok(graph) = rnpm_solver::WorkspaceDependencyGraph::construct(&members) {
-        let order_map: std::collections::HashMap<&str, usize> = graph
-            .topological_order
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.as_str(), i))
-            .collect();
-        members.sort_by_key(|m| order_map.get(m.name.as_str()).copied().unwrap_or(usize::MAX));
-    }
+            let order_map: std::collections::HashMap<&str, usize> = graph
+                .topological_order
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.as_str(), i))
+                .collect();
+            members.sort_by_key(|m| {
+                order_map
+                    .get(m.name.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+        }
     } else {
         let manifest = Manifest::from_file(root.join("package.json"))?;
         let mut ordered_paths = Vec::new();
-        for pattern in manifest.workspace_patterns().iter().filter(|p| !p.starts_with('!')) {
-            ordered_paths.extend(rnpm_core::workspace::match_glob_patterns(root, std::slice::from_ref(pattern))?);
+        for pattern in manifest
+            .workspace_patterns()
+            .iter()
+            .filter(|p| !p.starts_with('!'))
+        {
+            ordered_paths.extend(rnpm_core::workspace::match_glob_patterns(
+                root,
+                std::slice::from_ref(pattern),
+            )?);
         }
-        members.sort_by_key(|m| ordered_paths.iter().position(|p| p == &m.path).unwrap_or(usize::MAX));
+        members.sort_by_key(|m| {
+            ordered_paths
+                .iter()
+                .position(|p| p == &m.path)
+                .unwrap_or(usize::MAX)
+        });
     }
-    members.retain(|m| filters.is_empty() || filters.iter()
-        .any(|f| rnpm_lifecycle::matches_filter(f, &m.name, &m.path, root)));
+    members.retain(|m| {
+        filters.is_empty()
+            || filters
+                .iter()
+                .any(|f| rnpm_lifecycle::matches_filter(f, &m.name, &m.path, root))
+    });
     if include_root {
         let manifest = Manifest::from_file(root.join("package.json"))?;
-        members.insert(0, rnpm_core::workspace::WorkspaceMember {
-            name: manifest.name.clone().unwrap_or_default(),
-            version: manifest.version.clone(), path: root.to_path_buf(),
-            relative_path: String::new(), manifest,
-        });
+        members.insert(
+            0,
+            rnpm_core::workspace::WorkspaceMember {
+                name: manifest.name.clone().unwrap_or_default(),
+                version: manifest.version.clone(),
+                path: root.to_path_buf(),
+                relative_path: String::new(),
+                manifest,
+            },
+        );
     }
     Ok(members)
 }
@@ -2191,10 +2244,11 @@ where
             // npm accepts the lowercase short form as an alias for --version.
             // clap's generated version flag is -V, so normalize it before parsing.
             result.push("--version".to_string());
-        } else if arg == "--production"
-            && args.get(1).is_some_and(|c| c != "prune")
-        {
-            if !args.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent") {
+        } else if arg == "--production" && args.get(1).is_some_and(|c| c != "prune") {
+            if !args
+                .iter()
+                .any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent")
+            {
                 eprintln!("npm warn config production Use `--omit=dev` instead.");
             }
             result.push("--omit=dev".to_string());
@@ -2308,7 +2362,13 @@ fn extract_config_flag(
     is_silent: bool,
     overrides: &mut BTreeMap<String, String>,
 ) -> Option<usize> {
-    if token == "--" || token == "--help" || token == "-h" || token == "--version" || token == "-v" || token == "-V" {
+    if token == "--"
+        || token == "--help"
+        || token == "-h"
+        || token == "--version"
+        || token == "-v"
+        || token == "-V"
+    {
         return None;
     }
     if token == "-s" || token == "--silent" {
@@ -2385,7 +2445,9 @@ fn extract_config_flag(
             if is_known && !is_bool {
                 if let Some(next) = next_token {
                     if !next.starts_with('-') {
-                        if !((key == "ca" || key == "cafile") && (next == "true" || next == "false")) {
+                        if !((key == "ca" || key == "cafile")
+                            && (next == "true" || next == "false"))
+                        {
                             overrides.insert(key, next.to_string());
                         }
                         return Some(2);
@@ -2415,7 +2477,11 @@ fn preprocess_exec_args(
     };
 
     if before_dashdash.iter().any(|t| t == "--help" || t == "-h") {
-        return vec![program.to_string(), _subcmd.to_string(), "--help".to_string()];
+        return vec![
+            program.to_string(),
+            _subcmd.to_string(),
+            "--help".to_string(),
+        ];
     }
 
     let mut clap_flags = Vec::new();
@@ -2565,7 +2631,11 @@ fn preprocess_init_args(
     overrides: &mut BTreeMap<String, String>,
 ) -> Vec<String> {
     if tokens.iter().any(|t| t == "--help" || t == "-h") {
-        return vec![program.to_string(), _subcmd.to_string(), "--help".to_string()];
+        return vec![
+            program.to_string(),
+            _subcmd.to_string(),
+            "--help".to_string(),
+        ];
     }
 
     let mut clap_flags = Vec::new();
@@ -2600,7 +2670,10 @@ fn preprocess_init_args(
             i += 1;
             continue;
         }
-        if token.starts_with("--scope=") || token.starts_with("--registry=") || token.starts_with("--cache=") {
+        if token.starts_with("--scope=")
+            || token.starts_with("--registry=")
+            || token.starts_with("--cache=")
+        {
             clap_flags.push(token.clone());
             i += 1;
             continue;
@@ -2647,7 +2720,11 @@ fn preprocess_run_args(
     };
 
     if before_dashdash.iter().any(|t| t == "--help" || t == "-h") {
-        return vec![program.to_string(), subcmd.to_string(), "--help".to_string()];
+        return vec![
+            program.to_string(),
+            subcmd.to_string(),
+            "--help".to_string(),
+        ];
     }
 
     let is_run = subcmd == "run" || subcmd == "run-script" || subcmd == "rum" || subcmd == "urn";
@@ -2805,7 +2882,9 @@ where
             is_silent = true;
             break;
         }
-        if (arg == "--loglevel" || arg == "-loglevel") && rest.get(idx + 1).map(|s| s.as_str()) == Some("silent") {
+        if (arg == "--loglevel" || arg == "-loglevel")
+            && rest.get(idx + 1).map(|s| s.as_str()) == Some("silent")
+        {
             is_silent = true;
             break;
         }
@@ -2857,7 +2936,21 @@ where
             let sub = &rest[idx];
             if matches!(
                 sub.as_str(),
-                "run" | "run-script" | "rum" | "urn" | "exec" | "x" | "npx" | "test" | "t" | "tst" | "start" | "restart" | "stop" | "init" | "create"
+                "run"
+                    | "run-script"
+                    | "rum"
+                    | "urn"
+                    | "exec"
+                    | "x"
+                    | "npx"
+                    | "test"
+                    | "t"
+                    | "tst"
+                    | "start"
+                    | "restart"
+                    | "stop"
+                    | "init"
+                    | "create"
             ) {
                 let pos_after = rest[idx + 1..]
                     .iter()
@@ -2909,11 +3002,29 @@ where
             || subcmd == "restart"
             || subcmd == "stop"
         {
-            preprocess_run_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+            preprocess_run_args(
+                &program,
+                subcmd,
+                &rest[idx + 1..],
+                is_silent,
+                &mut overrides,
+            )
         } else if subcmd == "exec" || subcmd == "x" || subcmd == "npx" {
-            preprocess_exec_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+            preprocess_exec_args(
+                &program,
+                subcmd,
+                &rest[idx + 1..],
+                is_silent,
+                &mut overrides,
+            )
         } else if subcmd == "init" || subcmd == "create" {
-            preprocess_init_args(&program, subcmd, &rest[idx + 1..], is_silent, &mut overrides)
+            preprocess_init_args(
+                &program,
+                subcmd,
+                &rest[idx + 1..],
+                is_silent,
+                &mut overrides,
+            )
         } else {
             // General subcommand
             let root_cmd = Cli::command();
@@ -2959,7 +3070,9 @@ where
                                 continue;
                             }
                         }
-                        if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                        if let Some(consumed) =
+                            extract_config_flag(token, next_token, is_silent, &mut overrides)
+                        {
                             j += consumed;
                             continue;
                         }
@@ -2974,7 +3087,9 @@ where
                     }
                 }
 
-                if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                if let Some(consumed) =
+                    extract_config_flag(token, next_token, is_silent, &mut overrides)
+                {
                     j += consumed;
                     continue;
                 }
@@ -3009,7 +3124,9 @@ where
                             continue;
                         }
                     }
-                    if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+                    if let Some(consumed) =
+                        extract_config_flag(token, next_token, is_silent, &mut overrides)
+                    {
                         j += consumed;
                         continue;
                     }
@@ -3020,7 +3137,9 @@ where
                 }
             }
 
-            if let Some(consumed) = extract_config_flag(token, next_token, is_silent, &mut overrides) {
+            if let Some(consumed) =
+                extract_config_flag(token, next_token, is_silent, &mut overrides)
+            {
                 j += consumed;
                 continue;
             }
@@ -3062,18 +3181,29 @@ pub(crate) async fn ensure_npx_environment(
     cache: Option<PathBuf>,
     offline: bool,
 ) -> anyhow::Result<PathBuf> {
-    let cache_path = cache.or_else(|| {
-        let dir = std::env::current_dir().ok()?;
-        rnpm_config::Config::load(Some(&dir)).ok()?.get("cache").map(PathBuf::from)
-    }).unwrap_or_else(|| {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
-            .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
-    });
+    let cache_path = cache
+        .or_else(|| {
+            let dir = std::env::current_dir().ok()?;
+            rnpm_config::Config::load(Some(&dir))
+                .ok()?
+                .get("cache")
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
+                .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
+        });
     let safe: String = specs
         .join("+")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let env_dir = cache_path.join("_npx").join(safe);
     let mut deps = serde_json::Map::new();
@@ -3081,7 +3211,8 @@ pub(crate) async fn ensure_npx_environment(
         let (name, req) = parse_package_spec(spec);
         deps.insert(name, serde_json::Value::String(req));
     }
-    let manifest = serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
+    let manifest =
+        serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
     let installed = env_dir.join("node_modules").is_dir()
         && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
@@ -3104,14 +3235,28 @@ pub(crate) async fn ensure_npx_environment(
 }
 
 fn package_binary(env_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(env_dir.join("node_modules").join(name).join("package.json"))?)?;
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        env_dir.join("node_modules").join(name).join("package.json"),
+    )?)?;
     let unscoped = name.rsplit('/').next().unwrap_or(name);
-    let selected = manifest["bin"].as_object().and_then(|bins| {
-        if bins.contains_key(unscoped) { Some(unscoped.to_string()) }
-        else if bins.values().next().is_some_and(|first| bins.values().all(|v| v == first)) { bins.keys().next().cloned() }
-        else { None }
-    }).or_else(|| manifest["bin"].as_str().map(|_| unscoped.to_string()));
-    selected.and_then(|bin| rnpm_lifecycle::find_local_binary(env_dir, &bin))
+    let selected = manifest["bin"]
+        .as_object()
+        .and_then(|bins| {
+            if bins.contains_key(unscoped) {
+                Some(unscoped.to_string())
+            } else if bins
+                .values()
+                .next()
+                .is_some_and(|first| bins.values().all(|v| v == first))
+            {
+                bins.keys().next().cloned()
+            } else {
+                None
+            }
+        })
+        .or_else(|| manifest["bin"].as_str().map(|_| unscoped.to_string()));
+    selected
+        .and_then(|bin| rnpm_lifecycle::find_local_binary(env_dir, &bin))
         .ok_or_else(|| anyhow::anyhow!("npm error could not determine executable to run"))
 }
 
@@ -3136,35 +3281,41 @@ pub(crate) async fn execute_exec(
         &cmd_pkg_name
     };
 
-    let cache_path = cache.clone().or_else(|| {
-        rnpm_config::Config::load(Some(current_dir)).ok()?.get("cache").map(PathBuf::from)
-    }).unwrap_or_else(|| {
-        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-            PathBuf::from(appdata).join("rnpm").join("cache")
-        } else {
-            std::env::temp_dir().join(".rnpm-cache")
-        }
-    });
+    let cache_path = cache
+        .clone()
+        .or_else(|| {
+            rnpm_config::Config::load(Some(current_dir))
+                .ok()?
+                .get("cache")
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(appdata).join("rnpm").join("cache")
+            } else {
+                std::env::temp_dir().join(".rnpm-cache")
+            }
+        });
 
-fn find_system_binary(command: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for p in std::env::split_paths(&path_var) {
-        let direct = p.join(command);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        #[cfg(windows)]
-        {
-            for ext in &[".cmd", ".exe", ".bat", ".ps1"] {
-                let with_ext = p.join(format!("{command}{ext}"));
-                if with_ext.is_file() {
-                    return Some(with_ext);
+    fn find_system_binary(command: &str) -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        for p in std::env::split_paths(&path_var) {
+            let direct = p.join(command);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            #[cfg(windows)]
+            {
+                for ext in &[".cmd", ".exe", ".bat", ".ps1"] {
+                    let with_ext = p.join(format!("{command}{ext}"));
+                    if with_ext.is_file() {
+                        return Some(with_ext);
+                    }
                 }
             }
         }
+        None
     }
-    None
-}
 
     let binary_to_run = if package_specs.is_empty() {
         // When -p is NOT provided:
@@ -3351,9 +3502,19 @@ fn find_system_binary(command: &str) -> Option<PathBuf> {
 
     if banner && !is_loglevel_silent(current_dir) {
         let manifest = Manifest::from_file(current_dir.join("package.json")).unwrap_or_default();
-        let id = manifest.name.map(|name| format!("{name}@{} ", manifest.version.unwrap_or_default())).unwrap_or_default();
-        let bin = binary_to_run.file_stem().unwrap_or_default().to_string_lossy();
-        let suffix = if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) };
+        let id = manifest
+            .name
+            .map(|name| format!("{name}@{} ", manifest.version.unwrap_or_default()))
+            .unwrap_or_default();
+        let bin = binary_to_run
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let suffix = if args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", args.join(" "))
+        };
         println!("\n> {id}npx\n> {bin}{suffix}\n");
     }
 
@@ -3402,13 +3563,16 @@ fn rebase_local_spec(spec: &str, base: &std::path::Path) -> String {
         || path_part.starts_with("..\\")
         || path_part == "."
         || path_part == "..";
-    let is_local = !prefix.is_empty() || looks_relative || {
-        let lower = path_part.to_ascii_lowercase();
-        (lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
-            && !path_part.contains("://")
-    } || (!path_part.contains(':')
-        && !path_part.starts_with('@')
-        && base.join(path_part).is_dir());
+    let is_local = !prefix.is_empty()
+        || looks_relative
+        || {
+            let lower = path_part.to_ascii_lowercase();
+            (lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+                && !path_part.contains("://")
+        }
+        || (!path_part.contains(':')
+            && !path_part.starts_with('@')
+            && base.join(path_part).is_dir());
     let path = std::path::Path::new(path_part);
     if !is_local || path_part.is_empty() || path.is_absolute() || path_part.starts_with("//") {
         return spec.to_string();
@@ -3444,18 +3608,32 @@ pub(crate) fn run_lifecycle_hook(
                 (Some(name), None) => name.clone(),
                 _ => String::new(),
             };
-            let banner = format!("\n> {}{hook_name}\n> {script_cmd}\n", if id.is_empty() { id } else { format!("{id} ") });
-            if json { eprintln!("{banner}"); } else { println!("{banner}"); }
+            let banner = format!(
+                "\n> {}{hook_name}\n> {script_cmd}\n",
+                if id.is_empty() { id } else { format!("{id} ") }
+            );
+            if json {
+                eprintln!("{banner}");
+            } else {
+                println!("{banner}");
+            }
         }
-        let mut ctx =
-            LifecycleContext::new(package_dir, package_dir, manifest.name.as_deref().unwrap_or(""), hook_name, script_cmd);
+        let mut ctx = LifecycleContext::new(
+            package_dir,
+            package_dir,
+            manifest.name.as_deref().unwrap_or(""),
+            hook_name,
+            script_cmd,
+        );
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.capture_output = !foreground_scripts;
         ctx.extra_env = lifecycle_config_env(package_dir);
         let status = execute_lifecycle_script(&ctx)?;
         if !status.success() {
-            return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError::lifecycle_failure(&ctx, &status)));
+            return Err(anyhow::Error::from(
+                rnpm_lifecycle::ScriptExitError::lifecycle_failure(&ctx, &status),
+            ));
         }
     }
 
@@ -3474,7 +3652,11 @@ pub(crate) fn prepare_publish_manifest(
     let Some(obj) = manifest.as_object_mut() else {
         return;
     };
-    if obj.get("readme").and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+    if obj
+        .get("readme")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty)
+    {
         let mut names: Vec<&String> = file_names
             .iter()
             .filter(|f| !f.contains('/'))
@@ -3508,7 +3690,10 @@ pub(crate) fn prepare_publish_manifest(
         if let Some(file) = chosen {
             if let Some(text) = read(file) {
                 readme = Some(text);
-                obj.insert("readmeFilename".into(), serde_json::Value::String((*file).clone()));
+                obj.insert(
+                    "readmeFilename".into(),
+                    serde_json::Value::String((*file).clone()),
+                );
             }
         }
         obj.insert(
@@ -3522,7 +3707,10 @@ pub(crate) fn prepare_publish_manifest(
     }
     if let Ok(out) = std::process::Command::new("node").arg("--version").output() {
         if out.status.success() {
-            let v = String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').to_string();
+            let v = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .trim_start_matches('v')
+                .to_string();
             obj.insert("_nodeVersion".into(), serde_json::Value::String(v));
         }
     }
@@ -3613,9 +3801,13 @@ pub(crate) async fn execute_publish(
     let foreground = script_config.get_bool("foreground-scripts").unwrap_or(true);
 
     let (summary, tarball_bytes, manifest_json) = if tarball_spec {
-        let bytes = commands::pack::fetch_archive(&current_dir, &raw_target, registry.clone()).await?;
+        let bytes =
+            commands::pack::fetch_archive(&current_dir, &raw_target, registry.clone()).await?;
         let (summary, manifest_json) = rnpm_fs::summarize_tarball(&bytes).map_err(|e| {
-            anyhow::anyhow!("npm error code ENOENT\nnpm error Could not read {}: {e}", target_path.display())
+            anyhow::anyhow!(
+                "npm error code ENOENT\nnpm error Could not read {}: {e}",
+                target_path.display()
+            )
         })?;
         (summary, bytes, manifest_json)
     } else {
@@ -3627,9 +3819,12 @@ pub(crate) async fn execute_publish(
             ));
         }
         let manifest_content = std::fs::read_to_string(&manifest_path)?;
-        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).map_err(|e| {
-            anyhow::anyhow!("npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}")
-        })?;
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&manifest_content).map_err(|e| {
+                anyhow::anyhow!(
+                    "npm error code EJSONPARSE\nnpm error Failed to parse package.json: {e}"
+                )
+            })?;
         let manifest = Manifest::from_file(&manifest_path)?;
         if manifest.version.is_none() {
             anyhow::bail!("npm error Cannot read properties of null (reading 'prerelease')");
@@ -3642,9 +3837,33 @@ pub(crate) async fn execute_publish(
         if manifest.name.is_none() && !is_silent {
             eprintln!("npm warn publish npm auto-corrected some errors in your package.json when publishing.  Please run \"npm pkg fix\" to address these errors.\nnpm warn publish errors corrected:\nnpm warn publish Missing \"name\" field was set to an empty string");
         }
-        run_lifecycle_hook(&package_dir, &manifest, "prepublishOnly", ignore_scripts, foreground, is_silent, json)?;
-        run_lifecycle_hook(&package_dir, &manifest, "prepack", ignore_scripts, foreground, is_silent, json)?;
-        run_lifecycle_hook(&package_dir, &manifest, "prepare", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            "prepublishOnly",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
+        run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            "prepack",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
+        run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            "prepare",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
         let (mut summary, bytes) = rnpm_fs::pack_directory(&package_dir, None)
             .map_err(|e| anyhow::anyhow!("npm error pack failed: {e}"))?;
         let updated = Manifest::from_file(&manifest_path).unwrap_or(manifest);
@@ -3652,7 +3871,15 @@ pub(crate) async fn execute_publish(
             summary.name = String::new();
             summary.filename = format!("-{}.tgz", summary.version);
         }
-        run_lifecycle_hook(&package_dir, &updated, "postpack", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(
+            &package_dir,
+            &updated,
+            "postpack",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
         // Re-read: hooks may have changed package.json (including publishConfig).
         let manifest_json = std::fs::read_to_string(&manifest_path)
             .ok()
@@ -3704,9 +3931,13 @@ pub(crate) async fn execute_publish(
     let parsed_version = rnpm_core::semver::Version::parse(&pkg_version).ok();
     if !force
         && is_default_tag
-        && parsed_version.as_ref().is_some_and(|v| !v.prerelease.is_empty())
+        && parsed_version
+            .as_ref()
+            .is_some_and(|v| !v.prerelease.is_empty())
     {
-        anyhow::bail!("npm error You must specify a tag using --tag when publishing a prerelease version.");
+        anyhow::bail!(
+            "npm error You must specify a tag using --tag when publishing a prerelease version."
+        );
     }
 
     // npm shows the contents before authenticating so they are visible while
@@ -3722,7 +3953,9 @@ pub(crate) async fn execute_publish(
     let config = rnpm_config::Config::load(Some(&package_dir)).unwrap_or_default();
     let registry_url = if let Some(ref reg_str) = registry {
         Url::parse(reg_str).map_err(|e| {
-            anyhow::anyhow!("npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}")
+            anyhow::anyhow!(
+                "npm error code EINVALIDURL\nnpm error Invalid registry URL '{reg_str}': {e}"
+            )
         })?
     } else if let Some(pub_reg) = manifest_json
         .get("publishConfig")
@@ -3749,7 +3982,10 @@ pub(crate) async fn execute_publish(
     if let Some(token) = commands::oidc::exchange(&registry_url, &pkg_name).await {
         let key = commands::logout::auth_key_for_registry(&registry_url);
         // Exchange credentials are session-only; never write them to the user's npmrc.
-        client_config.auth_tokens.insert(key.trim_end_matches(":_authToken").to_string(), token.clone());
+        client_config.auth_tokens.insert(
+            key.trim_end_matches(":_authToken").to_string(),
+            token.clone(),
+        );
         client_config.auth_token = Some(token);
     }
     let client = rnpm_registry::RegistryClient::with_config(client_config)?;
@@ -3842,8 +4078,12 @@ pub(crate) async fn execute_publish(
                 publish_manifest["_resolved"] = raw_target.clone().into();
             } else {
                 let (_, fetch_client) = make_registry_client(&current_dir, registry.clone())?;
-                let url = fetch_client.registry_for_package(&pkg_name).join(&rnpm_config::encode_package_name(&pkg_name))?;
-                let (response, _permit) = fetch_client.execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None).await?;
+                let url = fetch_client
+                    .registry_for_package(&pkg_name)
+                    .join(&rnpm_config::encode_package_name(&pkg_name))?;
+                let (response, _permit) = fetch_client
+                    .execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None)
+                    .await?;
                 let metadata: serde_json::Value = response.error_for_status()?.json().await?;
                 if let Some(source) = metadata["versions"].get(&pkg_version) {
                     let node_version = publish_manifest["_nodeVersion"].clone();
@@ -3860,7 +4100,15 @@ pub(crate) async fn execute_publish(
             name: &pkg_name,
             version: &pkg_version,
             description: manifest_json.get("description").and_then(|d| d.as_str()),
-            tag: if std::env::args().any(|a| a == "--tag" || a.starts_with("--tag=")) { &tag } else { manifest_json.get("publishConfig").and_then(|c| c.get("tag")).and_then(|t| t.as_str()).unwrap_or(&tag) },
+            tag: if std::env::args().any(|a| a == "--tag" || a.starts_with("--tag=")) {
+                &tag
+            } else {
+                manifest_json
+                    .get("publishConfig")
+                    .and_then(|c| c.get("tag"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(&tag)
+            },
             access: effective_access,
             manifest: &publish_manifest,
             tarball: tarball_data,
@@ -3869,27 +4117,50 @@ pub(crate) async fn execute_publish(
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url
-            .join(&if stage { format!("-/stage/package/{}", rnpm_config::encode_package_name(&pkg_name)) } else { rnpm_config::encode_package_name(&pkg_name) })
+            .join(&if stage {
+                format!(
+                    "-/stage/package/{}",
+                    rnpm_config::encode_package_name(&pkg_name)
+                )
+            } else {
+                rnpm_config::encode_package_name(&pkg_name)
+            })
             .unwrap_or_else(|_| registry_url.clone());
         if stage {
-            let command_client = commands::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
-            let response = command_client.request(reqwest::Method::POST, put_url.clone(), None).json(&payload).send().await?;
+            let command_client = commands::client_helper::CommandClient::new(
+                &current_dir,
+                Some(registry_url.as_str()),
+            )?;
+            let response = command_client
+                .request(reqwest::Method::POST, put_url.clone(), None)
+                .json(&payload)
+                .send()
+                .await?;
             let status = response.status();
             let text = response.text().await?;
-            if !status.is_success() { return Err(commands::client_helper::format_http_error("POST", &put_url, status, &text)); }
+            if !status.is_success() {
+                return Err(commands::client_helper::format_http_error(
+                    "POST", &put_url, status, &text,
+                ));
+            }
             let value: serde_json::Value = serde_json::from_str(&text)?;
             stage_id = value["stageId"].as_str().map(str::to_string);
         } else {
             commands::client_helper::with_registry_otp(&current_dir, "PUT", otp, async |code| {
-                client.publish_to(&registry_url, &pkg_name, &payload, code.as_deref()).await
-            }).await?;
+                client
+                    .publish_to(&registry_url, &pkg_name, &payload, code.as_deref())
+                    .await
+            })
+            .await?;
         }
     }
 
     // JSON is only printed once the publish has completed.
     if json {
         let mut details = pack_json();
-        if let Some(id) = &stage_id { details[&pkg_name]["stageId"] = id.clone().into(); }
+        if let Some(id) = &stage_id {
+            details[&pkg_name]["stageId"] = id.clone().into();
+        }
         println!("{}", serde_json::to_string_pretty(&details)?);
     }
 
@@ -3897,21 +4168,41 @@ pub(crate) async fn execute_publish(
     // only for directory specs.
     if !tarball_spec {
         let manifest = Manifest::from_file(package_dir.join("package.json"))?;
-        run_lifecycle_hook(&package_dir, &manifest, "publish", ignore_scripts, foreground, is_silent, json)?;
-        run_lifecycle_hook(&package_dir, &manifest, "postpublish", ignore_scripts, foreground, is_silent, json)?;
+        run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            "publish",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
+        run_lifecycle_hook(
+            &package_dir,
+            &manifest,
+            "postpublish",
+            ignore_scripts,
+            foreground,
+            is_silent,
+            json,
+        )?;
     }
 
     if !json && !is_silent {
         if stage {
-            let suffix = stage_id.map(|id| format!(" with id {id}")).unwrap_or_default();
+            let suffix = stage_id
+                .map(|id| format!(" with id {id}"))
+                .unwrap_or_default();
             println!("+ {pkg_name}@{pkg_version} (staged{suffix})");
-            eprintln!("npm notice stage package {pkg_name}@{pkg_version} has been staged with tag {tag}");
-        } else { println!("+ {pkg_name}@{pkg_version}"); }
+            eprintln!(
+                "npm notice stage package {pkg_name}@{pkg_version} has been staged with tag {tag}"
+            );
+        } else {
+            println!("+ {pkg_name}@{pkg_version}");
+        }
     }
     Ok(())
 }
-
-
 
 pub(crate) fn make_registry_client(
     current_dir: &Path,
@@ -3941,10 +4232,6 @@ pub(crate) fn make_registry_client(
         rnpm_registry::RegistryClient::with_config(client_config)?,
     ))
 }
-
-
-
-
 
 pub(crate) fn split_package_version(spec: &str) -> anyhow::Result<(&str, &str)> {
     let at = if let Some(stripped) = spec.strip_prefix('@') {
@@ -3999,13 +4286,9 @@ fn package_manifest_value(path: &Path) -> anyhow::Result<serde_json::Value> {
     )?)?)
 }
 
-
 /// Safely updates dependency versions in package.json preserving formatting, indentation,
 /// line endings (CRLF vs LF), and restricting edits exclusively to valid dependency sections.
-pub(crate) fn update_manifest_dependencies(
-    content: &str,
-    updates: &[(String, String)],
-) -> String {
+pub(crate) fn update_manifest_dependencies(content: &str, updates: &[(String, String)]) -> String {
     if updates.is_empty() {
         return content.to_string();
     }
@@ -4146,7 +4429,8 @@ async fn run_audit_fix(
             inventory,
         };
         let fund = config.get_bool("fund").unwrap_or(true);
-        let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+        let mut opts =
+            reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
         opts.audit_command = true;
         let funding = if fund && !dry_run {
             audit::count_funding_packages(project_dir)
@@ -4309,7 +4593,9 @@ async fn run_audit_fix(
         let mut top_force_fixes: BTreeMap<String, rnpm_core::semver::Version> = BTreeMap::new();
         for vuln in initial_report.vulnerabilities.values() {
             let fix = &vuln.fix_available;
-            if let (Some(fix_name), Some(fix_version)) = (fix["name"].as_str(), fix["version"].as_str()) {
+            if let (Some(fix_name), Some(fix_version)) =
+                (fix["name"].as_str(), fix["version"].as_str())
+            {
                 if let Ok(ver) = rnpm_core::semver::Version::parse(fix_version) {
                     top_force_fixes
                         .entry(fix_name.to_string())
@@ -4398,9 +4684,8 @@ async fn run_audit_fix(
             .changes
             .iter()
             .filter_map(|c| match c {
-                rnpm_install::ReifyChange::Change { from, .. } | rnpm_install::ReifyChange::Remove(from) => {
-                    Some(from.location.as_str())
-                }
+                rnpm_install::ReifyChange::Change { from, .. }
+                | rnpm_install::ReifyChange::Remove(from) => Some(from.location.as_str()),
                 rnpm_install::ReifyChange::Add(_) => None,
             })
             .collect();
@@ -4421,9 +4706,20 @@ async fn run_audit_fix(
     let fund = config.get_bool("fund").unwrap_or(true);
     let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
     opts.audit_command = true;
-    let funding = if fund && !dry_run { audit::count_funding_packages(project_dir) } else { 0 };
+    let funding = if fund && !dry_run {
+        audit::count_funding_packages(project_dir)
+    } else {
+        0
+    };
     if !opts.silent {
-        reify_output::print(project_dir, &report, Some(&post_report), funding, &opts, started.elapsed())?;
+        reify_output::print(
+            project_dir,
+            &report,
+            Some(&post_report),
+            funding,
+            &opts,
+            started.elapsed(),
+        )?;
     }
     audit::check_report_threshold(&post_report, audit_level)
 }
@@ -4468,8 +4764,8 @@ fn enforce_dev_engines(current_dir: &std::path::Path) -> anyhow::Result<()> {
     // Arguments after `--` belong to the script, not to npm.
     let argv: Vec<String> = std::env::args().take_while(|a| a != "--").collect();
     let has = |flags: &[&str]| argv.iter().any(|a| flags.contains(&a.as_str()));
-    let global = has(&["-g", "--global", "--location=global"])
-        || config.get_bool("global").unwrap_or(false);
+    let global =
+        has(&["-g", "--global", "--location=global"]) || config.get_bool("global").unwrap_or(false);
     if global {
         return Ok(());
     }
@@ -4512,7 +4808,12 @@ fn checks_dev_engines(cmd: &Commands) -> bool {
 /// npm's elapsed format: the `ms` package's short form (rounded units).
 pub(crate) fn format_duration(d: std::time::Duration) -> String {
     let ms = d.as_millis() as f64;
-    let units = [(86_400_000.0, "d"), (3_600_000.0, "h"), (60_000.0, "m"), (1_000.0, "s")];
+    let units = [
+        (86_400_000.0, "d"),
+        (3_600_000.0, "h"),
+        (60_000.0, "m"),
+        (1_000.0, "s"),
+    ];
     for (size, suffix) in units {
         if ms >= size {
             return format!("{}{suffix}", (ms / size).round());
@@ -4527,8 +4828,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         None => std::env::current_dir()?,
     };
 
-    let silent =
-        rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
+    let silent = rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
 
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
@@ -4609,8 +4909,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let effective_strategy = strategy_str
                 .parse::<rnpm_install::InstallStrategy>()
                 .unwrap_or_else(|_| {
-                    eprintln!("npm warn invalid config install-strategy={} set in command line options", strategy_str);
-                    eprintln!("npm warn invalid config Must be one of: hoisted, nested, shallow, linked");
+                    eprintln!(
+                        "npm warn invalid config install-strategy={} set in command line options",
+                        strategy_str
+                    );
+                    eprintln!(
+                        "npm warn invalid config Must be one of: hoisted, nested, shallow, linked"
+                    );
                     rnpm_install::InstallStrategy::Hoisted
                 });
 
@@ -4644,7 +4949,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 if let Some(root) = rnpm_config::find_workspace_root(&current_dir) {
                     if workspace.is_empty() && !workspaces {
                         if let Some(member) = rnpm_core::workspace::discover_workspaces(&root)?
-                            .into_iter().find(|m| m.path == current_dir) {
+                            .into_iter()
+                            .find(|m| m.path == current_dir)
+                        {
                             workspace.push(member.name);
                         }
                     }
@@ -4669,18 +4976,27 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 .or_else(|| config.get("save_prefix").map(ToString::to_string));
 
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let ws_in_overrides = cli_overrides.as_ref().map(|o| {
-                o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
-                    || o.contains_key("workspace")
-            }).unwrap_or(false);
+            let ws_in_overrides = cli_overrides
+                .as_ref()
+                .map(|o| {
+                    o.get("workspaces")
+                        .map(|v| v != "false" && v != "0")
+                        .unwrap_or(false)
+                        || o.contains_key("workspace")
+                })
+                .unwrap_or(false);
             if workspaces || !workspace.is_empty() || ws_in_overrides {
-                let has_ws = if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
-                    content.contains("\"workspaces\"")
-                } else {
-                    false
-                };
+                let has_ws =
+                    if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
+                        content.contains("\"workspaces\"")
+                    } else {
+                        false
+                    };
                 if !has_ws {
-                    eprintln!("npm error code ENOWORKSPACES\nnpm error No workspaces found in {}", target_dir.display());
+                    eprintln!(
+                        "npm error code ENOWORKSPACES\nnpm error No workspaces found in {}",
+                        target_dir.display()
+                    );
                     std::process::exit(1);
                 }
             }
@@ -4742,14 +5058,33 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             if let Some(report) = summary.reify.as_ref() {
                 let audit_report = if audit_val && !dry_run {
-                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                    audit::build_audit_report(&current_dir, registry.clone())
+                        .await
+                        .ok()
+                        .map(|(r, _)| r)
                 } else {
                     None
                 };
-                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
-                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                let funding = if fund_val && !dry_run {
+                    audit::count_funding_packages(&current_dir)
+                } else {
+                    0
+                };
+                let mut out = reify_output::ReifyOutputOptions::from_config(
+                    &current_dir,
+                    json,
+                    dry_run,
+                    fund_val,
+                );
                 out.silent |= silent;
-                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+                reify_output::print(
+                    &current_dir,
+                    report,
+                    audit_report.as_ref(),
+                    funding,
+                    &out,
+                    start_time.elapsed(),
+                )?;
             } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
@@ -4770,8 +5105,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else if !dry_run {
                 if !silent {
                     if summary.packages_installed > 0 {
-                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
-                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                        let pkg_str = if summary.packages_installed == 1 {
+                            "package"
+                        } else {
+                            "packages"
+                        };
+                        println!(
+                            "\nadded {} {} in {}",
+                            summary.packages_installed, pkg_str, elapsed_str
+                        );
                     } else {
                         println!("\nup to date in {}", elapsed_str);
                     }
@@ -4856,8 +5198,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let effective_strategy = strategy_str
                 .parse::<rnpm_install::InstallStrategy>()
                 .unwrap_or_else(|_| {
-                    eprintln!("npm warn invalid config install-strategy={} set in command line options", strategy_str);
-                    eprintln!("npm warn invalid config Must be one of: hoisted, nested, shallow, linked");
+                    eprintln!(
+                        "npm warn invalid config install-strategy={} set in command line options",
+                        strategy_str
+                    );
+                    eprintln!(
+                        "npm warn invalid config Must be one of: hoisted, nested, shallow, linked"
+                    );
                     rnpm_install::InstallStrategy::Hoisted
                 });
 
@@ -4925,14 +5272,33 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             if let Some(report) = summary.reify.as_ref() {
                 let audit_report = if audit_val && !dry_run {
-                    audit::build_audit_report(&current_dir, registry.clone()).await.ok().map(|(r, _)| r)
+                    audit::build_audit_report(&current_dir, registry.clone())
+                        .await
+                        .ok()
+                        .map(|(r, _)| r)
                 } else {
                     None
                 };
-                let funding = if fund_val && !dry_run { audit::count_funding_packages(&current_dir) } else { 0 };
-                let mut out = reify_output::ReifyOutputOptions::from_config(&current_dir, json, dry_run, fund_val);
+                let funding = if fund_val && !dry_run {
+                    audit::count_funding_packages(&current_dir)
+                } else {
+                    0
+                };
+                let mut out = reify_output::ReifyOutputOptions::from_config(
+                    &current_dir,
+                    json,
+                    dry_run,
+                    fund_val,
+                );
                 out.silent |= silent;
-                reify_output::print(&current_dir, report, audit_report.as_ref(), funding, &out, start_time.elapsed())?;
+                reify_output::print(
+                    &current_dir,
+                    report,
+                    audit_report.as_ref(),
+                    funding,
+                    &out,
+                    start_time.elapsed(),
+                )?;
             } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
@@ -4953,8 +5319,15 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else if !dry_run {
                 if !silent {
                     if summary.packages_installed > 0 {
-                        let pkg_str = if summary.packages_installed == 1 { "package" } else { "packages" };
-                        println!("\nadded {} {} in {}", summary.packages_installed, pkg_str, elapsed_str);
+                        let pkg_str = if summary.packages_installed == 1 {
+                            "package"
+                        } else {
+                            "packages"
+                        };
+                        println!(
+                            "\nadded {} {} in {}",
+                            summary.packages_installed, pkg_str, elapsed_str
+                        );
                     } else {
                         println!("\nup to date in {}", elapsed_str);
                     }
@@ -5064,22 +5437,39 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace_root,
         } => {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let has_script_overrides = cli_overrides.as_ref().map(|o| {
-                o.contains_key("ignore-scripts")
-                    || o.contains_key("foreground-scripts")
-                    || o.contains_key("strict-sandbox")
-            }).unwrap_or(false);
+            let has_script_overrides = cli_overrides
+                .as_ref()
+                .map(|o| {
+                    o.contains_key("ignore-scripts")
+                        || o.contains_key("foreground-scripts")
+                        || o.contains_key("strict-sandbox")
+                })
+                .unwrap_or(false);
 
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
+            {
                 let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ig = ignore_scripts
+                    || overrides
+                        .get("ignore-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let fg = foreground_scripts
+                    || overrides
+                        .get("foreground-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let ss = strict_sandbox
+                    || overrides
+                        .get("strict-sandbox")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
                 (ig, fg, ss)
             } else if current_dir.join(".npmrc").is_file() {
                 let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
                 let ig = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-                let fg = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+                let fg =
+                    foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
                 let ss = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
                 (ig, fg, ss)
             } else {
@@ -5140,7 +5530,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                             .collect();
                         format!("{cmd_str} {}", formatted_args.join(" "))
                     };
-                    let manifest = Manifest::from_file(target_dir.join("package.json")).unwrap_or_default();
+                    let manifest =
+                        Manifest::from_file(target_dir.join("package.json")).unwrap_or_default();
                     let mut ctx = LifecycleContext::new(
                         &target_dir,
                         &target_dir,
@@ -5304,8 +5695,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let elapsed_str = format_duration(start_time.elapsed());
 
             if let Some(before) = before {
-                let report = reify_output::report_between(&before, &reify_output::snapshot(&report_dir));
-                reify_output::finish(&report_dir, &report, json, false, silent, start_time.elapsed()).await?;
+                let report =
+                    reify_output::report_between(&before, &reify_output::snapshot(&report_dir));
+                reify_output::finish(
+                    &report_dir,
+                    &report,
+                    json,
+                    false,
+                    silent,
+                    start_time.elapsed(),
+                )
+                .await?;
             } else if json {
                 let json_output = serde_json::json!({
                     "add": [],
@@ -5320,7 +5720,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
             } else if !silent {
                 if total_removed > 0 {
-                    let pkg_str = if total_removed == 1 { "package" } else { "packages" };
+                    let pkg_str = if total_removed == 1 {
+                        "package"
+                    } else {
+                        "packages"
+                    };
                     println!("\nremoved {} {} in {}", total_removed, pkg_str, elapsed_str);
                 } else {
                     println!("\nup to date in {}", elapsed_str);
@@ -5373,9 +5777,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             commands::prune::run(args, current_dir).await?;
         }
         Commands::Dedupe {
-            packages,
-            dry_run,
-            ..
+            packages, dry_run, ..
         } => {
             commands::dedupe::run_dedupe(packages, dry_run, current_dir).await?;
         }
@@ -5528,20 +5930,31 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
 
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let ws_in_overrides = workspaces || !workspace.is_empty() || cli_overrides.as_ref().map(|o| {
-                o.get("workspaces").map(|v| v != "false" && v != "0").unwrap_or(false)
-                    || o.contains_key("workspace")
-            }).unwrap_or(false);
+            let ws_in_overrides = workspaces
+                || !workspace.is_empty()
+                || cli_overrides
+                    .as_ref()
+                    .map(|o| {
+                        o.get("workspaces")
+                            .map(|v| v != "false" && v != "0")
+                            .unwrap_or(false)
+                            || o.contains_key("workspace")
+                    })
+                    .unwrap_or(false);
             if ws_in_overrides {
                 let ws_filters = if !workspace.is_empty() {
                     workspace.clone()
                 } else if let Some(ref o) = cli_overrides {
-                    o.get("workspace").map(|w| vec![w.clone()]).unwrap_or_default()
+                    o.get("workspace")
+                        .map(|w| vec![w.clone()])
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
                 let members = select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
-                if packages.is_empty() { packages.extend(members.into_iter().map(|m| m.name)); }
+                if packages.is_empty() {
+                    packages.extend(members.into_iter().map(|m| m.name));
+                }
             }
 
             let opts = list::ListOptions {
@@ -5555,7 +5968,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 omit,
                 is_global,
             };
-            let code = if ws_in_overrides { list::run_workspace_list(&target_dir, &opts)? } else { list::run_list(&target_dir, &opts)? };
+            let code = if ws_in_overrides {
+                list::run_workspace_list(&target_dir, &opts)?
+            } else {
+                list::run_list(&target_dir, &opts)?
+            };
             if code != 0 {
                 return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
                     exit_code: code,
@@ -5563,10 +5980,36 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }));
             }
         }
-        Commands::Outdated { packages, all, json, long, parseable, registry, global, workspace, workspaces, include_workspace_root } => {
-            let target_dir = if global { rnpm_config::find_global_prefix() } else { current_dir };
-            let opts = outdated::OutdatedOptions {packages,all,json,long,parseable,registry,global,workspace,workspaces,include_workspace_root};
-            commands::outdated::run(opts,target_dir).await?;
+        Commands::Outdated {
+            packages,
+            all,
+            json,
+            long,
+            parseable,
+            registry,
+            global,
+            workspace,
+            workspaces,
+            include_workspace_root,
+        } => {
+            let target_dir = if global {
+                rnpm_config::find_global_prefix()
+            } else {
+                current_dir
+            };
+            let opts = outdated::OutdatedOptions {
+                packages,
+                all,
+                json,
+                long,
+                parseable,
+                registry,
+                global,
+                workspace,
+                workspaces,
+                include_workspace_root,
+            };
+            commands::outdated::run(opts, target_dir).await?;
         }
         Commands::View {
             args,
@@ -5623,7 +6066,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         } => {
             commands::login::run(&current_dir, registry, auth_type, scope, otp, false).await?;
         }
-        Commands::Adduser { registry, auth_type, scope, otp } => {
+        Commands::Adduser {
+            registry,
+            auth_type,
+            scope,
+            otp,
+        } => {
             commands::login::run(&current_dir, registry, auth_type, scope, otp, true).await?;
         }
         Commands::Logout { registry, scope } => {
@@ -5642,7 +6090,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             allow_scripts_pending,
             json,
         } => {
-            commands::allow_scripts::run_approve(&current_dir, &packages, all, allow_scripts_pending, json)?;
+            commands::allow_scripts::run_approve(
+                &current_dir,
+                &packages,
+                all,
+                allow_scripts_pending,
+                json,
+            )?;
         }
         Commands::DenyScripts {
             packages,
@@ -5650,7 +6104,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             allow_scripts_pending,
             json,
         } => {
-            commands::allow_scripts::run_deny(&current_dir, &packages, all, allow_scripts_pending, json)?;
+            commands::allow_scripts::run_deny(
+                &current_dir,
+                &packages,
+                all,
+                allow_scripts_pending,
+                json,
+            )?;
         }
         Commands::Completion { shell } => {
             if shell.is_none() {
@@ -5887,7 +6347,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             explain::run_explain(&current_dir, &package, json)?;
         }
         Commands::Bugs { packages, .. } => {
-            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
+            let packages = if packages.is_empty() {
+                vec![".".into()]
+            } else {
+                packages
+            };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
@@ -5898,22 +6362,58 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .or_else(|| value.get("bugs").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 if url.is_empty() {
-                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", &format!("https://www.npmjs.com/package/{package}?activeTab=issues"));
+                    print_package_url(
+                        &current_dir,
+                        value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&package),
+                        "bugs",
+                        &format!("https://www.npmjs.com/package/{package}?activeTab=issues"),
+                    );
                 } else {
-                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "bugs", url);
+                    print_package_url(
+                        &current_dir,
+                        value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&package),
+                        "bugs",
+                        url,
+                    );
                 }
             }
         }
         Commands::Docs { packages, .. } => {
-            let packages = if packages.is_empty() { vec![".".into()] } else { packages };
+            let packages = if packages.is_empty() {
+                vec![".".into()]
+            } else {
+                packages
+            };
             for package in packages {
                 let dir = resolve_local_package_dir(&current_dir, &package)?;
                 let value = package_manifest_value(&dir)?;
                 let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
                 if url.is_empty() {
-                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", &format!("https://www.npmjs.com/package/{package}?activeTab=readme"));
+                    print_package_url(
+                        &current_dir,
+                        value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&package),
+                        "docs",
+                        &format!("https://www.npmjs.com/package/{package}?activeTab=readme"),
+                    );
                 } else {
-                    print_package_url(&current_dir, value.get("name").and_then(|v| v.as_str()).unwrap_or(&package), "docs", url);
+                    print_package_url(
+                        &current_dir,
+                        value
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&package),
+                        "docs",
+                        url,
+                    );
                 }
             }
         }
@@ -5929,7 +6429,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     .and_then(|v| v.get("url").or(Some(v)))
                     .and_then(|v| v.as_str());
                 if let Some(r) = repo {
-                    let name = value.as_ref().and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let name = value
+                        .as_ref()
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     print_package_url(&current_dir, name, "repo", r.trim_end_matches(".git"));
                     return Ok(());
                 } else {
@@ -5953,7 +6457,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         .and_then(|v| v.as_str())
                         .or_else(|| value.get("repository").and_then(|v| v.as_str()))
                     {
-                        print_package_url(&current_dir, &package, "repo", repo.trim_end_matches(".git"));
+                        print_package_url(
+                            &current_dir,
+                            &package,
+                            "repo",
+                            repo.trim_end_matches(".git"),
+                        );
                         continue;
                     }
                 }
@@ -5971,7 +6480,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                             .and_then(|v| v.extra.get("repository"))
                             .and_then(|v| v.as_str())
                     });
-                print_package_url(&current_dir, &package, "repo", repo.unwrap_or("https://www.npmjs.com/package/").trim_end_matches(".git"));
+                print_package_url(
+                    &current_dir,
+                    &package,
+                    "repo",
+                    repo.unwrap_or("https://www.npmjs.com/package/")
+                        .trim_end_matches(".git"),
+                );
                 let _ = registry_url;
             }
         }
@@ -6064,7 +6579,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             dry_run,
         } => {
             let Some(action) = action else {
-                return Err(commands::stage::usage_error(None, commands::stage::TRUST_USAGE));
+                return Err(commands::stage::usage_error(
+                    None,
+                    commands::stage::TRUST_USAGE,
+                ));
             };
             if action == "list" {
                 return commands::stage::run_trust_list(&args, registry, json, &current_dir).await;
@@ -6081,12 +6599,30 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 )
                 .await;
             }
-            commands::trust::run(commands::trust::CreateArgs {
-                provider: action, package: args.first().cloned(), registry, otp,
-                file: workflow_file, repository, environment, project, org_id,
-                project_id, pipeline_definition_id, vcs_origin, context_ids: context_id,
-                allow_publish, allow_stage_publish, yes, json, dry_run,
-            }, &current_dir).await?;
+            commands::trust::run(
+                commands::trust::CreateArgs {
+                    provider: action,
+                    package: args.first().cloned(),
+                    registry,
+                    otp,
+                    file: workflow_file,
+                    repository,
+                    environment,
+                    project,
+                    org_id,
+                    project_id,
+                    pipeline_definition_id,
+                    vcs_origin,
+                    context_ids: context_id,
+                    allow_publish,
+                    allow_stage_publish,
+                    yes,
+                    json,
+                    dry_run,
+                },
+                &current_dir,
+            )
+            .await?;
         }
         Commands::Hook { registry, .. } => {
             let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
@@ -6118,7 +6654,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             global,
             location,
         } => {
-            commands::config::run_set(&key, Some(&value), global, location.as_deref(), &current_dir)?;
+            commands::config::run_set(
+                &key,
+                Some(&value),
+                global,
+                location.as_deref(),
+                &current_dir,
+            )?;
         }
         Commands::Config { action } => {
             commands::config::run(action, current_dir)?;
@@ -6182,15 +6724,78 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
 /// Command list printed by `npm help` (npm's lib/utils/cmd-list.js).
 const NPM_COMMANDS: &[&str] = &[
-    "access", "adduser", "approve-scripts", "audit", "bugs", "cache", "ci", "completion",
-    "config", "dedupe", "deny-scripts", "deprecate", "diff", "dist-tag", "docs", "doctor",
-    "edit", "exec", "explain", "explore", "find-dupes", "fund", "get", "help", "help-search",
-    "init", "install", "install-ci-test", "install-scripts", "install-test", "link", "ll",
-    "login", "logout", "ls", "org", "outdated", "owner", "pack", "ping", "pkg", "prefix",
-    "profile", "prune", "publish", "query", "rebuild", "repo", "restart", "root", "run",
-    "sbom", "search", "set", "shrinkwrap", "stage", "star", "stars", "start", "stop", "team",
-    "test", "token", "trust", "undeprecate", "uninstall", "unpublish", "unstar", "update",
-    "version", "view", "whoami",
+    "access",
+    "adduser",
+    "approve-scripts",
+    "audit",
+    "bugs",
+    "cache",
+    "ci",
+    "completion",
+    "config",
+    "dedupe",
+    "deny-scripts",
+    "deprecate",
+    "diff",
+    "dist-tag",
+    "docs",
+    "doctor",
+    "edit",
+    "exec",
+    "explain",
+    "explore",
+    "find-dupes",
+    "fund",
+    "get",
+    "help",
+    "help-search",
+    "init",
+    "install",
+    "install-ci-test",
+    "install-scripts",
+    "install-test",
+    "link",
+    "ll",
+    "login",
+    "logout",
+    "ls",
+    "org",
+    "outdated",
+    "owner",
+    "pack",
+    "ping",
+    "pkg",
+    "prefix",
+    "profile",
+    "prune",
+    "publish",
+    "query",
+    "rebuild",
+    "repo",
+    "restart",
+    "root",
+    "run",
+    "sbom",
+    "search",
+    "set",
+    "shrinkwrap",
+    "stage",
+    "star",
+    "stars",
+    "start",
+    "stop",
+    "team",
+    "test",
+    "token",
+    "trust",
+    "undeprecate",
+    "uninstall",
+    "unpublish",
+    "unstar",
+    "update",
+    "version",
+    "view",
+    "whoami",
 ];
 
 /// Wraps the command list like npm's utils/npm-usage.js for a non-TTY stdout.
@@ -6307,17 +6912,26 @@ CONFIGURATION
 }
 
 fn print_package_url(dir: &Path, name: &str, command: &str, url: &str) {
-    if rnpm_config::Config::load(Some(dir)).ok().is_some_and(|config| config.get("browser") == Some("false")) {
+    if rnpm_config::Config::load(Some(dir))
+        .ok()
+        .is_some_and(|config| config.get("browser") == Some("false"))
+    {
         println!("{name} {command} available at the following URL:\n{url}");
-    } else { println!("{url}"); }
+    } else {
+        println!("{url}");
+    }
 }
 
 pub(crate) fn use_unicode(dir: &Path) -> bool {
-    rnpm_config::Config::load(Some(dir)).ok().and_then(|config| config.get_bool("unicode"))
+    rnpm_config::Config::load(Some(dir))
+        .ok()
+        .and_then(|config| config.get_bool("unicode"))
         .unwrap_or_else(|| {
-            let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter()
+            let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .iter()
                 .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
-                .unwrap_or_default().to_ascii_uppercase();
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             locale.ends_with("UTF8") || locale.ends_with("UTF-8")
         })
 }
@@ -6338,10 +6952,17 @@ pub(crate) fn is_loglevel_silent(dir: &Path) -> bool {
 pub(crate) fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
     eprintln!("npm notice");
     let unicode = use_unicode(&std::env::current_dir().unwrap_or_default());
-    eprintln!("npm notice {} {}@{}", if unicode { "\u{1f4e6} " } else { "package:" }, summary.name, summary.version);
+    eprintln!(
+        "npm notice {} {}@{}",
+        if unicode { "\u{1f4e6} " } else { "package:" },
+        summary.name,
+        summary.version
+    );
     eprintln!("npm notice Tarball Contents");
     for file in &summary.files {
-        if file.path.starts_with("node_modules/") { continue; }
+        if file.path.starts_with("node_modules/") {
+            continue;
+        }
         eprintln!(
             "npm notice {} {}",
             format_bytes(file.size, false),
@@ -6416,57 +7037,93 @@ fn execute_run_sync(
     enforce_run_dev_engines_once()?;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
-        return Err(anyhow::anyhow!("package.json not found in {}", current_dir.display()));
+        return Err(anyhow::anyhow!(
+            "package.json not found in {}",
+            current_dir.display()
+        ));
     }
     let mut manifest = Manifest::from_file(&manifest_path)?;
     if !manifest.scripts.contains_key(&script) {
         if script == "start" && current_dir.join("server.js").exists() {
-            manifest.scripts.insert("start".to_string(), "node server.js".to_string());
+            manifest
+                .scripts
+                .insert("start".to_string(), "node server.js".to_string());
         } else {
-            if if_present { return Ok(()); }
+            if if_present {
+                return Ok(());
+            }
             anyhow::bail!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run");
         }
     }
     let config = rnpm_config::Config::load(Some(&current_dir))?;
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-    let foreground_scripts = foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+    let foreground_scripts =
+        foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
     let is_silent = config.get("loglevel") == Some("silent");
     let pre = format!("pre{script}");
     let post = format!("post{script}");
     for hook in [&pre, &script, &post] {
-        if ignore_scripts && hook != &script { continue; }
-        let Some(cmd) = manifest.scripts.get(hook) else { continue; };
+        if ignore_scripts && hook != &script {
+            continue;
+        }
+        let Some(cmd) = manifest.scripts.get(hook) else {
+            continue;
+        };
         let full_cmd = if hook == &script && !args.is_empty() {
-            let formatted: Vec<String> = args.iter().map(|arg| {
-                if arg.contains([' ', '\t', '"']) {
-                    format!("\"{}\"", arg.replace('"', "\\\""))
-                } else { arg.clone() }
-            }).collect();
+            let formatted: Vec<String> = args
+                .iter()
+                .map(|arg| {
+                    if arg.contains([' ', '\t', '"']) {
+                        format!("\"{}\"", arg.replace('"', "\\\""))
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
             format!("{cmd} {}", formatted.join(" "))
-        } else { cmd.clone() };
+        } else {
+            cmd.clone()
+        };
         if !is_silent {
             let id = match (&manifest.name, &manifest.version) {
                 (Some(name), Some(version)) => format!("{name}@{version}"),
                 (Some(name), None) => name.clone(),
                 _ => String::new(),
             };
-            println!("\n> {}{hook}\n> {full_cmd}\n", if id.is_empty() { id } else { format!("{id} ") });
+            println!(
+                "\n> {}{hook}\n> {full_cmd}\n",
+                if id.is_empty() { id } else { format!("{id} ") }
+            );
         }
         let mut ctx = LifecycleContext::new(
-            &current_dir, &current_dir, manifest.name.as_deref().unwrap_or(""), hook, &full_cmd,
+            &current_dir,
+            &current_dir,
+            manifest.name.as_deref().unwrap_or(""),
+            hook,
+            &full_cmd,
         );
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.extra_env = lifecycle_config_env(&current_dir);
-        ctx.extra_env.insert("npm_lifecycle_script".into(), cmd.clone());
-        if ignore_scripts { ctx.extra_env.insert("npm_config_ignore_scripts".into(), "true".into()); }
-        if foreground_scripts { ctx.extra_env.insert("npm_config_foreground_scripts".into(), "true".into()); }
-        if strict_sandbox { ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted(); }
+        ctx.extra_env
+            .insert("npm_lifecycle_script".into(), cmd.clone());
+        if ignore_scripts {
+            ctx.extra_env
+                .insert("npm_config_ignore_scripts".into(), "true".into());
+        }
+        if foreground_scripts {
+            ctx.extra_env
+                .insert("npm_config_foreground_scripts".into(), "true".into());
+        }
+        if strict_sandbox {
+            ctx.sandbox_policy = rnpm_lifecycle::ScriptSandboxPolicy::restricted();
+        }
         let status = execute_lifecycle_script(&ctx)?;
         if !status.success() {
             let code = rnpm_lifecycle::extract_exit_status_code(&status);
             return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                exit_code: code, message: format!("Lifecycle script '{hook}' failed with exit code: {code}"),
+                exit_code: code,
+                message: format!("Lifecycle script '{hook}' failed with exit code: {code}"),
             }));
         }
     }
@@ -6488,7 +7145,9 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
 
 /// `--json` (or `json=true` config) is in effect for this invocation.
 fn json_error_requested() -> bool {
-    std::env::args().skip(1).any(|a| a == "--json" || a == "--json=true")
+    std::env::args()
+        .skip(1)
+        .any(|a| a == "--json" || a == "--json=true")
         || std::env::current_dir()
             .ok()
             .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
@@ -6503,14 +7162,22 @@ fn npm_json_error(block: &str) -> String {
     let mut code = None;
     let mut lines: Vec<String> = Vec::new();
     for line in block.lines() {
-        let Some(rest) = line.strip_prefix("npm error").map(|r| r.strip_prefix(' ').unwrap_or(r)) else {
+        let Some(rest) = line
+            .strip_prefix("npm error")
+            .map(|r| r.strip_prefix(' ').unwrap_or(r))
+        else {
             continue;
         };
-        if let Some(c) = rest.strip_prefix("code ").filter(|_| code.is_none() && lines.is_empty()) {
+        if let Some(c) = rest
+            .strip_prefix("code ")
+            .filter(|_| code.is_none() && lines.is_empty())
+        {
             code = Some(c.trim().to_string());
             continue;
         }
-        if rest.starts_with("A complete log of this run") || rest.starts_with("Log files were not written") {
+        if rest.starts_with("A complete log of this run")
+            || rest.starts_with("Log files were not written")
+        {
             continue;
         }
         lines.push(rest.to_string());
@@ -6534,7 +7201,11 @@ fn npm_json_error(block: &str) -> String {
     ];
     let lines: Vec<String> = lines
         .into_iter()
-        .map(|l| l.strip_prefix("JSON.parse ").map(str::to_string).unwrap_or(l))
+        .map(|l| {
+            l.strip_prefix("JSON.parse ")
+                .map(str::to_string)
+                .unwrap_or(l)
+        })
         .collect();
     let split = lines
         .iter()
@@ -6544,7 +7215,14 @@ fn npm_json_error(block: &str) -> String {
         .map(|(i, _)| i)
         .unwrap_or(lines.len());
     let strip = |l: &String| {
-        for prefix in ["403 ", "404 ", "notarget ", "need auth ", "notsup ", "engine "] {
+        for prefix in [
+            "403 ",
+            "404 ",
+            "notarget ",
+            "need auth ",
+            "notsup ",
+            "engine ",
+        ] {
             if let Some(rest) = l.strip_prefix(prefix) {
                 return rest.to_string();
             }
@@ -6555,8 +7233,20 @@ fn npm_json_error(block: &str) -> String {
         l.clone()
     };
     // npm's jsonError trims both joined strings.
-    let summary = lines[..split].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
-    let detail = lines[split..].iter().map(strip).collect::<Vec<_>>().join("\n").trim().to_string();
+    let summary = lines[..split]
+        .iter()
+        .map(strip)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    let detail = lines[split..]
+        .iter()
+        .map(strip)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
     let mut error = serde_json::Map::new();
     if let Some(code) = code {
         error.insert("code".into(), serde_json::Value::String(code));
@@ -6574,7 +7264,9 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         std::process::exit(1);
     }
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {
-        if exit.message.starts_with("npm error ") { eprintln!("{}", exit.message); }
+        if exit.message.starts_with("npm error ") {
+            eprintln!("{}", exit.message);
+        }
         write_error_log(err);
         std::process::exit(exit.exit_code);
     }
@@ -6592,14 +7284,28 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
         eprintln!("{}", rendered.trim_end());
     } else {
         let diagnostic = diagnostics::classify_error(err);
-        if diagnostic.message.starts_with("npm error ") { eprintln!("{}", diagnostic.message); }
-        else { print_structured_error(err); }
+        if diagnostic.message.starts_with("npm error ") {
+            eprintln!("{}", diagnostic.message);
+        } else {
+            print_structured_error(err);
+        }
     }
     write_error_log(err);
     let missing_manifest = format!("{err:#}").contains("package.json not found");
-    let status = diagnostics::classify_error(err).code.parse::<i32>().unwrap_or({
-        if missing_manifest { if cfg!(windows) { -4058 } else { -2 } } else { 1 }
-    });
+    let status = diagnostics::classify_error(err)
+        .code
+        .parse::<i32>()
+        .unwrap_or({
+            if missing_manifest {
+                if cfg!(windows) {
+                    -4058
+                } else {
+                    -2
+                }
+            } else {
+                1
+            }
+        });
     std::process::exit(status);
 }
 
@@ -6699,7 +7405,9 @@ fn main() {
     }
 
     let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
-    let warn_workspaces = filtered_args.iter().take_while(|a| a.as_str() != "--")
+    let warn_workspaces = filtered_args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
         .any(|a| a == "-ws");
     let filtered_args = normalize_cli_args(filtered_args);
 
@@ -6710,7 +7418,8 @@ fn main() {
 
     let filtered_args = preprocess_cli_args(filtered_args);
     if warn_workspaces {
-        let config = rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
+        let config =
+            rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
         if !matches!(config.get("loglevel"), Some("silent" | "error")) {
             eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
         }
@@ -6718,7 +7427,15 @@ fn main() {
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
     if filtered_args.get(1).map(|s| s.as_str()) == Some("run")
-        && !filtered_args.iter().any(|a| a == "--help" || a == "-h" || a == "--workspaces" || a == "-ws" || a == "-w" || a == "--workspace" || a.starts_with("--workspace="))
+        && !filtered_args.iter().any(|a| {
+            a == "--help"
+                || a == "-h"
+                || a == "--workspaces"
+                || a == "-ws"
+                || a == "-w"
+                || a == "--workspace"
+                || a.starts_with("--workspace=")
+        })
     {
         let mut script_name = None;
         let mut script_args = Vec::new();
@@ -6767,22 +7484,47 @@ fn main() {
                     }
                 }
             }
-            let has_script_overrides = cli_overrides.as_ref().map(|o| {
-                o.contains_key("ignore-scripts")
-                    || o.contains_key("foreground-scripts")
-                    || o.contains_key("strict-sandbox")
-            }).unwrap_or(false);
+            let has_script_overrides = cli_overrides
+                .as_ref()
+                .map(|o| {
+                    o.contains_key("ignore-scripts")
+                        || o.contains_key("foreground-scripts")
+                        || o.contains_key("strict-sandbox")
+                })
+                .unwrap_or(false);
 
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
+            {
                 let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ig = ignore_scripts
+                    || overrides
+                        .get("ignore-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let fg = foreground_scripts
+                    || overrides
+                        .get("foreground-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let ss = strict_sandbox
+                    || overrides
+                        .get("strict-sandbox")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
                 (ig, fg, ss)
             } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
-                let ig = ignore_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("ignore-scripts=true"));
-                let fg = foreground_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("foreground-scripts=true"));
-                let ss = strict_sandbox || npmrc_text.lines().any(|l| l.trim().starts_with("strict-sandbox=true"));
+                let ig = ignore_scripts
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("ignore-scripts=true"));
+                let fg = foreground_scripts
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("foreground-scripts=true"));
+                let ss = strict_sandbox
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("strict-sandbox=true"));
                 (ig, fg, ss)
             } else {
                 (ignore_scripts, foreground_scripts, strict_sandbox)
@@ -6830,11 +7572,24 @@ fn main() {
         }
     };
 
-    if let Some(command) = Cli::command().try_get_matches_from(&filtered_args).ok()
-        .and_then(|matches| matches.subcommand_name().map(str::to_owned)) {
-        let config = std::env::current_dir().ok().and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok()).unwrap_or_default();
-        let mut agent = config.npmrc.settings.get("user-agent").cloned().unwrap_or_else(rnpm_lifecycle::npm_user_agent);
-        if config.get_bool("workspaces") == Some(true) || config.get("workspace").is_some_and(|v| !v.is_empty()) {
+    if let Some(command) = Cli::command()
+        .try_get_matches_from(&filtered_args)
+        .ok()
+        .and_then(|matches| matches.subcommand_name().map(str::to_owned))
+    {
+        let config = std::env::current_dir()
+            .ok()
+            .and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok())
+            .unwrap_or_default();
+        let mut agent = config
+            .npmrc
+            .settings
+            .get("user-agent")
+            .cloned()
+            .unwrap_or_else(rnpm_lifecycle::npm_user_agent);
+        if config.get_bool("workspaces") == Some(true)
+            || config.get("workspace").is_some_and(|v| !v.is_empty())
+        {
             agent = agent.replace("workspaces/false", "workspaces/true");
         }
         rnpm_registry::client::set_cli_request_context(command, agent);
@@ -6843,8 +7598,12 @@ fn main() {
     // npm warns whenever force is in effect, whatever the command.
     {
         let raw: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
-        let silent = raw.iter().any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent");
-        let forced = raw.iter().any(|a| a == "--force" || a == "-f" || a == "--force=true")
+        let silent = raw
+            .iter()
+            .any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent");
+        let forced = raw
+            .iter()
+            .any(|a| a == "--force" || a == "-f" || a == "--force=true")
             || std::env::current_dir()
                 .ok()
                 .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
@@ -6874,7 +7633,8 @@ fn main() {
         foreground_scripts,
         strict_sandbox,
         workspace_root: _,
-    } = cli.command {
+    } = cli.command
+    {
         let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
         if !workspaces && !has_filter && script.is_some() {
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -6887,22 +7647,47 @@ fn main() {
                     }
                 }
             }
-            let has_script_overrides = cli_overrides.as_ref().map(|o| {
-                o.contains_key("ignore-scripts")
-                    || o.contains_key("foreground-scripts")
-                    || o.contains_key("strict-sandbox")
-            }).unwrap_or(false);
+            let has_script_overrides = cli_overrides
+                .as_ref()
+                .map(|o| {
+                    o.contains_key("ignore-scripts")
+                        || o.contains_key("foreground-scripts")
+                        || o.contains_key("strict-sandbox")
+                })
+                .unwrap_or(false);
 
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides {
+            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
+            {
                 let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts || overrides.get("ignore-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let fg = foreground_scripts || overrides.get("foreground-scripts").map(|v| v == "true" || v == "1").unwrap_or(false);
-                let ss = strict_sandbox || overrides.get("strict-sandbox").map(|v| v == "true" || v == "1").unwrap_or(false);
+                let ig = ignore_scripts
+                    || overrides
+                        .get("ignore-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let fg = foreground_scripts
+                    || overrides
+                        .get("foreground-scripts")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
+                let ss = strict_sandbox
+                    || overrides
+                        .get("strict-sandbox")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false);
                 (ig, fg, ss)
             } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
-                let ig = ignore_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("ignore-scripts=true"));
-                let fg = foreground_scripts || npmrc_text.lines().any(|l| l.trim().starts_with("foreground-scripts=true"));
-                let ss = strict_sandbox || npmrc_text.lines().any(|l| l.trim().starts_with("strict-sandbox=true"));
+                let ig = ignore_scripts
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("ignore-scripts=true"));
+                let fg = foreground_scripts
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("foreground-scripts=true"));
+                let ss = strict_sandbox
+                    || npmrc_text
+                        .lines()
+                        .any(|l| l.trim().starts_with("strict-sandbox=true"));
                 (ig, fg, ss)
             } else {
                 (ignore_scripts, foreground_scripts, strict_sandbox)

@@ -86,11 +86,7 @@ fn workspace_run_uses_manifest_order_and_original_init_cwd() {
     success(&out);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!(
-            "a\n{}\nb\n{}\n",
-            temp_path.display(),
-            temp_path.display()
-        )
+        format!("a\n{}\nb\n{}\n", temp_path.display(), temp_path.display())
     );
     let mut root: Value =
         serde_json::from_slice(&fs::read(temp_path.join("package.json")).unwrap()).unwrap();
@@ -103,11 +99,7 @@ fn workspace_run_uses_manifest_order_and_original_init_cwd() {
     success(&out);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!(
-            "b\n{}\na\n{}\n",
-            temp_path.display(),
-            temp_path.display()
-        )
+        format!("b\n{}\na\n{}\n", temp_path.display(), temp_path.display())
     );
 }
 

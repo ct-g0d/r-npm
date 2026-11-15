@@ -46,7 +46,11 @@ where
         Some(serde_json::Value::String(s)) => Ok(Some(vec![s])),
         Some(serde_json::Value::Array(items)) => items
             .into_iter()
-            .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| D::Error::custom("expected a string")))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| D::Error::custom("expected a string"))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
         Some(_) => Err(D::Error::custom("expected a string or an array of strings")),
@@ -366,13 +370,25 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub license: Option<String>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
+    #[serde(
+        skip_serializing_if = "is_none_or_empty_vec",
+        default,
+        deserialize_with = "string_or_list"
+    )]
     pub os: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
+    #[serde(
+        skip_serializing_if = "is_none_or_empty_vec",
+        default,
+        deserialize_with = "string_or_list"
+    )]
     pub cpu: Option<Vec<String>>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_vec", default, deserialize_with = "string_or_list")]
+    #[serde(
+        skip_serializing_if = "is_none_or_empty_vec",
+        default,
+        deserialize_with = "string_or_list"
+    )]
     pub libc: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
@@ -765,7 +781,10 @@ pub struct LockfileV3 {
 
 // Shrinkwrap.inferFormattingOptions takes formatting from package.json, even
 // when an existing lockfile uses another newline or indentation style.
-fn project_lockfile_format(project_dir: &Path, fallbacks: &[std::path::PathBuf]) -> rnpm_core::ManifestFormat {
+fn project_lockfile_format(
+    project_dir: &Path,
+    fallbacks: &[std::path::PathBuf],
+) -> rnpm_core::ManifestFormat {
     let mut format = std::iter::once(project_dir.join("package.json"))
         .chain(fallbacks.iter().cloned())
         .find_map(|path| std::fs::read_to_string(path).ok())
@@ -1710,7 +1729,11 @@ impl LockfileV3 {
     }
 
     /// A new --no-save install has no persisted root metadata in its hidden lock.
-    pub fn save_hidden_with_root_metadata(&self, project_dir: &Path, root_metadata: bool) -> Result<(), LockfileError> {
+    pub fn save_hidden_with_root_metadata(
+        &self,
+        project_dir: &Path,
+        root_metadata: bool,
+    ) -> Result<(), LockfileError> {
         let hidden_path = project_dir.join(Self::HIDDEN_LOCKFILE_PATH);
         let mut hidden = self.for_writing().into_owned();
         hidden.lockfile_version = 3;
@@ -1743,11 +1766,14 @@ impl LockfileV3 {
             true
         });
 
-        let format = project_lockfile_format(project_dir, &[
-            hidden_path.clone(),
-            project_dir.join("package-lock.json"),
-            project_dir.join("npm-shrinkwrap.json"),
-        ]);
+        let format = project_lockfile_format(
+            project_dir,
+            &[
+                hidden_path.clone(),
+                project_dir.join("package-lock.json"),
+                project_dir.join("npm-shrinkwrap.json"),
+            ],
+        );
         let content = hidden.to_npm_json_string_formatted(&format, root_metadata)?;
 
         if let Some(parent) = hidden_path.parent() {
@@ -1841,22 +1867,19 @@ fn indent_spaces(out: &mut String, indent: &str, level: usize) {
 }
 
 const NPM_CHAR_RANK: [u8; 256] = [
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    0, 6, 12, 25, 35, 26, 24, 10, 13, 14, 20, 29, 3, 2, 8, 21,
-    36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 5, 4, 30, 31, 32, 7,
-    19, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75,
-    77, 79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 15, 23, 16, 28, 1,
-    27, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74,
-    76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 17, 33, 18, 34, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 6, 12, 25, 35, 26, 24, 10,
+    13, 14, 20, 29, 3, 2, 8, 21, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 5, 4, 30, 31, 32, 7, 19,
+    47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81, 83, 85, 87, 89, 91, 93,
+    95, 97, 15, 23, 16, 28, 1, 27, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76,
+    78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 17, 33, 18, 34, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255,
 ];
 
 static OMIT_REGISTRY_RESOLVED: std::sync::RwLock<Option<Vec<String>>> =
@@ -2056,7 +2079,6 @@ pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
     !(os_ok && cpu_ok && libc_ok)
 }
 
-
 fn bin_is_empty(bin: &Option<PackageBin>) -> bool {
     match bin {
         None => true,
@@ -2071,8 +2093,10 @@ mod platform_field_tests {
 
     #[test]
     fn libc_accepts_npm_string_form() {
-        let pkg: LockfilePackage =
-            serde_json::from_str(r#"{"version":"1.0.0","os":"linux","cpu":["arm"],"libc":"glibc"}"#).unwrap();
+        let pkg: LockfilePackage = serde_json::from_str(
+            r#"{"version":"1.0.0","os":"linux","cpu":["arm"],"libc":"glibc"}"#,
+        )
+        .unwrap();
         assert_eq!(pkg.libc, Some(vec!["glibc".to_string()]));
         assert_eq!(pkg.os, Some(vec!["linux".to_string()]));
         assert_eq!(pkg.cpu, Some(vec!["arm".to_string()]));

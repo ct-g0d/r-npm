@@ -282,7 +282,10 @@ fn test_dry_run_simulation_without_filesystem_mutation() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("rnpm: dry-run: would install") || stdout.contains("would install") || stdout.contains("added ") || stdout.contains("add "),
+        stdout.contains("rnpm: dry-run: would install")
+            || stdout.contains("would install")
+            || stdout.contains("added ")
+            || stdout.contains("add "),
         "stdout must report dry-run simulation notices: {stdout}"
     );
 
@@ -775,10 +778,20 @@ fn test_install_silent_dry_run_prints_nothing() {
         .output()
         .expect("Failed to execute rnpm");
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.trim().is_empty(), "stdout must be empty, but got: {stdout}");
-    assert!(stderr.trim().is_empty(), "stderr must be empty, but got: {stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must be empty, but got: {stdout}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "stderr must be empty, but got: {stderr}"
+    );
     assert!(!temp.path().join("node_modules").exists());
 }

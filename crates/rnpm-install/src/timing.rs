@@ -293,7 +293,10 @@ impl TimingCollector {
     }
 
     /// Finishes collection and populates HTTP request and 304 counters from the registry client.
-    pub fn finish_with_client(&self, client: &rnpm_registry::client::RegistryClient) -> TimingMetrics {
+    pub fn finish_with_client(
+        &self,
+        client: &rnpm_registry::client::RegistryClient,
+    ) -> TimingMetrics {
         let mut metrics = self.finish();
         metrics.http_requests = client.http_requests();
         metrics.http_304s = client.http_304s();

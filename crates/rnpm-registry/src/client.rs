@@ -38,7 +38,13 @@ pub fn set_cli_request_context(command: String, user_agent: String) {
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
     let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
         .into_iter()
-        .filter_map(|key| headers.get(key)?.to_str().ok().map(|value| (key.into(), value.into())))
+        .filter_map(|key| {
+            headers
+                .get(key)?
+                .to_str()
+                .ok()
+                .map(|value| (key.into(), value.into()))
+        })
         .collect();
     serde_json::json!({ "response": { "headers": headers } })
 }
@@ -126,7 +132,10 @@ pub enum MetadataFetchResult {
         cache_metadata: serde_json::Value,
     },
     /// Server returned HTTP 304 Not Modified; cached data is still valid.
-    NotModified { etag: Option<String>, cache_metadata: serde_json::Value },
+    NotModified {
+        etag: Option<String>,
+        cache_metadata: serde_json::Value,
+    },
 }
 
 impl MetadataFetchResult {
@@ -614,14 +623,19 @@ impl RegistryClient {
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
         let mut headers = HeaderMap::new();
         let cli_context = CLI_REQUEST_CONTEXT.get();
-        let agent = cli_context.filter(|_| config.user_agent == default_user_agent()).map(|(_, agent)| agent.as_str()).unwrap_or(&config.user_agent);
+        let agent = cli_context
+            .filter(|_| config.user_agent == default_user_agent())
+            .map(|(_, agent)| agent.as_str())
+            .unwrap_or(&config.user_agent);
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(agent)
-                .map_err(|e| RegistryError::Other(e.to_string()))?,
+            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?,
         );
         if let Some((command, _)) = cli_context {
-            headers.insert("npm-command", HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?);
+            headers.insert(
+                "npm-command",
+                HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?,
+            );
         }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
@@ -795,7 +809,8 @@ impl RegistryClient {
 
     /// Returns the total number of HTTP requests issued by this client.
     pub fn http_requests(&self) -> u64 {
-        self.http_requests.load(std::sync::atomic::Ordering::Relaxed)
+        self.http_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the total number of HTTP 304 (Not Modified) responses received.
@@ -805,8 +820,10 @@ impl RegistryClient {
 
     /// Reset HTTP request and 304 counters.
     pub fn reset_http_metrics(&self) {
-        self.http_requests.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.http_304s.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.http_requests
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.http_304s
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Access the bounded concurrency semaphore.
@@ -904,7 +921,14 @@ impl RegistryClient {
         let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
         let mut path = url.path().to_string();
         loop {
-            let key = format!("//{host}{port}{}", if path.ends_with('/') { path.clone() } else { format!("{path}/") });
+            let key = format!(
+                "//{host}{port}{}",
+                if path.ends_with('/') {
+                    path.clone()
+                } else {
+                    format!("{path}/")
+                }
+            );
             if let Some(basic) = self.config.basic_auths.get(&key) {
                 return Some(format!("Basic {basic}"));
             }
@@ -1721,7 +1745,10 @@ impl RegistryClient {
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string())
                     .or_else(|| if_none_match.map(|s| s.to_string()));
-                return Ok(MetadataFetchResult::NotModified { etag, cache_metadata });
+                return Ok(MetadataFetchResult::NotModified {
+                    etag,
+                    cache_metadata,
+                });
             }
 
             if status == StatusCode::NOT_FOUND {
@@ -1863,7 +1890,11 @@ impl RegistryClient {
 
             let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
             metadata.validate()?;
-            return Ok(MetadataFetchResult::Fresh { metadata, etag, cache_metadata });
+            return Ok(MetadataFetchResult::Fresh {
+                metadata,
+                etag,
+                cache_metadata,
+            });
         }
     }
 
@@ -1926,11 +1957,16 @@ impl RegistryClient {
             let etag = if_none_match.clone();
             join_set.spawn(async move {
                 let res = match client.package_metadata_url(&name) {
-                    Ok(url) => client
-                        .get_package_metadata_from_url_conditional_with_accept(
-                            &name, url, etag.as_deref(), accept,
-                        )
-                        .await,
+                    Ok(url) => {
+                        client
+                            .get_package_metadata_from_url_conditional_with_accept(
+                                &name,
+                                url,
+                                etag.as_deref(),
+                                accept,
+                            )
+                            .await
+                    }
                     Err(error) => Err(error),
                 };
                 (idx, res)
@@ -2966,7 +3002,10 @@ impl RegistryClient {
             reg_url.as_str().trim_end_matches('/'),
             encoded
         )) {
-            if let Ok(val) = self.admin_json_request(Method::GET, pkg_url, None, None).await {
+            if let Ok(val) = self
+                .admin_json_request(Method::GET, pkg_url, None, None)
+                .await
+            {
                 if val.get("maintainers").is_some() {
                     return Ok(val);
                 }
@@ -3720,11 +3759,19 @@ impl RegistryClient {
         };
         let (response, _permit) = result;
         let status = response.status();
-        let www = response.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let www = response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body_text = response.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(match status {
-                StatusCode::UNAUTHORIZED if www.is_some() => RegistryError::AuthChallenge { url: target.to_string(), www_authenticate: www.unwrap(), body: body_text },
+                StatusCode::UNAUTHORIZED if www.is_some() => RegistryError::AuthChallenge {
+                    url: target.to_string(),
+                    www_authenticate: www.unwrap(),
+                    body: body_text,
+                },
                 StatusCode::UNAUTHORIZED => RegistryError::Unauthorized {
                     url: target.to_string(),
                     status: 401,

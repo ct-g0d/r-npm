@@ -409,12 +409,27 @@ fn test_additional_aliases_and_flag_routing() {
     );
 
     let project = tempdir().unwrap();
-    fs::write(project.path().join("package.json"), r#"{"name":"bundle-routing","version":"1.0.0"}"#).unwrap();
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"bundle-routing","version":"1.0.0"}"#,
+    )
+    .unwrap();
     let output = Command::new(rnpm_bin)
-        .args(["install", "--save-bundle", "--ignore-scripts", "--no-audit", "--no-fund"])
+        .args([
+            "install",
+            "--save-bundle",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ])
         .current_dir(project.path())
-        .output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -744,7 +759,8 @@ fn test_post_install_concise_audit_summary_no_full_table() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("1 high severity vulnerability") || stdout.contains("found 1 vulnerability"),
+        stdout.contains("1 high severity vulnerability")
+            || stdout.contains("found 1 vulnerability"),
         "Must output concise summary: {stdout}"
     );
     assert!(

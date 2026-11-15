@@ -43,8 +43,16 @@ pub(crate) async fn run(args: UnpublishArgs, current_dir: PathBuf) -> Result<()>
 
     let (registry_url, client) = crate::make_registry_client(&current_dir, args.registry)?;
     super::client_helper::with_registry_otp(&current_dir, "PUT", args.otp, async |otp| {
-        client.unpublish(Some(&registry_url), &package, version.as_deref(), otp.as_deref()).await
-    }).await?;
+        client
+            .unpublish(
+                Some(&registry_url),
+                &package,
+                version.as_deref(),
+                otp.as_deref(),
+            )
+            .await
+    })
+    .await?;
 
     println!("- {target_display}");
     Ok(())

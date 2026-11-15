@@ -53,7 +53,10 @@ async fn test_git_dependency_honors_autocrlf_and_preserves_cr() {
     let repo_dir = tempdir().unwrap();
     run_git(repo_dir.path(), &["init"]);
     run_git(repo_dir.path(), &["config", "user.name", "Tester"]);
-    run_git(repo_dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(
+        repo_dir.path(),
+        &["config", "user.email", "test@example.com"],
+    );
     run_git(repo_dir.path(), &["config", "core.autocrlf", "false"]);
     run_git(repo_dir.path(), &["config", "core.eol", "lf"]);
 

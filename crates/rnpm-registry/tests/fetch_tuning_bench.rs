@@ -1,17 +1,22 @@
-#![allow(clippy::field_reassign_with_default, clippy::redundant_pattern_matching)]
+#![allow(
+    clippy::field_reassign_with_default,
+    clippy::redundant_pattern_matching
+)]
 
+use rnpm_registry::{RegistryClient, RegistryClientConfig};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use rnpm_registry::{RegistryClient, RegistryClientConfig};
 
 fn load_project_486_urls() -> Vec<(String, usize)> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let lock_path = Path::new(manifest_dir).join("../../benchmarks/fixtures/project-486/package-lock.json");
+    let lock_path =
+        Path::new(manifest_dir).join("../../benchmarks/fixtures/project-486/package-lock.json");
     let content = std::fs::read_to_string(&lock_path).expect("Failed to read project-486 lockfile");
-    let val: serde_json::Value = serde_json::from_str(&content).expect("Failed to parse lockfile JSON");
+    let val: serde_json::Value =
+        serde_json::from_str(&content).expect("Failed to parse lockfile JSON");
 
     let mut urls = Vec::new();
     if let Some(packages) = val.get("packages").and_then(|p| p.as_object()) {
@@ -136,7 +141,8 @@ async fn bench_fetch_matrix() {
                             let mut d = flate2::read::GzDecoder::new(&bytes[..]);
                             let mut out = Vec::new();
                             let _ = d.read_to_end(&mut out);
-                        }).await;
+                        })
+                        .await;
                     } else {
                         use std::io::Read;
                         let mut d = flate2::read::GzDecoder::new(&bytes[..]);

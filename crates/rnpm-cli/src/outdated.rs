@@ -447,7 +447,12 @@ pub async fn run_outdated_inner(
         let mut lines = format_parseable(&outdated_packages);
         if options.long {
             for (line, pkg) in lines.iter_mut().zip(&outdated_packages) {
-                line.push_str(&format!(":{}:{}:{}", pkg.package_type, pkg.homepage.as_deref().unwrap_or(""), pkg.dependent_location));
+                line.push_str(&format!(
+                    ":{}:{}:{}",
+                    pkg.package_type,
+                    pkg.homepage.as_deref().unwrap_or(""),
+                    pkg.dependent_location
+                ));
             }
         }
         format!("{}\n", lines.join("\n"))
@@ -1171,7 +1176,9 @@ mod tests {
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Package  Current  Wanted  Latest  Location            Depended by  Package Type  Homepage"));
-        assert!(lines[0].trim_end().ends_with("Homepage                               Depended By Location"));
+        assert!(lines[0]
+            .trim_end()
+            .ends_with("Homepage                               Depended By Location"));
         assert!(lines[1].contains("chalk"));
         assert!(lines[1].contains("dependencies"));
         assert!(lines[1].contains("https://github.com/chalk/chalk#readme"));

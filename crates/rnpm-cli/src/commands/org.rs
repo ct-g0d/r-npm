@@ -107,11 +107,7 @@ async fn run_set(args: &OrgArgs, current_dir: &Path) -> Result<()> {
         .args
         .get(1)
         .ok_or_else(|| anyhow::anyhow!("npm error Second argument `username` is required."))?;
-    let role = args
-        .args
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("developer");
+    let role = args.args.get(2).map(String::as_str).unwrap_or("developer");
 
     if !matches!(role, "developer" | "admin" | "owner") {
         return Err(anyhow::anyhow!(

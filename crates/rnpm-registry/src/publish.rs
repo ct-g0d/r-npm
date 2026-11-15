@@ -72,7 +72,10 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     if let Some(serde_json::Value::Object(existing)) = opts.manifest.get("dist") {
         dist.extend(existing.clone());
     }
-    dist.insert("integrity".into(), serde_json::json!(opts.tarball.integrity));
+    dist.insert(
+        "integrity".into(),
+        serde_json::json!(opts.tarball.integrity),
+    );
     dist.insert("shasum".into(), serde_json::json!(opts.tarball.shasum));
     dist.insert("tarball".into(), serde_json::json!(tarball_url));
     if let Some(attestation) = opts.provenance_attestation {
@@ -95,14 +98,19 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     if let Some(desc) = opts.description {
         doc.insert("description".into(), serde_json::json!(desc));
     }
-    doc.insert("dist-tags".into(), serde_json::json!({ opts.tag: opts.version }));
+    doc.insert(
+        "dist-tags".into(),
+        serde_json::json!({ opts.tag: opts.version }),
+    );
     doc.insert(
         "versions".into(),
         serde_json::json!({ opts.version: serde_json::Value::Object(manifest) }),
     );
     doc.insert(
         "access".into(),
-        opts.access.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        opts.access
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
     );
     doc.insert(
         "_attachments".into(),

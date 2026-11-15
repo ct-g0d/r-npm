@@ -17,7 +17,14 @@ pub(crate) async fn run_star(
         client
             .star_package(Some(&registry_url), &package, otp.as_deref())
             .await?;
-        println!("{} {package}", if crate::use_unicode(&current_dir) { "\u{2605} " } else { "(*)" });
+        println!(
+            "{} {package}",
+            if crate::use_unicode(&current_dir) {
+                "\u{2605} "
+            } else {
+                "(*)"
+            }
+        );
     }
     Ok(())
 }
@@ -38,7 +45,14 @@ pub(crate) async fn run_unstar(
         client
             .unstar_package(Some(&registry_url), &package, otp.as_deref())
             .await?;
-        println!("{} {package}", if crate::use_unicode(&current_dir) { "\u{2606} " } else { "( )" });
+        println!(
+            "{} {package}",
+            if crate::use_unicode(&current_dir) {
+                "\u{2606} "
+            } else {
+                "( )"
+            }
+        );
     }
     Ok(())
 }
@@ -59,7 +73,9 @@ pub(crate) async fn run_stars(
                 if let Some(s) = v.as_str() {
                     Some(s.to_string())
                 } else {
-                    v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
                 }
             })
             .collect()

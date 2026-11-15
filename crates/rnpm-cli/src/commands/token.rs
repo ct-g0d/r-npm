@@ -73,13 +73,14 @@ pub(crate) async fn run(
     match action.unwrap_or(crate::TokenAction::List) {
         crate::TokenAction::List => {
             let val = client.token_list(Some(&registry_url)).await?;
-            let mut tokens: Vec<serde_json::Value> = if let Some(objs) = val.get("objects").and_then(|o| o.as_array()) {
-                objs.clone()
-            } else if let Some(arr) = val.as_array() {
-                arr.clone()
-            } else {
-                Vec::new()
-            };
+            let mut tokens: Vec<serde_json::Value> =
+                if let Some(objs) = val.get("objects").and_then(|o| o.as_array()) {
+                    objs.clone()
+                } else if let Some(arr) = val.as_array() {
+                    arr.clone()
+                } else {
+                    Vec::new()
+                };
 
             generate_token_ids(&mut tokens, 6);
 
@@ -91,7 +92,11 @@ pub(crate) async fn run(
                     let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let created = t.get("created").and_then(|v| v.as_str()).unwrap_or("");
-                    let created_date = if created.len() >= 10 { &created[..10] } else { created };
+                    let created_date = if created.len() >= 10 {
+                        &created[..10]
+                    } else {
+                        created
+                    };
                     println!("Token {tok}… with id {id} name {name} created {created_date}");
                     if let Some(cidr) = t.get("cidr_whitelist").and_then(|v| v.as_array()) {
                         let cidr_strs: Vec<_> = cidr.iter().filter_map(|c| c.as_str()).collect();
@@ -104,14 +109,18 @@ pub(crate) async fn run(
             }
         }
         crate::TokenAction::Revoke { token_id } => {
-            let val = client.token_list(Some(&registry_url)).await.unwrap_or_default();
-            let tokens: Vec<serde_json::Value> = if let Some(objs) = val.get("objects").and_then(|o| o.as_array()) {
-                objs.clone()
-            } else if let Some(arr) = val.as_array() {
-                arr.clone()
-            } else {
-                Vec::new()
-            };
+            let val = client
+                .token_list(Some(&registry_url))
+                .await
+                .unwrap_or_default();
+            let tokens: Vec<serde_json::Value> =
+                if let Some(objs) = val.get("objects").and_then(|o| o.as_array()) {
+                    objs.clone()
+                } else if let Some(arr) = val.as_array() {
+                    arr.clone()
+                } else {
+                    Vec::new()
+                };
 
             let key_to_remove = tokens
                 .iter()
@@ -124,11 +133,18 @@ pub(crate) async fn run(
                         None
                     }
                 })
-                .ok_or_else(|| anyhow::anyhow!("npm error Unknown token id or value \"{token_id}\"."))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("npm error Unknown token id or value \"{token_id}\".")
+                })?;
 
-            let command_client = super::client_helper::CommandClient::new(&current_dir, Some(registry_url.as_str()))?;
+            let command_client = super::client_helper::CommandClient::new(
+                &current_dir,
+                Some(registry_url.as_str()),
+            )?;
             let url = registry_url.join(&format!("-/npm/v1/tokens/token/{key_to_remove}"))?;
-            command_client.send_text(&current_dir, reqwest::Method::DELETE, url, None, None).await?;
+            command_client
+                .send_text(&current_dir, reqwest::Method::DELETE, url, None, None)
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&vec![key_to_remove])?);
             } else {

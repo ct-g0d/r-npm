@@ -57,7 +57,9 @@ impl Ctx<'_> {
 
     async fn get(&self, path: &str) -> Result<Value> {
         let url = self.url(path)?;
-        self.client.send_json(self.dir, Method::GET, url, None, None).await
+        self.client
+            .send_json(self.dir, Method::GET, url, None, None)
+            .await
     }
 
     async fn mutate(&self, method: Method, path: &str, body: Value) -> Result<()> {
@@ -87,7 +89,10 @@ impl Ctx<'_> {
         for key in keys {
             if limiter.is_none_or(|l| l == key) {
                 let v = &outputs[&key];
-                let text = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                let text = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
                 println!("{key}: {text}");
             }
         }
@@ -110,15 +115,23 @@ impl Ctx<'_> {
             }
         };
         if require_scope && !name.starts_with('@') {
-            return Err(usage(Some("This command is only available for scoped packages.")));
+            return Err(usage(Some(
+                "This command is only available for scoped packages.",
+            )));
         }
         Ok(name)
     }
 
     async fn get_status(&self, pkg: Option<&str>) -> Result<()> {
         let name = self.package(pkg, false)?;
-        let visibility = self.get(&format!("/-/package/{}/visibility", escaped(&name))).await?;
-        let status = if visibility["public"].as_bool().unwrap_or(false) { "public" } else { "private" };
+        let visibility = self
+            .get(&format!("/-/package/{}/visibility", escaped(&name)))
+            .await?;
+        let status = if visibility["public"].as_bool().unwrap_or(false) {
+            "public"
+        } else {
+            "private"
+        };
         let mut items = Map::new();
         items.insert(name, status.into());
         self.output(&items, None)
@@ -129,10 +142,20 @@ fn read_pkg_name(current_dir: &Path) -> Option<String> {
     std::fs::read_to_string(current_dir.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
-        .and_then(|v| v["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string))
+        .and_then(|v| {
+            v["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+        })
 }
 
-fn infer_target_for_registry(cmd: &str, subcmd: &str, rest: &[&str], current_dir: &Path) -> Option<String> {
+fn infer_target_for_registry(
+    cmd: &str,
+    subcmd: &str,
+    rest: &[&str],
+    current_dir: &Path,
+) -> Option<String> {
     match cmd {
         "grant" => {
             if let Some(pkg) = rest.get(1).filter(|p| !p.is_empty()) {
@@ -176,14 +199,17 @@ fn infer_target_for_registry(cmd: &str, subcmd: &str, rest: &[&str], current_dir
                     None
                 }
             } else if subcmd == "collaborators" {
-                rest.first().map(|s| s.to_string()).or_else(|| read_pkg_name(current_dir))
+                rest.first()
+                    .map(|s| s.to_string())
+                    .or_else(|| read_pkg_name(current_dir))
             } else {
                 None
             }
         }
-        "get" | "set" => {
-            rest.first().map(|s| s.to_string()).or_else(|| read_pkg_name(current_dir))
-        }
+        "get" | "set" => rest
+            .first()
+            .map(|s| s.to_string())
+            .or_else(|| read_pkg_name(current_dir)),
         _ => None,
     }
 }
@@ -209,14 +235,24 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
         },
     };
     let client = CommandClient::new(&current_dir, Some(base.as_str()))?;
-    let ctx = Ctx { dir: &current_dir, client, base, json, otp: args.otp.clone() };
+    let ctx = Ctx {
+        dir: &current_dir,
+        client,
+        base,
+        json,
+        otp: args.otp.clone(),
+    };
 
     match cmd {
         "grant" => {
             if !["read-only", "read-write"].contains(&subcmd) {
-                return Err(usage(Some("grant must be either `read-only` or `read-write`")));
+                return Err(usage(Some(
+                    "grant must be either `read-only` or `read-write`",
+                )));
             }
-            let scope_team = rest.first().ok_or_else(|| usage(Some("`<scope:team>` argument is required")))?;
+            let scope_team = rest
+                .first()
+                .ok_or_else(|| usage(Some("`<scope:team>` argument is required")))?;
             let pkg = rest.get(1).copied().unwrap_or_default();
             let (scope, team) = parse_team(scope_team);
             let team = team
@@ -233,7 +269,9 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
             let pkg = rest.first().copied().unwrap_or_default();
             let (scope, team) = parse_team(subcmd);
             if scope.is_empty() {
-                return Err(anyhow::anyhow!("npm error team must be in format `scope:team`"));
+                return Err(anyhow::anyhow!(
+                    "npm error team must be in format `scope:team`"
+                ));
             }
             let team = team
                 .filter(|t| !t.is_empty())
@@ -249,7 +287,10 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
             "packages" => {
                 let owner = match rest.first() {
                     Some(o) => o.to_string(),
-                    None => ctx.get("/-/whoami").await?["username"].as_str().unwrap_or_default().to_string(),
+                    None => ctx.get("/-/whoami").await?["username"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                 };
                 let (scope, team) = parse_team(&owner);
                 let first = match team {
@@ -262,30 +303,48 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
                     }
                     other => other?,
                 };
-                ctx.output(pkgs.as_object().unwrap_or(&Map::new()), rest.get(1).copied())
+                ctx.output(
+                    pkgs.as_object().unwrap_or(&Map::new()),
+                    rest.get(1).copied(),
+                )
             }
             "collaborators" => {
                 let name = ctx.package(rest.first().copied(), false)?;
-                let collabs = ctx.get(&format!("/-/package/{}/collaborators", escaped(&name))).await?;
-                ctx.output(collabs.as_object().unwrap_or(&Map::new()), rest.get(1).copied())
+                let collabs = ctx
+                    .get(&format!("/-/package/{}/collaborators", escaped(&name)))
+                    .await?;
+                ctx.output(
+                    collabs.as_object().unwrap_or(&Map::new()),
+                    rest.get(1).copied(),
+                )
             }
-            other => Err(usage(Some(&format!("list {other} is not a valid access command")))),
+            other => Err(usage(Some(&format!(
+                "list {other} is not a valid access command"
+            )))),
         },
         "get" => {
             if subcmd != "status" {
-                return Err(usage(Some(&format!("get {subcmd} is not a valid access command"))));
+                return Err(usage(Some(&format!(
+                    "get {subcmd} is not a valid access command"
+                ))));
             }
             ctx.get_status(rest.first().copied()).await
         }
         _ => {
             if !SET_COMMANDS.contains(&subcmd) {
-                return Err(usage(Some(&format!("set {subcmd} is not a valid access command"))));
+                return Err(usage(Some(&format!(
+                    "set {subcmd} is not a valid access command"
+                ))));
             }
             let (key, value) = subcmd.split_once('=').unwrap_or((subcmd, ""));
             let pkg = rest.first().copied();
             if key == "status" {
                 let name = ctx.package(pkg, true)?;
-                let status = if value == "private" { "restricted" } else { value };
+                let status = if value == "private" {
+                    "restricted"
+                } else {
+                    value
+                };
                 ctx.mutate(
                     Method::POST,
                     &format!("/-/package/{}/access", escaped(&name)),
@@ -297,10 +356,19 @@ pub(crate) async fn run(args: AccessArgs, current_dir: PathBuf) -> Result<()> {
                 let name = ctx.package(pkg, false)?;
                 let body = match value {
                     "none" => serde_json::json!({ "publish_requires_tfa": false }),
-                    "publish" => serde_json::json!({ "publish_requires_tfa": true, "automation_token_overrides_tfa": false }),
-                    _ => serde_json::json!({ "publish_requires_tfa": true, "automation_token_overrides_tfa": true }),
+                    "publish" => {
+                        serde_json::json!({ "publish_requires_tfa": true, "automation_token_overrides_tfa": false })
+                    }
+                    _ => {
+                        serde_json::json!({ "publish_requires_tfa": true, "automation_token_overrides_tfa": true })
+                    }
                 };
-                ctx.mutate(Method::POST, &format!("/-/package/{}/access", escaped(&name)), body).await
+                ctx.mutate(
+                    Method::POST,
+                    &format!("/-/package/{}/access", escaped(&name)),
+                    body,
+                )
+                .await
             }
         }
     }

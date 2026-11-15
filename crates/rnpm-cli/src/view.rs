@@ -166,8 +166,12 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
     let status = resp.status();
     if status == StatusCode::NOT_FOUND {
         let body = resp.text().await.unwrap_or_default();
-        let message = crate::http_errors::general_message("GET", packument_url.as_str(), status, &body);
-        return Err(anyhow::anyhow!(crate::http_errors::e404_block(&message, Some(&view_pkgid))));
+        let message =
+            crate::http_errors::general_message("GET", packument_url.as_str(), status, &body);
+        return Err(anyhow::anyhow!(crate::http_errors::e404_block(
+            &message,
+            Some(&view_pkgid)
+        )));
     }
 
     if !status.is_success() {
@@ -1111,9 +1115,18 @@ mod tests {
             json: false,
             registry: Some(server.url()),
         };
-        let err = run_view(temp_dir.path(), &opts).await.unwrap_err().to_string();
-        assert!(err.starts_with("npm error code E404\nnpm error 404 Not Found - GET "), "{err}");
-        assert!(err.contains("The requested resource 'missing-pkg@*' could not be found"), "{err}");
+        let err = run_view(temp_dir.path(), &opts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("npm error code E404\nnpm error 404 Not Found - GET "),
+            "{err}"
+        );
+        assert!(
+            err.contains("The requested resource 'missing-pkg@*' could not be found"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
