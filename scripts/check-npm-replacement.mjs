@@ -551,6 +551,15 @@ add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
   manifest(path.join(dir,'packages/a'),{name:'a',version:'1.0.0',dependencies:{b:'^1.0.0'}});
   manifest(path.join(dir,'packages/b'),{name:'b',version:'1.0.0',dependencies:{a:'^1.0.0'}});
 });
+// npm ci links a workspace whose folder is missing, leaving a dangling link.
+add('ci-missing-link-target','ci',['ci','--ignore-scripts'],dir=>{
+  const root={name:'root',version:'1.0.0',workspaces:['packages/*'],devDependencies:{cfg:'file:packages/cfg'}};
+  manifest(dir,root);
+  write(dir,'package-lock.json',{name:'root',version:'1.0.0',lockfileVersion:3,requires:true,packages:{'':root,'node_modules/cfg':{resolved:'packages/cfg',link:true},'packages/cfg':{dev:true}}});
+});
+// A root that depends on itself (file:.) gets a link to the root. The link adds
+// no optional-peer edges of its own, so the root's dev dependency stays dev.
+for(const flags of [[],['--package-lock-only']])add(`install-root-self-link-optional-peer${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{name:'b-ws-peer-member',dependencies:{'a-ws-peer-owner':'1.0.0'},devDependencies:{'b-ws-peer-member':'file:.',dep:'^1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}));
 // A bundled link's target has no parent in npm's tree: nothing behind it is inBundle.
 for(const flags of [[],['--package-lock-only']])add(`install-bundled-link-target${flags.length?'-lock-only':''}`,'install',['install','--ignore-scripts',...flags],dir=>{
   manifest(dir,{dependencies:{x:'file:x'},bundleDependencies:['x']});

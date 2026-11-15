@@ -217,9 +217,14 @@ impl DependencyGraph {
             .collect();
         let mut late = Vec::new();
         for (location, node) in &self.nodes {
+            if resolves_to_root(node) {
+                continue;
+            }
             for (name, spec) in &node.peer_dependencies {
+                // Node#loadDeps: a later dependency type replaces the peer edge.
                 if node.dependencies.contains_key(name)
                     || node.optional_dependencies.contains_key(name)
+                    || node.dev_dependencies.contains_key(name)
                 {
                     continue;
                 }
@@ -280,6 +285,11 @@ impl DependencyGraph {
         let mut queue = VecDeque::from([self.root_location.clone()]);
         let mut outgoing: HashMap<String, Vec<DependencyEdge>> = HashMap::new();
         for edge in &self.edges {
+            if self.nodes.get(&edge.from_location).is_some_and(|node| {
+                edge.from_location != self.root_location && resolves_to_root(node)
+            }) {
+                continue;
+            }
             outgoing
                 .entry(edge.from_location.clone())
                 .or_default()
@@ -1003,4 +1013,14 @@ impl DependencyGraph {
         buf.push_str(dep_name);
         nodes.get_key_value(buf.as_str()).map(|(k, _)| k.as_str())
     }
+}
+
+/// A `file:.` dependency is a link to the root itself. Its target's edges are
+/// the root's, already counted, so it adds none of its own.
+fn resolves_to_root(node: &Node) -> bool {
+    node.resolved.as_deref().is_some_and(|resolved| {
+        resolved
+            .strip_prefix("file:")
+            .is_some_and(|path| matches!(path.trim_end_matches(['/', '\\']), "" | "."))
+    })
 }
