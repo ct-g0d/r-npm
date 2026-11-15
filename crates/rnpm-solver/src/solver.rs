@@ -1646,7 +1646,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .filter(|key| key.as_str() == location || key.starts_with(&nested))
             .cloned()
             .collect();
+        let mut detached = std::collections::HashSet::new();
         while let Some(gone) = removed.pop() {
+            detached.insert(gone.clone());
             if gone != location {
                 self.graph.nodes.remove(&gone);
             }
@@ -1673,6 +1675,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         self.graph.nodes.remove(location);
+        // Work queued for the detached nodes belongs to the old version; the
+        // replacement enqueues its own dependencies.
+        self.queue
+            .retain(|task| !detached.contains(&task.parent_location));
+        for tasks in self.deferred_workspaces.values_mut() {
+            tasks.retain(|task| !detached.contains(&task.parent_location));
+        }
+        for tasks in self.deferred_optional_peers.values_mut() {
+            tasks.retain(|task| !detached.contains(&task.parent_location));
+        }
     }
 
     fn rehome_transitive_root_node(&mut self, root_location: &str, install_name: &str) -> bool {

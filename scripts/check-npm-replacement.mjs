@@ -431,6 +431,10 @@ for(const [name,versions] of Object.entries({
   'a-star-peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
   'pinning-optional-owner':{'1.0.0':{peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'z-pinning-parent':{'1.0.0':{dependencies:{'pinning-optional-owner':'1.0.0'}}},
+  'replaced-provider':{'1.0.0':{},'2.0.0':{dependencies:{'replaced-provider-child':'1.0.0'}}},
+  'replaced-provider-child':{'1.0.0':{}},
+  'a-star-replaced-consumer':{'1.0.0':{peerDependencies:{'replaced-provider':'*'}}},
+  'b-replaced-pinner':{'1.0.0':{peerDependencies:{'replaced-provider':'1.0.0'},peerDependenciesMeta:{'replaced-provider':{optional:true}}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
@@ -562,6 +566,8 @@ const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs'
 // A provider placed for a `*` peer is replaced, not nested around, when a later
 // package's optional peer pins a version every existing dependent accepts.
 for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
+// The replaced provider's queued dependencies go with it.
+add('install-optional-peer-replace-drops-old-deps','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-replaced-consumer':'1.0.0','b-replaced-pinner':'1.0.0'}}));
 // npm's ERESOLVE explanation: a root-held node, a peer set placed beside
 // another package's peer, and an optional peer the root pins.
 for(const [name,fields,flags=[]] of [
