@@ -316,6 +316,14 @@ fn package_metadata_from_lockfile(name: &str, lf: &LockfileV3) -> Option<Package
                     .iter()
                     .filter(|(k, _)| matches!(k.as_str(), "funding" | "deprecated"))
                     .map(|(k, v)| (k.clone(), v.clone()))
+                    // Bundled children ship in the owner's tarball; the solver
+                    // must not resolve them from the registry.
+                    .chain(
+                        pkg.bundle_dependencies
+                            .as_ref()
+                            .and_then(|b| serde_json::to_value(b).ok())
+                            .map(|b| ("bundleDependencies".to_string(), b)),
+                    )
                     .collect(),
             };
             versions.insert(ver_str.clone(), ver_meta);
