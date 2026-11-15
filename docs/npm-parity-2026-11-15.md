@@ -108,8 +108,31 @@ optional version, and the existing nested optional-peer conflict case
 (`target/npm-parity-optional-peer-final.json`). A fresh two-project corpus
 rerun is retained in `target/corpus-optional-peer-final`; scripts-sqlite3
 now matches install, ci, and ci-omit-dev, clearing the prior 524 fresh-install
-differences. Its script phase and the complete better-sqlite3 check are
-part of the ongoing verification.
+differences. The completed corpus rerun matches both projects exactly,
+including sqlite3's script-enabled install and smoke test. PR #38 merged
+as `d093186` after all eight CI checks passed. The complete pinned
+comparison run matches 495/497 cases, with only the two audit dry-run
+report differences remaining (`target/npm-parity-optional-peer-full.json`).
+
+## Late optional-peer providers
+
+A two-package mock reproduces the shared pacote/cacache resolution gap:
+an optional peer is initially absent, then becomes invalid when another
+dependency places an incompatible provider. npm revisits the owner, moves
+the transitive provider beneath its consumer, and retains the peer's
+provider at the top level, marked extraneous. Defer missing peer tasks by
+name and wake them when a visible provider arrives. Preserve queued child
+locations when their package moves. Plain `install --no-save` does not
+perform this repair; explicit package requests and updates still do.
+
+All 130 solver tests, strict workspace clippy on all targets, and the
+all-target compile check pass. Seven focused differential cases match,
+including provider children and --no-save (`target/npm-late-peer-final.json`).
+The fresh real-project results are retained in `target/corpus-late-peer`.
+Both pacote and cacache lockfiles now match npm exactly. Their remaining
+36 and 154 fresh-install differences concern the installed tree, including
+a TypeScript native package and nested command shims. The other corpus
+phases remain under verification.
 
 ## Native-project baseline
 

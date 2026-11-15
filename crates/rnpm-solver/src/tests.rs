@@ -6,6 +6,61 @@ use rnpm_core::manifest::{Manifest, PeerDependencyMeta};
 use std::collections::BTreeMap;
 
 #[test]
+fn late_optional_peer_rehomes_provider_and_pending_children() {
+    let mut provider = InMemoryPackageProvider::new();
+    for version in ["1.0.0", "2.0.0"] {
+        provider.add_version("leaf", version, |_| {});
+        provider.add_version("shared", version, |v| {
+            v.dependencies.insert("leaf".into(), version.into());
+        });
+    }
+    provider.add_version("a-peer", "1.0.0", |v| {
+        v.peer_dependencies.insert("shared".into(), "2.0.0".into());
+        v.peer_dependencies_meta
+            .insert("shared".into(), PeerDependencyMeta { optional: true });
+    });
+    provider.add_version("b-writer", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "1.0.0".into());
+    });
+    let mut manifest = Manifest::default();
+    manifest
+        .dependencies
+        .insert("a-peer".into(), "1.0.0".into());
+    manifest
+        .dependencies
+        .insert("b-writer".into(), "1.0.0".into());
+    let unsaved = resolve_dependency_graph(
+        &manifest,
+        &provider,
+        &ResolverOptions {
+            repair_optional_peers: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(unsaved.nodes["node_modules/shared"].version, "1.0.0");
+    assert!(!unsaved
+        .nodes
+        .contains_key("node_modules/b-writer/node_modules/shared"));
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert_eq!(graph.nodes["node_modules/shared"].version, "2.0.0");
+    let old_location = "node_modules/b-writer/node_modules/shared";
+    assert_eq!(graph.nodes[old_location].version, "1.0.0");
+    for (location, expected) in [("node_modules/shared", "2.0.0"), (old_location, "1.0.0")] {
+        let edges = graph.get_outgoing_edges(location);
+        let leaf = edges
+            .iter()
+            .find(|edge| edge.install_name == "leaf")
+            .unwrap();
+        assert_eq!(graph.nodes[&leaf.to_location].version, expected);
+    }
+    let lock = graph.to_lockfile_v3("app", None);
+    let json = serde_json::to_value(lock).unwrap();
+    assert_eq!(json["packages"]["node_modules/shared"]["extraneous"], true);
+}
+
+#[test]
 fn optional_dependency_replaces_peer_before_placement() {
     for optional_peer in [false, true] {
         for transitive in [false, true] {
