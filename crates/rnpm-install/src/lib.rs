@@ -130,6 +130,17 @@ fn queue_pack_files(
     if !pack.index.symlinks.is_empty() || dest.to_str().is_none() {
         return false;
     }
+    // The Rust writer does not create parent directories.
+    let dirs: std::collections::BTreeSet<PathBuf> = pack
+        .index
+        .files
+        .iter()
+        .filter_map(|entry| dest.join(&entry.path).parent().map(Path::to_path_buf))
+        .chain(std::iter::once(dest.to_path_buf()))
+        .collect();
+    if rnpm_fs::precreate_directories(dirs.iter().map(PathBuf::as_path)).is_err() {
+        return false;
+    }
     for entry in &pack.index.files {
         let Some(data) = pack.get_file_slice(&entry.path) else {
             return false;
@@ -4044,7 +4055,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
 
             for (loc, node) in &packages_to_download {
-                let file_sender = pack_sender.clone();
+                // Optional packages write directly so a write failure stays
+                // theirs to skip rather than failing the whole install.
+                let file_sender = if node.flags.optional {
+                    None
+                } else {
+                    pack_sender.clone()
+                };
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache.clone();
                 let pack_store = Arc::clone(&self.pack_store);
