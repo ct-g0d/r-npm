@@ -445,6 +445,8 @@ for(const [name,versions] of Object.entries({
   'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'alias-held':{'1.0.0':{}},
+  'steered-plugin':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}},'2.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'a-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
   'alias-held-real':{'2.0.0':{}},
   'alias-held-peer-two':{'1.0.0':{peerDependencies:{'alias-held':'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
@@ -595,6 +597,7 @@ for(const [name,fields,flags=[]] of [
   // Root-held checks that npm settles elsewhere: an absent optional root peer,
   // an alias to another package, and a scoped override of the peer.
   ['root-optional-peer-absent',{dependencies:{shared:'1.0.0'},peerDependencies:{'eresolve-peer-two':'1.0.0'},peerDependenciesMeta:{'eresolve-peer-two':{optional:true}}}],
+  ['root-peer-steered',{dependencies:{'a-steers-plugin':'1.0.0','steered-plugin':'*',shared:'1.0.0'}}],
   ['root-alias-holds',{dependencies:{'alias-held':'npm:alias-held-real@*','alias-held-peer-two':'1.0.0'}}],
   ['root-holds-scoped-override',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'},overrides:{'eresolve-peer-two':{shared:'1.0.0'}}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],

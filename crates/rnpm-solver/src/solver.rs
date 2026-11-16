@@ -474,6 +474,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
 
+        let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
+        self.provider.prefetch_packages(&root_names);
+
         // Overrides rewrite peer specs per path; leave those to placement.
         if self.options.lockfile.is_none()
             && self.options.is_strict_peers()
@@ -527,9 +530,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         for install_name in root_deps.keys() {
             enqueue_root(install_name, &mut self, &mut queued);
         }
-
-        let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
-        self.provider.prefetch_packages(&root_names);
 
         // Process resolution queue
         self.resolve_tasks()?;
@@ -1919,6 +1919,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
             )
         };
+        // Each root edge's own pick, before any peer steers it.
+        let mut picks = Vec::new();
         for name in order {
             let (spec, dep_type) = &root_deps[name];
             // An absent optional peer is never fetched.
@@ -1940,6 +1942,17 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             else {
                 continue;
             };
+            picks.push((name, spec, dep_type, chosen.clone()));
+        }
+        for (name, spec, dep_type, chosen) in &picks {
+            let (name, spec, dep_type) = (*name, *spec, *dep_type);
+            // Another root package's peer on this one can steer its version
+            // (nodeFromEdge's second edge), so the pick above may not stand.
+            if picks.iter().any(|(other, _, _, other_pick)| {
+                *other != name && other_pick.peer_dependencies.contains_key(name)
+            }) {
+                continue;
+            }
             for (peer, peer_spec) in &chosen.peer_dependencies {
                 if chosen
                     .peer_dependencies_meta
