@@ -441,7 +441,20 @@ for(const [name,versions] of Object.entries({
   'replaced-provider-child':{'1.0.0':{}},
   'a-star-replaced-consumer':{'1.0.0':{peerDependencies:{'replaced-provider':'*'}}},
   'b-replaced-pinner':{'1.0.0':{peerDependencies:{'replaced-provider':'1.0.0'},peerDependenciesMeta:{'replaced-provider':{optional:true}}}},
+  'aa-shared-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
+  'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'alias-held':{'1.0.0':{}},
+  'steered-plugin':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}},'2.0.0':{peerDependencies:{shared:'^2.0.0'}}},
+  'a-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
+  'b-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
+  'a-steers-indirectly':{'1.0.0':{peerDependencies:{'b-steers-plugin':'1.0.0'}}},
+  'z-bridge':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}},'2.0.0':{peerDependencies:{'steered-plugin':'^2.0.0'}}},
+  'a-bridge-peer':{'1.0.0':{peerDependencies:{'z-bridge':'*'}}},
+  'other-held':{'1.0.0':{},'2.0.0':{}},
+  'z-bad-peer':{'1.0.0':{peerDependencies:{'other-held':'^2.0.0'}}},
+  'alias-held-real':{'2.0.0':{}},
+  'alias-held-peer-two':{'1.0.0':{peerDependencies:{'alias-held':'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'a-ws-trigger':{'1.0.0':{dependencies:{dep:'^1.0.0'}}},
@@ -588,7 +601,23 @@ add('install-optional-peer-replace-drops-old-deps','install',['install','--ignor
 for(const [name,fields,flags=[]] of [
   ['root-holds',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}],
   ['root-holds-strict',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}},['--strict-peer-deps']],
+  // npm loads every root edge's peer set before placing any, so the root-held
+  // conflict wins over an earlier placement conflict.
+  ['root-holds-before-placement',{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'},devDependencies:{dep:'1.0.0','virtual-peer-parent':'1.0.0'}}],
   ['placed-peer',{dependencies:{'eresolve-peer-two':'1.0.0','eresolve-z-peer-one':'1.0.0'}}],
+  // Root-held checks that npm settles elsewhere: an absent optional root peer,
+  // an alias to another package, and a scoped override of the peer.
+  ['root-optional-peer-absent',{dependencies:{shared:'1.0.0'},peerDependencies:{'eresolve-peer-two':'1.0.0'},peerDependenciesMeta:{'eresolve-peer-two':{optional:true}}}],
+  ['root-peer-steered',{dependencies:{'a-steers-plugin':'1.0.0','steered-plugin':'*',shared:'1.0.0'}}],
+  ['root-peer-steered-indirect',{dependencies:{'a-steers-indirectly':'1.0.0','steered-plugin':'*',shared:'1.0.0'}}],
+  ['root-peer-steered-root-bridge',{dependencies:{'a-bridge-peer':'1.0.0','steered-plugin':'*',shared:'1.0.0','z-bridge':'1.0.0'}}],
+  // Placement steers around the precheck's conflict, then fails elsewhere:
+  // that real failure is the one reported.
+  ['root-peer-steered-unrelated-failure',{dependencies:{'a-steers-plugin':'1.0.0','steered-plugin':'*',shared:'1.0.0','other-held':'1.0.0','z-bad-peer':'1.0.0'}}],
+  ['root-alias-holds',{dependencies:{'alias-held':'npm:alias-held-real@*','alias-held-peer-two':'1.0.0'}}],
+  // An override of an unrelated package leaves the root-held check alone.
+  ['root-holds-unrelated-override',{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'},devDependencies:{dep:'1.0.0','virtual-peer-parent':'1.0.0'},overrides:{'z-prod':'1.0.0'}}],
+  ['root-holds-scoped-override',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'},overrides:{'eresolve-peer-two':{shared:'1.0.0'}}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
 ])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});
 // A link target whose folder is missing still carries the linking node's flags.
