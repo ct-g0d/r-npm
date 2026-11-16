@@ -312,11 +312,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
     }
 
-    /// arborist conflictOK: a peer conflict is fatal only for a package placed
-    /// directly in the project (under the root or a workspace), or with
+    /// Arborist's conflictOK: without --force, a peer conflict is fatal only
+    /// for a package placed directly under the root or a workspace, or with
     /// --strict-peer-deps; deeper conflicts are overridden with a warning.
     fn peer_conflict_is_fatal(&self, is_mine: bool) -> bool {
-        if self.options.legacy_peer_deps {
+        if self.options.legacy_peer_deps || self.options.force {
             return false;
         }
         if self.options.strict_peer_deps {
@@ -488,7 +488,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // steer around it (an earlier peer set may pick another version), so
         // it replaces placement's own peer conflict but never fails a tree
         // placement resolves.
-        let root_conflict = if self.options.lockfile.is_none() && self.options.is_strict_peers() {
+        let root_conflict = if self.options.lockfile.is_none()
+            && self.options.is_strict_peers()
+            && !self.options.force
+        {
             self.precheck_root_peer_sets(root_manifest, &root_deps)
         } else {
             None

@@ -290,14 +290,21 @@ add('ci-no-lock','ci',['ci']);
 add('install-peer-conflict-pinned-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-pinned-host':'1.0.0'}}));
 add('install-peer-conflict-free-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-free-host':'1.0.0',shared:'1.0.0'}}));
 const peerClashOwner=dir=>manifest(dir,{dependencies:{'peer-clash-peer-host':'1.0.0',shared:'1.0.0'}});
+for(const flags of [['--force'],['--strict-peer-deps','--force']])add('install-force-peer-conflict-root'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only'],['--dry-run'],['--loglevel=error'],['--silent'],['--legacy-peer-deps']])add('install-peer-conflict-through-peer-owner'+flags.join(''),'install',['install','--ignore-scripts',...flags],peerClashOwner);
 add('ci-peer-conflict-through-peer-owner','ci',['ci','--ignore-scripts'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 add('install-peer-conflict-through-peer-owner-noop','install',['install','--ignore-scripts'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);}});
 add('install-peer-conflict-through-peer-owner-no-lock-noop','install',['install','--ignore-scripts','--no-package-lock'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--no-package-lock']);if(p.exit!==0)throw new Error(p.stderr);}});
-add('install-peer-conflict-through-peer-owner-ignored-lock-noop','install',['install','--ignore-scripts','--no-package-lock'],dir=>{
+const peerClashStaleLock=dir=>{
   peerClashOwner(dir);
   write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,packages:{'':{name:'readiness-case',version:'1.0.0'},'node_modules/shared':{version:'2.0.0'}}});
-},{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--no-package-lock']);if(p.exit!==0)throw new Error(p.stderr);}});
+};
+add('install-peer-conflict-through-peer-owner-new-owner-in-lock','install',['install','--ignore-scripts'],peerClashOwner,{before:async ctx=>{
+  edit(ctx.dir,p=>{delete p.dependencies['peer-clash-peer-host'];});
+  const p=await ctx.exec(['install','--ignore-scripts','--package-lock-only']);if(p.exit!==0)throw new Error(p.stderr);
+  edit(ctx.dir,p=>{p.dependencies['peer-clash-peer-host']='1.0.0';});
+}});
+add('install-peer-conflict-through-peer-owner-ignored-lock-noop','install',['install','--ignore-scripts','--no-package-lock'],peerClashStaleLock,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--no-package-lock']);if(p.exit!==0)throw new Error(p.stderr);}});
 add('install-nested-peer-conflict-sibling','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-host':'1.0.0'}}));
 // Packages only a platform-skipped optional package needs are skipped with
 // it and not counted as added.

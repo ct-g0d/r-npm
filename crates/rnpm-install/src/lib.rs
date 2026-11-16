@@ -2352,7 +2352,11 @@ impl Installer {
         self.dry_run_ideal.as_ref()
     }
 
-    async fn peer_conflict_warnings(&self, graph: &DependencyGraph, detailed: bool) -> Vec<String> {
+    async fn peer_conflict_warnings(
+        &self,
+        graph: &DependencyGraph,
+        loaded: Option<&LockfileV3>,
+    ) -> Vec<String> {
         use rnpm_solver::explain::{Explanation, Subject};
         use rnpm_solver::graph::DependencyType;
         if self.options.legacy_peer_deps {
@@ -2381,7 +2385,19 @@ impl Installer {
                 continue;
             }
             let mut warning = "ERESOLVE overriding peer dependency".to_string();
-            if detailed {
+            // A newly loaded peer set has no previous owner to explain. npm
+            // prints only the heading in that case, even when other packages
+            // came from a lockfile. Use provenance for this owner, not the tree.
+            let forced_project_peer = self.options.force
+                && graph.edges.iter().any(|incoming| {
+                    incoming.to_location == owner.location
+                        && !incoming.from_location.contains("node_modules")
+                });
+            if forced_project_peer
+                || loaded
+                    .and_then(|lock| lock.packages.get(&edge.from_location))
+                    .is_some_and(|pkg| pkg.version.as_deref() == Some(owner.version.as_str()))
+            {
                 let peer_edge = rnpm_solver::explain::graph_edge(
                     graph,
                     &edge.from_location,
@@ -2556,18 +2572,19 @@ impl Installer {
                                     .is_some_and(|peers| !peers.is_empty())
                             })
                         }) {
+                            let project_lock = LockfileV3::load_from_file(&lockfile_path).ok();
                             let peer_lock = if self.options.package_lock_enabled() {
-                                LockfileV3::load_from_file(&lockfile_path).ok().or(actual)
+                                project_lock.as_ref().or(actual.as_ref())
                             } else {
-                                actual
+                                actual.as_ref()
                             };
                             if let (Some(lock), Ok(root)) =
                                 (peer_lock, Manifest::from_file(&manifest_path))
                             {
                                 peer_warnings = self
                                     .peer_conflict_warnings(
-                                        &peer_graph_from_lockfile(&lock, &root),
-                                        true,
+                                        &peer_graph_from_lockfile(lock, &root),
+                                        project_lock.as_ref().or(actual.as_ref()),
                                     )
                                     .await;
                             }
@@ -3332,7 +3349,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             let peer_warnings = self
-                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.is_some())
+                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.as_deref())
                 .await;
             return Ok(InstallSummary {
                 reify: (!peer_warnings.is_empty()).then_some(ReifyReport {
@@ -3408,7 +3425,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         if let Some(report) = &mut reify_report {
             report.peer_warnings = self
-                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.is_some())
+                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.as_deref())
                 .await;
         }
 
@@ -5186,7 +5203,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         });
         if let Some(report) = &mut reify_report {
             let graph = peer_graph_from_lockfile(&lockfile, &manifest);
-            report.peer_warnings = self.peer_conflict_warnings(&graph, true).await;
+            report.peer_warnings = self.peer_conflict_warnings(&graph, Some(&lockfile)).await;
         }
         if self.options.dry_run {
             let host_platform = self.options.platform();
