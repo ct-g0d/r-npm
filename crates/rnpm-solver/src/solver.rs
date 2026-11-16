@@ -2261,8 +2261,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// placement ends up not using is harmless.
     fn prefetch_closure(&self, root_deps: &BTreeMap<String, (String, DependencyType)>) {
         let mut seen: std::collections::HashSet<String> = root_deps.keys().cloned().collect();
+        // An absent optional peer is never fetched by placement.
         let mut wave: Vec<(String, String)> = root_deps
             .iter()
+            .filter(|(_, (_, dep_type))| *dep_type != DependencyType::PeerOptional)
             .map(|(name, (spec, _))| (name.clone(), spec.clone()))
             .collect();
         while !wave.is_empty() {
@@ -2314,7 +2316,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let peers = (!self.options.legacy_peer_deps)
                     .then_some(&version.peer_dependencies)
                     .into_iter()
-                    .flatten();
+                    .flatten()
+                    .filter(|(peer, _)| {
+                        !version
+                            .peer_dependencies_meta
+                            .get(*peer)
+                            .is_some_and(|meta| meta.optional)
+                    });
                 for (child, child_spec) in version
                     .dependencies
                     .iter()
