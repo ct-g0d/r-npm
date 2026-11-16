@@ -119,6 +119,56 @@ fn materialize_warm_files(
     }
 }
 
+/// Queues a stored package's files on the async writer. Packages with
+/// symlinks keep the direct path, since a link needs its target on disk.
+/// Returns false (nothing usable queued) so the caller writes directly.
+fn queue_pack_files(
+    pack: &rnpm_cache::PackagePack,
+    dest: &Path,
+    sender: &rnpm_fs::AsyncFileWriterSender,
+) -> bool {
+    if !pack.index.symlinks.is_empty() || dest.to_str().is_none() {
+        return false;
+    }
+    for entry in &pack.index.files {
+        let Some(data) = pack.get_file_slice(&entry.path) else {
+            return false;
+        };
+        let rel = if cfg!(windows) {
+            entry.path.replace('/', "\\")
+        } else {
+            entry.path.clone()
+        };
+        if sender
+            .send(dest.join(rel), data.to_vec(), entry.mode)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// An installed package's manifest, read from its stored pack when there is
+/// one (the async writer may not have written it to disk yet).
+fn installed_manifest(
+    pack_store: &rnpm_cache::PackStore,
+    integrity: Option<&str>,
+    dest: &Path,
+) -> Option<Manifest> {
+    if let Some(integrity) = integrity.filter(|i| !i.is_empty()) {
+        if let Ok(Some(pack)) = pack_store.get_package_pack(integrity) {
+            if let Some(slice) = pack.get_file_slice("package.json") {
+                return Manifest::from_slice(slice).ok();
+            }
+        }
+    }
+    let path = dest.join("package.json");
+    path.exists()
+        .then(|| Manifest::from_file(&path).ok())
+        .flatten()
+}
+
 /// Resolves the committed lockfile path for a project directory, giving `npm-shrinkwrap.json` precedence over `package-lock.json`.
 /// Returns `(lockfile_path, is_shrinkwrap)`.
 pub fn resolve_lockfile_path(project_dir: &Path) -> (PathBuf, bool) {
@@ -3988,8 +4038,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         if !used_fast_materialize {
             let mut join_set = tokio::task::JoinSet::new();
             let unlocked_packages = self.options.unlocked_packages.clone();
+            // Stored packages are written through the async writer (the node
+            // helper on Windows, where its writes are several times faster).
+            let pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let pack_sender = pack_writer.as_ref().map(|w| w.sender());
 
             for (loc, node) in &packages_to_download {
+                let file_sender = pack_sender.clone();
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache.clone();
                 let pack_store = Arc::clone(&self.pack_store);
@@ -4032,8 +4087,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let integ_clone = integ_str.clone();
                         let cfg_clone = Arc::clone(&pkg_writer_cfg);
                         let loc_clone = loc.clone();
+                        let warm_sender = file_sender.clone();
                         let mat_res = tokio::task::spawn_blocking(move || {
                             let _mat_span = tracing::info_span!("materialize-pack", package = %loc_clone).entered();
+                            if let (Some(sender), Ok(Some(pack))) = (warm_sender.as_ref(), ps_clone.get_package_pack(&integ_clone)) {
+                                if queue_pack_files(&pack, &dest_dir_clone, sender) {
+                                    return Ok(rnpm_fs::ExtractionSummary::default());
+                                }
+                            }
                             let res = ps_clone.materialize_pack(&integ_clone, &dest_dir_clone, Some(&cfg_clone));
                             drop(_mat_span);
                             res
@@ -4042,10 +4103,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         match mat_res {
                             Ok(_) => {
-                                let pkg_manifest_path = dest_dir.join("package.json");
                                 let mut lifecycle_node = None;
-                                if pkg_manifest_path.exists() {
-                                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                                {
+                                    if let Some(pkg_manifest) = installed_manifest(&pack_store, Some(integ_str), &dest_dir) {
                                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
                                             || pkg_manifest.scripts.contains_key("postinstall");
@@ -4260,23 +4320,31 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
                 }
 
-                // Construct and write pack to store if not already present
-                if let Some(ref integ_str) = node.integrity {
-                    if !integ_str.is_empty() && !pack_store.has_package_pack(integ_str) {
-                        let _ = pack_store.put_package_from_tarball(integ_str, &bytes);
-                    }
-                }
-
                 // Parallel native materialization straight into place without staging dirs or renames
                 let dest_dir_clone = dest_dir.clone();
                 let cfg_clone = Arc::clone(&pkg_writer_cfg);
                 let ps_clone = Arc::clone(&pack_store);
                 let integ_opt = node.integrity.clone();
+                let cold_sender = file_sender.clone();
                 let extract_res = tokio::task::spawn_blocking(move || {
                     if rnpm_fs::is_junction(&dest_dir_clone).unwrap_or(false) {
                         let _ = rnpm_fs::remove_junction(&dest_dir_clone);
                     }
+                    // Store the pack (bytes were verified above). Per-file CAS
+                    // copies are skipped: they double the writes for no gain here.
                     if let Some(ref integ) = integ_opt {
+                        if !integ.is_empty() && !ps_clone.has_package_pack(integ) {
+                            let _ = ps_clone.put_package_from_verified_tarball_deferred(integ, &bytes);
+                        }
+                    }
+                    if let Some(ref integ) = integ_opt {
+                        if let (Some(sender), false) = (cold_sender.as_ref(), integ.is_empty()) {
+                            if let Ok(Some(pack)) = ps_clone.get_package_pack(integ) {
+                                if queue_pack_files(&pack, &dest_dir_clone, sender) {
+                                    return Ok(rnpm_fs::ExtractionSummary::default());
+                                }
+                            }
+                        }
                         if !integ.is_empty() && ps_clone.has_package_pack(integ) {
                             match ps_clone.materialize_pack(integ, &dest_dir_clone, Some(&cfg_clone)) {
                                 Ok(sum) => return Ok(sum),
@@ -4322,11 +4390,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
 
                 // Generate shims if package declares bin and collect lifecycle node
-                let pkg_manifest_path = dest_dir.join("package.json");
                 let mut lifecycle_node = None;
 
-                if pkg_manifest_path.exists() {
-                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                {
+                    if let Some(pkg_manifest) = installed_manifest(&pack_store, node.integrity.as_deref(), &dest_dir) {
                         let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
                             || pkg_manifest.scripts.contains_key("postinstall");
@@ -4367,6 +4434,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         lifecycle_nodes.push(l_node);
                     }
                 }
+            }
+            // Every queued file must be on disk before bins and scripts run.
+            drop(pack_sender);
+            if let Some(writer) = pack_writer {
+                tokio::task::spawn_blocking(move || writer.finish())
+                    .await
+                    .map_err(|e| anyhow!("File writer panicked: {e}"))?
+                    .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
             }
         }
 

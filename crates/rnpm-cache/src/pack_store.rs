@@ -1493,13 +1493,13 @@ impl PackStore {
                 }));
             }
 
-            let (sha256, cas_path) = if populate_cas {
-                let h = HEXLOWER.encode(&Sha256::digest(file.data));
-                let p = self.cas_file_path(&h);
-                (Some(h), Some(p))
-            } else {
-                (None, None)
-            };
+            // Record each file's digest now: the first load otherwise
+            // computes it and rewrites the index.
+            // The CAS location stays unset unless the CAS is filled here, so
+            // install does not start copying every file into it.
+            let sha = HEXLOWER.encode(&Sha256::digest(file.data));
+            let cas_path = populate_cas.then(|| self.cas_file_path(&sha));
+            let sha256 = Some(sha);
             index_files.push(PackFileEntry {
                 path: file.path,
                 mode: file.mode,
@@ -1566,17 +1566,20 @@ impl PackStore {
             let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
             let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
 
-            let pack_mtime = {
+            {
                 let mut f_pack = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&tmp_pack)?;
                 f_pack.write_all(&pack_bytes)?;
                 f_pack.flush()?;
-                f_pack.metadata().ok().and_then(|m| mtime_to_timestamp(&m))
-            };
-
-            index.pack_mtime = pack_mtime;
+            }
+            // Windows can move the write time when the handle closes, so
+            // read it from the closed file; a stale stamp makes the first
+            // load re-verify the whole pack and rewrite the index.
+            index.pack_mtime = fs::metadata(&tmp_pack)
+                .ok()
+                .and_then(|m| mtime_to_timestamp(&m));
             let idx_bytes = index.to_bytes().map_err(CacheError::Json)?;
 
             {
