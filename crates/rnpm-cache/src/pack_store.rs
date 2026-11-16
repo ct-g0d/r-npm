@@ -377,14 +377,16 @@ impl PackagePack {
     /// Retrieve a direct slice for a specific file path within the memory-mapped pack.
     pub fn get_file_slice(&self, path: &str) -> Option<&[u8]> {
         let entry = self.index.get_file(path)?;
-        let start = entry.offset as usize;
-        let end = start + entry.size as usize;
-        let data = self.data();
-        if end <= data.len() {
-            Some(&data[start..end])
-        } else {
-            None
-        }
+        self.get_entry_slice(entry)
+    }
+
+    /// Read an entry already obtained from this pack's index without searching
+    /// the index again. Bulk materialization must stay linear in file count.
+    pub fn get_entry_slice(&self, entry: &PackFileEntry) -> Option<&[u8]> {
+        let start = usize::try_from(entry.offset).ok()?;
+        let size = usize::try_from(entry.size).ok()?;
+        let end = start.checked_add(size)?;
+        self.data().get(start..end)
     }
 
     /// Materialize all files directly from the memory-mapped pack into `target_dir`
@@ -2395,6 +2397,18 @@ mod tests {
             b"<svg></svg>"
         );
         assert!(pack.get_file_slice("nonexistent.txt").is_none());
+        for entry in &pack.index.files {
+            assert_eq!(
+                pack.get_entry_slice(entry),
+                pack.get_file_slice(&entry.path)
+            );
+        }
+        let mut invalid = pack.index.files[0].clone();
+        invalid.offset = pack.data().len() as u64;
+        invalid.size = 1;
+        assert!(pack.get_entry_slice(&invalid).is_none());
+        invalid.offset = u64::MAX;
+        assert!(pack.get_entry_slice(&invalid).is_none());
     }
 
     #[test]

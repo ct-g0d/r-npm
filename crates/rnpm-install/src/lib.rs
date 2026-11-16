@@ -142,7 +142,7 @@ fn queue_pack_files(
         return false;
     }
     for entry in &pack.index.files {
-        let Some(data) = pack.get_file_slice(&entry.path) else {
+        let Some(data) = pack.get_entry_slice(entry) else {
             return false;
         };
         let rel = if cfg!(windows) {
@@ -4213,7 +4213,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if let Some(parent) = full_path.parent() {
                             all_dirs.insert(parent.to_path_buf());
                         }
-                        if let Some(slice) = pack.get_file_slice(&entry.path) {
+                        if let Some(slice) = pack.get_entry_slice(entry) {
                             all_file_refs.push(rnpm_fs::MaterializeFileRef {
                                 path: full_path,
                                 data: slice,
@@ -6387,7 +6387,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if let Some(parent) = full_path.parent() {
                             all_dirs.insert(parent.to_path_buf());
                         }
-                        if let Some(slice) = pack.get_file_slice(&entry.path) {
+                        if let Some(slice) = pack.get_entry_slice(entry) {
                             let source_path = if entry.cas_verified {
                                 entry.cas_path.as_deref()
                             } else {
