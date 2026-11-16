@@ -571,6 +571,8 @@ add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
 const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs');const files=fs.existsSync(logs)?fs.readdirSync(logs).filter(f=>f.endsWith('-eresolve-report.txt')):[];return files.map(f=>fs.readFileSync(path.join(logs,f),'utf8').replaceAll(logs,'<logs>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-/g,'<timestamp>-'));};
 // A provider placed for a `*` peer is replaced, not nested around, when a later
 // package's optional peer pins a version every existing dependent accepts.
+// The root's own '*' dependency is replaced too when it accepts the pin.
+add('install-optional-peer-replaces-root-star-dep','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'*','z-pinning-parent':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
 // The replaced provider's queued dependencies go with it.
 // A dependency cycle under the replaced provider goes with it.

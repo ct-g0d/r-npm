@@ -780,8 +780,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     format!("{scope}/node_modules/{}", task.install_name)
                                 });
                         // A top-level owner's provider slot is the root's own
-                        // dependency: npm cannot replace it, so it is ERESOLVE.
+                        // dependency: npm replaces it only when every edge into
+                        // it accepts the pinned version (as placement checked);
+                        // otherwise it is ERESOLVE.
                         let root_pins_provider = sibling.is_none()
+                            && !crate::hoisting::root_provider_replaceable(
+                                &self.graph,
+                                existing,
+                                &task.install_name,
+                                &effective_spec,
+                            )
                             && existing.location == format!("node_modules/{}", task.install_name)
                             && self.graph.nodes.get(&self.graph.root_location).is_some_and(
                                 |root| {
