@@ -483,7 +483,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // placement resolves.
         let root_conflict = if self.options.lockfile.is_none() && self.options.is_strict_peers() {
             self.precheck_root_peer_sets(root_manifest, &root_deps)
-                .err()
         } else {
             None
         };
@@ -537,7 +536,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // Process resolution queue
         if let Err(error) = self.resolve_tasks() {
             return Err(match root_conflict {
-                Some(conflict) if error.is_peer_conflict() => conflict,
+                Some((conflict, version))
+                    if error.is_peer_conflict()
+                        && self.root_conflict_holds(&conflict, &version) =>
+                {
+                    conflict
+                }
                 _ => error,
             });
         }
@@ -1904,7 +1908,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         &self,
         root_manifest: &Manifest,
         root_deps: &BTreeMap<String, (String, DependencyType)>,
-    ) -> Result<(), SolverError> {
+    ) -> Option<(SolverError, String)> {
         use crate::explain::{EdgeFrom, EdgeView, Explanation, Subject};
         // Node#loadDeps inserts peer, prod, optional, then dev edges; a name
         // keeps the position of its first appearance.
@@ -2036,7 +2040,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     conflict: None,
                 }
                 .render(&self.graph, self.options.strict_peer_deps);
-                return Err(SolverError::peer_conflict(
+                let conflict = SolverError::peer_conflict(
                     name,
                     peer,
                     peer_spec,
@@ -2048,10 +2052,40 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         root_choice.version
                     ),
                 )
-                .with_eresolve(explanation));
+                .with_eresolve(explanation);
+                return Some((conflict, chosen.version.clone()));
             }
         }
-        Ok(())
+        None
+    }
+
+    /// Whether a precheck conflict still describes the tree placement built:
+    /// placement may have steered the package to another version, or placed
+    /// a peer that fits, in which case its own error is the real one.
+    fn root_conflict_holds(&self, conflict: &SolverError, version: &str) -> bool {
+        let SolverError::PeerConflict {
+            parent,
+            peer,
+            required_spec,
+            ..
+        } = conflict
+        else {
+            return true;
+        };
+        if self
+            .graph
+            .nodes
+            .get(&format!("node_modules/{parent}"))
+            .is_some_and(|node| node.version != version)
+        {
+            return false;
+        }
+        !self
+            .graph
+            .nodes
+            .get(&format!("node_modules/{peer}"))
+            .zip(PackageTarget::parse(required_spec).ok())
+            .is_some_and(|(node, target)| crate::hoisting::node_satisfies_target(node, &target))
     }
 
     /// `name@version` as printNode shows a virtual tree's source; npm prints
