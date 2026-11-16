@@ -1673,6 +1673,36 @@ fn peer_graph_from_lockfile(lockfile: &LockfileV3, manifest: &Manifest) -> Depen
         );
     }
     let mut graph = DependencyGraph::from_lockfile_v3(&lockfile);
+    // Link lock entries carry only a target path. npm checks a link's target
+    // package version when validating peers, including links back to ".".
+    for (location, package) in &lockfile.packages {
+        let Some(target) = package
+            .resolved
+            .as_deref()
+            .filter(|_| package.link == Some(true))
+        else {
+            continue;
+        };
+        let target = if target == "." {
+            ""
+        } else {
+            target.strip_prefix("./").unwrap_or(target)
+        };
+        let identity = graph.nodes.get(target).map(|node| {
+            (
+                node.name.clone(),
+                node.version.clone(),
+                node.parsed_version.clone(),
+            )
+        });
+        if let (Some((name, version, parsed_version)), Some(node)) =
+            (identity, graph.nodes.get_mut(location))
+        {
+            node.name = name;
+            node.version = version;
+            node.parsed_version = parsed_version;
+        }
+    }
     if let Ok(overrides) = rnpm_solver::Overrides::from_manifest(manifest) {
         for edge in &mut graph.edges {
             let ancestors = edge
