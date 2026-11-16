@@ -34,6 +34,9 @@ pub struct ResolverOptions {
     pub unlocked_packages: std::collections::HashSet<String>,
     /// Vulnerability constraints to avoid when selecting versions during audit fix.
     pub vulnerability_constraints: std::collections::HashMap<String, Vec<rnpm_core::semver::Range>>,
+    /// `--force`: npm-install-checks' checkPlatform returns early, so a
+    /// required package for another platform is installed anyway.
+    pub force: bool,
 }
 
 impl Default for ResolverOptions {
@@ -48,6 +51,7 @@ impl Default for ResolverOptions {
             lockfile: None,
             unlocked_packages: std::collections::HashSet::new(),
             vulnerability_constraints: std::collections::HashMap::new(),
+            force: false,
         }
     }
 }
@@ -1017,18 +1021,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             chosen_version.libc.as_deref(),
         );
         let platform_skipped = !compatible && task.dep_type == DependencyType::Optional;
-        if !compatible && !platform_skipped {
-            let wanted = format!(
-                "os: {:?}, cpu: {:?}, libc: {:?}",
-                chosen_version.os.as_deref().unwrap_or(&[]),
-                chosen_version.cpu.as_deref().unwrap_or(&[]),
-                chosen_version.libc.as_deref().unwrap_or(&[])
-            );
-            let current = format!(
-                "os: {}, cpu: {}, libc: {}",
-                self.options.platform.os,
-                self.options.platform.cpu,
-                self.options.platform.libc.as_deref().unwrap_or("none")
+        // Optional packages are still skipped under --force (reify checks
+        // them without force); required ones are installed anyway.
+        if !compatible && !platform_skipped && !self.options.force {
+            let (wanted, current, detail) = crate::platform::npm_platform_report(
+                chosen_version.os.as_deref(),
+                chosen_version.cpu.as_deref(),
+                chosen_version.libc.as_deref(),
+                &self.options.platform,
             );
             return Err(SolverError::platform_incompatible(
                 &dep_spec.package_name,
@@ -1036,10 +1036,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 wanted,
                 current,
                 (*task.ancestors).clone(),
-                format!(
-                    "Package '{}@{}' is incompatible with the current platform",
-                    dep_spec.package_name, chosen_version.version
-                ),
+                detail,
             ));
         }
         if platform_skipped {

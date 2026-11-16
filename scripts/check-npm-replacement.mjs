@@ -491,6 +491,7 @@ for(const [name,versions] of Object.entries({
   'nested-optional-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'legacy-owner':{'1.0.0':{license:'MIT',bin:'index.js',dependencies:{shared:'>=1.0.0'},optionalDependencies:{'legacy-native':'1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}},
   'legacy-native':{'1.0.0':{license:'MIT',os:[process.platform==='win32'?'darwin':'win32']}},
+  'multi-native':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32','freebsd'],cpu:[process.arch==='x64'?'arm64':'x64']}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -509,6 +510,10 @@ for(const [name,versions] of Object.entries({
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-late-optional-peer-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
+// A required package for another platform: EBADPLATFORM, unless --force,
+// which installs it anyway.
+add('install-platform-required-os-cpu','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'multi-native':'1.0.0'}}));
+for(const flags of [[],['--force'],['--force','--package-lock-only']])add('install-platform-required'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'legacy-native':'1.0.0'}}));
 add('materialization-shared-optional-native','install',['install','--ignore-scripts'],dir=>manifest(dir,{optionalDependencies:{'a-unsupported-parent':'1.0.0','shared-native':'1.0.0'}}));
 add('resolver-late-optional-peer-required-provider','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-required':'1.0.0'}}));
 add('cli-silent-registry-error','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'silent-missing':'1.0.0'}}));

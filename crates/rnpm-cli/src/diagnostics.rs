@@ -202,6 +202,26 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 } if message == "Package not found in metadata provider" => {
                     return missing_package_diagnostic(name, spec);
                 }
+                SolverError::PlatformIncompatible {
+                    package,
+                    version,
+                    wanted,
+                    current,
+                    message,
+                    ..
+                } => {
+                    let mut block = format!(
+                        "npm error code EBADPLATFORM
+npm error notsup Unsupported platform for {package}@{version}: wanted {wanted} (current: {current})"
+                    );
+                    for line in message.lines() {
+                        block.push_str(&format!(
+                            "
+npm error notsup {line}"
+                        ));
+                    }
+                    return Diagnostic::new("EBADPLATFORM", block);
+                }
                 SolverError::PeerConflict { .. } => {
                     if let Some(eresolve) = solver_err.eresolve() {
                         return Diagnostic::new("ERESOLVE", eresolve_block(eresolve));

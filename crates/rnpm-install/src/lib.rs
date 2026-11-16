@@ -2781,6 +2781,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             lockfile: existing_lockfile,
             unlocked_packages,
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),
+            force: self.options.force,
         };
 
         let mut graph = if !workspace_members.is_empty() {
@@ -7531,7 +7532,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let host_platform = self.options.platform();
         let compatible = host_platform.matches_with_libc(os_list, cpu_list, libc_list);
-        if !compatible && !is_optional {
+        if !compatible && !is_optional && !self.options.force {
             return Err(anyhow!(
                 "rnpm ERR! code EBADPLATFORM: Unsupported platform for {}@{}: wanted os: {:?}, cpu: {:?}, libc: {:?}",
                 name, best_ver_str, ver_info.os, ver_info.cpu, ver_info.libc
