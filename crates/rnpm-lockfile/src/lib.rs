@@ -34,6 +34,23 @@ mod tests {
     const VALID_SHA1: &str = "sha1-AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
     #[test]
+    fn hidden_lock_without_root_metadata_can_be_loaded() {
+        let lock = LockfileV3::from_json_str(
+            r#"{
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {"node_modules/dep": {"version": "1.0.0"}}
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lock.packages["node_modules/dep"].version.as_deref(),
+            Some("1.0.0")
+        );
+        assert!(!lock.packages.contains_key(""));
+    }
+
+    #[test]
     fn test_lockfile_v3_deterministic_serialization() {
         let mut lockfile = LockfileV3::new("my-app", Some("1.0.0".to_string()));
 

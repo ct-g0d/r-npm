@@ -1619,12 +1619,15 @@ fn reify_report_for(
     ideal_rank: Option<&HashMap<String, usize>>,
 ) -> ReifyReport {
     let platform = options.platform();
+    // Packages only an incompatible optional package needs are skipped with
+    // it, so they are not added either (npm counts the nodes it reifies).
+    let platform_skipped = lockfile_platform_skipped_packages(ideal, &platform);
     reify_report::compute(
         &ideal.packages,
         actual,
         ideal_rank,
         |key, p| {
-            if lockfile_entry_omitted(options, ideal, key, p) {
+            if lockfile_entry_omitted(options, ideal, key, p) || platform_skipped.contains(key) {
                 return true;
             }
             // A link is omitted with its target.
@@ -1652,6 +1655,44 @@ fn reify_report_for(
         },
         |loc| include.is_none_or(|set| set.contains(loc)),
     )
+}
+
+fn peer_graph_from_lockfile(lockfile: &LockfileV3, manifest: &Manifest) -> DependencyGraph {
+    let mut lockfile = std::borrow::Cow::Borrowed(lockfile);
+    if !lockfile.packages.contains_key("") {
+        lockfile.to_mut().packages.insert(
+            String::new(),
+            LockfilePackage {
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                dependencies: Some(manifest.dependencies.clone()),
+                dev_dependencies: Some(manifest.dev_dependencies.clone()),
+                optional_dependencies: Some(manifest.optional_dependencies.clone()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut graph = DependencyGraph::from_lockfile_v3(&lockfile);
+    if let Ok(overrides) = rnpm_solver::Overrides::from_manifest(manifest) {
+        for edge in &mut graph.edges {
+            let ancestors = edge
+                .from_location
+                .split("/node_modules/")
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.strip_prefix("node_modules/")
+                        .unwrap_or(part)
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            if let Ok(Some(spec)) =
+                overrides.resolve_override_strings(&edge.install_name, &edge.spec, &ancestors)
+            {
+                edge.spec = spec;
+            }
+        }
+    }
+    graph
 }
 
 /// The hidden lockfile describes the tree on disk: omitted packages are not
@@ -2311,6 +2352,110 @@ impl Installer {
         self.dry_run_ideal.as_ref()
     }
 
+    async fn peer_conflict_warnings(&self, graph: &DependencyGraph, detailed: bool) -> Vec<String> {
+        use rnpm_solver::explain::{Explanation, Subject};
+        use rnpm_solver::graph::DependencyType;
+        if self.options.legacy_peer_deps {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        for edge in &graph.edges {
+            if !matches!(
+                edge.dep_type,
+                DependencyType::Peer | DependencyType::PeerOptional
+            ) {
+                continue;
+            }
+            let (Some(owner), Some(current)) = (
+                graph.nodes.get(&edge.from_location),
+                graph.nodes.get(&edge.to_location),
+            ) else {
+                continue;
+            };
+            let Ok(spec) =
+                rnpm_solver::aliases::DependencySpec::parse(&edge.install_name, &edge.spec)
+            else {
+                continue;
+            };
+            if rnpm_solver::hoisting::node_satisfies_target(current, &spec.target) {
+                continue;
+            }
+            let mut warning = "ERESOLVE overriding peer dependency".to_string();
+            if detailed {
+                let peer_edge = rnpm_solver::explain::graph_edge(
+                    graph,
+                    &edge.from_location,
+                    edge.dep_type,
+                    &edge.install_name,
+                    &edge.spec,
+                );
+                // Diagnostics must never turn an allowed conflict into a fetch failure.
+                let cached = (self.options.offline || self.options.prefer_offline)
+                    .then(|| {
+                        self.cache
+                            .get_packument_with_accept(
+                                self.registry_client
+                                    .registry_for_package(&spec.package_name)
+                                    .as_str(),
+                                &spec.package_name,
+                                Some(INSTALL_PACKUMENT_ACCEPT),
+                            )
+                            .ok()
+                            .flatten()
+                            .and_then(|(_, bytes)| {
+                                serde_json::from_slice::<AbbreviatedPackageMetadata>(&bytes).ok()
+                            })
+                    })
+                    .flatten();
+                let metadata = if cached.is_some() || self.options.offline {
+                    cached
+                } else {
+                    self.registry_client
+                        .get_package_metadata(&spec.package_name)
+                        .await
+                        .ok()
+                };
+                let candidate = metadata.and_then(|meta| {
+                    let latest = meta
+                        .dist_tags
+                        .get("latest")
+                        .filter(|v| {
+                            rnpm_solver::hoisting::version_satisfies_target(v, &spec.target)
+                        })
+                        .cloned();
+                    latest.or_else(|| {
+                        meta.versions
+                            .keys()
+                            .filter(|v| {
+                                rnpm_solver::hoisting::version_satisfies_target(v, &spec.target)
+                            })
+                            .filter_map(|v| {
+                                Version::parse(v).ok().map(|parsed| (parsed, v.clone()))
+                            })
+                            .max_by(|a, b| a.0.cmp(&b.0))
+                            .map(|(_, v)| v)
+                    })
+                });
+                let explanation = Explanation {
+                    heading: "could not resolve",
+                    while_resolving: Some(format!("{}@{}", owner.install_name, owner.version)),
+                    found: Subject::Graph(edge.to_location.clone()),
+                    edge: peer_edge.clone(),
+                    conflict: candidate.map(|version| Subject::Candidate {
+                        name: edge.install_name.clone(),
+                        version,
+                        location: edge.to_location.clone(),
+                        dependents: vec![peer_edge],
+                    }),
+                };
+                warning.push('\n');
+                warning.push_str(&explanation.render_at(graph, 2));
+            }
+            warnings.push(warning);
+        }
+        warnings
+    }
+
     pub fn registry_client(&self) -> &RegistryClient {
         &self.registry_client
     }
@@ -2391,19 +2536,47 @@ impl Installer {
                             let _life_guard = collector.enter_phase(Phase::Lifecycle);
                             rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts).await?;
                         }
-                        let inventory = LockfileV3::load_from_file(
+                        let actual = LockfileV3::load_from_file(
                             &self
                                 .options
                                 .project_dir
                                 .join("node_modules")
                                 .join(".package-lock.json"),
                         )
-                        .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
-                        .unwrap_or(1);
+                        .ok();
+                        let inventory = actual
+                            .as_ref()
+                            .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
+                            .unwrap_or(1);
+                        let mut peer_warnings = Vec::new();
+                        if actual.as_ref().is_some_and(|lock| {
+                            lock.packages.values().any(|p| {
+                                p.peer_dependencies
+                                    .as_ref()
+                                    .is_some_and(|peers| !peers.is_empty())
+                            })
+                        }) {
+                            let peer_lock = if self.options.package_lock_enabled() {
+                                LockfileV3::load_from_file(&lockfile_path).ok().or(actual)
+                            } else {
+                                actual
+                            };
+                            if let (Some(lock), Ok(root)) =
+                                (peer_lock, Manifest::from_file(&manifest_path))
+                            {
+                                peer_warnings = self
+                                    .peer_conflict_warnings(
+                                        &peer_graph_from_lockfile(&lock, &root),
+                                        true,
+                                    )
+                                    .await;
+                            }
+                        }
                         return Ok(InstallSummary {
                             reify: Some(ReifyReport {
                                 changes: Vec::new(),
                                 inventory,
+                                peer_warnings,
                             }),
                             packages_installed: 0,
                             cache_hits: 0,
@@ -3158,8 +3331,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
+            let peer_warnings = self
+                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.is_some())
+                .await;
             return Ok(InstallSummary {
-                reify: None,
+                reify: (!peer_warnings.is_empty()).then_some(ReifyReport {
+                    peer_warnings,
+                    inventory: lockfile.packages.len(),
+                    ..Default::default()
+                }),
                 packages_installed: 0,
                 cache_hits: 0,
                 cache_misses: 0,
@@ -3205,7 +3385,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         };
 
         // npm reify-output: diff the actual tree on disk against the ideal tree.
-        let reify_report = (!self.options.is_global).then(|| {
+        let mut reify_report = (!self.options.is_global).then(|| {
             let hidden_valid =
                 validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
             let actual = reify_report::load_actual(
@@ -3225,6 +3405,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 Some(&rank),
             )
         });
+
+        if let Some(report) = &mut reify_report {
+            report.peer_warnings = self
+                .peer_conflict_warnings(&graph, existing_lockfile_for_merge.is_some())
+                .await;
+        }
 
         // 3b. For --dry-run, simulate installation and report what would be installed
         if self.options.dry_run {
@@ -4609,6 +4795,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             None
         };
 
+        // Removing empty bin folders changes package directory mtimes. Finish
+        // that before saving the hidden lock so our own cleanup cannot stale it.
+        clean_empty_bin_dirs(&node_modules_dir);
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         // npm writes node_modules/.package-lock.json even with package-lock=false
         // (without root metadata); only package-lock.json depends on the flag.
@@ -4699,7 +4888,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        clean_empty_bin_dirs(&node_modules_dir);
         remove_node_modules_if_empty(&node_modules_dir);
 
         Ok(InstallSummary {
@@ -4982,7 +5170,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         collector.record_phase(Phase::Metadata, metadata_start.elapsed());
 
         // npm ci removes node_modules first, so every placed node is added.
-        let reify_report = (!self.options.is_global).then(|| {
+        let mut reify_report = (!self.options.is_global).then(|| {
             let actual = if from_scratch && !self.options.dry_run {
                 BTreeMap::new()
             } else {
@@ -4996,6 +5184,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             };
             reify_report_for(&self.options, &lockfile, &actual, None, None)
         });
+        if let Some(report) = &mut reify_report {
+            let graph = peer_graph_from_lockfile(&lockfile, &manifest);
+            report.peer_warnings = self.peer_conflict_warnings(&graph, true).await;
+        }
         if self.options.dry_run {
             let host_platform = self.options.platform();
             let mut packages_installed = 0;

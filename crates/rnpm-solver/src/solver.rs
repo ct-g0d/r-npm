@@ -759,6 +759,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         });
                         return Ok(());
                     } else if task.dep_type == DependencyType::Peer {
+                        let scope = crate::hoisting::peer_provider_scope(
+                            &self.graph,
+                            &task.parent_location,
+                            &task.install_name,
+                        );
+                        let sibling = if scope.is_empty() {
+                            format!("node_modules/{}", task.install_name)
+                        } else {
+                            format!("{scope}/node_modules/{}", task.install_name)
+                        };
                         if self.peer_conflict_is_fatal(task.is_mine) {
                             return Err(SolverError::peer_conflict(
                                 &task.parent_package_name,
@@ -783,7 +793,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     &existing.location,
                                 ),
                             ));
-                        } else {
+                        } else if self.graph.nodes.contains_key(&sibling) {
                             warn!(
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
                                 task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
@@ -800,6 +810,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             });
                             return Ok(());
                         }
+                        // Otherwise the owner is nested and its sibling slot is
+                        // free: npm places the peer there, beside its owner,
+                        // instead of keeping the conflicting visible one.
                     } else if task.dep_type == DependencyType::PeerOptional {
                         // loadPeerSet resolves an incompatible optional peer
                         // when its owner can nest with a new sibling provider.
@@ -1169,16 +1182,32 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
 
         // 6. Hoisting & Tree Placement
+        let peer_scope = is_peer.then(|| {
+            crate::hoisting::peer_provider_scope(
+                &self.graph,
+                &task.parent_location,
+                &task.install_name,
+            )
+        });
+        // The placement routine treats this as an ordinary child of the
+        // deepest allowed scope; it must not nest inside its peer owner.
+        let placement_parent = peer_scope.unwrap_or(&task.parent_location);
+        let no_peers = BTreeMap::new();
+        let candidate_peers = if self.options.legacy_peer_deps {
+            &no_peers
+        } else {
+            placement_peers
+                .as_ref()
+                .unwrap_or(&chosen_version.peer_dependencies)
+        };
         let mut placement = determine_placement_with_peers(
             &self.graph,
-            &task.parent_location,
+            placement_parent,
             &dep_spec.install_name,
             &dep_spec.package_name,
             &dep_spec.target,
             &chosen_version.dependencies,
-            placement_peers
-                .as_ref()
-                .unwrap_or(&chosen_version.peer_dependencies),
+            candidate_peers,
             &chosen_version.peer_dependencies_meta,
             Some(&chosen_version.version),
             chosen_version.dist_tarball.as_deref(),

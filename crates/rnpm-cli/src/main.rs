@@ -4428,6 +4428,7 @@ async fn run_audit_fix(
         let report = rnpm_install::ReifyReport {
             changes: Vec::new(),
             inventory,
+            peer_warnings: Vec::new(),
         };
         let fund = config.get_bool("fund").unwrap_or(true);
         let mut opts =

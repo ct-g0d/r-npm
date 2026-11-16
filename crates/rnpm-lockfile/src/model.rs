@@ -729,6 +729,8 @@ impl LockfilePackage {
 /// npm `package-lock.json` lockfile version 3 document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockfileV3 {
+    // npm omits root metadata from the hidden lock with --no-package-lock.
+    #[serde(default)]
     pub name: String,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
