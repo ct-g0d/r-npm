@@ -86,6 +86,39 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
     first_error.map_or(Ok(()), Err)
 }
 
+/// Writes warm-store files. Files with a verified CAS blob are copied; the
+/// rest go to the async writer (the node helper on Windows, where node's
+/// writes run several times faster than ours), falling back to our writer.
+/// Paths that are not valid UTF-8 stay on our writer: the helper takes text.
+fn materialize_warm_files(
+    files: Vec<rnpm_fs::MaterializeFileRef<'_>>,
+    config: &rnpm_fs::ParallelWriterConfig,
+) -> Result<(), rnpm_fs::FsError> {
+    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn() else {
+        return rnpm_fs::materialize_files_parallel_refs(files, config);
+    };
+    let sender = writer.sender();
+    let (local, written): (Vec<_>, Vec<_>) = files.into_iter().partition(|file| {
+        (file.source_path.is_some() && file.source_verified) || file.path.to_str().is_none()
+    });
+    let mut sent = Ok(());
+    for file in &written {
+        sent = sender.send(file.path.clone(), file.data.to_vec(), file.mode);
+        if sent.is_err() {
+            break;
+        }
+    }
+    drop(sender);
+    let local_result = rnpm_fs::materialize_files_parallel_refs(local, config);
+    let wait_result = writer.finish();
+    local_result?;
+    match sent.and(wait_result) {
+        Ok(()) => Ok(()),
+        // The helper failed part-way: write its files ourselves.
+        Err(_) => rnpm_fs::materialize_files_parallel_refs(written, config),
+    }
+}
+
 /// Resolves the committed lockfile path for a project directory, giving `npm-shrinkwrap.json` precedence over `package-lock.json`.
 /// Returns `(lockfile_path, is_shrinkwrap)`.
 pub fn resolve_lockfile_path(project_dir: &Path) -> (PathBuf, bool) {
@@ -3877,8 +3910,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if files_valid {
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                     if precreate_directories(dir_refs).is_ok()
-                        && rnpm_fs::materialize_files_parallel_refs(all_file_refs, &writer_cfg)
-                            .is_ok()
+                        && materialize_warm_files(all_file_refs, &writer_cfg).is_ok()
                     {
                         for (link_path, target_path) in all_symlinks {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
@@ -6087,7 +6119,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         // Bin shims read script headers, so complete the files
                         // and symlinks before selecting their interpreter.
-                        rnpm_fs::materialize_files_parallel_refs(all_file_refs, &ci_writer_cfg)
+                        materialize_warm_files(all_file_refs, &ci_writer_cfg)
                             .map_err(|e| anyhow!("{e}"))?;
                         collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
