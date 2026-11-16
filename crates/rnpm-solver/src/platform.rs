@@ -202,6 +202,68 @@ pub fn is_platform_compatible(
     platform.matches_with_libc(os_list, cpu_list, libc_list)
 }
 
+/// npm's EBADPLATFORM report pieces (npm-install-checks + error-message.js):
+/// the wanted and current objects as JSON, keeping only the fields the
+/// package restricts, and the aligned "Valid"/"Actual" detail lines.
+pub fn npm_platform_report(
+    os: Option<&[String]>,
+    cpu: Option<&[String]>,
+    libc: Option<&[String]>,
+    platform: &Platform,
+) -> (String, String, String) {
+    let current = [
+        serde_json::Value::from(platform.os.clone()),
+        serde_json::Value::from(platform.cpu.clone()),
+        // npm only knows a libc family on linux.
+        match (&platform.libc, platform.os.as_str()) {
+            (Some(family), "linux") => serde_json::Value::from(family.clone()),
+            _ => serde_json::Value::Null,
+        },
+    ];
+    let mut wanted = serde_json::Map::new();
+    let mut actual = serde_json::Map::new();
+    let mut keys = Vec::new();
+    for ((key, list), current) in ["os", "cpu", "libc"]
+        .into_iter()
+        .zip([os, cpu, libc])
+        .zip(current)
+    {
+        let Some(list) = list.filter(|list| !list.is_empty()) else {
+            continue;
+        };
+        wanted.insert(key.to_string(), serde_json::Value::from(list.join(",")));
+        actual.insert(key.to_string(), current);
+        keys.push(key);
+    }
+    let longest = keys.iter().map(|key| key.len()).max().unwrap_or(0);
+    let mut detail = Vec::new();
+    for key in &keys {
+        let padding = 1 + longest - key.len();
+        let shown = |value: &serde_json::Value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        detail.push(format!(
+            "Valid {key}:{}{}",
+            " ".repeat(padding + 1),
+            shown(&wanted[*key])
+        ));
+        detail.push(format!(
+            "Actual {key}:{}{}",
+            " ".repeat(padding),
+            shown(&actual[*key])
+        ));
+    }
+    (
+        serde_json::Value::Object(wanted).to_string(),
+        serde_json::Value::Object(actual).to_string(),
+        detail.join(
+            "
+",
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
