@@ -169,7 +169,13 @@ async function checkProject(project) {
       const locks = ['npm', 'rnpm'].map(tool => path.join(dirs[tool], 'package-lock.json'));
       if (locks.every(file => fs.existsSync(file))) stage.differences.push(...differences(read(locks[0]), read(locks[1])).map(diff => ({ check: 'lock', ...diff })));
       else stage.differences.push({ check: 'missing-lockfile', files: locks.filter(file => !fs.existsSync(file)) });
-      stage.differences.push(...differences(tree(dirs.npm), tree(dirs.rnpm)).map(diff => ({ check: 'tree', ...diff })));
+      // Compare the complete post-command snapshots retained as evidence.
+      // Each isolated tree has already been hashed after its command and smoke.
+      const inventory = tool => {
+        const file = path.join(location, `${phase}-${tool}-tree.json`);
+        return fs.existsSync(file) ? read(file) : tree(dirs[tool]);
+      };
+      stage.differences.push(...differences(inventory('npm'), inventory('rnpm')).map(diff => ({ check: 'tree', ...diff })));
       result.phases.push(stage);
       write(path.join(location, 'result.json'), result);
       console.log(`${project.id} ${phase}: ${stage.differences.length} differences`);
