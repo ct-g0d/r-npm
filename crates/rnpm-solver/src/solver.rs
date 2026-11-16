@@ -820,12 +820,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         // loadPeerSet resolves an incompatible optional peer
                         // when its owner can nest with a new sibling provider.
                         // A missing optional peer still never triggers a fetch.
-                        let sibling =
-                            task.parent_location
-                                .rsplit_once("/node_modules/")
-                                .map(|(scope, _)| {
-                                    format!("{scope}/node_modules/{}", task.install_name)
-                                });
+                        let scope = crate::hoisting::peer_provider_scope(
+                            &self.graph,
+                            &task.parent_location,
+                            &task.install_name,
+                        );
+                        let sibling = (!scope.is_empty())
+                            .then(|| format!("{scope}/node_modules/{}", task.install_name));
                         // A top-level owner's provider slot is the root's own
                         // dependency: npm replaces it only when every edge into
                         // it accepts the pinned version (as placement checked);
@@ -867,6 +868,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 .as_ref()
                                 .is_none_or(|location| self.graph.nodes.contains_key(location))
                         {
+                            // Keep the invalid edge so the permitted conflict
+                            // still produces npm's overridden-peer warning.
+                            self.graph.edges.push(DependencyEdge {
+                                from_location: task.parent_location,
+                                to_location: existing.location.clone(),
+                                install_name: task.install_name,
+                                package_name: dep_spec.package_name,
+                                spec: effective_spec,
+                                dep_type: task.dep_type,
+                            });
                             return Ok(());
                         }
                     }

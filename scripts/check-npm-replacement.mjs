@@ -290,6 +290,7 @@ add('ci-no-lock','ci',['ci']);
 add('install-peer-conflict-pinned-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-pinned-host':'1.0.0'}}));
 add('install-peer-conflict-free-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-free-host':'1.0.0',shared:'1.0.0'}}));
 const peerClashOwner=dir=>manifest(dir,{dependencies:{'peer-clash-peer-host':'1.0.0',shared:'1.0.0'}});
+for(const flags of [[],['--force'],['--strict-peer-deps','--force']])add('install-optional-peer-conflict-through-peer-owner'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'peer-clash-optional-peer-host':'1.0.0',shared:'1.0.0'}}));
 for(const flags of [['--force'],['--strict-peer-deps','--force']])add('install-force-peer-conflict-root'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}));
 for(const flags of [[],['--package-lock-only'],['--dry-run'],['--loglevel=error'],['--silent'],['--legacy-peer-deps']])add('install-peer-conflict-through-peer-owner'+flags.join(''),'install',['install','--ignore-scripts',...flags],peerClashOwner);
 add('ci-peer-conflict-through-peer-owner','ci',['ci','--ignore-scripts'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
@@ -547,6 +548,7 @@ for(const [name,versions] of Object.entries({
   'peer-clash-pinned-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0',shared:'1.0.0'}}},
   'peer-clash-free-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0'}}},
   'peer-clash-peer-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0'},peerDependencies:{shared:'>=1.0.0'}}},
+  'peer-clash-optional-peer-host':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'},peerDependencies:{shared:'>=1.0.0'}}},
   'peer-clash-host':{'1.0.0':{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'}}},
   'legacy-native':{'1.0.0':{license:'MIT',os:[process.platform==='win32'?'darwin':'win32']}},
   'multi-native':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32','freebsd'],cpu:[process.arch==='x64'?'arm64':'x64']}},
