@@ -480,6 +480,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
         let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
         self.provider.prefetch_packages(&root_names);
+        if self.options.lockfile.is_none() {
+            self.prefetch_closure(&root_deps);
+        }
 
         // A root-held peer conflict is only a candidate: placement can still
         // steer around it (an earlier peer set may pick another version), so
@@ -2249,6 +2252,92 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }),
         }
         .render(&self.graph, self.options.strict_peer_deps)
+    }
+
+    /// Warms the metadata cache for the likely dependency closure, one
+    /// parallel batch per depth level, so placement (which visits one node at
+    /// a time) rarely waits on the network. Only a cache warm-up: lookups that
+    /// fail here are left for placement to report, and over-fetching a range
+    /// placement ends up not using is harmless.
+    fn prefetch_closure(&self, root_deps: &BTreeMap<String, (String, DependencyType)>) {
+        let mut seen: std::collections::HashSet<String> = root_deps.keys().cloned().collect();
+        // An absent optional peer is never fetched by placement.
+        let mut wave: Vec<(String, String)> = root_deps
+            .iter()
+            .filter(|(_, (_, dep_type))| *dep_type != DependencyType::PeerOptional)
+            .map(|(name, (spec, _))| (name.clone(), spec.clone()))
+            .collect();
+        while !wave.is_empty() {
+            let mut next = Vec::new();
+            let mut targets = Vec::new();
+            for (name, spec) in &wave {
+                let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
+                    continue;
+                };
+                if matches!(
+                    dep_spec.target,
+                    PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                ) {
+                    targets.push(dep_spec);
+                }
+            }
+            let names: Vec<&str> = targets.iter().map(|t| t.package_name.as_str()).collect();
+            self.provider.prefetch_packages(&names);
+            for dep_spec in &targets {
+                // Only what the prefetch brought in: a failed prefetch is not
+                // retried here, placement looks it up again.
+                let Some(meta) = self.provider.cached_package(&dep_spec.package_name) else {
+                    continue;
+                };
+                let Some(version) =
+                    self.select_version("", &dep_spec.package_name, &meta, &dep_spec.target, &[])
+                else {
+                    continue;
+                };
+                // Follow the edges placement follows: no peers under
+                // legacy-peer-deps, and no bundled names (they ship inside
+                // the parent's tarball).
+                let bundled: Vec<&str> = match version
+                    .extra
+                    .get("bundleDependencies")
+                    .or_else(|| version.extra.get("bundledDependencies"))
+                {
+                    Some(serde_json::Value::Array(names)) => {
+                        names.iter().filter_map(|n| n.as_str()).collect()
+                    }
+                    Some(serde_json::Value::Bool(true)) => {
+                        version.dependencies.keys().map(String::as_str).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let peers = (!self.options.legacy_peer_deps)
+                    .then_some(&version.peer_dependencies)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(peer, _)| {
+                        !version
+                            .peer_dependencies_meta
+                            .get(*peer)
+                            .is_some_and(|meta| meta.optional)
+                    });
+                for (child, child_spec) in version
+                    .dependencies
+                    .iter()
+                    .chain(&version.optional_dependencies)
+                    .chain(peers)
+                {
+                    // Bundled names ship in the tarball; overridden names may
+                    // resolve elsewhere, so placement fetches those itself.
+                    if bundled.contains(&child.as_str()) || self.overrides.mentions(child) {
+                        continue;
+                    }
+                    if seen.insert(child.clone()) {
+                        next.push((child.clone(), child_spec.clone()));
+                    }
+                }
+            }
+            wave = next;
+        }
     }
 
     fn select_version<'b>(

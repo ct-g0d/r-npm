@@ -119,6 +119,11 @@ pub struct PackageMetadata {
 pub trait PackageMetadataProvider: Send + Sync {
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError>;
     fn prefetch_packages(&self, _names: &[&str]) {}
+    /// Metadata already in memory, without touching the network. Providers
+    /// that never fetch can answer with `get_package`.
+    fn cached_package(&self, name: &str) -> Option<PackageMetadata> {
+        self.get_package(name).ok().flatten()
+    }
 }
 
 /// In-memory package provider convenient for unit tests, fixtures, and synthetic graph creation.
