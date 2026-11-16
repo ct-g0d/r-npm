@@ -89,6 +89,7 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
 /// Writes warm-store files. Files with a verified CAS blob are copied; the
 /// rest go to the async writer (the node helper on Windows, where node's
 /// writes run several times faster than ours), falling back to our writer.
+/// Paths that are not valid UTF-8 stay on our writer: the helper takes text.
 fn materialize_warm_files(
     files: Vec<rnpm_fs::MaterializeFileRef<'_>>,
     config: &rnpm_fs::ParallelWriterConfig,
@@ -97,9 +98,9 @@ fn materialize_warm_files(
         return rnpm_fs::materialize_files_parallel_refs(files, config);
     };
     let sender = writer.sender();
-    let (copied, written): (Vec<_>, Vec<_>) = files
-        .into_iter()
-        .partition(|file| file.source_path.is_some() && file.source_verified);
+    let (local, written): (Vec<_>, Vec<_>) = files.into_iter().partition(|file| {
+        (file.source_path.is_some() && file.source_verified) || file.path.to_str().is_none()
+    });
     let mut sent = Ok(());
     for file in &written {
         sent = sender.send(file.path.clone(), file.data.to_vec(), file.mode);
@@ -108,12 +109,13 @@ fn materialize_warm_files(
         }
     }
     drop(sender);
-    let copy_result = rnpm_fs::materialize_files_parallel_refs(copied, config);
+    let local_result = rnpm_fs::materialize_files_parallel_refs(local, config);
     let wait_result = writer.finish();
-    match (sent.and(wait_result), copy_result) {
-        (Ok(()), result) => result,
-        // The helper failed part-way: write everything ourselves.
-        (Err(_), _) => rnpm_fs::materialize_files_parallel_refs(written, config),
+    local_result?;
+    match sent.and(wait_result) {
+        Ok(()) => Ok(()),
+        // The helper failed part-way: write its files ourselves.
+        Err(_) => rnpm_fs::materialize_files_parallel_refs(written, config),
     }
 }
 
