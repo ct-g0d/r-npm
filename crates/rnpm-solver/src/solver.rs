@@ -477,9 +477,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
         self.provider.prefetch_packages(&root_names);
 
-        if self.options.lockfile.is_none() && self.options.is_strict_peers() {
-            self.precheck_root_peer_sets(root_manifest, &root_deps)?;
-        }
+        // A root-held peer conflict is only a candidate: placement can still
+        // steer around it (an earlier peer set may pick another version), so
+        // it replaces placement's own peer conflict but never fails a tree
+        // placement resolves.
+        let root_conflict = if self.options.lockfile.is_none() && self.options.is_strict_peers() {
+            self.precheck_root_peer_sets(root_manifest, &root_deps)
+                .err()
+        } else {
+            None
+        };
 
         let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
         let mut queued = std::collections::HashSet::new();
@@ -528,7 +535,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         // Process resolution queue
-        self.resolve_tasks()?;
+        if let Err(error) = self.resolve_tasks() {
+            return Err(match root_conflict {
+                Some(conflict) if error.is_peer_conflict() => conflict,
+                _ => error,
+            });
+        }
 
         self.graph.normalize_dependency_flags();
         Ok(self.graph)
@@ -1915,8 +1927,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
             )
         };
-        // Each root edge's own pick, before any peer steers it.
-        let mut picks = Vec::new();
         for name in order {
             let (spec, dep_type) = &root_deps[name];
             // An absent optional peer is never fetched.
@@ -1930,7 +1940,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             if dep_spec.package_name != *name || !registry_target(&dep_spec.target) {
                 continue;
             }
-            let Some(meta) = self.provider.get_package(&dep_spec.package_name)? else {
+            // Metadata failures belong to placement, which reports them in order.
+            let Some(meta) = self
+                .provider
+                .get_package(&dep_spec.package_name)
+                .ok()
+                .flatten()
+            else {
                 continue;
             };
             let Some(chosen) =
@@ -1938,72 +1954,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             else {
                 continue;
             };
-            picks.push((name, spec, dep_type, dep_spec.target, chosen.clone()));
-        }
-        // A root package whose peer set is loaded earlier and reaches this one,
-        // directly or through peers of peers, steers its version with that
-        // peer range (nodeFromEdge's second edge).
-        let mut steered: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-        for (index, (_, _, _, _, other_pick)) in picks.iter().enumerate() {
-            let mut seen = std::collections::HashSet::new();
-            let mut stack: Vec<(String, String)> = other_pick
-                .peer_dependencies
-                .iter()
-                .map(|(peer, spec)| (peer.clone(), spec.clone()))
-                .collect();
-            while let Some((peer, peer_spec)) = stack.pop() {
-                if !seen.insert(peer.clone()) {
-                    continue;
-                }
-                steered
-                    .entry(peer.clone())
-                    .or_default()
-                    .push((index, peer_spec.clone()));
-                let Ok(target) = PackageTarget::parse(&peer_spec) else {
-                    continue;
-                };
-                if !registry_target(&target) {
-                    continue;
-                }
-                let Some(meta) = self.provider.get_package(&peer)? else {
-                    continue;
-                };
-                if let Some(version) = self.select_version("", &peer, &meta, &target, &[]) {
-                    stack.extend(
-                        version
-                            .peer_dependencies
-                            .iter()
-                            .map(|(next, spec)| (next.clone(), spec.clone())),
-                    );
-                }
-            }
-        }
-        for (index, (name, spec, dep_type, target, chosen)) in picks.iter().enumerate() {
-            let (name, spec, dep_type) = (*name, *spec, *dep_type);
-            // Leave it to placement when such a range moves the pick.
-            let steers: Vec<&String> = steered
-                .get(name)
-                .into_iter()
-                .flatten()
-                .filter(|(by, _)| *by < index)
-                .map(|(_, range)| range)
-                .collect();
-            if !steers.is_empty() {
-                let Some(meta) = self.provider.get_package(name)? else {
-                    continue;
-                };
-                let moved = steers.iter().any(|range| {
-                    PackageTarget::parse(range)
-                        .ok()
-                        .and_then(|advisory| {
-                            self.select_version("", name, &meta, target, &[advisory])
-                        })
-                        .is_none_or(|steered_pick| steered_pick.version != chosen.version)
-                });
-                if moved {
-                    continue;
-                }
-            }
             for (peer, peer_spec) in &chosen.peer_dependencies {
                 if chosen
                     .peer_dependencies_meta
@@ -2036,7 +1986,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 {
                     continue;
                 }
-                let Some(peer_meta) = self.provider.get_package(peer)? else {
+                let Some(peer_meta) = self.provider.get_package(peer).ok().flatten() else {
                     continue;
                 };
                 // nodeFromEdge(parentEdge, ..., peerEdge): the root's choice,

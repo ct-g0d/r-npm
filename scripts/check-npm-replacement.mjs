@@ -449,6 +449,8 @@ for(const [name,versions] of Object.entries({
   'a-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
   'b-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
   'a-steers-indirectly':{'1.0.0':{peerDependencies:{'b-steers-plugin':'1.0.0'}}},
+  'z-bridge':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}},'2.0.0':{peerDependencies:{'steered-plugin':'^2.0.0'}}},
+  'a-bridge-peer':{'1.0.0':{peerDependencies:{'z-bridge':'*'}}},
   'alias-held-real':{'2.0.0':{}},
   'alias-held-peer-two':{'1.0.0':{peerDependencies:{'alias-held':'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
@@ -601,6 +603,7 @@ for(const [name,fields,flags=[]] of [
   ['root-optional-peer-absent',{dependencies:{shared:'1.0.0'},peerDependencies:{'eresolve-peer-two':'1.0.0'},peerDependenciesMeta:{'eresolve-peer-two':{optional:true}}}],
   ['root-peer-steered',{dependencies:{'a-steers-plugin':'1.0.0','steered-plugin':'*',shared:'1.0.0'}}],
   ['root-peer-steered-indirect',{dependencies:{'a-steers-indirectly':'1.0.0','steered-plugin':'*',shared:'1.0.0'}}],
+  ['root-peer-steered-root-bridge',{dependencies:{'a-bridge-peer':'1.0.0','steered-plugin':'*',shared:'1.0.0','z-bridge':'1.0.0'}}],
   ['root-alias-holds',{dependencies:{'alias-held':'npm:alias-held-real@*','alias-held-peer-two':'1.0.0'}}],
   // An override of an unrelated package leaves the root-held check alone.
   ['root-holds-unrelated-override',{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'},devDependencies:{dep:'1.0.0','virtual-peer-parent':'1.0.0'},overrides:{'z-prod':'1.0.0'}}],
