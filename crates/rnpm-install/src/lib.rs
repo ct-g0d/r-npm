@@ -917,6 +917,10 @@ impl RegistryPackageProvider {
 }
 
 impl PackageMetadataProvider for RegistryPackageProvider {
+    fn cached_package(&self, name: &str) -> Option<PackageMetadata> {
+        self.metadata_cache.lock().ok()?.get(name).cloned()
+    }
+
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
         if let Ok(cache) = self.metadata_cache.lock() {
             if let Some(meta) = cache.get(name) {

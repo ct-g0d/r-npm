@@ -2284,12 +2284,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             let names: Vec<&str> = targets.iter().map(|t| t.package_name.as_str()).collect();
             self.provider.prefetch_packages(&names);
             for dep_spec in &targets {
-                let Some(meta) = self
-                    .provider
-                    .get_package(&dep_spec.package_name)
-                    .ok()
-                    .flatten()
-                else {
+                // Only what the prefetch brought in: a failed prefetch is not
+                // retried here, placement looks it up again.
+                let Some(meta) = self.provider.cached_package(&dep_spec.package_name) else {
                     continue;
                 };
                 let Some(version) =
@@ -2329,7 +2326,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     .chain(&version.optional_dependencies)
                     .chain(peers)
                 {
-                    if bundled.contains(&child.as_str()) {
+                    // Bundled names ship in the tarball; overridden names may
+                    // resolve elsewhere, so placement fetches those itself.
+                    if bundled.contains(&child.as_str()) || self.overrides.mentions(child) {
                         continue;
                     }
                     if seen.insert(child.clone()) {
