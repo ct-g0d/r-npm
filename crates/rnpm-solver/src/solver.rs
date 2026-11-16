@@ -1635,46 +1635,73 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// requires its version. Direct root dependencies are never moved, and
     /// ambiguous multi-parent occupants are left untouched for the normal
     /// conflict-nesting path.
-    /// Removes a node, the nodes nested under it and its outgoing edges, then
-    /// any hoisted node left with no incoming edge (Arborist prunes them).
+    /// Removes a node and the nodes nested under it, then every node it
+    /// reached that nothing outside that set still reaches (Arborist prunes
+    /// them; a dependency cycle does not keep itself alive).
     fn detach_subtree(&mut self, location: &str) {
-        let nested = format!("{location}/node_modules/");
-        let mut removed: Vec<String> = self
+        use std::collections::{HashSet, VecDeque};
+        let nested_under = |loc: &str, key: &str| key.starts_with(&format!("{loc}/node_modules/"));
+        let forced: HashSet<String> = self
             .graph
             .nodes
             .keys()
-            .filter(|key| key.as_str() == location || key.starts_with(&nested))
+            .filter(|key| key.as_str() == location || nested_under(location, key))
             .cloned()
             .collect();
-        let mut detached = std::collections::HashSet::new();
-        while let Some(gone) = removed.pop() {
-            detached.insert(gone.clone());
-            if gone != location {
-                self.graph.nodes.remove(&gone);
+        // Everything the old node reaches through edges or nesting.
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<String> = forced.iter().cloned().collect();
+        while let Some(loc) = work.pop_front() {
+            if !reached.insert(loc.clone()) {
+                continue;
             }
-            let orphans: Vec<String> = self
-                .graph
-                .edges
-                .iter()
-                .filter(|edge| edge.from_location == gone)
-                .map(|edge| edge.to_location.clone())
-                .collect();
-            self.graph.edges.retain(|edge| edge.from_location != gone);
-            for orphan in orphans {
-                if orphan != location
-                    && orphan.contains("node_modules/")
-                    && self.graph.nodes.contains_key(&orphan)
-                    && !self
-                        .graph
-                        .edges
-                        .iter()
-                        .any(|edge| edge.to_location == orphan)
+            for edge in &self.graph.edges {
+                if edge.from_location == loc
+                    && edge.to_location.contains("node_modules/")
+                    && self.graph.nodes.contains_key(&edge.to_location)
                 {
-                    removed.push(orphan);
+                    work.push_back(edge.to_location.clone());
+                }
+            }
+            for key in self.graph.nodes.keys() {
+                if nested_under(&loc, key) {
+                    work.push_back(key.clone());
                 }
             }
         }
-        self.graph.nodes.remove(location);
+        // A reached node survives when a node outside the set depends on it,
+        // and so does whatever it reaches.
+        let mut kept: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<String> = reached
+            .iter()
+            .filter(|loc| {
+                !forced.contains(*loc)
+                    && self.graph.edges.iter().any(|edge| {
+                        edge.to_location == **loc && !reached.contains(&edge.from_location)
+                    })
+            })
+            .cloned()
+            .collect();
+        while let Some(loc) = work.pop_front() {
+            if forced.contains(&loc) || !kept.insert(loc.clone()) {
+                continue;
+            }
+            for edge in &self.graph.edges {
+                if edge.from_location == loc && reached.contains(&edge.to_location) {
+                    work.push_back(edge.to_location.clone());
+                }
+            }
+            for key in &reached {
+                if nested_under(&loc, key) {
+                    work.push_back(key.clone());
+                }
+            }
+        }
+        let detached: HashSet<String> = reached.difference(&kept).cloned().collect();
+        self.graph.nodes.retain(|key, _| !detached.contains(key));
+        self.graph
+            .edges
+            .retain(|edge| !detached.contains(&edge.from_location));
         // Work queued for the detached nodes belongs to the old version; the
         // replacement enqueues its own dependencies.
         self.queue

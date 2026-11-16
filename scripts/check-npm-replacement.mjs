@@ -432,6 +432,12 @@ for(const [name,versions] of Object.entries({
   'pinning-optional-owner':{'1.0.0':{peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'z-pinning-parent':{'1.0.0':{dependencies:{'pinning-optional-owner':'1.0.0'}}},
   'replaced-provider':{'1.0.0':{},'2.0.0':{dependencies:{'replaced-provider-child':'1.0.0'}}},
+  'cycled-provider':{'1.0.0':{},'2.0.0':{dependencies:{'cycle-a':'1.0.0'}}},
+  'cycle-a':{'1.0.0':{dependencies:{'cycle-b':'1.0.0'}}},
+  'cycle-b':{'1.0.0':{dependencies:{'cycle-a':'1.0.0'}}},
+  'a-star-cycled-consumer':{'1.0.0':{peerDependencies:{'cycled-provider':'*'}}},
+  'z-cycled-pinner':{'1.0.0':{peerDependencies:{'cycled-provider':'1.0.0'},peerDependenciesMeta:{'cycled-provider':{optional:true}}}},
+  'z-cycled-parent':{'1.0.0':{dependencies:{'z-cycled-pinner':'1.0.0'}}},
   'replaced-provider-child':{'1.0.0':{}},
   'a-star-replaced-consumer':{'1.0.0':{peerDependencies:{'replaced-provider':'*'}}},
   'b-replaced-pinner':{'1.0.0':{peerDependencies:{'replaced-provider':'1.0.0'},peerDependenciesMeta:{'replaced-provider':{optional:true}}}},
@@ -567,6 +573,8 @@ const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs'
 // package's optional peer pins a version every existing dependent accepts.
 for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
 // The replaced provider's queued dependencies go with it.
+// A dependency cycle under the replaced provider goes with it.
+add('install-optional-peer-replace-drops-old-cycle','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-cycled-consumer':'1.0.0','z-cycled-parent':'1.0.0'}}));
 add('install-optional-peer-replace-drops-old-deps','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-replaced-consumer':'1.0.0','b-replaced-pinner':'1.0.0'}}));
 // npm's ERESOLVE explanation: a root-held node, a peer set placed beside
 // another package's peer, and an optional peer the root pins.
