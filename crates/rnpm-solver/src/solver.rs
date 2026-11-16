@@ -2295,12 +2295,35 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 else {
                     continue;
                 };
+                // Follow the edges placement follows: no peers under
+                // legacy-peer-deps, and no bundled names (they ship inside
+                // the parent's tarball).
+                let bundled: Vec<&str> = match version
+                    .extra
+                    .get("bundleDependencies")
+                    .or_else(|| version.extra.get("bundledDependencies"))
+                {
+                    Some(serde_json::Value::Array(names)) => {
+                        names.iter().filter_map(|n| n.as_str()).collect()
+                    }
+                    Some(serde_json::Value::Bool(true)) => {
+                        version.dependencies.keys().map(String::as_str).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let peers = (!self.options.legacy_peer_deps)
+                    .then_some(&version.peer_dependencies)
+                    .into_iter()
+                    .flatten();
                 for (child, child_spec) in version
                     .dependencies
                     .iter()
                     .chain(&version.optional_dependencies)
-                    .chain(&version.peer_dependencies)
+                    .chain(peers)
                 {
+                    if bundled.contains(&child.as_str()) {
+                        continue;
+                    }
                     if seen.insert(child.clone()) {
                         next.push((child.clone(), child_spec.clone()));
                     }
