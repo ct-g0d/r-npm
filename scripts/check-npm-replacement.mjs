@@ -445,6 +445,7 @@ for(const [name,versions] of Object.entries({
   'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'alias-held':{'1.0.0':{}},
+  'z-alias-optional-peer-owner':{'1.0.0':{peerDependencies:{'@alias/native':'npm:shared@>=2.0.0'},peerDependenciesMeta:{'@alias/native':{optional:true}}}},
   'steered-plugin':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}},'2.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'a-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
   'b-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
@@ -594,6 +595,9 @@ add('install-optional-peer-replaces-root-star-dep','install',['install','--ignor
 for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
 // The replaced provider's queued dependencies go with it.
 // A dependency cycle under the replaced provider goes with it.
+// An aliased optional peer resolves by its alias folder only: the real
+// package under its own name neither satisfies nor gets replaced for it.
+add('install-optional-alias-peer-absent','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'1.0.0','z-alias-optional-peer-owner':'1.0.0'}}));
 add('install-optional-peer-replace-drops-old-cycle','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-cycled-consumer':'1.0.0','z-cycled-parent':'1.0.0'}}));
 add('install-optional-peer-replace-drops-old-deps','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-replaced-consumer':'1.0.0','b-replaced-pinner':'1.0.0'}}));
 // npm's ERESOLVE explanation: a root-held node, a peer set placed beside

@@ -680,11 +680,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     cycle_path_str
                 );
                 // Look for existing node with package_name or install_name visible in ancestor scope
+                // Peers resolve by folder name, as npm does: an aliased peer is
+                // never provided by the real package under its own name.
                 if let Some(existing) = crate::hoisting::find_visible_peer_node(
                     &self.graph,
                     &task.parent_location,
                     &task.install_name,
-                    &dep_spec.package_name,
+                    &task.install_name,
                 ) {
                     if !crate::hoisting::node_satisfies_target(existing, &dep_spec.target) {
                         if task.dep_type == DependencyType::Peer {
@@ -729,11 +731,13 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
 
             // Check if peer is already satisfied in ancestor/root scope
+            // Peers resolve by folder name, as npm does: an aliased peer is
+            // never provided by the real package under its own name.
             if let Some(existing) = crate::hoisting::find_visible_peer_node(
                 &self.graph,
                 &task.parent_location,
                 &task.install_name,
-                &dep_spec.package_name,
+                &task.install_name,
             ) {
                 if crate::hoisting::node_matches_peer_name(
                     existing,
