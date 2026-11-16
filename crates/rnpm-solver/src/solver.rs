@@ -477,11 +477,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
         self.provider.prefetch_packages(&root_names);
 
-        // Overrides rewrite peer specs per path; leave those to placement.
-        if self.options.lockfile.is_none()
-            && self.options.is_strict_peers()
-            && self.overrides.rules.is_empty()
-        {
+        if self.options.lockfile.is_none() && self.options.is_strict_peers() {
             self.precheck_root_peer_sets(root_manifest, &root_deps)?;
         }
 
@@ -1942,16 +1938,71 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             else {
                 continue;
             };
-            picks.push((name, spec, dep_type, chosen.clone()));
+            picks.push((name, spec, dep_type, dep_spec.target, chosen.clone()));
         }
-        for (name, spec, dep_type, chosen) in &picks {
+        // A root package whose peer set is loaded earlier and reaches this one,
+        // directly or through peers of peers, steers its version with that
+        // peer range (nodeFromEdge's second edge).
+        let mut steered: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+        for (index, (_, _, _, _, other_pick)) in picks.iter().enumerate() {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack: Vec<(String, String)> = other_pick
+                .peer_dependencies
+                .iter()
+                .map(|(peer, spec)| (peer.clone(), spec.clone()))
+                .collect();
+            while let Some((peer, peer_spec)) = stack.pop() {
+                if !seen.insert(peer.clone()) {
+                    continue;
+                }
+                steered
+                    .entry(peer.clone())
+                    .or_default()
+                    .push((index, peer_spec.clone()));
+                let Ok(target) = PackageTarget::parse(&peer_spec) else {
+                    continue;
+                };
+                if !registry_target(&target) {
+                    continue;
+                }
+                let Some(meta) = self.provider.get_package(&peer)? else {
+                    continue;
+                };
+                if let Some(version) = self.select_version("", &peer, &meta, &target, &[]) {
+                    stack.extend(
+                        version
+                            .peer_dependencies
+                            .iter()
+                            .map(|(next, spec)| (next.clone(), spec.clone())),
+                    );
+                }
+            }
+        }
+        for (index, (name, spec, dep_type, target, chosen)) in picks.iter().enumerate() {
             let (name, spec, dep_type) = (*name, *spec, *dep_type);
-            // Another root package's peer on this one can steer its version
-            // (nodeFromEdge's second edge), so the pick above may not stand.
-            if picks.iter().any(|(other, _, _, other_pick)| {
-                *other != name && other_pick.peer_dependencies.contains_key(name)
-            }) {
-                continue;
+            // Leave it to placement when such a range moves the pick.
+            let steers: Vec<&String> = steered
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|(by, _)| *by < index)
+                .map(|(_, range)| range)
+                .collect();
+            if !steers.is_empty() {
+                let Some(meta) = self.provider.get_package(name)? else {
+                    continue;
+                };
+                let moved = steers.iter().any(|range| {
+                    PackageTarget::parse(range)
+                        .ok()
+                        .and_then(|advisory| {
+                            self.select_version("", name, &meta, target, &[advisory])
+                        })
+                        .is_none_or(|steered_pick| steered_pick.version != chosen.version)
+                });
+                if moved {
+                    continue;
+                }
             }
             for (peer, peer_spec) in &chosen.peer_dependencies {
                 if chosen
@@ -1960,6 +2011,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     .is_some_and(|meta| meta.optional)
                     || chosen.dependencies.contains_key(peer)
                     || chosen.optional_dependencies.contains_key(peer)
+                    // Overrides rewrite these specs per path; leave them to placement.
+                    || self.overrides.mentions(name)
+                    || self.overrides.mentions(peer)
                 {
                     continue;
                 }

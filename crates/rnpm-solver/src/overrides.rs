@@ -383,6 +383,19 @@ fn insert_override_rule(
     }
 }
 
+impl Overrides {
+    /// Whether any rule, at any depth, names `name`.
+    pub fn mentions(&self, name: &str) -> bool {
+        fn walk(rules: &BTreeMap<String, OverrideValue>, name: &str) -> bool {
+            rules.iter().any(|(key, value)| {
+                parse_key_and_spec(key).map_or(key.as_str(), |(key_name, _)| key_name) == name
+                    || matches!(value, OverrideValue::Nested(nested) if walk(nested, name))
+            })
+        }
+        walk(&self.rules, name)
+    }
+}
+
 /// Parses "name@spec" while respecting scoped package names like "@scope/pkg@^1.0.0".
 fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
     if key.starts_with('@') {
