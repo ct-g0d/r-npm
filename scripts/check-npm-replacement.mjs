@@ -428,6 +428,19 @@ for(const [name,versions] of Object.entries({
   'a-dev':{'1.0.0':{dependencies:{shared:'1.0.0'}}},
   'z-prod':{'1.0.0':{dependencies:{shared:'2.0.0'}}},
   shared:{'1.0.0':{},'2.0.0':{}},
+  'a-star-peer-consumer':{'1.0.0':{peerDependencies:{shared:'*'}}},
+  'pinning-optional-owner':{'1.0.0':{peerDependencies:{shared:'1.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
+  'z-pinning-parent':{'1.0.0':{dependencies:{'pinning-optional-owner':'1.0.0'}}},
+  'replaced-provider':{'1.0.0':{},'2.0.0':{dependencies:{'replaced-provider-child':'1.0.0'}}},
+  'cycled-provider':{'1.0.0':{},'2.0.0':{dependencies:{'cycle-a':'1.0.0'}}},
+  'cycle-a':{'1.0.0':{dependencies:{'cycle-b':'1.0.0'}}},
+  'cycle-b':{'1.0.0':{dependencies:{'cycle-a':'1.0.0'}}},
+  'a-star-cycled-consumer':{'1.0.0':{peerDependencies:{'cycled-provider':'*'}}},
+  'z-cycled-pinner':{'1.0.0':{peerDependencies:{'cycled-provider':'1.0.0'},peerDependenciesMeta:{'cycled-provider':{optional:true}}}},
+  'z-cycled-parent':{'1.0.0':{dependencies:{'z-cycled-pinner':'1.0.0'}}},
+  'replaced-provider-child':{'1.0.0':{}},
+  'a-star-replaced-consumer':{'1.0.0':{peerDependencies:{'replaced-provider':'*'}}},
+  'b-replaced-pinner':{'1.0.0':{peerDependencies:{'replaced-provider':'1.0.0'},peerDependenciesMeta:{'replaced-provider':{optional:true}}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-z-peer-one':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}}},
   'eresolve-optional-two':{'1.0.0':{peerDependencies:{shared:'>=2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
@@ -556,6 +569,15 @@ add('install-cyclic-workspaces','install',['install','--ignore-scripts'],dir=>{
 });
 // The full report npm writes beside the debug log, with its paths normalized.
 const eresolveReport=({env})=>{const logs=path.join(env.NPM_CONFIG_CACHE,'_logs');const files=fs.existsSync(logs)?fs.readdirSync(logs).filter(f=>f.endsWith('-eresolve-report.txt')):[];return files.map(f=>fs.readFileSync(path.join(logs,f),'utf8').replaceAll(logs,'<logs>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-/g,'<timestamp>-'));};
+// A provider placed for a `*` peer is replaced, not nested around, when a later
+// package's optional peer pins a version every existing dependent accepts.
+// The root's own '*' dependency is replaced too when it accepts the pin.
+add('install-optional-peer-replaces-root-star-dep','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{shared:'*','z-pinning-parent':'1.0.0'}}));
+for(const flags of [[],['--package-lock-only']])add('install-optional-peer-replaces-star-provider'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'a-star-peer-consumer':'1.0.0','z-pinning-parent':'1.0.0'}}));
+// The replaced provider's queued dependencies go with it.
+// A dependency cycle under the replaced provider goes with it.
+add('install-optional-peer-replace-drops-old-cycle','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-cycled-consumer':'1.0.0','z-cycled-parent':'1.0.0'}}));
+add('install-optional-peer-replace-drops-old-deps','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-star-replaced-consumer':'1.0.0','b-replaced-pinner':'1.0.0'}}));
 // npm's ERESOLVE explanation: a root-held node, a peer set placed beside
 // another package's peer, and an optional peer the root pins.
 for(const [name,fields,flags=[]] of [

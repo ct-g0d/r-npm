@@ -559,7 +559,7 @@ fn candidate_has_incompatible_peer(
             .map(|meta| meta.optional)
             .unwrap_or(false);
         if optional {
-            return true;
+            return !root_provider_replaceable(graph, existing, peer_name, peer_spec);
         }
 
         // For required peers: if parent scope has a satisfying peer visible,
@@ -582,6 +582,51 @@ fn candidate_has_incompatible_peer(
 
         false
     })
+}
+
+/// can-place-dep: a top-level provider can be REPLACEd by a pinned version when
+/// every edge into it accepts that version (Node#canReplace). The replacement
+/// happens when the optional peer edge is resolved.
+pub fn root_provider_replaceable(
+    graph: &DependencyGraph,
+    existing: &crate::graph::Node,
+    peer_name: &str,
+    peer_spec: &str,
+) -> bool {
+    if existing.location != format!("node_modules/{peer_name}") {
+        return false;
+    }
+    let Ok(version) = rnpm_core::semver::Version::parse(peer_spec) else {
+        return false;
+    };
+    provider_accepts_version(graph, &existing.location, &version.to_string())
+}
+
+/// Every edge into `location` accepts `version` in place of the current node,
+/// and there is at least one.
+pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version: &str) -> bool {
+    let Some(existing) = graph.nodes.get(location) else {
+        return false;
+    };
+    let replacement = crate::graph::Node {
+        version: version.to_string(),
+        parsed_version: Version::parse(version).ok(),
+        resolved: None,
+        integrity: None,
+        ..existing.clone()
+    };
+    // A provider whose placing edge is not recorded yet (a late optional peer
+    // activated while it is being placed) has dependents this cannot see.
+    let mut incoming = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.to_location == location)
+        .peekable();
+    incoming.peek().is_some()
+        && incoming.all(|edge| {
+            PackageTarget::parse(&edge.spec)
+                .is_ok_and(|target| node_satisfies_target(&replacement, &target))
+        })
 }
 
 /// can-place-dep: a required peer that is visible but incompatible at the

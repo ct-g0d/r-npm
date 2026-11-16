@@ -780,8 +780,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     format!("{scope}/node_modules/{}", task.install_name)
                                 });
                         // A top-level owner's provider slot is the root's own
-                        // dependency: npm cannot replace it, so it is ERESOLVE.
+                        // dependency: npm replaces it only when every edge into
+                        // it accepts the pinned version (as placement checked);
+                        // otherwise it is ERESOLVE.
                         let root_pins_provider = sibling.is_none()
+                            && !crate::hoisting::root_provider_replaceable(
+                                &self.graph,
+                                existing,
+                                &task.install_name,
+                                &effective_spec,
+                            )
                             && existing.location == format!("node_modules/{}", task.install_name)
                             && self.graph.nodes.get(&self.graph.root_location).is_some_and(
                                 |root| {
@@ -1210,7 +1218,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         let root_slot = format!("node_modules/{}", dep_spec.install_name);
-        if replace_transitive_root_peer {
+        if replace_transitive_root_peer
+            && crate::hoisting::provider_accepts_version(
+                &self.graph,
+                &root_slot,
+                &chosen_version.version,
+            )
+        {
+            // Node#canReplace: every dependent accepts the new version, so it
+            // takes the old node's place instead of nesting around it.
+            self.detach_subtree(&root_slot);
+            placement = PlacementDecision::PlaceNew(root_slot.clone());
+        } else if replace_transitive_root_peer {
             let existing = &self.graph.nodes[&root_slot];
             let pinned_by_peer = self.graph.edges.iter().any(|edge| {
                 edge.to_location == root_slot
@@ -1624,6 +1643,85 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// requires its version. Direct root dependencies are never moved, and
     /// ambiguous multi-parent occupants are left untouched for the normal
     /// conflict-nesting path.
+    /// Removes a node and the nodes nested under it, then every node it
+    /// reached that nothing outside that set still reaches (Arborist prunes
+    /// them; a dependency cycle does not keep itself alive).
+    fn detach_subtree(&mut self, location: &str) {
+        use std::collections::{HashSet, VecDeque};
+        let nested_under = |loc: &str, key: &str| key.starts_with(&format!("{loc}/node_modules/"));
+        let forced: HashSet<String> = self
+            .graph
+            .nodes
+            .keys()
+            .filter(|key| key.as_str() == location || nested_under(location, key))
+            .cloned()
+            .collect();
+        // Everything the old node reaches through edges or nesting.
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<String> = forced.iter().cloned().collect();
+        while let Some(loc) = work.pop_front() {
+            if !reached.insert(loc.clone()) {
+                continue;
+            }
+            for edge in &self.graph.edges {
+                if edge.from_location == loc
+                    && edge.to_location.contains("node_modules/")
+                    && self.graph.nodes.contains_key(&edge.to_location)
+                {
+                    work.push_back(edge.to_location.clone());
+                }
+            }
+            for key in self.graph.nodes.keys() {
+                if nested_under(&loc, key) {
+                    work.push_back(key.clone());
+                }
+            }
+        }
+        // A reached node survives when a node outside the set depends on it,
+        // and so does whatever it reaches.
+        let mut kept: HashSet<String> = HashSet::new();
+        let mut work: VecDeque<String> = reached
+            .iter()
+            .filter(|loc| {
+                !forced.contains(*loc)
+                    && self.graph.edges.iter().any(|edge| {
+                        edge.to_location == **loc && !reached.contains(&edge.from_location)
+                    })
+            })
+            .cloned()
+            .collect();
+        while let Some(loc) = work.pop_front() {
+            if forced.contains(&loc) || !kept.insert(loc.clone()) {
+                continue;
+            }
+            for edge in &self.graph.edges {
+                if edge.from_location == loc && reached.contains(&edge.to_location) {
+                    work.push_back(edge.to_location.clone());
+                }
+            }
+            for key in &reached {
+                if nested_under(&loc, key) {
+                    work.push_back(key.clone());
+                }
+            }
+        }
+        let detached: HashSet<String> = reached.difference(&kept).cloned().collect();
+        self.graph.nodes.retain(|key, _| !detached.contains(key));
+        self.graph
+            .edges
+            .retain(|edge| !detached.contains(&edge.from_location));
+        // Work queued for the detached nodes belongs to the old version; the
+        // replacement enqueues its own dependencies.
+        self.queue
+            .retain(|task| !detached.contains(&task.parent_location));
+        for tasks in self.deferred_workspaces.values_mut() {
+            tasks.retain(|task| !detached.contains(&task.parent_location));
+        }
+        for tasks in self.deferred_optional_peers.values_mut() {
+            tasks.retain(|task| !detached.contains(&task.parent_location));
+        }
+    }
+
     fn rehome_transitive_root_node(&mut self, root_location: &str, install_name: &str) -> bool {
         if let Some(ref lockfile) = self.options.lockfile {
             if lockfile.packages.contains_key(root_location)
