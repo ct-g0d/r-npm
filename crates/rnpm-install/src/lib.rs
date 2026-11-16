@@ -1113,95 +1113,122 @@ impl PackageMetadataProvider for RegistryPackageProvider {
 
         let reg_cache = self.metadata_cache.clone();
         let client_c = self.client.clone();
-        let cache_c = self.cache.clone();
         let lockfile_c = self.lockfile.clone();
-        self.handle.block_on(async move {
-            let req_pkgs: Vec<(String, Option<String>)> = to_revalidate
-                .iter()
-                .map(|(n, etag, _)| (n.clone(), etag.clone()))
-                .collect();
-            let results = client_c
-                .get_package_metadata_full_conditional_concurrent(&req_pkgs)
-                .await;
-            for ((name, stored_etag, cached_info), res) in to_revalidate.into_iter().zip(results) {
-                let reg_url = client_c.registry_for_package(&name).as_str().to_string();
-                match res {
-                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified {
-                        etag,
-                        cache_metadata,
-                    }) => {
-                        let new_etag = etag.or(stored_etag);
-                        let cache_meta = merge_packument_cache_metadata(
+        // Cache writes run after the batch, in parallel: written one by one
+        // they cost more than the network round trip they follow.
+        let stores: Vec<(String, String, Vec<u8>, Option<serde_json::Value>)> =
+            self.handle.block_on(async move {
+                let mut stores = Vec::new();
+                let req_pkgs: Vec<(String, Option<String>)> = to_revalidate
+                    .iter()
+                    .map(|(n, etag, _)| (n.clone(), etag.clone()))
+                    .collect();
+                let results = client_c
+                    .get_package_metadata_full_conditional_concurrent(&req_pkgs)
+                    .await;
+                for ((name, stored_etag, cached_info), res) in
+                    to_revalidate.into_iter().zip(results)
+                {
+                    let reg_url = client_c.registry_for_package(&name).as_str().to_string();
+                    match res {
+                        Ok(rnpm_registry::client::MetadataFetchResult::NotModified {
+                            etag,
                             cache_metadata,
-                            new_etag,
-                            cached_info
-                                .as_ref()
-                                .and_then(|(entry, _)| entry.metadata.as_ref()),
-                        );
-                        if let Some((_, ref data)) = cached_info {
-                            store_install_packument(&cache_c, &reg_url, &name, data, cache_meta);
-                            if let Ok(abbrev) =
-                                serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
-                            {
-                                let mut meta = abbreviated_to_package_metadata(&abbrev);
-                                if let Some(ref lf) = lockfile_c {
-                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf)
-                                    {
-                                        for (v, vm) in lf_meta.versions {
-                                            meta.versions.entry(v).or_insert(vm);
+                        }) => {
+                            let new_etag = etag.or(stored_etag);
+                            let cache_meta = merge_packument_cache_metadata(
+                                cache_metadata,
+                                new_etag,
+                                cached_info
+                                    .as_ref()
+                                    .and_then(|(entry, _)| entry.metadata.as_ref()),
+                            );
+                            if let Some((_, ref data)) = cached_info {
+                                stores.push((
+                                    reg_url.clone(),
+                                    name.clone(),
+                                    data.clone(),
+                                    cache_meta,
+                                ));
+                                if let Ok(abbrev) =
+                                    serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
+                                {
+                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
+                                    if let Some(ref lf) = lockfile_c {
+                                        if let Some(lf_meta) =
+                                            package_metadata_from_lockfile(&name, lf)
+                                        {
+                                            for (v, vm) in lf_meta.versions {
+                                                meta.versions.entry(v).or_insert(vm);
+                                            }
                                         }
                                     }
-                                }
-                                if let Ok(mut locked) = reg_cache.lock() {
-                                    locked.insert(name, meta);
+                                    if let Ok(mut locked) = reg_cache.lock() {
+                                        locked.insert(name, meta);
+                                    }
                                 }
                             }
                         }
-                    }
-                    Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
-                        metadata: abbrev,
-                        etag,
-                        cache_metadata,
-                    }) => {
-                        if let Ok(bytes) = serde_json::to_vec(&abbrev) {
-                            let cache_meta =
-                                merge_packument_cache_metadata(cache_metadata, etag, None);
-                            store_install_packument(&cache_c, &reg_url, &name, &bytes, cache_meta);
-                        }
-                        let mut meta = abbreviated_to_package_metadata(&abbrev);
-                        if let Some(ref lf) = lockfile_c {
-                            if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
-                                for (v, vm) in lf_meta.versions {
-                                    meta.versions.entry(v).or_insert(vm);
-                                }
+                        Ok(rnpm_registry::client::MetadataFetchResult::Fresh {
+                            metadata: abbrev,
+                            etag,
+                            cache_metadata,
+                        }) => {
+                            if let Ok(bytes) = serde_json::to_vec(&abbrev) {
+                                let cache_meta =
+                                    merge_packument_cache_metadata(cache_metadata, etag, None);
+                                stores.push((reg_url.clone(), name.clone(), bytes, cache_meta));
                             }
-                        }
-                        if let Ok(mut locked) = reg_cache.lock() {
-                            locked.insert(name, meta);
-                        }
-                    }
-                    Err(err) => {
-                        debug!("Conditional fetch error for {name}: {err}");
-                        if let Some((_, ref data)) = cached_info {
-                            if let Ok(abbrev) =
-                                serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
-                            {
-                                let mut meta = abbreviated_to_package_metadata(&abbrev);
-                                if let Some(ref lf) = lockfile_c {
-                                    if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf)
-                                    {
-                                        for (v, vm) in lf_meta.versions {
-                                            meta.versions.entry(v).or_insert(vm);
-                                        }
+                            let mut meta = abbreviated_to_package_metadata(&abbrev);
+                            if let Some(ref lf) = lockfile_c {
+                                if let Some(lf_meta) = package_metadata_from_lockfile(&name, lf) {
+                                    for (v, vm) in lf_meta.versions {
+                                        meta.versions.entry(v).or_insert(vm);
                                     }
                                 }
-                                if let Ok(mut locked) = reg_cache.lock() {
-                                    locked.insert(name, meta);
+                            }
+                            if let Ok(mut locked) = reg_cache.lock() {
+                                locked.insert(name, meta);
+                            }
+                        }
+                        Err(err) => {
+                            debug!("Conditional fetch error for {name}: {err}");
+                            if let Some((_, ref data)) = cached_info {
+                                if let Ok(abbrev) =
+                                    serde_json::from_slice::<AbbreviatedPackageMetadata>(data)
+                                {
+                                    let mut meta = abbreviated_to_package_metadata(&abbrev);
+                                    if let Some(ref lf) = lockfile_c {
+                                        if let Some(lf_meta) =
+                                            package_metadata_from_lockfile(&name, lf)
+                                        {
+                                            for (v, vm) in lf_meta.versions {
+                                                meta.versions.entry(v).or_insert(vm);
+                                            }
+                                        }
+                                    }
+                                    if let Ok(mut locked) = reg_cache.lock() {
+                                        locked.insert(name, meta);
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                stores
+            });
+        let cache = &self.cache;
+        let threads = std::thread::available_parallelism()
+            .map_or(8, |n| n.get())
+            .min(16);
+        let chunk = stores.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for batch in stores.chunks(chunk) {
+                scope.spawn(move || {
+                    for (registry, name, data, meta) in batch {
+                        store_install_packument(cache, registry, name, data, meta.clone());
+                    }
+                });
             }
         });
     }
