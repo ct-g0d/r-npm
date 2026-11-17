@@ -28,6 +28,8 @@ pub enum ReifyChange {
 pub struct ReifyReport {
     pub changes: Vec<ReifyChange>,
     pub inventory: usize,
+    /// Nonfatal peer conflicts found while building the ideal tree.
+    pub peer_warnings: Vec<String>,
 }
 
 /// Splits a location into its parent location and child name. Returns None
@@ -220,6 +222,7 @@ pub fn compute(
     ReifyReport {
         changes,
         inventory: ideal_live.len() + 1,
+        peer_warnings: Vec::new(),
     }
 }
 

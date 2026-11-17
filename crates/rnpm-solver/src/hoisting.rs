@@ -11,6 +11,22 @@ pub enum PlacementDecision {
     PlaceNew(String),
 }
 
+/// A peer provider cannot nest inside a package that itself peers on that name.
+/// Follow the peer group up to npm's deepestNestingTarget.
+pub fn peer_provider_scope<'a>(graph: &DependencyGraph, owner: &'a str, name: &str) -> &'a str {
+    let mut scope = owner.rsplit_once("/node_modules/").map_or("", |(p, _)| p);
+    while !scope.is_empty()
+        && graph.nodes.get(scope).is_some_and(|node| {
+            node.peer_dependencies.contains_key(name)
+                && !node.dependencies.contains_key(name)
+                && !node.optional_dependencies.contains_key(name)
+        })
+    {
+        scope = scope.rsplit_once("/node_modules/").map_or("", |(p, _)| p);
+    }
+    scope
+}
+
 /// File specs can retain an older spelling in installed metadata and lockfiles.
 pub(crate) fn file_target_matches_resolved(target: &std::path::Path, resolved: &str) -> bool {
     matches!(

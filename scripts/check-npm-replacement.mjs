@@ -285,6 +285,42 @@ add('json-error-ci-no-lock','ci',['ci','--json']);
 add('json-error-invalid-manifest','install',['install','--json'],dir=>write(dir,'package.json','{"name":'));
 add('json-error-missing-script','run',['run','nope','--json']);
 add('ci-no-lock','ci',['ci']);
+// A conflicting peer can nest beside its owner, unless an ancestor peers
+// on that same name: that entire peer group must share the outer provider.
+add('install-peer-conflict-pinned-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-pinned-host':'1.0.0'}}));
+add('install-peer-conflict-free-host','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-free-host':'1.0.0',shared:'1.0.0'}}));
+const peerClashOwner=dir=>manifest(dir,{dependencies:{'peer-clash-peer-host':'1.0.0',shared:'1.0.0'}});
+for(const flags of [[],['--force'],['--strict-peer-deps','--force']])add('install-optional-peer-conflict-through-peer-owner'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{'peer-clash-optional-peer-host':'1.0.0',shared:'1.0.0'}}));
+for(const flags of [['--force'],['--strict-peer-deps','--force']])add('install-force-peer-conflict-root'+flags.join(''),'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'}}));
+for(const flags of [[],['--package-lock-only'],['--dry-run'],['--loglevel=error'],['--silent'],['--legacy-peer-deps']])add('install-peer-conflict-through-peer-owner'+flags.join(''),'install',['install','--ignore-scripts',...flags],peerClashOwner);
+add('ci-peer-conflict-through-peer-owner','ci',['ci','--ignore-scripts'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
+add('install-peer-conflict-through-peer-owner-noop','install',['install','--ignore-scripts'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);}});
+add('install-peer-conflict-through-peer-owner-no-lock-noop','install',['install','--ignore-scripts','--no-package-lock'],peerClashOwner,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--no-package-lock']);if(p.exit!==0)throw new Error(p.stderr);}});
+const peerClashStaleLock=dir=>{
+  peerClashOwner(dir);
+  write(dir,'package-lock.json',{name:'readiness-case',version:'1.0.0',lockfileVersion:3,packages:{'':{name:'readiness-case',version:'1.0.0'},'node_modules/shared':{version:'2.0.0'}}});
+};
+add('install-peer-conflict-through-peer-owner-new-owner-in-lock','install',['install','--ignore-scripts'],peerClashOwner,{before:async ctx=>{
+  edit(ctx.dir,p=>{delete p.dependencies['peer-clash-peer-host'];});
+  const p=await ctx.exec(['install','--ignore-scripts','--package-lock-only']);if(p.exit!==0)throw new Error(p.stderr);
+  edit(ctx.dir,p=>{p.dependencies['peer-clash-peer-host']='1.0.0';});
+}});
+add('install-peer-conflict-through-peer-owner-ignored-lock-noop','install',['install','--ignore-scripts','--no-package-lock'],peerClashStaleLock,{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--no-package-lock']);if(p.exit!==0)throw new Error(p.stderr);}});
+add('install-nested-peer-conflict-sibling','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'peer-clash-host':'1.0.0'}}));
+// Packages only a platform-skipped optional package needs are skipped with
+// it and not counted as added.
+add('install-platform-skipped-subtree-count','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},optionalDependencies:{'skipped-native-parent':'1.0.0'}}));
+add('install-platform-skipped-subtree-json','install',['install','--ignore-scripts','--json'],dir=>manifest(dir,{dependencies:{dep:'1.0.0'},optionalDependencies:{'skipped-native-parent':'1.0.0'}}));
+// npm warns for every reified package whose metadata is deprecated, on
+// install and on ci (the note is kept in the lockfile).
+add('install-deprecated-warning','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'deprecated-pkg':'1.0.0'}}));
+add('install-deprecated-multiline','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'deprecated-multiline':'1.0.0'}}));
+add('install-deprecated-alias','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'my-old':'npm:deprecated-pkg@1.0.0'}}));
+add('install-deprecated-loglevel-error','install',['install','--ignore-scripts','--loglevel=error'],dir=>manifest(dir,{dependencies:{'deprecated-pkg':'1.0.0'}}));
+add('install-deprecated-silent','install',['install','--ignore-scripts','--silent'],dir=>manifest(dir,{dependencies:{'deprecated-pkg':'1.0.0'}}));
+add('install-deprecated-empty','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'deprecated-empty':'1.0.0'}}));
+add('install-deprecated-noop','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'deprecated-pkg':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);}});
+add('ci-deprecated-warning','ci',['ci','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'deprecated-pkg':'1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}});
 const engineDep=dir=>{manifest(dir,{dependencies:{'engine-dep':'file:./engine-dep'}});manifest(path.join(dir,'engine-dep'),{name:'engine-dep',version:'1.0.0',engines:{node:'>=99.0.0'}});};
 add('engines-warn','install',['install'],engineDep);
 add('engines-strict','install',['install','--engine-strict'],engineDep);
@@ -445,6 +481,9 @@ for(const [name,versions] of Object.entries({
   'ab-shared-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'eresolve-peer-two':{'1.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'alias-held':{'1.0.0':{}},
+  'deprecated-pkg':{'1.0.0':{deprecated:'Use shared instead.'}},
+  'deprecated-empty':{'1.0.0':{deprecated:''}},
+  'deprecated-multiline':{'1.0.0':{deprecated:'First line.\nSecond line.'}},
   'z-alias-optional-peer-owner':{'1.0.0':{peerDependencies:{'@alias/native':'npm:shared@>=2.0.0'},peerDependenciesMeta:{'@alias/native':{optional:true}}}},
   'steered-plugin':{'1.0.0':{peerDependencies:{shared:'^1.0.0'}},'2.0.0':{peerDependencies:{shared:'^2.0.0'}}},
   'a-steers-plugin':{'1.0.0':{peerDependencies:{'steered-plugin':'^1.0.0'}}},
@@ -504,6 +543,13 @@ for(const [name,versions] of Object.entries({
   'nested-optional-owner':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'}}},
   'nested-optional-plugin':{'1.0.0':{peerDependencies:{shared:'^2.0.0'},peerDependenciesMeta:{shared:{optional:true}}}},
   'legacy-owner':{'1.0.0':{license:'MIT',bin:'index.js',dependencies:{shared:'>=1.0.0'},optionalDependencies:{'legacy-native':'1.0.0'},peerDependencies:{dep:'*'},peerDependenciesMeta:{dep:{optional:true}}}},
+  'skipped-native-parent':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32'],dependencies:{'skipped-native-only-dep':'1.0.0'}}},
+  'skipped-native-only-dep':{'1.0.0':{}},
+  'peer-clash-pinned-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0',shared:'1.0.0'}}},
+  'peer-clash-free-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0'}}},
+  'peer-clash-peer-host':{'1.0.0':{dependencies:{'ab-shared-peer-two':'1.0.0'},peerDependencies:{shared:'>=1.0.0'}}},
+  'peer-clash-optional-peer-host':{'1.0.0':{dependencies:{'nested-optional-plugin':'1.0.0'},peerDependencies:{shared:'>=1.0.0'}}},
+  'peer-clash-host':{'1.0.0':{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'}}},
   'legacy-native':{'1.0.0':{license:'MIT',os:[process.platform==='win32'?'darwin':'win32']}},
   'multi-native':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32','freebsd'],cpu:[process.arch==='x64'?'arm64':'x64']}},
 })){

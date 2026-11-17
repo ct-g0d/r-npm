@@ -312,11 +312,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
     }
 
-    /// arborist conflictOK: a peer conflict is fatal only for a package placed
-    /// directly in the project (under the root or a workspace), or with
+    /// Arborist's conflictOK: without --force, a peer conflict is fatal only
+    /// for a package placed directly under the root or a workspace, or with
     /// --strict-peer-deps; deeper conflicts are overridden with a warning.
     fn peer_conflict_is_fatal(&self, is_mine: bool) -> bool {
-        if self.options.legacy_peer_deps {
+        if self.options.legacy_peer_deps || self.options.force {
             return false;
         }
         if self.options.strict_peer_deps {
@@ -488,7 +488,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // steer around it (an earlier peer set may pick another version), so
         // it replaces placement's own peer conflict but never fails a tree
         // placement resolves.
-        let root_conflict = if self.options.lockfile.is_none() && self.options.is_strict_peers() {
+        let root_conflict = if self.options.lockfile.is_none()
+            && self.options.is_strict_peers()
+            && !self.options.force
+        {
             self.precheck_root_peer_sets(root_manifest, &root_deps)
         } else {
             None
@@ -759,6 +762,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         });
                         return Ok(());
                     } else if task.dep_type == DependencyType::Peer {
+                        let scope = crate::hoisting::peer_provider_scope(
+                            &self.graph,
+                            &task.parent_location,
+                            &task.install_name,
+                        );
+                        let sibling = if scope.is_empty() {
+                            format!("node_modules/{}", task.install_name)
+                        } else {
+                            format!("{scope}/node_modules/{}", task.install_name)
+                        };
                         if self.peer_conflict_is_fatal(task.is_mine) {
                             return Err(SolverError::peer_conflict(
                                 &task.parent_package_name,
@@ -783,7 +796,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     &existing.location,
                                 ),
                             ));
-                        } else {
+                        } else if self.graph.nodes.contains_key(&sibling) {
                             warn!(
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
                                 task.parent_package_name, dep_spec.package_name, effective_spec, existing.name, existing.version
@@ -800,16 +813,20 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             });
                             return Ok(());
                         }
+                        // Otherwise the owner is nested and its sibling slot is
+                        // free: npm places the peer there, beside its owner,
+                        // instead of keeping the conflicting visible one.
                     } else if task.dep_type == DependencyType::PeerOptional {
                         // loadPeerSet resolves an incompatible optional peer
                         // when its owner can nest with a new sibling provider.
                         // A missing optional peer still never triggers a fetch.
-                        let sibling =
-                            task.parent_location
-                                .rsplit_once("/node_modules/")
-                                .map(|(scope, _)| {
-                                    format!("{scope}/node_modules/{}", task.install_name)
-                                });
+                        let scope = crate::hoisting::peer_provider_scope(
+                            &self.graph,
+                            &task.parent_location,
+                            &task.install_name,
+                        );
+                        let sibling = (!scope.is_empty())
+                            .then(|| format!("{scope}/node_modules/{}", task.install_name));
                         // A top-level owner's provider slot is the root's own
                         // dependency: npm replaces it only when every edge into
                         // it accepts the pinned version (as placement checked);
@@ -851,6 +868,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 .as_ref()
                                 .is_none_or(|location| self.graph.nodes.contains_key(location))
                         {
+                            // Keep the invalid edge so the permitted conflict
+                            // still produces npm's overridden-peer warning.
+                            self.graph.edges.push(DependencyEdge {
+                                from_location: task.parent_location,
+                                to_location: existing.location.clone(),
+                                install_name: task.install_name,
+                                package_name: dep_spec.package_name,
+                                spec: effective_spec,
+                                dep_type: task.dep_type,
+                            });
                             return Ok(());
                         }
                     }
@@ -1169,16 +1196,32 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         };
 
         // 6. Hoisting & Tree Placement
+        let peer_scope = is_peer.then(|| {
+            crate::hoisting::peer_provider_scope(
+                &self.graph,
+                &task.parent_location,
+                &task.install_name,
+            )
+        });
+        // The placement routine treats this as an ordinary child of the
+        // deepest allowed scope; it must not nest inside its peer owner.
+        let placement_parent = peer_scope.unwrap_or(&task.parent_location);
+        let no_peers = BTreeMap::new();
+        let candidate_peers = if self.options.legacy_peer_deps {
+            &no_peers
+        } else {
+            placement_peers
+                .as_ref()
+                .unwrap_or(&chosen_version.peer_dependencies)
+        };
         let mut placement = determine_placement_with_peers(
             &self.graph,
-            &task.parent_location,
+            placement_parent,
             &dep_spec.install_name,
             &dep_spec.package_name,
             &dep_spec.target,
             &chosen_version.dependencies,
-            placement_peers
-                .as_ref()
-                .unwrap_or(&chosen_version.peer_dependencies),
+            candidate_peers,
             &chosen_version.peer_dependencies_meta,
             Some(&chosen_version.version),
             chosen_version.dist_tarball.as_deref(),

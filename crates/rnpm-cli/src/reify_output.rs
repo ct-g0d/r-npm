@@ -9,6 +9,8 @@ use std::path::Path;
 pub(crate) struct ReifyOutputOptions {
     pub json: bool,
     pub silent: bool,
+    /// Warnings reach stderr unless loglevel is error or silent.
+    pub warnings: bool,
     pub dry_run: bool,
     pub long: bool,
     pub fund: bool,
@@ -24,6 +26,8 @@ impl ReifyOutputOptions {
             json: json || config.get_bool("json").unwrap_or(false),
             silent: config.get("loglevel") == Some("silent")
                 || config.get_bool("silent").unwrap_or(false),
+            warnings: !matches!(config.get("loglevel"), Some("silent" | "error"))
+                && !config.get_bool("silent").unwrap_or(false),
             dry_run: dry_run || config.get_bool("dry-run").unwrap_or(false),
             long: config.get_bool("long").unwrap_or(false),
             fund,
@@ -110,6 +114,47 @@ pub(crate) fn install_audit_report(report: &AuditReport) -> String {
     format!("{}\n\nRun `npm audit` for details.", out.join("\n"))
 }
 
+/// npm warns once for every package it reifies whose metadata is deprecated
+/// (arborist reify.js, after extracting the node). The note is read from the
+/// lockfile written for the new tree.
+fn warn_deprecated(project_dir: &Path, report: &ReifyReport) {
+    let read = |file: &str| -> Option<Value> {
+        serde_json::from_slice(&std::fs::read(project_dir.join(file)).ok()?).ok()
+    };
+    let Some(lock) = read("node_modules/.package-lock.json").or_else(|| read("package-lock.json"))
+    else {
+        return;
+    };
+    let Some(packages) = lock.get("packages") else {
+        return;
+    };
+    for change in &report.changes {
+        let entry = match change {
+            ReifyChange::Add(entry) | ReifyChange::Change { to: entry, .. } => entry,
+            ReifyChange::Remove(_) => continue,
+        };
+        let Some(meta) = packages.get(&entry.location) else {
+            continue;
+        };
+        let Some(message) = meta
+            .get("deprecated")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // _id uses the real package name, so an alias reports its target.
+        let name = meta
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&entry.name);
+        let text = format!("{name}@{}: {message}", entry.version);
+        for line in text.lines() {
+            eprintln!("{}", format!("npm warn deprecated {line}").trim_end());
+        }
+    }
+}
+
 pub(crate) fn print(
     project_dir: &Path,
     report: &ReifyReport,
@@ -118,6 +163,16 @@ pub(crate) fn print(
     opts: &ReifyOutputOptions,
     elapsed: std::time::Duration,
 ) -> anyhow::Result<()> {
+    if opts.warnings && !opts.silent {
+        for warning in &report.peer_warnings {
+            for line in warning.split('\n') {
+                eprintln!("{}", format!("npm warn {line}").trim_end());
+            }
+        }
+    }
+    if opts.warnings && !opts.silent && !opts.dry_run {
+        warn_deprecated(project_dir, report);
+    }
     if opts.silent {
         return Ok(());
     }

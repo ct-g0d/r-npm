@@ -77,7 +77,7 @@ impl Explanation {
         }
     }
 
-    fn render_at(&self, graph: &DependencyGraph, depth: usize) -> String {
+    pub fn render_at(&self, graph: &DependencyGraph, depth: usize) -> String {
         let r = Renderer { graph };
         let mut out = Vec::new();
         if let Some(while_resolving) = &self.while_resolving {

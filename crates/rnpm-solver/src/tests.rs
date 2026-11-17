@@ -5967,10 +5967,8 @@ fn test_peer_set_resolves_root_dev_edge_with_peer_range_as_advisory() {
 
 #[test]
 fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
-    // webpack's dev tree: a transitive dependency peers on a version the root
-    // pins differently. npm's can-place-dep treats the root as a CONFLICT, so
-    // the dependency nests under the parent and npm overrides the peer with
-    // a warning instead of ERESOLVE.
+    // A transitive dependency peers on a version the root pins differently.
+    // npm nests the owner and its peer together when the sibling slot is free.
     use crate::overrides::Overrides;
     use crate::solver::Solver;
 
@@ -6005,11 +6003,10 @@ fn test_dependency_with_conflicting_root_peer_nests_instead_of_eresolve() {
         graph.nodes["node_modules/a/node_modules/lib"].version,
         "1.0.0"
     );
-    // Like webpack's babel-preset-current-node-syntax plugins: the peer is
-    // overridden by the visible root node, not duplicated beside the owner.
-    assert!(!graph
-        .nodes
-        .contains_key("node_modules/a/node_modules/react"));
+    assert_eq!(
+        graph.nodes["node_modules/a/node_modules/react"].version,
+        "18.0.0"
+    );
 }
 
 #[test]
