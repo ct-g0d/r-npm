@@ -1482,13 +1482,14 @@ pub fn apply_npmrc_to_client_config(
         .or_else(|| npmrc.settings.get("fetch_timeout"))
         .or_else(|| npmrc.settings.get("timeout"))
         .and_then(|val_str| val_str.trim().parse::<u64>().ok());
-    if let Some(ms) = timeout_ms {
-        client_config.timeout = std::time::Duration::from_millis(ms);
-    }
+    // npm's fetch-timeout defaults to 5 minutes. A shorter cap on the whole
+    // request kills large packuments sharing a slow link, and their retries
+    // saturate it again: antd's ~180 full packuments never finished at 30s.
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
+    client_config.timeout = timeout;
     // make-fetch-happen only gives up on a stalled body after fetch-timeout
     // (default 5 minutes); a short idle cutoff fails large tarballs under load.
-    client_config.chunk_idle_timeout =
-        std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
+    client_config.chunk_idle_timeout = timeout;
 
     let connect_timeout_ms = npmrc
         .settings
