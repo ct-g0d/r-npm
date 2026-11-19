@@ -1991,6 +1991,44 @@ fn is_directory_dependency(path: &Path) -> bool {
             .any(|suffix| spec.ends_with(suffix))
 }
 
+/// `--install-links`: arborist packs a `file:` directory outside the project
+/// and installs the packed files as a real folder; one inside the project
+/// (`clean_rel` not climbing out) stays a link.
+fn installs_as_copy(install_links: bool, clean_rel: &str) -> bool {
+    install_links && (clean_rel == ".." || clean_rel.starts_with("../"))
+}
+
+/// Copies the files `npm pack` would include from `src` into `dest`.
+fn copy_packed_directory(src: &Path, dest: &Path) -> Result<()> {
+    let manifest = Manifest::from_file(src.join("package.json"))
+        .with_context(|| format!("Failed to read {}", src.join("package.json").display()))?;
+    let files = rnpm_fs::collect_pack_files(src, &manifest)
+        .map_err(|e| anyhow!("Failed to list files to pack in {}: {e}", src.display()))?;
+    for (rel, from) in files {
+        let to = dest.join(&rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+/// The lock entry of a packed `file:` directory: the target's fields under
+/// the node's own location, resolved to the `file:` spec.
+fn packed_directory_entry(
+    abs_file: &Path,
+    clean_rel: &str,
+    node: &rnpm_solver::graph::Node,
+) -> LockfilePackage {
+    LockfilePackage {
+        resolved: Some(format!("file:{clean_rel}")),
+        name: None,
+        ..directory_target_entry(abs_file, clean_rel, node)
+    }
+}
+
 /// The lockfile location a `file:` directory link points at, as npm writes it:
 /// relative, forward slashes, and `""` for the project root itself.
 fn link_target_rel(rel_file: &str) -> String {
@@ -3512,6 +3550,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if is_directory_dependency(&abs_file) {
                             let clean_rel = link_target_rel(rel_file);
                             let clean_rel = clean_rel.as_str();
+                            if installs_as_copy(self.options.install_links, clean_rel) {
+                                lockfile.insert_package(
+                                    loc,
+                                    packed_directory_entry(&abs_file, clean_rel, node),
+                                );
+                                continue;
+                            }
                             let link_entry = LockfilePackage {
                                 resolved: Some(clean_rel.to_string()),
                                 link: Some(true),
@@ -4147,6 +4192,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 }
                             }
                         }
+                        continue;
+                    } else if is_directory_dependency(&abs_file)
+                        && installs_as_copy(self.options.install_links, &link_target_rel(rel_file))
+                    {
+                        if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_junction(&dest_dir);
+                        }
+                        if dest_dir.exists() {
+                            let _ = std::fs::remove_dir_all(&dest_dir);
+                        }
+                        copy_packed_directory(&abs_file, &dest_dir)?;
+                        packages_installed += 1;
+                        let clean_rel = link_target_rel(rel_file);
+                        lockfile.insert_package(
+                            loc,
+                            packed_directory_entry(&abs_file, &clean_rel, node),
+                        );
                         continue;
                     } else if is_directory_dependency(&abs_file) {
                         if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
@@ -5843,6 +5905,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
             };
+
+            // A packed `file:` directory (`--install-links`) is copied again
+            // from its source folder.
+            if let Some(rel) = resolved_url.strip_prefix("file:") {
+                let src = self.options.project_dir.join(rel);
+                if pkg_info.link != Some(true) && src.is_dir() {
+                    if full_target.exists() {
+                        let _ = std::fs::remove_dir_all(&full_target);
+                    }
+                    copy_packed_directory(&src, &full_target)?;
+                    packages_installed += 1;
+                    continue;
+                }
+            }
 
             let is_git = resolved_url.starts_with("git+")
                 || resolved_url.starts_with("git:")
