@@ -192,33 +192,21 @@ fn test_unsupported_flags_gate_e_diagnostics() {
     // npm 11 accepts --production (as --omit=dev) and --save-bundle.
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--production"]).is_none());
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
-    let flags = ["--legacy-peer-deps", "--strict-peer-deps"];
-    for flag in flags {
-        let res = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
-        assert!(res.is_some(), "Expected diagnostic for flag: {flag}");
-        let (code, msg) = res.unwrap();
-        assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
-        assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
-        assert!(msg.contains(&format!("The flag '{flag}' is not supported by rnpm.")));
-    }
-
     // --global and -g are supported on install and uninstall
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--global"]).is_none());
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "-g"]).is_none());
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "uninstall", "--global"]).is_none());
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "uninstall", "-g"]).is_none());
 
-    // --legacy-peer-deps and --strict-peer-deps are supported on install, but unsupported on commands like audit/pack
-    assert!(
-        check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none()
-    );
-    assert!(
-        check_unsupported_cli_invocation(vec!["rnpm", "install", "--strict-peer-deps"]).is_none()
-    );
-    let res = check_unsupported_cli_invocation(vec!["rnpm", "audit", "--legacy-peer-deps"]);
-    assert!(res.is_some());
-    let res_strict = check_unsupported_cli_invocation(vec!["rnpm", "audit", "--strict-peer-deps"]);
-    assert!(res_strict.is_some());
+    // npm treats --legacy-peer-deps and --strict-peer-deps as plain config on every command.
+    for command in ["install", "pack", "audit", "dedupe", "upgrade", "u", "in", "exec"] {
+        for flag in ["--legacy-peer-deps", "--strict-peer-deps"] {
+            assert!(
+                check_unsupported_cli_invocation(vec!["rnpm", command, flag]).is_none(),
+                "{command} {flag} must be accepted"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1264,20 +1252,6 @@ async fn test_cli_audit_unsupported_command_filtering() {
 #[tokio::test]
 async fn test_cli_unsupported_flags_filtering() {
     assert!(check_unsupported_cli_invocation(vec!["rnpm", "install", "--save-bundle"]).is_none());
-    let test_flags = ["--legacy-peer-deps", "--strict-peer-deps"];
-
-    for flag in test_flags {
-        let check = check_unsupported_cli_invocation(vec!["rnpm", "pack", flag]);
-        assert!(
-            check.is_some(),
-            "Expected unsupported flag check to trigger for '{flag}'"
-        );
-        let (code, msg) = check.unwrap();
-        assert_eq!(code, "ERR_UNSUPPORTED_FLAG");
-        assert!(msg.contains("npm error code ERR_UNSUPPORTED_FLAG"));
-        assert!(msg.contains(flag));
-        assert!(msg.contains("docs/compatibility-contract.md"));
-    }
 
     // --omit is supported on install and ci
     for omit_val in ["dev", "optional", "peer"] {
@@ -1293,7 +1267,7 @@ async fn test_cli_unsupported_flags_filtering() {
         assert!(check_unsupported_cli_invocation(vec!["rnpm", "ci", "--omit", omit_val]).is_none());
     }
 
-    // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, and update
+    // --legacy-peer-deps and --strict-peer-deps are config: accepted on every command
     assert!(
         check_unsupported_cli_invocation(vec!["rnpm", "install", "--legacy-peer-deps"]).is_none()
     );

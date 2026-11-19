@@ -390,24 +390,6 @@ fn test_additional_aliases_and_flag_routing() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Search the registry"));
 
-    // Peer-resolution flags are still unsupported for pack.
-    let flag_args = ["pack", "--legacy-peer-deps"];
-    let output = Command::new(rnpm_bin)
-        .args(flag_args)
-        .output()
-        .expect("Failed to execute rnpm");
-    assert!(
-        !output.status.success(),
-        "Flag args '{:?}' must fail",
-        flag_args
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"),
-        "Expected ERR_UNSUPPORTED_FLAG for '{:?}', got: {stderr}",
-        flag_args
-    );
-
     let project = tempdir().unwrap();
     fs::write(
         project.path().join("package.json"),
@@ -455,8 +437,11 @@ fn test_cli_peer_dependency_flags_and_resolution() {
         );
     }
 
-    // 2. Verify flags are supported on install, ci, update and rejected on audit
-    for cmd in ["install", "ci", "update", "i", "clean-install", "up"] {
+    // 2. npm accepts the flags as config on every command and alias.
+    for cmd in [
+        "install", "ci", "update", "i", "clean-install", "up", "upgrade", "u", "in", "audit",
+        "dedupe", "uninstall", "exec",
+    ] {
         for flag in ["--legacy-peer-deps", "--strict-peer-deps"] {
             let output = Command::new(rnpm_bin)
                 .args([cmd, flag, "--help"])
@@ -468,19 +453,6 @@ fn test_cli_peer_dependency_flags_and_resolution() {
                 "Flag {flag} on {cmd} must not be gated as ERR_UNSUPPORTED_FLAG"
             );
         }
-    }
-
-    for flag in ["--legacy-peer-deps", "--strict-peer-deps"] {
-        let output = Command::new(rnpm_bin)
-            .args(["audit", flag])
-            .output()
-            .expect("Failed to run command");
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("npm error code ERR_UNSUPPORTED_FLAG"),
-            "Flag {flag} on audit must be gated as ERR_UNSUPPORTED_FLAG, got: {stderr}"
-        );
     }
 }
 

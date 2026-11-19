@@ -45,6 +45,7 @@
 - `bin`: Print local executable bin folder (`node_modules/.bin`) or global bin directory (`--global`, `-g`).
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
+  - `audit signatures` verifies each installed registry package's ECDSA registry signature against the registry's `/-/npm/v1/keys`, with npm's text and `--json` reports and exit codes. Provenance attestations (`dist.attestations`) are not verified yet.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
 - `get` / `set`: Top-level npm-compatible aliases for configuration reads and writes.
@@ -81,14 +82,8 @@ npm error Unsupported URL Type "<protocol>": <spec>
 ```
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
-### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--save-bundle`, `--production` on non-prune commands) terminate immediately with exit code `1` and a structured diagnostic:
-```text
-npm error code ERR_UNSUPPORTED_FLAG
-npm error The flag '<flag>' is not supported by rnpm.
-npm error See docs/compatibility-contract.md for supported options.
-```
-*(Note: `--legacy-peer-deps` is fully supported on `install`, `ci`, and `update` commands).*
+### Flags Handling
+Like npm, rnpm rejects no flag as unsupported: flags a command does not declare are read as config. `--save-bundle` works on install, `--production` is treated as `--omit=dev` (with npm's deprecation warning), and `--legacy-peer-deps` / `--strict-peer-deps` are accepted on every command and alias and honored, from the command line or `.npmrc`, by the commands that build a tree (install, ci, update, uninstall, dedupe, audit fix, exec, and their aliases). `--before=<date>` (or `before=` in `.npmrc`) limits install/update resolution and `outdated` to versions published on or before the date, as npm does; `min-release-age` is not implemented yet.
 
 ### Remaining Gaps
 - Registry-specific organization, team, profile, and star APIs vary across compatible registries; rnpm exposes the command surface and reports when the target registry does not implement an endpoint.
@@ -247,7 +242,6 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 | `ESECURITY` | 1 | Tarball contained traversal (`..`), absolute paths, or escaping symlinks |
 | `EJSONPARSE` | 1 | Malformed `package.json` or `package-lock.json` |
 | `ERR_UNSUPPORTED_COMMAND` | 1 | Attempted invocation of an npm command outside the active compatibility matrix |
-| `ERR_UNSUPPORTED_FLAG` | 1 | Attempted invocation of an unsupported flag |
 | `ENOLOCK` | 1 | Command requires an existing package-lock.json |
 | `ENOENT` | 1 | File or package.json not found |
 | `ENOWORKSPACES` | 1 | No workspace packages discovered |

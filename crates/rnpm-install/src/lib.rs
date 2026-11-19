@@ -204,6 +204,11 @@ use rnpm_solver::{
 
 /// Converts registry AbbreviatedPackageMetadata to Solver PackageMetadata.
 pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> PackageMetadata {
+    if let Some(cutoff) = before_cutoff().filter(|_| !meta.time.is_empty()) {
+        let mut dated = meta.clone();
+        apply_before(&mut dated, cutoff);
+        return abbreviated_to_package_metadata(&dated);
+    }
     let mut dist_tags = BTreeMap::new();
     for (k, v) in &meta.dist_tags {
         dist_tags.insert(k.clone(), v.clone());
@@ -313,6 +318,70 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
         name: meta.name.clone(),
         dist_tags,
         versions,
+    }
+}
+
+/// npm's `before` cutoff (ms since the epoch); `i64::MAX` when unset.
+static BEFORE_CUTOFF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
+
+/// Sets the `before` cutoff that registry metadata is filtered by.
+pub fn set_before_cutoff(cutoff: Option<i64>) {
+    BEFORE_CUTOFF.store(
+        cutoff.unwrap_or(i64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn before_cutoff() -> Option<i64> {
+    Some(BEFORE_CUTOFF.load(std::sync::atomic::Ordering::Relaxed)).filter(|&c| c != i64::MAX)
+}
+
+/// npm-pick-manifest under `before`: versions published after the cutoff are
+/// out, and a dist-tag on such a version falls back to the version npm picks
+/// for `<=tagged`. A packument without publish times is left as is.
+pub fn apply_before(meta: &mut AbbreviatedPackageMetadata, cutoff: i64) {
+    let time = std::mem::take(&mut meta.time);
+    if time.is_empty() {
+        return;
+    }
+    let is_before = |ver: &str| {
+        time.get(ver)
+            .and_then(|t| rnpm_config::date::parse_js_date(t))
+            .is_none_or(|t| t <= cutoff)
+    };
+    meta.versions.retain(|ver, _| is_before(ver));
+    let latest = meta.dist_tags.get("latest").cloned();
+    let picks: Vec<(String, Option<String>)> = meta
+        .dist_tags
+        .iter()
+        .filter(|(_, ver)| !is_before(ver))
+        .map(|(tag, ver)| {
+            let Ok(range) = rnpm_core::semver::Range::parse(&format!("<={ver}")) else {
+                return (tag.clone(), None);
+            };
+            let satisfies = |v: &str| Version::parse(v).is_ok_and(|v| range.satisfies(&v));
+            // The default tag wins when it is old enough and in range.
+            let preferred = latest.as_ref().filter(|l| {
+                satisfies(l) && meta.versions.get(*l).is_some_and(|m| m.deprecated.is_none())
+            });
+            let pick = preferred.cloned().or_else(|| {
+                meta.versions
+                    .iter()
+                    .filter_map(|(v, m)| Some((Version::parse(v).ok()?, v, m)))
+                    .filter(|(parsed, _, _)| range.satisfies(parsed))
+                    .max_by(|a, b| {
+                        (a.2.deprecated.is_none(), &a.0).cmp(&(b.2.deprecated.is_none(), &b.0))
+                    })
+                    .map(|(_, v, _)| v.clone())
+            });
+            (tag.clone(), pick)
+        })
+        .collect();
+    for (tag, pick) in picks {
+        match pick {
+            Some(ver) => meta.dist_tags.insert(tag, ver),
+            None => meta.dist_tags.remove(&tag),
+        };
     }
 }
 
@@ -2065,6 +2134,10 @@ impl Installer {
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
         options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
+        // Peer handling is config, whichever command or source sets it.
+        options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
+        options.strict_peer_deps |= config.get_bool("strict-peer-deps").unwrap_or(false);
+        set_before_cutoff(config.before_cutoff());
 
         if options.install_strategy == InstallStrategy::Hoisted {
             if let Some(strat_str) = config

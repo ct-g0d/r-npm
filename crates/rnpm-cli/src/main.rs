@@ -3,6 +3,7 @@
 
 mod audit;
 mod audit_dry_run;
+mod audit_signatures;
 pub mod commands;
 pub mod diagnostics;
 pub mod diff;
@@ -1728,21 +1729,8 @@ where
         args_to_scan.extend_from_slice(pre_dash_dash);
     }
 
-    let unsupported_flags = ["--legacy-peer-deps", "--strict-peer-deps"];
-
-    let mut i = 0;
-    while i < args_to_scan.len() {
-        let arg = &args_to_scan[i];
-        // For prune, --production, -p, --omit=..., and --include=... are supported options.
-        if first == "prune"
-            && (arg == "--production"
-                || arg == "-p"
-                || arg.starts_with("--omit")
-                || arg.starts_with("--include"))
-        {
-            i += 1;
-            continue;
-        }
+    let is_global = args_to_scan.iter().any(|a| a == "-g" || a == "--global");
+    for arg in &args_to_scan {
         if matches!(first.as_str(), "config" | "c") {
             if arg == "--workspaces"
                 || arg == "--workspace"
@@ -1755,16 +1743,8 @@ where
                     "npm error code ENOWORKSPACES\nnpm error This command does not support workspaces.".to_string(),
                 ));
             }
-            i += 1;
             continue;
         }
-
-        if matches!(first.as_str(), "pkg" | "ls" | "list" | "la" | "ll") {
-            i += 1;
-            continue;
-        }
-        // --legacy-peer-deps and --strict-peer-deps are supported on install, ci, update (and their aliases)
-        let is_global = args_to_scan.iter().any(|a| a == "-g" || a == "--global");
         if matches!(first.as_str(), "install" | "i" | "add" | "isntall")
             && !is_global
             && (arg == "--allow-scripts" || arg == "--no-allow-scripts")
@@ -1774,30 +1754,6 @@ where
                 "npm error code EALLOWSCRIPTS\nnpm error --allow-scripts is not allowed in project-scoped installs. Add the entries to the \"allowScripts\" field in package.json, or to .npmrc, instead.".to_string(),
             ));
         }
-        if matches!(
-            first.as_str(),
-            "install" | "i" | "add" | "isntall" | "ci" | "clean-install" | "ic" | "update" | "up"
-        ) && (arg == "--legacy-peer-deps"
-            || arg.starts_with("--legacy-peer-deps=")
-            || arg == "--strict-peer-deps"
-            || arg.starts_with("--strict-peer-deps="))
-        {
-            i += 1;
-            continue;
-        }
-        if unsupported_flags.contains(&arg.as_str()) {
-            return Some((
-                "ERR_UNSUPPORTED_FLAG".to_string(),
-                format!(
-                    "npm error code ERR_UNSUPPORTED_FLAG\n\
-                     npm error The flag '{}' is not supported by rnpm.\n\
-                     npm error See docs/compatibility-contract.md for supported options.",
-                    arg
-                ),
-            ));
-        }
-
-        i += 1;
     }
 
     None
@@ -5807,6 +5763,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         } => {
             if action.as_deref() == Some("fix") {
                 run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
+            } else if action.as_deref() == Some("signatures") {
+                audit_signatures::run(&current_dir, json).await?;
             } else {
                 audit::run_audit(&current_dir, registry, json, &audit_level).await?;
             }
@@ -7250,7 +7208,7 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
     if err.is::<commands::login::InputClosed>() {
         std::process::exit(1);
     }
-    if err.is::<outdated::OutdatedStatus>() {
+    if err.is::<outdated::OutdatedStatus>() || err.is::<audit_signatures::SignaturesFailed>() {
         std::process::exit(1);
     }
     if let Some(exit) = err.downcast_ref::<rnpm_lifecycle::ScriptExitError>() {

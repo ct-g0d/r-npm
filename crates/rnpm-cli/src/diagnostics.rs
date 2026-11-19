@@ -4,6 +4,21 @@ use rnpm_lockfile::LockfileError;
 use rnpm_registry::RegistryError;
 use rnpm_solver::SolverError;
 
+/// npm-pick-manifest names the `before` date in ETARGET messages.
+fn before_suffix() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok())
+        .and_then(|config| config.before_cutoff())
+        .map(|ms| {
+            format!(
+                " with a date before {}",
+                rnpm_config::date::to_locale_string(ms)
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Structured diagnostic payload conforming to npm error output standard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -112,7 +127,6 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ESECURITY" => "ESECURITY",
                 "EJSONPARSE" => "EJSONPARSE",
                 "ERR_UNSUPPORTED_COMMAND" => "ERR_UNSUPPORTED_COMMAND",
-                "ERR_UNSUPPORTED_FLAG" => "ERR_UNSUPPORTED_FLAG",
                 "ENOLOCK" => "ENOLOCK",
                 "ENOENT" => "ENOENT",
                 "ENOWORKSPACES" => "ENOWORKSPACES",
@@ -192,7 +206,7 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                     spec,
                     message,
                 } if message == "No matching version found satisfying constraint" => {
-                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}."))
+                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {name}@{spec}{}.", before_suffix()))
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
                 SolverError::UnresolvedDependency {
@@ -478,7 +492,7 @@ npm error notsup {line}"
         if let Some((package_spec, reason)) = unresolved.split_once("': ") {
             match reason {
                 "No matching version found satisfying constraint" => {
-                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {package_spec}."))
+                    return Diagnostic::new("ETARGET", format!("notarget No matching version found for {package_spec}{}.", before_suffix()))
                         .with_detail("notarget In most cases you or one of your dependencies are requesting a package version that doesn't exist.");
                 }
                 "Package not found in metadata provider" => {

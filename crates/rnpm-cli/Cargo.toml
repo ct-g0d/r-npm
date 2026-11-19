@@ -32,6 +32,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 data-encoding = { workspace = true }
 mimalloc = { version = "0.1", default-features = false }
+ring = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
