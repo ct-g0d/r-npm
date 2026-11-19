@@ -37,6 +37,8 @@ pub struct ResolverOptions {
     /// `--force`: npm-install-checks' checkPlatform returns early, so a
     /// required package for another platform is installed anyway.
     pub force: bool,
+    /// npm's `install-strategy` for PlaceDep's target walk.
+    pub install_strategy: crate::hoisting::PlacementStrategy,
 }
 
 impl Default for ResolverOptions {
@@ -52,6 +54,7 @@ impl Default for ResolverOptions {
             unlocked_packages: std::collections::HashSet::new(),
             vulnerability_constraints: std::collections::HashMap::new(),
             force: false,
+            install_strategy: crate::hoisting::PlacementStrategy::Hoisted,
         }
     }
 }
@@ -1227,6 +1230,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             chosen_version.dist_tarball.as_deref(),
             chosen_version.dist_integrity.as_deref(),
             is_peer,
+            self.options.install_strategy,
         );
 
         let is_unlocked = self

@@ -2,7 +2,7 @@
 
 Experimental Rust implementation of npm 11.x workflows.
 
-`rnpm` is designed to install and operate ordinary Node.js projects reliably, with npm 11.x-compatible commands, lockfile v3 output, and a measurable path toward matching npm's tree and performance behavior. Real-project parity is tracked by the differential benchmarks rather than treated as a completed guarantee. See the [current replacement-readiness assessment](docs/npm-replacement-readiness-2026-11-13.md) for reproduced gaps and measured performance.
+`rnpm` is designed to install and operate ordinary Node.js projects reliably, with npm 11.x-compatible commands, lockfile v3 output, and a measurable path toward matching npm's tree and performance behavior. Real-project parity is tracked by the differential benchmarks rather than treated as a completed guarantee. See the [compatibility contract](docs/compatibility-contract.md) for supported commands, flags, and known gaps, and `scripts/check-npm-replacement.mjs` for the differential gate against npm that backs it. The [2026-11-13 readiness assessment](docs/npm-replacement-readiness-2026-11-13.md) is kept as a historical record.
 
 ---
 

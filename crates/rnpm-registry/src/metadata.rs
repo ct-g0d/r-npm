@@ -325,6 +325,29 @@ pub struct AbbreviatedPackageMetadata {
     pub modified: Option<String>,
     #[serde(default, deserialize_with = "deserialize_unique_versions")]
     pub versions: BTreeMap<String, AbbreviatedVersion>,
+    /// Publish times by version, present only in the full packument.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_publish_times",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub time: BTreeMap<String, String>,
+}
+
+/// Keeps string entries only: unpublished packuments carry an object there.
+fn deserialize_publish_times<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            serde_json::Value::String(s) => Some((k, s)),
+            _ => None,
+        })
+        .collect())
 }
 
 impl AbbreviatedPackageMetadata {

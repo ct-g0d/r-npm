@@ -45,6 +45,7 @@
 - `bin`: Print local executable bin folder (`node_modules/.bin`) or global bin directory (`--global`, `-g`).
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
+  - `audit signatures` verifies each installed registry package's ECDSA registry signature against the registry's `/-/npm/v1/keys`, with npm's text and `--json` reports and exit codes. Provenance attestations (`dist.attestations`) are not verified yet.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
 - `get` / `set`: Top-level npm-compatible aliases for configuration reads and writes.
@@ -67,7 +68,9 @@
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
-- **Local Directories (`file:../dir`):** Linked via unprivileged directory junctions (Windows) or symlinks (Unix).
+- **Local Directories (`file:../dir`):** Linked via unprivileged directory junctions (Windows) or symlinks (Unix). With `--install-links`, a directory outside the project is packed and installed as a real copy, as npm does; one inside the project stays a link.
+- **Install strategies:** `hoisted` (default), `nested` (`--legacy-bundling`), `shallow` (`--global-style`) and `linked`. `linked` builds npm's isolated tree: `node_modules/.store/<name>@<version>-<hash>/node_modules/<name>` per package with links per dependency, keyed exactly as arborist keys it.
+- **Cache modes:** `--offline`, `--prefer-offline` and `--prefer-online` contact the registry exactly where npm does, including re-fetching tarballs under `--prefer-online`.
 - **Local Archives (`file:./pkg.tgz`):** In-memory manifest extraction, streaming unpacking, and SSRI sha512 integrity generation.
 - **Workspaces (`workspace:*`, `workspace:^`, `workspace:~`):** Multi-tier workspace DAGs, cross-package linking, and topological script execution.
 - **Git Dependencies (`github:user/repo`, `gitlab:`, `bitbucket:`, `git+https://`, `git+ssh://`, `git://`, `git+file://`):** Remote repositories with optional commit-ish / tag specs.
@@ -81,14 +84,8 @@ npm error Unsupported URL Type "<protocol>": <spec>
 ```
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
-### Unsupported Flags Handling (Gate E)
-Flags not supported or outside the scope of `rnpm` (e.g., `--save-bundle`, `--production` on non-prune commands) terminate immediately with exit code `1` and a structured diagnostic:
-```text
-npm error code ERR_UNSUPPORTED_FLAG
-npm error The flag '<flag>' is not supported by rnpm.
-npm error See docs/compatibility-contract.md for supported options.
-```
-*(Note: `--legacy-peer-deps` is fully supported on `install`, `ci`, and `update` commands).*
+### Flags Handling
+Like npm, rnpm rejects no flag as unsupported: flags a command does not declare are read as config. `--save-bundle` works on install, `--production` is treated as `--omit=dev` (with npm's deprecation warning), and `--legacy-peer-deps` / `--strict-peer-deps` are accepted on every command and alias and honored, from the command line or `.npmrc`, by the commands that build a tree (install, ci, update, uninstall, dedupe, audit fix, exec, and their aliases). `--before=<date>` (or `before=` in `.npmrc`) limits install/update resolution and `outdated` to versions published on or before the date, as npm does; `min-release-age` is not implemented yet.
 
 ### Remaining Gaps
 - Registry-specific organization, team, profile, and star APIs vary across compatible registries; rnpm exposes the command surface and reports when the target registry does not implement an endpoint.
@@ -132,7 +129,7 @@ npm error See docs/compatibility-contract.md for the active compatibility surfac
 
 ### 4.2. Local Dependencies: `file:` Protocol
 - **Distinguish Directories vs Tarballs:**
-  - `file:../local-dir`: Directory reference. Must be linked via platform directory link (NTFS Junction on Windows, symlink on Unix). Never copy or re-pack.
+  - `file:../local-dir`: Directory reference. Linked via platform directory link (NTFS Junction on Windows, symlink on Unix), unless `--install-links` packs a directory outside the project into a real copy.
   - `file:../local-pkg.tgz`: Tarball archive. Must be unpacked, verified, and installed like a registry package.
 
 ### 4.3. Optional Dependencies Multi-Stage Failure Isolation
@@ -247,7 +244,6 @@ An optional dependency failure must NEVER fail the parent installation. Failure 
 | `ESECURITY` | 1 | Tarball contained traversal (`..`), absolute paths, or escaping symlinks |
 | `EJSONPARSE` | 1 | Malformed `package.json` or `package-lock.json` |
 | `ERR_UNSUPPORTED_COMMAND` | 1 | Attempted invocation of an npm command outside the active compatibility matrix |
-| `ERR_UNSUPPORTED_FLAG` | 1 | Attempted invocation of an unsupported flag |
 | `ENOLOCK` | 1 | Command requires an existing package-lock.json |
 | `ENOENT` | 1 | File or package.json not found |
 | `ENOWORKSPACES` | 1 | No workspace packages discovered |

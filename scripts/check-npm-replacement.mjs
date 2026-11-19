@@ -5,7 +5,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { createHash } from 'node:crypto';
+import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = process.argv.slice(2);
@@ -36,7 +36,12 @@ async function run(exe,args,cwd,env,input=[]) {
   });
 }
 const STAGE_ID='6d8ce1e2-9bca-496a-b8b5-3e0fa10728ed';
-const tarballs=new Map(); const probePackages=new Map(); const probeCacheControl=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false;
+const tarballs=new Map(); const probePackages=new Map(); const probeCacheControl=new Map(); const requests=[]; let generation=1,authScenario='',authPolls=0,securityAdvisories={},securityRequireAuth=false,signingKeys=false;
+// Registry signing key for `npm audit signatures`: ECDSA P-256 over `${name}@${version}:${integrity}`.
+const signingKey=generateKeyPairSync('ec',{namedCurve:'prime256v1'});
+const signingPublicKey=signingKey.publicKey.export({type:'spki',format:'der'}).toString('base64');
+const signingKeyId='SHA256:'+createHash('sha256').update(signingKey.publicKey.export({type:'spki',format:'der'})).digest('base64').replace(/=+$/,'');
+const registrySignature=message=>createSign('SHA256').update(message).sign(signingKey.privateKey).toString('base64');
 const server=http.createServer((req,res)=>{
   const url=decodeURIComponent(req.url.split('?')[0]);
   const request={method:req.method,url,etag:req.headers['if-none-match'],headers:{'npm-command':req.headers['npm-command']??null,'npm-session':req.headers['npm-session']??null,'user-agent':req.headers['user-agent']??null}};requests.push(request);
@@ -49,6 +54,7 @@ const server=http.createServer((req,res)=>{
   if(url==='/-/ping')return json({});
   if(url.includes('/security/advisories/bulk'))return json(securityAdvisories);
   if(url.includes('/security/audits/quick'))return json({actions:[],advisories:{},metadata:{vulnerabilities:{info:0,low:0,moderate:0,high:0,critical:0},dependencies:0,devDependencies:0,optionalDependencies:0,totalDependencies:0}});
+  if(url==='/-/npm/v1/keys'&&signingKeys)return json({keys:[{expires:null,keyid:signingKeyId,keytype:'ecdsa-sha2-nistp256',scheme:'ecdsa-sha2-nistp256',key:signingPublicKey}]});
   if(url==='/-/whoami')return json({username:'mock-user'});
   if(url==='/oidc/id-token')return json({value:'mock-id-token'});
   if(url.startsWith('/-/npm/v1/oidc/token/exchange/package/'))return json({token:'mock-exchanged-token'});
@@ -90,6 +96,8 @@ const server=http.createServer((req,res)=>{
   if(['audit-leaf','audit-branch'].includes(name))return json({name,'dist-tags':{latest:'2.0.0'},versions:Object.fromEntries(['1.0.0','1.1.0','2.0.0'].map(version=>[version,{name,version,...(name==='audit-branch'?{dependencies:{'audit-leaf':version==='2.0.0'?'^2.0.0':'^1.0.0'}}:{})}]))});
   if(probePackages.has(name)){
     const metadata=probePackages.get(name);
+    // Like the real registry, the abbreviated document carries no publish times.
+    if(metadata.time&&req.headers.accept?.includes('install-v1')){const {time,...abbreviated}=metadata;return json(abbreviated);}
     if(['metadata-probe','platform-full','legacy-owner','legacy-native'].includes(name)&&req.headers.accept?.includes('install-v1'))return json({...metadata,versions:Object.fromEntries(Object.entries(metadata.versions).map(([v,m])=>{const {license,libc,...abbreviated}=m;return [v,abbreviated];}))});
     return json(metadata);
   }
@@ -411,6 +419,7 @@ for(const [name,args]of [['json',['audit','fix','--dry-run','--json']],['text',[
     ['transitive',{parent:'^1.0.0'},'<1.1.0',[]],
     ['transitive-json',{parent:'^1.0.0'},'<1.1.0',['--json']],
     ['transitive-dry',{parent:'^1.0.0'},'<1.1.0',['--dry-run']],
+    ['transitive-legacy-peer',{parent:'^1.0.0'},'<1.1.0',['--legacy-peer-deps']],
     ['direct-major',{dep:'^1.0.0'},'<2.0.0',[]],
     ['direct-major-force',{dep:'^1.0.0'},'<2.0.0',['--force']],
     ['direct-major-force-json',{dep:'^1.0.0'},'<2.0.0',['--force','--json']],
@@ -552,6 +561,12 @@ for(const [name,versions] of Object.entries({
   'peer-clash-host':{'1.0.0':{dependencies:{'aa-shared-peer-one':'1.0.0','ab-shared-peer-two':'1.0.0'}}},
   'legacy-native':{'1.0.0':{license:'MIT',os:[process.platform==='win32'?'darwin':'win32']}},
   'multi-native':{'1.0.0':{os:[process.platform==='win32'?'darwin':'win32','freebsd'],cpu:[process.arch==='x64'?'arm64':'x64']}},
+  'dated-pkg':{'1.0.0':{},'1.1.0':{},'2.0.0':{}},
+  'dated-parent':{'1.0.0':{dependencies:{'dated-pkg':'*'}}},
+  'signed-a':{'1.0.0':{}},
+  'signed-b':{'1.0.0':{}},
+  'signed-bad':{'1.0.0':{}},
+  'unsigned-pkg':{'1.0.0':{}},
 })){
   const packed={};
   for(const [version,fields]of Object.entries(versions)){
@@ -567,6 +582,14 @@ for(const [name,versions] of Object.entries({
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
   probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+// Publish times for --before (served only in the full packument).
+for(const name of ['dated-pkg','dated-parent'])probePackages.get(name).time={created:'2019-12-01T00:00:00.000Z',modified:'2022-01-01T00:00:00.000Z','1.0.0':'2020-01-01T00:00:00.000Z','1.1.0':'2021-01-01T00:00:00.000Z','2.0.0':'2022-01-01T00:00:00.000Z'};
+probePackages.get('dated-pkg')['dist-tags'].beta='2.0.0';
+// Registry signatures: two valid, one signed over the wrong message, one unsigned.
+for(const name of ['signed-a','signed-b','signed-bad']){
+  const mani=probePackages.get(name).versions['1.0.0'];
+  mani.dist.signatures=[{keyid:signingKeyId,sig:registrySignature(`${name}@1.0.0:${name==='signed-bad'?'sha512-tampered':mani.dist.integrity}`)}];
 }
 add('resolver-places-parent-edges-together','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{branch:'1.0.0'}}));
 add('resolver-late-optional-peer-provider','install',['install','--ignore-scripts'],dir=>manifest(dir,{dependencies:{'a-late-peer':'1.0.0','b-late-writer':'1.0.0'}}));
@@ -670,6 +693,47 @@ for(const [name,fields,flags=[]] of [
   ['root-holds-scoped-override',{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0'},overrides:{'eresolve-peer-two':{shared:'1.0.0'}}}],
   ['optional-root-pin',{devDependencies:{shared:'^1.0.0','eresolve-optional-two':'1.0.0'}}],
 ])add('install-eresolve-'+name,'install',['install','--ignore-scripts',...flags],dir=>manifest(dir,fields),{observe:eresolveReport});
+// legacy-peer-deps / strict-peer-deps are plain config: every command and
+// alias accepts them, from the command line or from .npmrc.
+{
+  const rootHolds=(extra={})=>dir=>manifest(dir,{dependencies:{shared:'1.0.0','eresolve-peer-two':'1.0.0',...extra}});
+  const installedLegacy={before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--legacy-peer-deps']);if(p.exit!==0)throw new Error(p.stderr);}};
+  const lockedLegacy={before:async ctx=>{await installedLegacy.before(ctx);fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});}};
+  for(const [name,args,setup=rootHolds(),extra={}] of [
+    ['dedupe',['dedupe','--ignore-scripts','--legacy-peer-deps'],rootHolds(),installedLegacy],
+    ['upgrade',['upgrade','--ignore-scripts','--legacy-peer-deps']],
+    ['u-strict',['u','--ignore-scripts','--strict-peer-deps']],
+    ['in-strict',['in','--ignore-scripts','--strict-peer-deps']],
+    ['install-clean',['install-clean','--ignore-scripts','--legacy-peer-deps'],rootHolds(),lockedLegacy],
+    ['uninstall',['uninstall','dep','--ignore-scripts','--legacy-peer-deps'],rootHolds({dep:'1.0.0'}),installedLegacy],
+    ['exec',['exec','--legacy-peer-deps','--call=node -p 123'],dir=>manifest(dir)],
+    ['npmrc-update',['update','--ignore-scripts'],dir=>{rootHolds()(dir);write(dir,'.npmrc','legacy-peer-deps=true\n');}],
+  ])add(`peer-config-${name}`,args[0],args,setup,{observe:eresolveReport,...extra});
+}
+// --before / before= pick only versions published on or before the date.
+for(const [name,args,setup=dir=>manifest(dir),extra={}] of [
+  ['range',['install','--ignore-scripts','--before=2020-06-01'],dir=>manifest(dir,{dependencies:{'dated-pkg':'^1.0.0'}})],
+  ['latest-tag',['install','dated-pkg','--ignore-scripts','--before=2021-06-01']],
+  ['dist-tag',['install','dated-pkg@beta','--ignore-scripts','--before=2021-06-01']],
+  ['transitive',['install','--ignore-scripts','--before=2020-06-01'],dir=>manifest(dir,{dependencies:{'dated-parent':'1.0.0'}})],
+  ['npmrc',['install','--ignore-scripts'],dir=>{manifest(dir,{dependencies:{'dated-pkg':'*'}});write(dir,'.npmrc','before=2020-06-01\n');}],
+  ['lock-only',['install','--ignore-scripts','--package-lock-only','--before','2021-06-01T00:00:00.000Z'],dir=>manifest(dir,{dependencies:{'dated-pkg':'*'}})],
+  ['etarget-range',['install','dated-pkg@^2.0.0','--ignore-scripts','--before=2021-06-01']],
+  ['etarget-version',['install','dated-pkg@2.0.0','--ignore-scripts','--before=2021-06-01']],
+  ['update',['update','--ignore-scripts','--before=2021-06-01'],dir=>manifest(dir,{dependencies:{'dated-pkg':'*'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--before=2020-06-01']);if(p.exit!==0)throw new Error(p.stderr);}}],
+  ['outdated',['outdated','--json','--before=2021-06-01'],dir=>manifest(dir,{dependencies:{'dated-pkg':'*'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts','--before=2020-06-01']);if(p.exit!==0)throw new Error(p.stderr);}}],
+])add(`before-${name}`,args[0],args,setup,extra);
+// npm audit signatures: registry keys from /-/npm/v1/keys, ECDSA signatures per installed package.
+for(const [name,deps,flags=[],extra={}] of [
+  ['valid',{'signed-a':'1.0.0','signed-b':'1.0.0'}],
+  ['invalid',{'signed-a':'1.0.0','signed-bad':'1.0.0'}],
+  ['missing',{'signed-a':'1.0.0','unsigned-pkg':'1.0.0'}],
+  ['json',{'signed-a':'1.0.0','signed-bad':'1.0.0','unsigned-pkg':'1.0.0'},['--json']],
+  ['json-valid',{'signed-a':'1.0.0'},['--json']],
+  ['no-keys',{'unsigned-pkg':'1.0.0'},[],{signingKeys:false}],
+  ['non-registry',{'signed-a':'1.0.0',local:'file:./local'}],
+  ['no-deps',{}],
+])add(`audit-signatures-${name}`,'audit',['audit','signatures',...flags],dir=>{manifest(dir,{dependencies:deps});if(deps.local)manifest(path.join(dir,'local'),{name:'local',version:'1.0.0'});},{signingKeys:true,before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(p.stderr);},...extra});
 // A link target whose folder is missing still carries the linking node's flags.
 add('install-missing-link-target-dev','install',['install','--ignore-scripts','--package-lock-only'],dir=>manifest(dir,{devDependencies:{cfg:'file:packages/cfg'}}));
 // npm ci links a workspace whose folder is missing, leaving a dangling link;
@@ -758,10 +822,94 @@ for(const [name,flags] of [['publish',['--ignore-scripts']],['publish-json',['--
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
 add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});
+// --- layout parity: install strategies, --install-links, offline modes ---
+// Shared transitive deps, a peer, bins at two depths, a version conflict and
+// a workspace, laid out under each install strategy.
+for(const [name,versions] of Object.entries({
+  'lay-top-a':{'1.0.0':{bin:{'lay-a':'index.js'},dependencies:{'lay-shared':'^1.0.0','lay-mid':'1.0.0'}}},
+  'lay-top-b':{'1.0.0':{dependencies:{'lay-shared':'^1.0.0','lay-peer-user':'1.0.0'}}},
+  'lay-mid':{'1.0.0':{bin:{'lay-mid':'index.js'},dependencies:{'lay-shared':'^1.0.0','lay-leaf':'1.0.0'}}},
+  'lay-leaf':{'1.0.0':{}},
+  'lay-shared':{'1.0.0':{},'2.0.0':{}},
+  'lay-peer-user':{'1.0.0':{peerDependencies:{'lay-peer-host':'^1.0.0'}}},
+  'lay-peer-host':{'1.0.0':{}},
+  '@lay/scoped':{'1.0.0':{dependencies:{'lay-leaf':'1.0.0'}}},
+})){
+  const packed={};
+  // npm pack names a scoped tarball scope-name-version.tgz.
+  const file=name.replace(/^@/,'').replace('/','-');
+  for(const [version,fields]of Object.entries(versions)){
+    const dir=path.join(root,'tarballs',`${file}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const bytes=fs.readFileSync(path.join(dir,`${file}-${version}.tgz`));tarballs.set(`/${file}-${version}.tgz`,bytes);
+    packed[version]={name,version,...fields,dist:{tarball:`${registry}${file}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+  }
+  probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+// A second linked install keeps an unchanged scoped store folder: a marker
+// dropped into it survives.
+{
+  const scoped=dir=>manifest(dir,{dependencies:{'@lay/scoped':'1.0.0','lay-top-b':'1.0.0'}});
+  const linked=['install','--ignore-scripts','--install-strategy=linked'];
+  add('layout-strategy-install-linked-scoped','install',linked,scoped);
+  // An optional package for another platform stays out of the store.
+  const foreign=dir=>manifest(dir,{dependencies:{'lay-leaf':'1.0.0'},optionalDependencies:{'multi-native':'1.0.0'}});
+  add('layout-strategy-install-linked-foreign-optional','install',linked,foreign);
+  add('layout-strategy-ci-linked-foreign-optional','ci',['ci','--ignore-scripts','--install-strategy=linked'],foreign,{before:async ctx=>{
+    const p=await ctx.exec(linked);if(p.exit!==0)throw new Error(`linked seed failed: ${p.stderr}`);
+    fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});
+  }});
+  add('layout-strategy-reinstall-linked-scoped','install',linked,scoped,{before:async ctx=>{
+    const p=await ctx.exec(linked);if(p.exit!==0)throw new Error(`linked seed failed: ${p.stderr}`);
+    const scope=path.join(ctx.dir,'node_modules/.store/@lay');
+    for(const key of fs.readdirSync(scope))write(path.join(scope,key),'kept.txt','kept\n');
+  }});
+}
+const layoutTree=dir=>{
+  manifest(dir,{workspaces:['packages/*'],dependencies:{'lay-top-a':'1.0.0','lay-top-b':'1.0.0'}});
+  manifest(path.join(dir,'packages/w'),{name:'w',version:'1.0.0',dependencies:{'lay-mid':'1.0.0','lay-shared':'^2.0.0'}});
+};
+const layoutSeed=(flags,remove)=>({before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts',...flags]);if(p.exit!==0)throw new Error(`layout seed failed: ${p.stderr}`);for(const name of remove)fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});}});
+for(const [name,flags] of [['nested',['--install-strategy=nested']],['shallow',['--install-strategy=shallow']],['linked',['--install-strategy=linked']],['global-style',['--global-style']],['legacy-bundling',['--legacy-bundling']]]){
+  add(`layout-strategy-install-${name}`,'install',['install','--ignore-scripts',...flags],layoutTree);
+  add(`layout-strategy-ls-${name}`,'ls',['ls','--all'],layoutTree,layoutSeed(flags,[]));
+  add(`layout-strategy-ci-${name}`,'ci',['ci','--ignore-scripts',...flags],layoutTree,layoutSeed(flags,['node_modules','packages/w/node_modules']));
+}
+// --install-links packs a file: directory outside the project and installs a
+// real copy; one inside the project and workspaces stay links.
+const layoutLocal=folder=>dir=>{
+  const local=path.join(dir,folder);
+  manifest(dir,{dependencies:{local:'file:'+folder,'lay-top-b':'1.0.0'}});
+  manifest(local,{name:'local',version:'1.0.0',bin:{'local-cli':'cli.js'},dependencies:{'lay-shared':'^1.0.0'}});
+  write(local,'cli.js','#!/usr/bin/env node\nconsole.log("local");\n');
+};
+for(const [name,folder] of [['external','../local'],['internal','./local']]){
+  add(`layout-install-links-${name}`,'install',['install','--ignore-scripts','--install-links'],layoutLocal(folder));
+  add(`layout-install-links-${name}-ci`,'ci',['ci','--ignore-scripts','--install-links'],layoutLocal(folder),layoutSeed(['--install-links'],['node_modules']));
+}
+add('layout-install-links-workspace','install',['install','--ignore-scripts','--install-links'],layoutTree);
+// Offline modes against a warm cache (request logs compared) and a cold one.
+// Which URLs each mode contacts; npm revalidates one packument once per
+// spec it resolves, a repeat count that carries no behavior of its own.
+const layoutRequests=({requests})=>[...new Set(requests.map(({method,url})=>`${method} ${url}`))].sort();
+const layoutOffline=dir=>manifest(dir,{dependencies:{'lay-top-b':'1.0.0'}});
+for(const flag of ['--offline','--prefer-offline','--prefer-online','']){
+  const tag=flag?flag.slice(2):'cache-default',flags=flag?[flag]:[];
+  add(`layout-${tag}-install-warm`,'install',['install','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],['node_modules','package-lock.json']),observe:layoutRequests});
+  add(`layout-${tag}-ci-warm`,'ci',['ci','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],['node_modules']),observe:layoutRequests});
+  add(`layout-${tag}-install-cold`,'install',['install','--ignore-scripts',...flags],layoutOffline,{observe:layoutRequests});
+  // A packument that was never cached, and a cached packument whose tarball was not.
+  add(`layout-${tag}-install-missing-packument`,'install',['install','lay-mid@1.0.0','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],[]),observe:layoutRequests});
+  add(`layout-${tag}-install-missing-tarball`,'install',['install','lay-shared@2.0.0','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],[]),observe:layoutRequests});
+}
+// --- end layout parity ---
 // Only stack frames inside npm's JavaScript dependencies or Node internals differ
 // by runtime. Preserve the inspected error properties, including its brace.
 const normalizeJsFrames=str=>str.replace(/^npm error {5}at .*?(?:node:|[\\/]node_modules[\\/]npm[\\/]node_modules[\\/]).*\r?\n/gm,line=>line.trimEnd().endsWith('{')?'npm error {\n':'');
-const normalize=(str,dir,config)=>normalizeJsFrames(str).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
+// npm's rollback on Windows sometimes races its own folder removal and
+// warns EPERM; whether it does is timing, not behavior.
+const normalizeCleanupRace=str=>str.replace(/^npm warn cleanup .*\r?\n/gm,'');
+const normalize=(str,dir,config)=>normalizeJsFrames(normalizeCleanupRace(str)).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
 function snapshot(dir,config){
   if(!fs.existsSync(dir))return {};
   const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){
@@ -785,7 +933,7 @@ for(const c of cases){
     if(c.userconfig)write(config,'user.npmrc',c.userconfig);
     const exec=async args=>{const p=await run(tool==='npm'?process.execPath:binary,tool==='npm'?[npmCli,...args]:args,dir,env,c.input);return p;};
     if(c.before)await c.before({dir,env,exec});
-    authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};securityRequireAuth=!!c.advisoryAuth;
+    authScenario=c.authScenario||'';authPolls=0;securityAdvisories=c.advisories||{};securityRequireAuth=!!c.advisoryAuth;signingKeys=!!c.signingKeys;
     const start=requests.length;const p=await exec(c.args);
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);

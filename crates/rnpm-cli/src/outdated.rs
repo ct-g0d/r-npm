@@ -383,11 +383,22 @@ pub async fn run_outdated_inner(
 
     // 5. Fetch packument metadata concurrently and determine wanted / latest
     let mut join_set = tokio::task::JoinSet::new();
+    // `before` needs publish times, which only the full packument carries.
+    let before = config.before_cutoff();
 
     for (dep, current, homepage) in installed_info {
         let client_clone = client.clone();
         join_set.spawn(async move {
-            let res = client_clone.get_package_metadata(&dep.name).await;
+            let res = match before {
+                Some(cutoff) => client_clone
+                    .get_package_metadata_full(&dep.name)
+                    .await
+                    .map(|mut packument| {
+                        rnpm_install::apply_before(&mut packument, cutoff);
+                        packument
+                    }),
+                None => client_clone.get_package_metadata(&dep.name).await,
+            };
             (dep, current, homepage, res)
         });
     }

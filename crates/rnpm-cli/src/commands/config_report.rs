@@ -111,11 +111,9 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                 continue;
             }
             "noproxy" => {
-                *value = Value::Array(vec![Value::String(
-                    std::env::var("NO_PROXY")
-                        .or_else(|_| std::env::var("no_proxy"))
-                        .unwrap_or_default(),
-                )]);
+                // npm's default is "", shown as [""]; NO_PROXY is not read
+                // into the setting.
+                *value = Value::Array(vec![Value::String(String::new())]);
                 continue;
             }
             _ => rnpm_config::npm_default(key).unwrap_or_default(),
@@ -237,6 +235,28 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
+        // npm lists the proxy variables it reads from the environment, the
+        // first spelling of each name in environment order.
+        let mut seen = std::collections::HashSet::new();
+        let mut env_vars: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| {
+                let lower = k.to_ascii_lowercase();
+                ["http_proxy", "https_proxy", "proxy", "no_proxy"].contains(&lower.as_str())
+                    && seen.insert(lower)
+            })
+            .collect();
+        if cfg!(windows) {
+            // Windows keeps its environment block sorted by uppercased name.
+            env_vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
+        }
+        if !env_vars.is_empty() {
+            text.push("; environment-related config".into());
+            text.push(String::new());
+            for (k, v) in env_vars {
+                text.push(format!("; {k} = {}", serde_json::to_string(&v).unwrap_or_default()));
+            }
+            text.push(String::new());
+        }
         text.extend([
             format!("; node bin location = {}", node.display()),
             format!("; node version = {version}"),

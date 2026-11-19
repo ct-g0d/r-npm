@@ -135,6 +135,12 @@ impl Config {
             })
     }
 
+    /// npm's `before`: resolve only versions published on or before this
+    /// instant (milliseconds since the epoch).
+    pub fn before_cutoff(&self) -> Option<i64> {
+        self.get("before").and_then(crate::date::parse_js_date)
+    }
+
     pub fn load(project_dir: Option<&Path>) -> Result<Self, ConfigError> {
         Self::load_with_options(ConfigOptions {
             project_dir,

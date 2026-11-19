@@ -68,6 +68,7 @@ pub use trash::*;
 pub mod save;
 pub use save::*;
 
+pub mod isolated;
 pub mod linked;
 pub mod policy;
 pub use linked::*;
@@ -204,6 +205,11 @@ use rnpm_solver::{
 
 /// Converts registry AbbreviatedPackageMetadata to Solver PackageMetadata.
 pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> PackageMetadata {
+    if let Some(cutoff) = before_cutoff().filter(|_| !meta.time.is_empty()) {
+        let mut dated = meta.clone();
+        apply_before(&mut dated, cutoff);
+        return abbreviated_to_package_metadata(&dated);
+    }
     let mut dist_tags = BTreeMap::new();
     for (k, v) in &meta.dist_tags {
         dist_tags.insert(k.clone(), v.clone());
@@ -316,6 +322,104 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
     }
 }
 
+/// `--prefer-online`: pacote skips its integrity cache shortcut and fetches
+/// every registry tarball again, verifying it against the locked integrity.
+async fn refetch_tarballs_online(
+    client: &RegistryClient,
+    tarballs: Vec<(String, String)>,
+) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(16));
+    for (url, integrity) in tarballs {
+        if !url.starts_with("http") {
+            continue;
+        }
+        let client = client.clone();
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+            let bytes = client
+                .download_tarball_bytes(&url)
+                .await
+                .map_err(|e| anyhow!("Failed to download tarball from {url}: {e}"))?;
+            if let Ok(expected) = integrity.parse::<Integrity>() {
+                expected
+                    .verify(&bytes)
+                    .map_err(|e| anyhow!("Integrity verification failed for {url}: {e}"))?;
+            }
+            anyhow::Ok(())
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        res.map_err(|e| anyhow!("{e}"))??;
+    }
+    Ok(())
+}
+
+/// npm's `before` cutoff (ms since the epoch); `i64::MAX` when unset.
+static BEFORE_CUTOFF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
+
+/// Sets the `before` cutoff that registry metadata is filtered by.
+pub fn set_before_cutoff(cutoff: Option<i64>) {
+    BEFORE_CUTOFF.store(
+        cutoff.unwrap_or(i64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn before_cutoff() -> Option<i64> {
+    Some(BEFORE_CUTOFF.load(std::sync::atomic::Ordering::Relaxed)).filter(|&c| c != i64::MAX)
+}
+
+/// npm-pick-manifest under `before`: versions published after the cutoff are
+/// out, and a dist-tag on such a version falls back to the version npm picks
+/// for `<=tagged`. A packument without publish times is left as is.
+pub fn apply_before(meta: &mut AbbreviatedPackageMetadata, cutoff: i64) {
+    let time = std::mem::take(&mut meta.time);
+    if time.is_empty() {
+        return;
+    }
+    let is_before = |ver: &str| {
+        time.get(ver)
+            .and_then(|t| rnpm_config::date::parse_js_date(t))
+            .is_none_or(|t| t <= cutoff)
+    };
+    meta.versions.retain(|ver, _| is_before(ver));
+    let latest = meta.dist_tags.get("latest").cloned();
+    let picks: Vec<(String, Option<String>)> = meta
+        .dist_tags
+        .iter()
+        .filter(|(_, ver)| !is_before(ver))
+        .map(|(tag, ver)| {
+            let Ok(range) = rnpm_core::semver::Range::parse(&format!("<={ver}")) else {
+                return (tag.clone(), None);
+            };
+            let satisfies = |v: &str| Version::parse(v).is_ok_and(|v| range.satisfies(&v));
+            // The default tag wins when it is old enough and in range.
+            let preferred = latest.as_ref().filter(|l| {
+                satisfies(l) && meta.versions.get(*l).is_some_and(|m| m.deprecated.is_none())
+            });
+            let pick = preferred.cloned().or_else(|| {
+                meta.versions
+                    .iter()
+                    .filter_map(|(v, m)| Some((Version::parse(v).ok()?, v, m)))
+                    .filter(|(parsed, _, _)| range.satisfies(parsed))
+                    .max_by(|a, b| {
+                        (a.2.deprecated.is_none(), &a.0).cmp(&(b.2.deprecated.is_none(), &b.0))
+                    })
+                    .map(|(_, v, _)| v.clone())
+            });
+            (tag.clone(), pick)
+        })
+        .collect();
+    for (tag, pick) in picks {
+        match pick {
+            Some(ver) => meta.dist_tags.insert(tag, ver),
+            None => meta.dist_tags.remove(&tag),
+        };
+    }
+}
+
 type RevalidationItem = (
     String,
     Option<String>,
@@ -329,6 +433,10 @@ pub struct RegistryPackageProvider {
     cache: Cache,
     offline: bool,
     prefer_offline: bool,
+    prefer_online: bool,
+    /// Packages named on the command line: never served from the lockfile
+    /// shortcut, so a stale packument is revalidated as npm does.
+    named_packages: std::collections::HashSet<String>,
     git_fetcher: crate::git::GitFetcher,
     lockfile: Option<Arc<LockfileV3>>,
     unlocked_packages: std::collections::HashSet<String>,
@@ -848,8 +956,12 @@ impl RegistryPackageProvider {
             if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                 self.merge_lockfile_metadata(name, &mut meta);
-                let is_in_lockfile = self.is_package_locked(name);
-                if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, self.offline) {
+                let is_in_lockfile =
+                    self.is_package_locked(name) && !self.named_packages.contains(name);
+                if is_in_lockfile
+                    || (!self.prefer_online
+                        && is_packument_fresh(&entry, self.prefer_offline, self.offline))
+                {
                     return Ok(meta);
                 }
             }
@@ -927,10 +1039,15 @@ impl RegistryPackageProvider {
         }
 
         if self.offline {
+            let url = self
+                .client
+                .package_metadata_url(name)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| name.to_string());
             return Err(SolverError::PackageMetadata(
                 name.to_string(),
                 format!(
-                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                    "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
                 ),
             ));
         }
@@ -970,10 +1087,35 @@ impl RegistryPackageProvider {
                 }
                 Err(SolverError::PackageMetadata(
                     name.to_string(),
-                    e.to_string(),
+                    self.metadata_error_message(name, &e),
                 ))
             }
         }
+    }
+
+    /// npm-registry-fetch reports a failing status as HttpErrorGeneral:
+    /// `E<status>` and `<status> <reason> - GET <url>[ - <body.error>]`.
+    fn metadata_error_message(&self, name: &str, e: &rnpm_registry::RegistryError) -> String {
+        let rnpm_registry::RegistryError::ServerError { status, body } = e else {
+            return e.to_string();
+        };
+        let Ok(url) = self.client.package_metadata_url(name) else {
+            return e.to_string();
+        };
+        let reason = rnpm_registry::StatusCode::from_u16(*status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("");
+        let mut message = format!("{status} {reason} - GET {url}");
+        if let Some(error) = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .filter(|s| !s.is_empty())
+        {
+            message.push_str(" - ");
+            message.push_str(&error);
+        }
+        format!("npm error code E{status}\nnpm error {message}")
     }
 }
 
@@ -1126,8 +1268,11 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 self.merge_lockfile_metadata(name, &mut meta);
-                                if is_in_lockfile
-                                    || is_packument_fresh(&entry, self.prefer_offline, false)
+                                // A package named on the command line is
+                                // resolved afresh, so its packument is revalidated.
+                                if (is_in_lockfile && !self.named_packages.contains(name))
+                                    || (!self.prefer_online
+                                        && is_packument_fresh(&entry, self.prefer_offline, false))
                                 {
                                     local_fresh.push((name.to_string(), meta));
                                     continue;
@@ -1330,8 +1475,10 @@ pub fn apply_npmrc_to_client_config(
 
     if let Some(no_proxy_val) = npmrc
         .settings
-        .get("no-proxy")
+        .get("noproxy")
+        .or_else(|| npmrc.settings.get("no-proxy"))
         .or_else(|| npmrc.settings.get("no_proxy"))
+        .filter(|v| !v.is_empty())
     {
         client_config.no_proxy = Some(no_proxy_val.clone());
     }
@@ -1362,13 +1509,14 @@ pub fn apply_npmrc_to_client_config(
         .or_else(|| npmrc.settings.get("fetch_timeout"))
         .or_else(|| npmrc.settings.get("timeout"))
         .and_then(|val_str| val_str.trim().parse::<u64>().ok());
-    if let Some(ms) = timeout_ms {
-        client_config.timeout = std::time::Duration::from_millis(ms);
-    }
+    // npm's fetch-timeout defaults to 5 minutes. A shorter cap on the whole
+    // request kills large packuments sharing a slow link, and their retries
+    // saturate it again: antd's ~180 full packuments never finished at 30s.
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
+    client_config.timeout = timeout;
     // make-fetch-happen only gives up on a stalled body after fetch-timeout
     // (default 5 minutes); a short idle cutoff fails large tarballs under load.
-    client_config.chunk_idle_timeout =
-        std::time::Duration::from_millis(timeout_ms.unwrap_or(300_000));
+    client_config.chunk_idle_timeout = timeout;
 
     let connect_timeout_ms = npmrc
         .settings
@@ -1469,6 +1617,10 @@ pub struct InstallOptions {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub prefer_offline: bool,
+    /// `--prefer-online`: revalidate every cached packument and tarball.
+    pub prefer_online: bool,
+    /// `--install-links`: pack and copy external `file:` directories.
+    pub install_links: bool,
     pub force: bool,
     pub ignore_scripts: bool,
     pub foreground_scripts: bool,
@@ -1551,6 +1703,8 @@ impl Default for InstallOptions {
             cache_dir: None,
             offline: false,
             prefer_offline: false,
+            prefer_online: false,
+            install_links: false,
             force: false,
             ignore_scripts: false,
             foreground_scripts: false,
@@ -1866,6 +2020,44 @@ fn is_directory_dependency(path: &Path) -> bool {
             .any(|suffix| spec.ends_with(suffix))
 }
 
+/// `--install-links`: arborist packs a `file:` directory outside the project
+/// and installs the packed files as a real folder; one inside the project
+/// (`clean_rel` not climbing out) stays a link.
+fn installs_as_copy(install_links: bool, clean_rel: &str) -> bool {
+    install_links && (clean_rel == ".." || clean_rel.starts_with("../"))
+}
+
+/// Copies the files `npm pack` would include from `src` into `dest`.
+fn copy_packed_directory(src: &Path, dest: &Path) -> Result<()> {
+    let manifest = Manifest::from_file(src.join("package.json"))
+        .with_context(|| format!("Failed to read {}", src.join("package.json").display()))?;
+    let files = rnpm_fs::collect_pack_files(src, &manifest)
+        .map_err(|e| anyhow!("Failed to list files to pack in {}: {e}", src.display()))?;
+    for (rel, from) in files {
+        let to = dest.join(&rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+/// The lock entry of a packed `file:` directory: the target's fields under
+/// the node's own location, resolved to the `file:` spec.
+fn packed_directory_entry(
+    abs_file: &Path,
+    clean_rel: &str,
+    node: &rnpm_solver::graph::Node,
+) -> LockfilePackage {
+    LockfilePackage {
+        resolved: Some(format!("file:{clean_rel}")),
+        name: None,
+        ..directory_target_entry(abs_file, clean_rel, node)
+    }
+}
+
 /// The lockfile location a `file:` directory link points at, as npm writes it:
 /// relative, forward slashes, and `""` for the project root itself.
 fn link_target_rel(rel_file: &str) -> String {
@@ -2049,6 +2241,10 @@ pub struct Installer {
     engine_strict: bool,
     /// The ideal lockfile a --dry-run install planned but did not write.
     dry_run_ideal: Option<LockfileV3>,
+    /// package.json bytes from before this install saved new specs. npm saves
+    /// them only after reify succeeds, so a failure before the lockfile is
+    /// written puts them back.
+    manifest_rollback: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Installer {
@@ -2065,6 +2261,14 @@ impl Installer {
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
         options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
+        // Peer handling is config, whichever command or source sets it.
+        options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
+        options.strict_peer_deps |= config.get_bool("strict-peer-deps").unwrap_or(false);
+        set_before_cutoff(config.before_cutoff());
+        options.offline |= config.get_bool("offline").unwrap_or(false);
+        options.prefer_offline |= config.get_bool("prefer-offline").unwrap_or(false);
+        options.prefer_online |= config.get_bool("prefer-online").unwrap_or(false);
+        options.install_links |= config.get_bool("install-links").unwrap_or(false);
 
         if options.install_strategy == InstallStrategy::Hoisted {
             if let Some(strat_str) = config
@@ -2207,6 +2411,7 @@ impl Installer {
             script_policy,
             engine_strict: config.get_bool("engine-strict").unwrap_or(false),
             dry_run_ideal: None,
+            manifest_rollback: Vec::new(),
         })
     }
 
@@ -2525,6 +2730,12 @@ impl Installer {
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
         let res = self.install_internal().await;
+        let rollback = std::mem::take(&mut self.manifest_rollback);
+        if res.is_err() {
+            for (path, bytes) in rollback {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
         if self.options.wait_for_trash || !self.options.detached_trash {
             crate::trash::wait_all_trash_deletions();
         }
@@ -3108,6 +3319,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache: self.cache.clone(),
             offline: self.options.offline,
             prefer_offline,
+            prefer_online: self.options.prefer_online,
+            named_packages: added_pkgs.iter().map(|a| a.name.clone()).collect(),
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
             unlocked_packages: unlocked_packages.clone(),
@@ -3127,6 +3340,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             unlocked_packages,
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),
             force: self.options.force,
+            install_strategy: match self.options.install_strategy {
+                InstallStrategy::Nested => rnpm_solver::hoisting::PlacementStrategy::Nested,
+                InstallStrategy::Shallow => rnpm_solver::hoisting::PlacementStrategy::Shallow,
+                // The linked layout is built from npm's hoisted ideal tree.
+                InstallStrategy::Hoisted | InstallStrategy::Linked => {
+                    rnpm_solver::hoisting::PlacementStrategy::Hoisted
+                }
+            },
         };
 
         let mut graph = if !workspace_members.is_empty() {
@@ -3211,6 +3432,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 && !self.options.skip_manifest_save
                 && !self.options.dry_run
             {
+                let mut paths = Vec::new();
+                if target_root {
+                    paths.push(self.options.project_dir.join("package.json"));
+                }
+                for &idx in &targeted_workspace_indices {
+                    let rel = &workspace_members[idx].relative_path;
+                    paths.push(self.options.project_dir.join(rel).join("package.json"));
+                }
+                self.manifest_rollback = paths
+                    .into_iter()
+                    .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+                    .collect();
                 save::save_manifests(
                     &self.options.project_dir,
                     &manifest,
@@ -3346,6 +3579,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if is_directory_dependency(&abs_file) {
                             let clean_rel = link_target_rel(rel_file);
                             let clean_rel = clean_rel.as_str();
+                            if installs_as_copy(self.options.install_links, clean_rel) {
+                                lockfile.insert_package(
+                                    loc,
+                                    packed_directory_entry(&abs_file, clean_rel, node),
+                                );
+                                continue;
+                            }
                             let link_entry = LockfilePackage {
                                 resolved: Some(clean_rel.to_string()),
                                 link: Some(true),
@@ -3534,7 +3774,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
 
         // Milestone M3: Diff ideal tree against actual tree (node_modules/.package-lock.json)
+        // A linked tree's hidden lockfile describes the isolated store, not
+        // the hoisted plan: diffing the two would delete every store folder.
+        // reify_isolated reconciles that tree itself.
         let actual_lockfile_opt = if !self.options.force
+            && self.options.install_strategy != InstallStrategy::Linked
             && validate_hidden_lockfile(&loc_base_dir, Some(&self.options))
         {
             LockfileV3::load_hidden(&loc_base_dir).ok()
@@ -3632,17 +3876,26 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            return self
-                .execute_linked_install(
-                    &manifest,
-                    &graph,
-                    &lockfile,
-                    &node_modules_dir,
-                    &root_bin_dir,
-                    collector,
-                    plan_start,
-                )
-                .await;
+            let added = self
+                .reify_isolated(&lockfile, existing_lockfile_for_merge.as_deref())
+                .await?;
+            self.manifest_rollback.clear();
+            let lockfile_path = project_lockfile_path(&self.options.project_dir);
+            if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
+                lockfile
+                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
+            }
+            self.run_linked_root_hooks(&manifest).await?;
+            collector.record_phase(Phase::Plan, plan_start.elapsed());
+            return Ok(InstallSummary {
+                reify: None,
+                packages_installed: added,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path,
+                timing: Some(collector.finish()),
+            });
         }
 
         let mut cache_hits = 0;
@@ -3982,6 +4235,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             }
                         }
                         continue;
+                    } else if is_directory_dependency(&abs_file)
+                        && installs_as_copy(self.options.install_links, &link_target_rel(rel_file))
+                    {
+                        if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_junction(&dest_dir);
+                        }
+                        if dest_dir.exists() {
+                            let _ = std::fs::remove_dir_all(&dest_dir);
+                        }
+                        copy_packed_directory(&abs_file, &dest_dir)?;
+                        packages_installed += 1;
+                        let clean_rel = link_target_rel(rel_file);
+                        lockfile.insert_package(
+                            loc,
+                            packed_directory_entry(&abs_file, &clean_rel, node),
+                        );
+                        continue;
                     } else if is_directory_dependency(&abs_file) {
                         if dest_dir.exists() || rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
                             let _ = rnpm_fs::remove_junction(&dest_dir);
@@ -4117,6 +4387,46 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     "Package installation path '{cleaned_dest:?}' escapes project root"
                 ));
             }
+        }
+
+        // An uncached tarball fails an offline install before anything is
+        // reified, so npm's rollback leaves the tree as it was.
+        if self.options.offline {
+            for (_, node) in &packages_to_download {
+                let Some(url) = node.resolved.as_deref() else {
+                    continue;
+                };
+                if node.flags.optional || !url.starts_with("http") {
+                    continue;
+                }
+                let packed = node
+                    .integrity
+                    .as_deref()
+                    .is_some_and(|i| !i.is_empty() && self.pack_store.has_package_pack(i));
+                if !packed && !matches!(self.cache.get(url), Ok(Some(_))) {
+                    return Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
+                    ));
+                }
+            }
+        }
+
+        if self.options.prefer_online {
+            // Only nodes reify actually changes are fetched; an installed
+            // folder already at the planned version is left alone.
+            let tarballs = packages_to_download
+                .iter()
+                .filter(|(loc, node)| {
+                    let installed = Manifest::from_file(loc_base_dir.join(loc).join("package.json"))
+                        .ok()
+                        .and_then(|m| m.version);
+                    installed.as_deref() != Some(node.version.as_str())
+                })
+                .filter_map(|(_, node)| {
+                    Some((node.resolved.clone()?, node.integrity.clone().unwrap_or_default()))
+                })
+                .collect();
+            refetch_tarballs_online(&self.registry_client, tarballs).await?;
         }
 
         let all_packs_available = !packages_to_download.is_empty()
@@ -4485,7 +4795,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         return Ok(None);
                     }
                     return Err(anyhow!(
-                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                     ));
                 } else {
                     info!("Downloading {}", resolved_url);
@@ -4841,6 +5151,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         } else {
             None
         };
+        // Reify succeeded: the saved package.json stays, as npm's does.
+        self.manifest_rollback.clear();
 
         // Removing empty bin folders changes package directory mtimes. Finish
         // that before saving the hidden lock so our own cleanup cannot stale it.
@@ -5296,7 +5608,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
-        if node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false) {
+        // An install that reuses the lockfile keeps a linked tree: its store
+        // folders are reconciled in place, as arborist's reify diff does.
+        let keeps_linked_tree =
+            !from_scratch && self.options.install_strategy == InstallStrategy::Linked;
+        if !keeps_linked_tree
+            && (node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false))
+        {
             fast_trash_wipe_dir(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
@@ -5363,9 +5681,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            return self
-                .execute_linked_ci(&manifest, &lockfile, &node_modules_dir, &bin_dir, collector)
-                .await;
+            // ci loads every node from the lockfile.
+            let added = self.reify_isolated(&lockfile, Some(&lockfile)).await?;
+            self.run_linked_root_hooks(&manifest).await?;
+            return Ok(InstallSummary {
+                reify: None,
+                packages_installed: added,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path: project_lockfile_path(&self.options.project_dir),
+                timing: Some(collector.finish()),
+            });
         }
 
         let mut cache_hits = 0;
@@ -5636,6 +5962,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             };
 
+            // A packed `file:` directory (`--install-links`) is copied again
+            // from its source folder.
+            if let Some(rel) = resolved_url.strip_prefix("file:") {
+                let src = self.options.project_dir.join(rel);
+                if pkg_info.link != Some(true) && src.is_dir() {
+                    if full_target.exists() {
+                        let _ = std::fs::remove_dir_all(&full_target);
+                    }
+                    copy_packed_directory(&src, &full_target)?;
+                    packages_installed += 1;
+                    continue;
+                }
+            }
+
             let is_git = resolved_url.starts_with("git+")
                 || resolved_url.starts_with("git:")
                 || PackageTarget::parse(resolved_url)
@@ -5781,11 +6121,19 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             continue;
                         }
                         return Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                         ));
                     }
                 }
             }
+        }
+
+        if self.options.prefer_online {
+            let tarballs = packages_to_process
+                .iter()
+                .map(|(_, url, integrity, _, _, _)| (url.clone(), integrity.clone()))
+                .collect();
+            refetch_tarballs_online(&self.registry_client, tarballs).await?;
         }
 
         let mut custom_cfg = (*self.writer_cfg).clone();
@@ -6006,7 +6354,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 return Ok(None);
                             }
                             return Err(anyhow!(
-                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                                "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                             ));
                         } else {
                             let _io_permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -6780,7 +7128,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 return Ok(None);
                             }
                             return Err(anyhow!(
-                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                                "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                             ));
                         } else {
                             match registry_client.download_tarball_bytes(&resolved_url).await {
@@ -8003,7 +8351,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     return (
                         idx,
                         Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{url_str}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            "npm error code ENOTCACHED\nnpm error request to {url_str} failed: cache mode is 'only-if-cached' but no cached response is available."
                         )),
                     );
                 }

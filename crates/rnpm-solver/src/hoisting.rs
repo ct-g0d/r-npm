@@ -11,6 +11,18 @@ pub enum PlacementDecision {
     PlaceNew(String),
 }
 
+/// npm's `install-strategy` as it affects PlaceDep's target walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlacementStrategy {
+    /// Hoist as high as possible (the default).
+    #[default]
+    Hoisted,
+    /// `nested` (`--legacy-bundling`): place under the dependent itself.
+    Nested,
+    /// `shallow` (`--global-style`): never hoist above a top-level node.
+    Shallow,
+}
+
 /// A peer provider cannot nest inside a package that itself peers on that name.
 /// Follow the peer group up to npm's deepestNestingTarget.
 pub fn peer_provider_scope<'a>(graph: &DependencyGraph, owner: &'a str, name: &str) -> &'a str {
@@ -244,6 +256,7 @@ pub fn determine_placement(
         None,
         None,
         true,
+        PlacementStrategy::Hoisted,
     )
 }
 
@@ -266,6 +279,7 @@ pub fn determine_placement_with_peers(
     resolved: Option<&str>,
     integrity: Option<&str>,
     placing_peer: bool,
+    strategy: PlacementStrategy,
 ) -> PlacementDecision {
     let mut root_target = String::with_capacity(14 + install_name.len());
     root_target.push_str("node_modules/");
@@ -313,6 +327,20 @@ pub fn determine_placement_with_peers(
         return PlacementDecision::PlaceNew(root_target);
     }
 
+    // PlaceDep leaves an edge alone when its nearest visible node already
+    // satisfies it; nested placement then stops at the dependent itself.
+    if strategy == PlacementStrategy::Nested {
+        if let Some(existing) = find_visible_node(graph, parent_location, install_name) {
+            if existing.name == package_name
+                && node_satisfies_target(existing, target)
+                && reuse_peer_set(existing, &existing.location)
+            {
+                return PlacementDecision::Reuse(existing.location.clone());
+            }
+        }
+        return PlacementDecision::PlaceNew(format!("{parent_location}/node_modules/{install_name}"));
+    }
+
     // Attempt 1: Check root node_modules
     if let Some(existing) = graph.nodes.get(&root_target) {
         if existing.name == package_name
@@ -331,7 +359,8 @@ pub fn determine_placement_with_peers(
             }
         }
         // Root is occupied and either incompatible or shadowed -> conflict!
-    } else {
+    } else if strategy != PlacementStrategy::Shallow {
+        // Shallow placement never hoists a transitive dependency to the root.
         // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
         if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target)
             && (placing_peer

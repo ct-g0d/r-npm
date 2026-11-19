@@ -1,6 +1,7 @@
 #![allow(clippy::manual_strip)]
 
 pub mod config;
+pub mod date;
 pub mod error;
 pub mod npm_keys;
 pub mod npmrc;

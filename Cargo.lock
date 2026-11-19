@@ -1127,6 +1127,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "reqwest",
+ "ring",
  "rnpm-cache",
  "rnpm-config",
  "rnpm-core",
@@ -1151,6 +1152,7 @@ name = "rnpm-config"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "libc",
  "rnpm-core",
  "serde",
  "serde_json",
