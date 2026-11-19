@@ -68,7 +68,9 @@
 
 ### Supported Protocol Surface
 - **Registry Packages:** Ordinary registry dependencies, dist-tags, semver ranges, and scoped packages (`@scope/pkg`).
-- **Local Directories (`file:../dir`):** Linked via unprivileged directory junctions (Windows) or symlinks (Unix).
+- **Local Directories (`file:../dir`):** Linked via unprivileged directory junctions (Windows) or symlinks (Unix). With `--install-links`, a directory outside the project is packed and installed as a real copy, as npm does; one inside the project stays a link.
+- **Install strategies:** `hoisted` (default), `nested` (`--legacy-bundling`), `shallow` (`--global-style`) and `linked`. `linked` builds npm's isolated tree: `node_modules/.store/<name>@<version>-<hash>/node_modules/<name>` per package with links per dependency, keyed exactly as arborist keys it.
+- **Cache modes:** `--offline`, `--prefer-offline` and `--prefer-online` contact the registry exactly where npm does, including re-fetching tarballs under `--prefer-online`.
 - **Local Archives (`file:./pkg.tgz`):** In-memory manifest extraction, streaming unpacking, and SSRI sha512 integrity generation.
 - **Workspaces (`workspace:*`, `workspace:^`, `workspace:~`):** Multi-tier workspace DAGs, cross-package linking, and topological script execution.
 - **Git Dependencies (`github:user/repo`, `gitlab:`, `bitbucket:`, `git+https://`, `git+ssh://`, `git://`, `git+file://`):** Remote repositories with optional commit-ish / tag specs.
@@ -127,7 +129,7 @@ npm error See docs/compatibility-contract.md for the active compatibility surfac
 
 ### 4.2. Local Dependencies: `file:` Protocol
 - **Distinguish Directories vs Tarballs:**
-  - `file:../local-dir`: Directory reference. Must be linked via platform directory link (NTFS Junction on Windows, symlink on Unix). Never copy or re-pack.
+  - `file:../local-dir`: Directory reference. Linked via platform directory link (NTFS Junction on Windows, symlink on Unix), unless `--install-links` packs a directory outside the project into a real copy.
   - `file:../local-pkg.tgz`: Tarball archive. Must be unpacked, verified, and installed like a registry package.
 
 ### 4.3. Optional Dependencies Multi-Stage Failure Isolation
