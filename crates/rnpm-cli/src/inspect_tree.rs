@@ -293,8 +293,21 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
     let mut raw_entries = Vec::new();
     let mut nm_queue = VecDeque::new();
     nm_queue.push_back("node_modules".to_string());
+    let mut scanned = HashSet::new();
+    // A link into the project (a workspace) keeps its own node_modules at its
+    // real location, where arborist loads it as an fsChild.
+    let scan_link_target = |nm_queue: &mut VecDeque<String>, link: &Path| {
+        if let Some(rel) = project_relative_realpath(project_dir, link) {
+            if !rel.starts_with("node_modules/") && link.join("node_modules").is_dir() {
+                nm_queue.push_back(format!("{rel}/node_modules"));
+            }
+        }
+    };
 
     while let Some(nm_rel) = nm_queue.pop_front() {
+        if !scanned.insert(nm_rel.clone()) {
+            continue;
+        }
         let full_path = project_dir.join(&nm_rel);
         let entries = match std::fs::read_dir(&full_path) {
             Ok(e) => e,
@@ -331,7 +344,9 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
 
                         let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
                         let pkg_name = format!("{name_str}/{sub_name_str}");
-                        if !sub_junc && sub_path.join("node_modules").is_dir() {
+                        if sub_junc {
+                            scan_link_target(&mut nm_queue, &sub_path);
+                        } else if sub_path.join("node_modules").is_dir() {
                             nm_queue.push_back(format!("{loc}/node_modules"));
                         }
                         raw_entries.push(RawDiskEntry {
@@ -344,7 +359,9 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
             } else {
                 let loc = format!("{nm_rel}/{name_str}");
                 let pkg_name = name_str.to_string();
-                if !is_junc && entry_path.join("node_modules").is_dir() {
+                if is_junc {
+                    scan_link_target(&mut nm_queue, &entry_path);
+                } else if entry_path.join("node_modules").is_dir() {
                     nm_queue.push_back(format!("{loc}/node_modules"));
                 }
                 raw_entries.push(RawDiskEntry {
@@ -408,6 +425,17 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
         }
     }
     result
+}
+
+/// The posix location, relative to the project, of a link's real target when
+/// that target lies inside the project.
+fn project_relative_realpath(project_dir: &Path, link: &Path) -> Option<String> {
+    let strip = |p: PathBuf| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\"));
+    let target = strip(std::fs::canonicalize(link).ok()?);
+    let root = strip(std::fs::canonicalize(project_dir).ok()?);
+    let rel = target.strip_prefix(&root).ok()?;
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    (!rel.is_empty()).then_some(rel)
 }
 
 fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option<String>) {
@@ -672,8 +700,16 @@ pub fn build_dependency_tree(
             }
         }
 
+        // A link's dependencies resolve from its target's folder.
+        let lookup_loc = if is_junction(&current_disk.dir_path).unwrap_or(false) {
+            project_relative_realpath(project_dir, &current_disk.dir_path)
+                .filter(|rel| !rel.starts_with("node_modules/"))
+                .unwrap_or_else(|| current_loc.clone())
+        } else {
+            current_loc.clone()
+        };
         for (child_name, (child_req, child_type, is_optional)) in &child_deps {
-            let candidates = candidate_locations(&current_loc, child_name);
+            let candidates = candidate_locations(&lookup_loc, child_name);
             let mut resolved_loc = None;
 
             for cand in &candidates {

@@ -2678,7 +2678,7 @@ async fn test_offline_mode_metadata_cache_miss_enotcached() {
         "Must contain ENOTCACHED code: {err_str}"
     );
     assert!(
-        err_str.contains("only-if-cached") && err_str.contains("--offline"),
+        err_str.contains("cache mode is 'only-if-cached' but no cached response is available"),
         "Must contain offline cache mode explanation: {err_str}"
     );
 }
@@ -2734,7 +2734,7 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
         "Must contain ENOTCACHED code: {err_str}"
     );
     assert!(
-        err_str.contains("only-if-cached") && err_str.contains("--offline"),
+        err_str.contains("cache mode is 'only-if-cached' but no cached response is available"),
         "Must contain offline cache mode explanation: {err_str}"
     );
 }
