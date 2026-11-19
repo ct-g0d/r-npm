@@ -321,6 +321,40 @@ pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> Pac
     }
 }
 
+/// `--prefer-online`: pacote skips its integrity cache shortcut and fetches
+/// every registry tarball again, verifying it against the locked integrity.
+async fn refetch_tarballs_online(
+    client: &RegistryClient,
+    tarballs: Vec<(String, String)>,
+) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(16));
+    for (url, integrity) in tarballs {
+        if !url.starts_with("http") {
+            continue;
+        }
+        let client = client.clone();
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+            let bytes = client
+                .download_tarball_bytes(&url)
+                .await
+                .map_err(|e| anyhow!("Failed to download tarball from {url}: {e}"))?;
+            if let Ok(expected) = integrity.parse::<Integrity>() {
+                expected
+                    .verify(&bytes)
+                    .map_err(|e| anyhow!("Integrity verification failed for {url}: {e}"))?;
+            }
+            anyhow::Ok(())
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        res.map_err(|e| anyhow!("{e}"))??;
+    }
+    Ok(())
+}
+
 /// npm's `before` cutoff (ms since the epoch); `i64::MAX` when unset.
 static BEFORE_CUTOFF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
 
@@ -399,6 +433,9 @@ pub struct RegistryPackageProvider {
     offline: bool,
     prefer_offline: bool,
     prefer_online: bool,
+    /// Packages named on the command line: never served from the lockfile
+    /// shortcut, so a stale packument is revalidated as npm does.
+    named_packages: std::collections::HashSet<String>,
     git_fetcher: crate::git::GitFetcher,
     lockfile: Option<Arc<LockfileV3>>,
     unlocked_packages: std::collections::HashSet<String>,
@@ -918,7 +955,8 @@ impl RegistryPackageProvider {
             if let Ok(abbrev) = serde_json::from_slice::<AbbreviatedPackageMetadata>(&data) {
                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                 self.merge_lockfile_metadata(name, &mut meta);
-                let is_in_lockfile = self.is_package_locked(name);
+                let is_in_lockfile =
+                    self.is_package_locked(name) && !self.named_packages.contains(name);
                 if is_in_lockfile
                     || (!self.prefer_online
                         && is_packument_fresh(&entry, self.prefer_offline, self.offline))
@@ -1204,7 +1242,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 self.merge_lockfile_metadata(name, &mut meta);
-                                if is_in_lockfile
+                                // A package named on the command line is
+                                // resolved afresh, so its packument is revalidated.
+                                if (is_in_lockfile && !self.named_packages.contains(name))
                                     || (!self.prefer_online
                                         && is_packument_fresh(&entry, self.prefer_offline, false))
                                 {
@@ -2134,6 +2174,10 @@ pub struct Installer {
     engine_strict: bool,
     /// The ideal lockfile a --dry-run install planned but did not write.
     dry_run_ideal: Option<LockfileV3>,
+    /// package.json bytes from before this install saved new specs. npm saves
+    /// them only after reify succeeds, so a failure before the lockfile is
+    /// written puts them back.
+    manifest_rollback: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Installer {
@@ -2300,6 +2344,7 @@ impl Installer {
             script_policy,
             engine_strict: config.get_bool("engine-strict").unwrap_or(false),
             dry_run_ideal: None,
+            manifest_rollback: Vec::new(),
         })
     }
 
@@ -2618,6 +2663,12 @@ impl Installer {
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
         let res = self.install_internal().await;
+        let rollback = std::mem::take(&mut self.manifest_rollback);
+        if res.is_err() {
+            for (path, bytes) in rollback {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
         if self.options.wait_for_trash || !self.options.detached_trash {
             crate::trash::wait_all_trash_deletions();
         }
@@ -3202,6 +3253,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             offline: self.options.offline,
             prefer_offline,
             prefer_online: self.options.prefer_online,
+            named_packages: added_pkgs.iter().map(|a| a.name.clone()).collect(),
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
             unlocked_packages: unlocked_packages.clone(),
@@ -3313,6 +3365,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 && !self.options.skip_manifest_save
                 && !self.options.dry_run
             {
+                let mut paths = Vec::new();
+                if target_root {
+                    paths.push(self.options.project_dir.join("package.json"));
+                }
+                for &idx in &targeted_workspace_indices {
+                    let rel = &workspace_members[idx].relative_path;
+                    paths.push(self.options.project_dir.join(rel).join("package.json"));
+                }
+                self.manifest_rollback = paths
+                    .into_iter()
+                    .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+                    .collect();
                 save::save_manifests(
                     &self.options.project_dir,
                     &manifest,
@@ -4244,13 +4308,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if self.options.prefer_online {
-            self.revalidate_tarballs(
-                packages_to_download
-                    .iter()
-                    .filter_map(|(_, node)| node.resolved.clone())
-                    .collect(),
-            )
-            .await?;
+            // Only nodes reify actually changes are fetched; an installed
+            // folder already at the planned version is left alone.
+            let tarballs = packages_to_download
+                .iter()
+                .filter(|(loc, node)| {
+                    let installed = Manifest::from_file(loc_base_dir.join(loc).join("package.json"))
+                        .ok()
+                        .and_then(|m| m.version);
+                    installed.as_deref() != Some(node.version.as_str())
+                })
+                .filter_map(|(_, node)| {
+                    Some((node.resolved.clone()?, node.integrity.clone().unwrap_or_default()))
+                })
+                .collect();
+            refetch_tarballs_online(&self.registry_client, tarballs).await?;
         }
 
         let all_packs_available = !packages_to_download.is_empty()
@@ -4975,6 +5047,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         } else {
             None
         };
+        // Reify succeeded: the saved package.json stays, as npm's does.
+        self.manifest_rollback.clear();
 
         // Removing empty bin folders changes package directory mtimes. Finish
         // that before saving the hidden lock so our own cleanup cannot stale it.
@@ -5920,6 +5994,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
             }
+        }
+
+        if self.options.prefer_online {
+            let tarballs = packages_to_process
+                .iter()
+                .map(|(_, url, integrity, _, _, _)| (url.clone(), integrity.clone()))
+                .collect();
+            refetch_tarballs_online(&self.registry_client, tarballs).await?;
         }
 
         let mut custom_cfg = (*self.writer_cfg).clone();

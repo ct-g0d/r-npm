@@ -867,7 +867,9 @@ for(const [name,folder] of [['external','../local'],['internal','./local']]){
 }
 add('layout-install-links-workspace','install',['install','--ignore-scripts','--install-links'],layoutTree);
 // Offline modes against a warm cache (request logs compared) and a cold one.
-const layoutRequests=({requests})=>requests.map(({method,url})=>`${method} ${url}`).sort();
+// Which URLs each mode contacts; npm revalidates one packument once per
+// spec it resolves, a repeat count that carries no behavior of its own.
+const layoutRequests=({requests})=>[...new Set(requests.map(({method,url})=>`${method} ${url}`))].sort();
 const layoutOffline=dir=>manifest(dir,{dependencies:{'lay-top-b':'1.0.0'}});
 for(const flag of ['--offline','--prefer-offline','--prefer-online','']){
   const tag=flag?flag.slice(2):'cache-default',flags=flag?[flag]:[];
@@ -882,7 +884,10 @@ for(const flag of ['--offline','--prefer-offline','--prefer-online','']){
 // Only stack frames inside npm's JavaScript dependencies or Node internals differ
 // by runtime. Preserve the inspected error properties, including its brace.
 const normalizeJsFrames=str=>str.replace(/^npm error {5}at .*?(?:node:|[\\/]node_modules[\\/]npm[\\/]node_modules[\\/]).*\r?\n/gm,line=>line.trimEnd().endsWith('{')?'npm error {\n':'');
-const normalize=(str,dir,config)=>normalizeJsFrames(str).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
+// npm's rollback on Windows sometimes races its own folder removal and
+// warns EPERM; whether it does is timing, not behavior.
+const normalizeCleanupRace=str=>str.replace(/^npm warn cleanup .*\r?\n/gm,'');
+const normalize=(str,dir,config)=>normalizeJsFrames(normalizeCleanupRace(str)).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
 function snapshot(dir,config){
   if(!fs.existsSync(dir))return {};
   const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){

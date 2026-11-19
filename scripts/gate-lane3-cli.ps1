@@ -181,14 +181,6 @@ Invoke-InDir $rnpmDir {
 
         $rnpmExitNorm = if ($rnpmExit -ne 0) { 1 } else { 0 }
         if ($rnpmExitNorm -ne $expected) {
-            if ($comboKey -eq "install|--save-bundle" -and $rnpmExitNorm -eq 1) {
-                # Documented contract exception: Gate E deliberate ERR_UNSUPPORTED_FLAG per docs/compatibility-contract.md
-                continue
-            }
-            if ($comboKey -eq "install|--production" -and $rnpmExitNorm -eq 1) {
-                # Documented contract exception: Gate E deliberate ERR_UNSUPPORTED_FLAG per docs/compatibility-contract.md
-                continue
-            }
             Write-Host "    [MISMATCH] $comboKey -> rnpm=$rnpmExitNorm npm=$expected" -ForegroundColor Red
             $script:configFailures++
         }
