@@ -758,6 +758,63 @@ for(const [name,flags] of [['publish',['--ignore-scripts']],['publish-json',['--
 for(const command of ['install','ci','uninstall','update','outdated','audit','fund'])add(`populated-${command}`,command,command==='uninstall'?['uninstall','parent']:command==='outdated'||command==='audit'||command==='fund'?[command,'--json']:[command,'--ignore-scripts'],dir=>manifest(dir,{dependencies:{parent:'^1.0.0'}}),{before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts']);if(p.exit!==0)throw new Error(`Failed populated setup: ${p.stderr}`);}});
 add('cache-add-registry','cache',['cache','add','dep@1.0.0']);
 add('cache-list-populated','cache',['cache','ls'],dir=>manifest(dir),{before:async ctx=>{const p=await ctx.exec(['cache','add','dep@1.0.0']);if(p.exit!==0)throw new Error(`Cache seed failed: ${p.stderr}`);}});
+// --- layout parity: install strategies, --install-links, offline modes ---
+// Shared transitive deps, a peer, bins at two depths, a version conflict and
+// a workspace, laid out under each install strategy.
+for(const [name,versions] of Object.entries({
+  'lay-top-a':{'1.0.0':{bin:{'lay-a':'index.js'},dependencies:{'lay-shared':'^1.0.0','lay-mid':'1.0.0'}}},
+  'lay-top-b':{'1.0.0':{dependencies:{'lay-shared':'^1.0.0','lay-peer-user':'1.0.0'}}},
+  'lay-mid':{'1.0.0':{bin:{'lay-mid':'index.js'},dependencies:{'lay-shared':'^1.0.0','lay-leaf':'1.0.0'}}},
+  'lay-leaf':{'1.0.0':{}},
+  'lay-shared':{'1.0.0':{},'2.0.0':{}},
+  'lay-peer-user':{'1.0.0':{peerDependencies:{'lay-peer-host':'^1.0.0'}}},
+  'lay-peer-host':{'1.0.0':{}},
+})){
+  const packed={};
+  for(const [version,fields]of Object.entries(versions)){
+    const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
+    packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+  }
+  probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+const layoutTree=dir=>{
+  manifest(dir,{workspaces:['packages/*'],dependencies:{'lay-top-a':'1.0.0','lay-top-b':'1.0.0'}});
+  manifest(path.join(dir,'packages/w'),{name:'w',version:'1.0.0',dependencies:{'lay-mid':'1.0.0','lay-shared':'^2.0.0'}});
+};
+const layoutSeed=(flags,remove)=>({before:async ctx=>{const p=await ctx.exec(['install','--ignore-scripts',...flags]);if(p.exit!==0)throw new Error(`layout seed failed: ${p.stderr}`);for(const name of remove)fs.rmSync(path.join(ctx.dir,name),{recursive:true,force:true});}});
+for(const [name,flags] of [['nested',['--install-strategy=nested']],['shallow',['--install-strategy=shallow']],['linked',['--install-strategy=linked']],['global-style',['--global-style']],['legacy-bundling',['--legacy-bundling']]]){
+  add(`layout-strategy-install-${name}`,'install',['install','--ignore-scripts',...flags],layoutTree);
+  add(`layout-strategy-ls-${name}`,'ls',['ls','--all'],layoutTree,layoutSeed(flags,[]));
+  add(`layout-strategy-ci-${name}`,'ci',['ci','--ignore-scripts',...flags],layoutTree,layoutSeed(flags,['node_modules','packages/w/node_modules']));
+}
+// --install-links packs a file: directory outside the project and installs a
+// real copy; one inside the project and workspaces stay links.
+const layoutLocal=folder=>dir=>{
+  const local=path.join(dir,folder);
+  manifest(dir,{dependencies:{local:'file:'+folder,'lay-top-b':'1.0.0'}});
+  manifest(local,{name:'local',version:'1.0.0',bin:{'local-cli':'cli.js'},dependencies:{'lay-shared':'^1.0.0'}});
+  write(local,'cli.js','#!/usr/bin/env node\nconsole.log("local");\n');
+};
+for(const [name,folder] of [['external','../local'],['internal','./local']]){
+  add(`layout-install-links-${name}`,'install',['install','--ignore-scripts','--install-links'],layoutLocal(folder));
+  add(`layout-install-links-${name}-ci`,'ci',['ci','--ignore-scripts','--install-links'],layoutLocal(folder),layoutSeed(['--install-links'],['node_modules']));
+}
+add('layout-install-links-workspace','install',['install','--ignore-scripts','--install-links'],layoutTree);
+// Offline modes against a warm cache (request logs compared) and a cold one.
+const layoutRequests=({requests})=>requests.map(({method,url})=>`${method} ${url}`).sort();
+const layoutOffline=dir=>manifest(dir,{dependencies:{'lay-top-b':'1.0.0'}});
+for(const flag of ['--offline','--prefer-offline','--prefer-online','']){
+  const tag=flag?flag.slice(2):'cache-default',flags=flag?[flag]:[];
+  add(`layout-${tag}-install-warm`,'install',['install','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],['node_modules','package-lock.json']),observe:layoutRequests});
+  add(`layout-${tag}-ci-warm`,'ci',['ci','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],['node_modules']),observe:layoutRequests});
+  add(`layout-${tag}-install-cold`,'install',['install','--ignore-scripts',...flags],layoutOffline,{observe:layoutRequests});
+  // A packument that was never cached, and a cached packument whose tarball was not.
+  add(`layout-${tag}-install-missing-packument`,'install',['install','lay-mid@1.0.0','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],[]),observe:layoutRequests});
+  add(`layout-${tag}-install-missing-tarball`,'install',['install','lay-shared@2.0.0','--ignore-scripts',...flags],layoutOffline,{...layoutSeed([],[]),observe:layoutRequests});
+}
+// --- end layout parity ---
 // Only stack frames inside npm's JavaScript dependencies or Node internals differ
 // by runtime. Preserve the inspected error properties, including its brace.
 const normalizeJsFrames=str=>str.replace(/^npm error {5}at .*?(?:node:|[\\/]node_modules[\\/]npm[\\/]node_modules[\\/]).*\r?\n/gm,line=>line.trimEnd().endsWith('{')?'npm error {\n':'');

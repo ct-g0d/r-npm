@@ -329,6 +329,7 @@ pub struct RegistryPackageProvider {
     cache: Cache,
     offline: bool,
     prefer_offline: bool,
+    prefer_online: bool,
     git_fetcher: crate::git::GitFetcher,
     lockfile: Option<Arc<LockfileV3>>,
     unlocked_packages: std::collections::HashSet<String>,
@@ -849,7 +850,10 @@ impl RegistryPackageProvider {
                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                 self.merge_lockfile_metadata(name, &mut meta);
                 let is_in_lockfile = self.is_package_locked(name);
-                if is_in_lockfile || is_packument_fresh(&entry, self.prefer_offline, self.offline) {
+                if is_in_lockfile
+                    || (!self.prefer_online
+                        && is_packument_fresh(&entry, self.prefer_offline, self.offline))
+                {
                     return Ok(meta);
                 }
             }
@@ -927,10 +931,15 @@ impl RegistryPackageProvider {
         }
 
         if self.offline {
+            let url = self
+                .client
+                .package_metadata_url(name)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| name.to_string());
             return Err(SolverError::PackageMetadata(
                 name.to_string(),
                 format!(
-                    "npm error code ENOTCACHED\nnpm error request to fetch metadata for '{name}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                    "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
                 ),
             ));
         }
@@ -1127,7 +1136,8 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 self.merge_lockfile_metadata(name, &mut meta);
                                 if is_in_lockfile
-                                    || is_packument_fresh(&entry, self.prefer_offline, false)
+                                    || (!self.prefer_online
+                                        && is_packument_fresh(&entry, self.prefer_offline, false))
                                 {
                                     local_fresh.push((name.to_string(), meta));
                                     continue;
@@ -1469,6 +1479,10 @@ pub struct InstallOptions {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub prefer_offline: bool,
+    /// `--prefer-online`: revalidate every cached packument and tarball.
+    pub prefer_online: bool,
+    /// `--install-links`: pack and copy external `file:` directories.
+    pub install_links: bool,
     pub force: bool,
     pub ignore_scripts: bool,
     pub foreground_scripts: bool,
@@ -1551,6 +1565,8 @@ impl Default for InstallOptions {
             cache_dir: None,
             offline: false,
             prefer_offline: false,
+            prefer_online: false,
+            install_links: false,
             force: false,
             ignore_scripts: false,
             foreground_scripts: false,
@@ -2065,6 +2081,10 @@ impl Installer {
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
         options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
+        options.offline |= config.get_bool("offline").unwrap_or(false);
+        options.prefer_offline |= config.get_bool("prefer-offline").unwrap_or(false);
+        options.prefer_online |= config.get_bool("prefer-online").unwrap_or(false);
+        options.install_links |= config.get_bool("install-links").unwrap_or(false);
 
         if options.install_strategy == InstallStrategy::Hoisted {
             if let Some(strat_str) = config
@@ -3108,6 +3128,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache: self.cache.clone(),
             offline: self.options.offline,
             prefer_offline,
+            prefer_online: self.options.prefer_online,
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
             unlocked_packages: unlocked_packages.clone(),
@@ -3127,6 +3148,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             unlocked_packages,
             vulnerability_constraints: self.options.vulnerability_constraints.clone(),
             force: self.options.force,
+            install_strategy: match self.options.install_strategy {
+                InstallStrategy::Nested => rnpm_solver::hoisting::PlacementStrategy::Nested,
+                InstallStrategy::Shallow => rnpm_solver::hoisting::PlacementStrategy::Shallow,
+                // The linked layout is built from npm's hoisted ideal tree.
+                InstallStrategy::Hoisted | InstallStrategy::Linked => {
+                    rnpm_solver::hoisting::PlacementStrategy::Hoisted
+                }
+            },
         };
 
         let mut graph = if !workspace_members.is_empty() {
@@ -4119,6 +4148,38 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
+        // An uncached tarball fails an offline install before anything is
+        // reified, so npm's rollback leaves the tree as it was.
+        if self.options.offline {
+            for (_, node) in &packages_to_download {
+                let Some(url) = node.resolved.as_deref() else {
+                    continue;
+                };
+                if node.flags.optional || !url.starts_with("http") {
+                    continue;
+                }
+                let packed = node
+                    .integrity
+                    .as_deref()
+                    .is_some_and(|i| !i.is_empty() && self.pack_store.has_package_pack(i));
+                if !packed && !matches!(self.cache.get(url), Ok(Some(_))) {
+                    return Err(anyhow!(
+                        "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
+                    ));
+                }
+            }
+        }
+
+        if self.options.prefer_online {
+            self.revalidate_tarballs(
+                packages_to_download
+                    .iter()
+                    .filter_map(|(_, node)| node.resolved.clone())
+                    .collect(),
+            )
+            .await?;
+        }
+
         let all_packs_available = !packages_to_download.is_empty()
             && packages_to_download.iter().all(|(_, node)| {
                 node.integrity
@@ -4485,7 +4546,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         return Ok(None);
                     }
                     return Err(anyhow!(
-                        "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                        "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                     ));
                 } else {
                     info!("Downloading {}", resolved_url);
@@ -5781,7 +5842,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             continue;
                         }
                         return Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                         ));
                     }
                 }
@@ -6006,7 +6067,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 return Ok(None);
                             }
                             return Err(anyhow!(
-                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                                "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                             ));
                         } else {
                             let _io_permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
@@ -6780,7 +6841,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 return Ok(None);
                             }
                             return Err(anyhow!(
-                                "npm error code ENOTCACHED\nnpm error request to download tarball from '{resolved_url}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                                "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
                             ));
                         } else {
                             match registry_client.download_tarball_bytes(&resolved_url).await {
@@ -8003,7 +8064,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     return (
                         idx,
                         Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to download tarball from '{url_str}' failed: cache mode is 'only-if-cached' (--offline) but no cached response is available."
+                            "npm error code ENOTCACHED\nnpm error request to {url_str} failed: cache mode is 'only-if-cached' but no cached response is available."
                         )),
                     );
                 }

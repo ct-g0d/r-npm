@@ -2253,10 +2253,18 @@ where
                 eprintln!("npm warn config production Use `--omit=dev` instead.");
             }
             result.push("--omit=dev".to_string());
-        } else if arg == "--legacy-bundling" {
-            result.push("--install-strategy=nested".to_string());
-        } else if arg == "--global-style" {
-            result.push("--install-strategy=shallow".to_string());
+        } else if arg == "--legacy-bundling" || arg == "--global-style" {
+            let strategy = if arg == "--legacy-bundling" { "nested" } else { "shallow" };
+            if !args
+                .iter()
+                .any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent")
+            {
+                eprintln!(
+                    "npm warn config {} This option has been deprecated in favor of `--install-strategy={strategy}`",
+                    &arg[2..]
+                );
+            }
+            result.push(format!("--install-strategy={strategy}"));
         } else if arg == "-ws" {
             result.push("--workspaces".to_string());
         } else if arg == "-wa" {
