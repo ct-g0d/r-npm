@@ -23,6 +23,7 @@ pub use client::{
     NPM_INSTALL_V1_JSON,
 };
 pub use error::RegistryError;
+pub use reqwest::StatusCode;
 pub use metadata::{
     AbbreviatedPackageMetadata, AbbreviatedVersion, AttestationProvenance, DistAttestations,
     DistInfo, DistSignature, PackageBin,

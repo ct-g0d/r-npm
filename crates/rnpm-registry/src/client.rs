@@ -661,6 +661,63 @@ impl RegistryClient {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
+        // Proxies follow @npmcli/agent, not reqwest's system lookup: the
+        // configured proxy, else HTTPS_PROXY for every URL (HTTP_PROXY and
+        // PROXY only for http), bypassed only by the `noproxy` setting.
+        builder = builder.no_proxy();
+        let (env_https_proxy, env_http_proxy) =
+            if config.https_proxy.is_none() && config.http_proxy.is_none() && config.proxy.is_none() {
+                let env = |name: &str| {
+                    std::env::vars()
+                        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .last()
+                        .map(|(_, v)| v)
+                        .filter(|v| !v.is_empty())
+                };
+                let https = env("https_proxy");
+                let http = https.clone().or_else(|| env("http_proxy")).or_else(|| env("proxy"));
+                (https, http)
+            } else {
+                (None, None)
+            };
+        if env_https_proxy.is_some() || env_http_proxy.is_some() {
+            // @npmcli/agent's isNoProxy: an entry matches when its dot
+            // segments end the hostname's; `*` and ports mean nothing.
+            let no_proxy: Vec<Vec<String>> = config
+                .no_proxy
+                .clone()
+                .filter(|v| !v.is_empty())
+                .or_else(|| {
+                    std::env::vars()
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("no_proxy"))
+                        .last()
+                        .map(|(_, v)| v)
+                })
+                .unwrap_or_default()
+                .split(',')
+                .map(|entry| {
+                    entry
+                        .trim()
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .rev()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|segments| !segments.is_empty())
+                .collect();
+            let https = env_https_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
+            let http = env_http_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
+            builder = builder.proxy(reqwest::Proxy::custom(move |url| {
+                let proxy = if url.scheme() == "https" { https.as_ref() } else { http.as_ref() }?;
+                let host: Vec<&str> = url.host_str()?.split('.').rev().collect();
+                let bypass = no_proxy
+                    .iter()
+                    .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
+                (!bypass).then(|| proxy.clone())
+            }));
+        }
+
         if let Some(https_proxy) = &config.https_proxy {
             let mut proxy = reqwest::Proxy::https(https_proxy).map_err(|err| {
                 RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}"))

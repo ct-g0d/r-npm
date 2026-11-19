@@ -1087,10 +1087,35 @@ impl RegistryPackageProvider {
                 }
                 Err(SolverError::PackageMetadata(
                     name.to_string(),
-                    e.to_string(),
+                    self.metadata_error_message(name, &e),
                 ))
             }
         }
+    }
+
+    /// npm-registry-fetch reports a failing status as HttpErrorGeneral:
+    /// `E<status>` and `<status> <reason> - GET <url>[ - <body.error>]`.
+    fn metadata_error_message(&self, name: &str, e: &rnpm_registry::RegistryError) -> String {
+        let rnpm_registry::RegistryError::ServerError { status, body } = e else {
+            return e.to_string();
+        };
+        let Ok(url) = self.client.package_metadata_url(name) else {
+            return e.to_string();
+        };
+        let reason = rnpm_registry::StatusCode::from_u16(*status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("");
+        let mut message = format!("{status} {reason} - GET {url}");
+        if let Some(error) = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .filter(|s| !s.is_empty())
+        {
+            message.push_str(" - ");
+            message.push_str(&error);
+        }
+        format!("npm error code E{status}\nnpm error {message}")
     }
 }
 
@@ -1450,8 +1475,10 @@ pub fn apply_npmrc_to_client_config(
 
     if let Some(no_proxy_val) = npmrc
         .settings
-        .get("no-proxy")
+        .get("noproxy")
+        .or_else(|| npmrc.settings.get("no-proxy"))
         .or_else(|| npmrc.settings.get("no_proxy"))
+        .filter(|v| !v.is_empty())
     {
         client_config.no_proxy = Some(no_proxy_val.clone());
     }

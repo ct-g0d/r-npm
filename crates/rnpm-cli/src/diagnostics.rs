@@ -141,6 +141,13 @@ pub fn classify_error(err: &anyhow::Error) -> Diagnostic {
                 "ECONNRESET" => "ECONNRESET",
                 "ETIMEDOUT" => "ETIMEDOUT",
                 "128" => "128",
+                // npm-registry-fetch's HttpErrorGeneral: `E<status>`.
+                c if c.len() == 4
+                    && c.starts_with('E')
+                    && c[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    Box::leak(c.to_string().into_boxed_str())
+                }
                 _ => "EUNKNOWN",
             };
             if matches!(

@@ -175,9 +175,14 @@ pub async fn run_view(project_dir: &Path, options: &ViewOptions) -> anyhow::Resu
     }
 
     if !status.is_success() {
-        eprintln!("npm error code EHTTP");
-        eprintln!("npm error HTTP error {status} fetching {packument_url}");
-        return Ok(1);
+        // npm-registry-fetch's HttpErrorGeneral: `E<status>` and its message.
+        let body = resp.text().await.unwrap_or_default();
+        let message =
+            crate::http_errors::general_message("GET", packument_url.as_str(), status, &body);
+        return Err(anyhow::anyhow!(
+            "npm error code E{}\nnpm error {message}",
+            status.as_u16()
+        ));
     }
 
     let packument: Value = match resp.json().await {
