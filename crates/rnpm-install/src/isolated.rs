@@ -475,6 +475,11 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
             for flag in ["name", "dev", "peer", "devOptional", "optional", "inBundle", "extraneous"] {
                 obj.remove(flag);
             }
+            // A store node's integrity comes from its fetched manifest
+            // (`_integrity`); one loaded from the lockfile has none.
+            if !manifests.contains_key(&entry.hoisted) {
+                obj.remove("integrity");
+            }
             if entry.optional {
                 obj.insert("optional".into(), Value::Bool(true));
             }
@@ -594,11 +599,17 @@ impl crate::Installer {
 
     /// Reifies npm's isolated tree for `lock` (the hoisted lockfile) and
     /// writes its hidden lockfile. Returns how many store packages were added.
-    pub(crate) async fn reify_isolated(&mut self, lock: &LockfileV3) -> Result<usize> {
+    /// `previous` is the lockfile the tree was loaded from, if any.
+    pub(crate) async fn reify_isolated(
+        &mut self,
+        lock: &LockfileV3,
+        previous: Option<&LockfileV3>,
+    ) -> Result<usize> {
         let project = self.options.project_dir.clone();
-        // Edge order (and so each store key) follows package.json key order:
-        // read the root's and workspaces' from disk, every package's from its
-        // tarball, which the store needs anyway.
+        // Edge order decides each store key. arborist takes it from the
+        // package.json of a node it resolved from the registry, but from the
+        // (sorted) lockfile for a node it loaded from one. So read manifests
+        // only for nodes the previous lockfile did not already hold.
         let mut manifests: HashMap<String, Value> = HashMap::new();
         let mut tarballs: HashMap<String, Vec<u8>> = HashMap::new();
         for (loc, pkg) in &lock.packages {
@@ -614,6 +625,12 @@ impl crate::Installer {
                 continue;
             }
             if pkg.in_bundle == Some(true) {
+                continue;
+            }
+            let loaded = previous
+                .and_then(|p| p.packages.get(loc))
+                .is_some_and(|old| old.version == pkg.version && old.resolved == pkg.resolved);
+            if loaded {
                 continue;
             }
             let bytes = match fetch_tarball(self, &project, loc, pkg).await {
@@ -688,15 +705,20 @@ impl crate::Installer {
         for entry in &plan.store {
             let dest = project.join(&entry.location);
             if !dest.join("package.json").is_file() {
-                let Some(bytes) = tarballs.get(&entry.hoisted) else {
-                    continue;
+                let bytes = match tarballs.remove(&entry.hoisted) {
+                    Some(bytes) => bytes,
+                    None => match fetch_tarball(self, &project, &entry.hoisted, &lock.packages[&entry.hoisted]).await {
+                        Ok(bytes) => bytes,
+                        Err(_) if entry.optional => continue,
+                        Err(e) => return Err(e),
+                    },
                 };
                 if dest.exists() {
                     let _ = std::fs::remove_dir_all(&dest);
                 }
                 std::fs::create_dir_all(&dest)?;
                 rnpm_fs::extract_tarball_direct(
-                    std::io::Cursor::new(bytes),
+                    std::io::Cursor::new(&bytes),
                     &dest,
                     None,
                     Some(&writer_cfg),

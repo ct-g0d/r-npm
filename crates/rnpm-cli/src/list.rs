@@ -435,6 +435,15 @@ fn format_child_text(
                 while project.file_name().is_some_and(|n| n != "node_modules") {
                     project = project.parent().unwrap_or(project);
                 }
+                // A link inside a linked-strategy store folder still shows
+                // its target relative to the project.
+                while project
+                    .parent()
+                    .and_then(Path::parent)
+                    .is_some_and(|store| store.file_name().is_some_and(|n| n == ".store"))
+                {
+                    project = project.parent().and_then(Path::parent).and_then(Path::parent).unwrap_or(project);
+                }
                 if let Some(project) = project.parent() {
                     if let Ok(relative) = realpath.strip_prefix(project) {
                         marker.push_str(&format!(

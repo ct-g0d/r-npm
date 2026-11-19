@@ -298,7 +298,13 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
     // real location, where arborist loads it as an fsChild.
     let scan_link_target = |nm_queue: &mut VecDeque<String>, link: &Path| {
         if let Some(rel) = project_relative_realpath(project_dir, link) {
-            if !rel.starts_with("node_modules/") && link.join("node_modules").is_dir() {
+            if rel.starts_with("node_modules/.store/") {
+                // A linked-strategy store package: its dependencies are the
+                // links beside it in the store folder's node_modules.
+                if let Some((folder, _)) = rel.rsplit_once("/node_modules/") {
+                    nm_queue.push_back(format!("{folder}/node_modules"));
+                }
+            } else if !rel.starts_with("node_modules/") && link.join("node_modules").is_dir() {
                 nm_queue.push_back(format!("{rel}/node_modules"));
             }
         }
@@ -588,6 +594,14 @@ pub fn build_dependency_tree(
                 if disk_packages.contains_key(&expected_loc) {
                     let ver_req = member.version.clone().unwrap_or_else(|| "*".to_string());
                     direct_deps.insert(member.name.clone(), (ver_req, "prod", false));
+                } else if project_dir.join("node_modules").join(".store").is_dir() {
+                    // The linked strategy links only workspaces the root
+                    // declares; arborist's workspace edge to any other one
+                    // is missing.
+                    let folder = project_dir.join(member.relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    direct_deps
+                        .entry(member.name.clone())
+                        .or_insert((format!("file:{}", folder.display()), "prod", false));
                 }
             }
         }
@@ -703,7 +717,9 @@ pub fn build_dependency_tree(
         // A link's dependencies resolve from its target's folder.
         let lookup_loc = if is_junction(&current_disk.dir_path).unwrap_or(false) {
             project_relative_realpath(project_dir, &current_disk.dir_path)
-                .filter(|rel| !rel.starts_with("node_modules/"))
+                .filter(|rel| {
+                    !rel.starts_with("node_modules/") || rel.starts_with("node_modules/.store/")
+                })
                 .unwrap_or_else(|| current_loc.clone())
         } else {
             current_loc.clone()
@@ -797,6 +813,8 @@ pub fn build_dependency_tree(
     let mut extraneous_locations: Vec<String> = disk_packages
         .keys()
         .filter(|loc| !reachable_locations.contains(*loc))
+        // Linked-strategy store packages are reached only through links.
+        .filter(|loc| !loc.starts_with("node_modules/.store/"))
         .cloned()
         .collect();
     extraneous_locations.sort();

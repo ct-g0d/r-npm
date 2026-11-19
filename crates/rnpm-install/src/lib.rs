@@ -3844,7 +3844,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            let added = self.reify_isolated(&lockfile).await?;
+            let added = self
+                .reify_isolated(&lockfile, existing_lockfile_for_merge.as_deref())
+                .await?;
             self.manifest_rollback.clear();
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
             if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
@@ -5641,7 +5643,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            let added = self.reify_isolated(&lockfile).await?;
+            // ci loads every node from the lockfile.
+            let added = self.reify_isolated(&lockfile, Some(&lockfile)).await?;
             self.run_linked_root_hooks(&manifest).await?;
             return Ok(InstallSummary {
                 reify: None,
