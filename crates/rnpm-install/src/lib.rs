@@ -68,6 +68,7 @@ pub use trash::*;
 pub mod save;
 pub use save::*;
 
+pub mod isolated;
 pub mod linked;
 pub mod policy;
 pub use linked::*;
@@ -3843,17 +3844,24 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            return self
-                .execute_linked_install(
-                    &manifest,
-                    &graph,
-                    &lockfile,
-                    &node_modules_dir,
-                    &root_bin_dir,
-                    collector,
-                    plan_start,
-                )
-                .await;
+            let added = self.reify_isolated(&lockfile).await?;
+            self.manifest_rollback.clear();
+            let lockfile_path = project_lockfile_path(&self.options.project_dir);
+            if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
+                lockfile
+                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
+            }
+            self.run_linked_root_hooks(&manifest).await?;
+            collector.record_phase(Phase::Plan, plan_start.elapsed());
+            return Ok(InstallSummary {
+                reify: None,
+                packages_installed: added,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path,
+                timing: Some(collector.finish()),
+            });
         }
 
         let mut cache_hits = 0;
@@ -5633,9 +5641,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         collector.record_phase(Phase::Plan, plan2_start.elapsed());
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            return self
-                .execute_linked_ci(&manifest, &lockfile, &node_modules_dir, &bin_dir, collector)
-                .await;
+            let added = self.reify_isolated(&lockfile).await?;
+            self.run_linked_root_hooks(&manifest).await?;
+            return Ok(InstallSummary {
+                reify: None,
+                packages_installed: added,
+                cache_hits: 0,
+                cache_misses: 0,
+                lockfile_path: project_lockfile_path(&self.options.project_dir),
+                timing: Some(collector.finish()),
+            });
         }
 
         let mut cache_hits = 0;
