@@ -829,4 +829,30 @@ mod tests {
         assert_eq!(hex(shake256_16(&[b'a'; 136])), "8fcc5a08f0a1f6827c9cf64ee8d16e04");
         assert_eq!(hex(shake256_16(&[b'a'; 135])), "55b991ece1e567b6e7c2c714444dd201");
     }
+
+    #[test]
+    fn plan_links_each_edge_beside_its_store_package() {
+        let lock = LockfileV3::from_json_str(
+            r#"{"name":"r","lockfileVersion":3,"requires":true,"packages":{
+              "":{"name":"r","dependencies":{"a":"1.0.0"}},
+              "node_modules/a":{"version":"1.0.0","resolved":"https://r/a.tgz","dependencies":{"b":"^1.0.0"},"bin":{"a":"a.js"}},
+              "node_modules/b":{"version":"1.0.0","resolved":"https://r/b.tgz"}}}"#,
+        )
+        .unwrap();
+        let plan = plan(
+            &lock,
+            Omit { dev: false, optional: false, peer: false },
+            &HashMap::new(),
+        );
+        // getKey of b: one entry, "b@1.0.0::https://r/b.tgz".
+        let b_hash = data_encoding::BASE64URL_NOPAD.encode(&shake256_16(b"b@1.0.0::https://r/b.tgz"));
+        let b = format!("node_modules/.store/b@1.0.0-{b_hash}/node_modules/b");
+        assert!(plan.store.iter().any(|e| e.location == b));
+        let a = plan.store.iter().find(|e| e.package_name == "a").unwrap();
+        assert_eq!(a.bin, vec![("a".to_string(), "a.js".to_string())]);
+        let link = |loc: &str| plan.links.iter().find(|l| l.location == loc).map(|l| l.target.clone());
+        assert_eq!(link("node_modules/a"), Some(a.location.clone()));
+        assert_eq!(link(&format!("{}/node_modules/b", a.store_dir)), Some(b.clone()));
+        assert!(plan.hidden_lock["packages"].get("").is_none());
+    }
 }
