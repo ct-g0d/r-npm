@@ -91,11 +91,10 @@ pub fn shake256_16(data: &[u8]) -> [u8; 16] {
         }
         keccak_f(st);
     };
-    let mut chunks = data.chunks_exact(RATE);
-    for block in &mut chunks {
+    let (blocks, rest) = data.as_chunks::<RATE>();
+    for block in blocks {
         absorb(&mut st, block);
     }
-    let rest = chunks.remainder();
     let mut last = [0u8; RATE];
     last[..rest.len()].copy_from_slice(rest);
     last[rest.len()] ^= 0x1f;
