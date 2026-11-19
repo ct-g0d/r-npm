@@ -833,15 +833,37 @@ for(const [name,versions] of Object.entries({
   'lay-shared':{'1.0.0':{},'2.0.0':{}},
   'lay-peer-user':{'1.0.0':{peerDependencies:{'lay-peer-host':'^1.0.0'}}},
   'lay-peer-host':{'1.0.0':{}},
+  '@lay/scoped':{'1.0.0':{dependencies:{'lay-leaf':'1.0.0'}}},
 })){
   const packed={};
+  // npm pack names a scoped tarball scope-name-version.tgz.
+  const file=name.replace(/^@/,'').replace('/','-');
   for(const [version,fields]of Object.entries(versions)){
-    const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
+    const dir=path.join(root,'tarballs',`${file}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
     const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
-    const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
-    packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
+    const bytes=fs.readFileSync(path.join(dir,`${file}-${version}.tgz`));tarballs.set(`/${file}-${version}.tgz`,bytes);
+    packed[version]={name,version,...fields,dist:{tarball:`${registry}${file}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
   probePackages.set(name,{name,'dist-tags':{latest:Object.keys(versions).at(-1)},versions:packed});
+}
+// A second linked install keeps an unchanged scoped store folder: a marker
+// dropped into it survives.
+{
+  const scoped=dir=>manifest(dir,{dependencies:{'@lay/scoped':'1.0.0','lay-top-b':'1.0.0'}});
+  const linked=['install','--ignore-scripts','--install-strategy=linked'];
+  add('layout-strategy-install-linked-scoped','install',linked,scoped);
+  // An optional package for another platform stays out of the store.
+  const foreign=dir=>manifest(dir,{dependencies:{'lay-leaf':'1.0.0'},optionalDependencies:{'multi-native':'1.0.0'}});
+  add('layout-strategy-install-linked-foreign-optional','install',linked,foreign);
+  add('layout-strategy-ci-linked-foreign-optional','ci',['ci','--ignore-scripts','--install-strategy=linked'],foreign,{before:async ctx=>{
+    const p=await ctx.exec(linked);if(p.exit!==0)throw new Error(`linked seed failed: ${p.stderr}`);
+    fs.rmSync(path.join(ctx.dir,'node_modules'),{recursive:true,force:true});
+  }});
+  add('layout-strategy-reinstall-linked-scoped','install',linked,scoped,{before:async ctx=>{
+    const p=await ctx.exec(linked);if(p.exit!==0)throw new Error(`linked seed failed: ${p.stderr}`);
+    const scope=path.join(ctx.dir,'node_modules/.store/@lay');
+    for(const key of fs.readdirSync(scope))write(path.join(scope,key),'kept.txt','kept\n');
+  }});
 }
 const layoutTree=dir=>{
   manifest(dir,{workspaces:['packages/*'],dependencies:{'lay-top-a':'1.0.0','lay-top-b':'1.0.0'}});

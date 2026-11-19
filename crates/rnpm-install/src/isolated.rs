@@ -160,6 +160,9 @@ pub struct Omit {
     pub dev: bool,
     pub optional: bool,
     pub peer: bool,
+    /// Lockfile locations skipped for this platform (os/cpu/libc), with
+    /// the subtrees only they need.
+    pub skipped: HashSet<String>,
 }
 
 fn is_external_location(loc: &str) -> bool {
@@ -219,7 +222,10 @@ impl<'a> Builder<'a> {
             let target = pkg.resolved.clone()?;
             return Some(Target::Local(target));
         }
-        if pkg.in_bundle == Some(true) || should_omit(pkg, &self.omit) {
+        if pkg.in_bundle == Some(true)
+            || should_omit(pkg, &self.omit)
+            || self.omit.skipped.contains(&key)
+        {
             return None;
         }
         Some(Target::External(key))
@@ -609,6 +615,7 @@ impl crate::Installer {
         // package.json of a node it resolved from the registry, but from the
         // (sorted) lockfile for a node it loaded from one. So read manifests
         // only for nodes the previous lockfile did not already hold.
+        let skipped = crate::lockfile_platform_skipped_packages(lock, &self.options.platform());
         let mut manifests: HashMap<String, Value> = HashMap::new();
         let mut tarballs: HashMap<String, Vec<u8>> = HashMap::new();
         for (loc, pkg) in &lock.packages {
@@ -623,7 +630,7 @@ impl crate::Installer {
                 }
                 continue;
             }
-            if pkg.in_bundle == Some(true) {
+            if pkg.in_bundle == Some(true) || skipped.contains(loc) {
                 continue;
             }
             let loaded = previous
@@ -650,6 +657,7 @@ impl crate::Installer {
                 dev: self.options.omit_dev,
                 optional: self.options.omit_optional,
                 peer: self.options.omit_peer,
+                skipped,
             },
             &manifests,
         );
@@ -684,14 +692,25 @@ impl crate::Installer {
                 remove(&entry.path());
             }
         }
+        // Store folders by path under .store; a scoped one sits in its
+        // scope folder (`.store/@scope/pkg@1.0.0-<hash>`).
         let store_dirs: HashSet<String> = plan
             .store
             .iter()
-            .map(|e| e.store_dir.rsplit('/').next().unwrap_or_default().to_string())
+            .filter_map(|e| e.store_dir.strip_prefix("node_modules/.store/").map(str::to_string))
             .collect();
         if let Ok(entries) = std::fs::read_dir(nm.join(".store")) {
             for entry in entries.flatten() {
-                if !store_dirs.contains(&entry.file_name().to_string_lossy().to_string()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('@') && entry.path().is_dir() {
+                    for child in std::fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+                        let rel = format!("{name}/{}", child.file_name().to_string_lossy());
+                        if !store_dirs.contains(&rel) {
+                            remove(&child.path());
+                        }
+                    }
+                    let _ = std::fs::remove_dir(entry.path());
+                } else if !store_dirs.contains(&name) {
                     remove(&entry.path());
                 }
             }
@@ -840,7 +859,7 @@ mod tests {
         .unwrap();
         let plan = plan(
             &lock,
-            Omit { dev: false, optional: false, peer: false },
+            Omit { dev: false, optional: false, peer: false, skipped: HashSet::new() },
             &HashMap::new(),
         );
         // getKey of b: one entry, "b@1.0.0::https://r/b.tgz".
@@ -853,5 +872,23 @@ mod tests {
         assert_eq!(link("node_modules/a"), Some(a.location.clone()));
         assert_eq!(link(&format!("{}/node_modules/b", a.store_dir)), Some(b.clone()));
         assert!(plan.hidden_lock["packages"].get("").is_none());
+
+        // A platform-skipped package is neither stored nor linked.
+        let skipped = plan_with_skipped(&lock, "node_modules/b");
+        assert!(skipped.store.iter().all(|e| e.package_name != "b"));
+        assert!(skipped.links.iter().all(|l| !l.location.ends_with("/b")));
+    }
+
+    fn plan_with_skipped(lock: &LockfileV3, loc: &str) -> IsolatedPlan {
+        plan(
+            lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: [loc.to_string()].into_iter().collect(),
+            },
+            &HashMap::new(),
+        )
     }
 }

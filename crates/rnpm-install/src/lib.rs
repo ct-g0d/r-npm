@@ -3774,7 +3774,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
 
         // Milestone M3: Diff ideal tree against actual tree (node_modules/.package-lock.json)
+        // A linked tree's hidden lockfile describes the isolated store, not
+        // the hoisted plan: diffing the two would delete every store folder.
+        // reify_isolated reconciles that tree itself.
         let actual_lockfile_opt = if !self.options.force
+            && self.options.install_strategy != InstallStrategy::Linked
             && validate_hidden_lockfile(&loc_base_dir, Some(&self.options))
         {
             LockfileV3::load_hidden(&loc_base_dir).ok()
@@ -5604,7 +5608,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
-        if node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false) {
+        // An install that reuses the lockfile keeps a linked tree: its store
+        // folders are reconciled in place, as arborist's reify diff does.
+        let keeps_linked_tree =
+            !from_scratch && self.options.install_strategy == InstallStrategy::Linked;
+        if !keeps_linked_tree
+            && (node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false))
+        {
             fast_trash_wipe_dir(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
