@@ -341,19 +341,27 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
 
             if !bundles.is_empty() {
                 let mut reg_keys = HashMap::new();
+                let mut reg_key_expiries = HashMap::new();
                 if let Some(rkeys) = keys.get(&pkg.registry) {
                     for k in rkeys {
-                        reg_keys.insert(k.keyid.clone(), k.spki.clone());
-                    }
-                }
-                for rkeys in keys.values() {
-                    for k in rkeys {
-                        reg_keys.entry(k.keyid.clone()).or_insert_with(|| k.spki.clone());
+                        let mut expired = false;
+                        if let Some(expires_str) = &k.expires {
+                            if let Some(exp) = rnpm_config::date::parse_js_date(expires_str) {
+                                reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), exp));
+                                if published >= exp {
+                                    expired = true;
+                                }
+                            }
+                        }
+                        if !expired {
+                            reg_keys.insert(k.keyid.clone(), k.spki.clone());
+                        }
                     }
                 }
 
                 let mut verifier = rnpm_registry::ProvenanceVerifier::new(rnpm_registry::ProvenancePolicy::AllowAny)
-                    .with_registry_keys(reg_keys);
+                    .with_registry_keys(reg_keys)
+                    .with_registry_key_expiries(reg_key_expiries);
 
                 if let Ok(path) = std::env::var("SIGSTORE_ROOT_CERT") {
                     if let Ok(bytes) = std::fs::read(&path) {

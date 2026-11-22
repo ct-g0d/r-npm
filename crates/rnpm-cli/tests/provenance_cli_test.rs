@@ -510,8 +510,15 @@ async fn test_publish_provenance_full_generation_and_cryptographic_verification(
         "application/vnd.sigstore.bundle+json;version=0.1"
     );
 
-    let bundle_bytes = BASE64.decode(sigstore_att["data"].as_str().unwrap().as_bytes()).unwrap();
-    let bundle: SigstoreBundle = serde_json::from_slice(&bundle_bytes).unwrap();
+    // npm 11.20.0 libnpmpublish sends serialized JSON string directly in data (NOT base64)
+    let bundle_str = sigstore_att["data"].as_str().unwrap();
+    assert_eq!(sigstore_att["length"].as_u64().unwrap(), bundle_str.len() as u64);
+    let bundle: SigstoreBundle = serde_json::from_str(bundle_str)
+        .or_else(|_| {
+            let bytes = BASE64.decode(bundle_str.as_bytes()).unwrap();
+            serde_json::from_slice(&bytes)
+        })
+        .unwrap();
 
     // Verify raw bundle was NOT stuffed into dist.attestations.bundle
     let version_entry = &put_json["versions"]["1.0.0"];
@@ -1041,8 +1048,15 @@ async fn test_publish_provenance_gitlab_ci_statement_generation() {
         "application/vnd.sigstore.bundle+json;version=0.1"
     );
 
-    let bundle_bytes = BASE64.decode(sigstore_att["data"].as_str().unwrap().as_bytes()).unwrap();
-    let bundle: SigstoreBundle = serde_json::from_slice(&bundle_bytes).unwrap();
+    // npm 11.20.0 libnpmpublish sends serialized JSON string directly in data (NOT base64)
+    let bundle_str = sigstore_att["data"].as_str().unwrap();
+    assert_eq!(sigstore_att["length"].as_u64().unwrap(), bundle_str.len() as u64);
+    let bundle: SigstoreBundle = serde_json::from_str(bundle_str)
+        .or_else(|_| {
+            let bytes = BASE64.decode(bundle_str.as_bytes()).unwrap();
+            serde_json::from_slice(&bytes)
+        })
+        .unwrap();
 
     let envelope = bundle.dsse_envelope.as_ref().unwrap();
     let statement = envelope.parse_statement().unwrap();

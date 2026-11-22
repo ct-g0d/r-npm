@@ -14,8 +14,8 @@ use rnpm_registry::provenance::{
 };
 use rnpm_registry::RegistryError;
 
-fn make_test_bundle(
-    pkg_name: &str,
+fn make_test_bundle_with_subject(
+    subject_name: &str,
     sha512_hex: &str,
     repo_uri: &str,
     commit_sha: &str,
@@ -29,7 +29,7 @@ fn make_test_bundle(
     let statement = InTotoStatement {
         statement_type: "https://in-toto.io/Statement/v0.1".into(),
         subject: vec![InTotoSubject {
-            name: format!("{pkg_name}-1.0.0.tgz"),
+            name: subject_name.to_string(),
             digest,
         }],
         predicate_type: "https://slsa.dev/provenance/v0.2".into(),
@@ -146,6 +146,20 @@ fn make_test_bundle(
     assemble_sigstore_bundle(envelope, &cert_der, tlog_entry)
 }
 
+fn make_test_bundle(
+    pkg_name: &str,
+    sha512_hex: &str,
+    repo_uri: &str,
+    commit_sha: &str,
+) -> SigstoreBundle {
+    let purl_name = if let Some(stripped) = pkg_name.strip_prefix('@') {
+        format!("pkg:npm/%40{stripped}@1.0.0")
+    } else {
+        format!("pkg:npm/{pkg_name}@1.0.0")
+    };
+    make_test_bundle_with_subject(&purl_name, sha512_hex, repo_uri, commit_sha)
+}
+
 #[test]
 fn test_packument_with_signatures_and_attestations() {
     let packument_json = r#"{
@@ -197,7 +211,7 @@ fn test_scoped_package_provenance_verification() {
     let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
 
     let bundle = make_test_bundle(
-        "cors",
+        "@fastify/cors",
         &sha512_hex,
         "git+https://github.com/fastify/fastify-cors.git@refs/heads/main",
         "abcdef11223344556677889900aabbccddeeff00",
@@ -852,4 +866,579 @@ fn test_embedded_sigstore_public_good_rekor_and_fulcio_roots() {
         rnpm_registry::asn1::parse_x509_certificate(&ci2).expect("parse Fulcio Intermediate 2");
     assert!(parsed_i2.not_before < parsed_i2.not_after, "Fulcio Intermediate 2 validity window");
     assert!(!parsed_i2.spki_bytes.is_empty(), "Fulcio Intermediate 2 SPKI");
+}
+
+#[test]
+fn test_checkpoint_only_bundle_without_authenticated_set_rejected() {
+    let tarball_bytes = b"checkpoint only test payload";
+    let (mut bundle, _) = rnpm_registry::provenance::generate_valid_signed_test_bundle(
+        "checkpoint-pkg",
+        "1.0.0",
+        tarball_bytes,
+        "org/checkpoint-repo",
+        "abcdef1234567890abcdef1234567890abcdef12",
+    );
+
+    let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+    // Remove inclusion promise (SET)
+    tlog.inclusion_promise = None;
+    // Add mock inclusion proof
+    tlog.inclusion_proof = Some(serde_json::json!({
+        "logIndex": 42,
+        "treeSize": 100,
+        "rootHash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "hashes": [],
+        "checkpoint": {
+            "envelope": "rekor.sigstore.dev - 12345\n100\n00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n"
+        }
+    }));
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let err = verifier
+        .verify_package(
+            "checkpoint-pkg",
+            Some("1.0.0"),
+            &bundle,
+            None,
+            Some(tarball_bytes),
+        )
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSigstoreBundle(msg) => {
+            assert!(
+                msg.contains("Fulcio certificate validity requires an authenticated signing time")
+                    || msg.contains("checkpoint-only bundles without an authenticated timestamp are rejected"),
+                "Expected rejection of checkpoint-only bundle without authenticated timestamp, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSigstoreBundle error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_rekor_body_unknown_schema_kind_rejected() {
+    let tarball_bytes = b"unknown schema payload";
+    let (mut bundle, _) = rnpm_registry::provenance::generate_valid_signed_test_bundle(
+        "unknown-kind-pkg",
+        "1.0.0",
+        tarball_bytes,
+        "org/repo",
+        "sha123",
+    );
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let cert_raw = bundle.verification_material.as_ref().unwrap().certificate.as_ref().unwrap().raw_bytes.clone();
+    let sig_str = bundle.dsse_envelope.as_ref().unwrap().signatures[0].sig.clone();
+    let payload_bytes = rnpm_registry::provenance::decode_base64(&bundle.dsse_envelope.as_ref().unwrap().payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+
+    let unsupported_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "unsupported_rekor_kind",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": payload_hash_hex,
+            },
+            "signatures": [{ "signature": sig_str, "verifier": cert_raw }]
+        }
+    });
+    let body_str = serde_json::to_string(&unsupported_body_json).unwrap();
+    let body_b64 = data_encoding::BASE64.encode(body_str.as_bytes());
+
+    let now = 1700000000i64;
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        body_b64, now, REKOR_DEFAULT_LOG_ID, 42
+    );
+    let rekor_sig = rekor_key_pair
+        .sign(&rng, set_canonical_json.as_bytes())
+        .unwrap();
+
+    let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+    tlog.canonicalized_body = Some(body_b64);
+    tlog.inclusion_promise = Some(rnpm_registry::provenance::InclusionPromise {
+        signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+    });
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let err = verifier
+        .verify_package("unknown-kind-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSigstoreBundle(msg) => {
+            assert!(
+                msg.contains("Unsupported Rekor entry kind: 'unsupported_rekor_kind'"),
+                "Expected Unsupported Rekor entry kind error, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSigstoreBundle error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_rekor_body_missing_binding_fields_rejected() {
+    let tarball_bytes = b"missing fields payload";
+    let (bundle_base, _) = rnpm_registry::provenance::generate_valid_signed_test_bundle(
+        "missing-fields-pkg",
+        "1.0.0",
+        tarball_bytes,
+        "org/repo",
+        "sha123",
+    );
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let cert_raw = bundle_base.verification_material.as_ref().unwrap().certificate.as_ref().unwrap().raw_bytes.clone();
+    let sig_str = bundle_base.dsse_envelope.as_ref().unwrap().signatures[0].sig.clone();
+    let payload_bytes = rnpm_registry::provenance::decode_base64(&bundle_base.dsse_envelope.as_ref().unwrap().payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+
+    // Case 1: Missing payloadHash
+    {
+        let mut bundle = bundle_base.clone();
+        let body_json = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "dsse",
+            "spec": {
+                "signatures": [{ "signature": &sig_str, "verifier": &cert_raw }]
+            }
+        });
+        let body_str = serde_json::to_string(&body_json).unwrap();
+        let body_b64 = data_encoding::BASE64.encode(body_str.as_bytes());
+        let now = 1700000000i64;
+        let set_canonical_json = format!(
+            r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+            body_b64, now, REKOR_DEFAULT_LOG_ID, 42
+        );
+        let rekor_sig = rekor_key_pair.sign(&rng, set_canonical_json.as_bytes()).unwrap();
+        let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+        tlog.canonicalized_body = Some(body_b64);
+        tlog.inclusion_promise = Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        });
+
+        let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+        let err = verifier
+            .verify_package("missing-fields-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidSigstoreBundle(msg) if msg.contains("Missing or empty payloadHash")));
+    }
+
+    // Case 2: Missing signatures
+    {
+        let mut bundle = bundle_base.clone();
+        let body_json = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "dsse",
+            "spec": {
+                "payloadHash": { "algorithm": "sha256", "value": &payload_hash_hex },
+                "signatures": []
+            }
+        });
+        let body_str = serde_json::to_string(&body_json).unwrap();
+        let body_b64 = data_encoding::BASE64.encode(body_str.as_bytes());
+        let now = 1700000000i64;
+        let set_canonical_json = format!(
+            r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+            body_b64, now, REKOR_DEFAULT_LOG_ID, 42
+        );
+        let rekor_sig = rekor_key_pair.sign(&rng, set_canonical_json.as_bytes()).unwrap();
+        let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+        tlog.canonicalized_body = Some(body_b64);
+        tlog.inclusion_promise = Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        });
+
+        let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+        let err = verifier
+            .verify_package("missing-fields-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidSigstoreBundle(msg) if msg.contains("Missing or empty signatures")));
+    }
+
+    // Case 3: Missing verifier
+    {
+        let mut bundle = bundle_base.clone();
+        let body_json = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "dsse",
+            "spec": {
+                "payloadHash": { "algorithm": "sha256", "value": &payload_hash_hex },
+                "signatures": [{ "signature": &sig_str }]
+            }
+        });
+        let body_str = serde_json::to_string(&body_json).unwrap();
+        let body_b64 = data_encoding::BASE64.encode(body_str.as_bytes());
+        let now = 1700000000i64;
+        let set_canonical_json = format!(
+            r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+            body_b64, now, REKOR_DEFAULT_LOG_ID, 42
+        );
+        let rekor_sig = rekor_key_pair.sign(&rng, set_canonical_json.as_bytes()).unwrap();
+        let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+        tlog.canonicalized_body = Some(body_b64);
+        tlog.inclusion_promise = Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        });
+
+        let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+        let err = verifier
+            .verify_package("missing-fields-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidSigstoreBundle(msg) if msg.contains("Missing or empty verifier")));
+    }
+}
+
+#[test]
+fn test_rekor_body_hashedrekord_schema_accepted() {
+    let tarball_bytes = b"hashedrekord valid payload";
+    let (mut bundle, _) = rnpm_registry::provenance::generate_valid_signed_test_bundle(
+        "hashedrekord-pkg",
+        "1.0.0",
+        tarball_bytes,
+        "org/repo",
+        "sha123",
+    );
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let cert_raw = bundle.verification_material.as_ref().unwrap().certificate.as_ref().unwrap().raw_bytes.clone();
+    let sig_str = bundle.dsse_envelope.as_ref().unwrap().signatures[0].sig.clone();
+    let payload_bytes = rnpm_registry::provenance::decode_base64(&bundle.dsse_envelope.as_ref().unwrap().payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+
+    let hashedrekord_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "hashedrekord",
+        "spec": {
+            "data": {
+                "hash": {
+                    "algorithm": "sha256",
+                    "value": payload_hash_hex,
+                }
+            },
+            "signature": {
+                "content": sig_str,
+                "publicKey": {
+                    "content": cert_raw,
+                }
+            }
+        }
+    });
+    let body_str = serde_json::to_string(&hashedrekord_body_json).unwrap();
+    let body_b64 = data_encoding::BASE64.encode(body_str.as_bytes());
+
+    let now = 1700000000i64;
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        body_b64, now, REKOR_DEFAULT_LOG_ID, 42
+    );
+    let rekor_sig = rekor_key_pair
+        .sign(&rng, set_canonical_json.as_bytes())
+        .unwrap();
+
+    let tlog = &mut bundle.verification_material.as_mut().unwrap().tlog_entries[0];
+    tlog.canonicalized_body = Some(body_b64);
+    tlog.inclusion_promise = Some(rnpm_registry::provenance::InclusionPromise {
+        signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+    });
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let res = verifier.verify_package("hashedrekord-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes));
+    assert!(res.is_ok(), "hashedrekord schema should be successfully verified: {:?}", res.err());
+}
+
+#[test]
+fn test_keyed_attestation_empty_registry_keys_unsafe_fallback_rejected() {
+    let tarball_bytes = b"keyed attestation payload";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let signer = EphemeralSigner::new().unwrap();
+
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/keyed-fallback-pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        predicate: SlsaPredicate::default(),
+    };
+    let mut envelope = sign_dsse_envelope(&statement, &signer).unwrap();
+    let keyid = "SHA256:untrusted-attacker-key";
+    envelope.signatures[0].keyid = Some(keyid.to_string());
+
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: None,
+            public_key: Some(PublicKeyHint {
+                hint: Some(keyid.to_string()),
+                raw_bytes: Some(data_encoding::BASE64.encode(signer.public_key_spki())),
+            }),
+            tlog_entries: Vec::new(),
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    };
+
+    // Verifier with EMPTY registry_keys (attacker supplies own key in bundle.verificationMaterial.publicKey.raw_bytes)
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
+    let err = verifier
+        .verify_package("keyed-fallback-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSignature(msg) => {
+            assert!(
+                msg.contains("No corresponding public key found for attestation keyid"),
+                "Unsafe fallback must be eliminated; expected missing key error, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSignature error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_keyed_attestation_expired_registry_key_rejected() {
+    let tarball_bytes = b"keyed attestation expired payload";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let signer = EphemeralSigner::new().unwrap();
+
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/expired-key-pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        predicate: SlsaPredicate::default(),
+    };
+    let mut envelope = sign_dsse_envelope(&statement, &signer).unwrap();
+    let keyid = "SHA256:expired-registry-key";
+    envelope.signatures[0].keyid = Some(keyid.to_string());
+
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: None,
+            public_key: Some(PublicKeyHint {
+                hint: Some(keyid.to_string()),
+                raw_bytes: None,
+            }),
+            tlog_entries: Vec::new(),
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    };
+
+    let mut reg_keys = HashMap::new();
+    reg_keys.insert(keyid.to_string(), signer.public_key_spki().to_vec());
+
+    let mut expiries = HashMap::new();
+    // Expired in 2020
+    expiries.insert(keyid.to_string(), ("2020-01-01T00:00:00Z".to_string(), 1577836800000i64));
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny)
+        .with_registry_keys(reg_keys)
+        .with_registry_key_expiries(expiries);
+
+    let err = verifier
+        .verify_package("expired-key-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSignature(msg) => {
+            assert!(
+                msg.contains("expired"),
+                "Expected expired key error, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSignature error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_strict_versioned_purl_subject_matching_rules() {
+    let tarball_bytes = b"purl matching test bytes";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let bundle = make_test_bundle_with_subject(
+        "pkg:npm/%40my-scope/foo@1.2.3",
+        &sha512_hex,
+        "org/repo",
+        "sha123",
+    );
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+
+    // 1. Scoped package verified with exact PURL pkg:npm/%40my-scope/foo@1.2.3 -> SUCCEEDS
+    let res = verifier.verify_package("@my-scope/foo", Some("1.2.3"), &bundle, None, Some(tarball_bytes));
+    assert!(res.is_ok(), "Exact scoped PURL verification should pass: {:?}", res.err());
+
+    // 2. Unscoped package name matching against scoped subject -> REJECTED
+    let err_unscoped = verifier
+        .verify_package("foo", Some("1.2.3"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+    assert!(matches!(err_unscoped, RegistryError::ProvenanceVerificationFailed(msg) if msg.contains("Attestation subject name mismatch")));
+
+    // 3. Subject missing version '@<version>' -> REJECTED
+    let unversioned_bundle = make_test_bundle_with_subject(
+        "pkg:npm/%40my-scope/foo",
+        &sha512_hex,
+        "org/repo",
+        "sha123",
+    );
+    let err_unversioned = verifier
+        .verify_package("@my-scope/foo", Some("1.2.3"), &unversioned_bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+    assert!(matches!(err_unversioned, RegistryError::ProvenanceVerificationFailed(msg) if msg.contains("Attestation subject name mismatch")));
+
+    // 4. Legacy .tgz subject without PURL -> REJECTED
+    let tgz_bundle = make_test_bundle_with_subject(
+        "foo-1.2.3.tgz",
+        &sha512_hex,
+        "org/repo",
+        "sha123",
+    );
+    let err_tgz = verifier
+        .verify_package("@my-scope/foo", Some("1.2.3"), &tgz_bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+    assert!(matches!(err_tgz, RegistryError::ProvenanceVerificationFailed(msg) if msg.contains("Attestation subject name mismatch")));
+}
+
+#[test]
+fn test_rekor_response_parser_verification_shape() {
+    let rekor_resp = serde_json::json!({
+        "65d4b83b": {
+            "logIndex": 42,
+            "logID": "c0d3cafe",
+            "integratedTime": 1700000000,
+            "body": "eyJraW5kIjoiZHNzZSJ9",
+            "verification": {
+                "signedEntryTimestamp": "c2lnbmVkLXRpbWVzdGFtcA==",
+                "inclusionProof": {
+                    "logIndex": 42,
+                    "treeSize": 100,
+                    "rootHash": "11223344",
+                    "hashes": ["aabbcc"],
+                    "checkpoint": "checkpoint-data"
+                }
+            }
+        }
+    });
+
+    let tlog = rnpm_registry::provenance::parse_rekor_log_entry_json(&rekor_resp).unwrap();
+    assert_eq!(tlog.log_index, 42);
+    assert_eq!(tlog.log_id.key_id, "c0d3cafe");
+    assert_eq!(tlog.integrated_time, 1700000000);
+    assert_eq!(
+        tlog.inclusion_promise.as_ref().unwrap().signed_entry_timestamp,
+        "c2lnbmVkLXRpbWVzdGFtcA=="
+    );
+    assert!(tlog.inclusion_proof.is_some());
+    assert_eq!(tlog.canonicalized_body.as_deref(), Some("eyJraW5kIjoiZHNzZSJ9"));
+
+    // Also test fallback to top-level fields
+    let rekor_resp_fallback = serde_json::json!({
+        "65d4b83c": {
+            "logIndex": 43,
+            "logID": "c0d3cafe",
+            "integratedTime": 1700000001,
+            "body": "eyJraW5kIjoiZHNzZSJ9",
+            "signedEntryTimestamp": "ZmFsbGJhY2stdGltZXN0YW1w",
+            "inclusionProof": {
+                "logIndex": 43,
+                "treeSize": 101,
+                "rootHash": "55667788"
+            }
+        }
+    });
+    let tlog_fb = rnpm_registry::provenance::parse_rekor_log_entry_json(&rekor_resp_fallback).unwrap();
+    assert_eq!(
+        tlog_fb.inclusion_promise.as_ref().unwrap().signed_entry_timestamp,
+        "ZmFsbGJhY2stdGltZXN0YW1w"
+    );
+    assert!(tlog_fb.inclusion_proof.is_some());
+}
+
+#[test]
+fn test_publish_sigstore_attachment_data_is_raw_json_string() {
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: None,
+        dsse_envelope: None,
+    };
+    let bundle_serialized = serde_json::to_string(&bundle).unwrap();
+
+    let manifest = serde_json::json!({
+        "name": "publish-raw-json-pkg",
+        "version": "1.0.0"
+    });
+    let tarball = rnpm_registry::PublishTarballData {
+        filename: "publish-raw-json-pkg-1.0.0.tgz",
+        bytes: b"tarball bytes",
+        integrity: "sha512-test",
+        shasum: "shasum-test",
+    };
+    let reg_url = reqwest::Url::parse("https://registry.npmjs.org").unwrap();
+
+    let opts = rnpm_registry::PublishPayloadOptions {
+        name: "publish-raw-json-pkg",
+        version: "1.0.0",
+        description: Some("test package"),
+        tag: "latest",
+        access: None,
+        manifest: &manifest,
+        tarball,
+        registry_url: &reg_url,
+        provenance_attestation: None,
+        provenance_bundle: Some(&bundle),
+    };
+
+    let payload = rnpm_registry::create_publish_payload(&opts);
+    let att = &payload["_attachments"]["publish-raw-json-pkg-1.0.0.sigstore"];
+
+    assert!(!att.is_null());
+    assert_eq!(
+        att["content_type"].as_str().unwrap(),
+        "application/vnd.sigstore.bundle+json;version=0.1"
+    );
+
+    // CRITICAL: Attachment data MUST be a raw JSON string (matching libnpmpublish/lib/publish.js:169), NOT base64-encoded!
+    let data_str = att["data"].as_str().expect("data must be a JSON string");
+    assert_eq!(data_str, bundle_serialized);
+    assert_eq!(att["length"].as_u64().unwrap(), bundle_serialized.len() as u64);
 }

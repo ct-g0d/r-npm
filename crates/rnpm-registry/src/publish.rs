@@ -107,13 +107,13 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
             .media_type
             .as_deref()
             .unwrap_or("application/vnd.sigstore.bundle+json;version=0.1");
-        let bytes = serialized.as_bytes();
+        let length = serialized.len();
         attachments.insert(
             provenance_bundle_name,
             serde_json::json!({
                 "content_type": content_type,
-                "data": BASE64.encode(bytes),
-                "length": bytes.len(),
+                "data": serialized,
+                "length": length,
             }),
         );
     } else if let Some(att_val) = opts.provenance_attestation {
@@ -123,13 +123,13 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
             .get("mediaType")
             .and_then(|m| m.as_str())
             .unwrap_or("application/vnd.sigstore.bundle+json;version=0.1");
-        let bytes = serialized.as_bytes();
+        let length = serialized.len();
         attachments.insert(
             provenance_bundle_name,
             serde_json::json!({
                 "content_type": content_type,
-                "data": BASE64.encode(bytes),
-                "length": bytes.len(),
+                "data": serialized,
+                "length": length,
             }),
         );
     }

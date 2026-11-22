@@ -427,7 +427,7 @@ pub fn verify_rekor_set(rekor_pubkeys: &[Vec<u8>], entry: &TlogEntry) -> Result<
 
     if !ok {
         return Err(RegistryError::InvalidSigstoreBundle(
-            "Rekor signedEntryTimestamp verification failed against trusted Rekor public keys"
+            "Rekor transparency log evidence missing or unauthenticated: Rekor signedEntryTimestamp verification failed against trusted Rekor public keys"
                 .into(),
         ));
     }
@@ -648,10 +648,32 @@ pub fn verify_rekor_body_binding(
         RegistryError::InvalidSigstoreBundle(format!("Invalid Rekor canonicalizedBody JSON: {e}"))
     })?;
 
-    let kind = body_json.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
+    let kind = body_json
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or_default()
+        .trim();
+
+    // Allow ONLY supported entry schemas (dsse, intoto, hashedrekord) and REJECT any unknown/unsupported kind
+    if !matches!(kind, "dsse" | "intoto" | "hashedrekord") {
+        return Err(RegistryError::InvalidSigstoreBundle(format!(
+            "Unsupported Rekor entry kind: '{kind}' - only 'dsse', 'intoto', and 'hashedrekord' are supported"
+        )));
+    }
+
     let payload_bytes = decode_base64(&envelope.payload)?;
     let expected_payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
-    let expected_sig_b64 = envelope.signatures.first().map(|s| s.sig.as_str()).unwrap_or_default();
+
+    let expected_sig = envelope
+        .signatures
+        .first()
+        .ok_or_else(|| RegistryError::InvalidSigstoreBundle("DSSE envelope has no signatures".into()))?;
+    let expected_sig_b64 = expected_sig.sig.trim();
+    if expected_sig_b64.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle("DSSE envelope signature is empty".into()));
+    }
+    let expected_sig_bytes = decode_base64(expected_sig_b64)?;
+
     let leaf_cert_b64 = BASE64.encode(leaf_cert_der);
 
     match kind {
@@ -660,68 +682,99 @@ pub fn verify_rekor_body_binding(
                 RegistryError::InvalidSigstoreBundle("Missing spec in Rekor dsse entry".into())
             })?;
 
-            // 1. Verify payload hash
+            // 1. Verify payload hash is present, non-empty, and matches
             let payload_hash = spec
                 .get("payloadHash")
                 .and_then(|ph| ph.get("value").or_else(|| ph.get("digest")))
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty payloadHash in Rekor dsse entry".into(),
+                    )
+                })?;
 
-            if !payload_hash.is_empty() {
-                let norm_ph = payload_hash.trim();
-                let matches = if norm_ph.len() == 64 {
-                    norm_ph.eq_ignore_ascii_case(&expected_payload_hash_hex)
-                } else if let Ok(dec) = decode_base64(norm_ph) {
-                    HEXLOWER.encode(&dec).eq_ignore_ascii_case(&expected_payload_hash_hex)
-                } else {
-                    false
-                };
-                if !matches {
-                    return Err(RegistryError::InvalidSigstoreBundle(format!(
-                        "Rekor dsse payloadHash mismatch: expected {expected_payload_hash_hex}, got {payload_hash}"
-                    )));
-                }
+            let norm_ph = payload_hash;
+            let matches = if norm_ph.len() == 64 {
+                norm_ph.eq_ignore_ascii_case(&expected_payload_hash_hex)
+            } else if let Ok(dec) = decode_base64(norm_ph) {
+                HEXLOWER.encode(&dec).eq_ignore_ascii_case(&expected_payload_hash_hex)
+            } else {
+                false
+            };
+            if !matches {
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "Rekor dsse payloadHash mismatch: expected {expected_payload_hash_hex}, got {payload_hash}"
+                )));
             }
 
-            // 2. Verify signature & verifier
-            if let Some(sigs) = spec.get("signatures").and_then(|s| s.as_array()) {
-                if !sigs.is_empty() {
-                    let sig_entry = &sigs[0];
-                    let entry_sig = sig_entry
-                        .get("signature")
-                        .or_else(|| sig_entry.get("content"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default();
-                    if !entry_sig.is_empty() && entry_sig.trim() != expected_sig_b64.trim() {
-                        return Err(RegistryError::InvalidSigstoreBundle(
-                            "Rekor dsse signature mismatch with DSSE envelope".into(),
-                        ));
-                    }
-                    if let Some(verifier) = sig_entry.get("verifier").and_then(|v| v.as_str()) {
-                        let clean_verifier = verifier.trim();
-                        let clean_leaf = leaf_cert_b64.trim();
-                        if clean_verifier != clean_leaf {
-                            let verifier_der = decode_pem_to_der(clean_verifier)
-                                .or_else(|_| decode_base64(clean_verifier))
-                                .unwrap_or_default();
-                            if verifier_der != leaf_cert_der {
-                                return Err(RegistryError::InvalidSigstoreBundle(
-                                    "Rekor dsse verifier mismatch with leaf X.509 certificate".into(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else if let Some(verifiers) = spec.get("verifiers").and_then(|v| v.as_array()) {
-                if let Some(first_v) = verifiers.first().and_then(|v| v.as_str()) {
-                    let verifier_der = decode_pem_to_der(first_v)
-                        .or_else(|_| decode_base64(first_v))
-                        .unwrap_or_default();
-                    if verifier_der != leaf_cert_der {
-                        return Err(RegistryError::InvalidSigstoreBundle(
-                            "Rekor dsse verifier mismatch with leaf X.509 certificate".into(),
-                        ));
-                    }
+            // 2. Verify signature is present, non-empty, and matches DSSE envelope
+            let sigs = spec
+                .get("signatures")
+                .and_then(|s| s.as_array())
+                .filter(|arr| !arr.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signatures in Rekor dsse entry".into(),
+                    )
+                })?;
+
+            let sig_entry = &sigs[0];
+            let entry_sig = sig_entry
+                .get("signature")
+                .or_else(|| sig_entry.get("content"))
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signature in Rekor dsse entry".into(),
+                    )
+                })?;
+
+            let sig_matches = if entry_sig == expected_sig_b64 {
+                true
+            } else if let Ok(dec) = decode_base64(entry_sig) {
+                dec == expected_sig_bytes
+            } else {
+                false
+            };
+            if !sig_matches {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Rekor dsse signature mismatch with DSSE envelope".into(),
+                ));
+            }
+
+            // 3. Verify verifier is present, non-empty, and matches leaf certificate
+            let verifier = sig_entry
+                .get("verifier")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    spec.get("verifiers")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_str())
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty verifier in Rekor dsse entry".into(),
+                    )
+                })?;
+
+            if verifier != leaf_cert_b64.trim() {
+                let verifier_der = decode_pem_to_der(verifier)
+                    .or_else(|_| decode_base64(verifier))
+                    .unwrap_or_default();
+                let spki_matches = parse_x509_certificate(leaf_cert_der)
+                    .map(|c| c.spki_bytes == verifier_der)
+                    .unwrap_or(false);
+                if verifier_der != leaf_cert_der && !spki_matches {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor dsse verifier mismatch with leaf X.509 certificate".into(),
+                    ));
                 }
             }
         }
@@ -731,47 +784,218 @@ pub fn verify_rekor_body_binding(
             })?;
             let content = spec.get("content").unwrap_or(spec);
 
-            if let Some(ph) = content
+            // 1. Verify payloadHash is present, non-empty, and matches
+            let payload_hash = content
                 .get("payloadHash")
-                .and_then(|p| p.get("value"))
+                .and_then(|p| p.get("value").or_else(|| p.get("digest")))
                 .and_then(|v| v.as_str())
-            {
-                let norm_ph = ph.trim();
-                let matches = if norm_ph.len() == 64 {
-                    norm_ph.eq_ignore_ascii_case(&expected_payload_hash_hex)
-                } else if let Ok(dec) = decode_base64(norm_ph) {
-                    HEXLOWER.encode(&dec).eq_ignore_ascii_case(&expected_payload_hash_hex)
-                } else {
-                    false
-                };
-                if !matches {
-                    return Err(RegistryError::InvalidSigstoreBundle(format!(
-                        "Rekor intoto payloadHash mismatch: expected {expected_payload_hash_hex}, got {ph}"
-                    )));
-                }
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty payloadHash in Rekor intoto entry".into(),
+                    )
+                })?;
+
+            let norm_ph = payload_hash;
+            let matches = if norm_ph.len() == 64 {
+                norm_ph.eq_ignore_ascii_case(&expected_payload_hash_hex)
+            } else if let Ok(dec) = decode_base64(norm_ph) {
+                HEXLOWER.encode(&dec).eq_ignore_ascii_case(&expected_payload_hash_hex)
+            } else {
+                false
+            };
+            if !matches {
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "Rekor intoto payloadHash mismatch: expected {expected_payload_hash_hex}, got {payload_hash}"
+                )));
             }
 
-            if let Some(env_val) = content.get("envelope") {
-                if let Some(sigs) = env_val.get("signatures").and_then(|s| s.as_array()) {
-                    if !sigs.is_empty() {
-                        let entry_sig = sigs[0].get("sig").and_then(|s| s.as_str()).unwrap_or_default();
-                        let matches = if entry_sig == expected_sig_b64 {
-                            true
-                        } else if let Ok(dec) = decode_base64(entry_sig) {
-                            String::from_utf8_lossy(&dec) == expected_sig_b64
-                        } else {
-                            false
-                        };
-                        if !matches && !entry_sig.is_empty() {
-                            return Err(RegistryError::InvalidSigstoreBundle(
-                                "Rekor intoto signature mismatch with DSSE envelope".into(),
-                            ));
-                        }
+            // 2. Verify signature in envelope is present, non-empty, and matches DSSE envelope
+            let env_val = content.get("envelope").ok_or_else(|| {
+                RegistryError::InvalidSigstoreBundle(
+                    "Missing envelope in Rekor intoto entry".into(),
+                )
+            })?;
+            let sigs = env_val
+                .get("signatures")
+                .and_then(|s| s.as_array())
+                .filter(|arr| !arr.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signatures in Rekor intoto entry".into(),
+                    )
+                })?;
+
+            let sig_entry = &sigs[0];
+            let entry_sig = sig_entry
+                .get("sig")
+                .or_else(|| sig_entry.get("signature"))
+                .and_then(|s| s.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signature in Rekor intoto entry".into(),
+                    )
+                })?;
+
+            let sig_matches = if entry_sig == expected_sig_b64 {
+                true
+            } else if let Ok(dec) = decode_base64(entry_sig) {
+                if dec == expected_sig_bytes {
+                    true
+                } else if let Ok(double_str) = String::from_utf8(dec) {
+                    if double_str.trim() == expected_sig_b64 {
+                        true
+                    } else if let Ok(dec2) = decode_base64(double_str.trim()) {
+                        dec2 == expected_sig_bytes
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !sig_matches {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Rekor intoto signature mismatch with DSSE envelope".into(),
+                ));
+            }
+
+            // 3. Verify verifier / publicKey is present, non-empty, and matches leaf certificate
+            let verifier = sig_entry
+                .get("publicKey")
+                .or_else(|| sig_entry.get("verifier"))
+                .or_else(|| {
+                    spec.get("verifiers")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                })
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty verifier/publicKey in Rekor intoto entry".into(),
+                    )
+                })?;
+
+            if verifier != leaf_cert_b64.trim() {
+                let verifier_der = decode_pem_to_der(verifier)
+                    .or_else(|_| decode_base64(verifier))
+                    .unwrap_or_default();
+                let spki_matches = parse_x509_certificate(leaf_cert_der)
+                    .map(|c| c.spki_bytes == verifier_der)
+                    .unwrap_or(false);
+                if verifier_der != leaf_cert_der && !spki_matches {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor intoto verifier mismatch with leaf X.509 certificate".into(),
+                    ));
                 }
             }
         }
-        _ => {}
+        "hashedrekord" => {
+            let spec = body_json.get("spec").ok_or_else(|| {
+                RegistryError::InvalidSigstoreBundle(
+                    "Missing spec in Rekor hashedrekord entry".into(),
+                )
+            })?;
+
+            // 1. Verify data.hash is present, non-empty, and matches
+            let hash_val = spec
+                .get("data")
+                .and_then(|d| d.get("hash"))
+                .and_then(|h| h.get("value").or_else(|| h.get("digest")))
+                .or_else(|| spec.get("digest"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty data.hash in Rekor hashedrekord entry".into(),
+                    )
+                })?;
+
+            let pae_bytes = dsse_pre_auth_encoding(&envelope.payload_type, &payload_bytes);
+            let pae_hash_hex = HEXLOWER.encode(&Sha256::digest(&pae_bytes));
+
+            let hash_matches = if hash_val.len() == 64 {
+                hash_val.eq_ignore_ascii_case(&expected_payload_hash_hex)
+                    || hash_val.eq_ignore_ascii_case(&pae_hash_hex)
+            } else if let Ok(dec) = decode_base64(hash_val) {
+                let dec_hex = HEXLOWER.encode(&dec);
+                dec_hex.eq_ignore_ascii_case(&expected_payload_hash_hex)
+                    || dec_hex.eq_ignore_ascii_case(&pae_hash_hex)
+            } else {
+                false
+            };
+            if !hash_matches {
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "Rekor hashedrekord data.hash mismatch: expected {expected_payload_hash_hex}, got {hash_val}"
+                )));
+            }
+
+            // 2. Verify signature is present, non-empty, and matches DSSE envelope
+            let sig_obj = spec.get("signature").ok_or_else(|| {
+                RegistryError::InvalidSigstoreBundle(
+                    "Missing signature in Rekor hashedrekord entry".into(),
+                )
+            })?;
+            let entry_sig = sig_obj
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signature.content in Rekor hashedrekord entry".into(),
+                    )
+                })?;
+
+            let sig_matches = if entry_sig == expected_sig_b64 {
+                true
+            } else if let Ok(dec) = decode_base64(entry_sig) {
+                dec == expected_sig_bytes
+            } else {
+                false
+            };
+            if !sig_matches {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Rekor hashedrekord signature mismatch with DSSE envelope".into(),
+                ));
+            }
+
+            // 3. Verify verifier / publicKey is present, non-empty, and matches leaf certificate
+            let verifier = sig_obj
+                .get("publicKey")
+                .and_then(|pk| pk.get("content"))
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty signature.publicKey.content in Rekor hashedrekord entry".into(),
+                    )
+                })?;
+
+            if verifier != leaf_cert_b64.trim() {
+                let verifier_der = decode_pem_to_der(verifier)
+                    .or_else(|_| decode_base64(verifier))
+                    .unwrap_or_default();
+                let spki_matches = parse_x509_certificate(leaf_cert_der)
+                    .map(|c| c.spki_bytes == verifier_der)
+                    .unwrap_or(false);
+                if verifier_der != leaf_cert_der && !spki_matches {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor hashedrekord verifier mismatch with leaf X.509 certificate".into(),
+                    ));
+                }
+            }
+        }
+        _ => unreachable!(),
     }
 
     Ok(())
@@ -1409,6 +1633,7 @@ pub struct ProvenanceVerifier {
     fulcio_root_certs: Vec<Vec<u8>>,
     rekor_public_keys: Vec<Vec<u8>>,
     registry_keys: HashMap<String, Vec<u8>>,
+    registry_key_expiries: HashMap<String, (String, i64)>,
 }
 
 impl ProvenanceVerifier {
@@ -1437,6 +1662,7 @@ impl ProvenanceVerifier {
             fulcio_root_certs,
             rekor_public_keys,
             registry_keys: HashMap::new(),
+            registry_key_expiries: HashMap::new(),
         };
 
         if cfg!(test) || std::env::var_os("RNPM_TEST_MOCK_ROOTS").is_some() {
@@ -1470,6 +1696,14 @@ impl ProvenanceVerifier {
 
     pub fn with_registry_keys(mut self, keys: HashMap<String, Vec<u8>>) -> Self {
         self.registry_keys = keys;
+        self
+    }
+
+    pub fn with_registry_key_expiries(
+        mut self,
+        expiries: HashMap<String, (String, i64)>,
+    ) -> Self {
+        self.registry_key_expiries = expiries;
         self
     }
 
@@ -1520,6 +1754,13 @@ impl ProvenanceVerifier {
     ) -> Result<VerifiedProvenance, RegistryError> {
         self.verify_package(package_name, None, bundle, tarball_integrity, tarball_bytes)
     }
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
     /// Verifies that a Sigstore bundle is authentic, matches exact package name and version,
     /// matches tarball digests, and conforms to the configured `ProvenancePolicy`.
@@ -1584,7 +1825,6 @@ impl ProvenanceVerifier {
                     tlog.integrated_time
                 )));
             }
-            primary_tlog = Some(tlog);
 
             let leaf = verify_fulcio_certificate_chain(
                 &raw_cert_chain,
@@ -1593,6 +1833,19 @@ impl ProvenanceVerifier {
             )?;
             let spki = leaf.spki_bytes.clone();
             parsed_leaf_cert = Some(leaf);
+
+            // Fulcio certificates are short-lived. A Rekor checkpoint authenticates
+            // ONLY the log root and carries NO entry timestamp. Therefore, Fulcio certificate validity
+            // checking strictly requires an authenticated signing time (a cryptographically verified
+            // Rekor SET covering integratedTime). Reject checkpoint-only bundles that have no authenticated timestamp!
+            if tlog.inclusion_promise.is_none() {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Rekor transparency log evidence missing or unauthenticated: Fulcio certificate validity requires an authenticated signing time (verified Rekor SET), but bundle has no inclusionPromise (checkpoint-only bundles without an authenticated timestamp are rejected)".into(),
+                ));
+            }
+            verify_rekor_set(&self.rekor_public_keys, tlog)?;
+
+            primary_tlog = Some(tlog);
             spki
         } else {
             // Keyed publish attestation
@@ -1603,23 +1856,38 @@ impl ProvenanceVerifier {
                 .or_else(|| envelope.signatures[0].keyid.as_deref())
                 .unwrap_or_default();
 
-            if let Some(reg_key) = self.registry_keys.get(keyid) {
-                reg_key.clone()
-            } else if !self.registry_keys.is_empty() {
-                return Err(RegistryError::InvalidSignature(format!(
-                    "No corresponding public key found for attestation keyid '{keyid}'"
-                )));
-            } else if let Some(pk_raw) = vm
-                .public_key
-                .as_ref()
-                .and_then(|pk| pk.raw_bytes.as_deref())
-            {
-                decode_base64(pk_raw)?
-            } else {
+            if keyid.trim().is_empty() {
                 return Err(RegistryError::InvalidSigstoreBundle(
-                    "Missing certificate chain in verification material and no matching registry key found".into(),
+                    "Missing certificate chain in verification material and no keyid hint for registry key matching".into(),
                 ));
             }
+
+            let reg_key = self.registry_keys.get(keyid).ok_or_else(|| {
+                RegistryError::InvalidSignature(format!(
+                    "No corresponding public key found for attestation keyid '{keyid}'"
+                ))
+            })?;
+
+            // Enforce key expiry if tracked
+            if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid) {
+                let signing_time_ms = if let Some(tlog) = vm.tlog_entries.first() {
+                    if tlog.integrated_time > 0 {
+                        tlog.integrated_time * 1000
+                    } else {
+                        Self::current_time_ms()
+                    }
+                } else {
+                    Self::current_time_ms()
+                };
+
+                if signing_time_ms >= *expires_ms {
+                    return Err(RegistryError::InvalidSignature(format!(
+                        "Registry public key for keyid '{keyid}' has expired {expires_str}"
+                    )));
+                }
+            }
+
+            reg_key.clone()
         };
 
         // 4. Verify DSSE envelope cryptographic signature over PAE
@@ -1639,31 +1907,16 @@ impl ProvenanceVerifier {
                 integrated_time: tlog.integrated_time,
             };
 
-            let mut evidence_authenticated = false;
-
-            // Check SET
-            if tlog.inclusion_promise.is_some()
-                && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok()
-            {
-                evidence_authenticated = true;
-            }
-
-            // Check Checkpoint & Inclusion proof
+            // SET was already cryptographically verified above.
+            // If inclusion proof is present, verify checkpoint & Merkle inclusion proof:
             if tlog.inclusion_proof.is_some() {
                 if let Ok(Some(auth_root)) = verify_checkpoint_signature(&self.rekor_public_keys, tlog) {
                     verify_merkle_inclusion_proof(tlog, Some(&auth_root))?;
-                    evidence_authenticated = true;
-                } else if !evidence_authenticated {
+                } else {
                     return Err(RegistryError::InvalidSigstoreBundle(
                         "Inclusion proof present but checkpoint signature failed verification against trusted Rekor keys".into(),
                     ));
                 }
-            }
-
-            if !evidence_authenticated {
-                return Err(RegistryError::InvalidSigstoreBundle(
-                    "Rekor transparency log evidence missing or unauthenticated: neither SET nor checkpoint verified against trusted Rekor keys".into(),
-                ));
             }
 
             // Bind Rekor body to DSSE envelope & leaf certificate
@@ -1773,74 +2026,53 @@ impl ProvenanceVerifier {
         package_name: &str,
         package_version: Option<&str>,
     ) -> Result<&'a InTotoSubject, RegistryError> {
-        let unscoped_name = package_name
-            .split('/')
-            .next_back()
-            .unwrap_or(package_name)
-            .trim_start_matches('@');
-
-        let purl_encoded_name = if let Some(stripped) = package_name.strip_prefix('@') {
-            format!("%40{}", stripped)
-        } else {
-            package_name.to_string()
-        };
+        let is_scoped = package_name.starts_with('@');
+        let stripped_scope = package_name.strip_prefix('@');
 
         for subj in subjects {
             let s = subj.name.trim();
 
-            // PURL matching: pkg:npm/<name>@<version>
-            if let Some(purl_rest) = s.strip_prefix("pkg:npm/") {
-                if let Some((name_part, version_part)) = purl_rest.split_once('@') {
-                    let decoded_name = name_part
-                        .replace("%40", "@")
-                        .replace("%2F", "/")
-                        .replace("%2f", "/");
-                    if decoded_name == package_name
-                        || decoded_name == unscoped_name
-                        || name_part == purl_encoded_name
-                    {
-                        if let Some(ver) = package_version {
-                            if version_part == ver {
-                                return Ok(subj);
-                            }
-                        } else {
-                            return Ok(subj);
-                        }
-                    }
-                } else {
-                    let decoded_name = purl_rest
-                        .replace("%40", "@")
-                        .replace("%2F", "/")
-                        .replace("%2f", "/");
-                    if (decoded_name == package_name
-                        || decoded_name == unscoped_name
-                        || purl_rest == purl_encoded_name)
-                        && package_version.is_none()
-                    {
-                        return Ok(subj);
-                    }
-                }
+            // Strict versioned PURL matching: must start with "pkg:npm/"
+            let Some(purl_rest) = s.strip_prefix("pkg:npm/") else {
+                continue;
+            };
+
+            // Require an exact versioned PURL with '@<version>'
+            let Some((name_part, version_part)) = purl_rest.split_once('@') else {
+                // NEVER accept a subject missing '@<version>'!
+                continue;
+            };
+
+            if version_part.trim().is_empty() {
                 continue;
             }
 
-            if let Some(prefix) = s.strip_suffix(".tgz") {
-                if let Some(ver) = package_version {
-                    let expected_prefix = format!("{package_name}-{ver}");
-                    let expected_unscoped = format!("{unscoped_name}-{ver}");
-                    if prefix == expected_prefix || prefix == expected_unscoped {
-                        return Ok(subj);
-                    }
-                } else if prefix == package_name
-                    || prefix == unscoped_name
-                    || prefix.starts_with(&format!("{package_name}-"))
-                    || prefix.starts_with(&format!("{unscoped_name}-"))
-                {
-                    return Ok(subj);
+            if let Some(expected_ver) = package_version {
+                if version_part != expected_ver {
+                    continue;
                 }
-                continue;
             }
 
-            if s == package_name || s == unscoped_name {
+            // Verify name part matches package_name strictly:
+            // For scoped package `@scope/pkg`:
+            // npm encodes as `%40scope/pkg` or allows `@scope/pkg` or `%40scope%2Fpkg`.
+            // NEVER match unscoped `pkg` against `@scope/pkg`!
+            // For unscoped package `pkg`:
+            // name_part MUST be `pkg`. NEVER match `@scope/pkg` or `%40scope/pkg`!
+            let name_matches = if is_scoped {
+                let stripped = stripped_scope.unwrap();
+                let encoded_at = format!("%40{}", stripped);
+                let encoded_full = format!("%40{}", stripped.replace('/', "%2F"));
+                let encoded_full_lower = format!("%40{}", stripped.replace('/', "%2f"));
+                name_part == encoded_at
+                    || name_part == package_name
+                    || name_part == encoded_full
+                    || name_part == encoded_full_lower
+            } else {
+                name_part == package_name
+            };
+
+            if name_matches {
                 return Ok(subj);
             }
         }
@@ -2517,6 +2749,13 @@ pub async fn submit_rekor_dsse_entry(
     }
 
     let resp_json: serde_json::Value = resp.json().await?;
+    parse_rekor_log_entry_json(&resp_json)
+}
+
+/// Parses a Rekor /api/v1/log/entries JSON response into a `TlogEntry`.
+/// Reads `signedEntryTimestamp` and `inclusionProof` from `entry["verification"]` (with fallback if top-level),
+/// matching Rekor's actual response shape and npm's parser, preserving both SET and inclusion proof.
+pub fn parse_rekor_log_entry_json(resp_json: &serde_json::Value) -> Result<TlogEntry, RegistryError> {
     let obj = resp_json
         .as_object()
         .ok_or_else(|| RegistryError::Other("Rekor response is not an object".into()))?;
@@ -2526,15 +2765,53 @@ pub async fn submit_rekor_dsse_entry(
         .next()
         .ok_or_else(|| RegistryError::Other("Empty Rekor entries map in response".into()))?;
 
-    let log_index = entry["logIndex"].as_u64().unwrap_or(0);
-    let log_id = entry["logID"].as_str().unwrap_or_default().to_string();
-    let integrated_time = entry["integratedTime"].as_i64().unwrap_or(0);
+    let log_index = entry
+        .get("logIndex")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0);
+    let log_id = entry
+        .get("logID")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let integrated_time = entry
+        .get("integratedTime")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0);
 
-    let inclusion_promise = entry.get("inclusionPromise").map(|p| InclusionPromise {
-        signed_entry_timestamp: p["signedEntryTimestamp"].as_str().unwrap_or_default().to_string(),
-    });
-    let inclusion_proof = entry.get("inclusionProof").cloned();
-    let canonicalized_body = entry.get("body").and_then(|b| b.as_str()).map(str::to_string);
+    let verification = entry.get("verification");
+
+    let signed_entry_timestamp = verification
+        .and_then(|v| v.get("signedEntryTimestamp"))
+        .and_then(|s| s.as_str())
+        .or_else(|| {
+            entry
+                .get("signedEntryTimestamp")
+                .and_then(|s| s.as_str())
+        })
+        .or_else(|| {
+            entry
+                .get("inclusionPromise")
+                .and_then(|p| p.get("signedEntryTimestamp"))
+                .and_then(|s| s.as_str())
+        });
+
+    let inclusion_promise = signed_entry_timestamp
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| InclusionPromise {
+            signed_entry_timestamp: s.to_string(),
+        });
+
+    let inclusion_proof = verification
+        .and_then(|v| v.get("inclusionProof"))
+        .cloned()
+        .or_else(|| entry.get("inclusionProof").cloned());
+
+    let canonicalized_body = entry
+        .get("body")
+        .and_then(|b| b.as_str())
+        .or_else(|| entry.get("canonicalizedBody").and_then(|b| b.as_str()))
+        .map(str::to_string);
 
     Ok(TlogEntry {
         log_index,
